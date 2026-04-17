@@ -46,6 +46,71 @@ Every convenience helper method (e.g., `email_get`, `mailbox_create`, `calendar_
 
 ---
 
+## API ergonomics (pre-1.0 breaking changes)
+
+Surfaced by downstream consumer feedback. All are breaking; bundle into a single pre-1.0 release with a migration note rather than trickling out.
+
+### 1. `Option`-less getters use sentinel values
+
+`Mailbox::role()` returns `Role` directly, requiring `== Role::None` to check for unset. `Mailbox::total_emails()` returns `usize` directly with no way to distinguish "zero" from "server didn't return it". Audit all typed-struct getters for the same pattern.
+
+**Change:** Return `Option<Role>` / `Option<usize>` etc. where the JMAP spec allows the property to be absent.
+
+**Why:** Sentinel values are un-Rusty and surprise users who reach for `if let Some(role)`. The `Field<T>` machinery already distinguishes omitted/null/value internally — the getter layer is flattening that away incorrectly.
+
+---
+
+### 2. `mailbox_get(id, props)` name implies plural
+
+`mailbox_get(id, props)` fetches exactly one mailbox by ID. Consumers expect it to fetch many (the JMAP `Mailbox/get` method accepts a list, and `ids: null` means "all"). The builder path (`MailboxGet::new(...)` without `.ids()`) is the only way to get all.
+
+**Change:** Either rename the single-fetch helper (`mailbox_get_one` / keep builder-only for bulk) or change the helper to accept `Option<&[Id]>` and fetch many, with `None` = all. Apply consistently across all `<type>_get` helpers (email, calendar, contact, etc.).
+
+**Why:** The current name lies about behavior. Whichever direction we pick, the helper and the builder should agree.
+
+---
+
+### 3. Common arguments hidden on `.arguments()`
+
+`fetch_text_body_values(true)` and similar common flags are only reachable via `get_req.arguments().fetch_text_body_values(true)` on the method struct. Consumers don't discover them.
+
+**Change:** Lift frequently-used arguments to first-class builder methods on the method struct. Keep `.arguments()` as an escape hatch for rarely-used ones.
+
+**Why:** Discoverability. Users shouldn't need to read the source to find `fetch_text_body_values`.
+
+---
+
+### 4. `max_changes: 0` silently invalid
+
+`mailbox_changes(since_state, 0)` compiles and sends, but `0` violates the JMAP spec (must be > 0). Server rejects at runtime.
+
+**Change:** Validate at the call site (return `Error::InvalidArgument` for `0`), or redefine `0` to mean "server default" and document it. Likely the former — silent semantic overloading is worse than an error.
+
+**Why:** Catch the bug before the network round-trip.
+
+---
+
+### 5. `AccountId` / `IdentityId` confusable in `email_submission_create`
+
+`email_submission_create(email_id, identity_id)` takes two string-ish IDs. Consumers pass an account ID by mistake because there's no type-level distinction.
+
+**Change:** Use the phantom-typed `Id<T>` wrapper (`Id<IdentityId>`, `Id<EmailId>`) on helper signatures so mix-ups fail to compile. `Id<T>` already exists in the crate (per CLAUDE.md "Available for incremental adoption") — this is the incremental adoption.
+
+**Why:** The type system should enforce what the parameter name only suggests.
+
+---
+
+### Explicitly not changing
+
+These came up in the same feedback but are Rust-isms, not API bugs:
+
+- `take_id()` / `take_list()` needing `let mut response` — ownership semantics, correct as-is.
+- `changes.created()` returning `&[String]` not `&[&str]` — matches storage, `.map(String::as_str)` is idiomatic.
+- Filter type inference requiring an explicit binding — a generics limitation; fixing it would need a less-generic API.
+- `download(blob_id)` signature — consumer expected a wrong signature; current shape is correct.
+
+---
+
 ## Remaining specs
 
 Implementation plans for additional JMAP specifications are in the `plans/` directory:
