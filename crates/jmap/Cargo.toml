@@ -1,0 +1,75 @@
+[package]
+name = "bifrost-jmap"
+description = "JMAP client for Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage = "https://github.com/folknor/bifrost"
+keywords = ["jmap", "email", "mail", "e-mail"]
+categories = ["email"]
+readme = "README.md"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { version = "0.13.2", default-features = false, features = ["stream"]}
+tokio-tungstenite = { version = "0.29.0", optional = true }
+tokio = { version = "1.47", default-features = false, features = ["io-util"], optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring"] }
+rustls-pki-types = { version = "1", optional = true }
+native-tls = { version = "0.2", optional = true }
+futures-util = "0.3"
+async-stream = "0.3"
+serde = { version = "1.0", features = ["derive"]}
+serde_json = { version = "1.0", features = ["raw_value"] }
+chrono = { version = "0.4", features = ["serde"]}
+base64 = "0.22"
+bytes = "1.11.1"
+
+[features]
+default = ["tls-rustls", "websockets", "mail", "calendars", "contacts", "blob", "quota"]
+tls-rustls = [
+    "reqwest/rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "tokio-tungstenite?/rustls-tls-webpki-roots",
+]
+tls-native = [
+    "reqwest/native-tls",
+    "dep:native-tls",
+    "tokio-tungstenite?/native-tls",
+]
+websockets = ["tokio", "dep:tokio-tungstenite"]
+mail = []
+calendars = []
+contacts = []
+blob = []
+quota = []
+debug = []
+
+[[example]]
+name = "mailboxes"
+required-features = ["mail"]
+
+[[example]]
+name = "messages"
+required-features = ["mail"]
+
+[[example]]
+name = "eventsource"
+required-features = ["mail"]
+
+[[example]]
+name = "result_reference"
+required-features = ["mail"]
+
+[[example]]
+name = "websocket"
+required-features = ["websockets"]

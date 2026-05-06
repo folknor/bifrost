@@ -1,0 +1,8 @@
+bifrost
+Copyright 2026 the bifrost authors
+
+This product includes software originally developed by Stalwart Labs LLC
+<hello@stalw.art> as the `jmap-client` crate
+(https://github.com/stalwartlabs/jmap-client), licensed under Apache-2.0
+OR MIT. The `bifrost-jmap` crate descends from that work; substantial
+portions have been rewritten since the fork point.
