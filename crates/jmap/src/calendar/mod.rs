@@ -236,3 +236,17 @@ crate::define_changes_method!(
     crate::core::capability::Calendars,
     crate::core::changes::ChangesResponse<Calendar<Get>>
 );
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+impl CalendarSet {
+    pub fn on_destroy_remove_events(&mut self, remove: bool) -> &mut Self {
+        self.arguments().on_destroy_remove_events(remove);
+        self
+    }
+
+    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_set_is_default(id);
+        self
+    }
+}

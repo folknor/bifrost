@@ -62,3 +62,24 @@ impl SetObject for SieveScript<Get> {
         None
     }
 }
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+use super::SieveScriptSet;
+
+impl SieveScriptSet {
+    pub fn on_success_activate_script(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_activate_script(id);
+        self
+    }
+
+    pub fn on_success_activate_script_id(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_activate_script_id(id);
+        self
+    }
+
+    pub fn on_success_deactivate_script(&mut self, value: bool) -> &mut Self {
+        self.arguments().on_success_deactivate_script(value);
+        self
+    }
+}

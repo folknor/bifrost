@@ -179,6 +179,9 @@ impl QueryArguments {
 
 // ---- Property enum ----
 
+// (Lifted-arguments forwarders are emitted after the macro-generated
+// CalendarEventGet / CalendarEventSet / CalendarEventQuery structs.)
+
 crate::define_open_property_enum! {
     /// Property names for CalendarEvent/get `properties` lists.
     ///
@@ -273,3 +276,46 @@ crate::define_copy_method!(
     crate::core::capability::Calendars,
     crate::core::copy::CopyResponse<CalendarEvent<Get>>
 );
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+impl CalendarEventGet {
+    pub fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
+        self.arguments().recurrence_overrides_before(before);
+        self
+    }
+
+    pub fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
+        self.arguments().recurrence_overrides_after(after);
+        self
+    }
+
+    pub fn reduce_participants(&mut self, reduce: bool) -> &mut Self {
+        self.arguments().reduce_participants(reduce);
+        self
+    }
+
+    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+        self.arguments().time_zone(tz);
+        self
+    }
+}
+
+impl CalendarEventSet {
+    pub fn send_scheduling_messages(&mut self, send: bool) -> &mut Self {
+        self.arguments().send_scheduling_messages(send);
+        self
+    }
+}
+
+impl CalendarEventQuery {
+    pub fn expand_recurrences(&mut self, expand: bool) -> &mut Self {
+        self.arguments().expand_recurrences(expand);
+        self
+    }
+
+    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+        self.arguments().time_zone(tz);
+        self
+    }
+}

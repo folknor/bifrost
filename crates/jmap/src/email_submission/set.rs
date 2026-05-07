@@ -178,3 +178,27 @@ impl SetArguments {
         self
     }
 }
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+use super::EmailSubmissionSet;
+
+impl EmailSubmissionSet {
+    pub fn on_success_update_email(&mut self, id: impl Into<String>) -> &mut Email<Set> {
+        self.arguments().on_success_update_email(id)
+    }
+
+    pub fn on_success_update_email_id(&mut self, id: impl Into<String>) -> &mut Email<Set> {
+        self.arguments().on_success_update_email_id(id)
+    }
+
+    pub fn on_success_destroy_email(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_destroy_email(id);
+        self
+    }
+
+    pub fn on_success_destroy_email_id(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_destroy_email_id(id);
+        self
+    }
+}

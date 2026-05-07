@@ -824,6 +824,48 @@ impl GetArguments {
     }
 }
 
+// -- Lifted method arguments (plans/API.md §5) -- the EmailGet /
+// EmailQuery method structs forward each Arguments setter so callers
+// don't have to drill through `.arguments()`. Same pattern in every
+// other module.
+
+impl EmailGet {
+    pub fn body_properties(
+        &mut self,
+        body_properties: impl IntoIterator<Item = BodyProperty>,
+    ) -> &mut Self {
+        self.arguments().body_properties(body_properties);
+        self
+    }
+
+    pub fn fetch_text_body_values(&mut self, v: bool) -> &mut Self {
+        self.arguments().fetch_text_body_values(v);
+        self
+    }
+
+    pub fn fetch_html_body_values(&mut self, v: bool) -> &mut Self {
+        self.arguments().fetch_html_body_values(v);
+        self
+    }
+
+    pub fn fetch_all_body_values(&mut self, v: bool) -> &mut Self {
+        self.arguments().fetch_all_body_values(v);
+        self
+    }
+
+    pub fn max_body_value_bytes(&mut self, v: usize) -> &mut Self {
+        self.arguments().max_body_value_bytes(v);
+        self
+    }
+}
+
+impl EmailQuery {
+    pub fn collapse_threads(&mut self, v: bool) -> &mut Self {
+        self.arguments().collapse_threads(v);
+        self
+    }
+}
+
 impl MailCapabilities {
     pub fn max_mailboxes_per_email(&self) -> Option<usize> {
         self.max_mailboxes_per_email

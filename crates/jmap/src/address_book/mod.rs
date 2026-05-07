@@ -161,3 +161,17 @@ crate::define_changes_method!(
     crate::core::capability::Contacts,
     crate::core::changes::ChangesResponse<AddressBook<Get>>
 );
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+impl AddressBookSet {
+    pub fn on_destroy_remove_contents(&mut self, remove: bool) -> &mut Self {
+        self.arguments().on_destroy_remove_contents(remove);
+        self
+    }
+
+    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_set_is_default(id);
+        self
+    }
+}

@@ -26,6 +26,27 @@ pub struct QueryArguments {
     filter_as_tree: bool,
 }
 
+// -- Lifted method arguments (plans/API.md §5) --
+
+impl MailboxSet {
+    pub fn on_destroy_remove_emails(&mut self, value: bool) -> &mut Self {
+        self.arguments().on_destroy_remove_emails(value);
+        self
+    }
+}
+
+impl MailboxQuery {
+    pub fn sort_as_tree(&mut self, value: bool) -> &mut Self {
+        self.arguments().sort_as_tree(value);
+        self
+    }
+
+    pub fn filter_as_tree(&mut self, value: bool) -> &mut Self {
+        self.arguments().filter_as_tree(value);
+        self
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct ChangesResponse {
     #[serde(rename = "updatedProperties")]

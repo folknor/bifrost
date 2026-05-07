@@ -101,3 +101,12 @@ crate::define_changes_method!(
     crate::core::capability::Calendars,
     crate::core::changes::ChangesResponse<ParticipantIdentity<Get>>
 );
+
+// -- Lifted method arguments (plans/API.md §5) --
+
+impl ParticipantIdentitySet {
+    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+        self.arguments().on_success_set_is_default(id);
+        self
+    }
+}
