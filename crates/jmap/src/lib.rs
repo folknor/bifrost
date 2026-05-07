@@ -29,6 +29,8 @@ pub mod event_source;
 #[cfg(feature = "mail")]
 pub mod identity;
 #[cfg(feature = "mail")]
+pub mod mail;
+#[cfg(feature = "mail")]
 pub mod mailbox;
 #[cfg(feature = "calendars")]
 pub mod participant_identity;
