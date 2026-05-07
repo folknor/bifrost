@@ -1,14 +1,12 @@
-/*
- * Result Reference Example
- *
- * Demonstrates JMAP result references - chaining method calls so that
- * the output of one call feeds into the input of the next, all in a
- * single HTTP request.
- */
+//! Result-reference example.
+//!
+//! Demonstrates JMAP result references: chaining method calls so the
+//! output of one call feeds the input of the next, all in a single
+//! HTTP round-trip.
 
 use bifrost_jmap::{
     client::Client,
-    core::query::Filter,
+    core::{capability, query::Filter},
     email::{self, EmailGet, EmailQuery},
     mailbox::{self, MailboxGet, MailboxQuery},
 };
@@ -19,60 +17,56 @@ async fn result_reference_example() -> bifrost_jmap::Result<()> {
         .connect("https://jmap.example.org")
         .await?;
 
-    // Build a batch request with result references.
-    // This sends ONE HTTP request that:
-    //   1. Queries for emails matching a filter
-    //   2. Fetches the matched emails using the query's result IDs
-    let mut request = client.build();
+    let mail = client.primary_account::<capability::Mail>()?;
 
-    // Step 1: Query for emails with subject "meeting"
-    let mut query = EmailQuery::new();
-    query.filter(Filter::<email::query::Filter>::and([
-        email::query::Filter::subject("meeting"),
-        email::query::Filter::has_keyword("$seen"),
-    ]));
-    let query_handle = request.call(query)?;
+    // Build a batch request with result references. ONE HTTP round-trip
+    // that queries for emails matching a filter, then fetches the
+    // matched emails using the query's result IDs.
+    let mut request = mail.build();
 
-    // Step 2: Fetch the emails found by the query.
-    // Instead of hardcoding IDs, we reference the query's result.
-    let mut get = EmailGet::new();
-    get.ids_ref(query_handle.result_reference("/ids"));
-    get.properties([
-        email::Property::Subject,
-        email::Property::From,
-        email::Property::ReceivedAt,
-    ]);
-    let get_handle = request.call(get)?;
+    let query_handle = request.call(EmailQuery::new().filter(
+        Filter::<email::query::Filter>::and([
+            email::query::Filter::subject("meeting"),
+            email::query::Filter::has_keyword("$seen"),
+        ]),
+    ))?;
 
-    // Send the batch - one HTTP round-trip for both calls
+    let get_handle = request.call(
+        EmailGet::new()
+            .ids_ref(query_handle.result_reference("/ids"))
+            .properties([
+                email::Property::Subject,
+                email::Property::From,
+                email::Property::ReceivedAt,
+            ]),
+    )?;
+
     let mut response = request.send().await?;
 
-    // Extract typed results using the handles
     let emails = response.get(&get_handle)?;
     for email in emails.list() {
         println!("Subject: {:?}, From: {:?}", email.subject(), email.from());
     }
 
-    // --- Second example: mailbox query + get ---
+    // Second example: mailbox query + get.
+    let mut request = mail.build();
 
-    let mut request = client.build();
-
-    // Find all mailboxes, then fetch their details
     let query_handle = request.call(MailboxQuery::new())?;
 
-    let mut get = MailboxGet::new();
-    get.ids_ref(query_handle.result_reference("/ids"));
-    get.properties([mailbox::Property::Name, mailbox::Property::Role]);
-    let get_handle = request.call(get)?;
+    let get_handle = request.call(
+        MailboxGet::new()
+            .ids_ref(query_handle.result_reference("/ids"))
+            .properties([mailbox::Property::Name, mailbox::Property::Role]),
+    )?;
 
     let mut response = request.send().await?;
     let mailboxes = response.get(&get_handle)?;
 
-    for mailbox in mailboxes.list() {
+    for mb in mailboxes.list() {
         println!(
             "Mailbox: {} (role: {:?})",
-            mailbox.name().unwrap_or("?"),
-            mailbox.role().cloned().unwrap_or(mailbox::Role::None)
+            mb.name().unwrap_or("?"),
+            mb.role().cloned().unwrap_or(mailbox::Role::None)
         );
     }
 

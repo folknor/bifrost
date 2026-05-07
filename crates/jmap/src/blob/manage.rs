@@ -352,7 +352,8 @@ impl BlobGetRequest {
     }
 
     /// Add blob IDs to retrieve.
-    pub fn ids<U, V>(&mut self, ids: U) -> &mut Self
+    #[must_use]
+    pub fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -365,7 +366,8 @@ impl BlobGetRequest {
     /// Set which properties to return. Valid values include `"data:asText"`,
     /// `"data:asBase64"`, `"data"` (auto-detect), `"digest:sha"`,
     /// `"digest:sha-256"`, `"digest:sha-512"`, `"size"`.
-    pub fn properties<U, V>(&mut self, properties: U) -> &mut Self
+    #[must_use]
+    pub fn properties<U, V>(mut self, properties: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -380,13 +382,15 @@ impl BlobGetRequest {
     }
 
     /// Set the byte offset for all requested blobs.
-    pub fn offset(&mut self, offset: u64) -> &mut Self {
+    #[must_use]
+    pub fn offset(mut self, offset: u64) -> Self {
         self.offset = Some(offset);
         self
     }
 
     /// Set the byte length for all requested blobs.
-    pub fn length(&mut self, length: u64) -> &mut Self {
+    #[must_use]
+    pub fn length(mut self, length: u64) -> Self {
         self.length = Some(length);
         self
     }
@@ -475,7 +479,8 @@ impl BlobLookupRequest {
     ///
     /// The caller must ensure the corresponding capabilities are added
     /// to the request's `using` array.
-    pub fn type_names<U, V>(&mut self, type_names: U) -> &mut Self
+    #[must_use]
+    pub fn type_names<U, V>(mut self, type_names: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -488,7 +493,8 @@ impl BlobLookupRequest {
     }
 
     /// Set the blob IDs to look up.
-    pub fn ids<U, V>(&mut self, ids: U) -> &mut Self
+    #[must_use]
+    pub fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,

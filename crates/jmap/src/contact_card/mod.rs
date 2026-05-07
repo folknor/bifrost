@@ -13,7 +13,6 @@
 //! from this crate) can parse the serialized JSON.
 
 pub mod get;
-pub mod helpers;
 pub mod parse;
 pub mod query;
 pub mod set;

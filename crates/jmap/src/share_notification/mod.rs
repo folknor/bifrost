@@ -4,7 +4,6 @@
 //! read-only - only destroy is permitted via `ShareNotification/set`.
 
 pub mod get;
-pub mod helpers;
 pub mod query;
 pub mod set;
 

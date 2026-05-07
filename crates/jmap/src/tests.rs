@@ -837,10 +837,10 @@ mod blob_get_request_serialization {
     #[test]
     fn blob_get_request_basic_serialization() {
         use crate::core::method::JmapMethod;
-        let mut req = BlobGetRequest::new();
+        let mut req = BlobGetRequest::new()
+            .ids(["blob-1", "blob-2"])
+            .properties(["data:asText", "size"]);
         req.set_account_id("acct-1");
-        req.ids(["blob-1", "blob-2"]);
-        req.properties(["data:asText", "size"]);
 
         let value = serde_json::to_value(&req).unwrap();
 
@@ -866,11 +866,11 @@ mod blob_get_request_serialization {
     #[test]
     fn blob_get_request_with_offset_and_length() {
         use crate::core::method::JmapMethod;
-        let mut req = BlobGetRequest::new();
+        let mut req = BlobGetRequest::new()
+            .ids(["blob-1"])
+            .offset(100)
+            .length(500);
         req.set_account_id("acct-1");
-        req.ids(["blob-1"]);
-        req.offset(100);
-        req.length(500);
 
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value.get("offset"), Some(&json!(100)));
@@ -880,9 +880,8 @@ mod blob_get_request_serialization {
     #[test]
     fn blob_get_request_without_optional_fields() {
         use crate::core::method::JmapMethod;
-        let mut req = BlobGetRequest::new();
+        let mut req = BlobGetRequest::new().ids(["blob-1"]);
         req.set_account_id("acct-1");
-        req.ids(["blob-1"]);
 
         let value = serde_json::to_value(&req).unwrap();
         // properties, offset, length should be absent

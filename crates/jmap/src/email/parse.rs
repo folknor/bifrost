@@ -82,7 +82,8 @@ impl EmailParseRequest {
         }
     }
 
-    pub fn blob_ids<U, V>(&mut self, blob_ids: U) -> &mut Self
+    #[must_use]
+    pub fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -91,35 +92,41 @@ impl EmailParseRequest {
         self
     }
 
-    pub fn properties(&mut self, properties: impl IntoIterator<Item = Property>) -> &mut Self {
+    #[must_use]
+    pub fn properties(mut self, properties: impl IntoIterator<Item = Property>) -> Self {
         self.properties = Some(properties.into_iter().collect());
         self
     }
 
+    #[must_use]
     pub fn body_properties(
-        &mut self,
+        mut self,
         body_properties: impl IntoIterator<Item = BodyProperty>,
-    ) -> &mut Self {
+    ) -> Self {
         self.body_properties = Some(body_properties.into_iter().collect());
         self
     }
 
-    pub fn fetch_text_body_values(&mut self, fetch_text_body_values: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_text_body_values(mut self, fetch_text_body_values: bool) -> Self {
         self.fetch_text_body_values = fetch_text_body_values.into();
         self
     }
 
-    pub fn fetch_html_body_values(&mut self, fetch_html_body_values: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_html_body_values(mut self, fetch_html_body_values: bool) -> Self {
         self.fetch_html_body_values = fetch_html_body_values.into();
         self
     }
 
-    pub fn fetch_all_body_values(&mut self, fetch_all_body_values: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_all_body_values(mut self, fetch_all_body_values: bool) -> Self {
         self.fetch_all_body_values = fetch_all_body_values.into();
         self
     }
 
-    pub fn max_body_value_bytes(&mut self, max_body_value_bytes: usize) -> &mut Self {
+    #[must_use]
+    pub fn max_body_value_bytes(mut self, max_body_value_bytes: usize) -> Self {
         self.max_body_value_bytes = max_body_value_bytes.into();
         self
     }

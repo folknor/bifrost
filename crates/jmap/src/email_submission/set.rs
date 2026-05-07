@@ -184,20 +184,26 @@ impl SetArguments {
 use super::EmailSubmissionSet;
 
 impl EmailSubmissionSet {
+    /// Stays imperative because the returned `&mut Email<Set>` writes
+    /// into a HashMap entry inside the request's arguments.
     pub fn on_success_update_email(&mut self, id: impl Into<String>) -> &mut Email<Set> {
         self.arguments().on_success_update_email(id)
     }
 
+    /// Stays imperative for the same reason as
+    /// `on_success_update_email`.
     pub fn on_success_update_email_id(&mut self, id: impl Into<String>) -> &mut Email<Set> {
         self.arguments().on_success_update_email_id(id)
     }
 
-    pub fn on_success_destroy_email(&mut self, id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn on_success_destroy_email(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_destroy_email(id);
         self
     }
 
-    pub fn on_success_destroy_email_id(&mut self, id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn on_success_destroy_email_id(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_destroy_email_id(id);
         self
     }

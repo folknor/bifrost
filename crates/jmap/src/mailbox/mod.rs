@@ -1,5 +1,4 @@
 pub mod get;
-pub mod helpers;
 pub mod query;
 pub mod set;
 
@@ -35,19 +34,22 @@ pub struct QueryArguments {
 // -- Lifted method arguments (plans/API.md §5) --
 
 impl MailboxSet {
-    pub fn on_destroy_remove_emails(&mut self, value: bool) -> &mut Self {
+    #[must_use]
+    pub fn on_destroy_remove_emails(mut self, value: bool) -> Self {
         self.arguments().on_destroy_remove_emails(value);
         self
     }
 }
 
 impl MailboxQuery {
-    pub fn sort_as_tree(&mut self, value: bool) -> &mut Self {
+    #[must_use]
+    pub fn sort_as_tree(mut self, value: bool) -> Self {
         self.arguments().sort_as_tree(value);
         self
     }
 
-    pub fn filter_as_tree(&mut self, value: bool) -> &mut Self {
+    #[must_use]
+    pub fn filter_as_tree(mut self, value: bool) -> Self {
         self.arguments().filter_as_tree(value);
         self
     }

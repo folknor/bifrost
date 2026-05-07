@@ -13,7 +13,6 @@
 //! from this crate) can parse the serialized JSON.
 
 pub mod get;
-pub mod helpers;
 pub mod parse;
 pub mod query;
 pub mod set;
@@ -286,41 +285,48 @@ crate::define_copy_method!(
 // -- Lifted method arguments (plans/API.md §5) --
 
 impl CalendarEventGet {
-    pub fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn recurrence_overrides_before(mut self, before: impl Into<String>) -> Self {
         self.arguments().recurrence_overrides_before(before);
         self
     }
 
-    pub fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn recurrence_overrides_after(mut self, after: impl Into<String>) -> Self {
         self.arguments().recurrence_overrides_after(after);
         self
     }
 
-    pub fn reduce_participants(&mut self, reduce: bool) -> &mut Self {
+    #[must_use]
+    pub fn reduce_participants(mut self, reduce: bool) -> Self {
         self.arguments().reduce_participants(reduce);
         self
     }
 
-    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn time_zone(mut self, tz: impl Into<String>) -> Self {
         self.arguments().time_zone(tz);
         self
     }
 }
 
 impl CalendarEventSet {
-    pub fn send_scheduling_messages(&mut self, send: bool) -> &mut Self {
+    #[must_use]
+    pub fn send_scheduling_messages(mut self, send: bool) -> Self {
         self.arguments().send_scheduling_messages(send);
         self
     }
 }
 
 impl CalendarEventQuery {
-    pub fn expand_recurrences(&mut self, expand: bool) -> &mut Self {
+    #[must_use]
+    pub fn expand_recurrences(mut self, expand: bool) -> Self {
         self.arguments().expand_recurrences(expand);
         self
     }
 
-    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn time_zone(mut self, tz: impl Into<String>) -> Self {
         self.arguments().time_zone(tz);
         self
     }

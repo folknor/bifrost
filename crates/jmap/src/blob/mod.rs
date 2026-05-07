@@ -5,7 +5,6 @@ use crate::core::{
 
 pub mod copy;
 pub mod download;
-pub mod helpers;
 pub mod manage;
 pub mod upload;
 

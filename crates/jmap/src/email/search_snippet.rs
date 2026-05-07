@@ -66,29 +66,30 @@ impl SearchSnippetGetRequest {
         }
     }
 
-    pub fn filter(&mut self, filter: impl Into<Filter<super::query::Filter>>) -> &mut Self {
+    #[must_use]
+    pub fn filter(mut self, filter: impl Into<Filter<super::query::Filter>>) -> Self {
         self.filter = Some(filter.into());
         self
     }
 
-    pub fn email_id(&mut self, email_id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn email_id(mut self, email_id: impl Into<String>) -> Self {
         self.email_ids
             .get_or_insert_with(Vec::new)
             .push(email_id.into());
         self
     }
 
-    pub fn email_ids(
-        &mut self,
-        email_ids: impl IntoIterator<Item = impl Into<String>>,
-    ) -> &mut Self {
+    #[must_use]
+    pub fn email_ids(mut self, email_ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.email_ids
             .get_or_insert_with(Vec::new)
             .extend(email_ids.into_iter().map(std::convert::Into::into));
         self
     }
 
-    pub fn email_ids_ref(&mut self, reference: ResultReference) -> &mut Self {
+    #[must_use]
+    pub fn email_ids_ref(mut self, reference: ResultReference) -> Self {
         self.email_ids_ref = reference.into();
         self.email_ids = None;
         self

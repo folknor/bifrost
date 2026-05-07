@@ -1,5 +1,4 @@
 pub mod get;
-pub mod helpers;
 pub mod import;
 pub mod parse;
 pub mod query;
@@ -831,43 +830,47 @@ impl GetArguments {
     }
 }
 
-// -- Lifted method arguments (plans/API.md §5) -- the EmailGet /
-// EmailQuery method structs forward each Arguments setter so callers
-// don't have to drill through `.arguments()`. Same pattern in every
-// other module.
+// -- Lifted method arguments (plans/API.md §5) - value-builder shape
+// (plans/API.md §2 builder-style rule).
 
 impl EmailGet {
+    #[must_use]
     pub fn body_properties(
-        &mut self,
+        mut self,
         body_properties: impl IntoIterator<Item = BodyProperty>,
-    ) -> &mut Self {
+    ) -> Self {
         self.arguments().body_properties(body_properties);
         self
     }
 
-    pub fn fetch_text_body_values(&mut self, v: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_text_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_text_body_values(v);
         self
     }
 
-    pub fn fetch_html_body_values(&mut self, v: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_html_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_html_body_values(v);
         self
     }
 
-    pub fn fetch_all_body_values(&mut self, v: bool) -> &mut Self {
+    #[must_use]
+    pub fn fetch_all_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_all_body_values(v);
         self
     }
 
-    pub fn max_body_value_bytes(&mut self, v: usize) -> &mut Self {
+    #[must_use]
+    pub fn max_body_value_bytes(mut self, v: usize) -> Self {
         self.arguments().max_body_value_bytes(v);
         self
     }
 }
 
 impl EmailQuery {
-    pub fn collapse_threads(&mut self, v: bool) -> &mut Self {
+    #[must_use]
+    pub fn collapse_threads(mut self, v: bool) -> Self {
         self.arguments().collapse_threads(v);
         self
     }

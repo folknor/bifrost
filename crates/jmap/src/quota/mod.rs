@@ -1,5 +1,4 @@
 pub mod get;
-pub mod helpers;
 pub mod query;
 
 use std::fmt::Display;

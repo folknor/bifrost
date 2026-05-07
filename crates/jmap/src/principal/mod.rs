@@ -1,6 +1,5 @@
 pub mod availability;
 pub mod get;
-pub mod helpers;
 pub mod query;
 pub mod set;
 

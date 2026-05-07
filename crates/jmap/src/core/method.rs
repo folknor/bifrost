@@ -33,6 +33,12 @@ pub trait JmapMethod: Serialize + Send {
 }
 
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
+///
+/// The macro emits value-builder forwarders (`fn ids(self, ...) -> Self`)
+/// on the outer struct so callers can chain
+/// `EmailGet::new().ids([id]).properties([...])`. The inner
+/// `GetRequest`'s `&mut self` setters stay as-is for internal use; the
+/// outer simply delegates and returns `Self` by value.
 #[macro_export]
 macro_rules! define_get_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
@@ -58,6 +64,40 @@ macro_rules! define_get_method {
                     inner: $crate::core::get::GetRequest::new(),
                 }
             }
+
+            #[must_use]
+            pub fn ids<U, V>(mut self, ids: U) -> Self
+            where
+                U: IntoIterator<Item = V>,
+                V: Into<String>,
+            {
+                self.inner.ids(ids);
+                self
+            }
+
+            #[must_use]
+            pub fn ids_ref(mut self, reference: $crate::core::request::ResultReference) -> Self {
+                self.inner.ids_ref(reference);
+                self
+            }
+
+            #[must_use]
+            pub fn properties(
+                mut self,
+                properties: impl IntoIterator<Item = <$obj as $crate::core::Object>::Property>,
+            ) -> Self {
+                self.inner.properties(properties);
+                self
+            }
+
+            #[must_use]
+            pub fn properties_ref(
+                mut self,
+                reference: $crate::core::request::ResultReference,
+            ) -> Self {
+                self.inner.properties_ref(reference);
+                self
+            }
         }
 
         impl Default for $name {
@@ -82,6 +122,10 @@ macro_rules! define_get_method {
 }
 
 /// Generates a JMAP /set method struct that wraps `SetRequest<O>`.
+///
+/// `create()` and `update()` accessors return `&mut entry` so callers
+/// can populate or patch entries in place; those stay imperative even
+/// in the value-builder world.
 #[macro_export]
 macro_rules! define_set_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
@@ -107,6 +151,40 @@ macro_rules! define_set_method {
                     inner: $crate::core::set::SetRequest::new(),
                 }
             }
+
+            #[must_use]
+            pub fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+                self.inner.if_in_state(if_in_state);
+                self
+            }
+
+            #[must_use]
+            pub fn destroy<U, V>(mut self, ids: U) -> Self
+            where
+                U: IntoIterator<Item = V>,
+                V: Into<String>,
+            {
+                self.inner.destroy(ids);
+                self
+            }
+
+            #[must_use]
+            pub fn destroy_ref(
+                mut self,
+                reference: $crate::core::request::ResultReference,
+            ) -> Self {
+                self.inner.destroy_ref(reference);
+                self
+            }
+
+            // `create` / `update` are not lifted onto the outer here:
+            // they only exist for objects that impl
+            // `SetObjectCreatable`, and Rust resolves their existence
+            // at impl-block expansion time. Callers reach them via
+            // Deref/DerefMut into the inner SetRequest, which keeps
+            // the conditional-impl shape intact and avoids generating
+            // dead methods on non-creatable Set types like
+            // ShareNotificationSet.
         }
 
         impl Default for $name {
@@ -156,6 +234,12 @@ macro_rules! define_changes_method {
                     inner: $crate::core::changes::ChangesRequest::new(since_state),
                 }
             }
+
+            #[must_use]
+            pub fn max_changes(mut self, max_changes: std::num::NonZeroUsize) -> Self {
+                self.inner.max_changes(max_changes);
+                self
+            }
         }
 
         impl std::ops::Deref for $name {
@@ -199,6 +283,60 @@ macro_rules! define_query_method {
                     inner: $crate::core::query::QueryRequest::new(),
                 }
             }
+
+            #[must_use]
+            pub fn filter(
+                mut self,
+                filter: impl Into<
+                    $crate::core::query::Filter<<$obj as $crate::core::query::QueryObject>::Filter>,
+                >,
+            ) -> Self {
+                self.inner.filter(filter);
+                self
+            }
+
+            #[must_use]
+            pub fn sort(
+                mut self,
+                sort: impl IntoIterator<
+                    Item = $crate::core::query::Comparator<
+                        <$obj as $crate::core::query::QueryObject>::Sort,
+                    >,
+                >,
+            ) -> Self {
+                self.inner.sort(sort);
+                self
+            }
+
+            #[must_use]
+            pub fn position(mut self, position: i32) -> Self {
+                self.inner.position(position);
+                self
+            }
+
+            #[must_use]
+            pub fn anchor(mut self, anchor: impl Into<String>) -> Self {
+                self.inner.anchor(anchor);
+                self
+            }
+
+            #[must_use]
+            pub fn anchor_offset(mut self, anchor_offset: i32) -> Self {
+                self.inner.anchor_offset(anchor_offset);
+                self
+            }
+
+            #[must_use]
+            pub fn limit(mut self, limit: usize) -> Self {
+                self.inner.limit(limit);
+                self
+            }
+
+            #[must_use]
+            pub fn calculate_total(mut self, calculate_total: bool) -> Self {
+                self.inner.calculate_total(calculate_total);
+                self
+            }
         }
 
         impl Default for $name {
@@ -222,7 +360,7 @@ macro_rules! define_query_method {
     };
 }
 
-/// Generates a JMAP /queryChanges method struct that wraps `QueryChangesRequest<O>`.
+/// Generates a JMAP /queryChanges method struct.
 #[macro_export]
 macro_rules! define_query_changes_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
@@ -248,6 +386,48 @@ macro_rules! define_query_changes_method {
                     inner: $crate::core::query_changes::QueryChangesRequest::new(since_query_state),
                 }
             }
+
+            #[must_use]
+            pub fn filter(
+                mut self,
+                filter: impl Into<
+                    $crate::core::query::Filter<<$obj as $crate::core::query::QueryObject>::Filter>,
+                >,
+            ) -> Self {
+                self.inner.filter(filter);
+                self
+            }
+
+            #[must_use]
+            pub fn sort(
+                mut self,
+                sort: impl IntoIterator<
+                    Item = $crate::core::query::Comparator<
+                        <$obj as $crate::core::query::QueryObject>::Sort,
+                    >,
+                >,
+            ) -> Self {
+                self.inner.sort(sort);
+                self
+            }
+
+            #[must_use]
+            pub fn max_changes(mut self, max_changes: std::num::NonZeroUsize) -> Self {
+                self.inner.max_changes(max_changes);
+                self
+            }
+
+            #[must_use]
+            pub fn up_to_id(mut self, up_to_id: impl Into<String>) -> Self {
+                self.inner.up_to_id(up_to_id);
+                self
+            }
+
+            #[must_use]
+            pub fn calculate_total(mut self, calculate_total: bool) -> Self {
+                self.inner.calculate_total(calculate_total);
+                self
+            }
         }
 
         impl std::ops::Deref for $name {
@@ -268,8 +448,8 @@ macro_rules! define_query_changes_method {
 /// Generates a JMAP /copy method struct that wraps `CopyRequest<O>`.
 ///
 /// The destination `accountId` is injected by `Request::call`; the
-/// source `fromAccountId` is the only constructor argument, since it
-/// is genuinely a per-call value (the account being copied *from*).
+/// source `fromAccountId` is the only constructor argument. `create()`
+/// stays imperative for the same HashMap-entry reason as `set`.
 #[macro_export]
 macro_rules! define_copy_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
@@ -295,6 +475,38 @@ macro_rules! define_copy_method {
                     inner: $crate::core::copy::CopyRequest::new(from_account_id),
                 }
             }
+
+            #[must_use]
+            pub fn if_from_in_state(mut self, if_from_in_state: impl Into<String>) -> Self {
+                self.inner.if_from_in_state(if_from_in_state);
+                self
+            }
+
+            #[must_use]
+            pub fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+                self.inner.if_in_state(if_in_state);
+                self
+            }
+
+            #[must_use]
+            pub fn on_success_destroy_original(mut self, value: bool) -> Self {
+                self.inner.on_success_destroy_original(value);
+                self
+            }
+
+            #[must_use]
+            pub fn destroy_from_if_in_state(
+                mut self,
+                destroy_from_if_in_state: impl Into<String>,
+            ) -> Self {
+                self.inner
+                    .destroy_from_if_in_state(destroy_from_if_in_state);
+                self
+            }
+
+            // `create` reaches through Deref/DerefMut into the inner
+            // CopyRequest (which conditionally provides it when the
+            // object implements `SetObjectCreatable`).
         }
 
         impl std::ops::Deref for $name {
@@ -377,7 +589,8 @@ macro_rules! define_open_property_enum {
     };
 }
 
-/// Generates a JMAP /parse method struct with `JmapMethod` impl and builders.
+/// Generates a JMAP /parse method struct with `JmapMethod` impl and
+/// value-builder methods.
 #[macro_export]
 macro_rules! define_parse_method {
     ($name:ident, $property:ty, $method_name:expr, $cap:ty, $response:ty) => {
@@ -413,7 +626,8 @@ macro_rules! define_parse_method {
                 }
             }
 
-            pub fn blob_ids<U, V>(&mut self, blob_ids: U) -> &mut Self
+            #[must_use]
+            pub fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
             where
                 U: IntoIterator<Item = V>,
                 V: Into<String>,
@@ -422,10 +636,8 @@ macro_rules! define_parse_method {
                 self
             }
 
-            pub fn properties(
-                &mut self,
-                properties: impl IntoIterator<Item = $property>,
-            ) -> &mut Self {
+            #[must_use]
+            pub fn properties(mut self, properties: impl IntoIterator<Item = $property>) -> Self {
                 self.properties = Some(properties.into_iter().collect());
                 self
             }

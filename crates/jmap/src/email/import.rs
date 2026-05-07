@@ -91,16 +91,22 @@ impl EmailImportRequest {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<String>) -> &mut Self {
+    /// Internal account-id setter. Prefer `JmapMethod::set_account_id`
+    /// (called automatically by `Request::call`); kept on the struct
+    /// for the few call sites that build a request directly.
+    pub fn set_account_id_inplace(&mut self, account_id: impl Into<String>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
 
-    pub fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
 
+    /// Add an email entry. Stays imperative because the returned
+    /// `&mut EmailImport` writes into a HashMap entry.
     pub fn email(&mut self, blob_id: impl Into<String>) -> &mut EmailImport {
         let create_id = self.emails.len();
         let create_id_str = format!("i{create_id}");

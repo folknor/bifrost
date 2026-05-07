@@ -1,5 +1,4 @@
 pub mod get;
-pub mod helpers;
 pub mod set;
 
 use std::fmt::Display;
@@ -111,7 +110,8 @@ crate::define_changes_method!(
 // -- Lifted method arguments (plans/API.md §5) --
 
 impl ParticipantIdentitySet {
-    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

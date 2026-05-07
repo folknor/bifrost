@@ -75,7 +75,8 @@ impl PrincipalGetAvailabilityRequest {
         }
     }
 
-    pub fn show_details(&mut self, show: bool) -> &mut Self {
+    #[must_use]
+    pub fn show_details(mut self, show: bool) -> Self {
         self.show_details = Some(show);
         self
     }

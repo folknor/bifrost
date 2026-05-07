@@ -50,7 +50,8 @@ impl CopyBlobRequest {
         }
     }
 
-    pub fn blob_id(&mut self, blob_id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn blob_id(mut self, blob_id: impl Into<String>) -> Self {
         self.blob_ids.push(blob_id.into());
         self
     }

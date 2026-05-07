@@ -1,5 +1,4 @@
 pub mod get;
-pub mod helpers;
 pub mod set;
 
 use std::fmt::Display;
@@ -171,12 +170,14 @@ crate::define_changes_method!(
 // -- Lifted method arguments (plans/API.md §5) --
 
 impl AddressBookSet {
-    pub fn on_destroy_remove_contents(&mut self, remove: bool) -> &mut Self {
+    #[must_use]
+    pub fn on_destroy_remove_contents(mut self, remove: bool) -> Self {
         self.arguments().on_destroy_remove_contents(remove);
         self
     }
 
-    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+    #[must_use]
+    pub fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

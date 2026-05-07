@@ -1,52 +1,73 @@
+//! Mailbox CRUD against the protocol layer.
+//!
+//! Demonstrates:
+//! - capability-typed account selection (`Client::primary_account`)
+//! - one-shot method calls via `Account::call`
+//! - batched/result-reference flows via `Account::build` + `Request::call`
+
 use bifrost_jmap::{
     client::Client,
-    mailbox::{Role, query::Filter},
+    core::{capability, set::SetObject},
+    mailbox::{MailboxGet, MailboxQuery, MailboxSet, Role, query::Filter},
 };
 
 async fn mailboxes() {
-    // Connect to the JMAP server using Basic authentication
     let client = Client::new()
         .credentials(("john@example.org", "secret"))
         .connect("https://jmap.example.org")
         .await
         .unwrap();
 
-    // Create a mailbox
-    let mailbox_id = client
-        .mailbox_create("My Mailbox", None::<String>, Role::None)
+    let mail = client.primary_account::<capability::Mail>().unwrap();
+
+    // Create a mailbox.
+    let mut create = MailboxSet::new();
+    let create_id = create
+        .create()
+        .name("My Mailbox")
+        .role(Role::None)
+        .create_id()
+        .unwrap();
+    let mailbox_id = mail
+        .call(create)
         .await
+        .unwrap()
+        .created(&create_id)
         .unwrap()
         .take_id();
 
-    // Rename a mailbox
-    client
-        .mailbox_rename(&mailbox_id, "My Renamed Mailbox")
-        .await
-        .unwrap();
+    // Rename it.
+    let mut rename = MailboxSet::new();
+    rename.update(&mailbox_id).name("My Renamed Mailbox");
+    mail.call(rename).await.unwrap();
 
-    // Query mailboxes to obtain Inbox's id
-    let inbox_id = client
-        .mailbox_query(Filter::role(Role::Inbox).into(), None::<Vec<_>>)
+    // Query for the inbox id.
+    let inbox_id = mail
+        .call(MailboxQuery::new().filter(Filter::role(Role::Inbox)))
         .await
         .unwrap()
         .into_ids()
         .pop()
         .unwrap();
 
-    // Print Inbox's details
-    println!(
-        "{:?}",
-        client.mailbox_get(&inbox_id, None::<Vec<_>>).await.unwrap()
-    );
-
-    // Move the newly created mailbox under Inbox
-    client
-        .mailbox_move(&mailbox_id, inbox_id.into())
+    // Print inbox details.
+    let inbox = mail
+        .call(MailboxGet::new().ids([&inbox_id]))
         .await
-        .unwrap();
+        .unwrap()
+        .into_list()
+        .pop();
+    println!("{inbox:?}");
 
-    // Delete the mailbox including any messages
-    client.mailbox_destroy(&mailbox_id, true).await.unwrap();
+    // Move the new mailbox under inbox.
+    let mut move_set = MailboxSet::new();
+    move_set.update(&mailbox_id).parent_id(Some(&inbox_id));
+    mail.call(move_set).await.unwrap();
+
+    // Destroy it (and any contained messages).
+    let mut destroy = MailboxSet::new().destroy([&mailbox_id]);
+    destroy.arguments().on_destroy_remove_emails(true);
+    mail.call(destroy).await.unwrap();
 }
 
 fn main() {
