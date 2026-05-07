@@ -18,7 +18,10 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         script: impl Into<Vec<u8>>,
         activate: bool,
     ) -> crate::Result<SieveScript> {
-        let blob_id = self.upload(None, script.into(), None).await?.take_blob_id();
+        let blob_id = self
+            .upload_to(&self.default_account(), script.into(), None)
+            .await?
+            .take_blob_id();
         let mut request = self.build();
         let mut set = SieveScriptSet::new();
         let id = set
@@ -41,7 +44,10 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         script: impl Into<Vec<u8>>,
         activate: bool,
     ) -> crate::Result<Option<SieveScript>> {
-        let blob_id = self.upload(None, script.into(), None).await?.take_blob_id();
+        let blob_id = self
+            .upload_to(&self.default_account(), script.into(), None)
+            .await?
+            .take_blob_id();
         let mut request = self.build();
         let mut set = SieveScriptSet::new();
         set.update(id).blob_id(blob_id);
@@ -132,7 +138,10 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     }
 
     pub async fn sieve_script_validate(&self, script: impl Into<Vec<u8>>) -> crate::Result<()> {
-        let blob_id = self.upload(None, script.into(), None).await?.take_blob_id();
+        let blob_id = self
+            .upload_to(&self.default_account(), script.into(), None)
+            .await?
+            .take_blob_id();
         let mut request = self.build();
         let validate = SieveScriptValidateRequest::new(blob_id);
         let handle = request.call(validate)?;

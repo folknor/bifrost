@@ -12,17 +12,32 @@ use serde::{Deserialize, Serialize};
 /// let mailbox_id: Id<Mailbox> = Id::from("mbox-1");
 /// // email_id == mailbox_id  // compile error - different types
 /// ```
-#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);
 
-// Manual Clone impl: the derived form requires `T: Clone`, but `T` is
-// a phantom marker (often an uninhabited enum like `Account`), so a
-// trait bound on it is bogus. The string is `Clone` and `PhantomData`
-// is always `Clone`.
+// Manual Clone / PartialEq / Eq / Hash impls: the derived forms each
+// require `T: Trait`, but `T` is a phantom marker (often an
+// uninhabited enum like `Account`), so any trait bound on it is
+// bogus. The string already implements all of these and `PhantomData`
+// implements them unconditionally.
 impl<T: ?Sized> Clone for Id<T> {
     fn clone(&self) -> Self {
         Id(self.0.clone(), std::marker::PhantomData)
+    }
+}
+
+impl<T: ?Sized> PartialEq for Id<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T: ?Sized> Eq for Id<T> {}
+
+impl<T: ?Sized> std::hash::Hash for Id<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
     }
 }
 

@@ -55,7 +55,11 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         W: Into<String>,
     {
         let blob_id = self
-            .upload(account_id.into(), raw_message, None)
+            .upload_to(
+                &crate::core::id::AccountId::new(account_id),
+                raw_message,
+                None,
+            )
             .await?
             .take_blob_id();
         let mut request = self.build().account_id(account_id.to_string());
