@@ -3,6 +3,7 @@ use crate::{
     client::Client,
     core::{
         changes::ChangesResponse,
+        get::GetResponse,
         query::{Comparator, Filter, QueryResponse},
         query_changes::QueryChangesResponse,
     },
@@ -17,7 +18,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let get = QuotaGet::new();
         let handle = request.call(get)?;
         let mut response = request.send().await?;
-        response.get(&handle).map(|mut r| r.take_list())
+        response.get(&handle).map(GetResponse::into_list)
     }
 
     pub async fn quota_get(
@@ -33,7 +34,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         }
         let handle = request.call(get)?;
         let mut response = request.send().await?;
-        response.get(&handle).map(|mut r| r.take_list().pop())
+        response.get(&handle).map(|r| r.into_list().pop())
     }
 
     pub async fn quota_changes(

@@ -266,8 +266,8 @@ impl<O: SetObject> SetResponse<O> {
         self.new_state.as_deref().unwrap_or("")
     }
 
-    pub fn take_new_state(&mut self) -> String {
-        self.new_state.take().unwrap_or_default()
+    pub fn into_new_state(self) -> String {
+        self.new_state.unwrap_or_default()
     }
 
     pub fn created(&mut self, id: &str) -> crate::Result<O> {
@@ -312,16 +312,16 @@ impl<O: SetObject> SetResponse<O> {
         self.updated.as_ref().map(|map| map.keys())
     }
 
-    pub fn take_updated_ids(&mut self) -> Option<Vec<String>> {
-        self.updated.take().map(|map| map.into_keys().collect())
+    pub fn into_updated_ids(self) -> Option<Vec<String>> {
+        self.updated.map(|map| map.into_keys().collect())
     }
 
     pub fn destroyed_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.destroyed.as_ref().map(|list| list.iter())
     }
 
-    pub fn take_destroyed_ids(&mut self) -> Option<Vec<String>> {
-        self.destroyed.take()
+    pub fn into_destroyed_ids(self) -> Option<Vec<String>> {
+        self.destroyed
     }
 
     pub fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {

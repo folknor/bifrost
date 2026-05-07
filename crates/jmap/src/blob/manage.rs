@@ -401,8 +401,8 @@ impl BlobGetResponse {
         &self.list
     }
 
-    pub fn take_list(&mut self) -> Vec<BlobGetResult> {
-        std::mem::take(&mut self.list)
+    pub fn into_list(self) -> Vec<BlobGetResult> {
+        self.list
     }
 
     pub fn not_found(&self) -> Option<&[String]> {
@@ -507,8 +507,8 @@ impl BlobLookupResponse {
         &self.list
     }
 
-    pub fn take_list(&mut self) -> Vec<BlobLookupResult> {
-        std::mem::take(&mut self.list)
+    pub fn into_list(self) -> Vec<BlobLookupResult> {
+        self.list
     }
 
     pub fn not_found(&self) -> Option<&[String]> {

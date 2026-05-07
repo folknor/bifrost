@@ -133,7 +133,7 @@ impl UploadResponse {
         self.size
     }
 
-    pub fn take_blob_id(&mut self) -> String {
-        std::mem::take(&mut self.blob_id)
+    pub fn into_blob_id(self) -> String {
+        self.blob_id
     }
 }

@@ -77,8 +77,8 @@ impl<O: ChangesObject> ChangesResponse<O> {
         &self.account_id
     }
 
-    pub fn take_account_id(&mut self) -> String {
-        std::mem::take(&mut self.account_id)
+    pub fn into_account_id(self) -> String {
+        self.account_id
     }
 
     pub fn old_state(&self) -> &str {
@@ -89,8 +89,8 @@ impl<O: ChangesObject> ChangesResponse<O> {
         &self.new_state
     }
 
-    pub fn take_new_state(&mut self) -> String {
-        std::mem::take(&mut self.new_state)
+    pub fn into_new_state(self) -> String {
+        self.new_state
     }
 
     pub fn has_more_changes(&self) -> bool {
@@ -101,24 +101,24 @@ impl<O: ChangesObject> ChangesResponse<O> {
         &self.created
     }
 
-    pub fn take_created(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.created)
+    pub fn into_created(self) -> Vec<String> {
+        self.created
     }
 
     pub fn updated(&self) -> &[String] {
         &self.updated
     }
 
-    pub fn take_updated(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.updated)
+    pub fn into_updated(self) -> Vec<String> {
+        self.updated
     }
 
     pub fn destroyed(&self) -> &[String] {
         &self.destroyed
     }
 
-    pub fn take_destroyed(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.destroyed)
+    pub fn into_destroyed(self) -> Vec<String> {
+        self.destroyed
     }
 
     pub fn arguments(&self) -> &O::ChangesResponse {

@@ -134,8 +134,10 @@ impl<O> GetResponse<O> {
         &self.state
     }
 
-    pub fn take_state(&mut self) -> String {
-        std::mem::take(&mut self.state)
+    /// Consume `self` and return the state token. Renamed from
+    /// `take_state` (plans/API.md §6).
+    pub fn into_state(self) -> String {
+        self.state
     }
 
     pub fn list(&self) -> &[O] {
@@ -146,14 +148,19 @@ impl<O> GetResponse<O> {
         &self.not_found
     }
 
-    pub fn take_list(&mut self) -> Vec<O> {
-        std::mem::take(&mut self.list)
+    /// Consume `self` and return the result list. Renamed from
+    /// `take_list` (plans/API.md §6).
+    pub fn into_list(self) -> Vec<O> {
+        self.list
     }
+
     pub fn pop(&mut self) -> Option<O> {
         self.list.pop()
     }
 
-    pub fn take_not_found(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.not_found)
+    /// Consume `self` and return the not-found list. Renamed from
+    /// `take_not_found` (plans/API.md §6).
+    pub fn into_not_found(self) -> Vec<String> {
+        self.not_found
     }
 }

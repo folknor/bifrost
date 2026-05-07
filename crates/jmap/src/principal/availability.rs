@@ -90,7 +90,7 @@ impl PrincipalGetAvailabilityResponse {
         &self.list
     }
 
-    pub fn take_list(&mut self) -> Vec<AvailabilityEntry> {
-        std::mem::take(&mut self.list)
+    pub fn into_list(self) -> Vec<AvailabilityEntry> {
+        self.list
     }
 }

@@ -189,8 +189,8 @@ impl QueryResponse {
         self.ids.get(pos).map(std::string::String::as_str)
     }
 
-    pub fn take_ids(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ids)
+    pub fn into_ids(self) -> Vec<String> {
+        self.ids
     }
 
     pub fn total(&self) -> Option<usize> {
@@ -205,8 +205,8 @@ impl QueryResponse {
         self.position
     }
 
-    pub fn take_query_state(&mut self) -> String {
-        std::mem::take(&mut self.query_state)
+    pub fn into_query_state(self) -> String {
+        self.query_state
     }
 
     pub fn query_state(&self) -> &str {

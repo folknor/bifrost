@@ -61,7 +61,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
                 None,
             )
             .await?
-            .take_blob_id();
+            .into_blob_id();
         let mut request = self.build().account_id(account_id.to_string());
         let mut import = EmailImportRequest::new();
         let import_item = import.email(blob_id).mailbox_ids(mailbox_ids);
@@ -164,7 +164,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         }
         let handle = request.call(get)?;
         let mut response = request.send().await?;
-        response.get(&handle).map(|mut r| r.take_list().pop())
+        response.get(&handle).map(|r| r.into_list().pop())
     }
 
     pub async fn email_changes(

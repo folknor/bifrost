@@ -134,8 +134,8 @@ impl<O: SetObject> CopyResponse<O> {
         }
     }
 
-    pub fn take_created(&mut self) -> Option<Vec<O>> {
-        self.created.take().map(|map| map.into_values().collect())
+    pub fn into_created(self) -> Option<Vec<O>> {
+        self.created.map(|map| map.into_values().collect())
     }
 
     pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {

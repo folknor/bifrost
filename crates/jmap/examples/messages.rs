@@ -28,7 +28,7 @@ async fn messages() {
         )
         .await
         .unwrap()
-        .take_ids()
+        .into_ids()
         .pop()
         .unwrap();
     let trash_id = client
@@ -38,7 +38,7 @@ async fn messages() {
         )
         .await
         .unwrap()
-        .take_ids()
+        .into_ids()
         .pop()
         .unwrap();
 
@@ -61,7 +61,7 @@ async fn messages() {
         )
         .await
         .unwrap()
-        .take_ids()
+        .into_ids()
         .pop()
         .unwrap();
 

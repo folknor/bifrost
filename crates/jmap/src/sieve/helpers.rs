@@ -21,7 +21,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let blob_id = self
             .upload_to(&self.default_account(), script.into(), None)
             .await?
-            .take_blob_id();
+            .into_blob_id();
         let mut request = self.build();
         let mut set = SieveScriptSet::new();
         let id = set
@@ -47,7 +47,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let blob_id = self
             .upload_to(&self.default_account(), script.into(), None)
             .await?
-            .take_blob_id();
+            .into_blob_id();
         let mut request = self.build();
         let mut set = SieveScriptSet::new();
         set.update(id).blob_id(blob_id);
@@ -116,7 +116,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         }
         let handle = request.call(get)?;
         let mut response = request.send().await?;
-        response.get(&handle).map(|mut r| r.take_list().pop())
+        response.get(&handle).map(|r| r.into_list().pop())
     }
 
     pub async fn sieve_script_query(
@@ -141,7 +141,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let blob_id = self
             .upload_to(&self.default_account(), script.into(), None)
             .await?
-            .take_blob_id();
+            .into_blob_id();
         let mut request = self.build();
         let validate = SieveScriptValidateRequest::new(blob_id);
         let handle = request.call(validate)?;

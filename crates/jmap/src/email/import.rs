@@ -172,8 +172,8 @@ impl EmailImportResponse {
         &self.new_state
     }
 
-    pub fn take_new_state(&mut self) -> String {
-        std::mem::take(&mut self.new_state)
+    pub fn into_new_state(self) -> String {
+        self.new_state
     }
 
     pub fn created(&mut self, id: &str) -> crate::Result<Email> {

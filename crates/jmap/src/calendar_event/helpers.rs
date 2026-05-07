@@ -26,7 +26,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         }
         let handle = request.call(get)?;
         let mut response = request.send().await?;
-        response.get(&handle).map(|mut r| r.take_list().pop())
+        response.get(&handle).map(|r| r.into_list().pop())
     }
 
     pub async fn calendar_event_destroy(&self, id: &str) -> crate::Result<()> {

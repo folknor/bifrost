@@ -29,7 +29,7 @@ async fn mailboxes() {
         .mailbox_query(Filter::role(Role::Inbox).into(), None::<Vec<_>>)
         .await
         .unwrap()
-        .take_ids()
+        .into_ids()
         .pop()
         .unwrap();
 
