@@ -39,7 +39,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn quota_changes(
         &self,
         since_state: impl Into<String>,
-        max_changes: usize,
+        max_changes: std::num::NonZeroUsize,
     ) -> crate::Result<ChangesResponse<Quota<Get>>> {
         let mut request = self.build();
         let mut changes = QuotaChanges::new(since_state);

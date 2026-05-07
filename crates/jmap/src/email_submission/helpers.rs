@@ -123,7 +123,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn email_submission_changes(
         &self,
         since_state: impl Into<String>,
-        max_changes: usize,
+        max_changes: std::num::NonZeroUsize,
     ) -> crate::Result<ChangesResponse<EmailSubmission<Get>>> {
         let mut request = self.build();
         request.add_capability::<crate::core::capability::Mail>();

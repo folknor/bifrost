@@ -41,7 +41,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn contact_card_changes(
         &self,
         since_state: impl Into<String>,
-        max_changes: Option<usize>,
+        max_changes: Option<std::num::NonZeroUsize>,
     ) -> crate::Result<ChangesResponse<ContactCard<Get>>> {
         let mut request = self.build();
         let mut changes = ContactCardChanges::new(since_state);

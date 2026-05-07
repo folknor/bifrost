@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 use super::query::{Comparator, Filter, QueryObject};
@@ -20,7 +22,7 @@ pub struct QueryChangesRequest<O: QueryObject> {
 
     #[serde(rename = "maxChanges")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_changes: Option<usize>,
+    max_changes: Option<NonZeroUsize>,
 
     #[serde(rename = "upToId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,7 +90,10 @@ impl<O: QueryObject> QueryChangesRequest<O> {
         self
     }
 
-    pub fn max_changes(&mut self, max_changes: usize) -> &mut Self {
+    /// Cap the response at most `max_changes` ID entries. RFC 8620
+    /// requires this to be a positive integer; using `NonZeroUsize`
+    /// rejects `0` at compile time.
+    pub fn max_changes(&mut self, max_changes: NonZeroUsize) -> &mut Self {
         self.max_changes = Some(max_changes);
         self
     }

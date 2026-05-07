@@ -166,7 +166,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn email_changes(
         &self,
         since_state: impl Into<String>,
-        max_changes: Option<usize>,
+        max_changes: Option<std::num::NonZeroUsize>,
     ) -> crate::Result<ChangesResponse<Email<Get>>> {
         let mut request = self.build();
         let mut changes = EmailChanges::new(since_state);
