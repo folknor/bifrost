@@ -1,9 +1,10 @@
 use std::{
     collections::HashSet,
     net::IpAddr,
+    ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -30,7 +31,9 @@ pub enum Credentials {
     Bearer(String),
 }
 
-pub struct Client<T: HttpTransport = ReqwestTransport> {
+/// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
+/// client itself is cheap to clone and pass around.
+pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
     transport: T,
     session: std::sync::Mutex<Arc<Session>>,
     session_url: String,
@@ -49,6 +52,31 @@ pub struct Client<T: HttpTransport = ReqwestTransport> {
     pub(crate) authorization: String,
     #[cfg(feature = "websockets")]
     pub(crate) ws: tokio::sync::Mutex<Option<crate::client_ws::WsStream>>,
+}
+
+/// A JMAP client. Cheap to clone - wraps an `Arc<ClientInner>` internally.
+///
+/// Cloning a `Client` shares the underlying transport, session state, and
+/// (when enabled) WebSocket connection. There is no public lifetime
+/// parameter, so `Client` can be stored in long-lived structs and moved
+/// across tasks freely.
+pub struct Client<T: HttpTransport = ReqwestTransport> {
+    inner: Arc<ClientInner<T>>,
+}
+
+impl<T: HttpTransport> Clone for Client<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T: HttpTransport> Deref for Client<T> {
+    type Target = ClientInner<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 pub struct ClientBuilder {
@@ -110,7 +138,9 @@ impl ClientBuilder {
 
     pub async fn connect(self, url: &str) -> crate::Result<Client> {
         let credentials = self.credentials.ok_or_else(|| {
-            crate::core::transport::TransportError::new("Missing credentials - call .credentials() before .connect()")
+            crate::core::transport::TransportError::new(
+                "Missing credentials - call .credentials() before .connect()",
+            )
         })?;
         let authorization = match credentials {
             Credentials::Basic(s) => format!("Basic {s}"),
@@ -119,19 +149,26 @@ impl ClientBuilder {
         let mut headers = header::HeaderMap::new();
         headers.insert(
             header::USER_AGENT,
-            header::HeaderValue::from_static(concat!(
-                "bifrost-jmap/",
-                env!("CARGO_PKG_VERSION")
-            )),
+            header::HeaderValue::from_static(concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION"))),
         );
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&authorization).map_err(|e| crate::core::transport::TransportError::with_source("Invalid authorization header", e))?,
+            header::HeaderValue::from_str(&authorization).map_err(|e| {
+                crate::core::transport::TransportError::with_source(
+                    "Invalid authorization header",
+                    e,
+                )
+            })?,
         );
         if let Some(forwarded_for) = self.forwarded_for {
             headers.insert(
                 header::FORWARDED,
-                header::HeaderValue::from_str(&forwarded_for).map_err(|e| crate::core::transport::TransportError::with_source("Invalid forwarded-for header", e))?,
+                header::HeaderValue::from_str(&forwarded_for).map_err(|e| {
+                    crate::core::transport::TransportError::with_source(
+                        "Invalid forwarded-for header",
+                        e,
+                    )
+                })?,
             );
         }
 
@@ -159,21 +196,23 @@ impl ClientBuilder {
             .unwrap_or_default();
 
         Ok(Client {
-            download_url: URLPart::parse(session.download_url())?,
-            upload_url: URLPart::parse(session.upload_url())?,
-            event_source_url: URLPart::parse(session.event_source_url())?,
-            api_url: session.api_url().to_string(),
-            session: std::sync::Mutex::new(Arc::new(session)),
-            session_url,
-            session_updated: true.into(),
-            accept_invalid_certs: self.accept_invalid_certs,
-            timeout: self.timeout,
-            transport,
-            default_account_id,
-            #[cfg(feature = "websockets")]
-            authorization,
-            #[cfg(feature = "websockets")]
-            ws: None.into(),
+            inner: Arc::new(ClientInner {
+                download_url: URLPart::parse(session.download_url())?,
+                upload_url: URLPart::parse(session.upload_url())?,
+                event_source_url: URLPart::parse(session.event_source_url())?,
+                api_url: session.api_url().to_string(),
+                session: std::sync::Mutex::new(Arc::new(session)),
+                session_url,
+                session_updated: true.into(),
+                accept_invalid_certs: self.accept_invalid_certs,
+                timeout: self.timeout,
+                transport,
+                default_account_id,
+                #[cfg(feature = "websockets")]
+                authorization,
+                #[cfg(feature = "websockets")]
+                ws: None.into(),
+            }),
         })
     }
 }
@@ -199,21 +238,23 @@ impl<T: HttpTransport> Client<T> {
             .unwrap_or_default();
 
         Ok(Client {
-            upload_url: URLPart::parse(session.upload_url())?,
-            download_url: URLPart::parse(session.download_url())?,
-            event_source_url: URLPart::parse(session.event_source_url())?,
-            api_url: session.api_url().to_string(),
-            session_url: String::new(),
-            session: std::sync::Mutex::new(Arc::new(session)),
-            session_updated: true.into(),
-            accept_invalid_certs: false,
-            timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
-            transport,
-            default_account_id,
-            #[cfg(feature = "websockets")]
-            authorization: String::new(),
-            #[cfg(feature = "websockets")]
-            ws: None.into(),
+            inner: Arc::new(ClientInner {
+                upload_url: URLPart::parse(session.upload_url())?,
+                download_url: URLPart::parse(session.download_url())?,
+                event_source_url: URLPart::parse(session.event_source_url())?,
+                api_url: session.api_url().to_string(),
+                session_url: String::new(),
+                session: std::sync::Mutex::new(Arc::new(session)),
+                session_updated: true.into(),
+                accept_invalid_certs: false,
+                timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
+                transport,
+                default_account_id,
+                #[cfg(feature = "websockets")]
+                authorization: String::new(),
+                #[cfg(feature = "websockets")]
+                ws: None.into(),
+            }),
         })
     }
 
@@ -222,36 +263,40 @@ impl<T: HttpTransport> Client<T> {
     }
 
     pub fn timeout(&self) -> Duration {
-        self.timeout
+        self.inner.timeout
     }
 
     pub fn session(&self) -> Arc<Session> {
-        self.session.lock().expect("session mutex poisoned").clone()
+        self.inner
+            .session
+            .lock()
+            .expect("session mutex poisoned")
+            .clone()
     }
 
     pub fn session_url(&self) -> &str {
-        &self.session_url
+        &self.inner.session_url
     }
 
     pub fn default_account_id(&self) -> &str {
-        &self.default_account_id
+        &self.inner.default_account_id
     }
 
     /// Get the default account ID as a typed `AccountId`.
     pub fn default_account(&self) -> crate::core::id::AccountId {
-        crate::core::id::AccountId::new(&self.default_account_id)
+        crate::core::id::AccountId::new(&self.inner.default_account_id)
     }
 
     pub(crate) fn download_url(&self) -> &[URLPart<blob::URLParameter>] {
-        &self.download_url
+        &self.inner.download_url
     }
 
     pub(crate) fn upload_url(&self) -> &[URLPart<blob::URLParameter>] {
-        &self.upload_url
+        &self.inner.upload_url
     }
 
     pub(crate) fn event_source_url(&self) -> &[URLPart<crate::event_source::URLParameter>] {
-        &self.event_source_url
+        &self.inner.event_source_url
     }
 
     /// Send a JMAP request and get a typed Response.
@@ -261,15 +306,16 @@ impl<T: HttpTransport> Client<T> {
     ) -> crate::Result<response::Response> {
         let body = serde_json::to_vec(request)?;
         let bytes = self
+            .inner
             .transport
-            .api_request(&self.api_url, body)
+            .api_request(&self.inner.api_url, body)
             .await
             .map_err(crate::Error::from)?;
         let response: response::Response = serde_json::from_slice(&bytes)?;
         {
-            let session = self.session.lock().expect("session mutex poisoned");
+            let session = self.inner.session.lock().expect("session mutex poisoned");
             if response.session_state() != session.state() {
-                self.session_updated.store(false, Ordering::Release);
+                self.inner.session_updated.store(false, Ordering::Release);
             }
         }
         Ok(response)
@@ -277,38 +323,38 @@ impl<T: HttpTransport> Client<T> {
 
     pub async fn refresh_session(&self) -> crate::Result<()> {
         let bytes = self
+            .inner
             .transport
-            .get_session(&self.session_url)
+            .get_session(&self.inner.session_url)
             .await
             .map_err(crate::Error::from)?;
         let session: Session = serde_json::from_slice(&bytes)?;
         {
-            *self.session.lock().expect("session mutex poisoned") = Arc::new(session);
-            self.session_updated.store(true, Ordering::Release);
+            *self.inner.session.lock().expect("session mutex poisoned") = Arc::new(session);
+            self.inner.session_updated.store(true, Ordering::Release);
         }
         Ok(())
     }
 
     pub fn is_session_updated(&self) -> bool {
-        self.session_updated.load(Ordering::Acquire)
+        self.inner.session_updated.load(Ordering::Acquire)
     }
 
     /// Access the underlying transport.
     pub fn transport(&self) -> &T {
-        &self.transport
+        &self.inner.transport
     }
 
     /// Returns the `Authorization` header value used by this client.
     #[cfg(feature = "websockets")]
     pub fn authorization(&self) -> &str {
-        &self.authorization
+        &self.inner.authorization
     }
 }
 
-
 impl Credentials {
     pub fn basic(username: &str, password: &str) -> Self {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use base64::{Engine, engine::general_purpose::STANDARD};
         Credentials::Basic(STANDARD.encode(format!("{username}:{password}")))
     }
 
