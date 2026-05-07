@@ -110,21 +110,44 @@ hope behind A is the kind of bet that loses on a multi-year horizon. C was
 already rejected in the prior pass — doubles the surface forever, makes
 batching consumers second-class.
 
-### Recommendation
+### Decision: B++
 
-**B++.** Ship B as the protocol layer this release; introduce a small `mail()`
+Ship B as the protocol layer this release; introduce one small `mail()`
 facade with the obvious workflows (list inbox, fetch message bodies, mark
 read, move to mailbox, send, search). Grow the facade as ratatoskr demands.
-Don't ship facades for JMAP types that don't yet have a clear workflow.
 
-D is a defensible alternative if we'd rather mirror the spec than mirror
-workflows. The choice is between *protocol-shaped* (D) and *task-shaped*
-(B++). B++ is more useful for the actual consumer; D is more discoverable
-for someone reading the JMAP RFCs. We have one consumer, so we optimize for
-that consumer.
+**Only `mail()` ships in this release.** `calendar()` and `contacts()`
+facades are not shipped until a real ratatoskr workflow demands a specific
+shape — shipping facades on speculation reintroduces the same accretion
+problem we're getting out of. The protocol layer (B) is fully sufficient
+for calendar and contacts work in the meantime.
 
-If we pick B++: §1 (next) collapses substantially — there are no helpers to
-relocate.
+D was the defensible alternative — protocol-shaped vs. task-shaped. We
+optimize for the actual consumer (task-shaped) over the hypothetical
+protocol-reader (spec-shaped). One consumer, one shape.
+
+§1 (next) collapses substantially — there are no helpers to relocate.
+
+#### Constructor rule
+
+With B++, account-scoped method-struct constructors no longer take an
+`accountId` parameter. `Account::call(M)` and `Batch` inject the account
+ID at request-build time. Today:
+
+```rust
+EmailGet::new(account_id_string).ids([id])      // before
+```
+
+Becomes:
+
+```rust
+EmailGet::new().ids([id])                        // after
+account.call(EmailGet::new().ids([id])).await?   // account injected here
+```
+
+Cross-account methods (`Email/copy`) take a *second* `&AccountId` (the
+source account); the calling `Account` is the destination, injected by
+`call`/`Batch`.
 
 ---
 
@@ -469,11 +492,28 @@ pub struct BlobRef {
     pub content_type: Option<String>,
 }
 
-impl Account {
+impl<Tr: HttpTransport> Client<Tr> {
+    /// Download a blob. The account is identified by the BlobRef.
     pub async fn download(&self, blob: &BlobRef) -> Result<Bytes>;
+}
+
+impl<Tr: HttpTransport> Account<Tr> {
+    /// Upload a blob to this account. Returns a BlobRef bound to this account.
     pub async fn upload(&self, data: Bytes, content_type: Option<&str>) -> Result<BlobRef>;
 }
 ```
+
+Asymmetric placement is intentional:
+
+- **`download` lives on `Client`** because `BlobRef` is self-describing —
+  it already carries the account ID. Routing through `Account` would either
+  duplicate that information (and require a mismatch check) or silently
+  ignore the `Account` and use the ref's account anyway. Both are worse
+  than just putting it on `Client`.
+- **`upload` lives on `Account`** because the upload URL is templated with
+  `accountId` — there's no `BlobRef` yet to pull it from. The upload's
+  account context comes from the `Account` handle, and the returned
+  `BlobRef` records that binding for subsequent reads.
 
 `BlobRef` is the unit that travels through the API. Functions returning blob
 references (`Email/get` for attachments, `Email/import` results, etc.) hand
@@ -532,16 +572,21 @@ pub struct MailboxPatch   { /* ... */ }
 - **Con:** every existing call site (helpers, builder, getters, set
   methods) changes.
 
-### Recommendation
+### Decision: defer, with eyes open
 
-**Defer.** This is a much larger structural rework than anything else in
-the release. It's worth doing eventually but not bundling here would mean
-shipping the rest of the redesign within a sane timeline. Note as
-**post-1.0 roadmap** with the understanding that it would be another
-breaking release.
+This is the one big compromise in the release. We claim "last pre-1.0 API
+revolution" and then leave `Email<Get>` / `Email<Set>` standing — that is
+philosophically a wart and we should not pretend otherwise.
 
-If we *do* bundle: it goes from a ~6-week release to a ~3-month release.
-That's the call to make consciously.
+The deferral rationale: bundling §8 turns a ~6-week release into a ~3-month
+release, and §8 is more invasive than the rest of the release combined
+(every typed object, every getter, every set-method, every helper-or-call
+site, plus a macro decision for shared field definitions).
+
+**Consequence we accept:** there will be one more breaking release after
+this one, dedicated to the type-state split, before 1.0. That's the honest
+plan. If we'd rather *not* have another breaking release, §8 needs to be
+in this one — make that call now, not later.
 
 ---
 
@@ -568,8 +613,10 @@ If we accept the recommendations above, the pre-1.0 release contains:
    lifetime.
 2. **`AccountScope` → `Account`** — owned, cheap-clone, capability-aware
    selection (`primary_account::<cap::Mail>()`).
-3. **§2 = B++** — delete helpers, add `Account::call<M>()`, add small
-   `mail()` / `calendar()` / `contacts()` workflow facades.
+3. **§2 = B++** — delete helpers, add `Account::call<M>()`, ship one
+   `mail()` workflow facade. `calendar()` and `contacts()` facades are
+   *not* in this release — protocol layer suffices until ratatoskr proves
+   a concrete workflow shape.
 4. **`Id<T>` adoption everywhere** — markers private, typedefs public,
    ~16 typed IDs across helpers/builders/filters/results.
 5. **`NonZeroUsize` for `max_changes`** — supersedes runtime validation.
@@ -596,17 +643,23 @@ If we accept the recommendations above, the pre-1.0 release contains:
 
 ---
 
-## Open questions (status)
+## Decisions (final)
 
-1. **§2: B vs D vs B++.** Recommended: **B++**. D is the defensible
-   alternative if we'd rather mirror the spec than mirror workflows.
-2. **`Account` ownership: borrow vs Arc.** Resolved: **Arc**.
-3. **`Id<T>` marker naming.** Resolved: **markers private, typedefs public**.
-4. **`Field<T>` exposure at getter layer.** Resolved: **expose both** —
-   ergonomic `Option<T>` and explicit `*_field()`.
-5. **Type-state split (§8).** Open — defer to post-1.0 unless we explicitly
-   decide to expand this release's scope.
-6. **Typed batch results (§6 stretch).** Open — bundle if scope allows,
-   defer otherwise.
+1. **§2 = B++.** Bare builder + one `mail()` workflow facade.
+   `calendar()` / `contacts()` deferred until ratatoskr drives the shape.
+2. **`Account` is owned, `Arc<ClientInner>`-backed.** No public lifetime.
+3. **`Id<T>` markers are module-private, typedefs are public.**
+4. **`Field<T>` exposed at the getter layer.** Both `role() -> Option<Role>`
+   and `role_field() -> &Field<Role>`.
+5. **§8 (type-state split) deferred.** Post-1.0 will need one more
+   breaking release dedicated to it. This is the release's one conscious
+   compromise.
+6. **Account-scoped method-struct constructors don't take `accountId`.**
+   `Account::call`/`Batch` injects it (see §2 constructor rule).
+7. **`download` lives on `Client`, `upload` on `Account`** (see §7).
 
-The questions still requiring a call before work starts: 1, 5, 6.
+### Still open
+
+- **Typed batch results (§6 stretch).** Bundle if scope allows, defer
+  otherwise. Decide during implementation, not now — it depends on how
+  much budget the rest of the release consumes.
