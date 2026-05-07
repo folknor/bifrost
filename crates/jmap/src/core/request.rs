@@ -165,6 +165,85 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     }
 }
 
+// -- Typed batch results (plans/API.md §6 stretch) --
+//
+// `Request::send_methods((m1, m2, ...))` adds the methods to the
+// batch in order, sends the request, and returns a tuple of the
+// typed responses. For batches that do not need a result reference
+// between calls, this collapses the
+// `let h = request.call(m)?; ... let r = response.get(&h)?` dance
+// into a single expression:
+//
+// ```ignore
+// let (q, g) = account.build().send_methods((email_query, email_get)).await?;
+// ```
+//
+// Result-reference flows (where method N needs a `CallHandle` from
+// method N-1 to construct an `ids_ref`/`mailbox_ids_ref`/etc.) keep
+// using the explicit `request.call(m)?` + `response.get(&h)?` path -
+// the handles are not exposed through the tuple boundary by design.
+
+/// Boxed extractor closure returned by [`MethodTuple::add_to_request`]:
+/// consumes the response and produces the typed tuple of results.
+type MethodTupleExtractor<R> = Box<dyn FnOnce(Response) -> crate::Result<R> + Send>;
+
+/// Trait implemented for tuples of `JmapMethod` values, for typed
+/// batch sends. See [`Request::send_methods`].
+pub trait MethodTuple: Sized {
+    type Responses;
+
+    fn add_to_request<T: HttpTransport>(
+        self,
+        request: &mut Request<'_, T>,
+    ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error>;
+}
+
+macro_rules! impl_method_tuple {
+    ($($M:ident),+ $(,)?) => {
+        impl<$($M),+> MethodTuple for ($($M,)+)
+        where
+            $($M: JmapMethod + 'static),+
+        {
+            type Responses = ($($M::Response,)+);
+
+            fn add_to_request<TR: HttpTransport>(
+                self,
+                request: &mut Request<'_, TR>,
+            ) -> Result<MethodTupleExtractor<Self::Responses>, crate::Error> {
+                #[allow(non_snake_case)]
+                let ($($M,)+) = self;
+                $(
+                    #[allow(non_snake_case)]
+                    let $M: CallHandle<$M> = request.call($M)?;
+                )+
+                Ok(Box::new(move |mut response: Response| {
+                    Ok(($(response.get(&$M)?,)+))
+                }))
+            }
+        }
+    };
+}
+
+impl_method_tuple!(M1);
+impl_method_tuple!(M1, M2);
+impl_method_tuple!(M1, M2, M3);
+impl_method_tuple!(M1, M2, M3, M4);
+impl_method_tuple!(M1, M2, M3, M4, M5);
+impl_method_tuple!(M1, M2, M3, M4, M5, M6);
+impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7);
+impl_method_tuple!(M1, M2, M3, M4, M5, M6, M7, M8);
+
+impl<T: HttpTransport> Request<'_, T> {
+    /// Send a tuple of methods in one batch and return their typed
+    /// responses as a tuple. See the module-level note on result
+    /// references.
+    pub async fn send_methods<M: MethodTuple>(mut self, methods: M) -> crate::Result<M::Responses> {
+        let extract = methods.add_to_request(&mut self)?;
+        let response = self.send().await?;
+        extract(response)
+    }
+}
+
 #[cfg(feature = "websockets")]
 impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
     pub async fn send_ws(self) -> crate::Result<String> {
