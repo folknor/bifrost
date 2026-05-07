@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod capability;
 pub mod changes;
-pub mod field;
-pub mod id;
 pub mod copy;
 pub mod error;
+pub mod field;
 pub mod get;
+pub mod id;
 pub mod method;
 pub mod parse;
 pub mod query;
@@ -112,10 +112,7 @@ macro_rules! json_object_struct {
         }
 
         impl<State> serde::Serialize for $name<State> {
-            fn serialize<S: serde::Serializer>(
-                &self,
-                serializer: S,
-            ) -> Result<S::Ok, S::Error> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(self.properties.len()))?;
                 for (k, v) in &self.properties {
@@ -126,18 +123,13 @@ macro_rules! json_object_struct {
         }
 
         impl<'de, State> serde::Deserialize<'de> for $name<State> {
-            fn deserialize<D: serde::Deserializer<'de>>(
-                deserializer: D,
-            ) -> Result<Self, D::Error> {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                 struct JsonObjectVisitor<S>(std::marker::PhantomData<S>);
 
                 impl<'de, S> serde::de::Visitor<'de> for JsonObjectVisitor<S> {
                     type Value = $name<S>;
 
-                    fn expecting(
-                        &self,
-                        f: &mut std::fmt::Formatter,
-                    ) -> std::fmt::Result {
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                         f.write_str($expecting)
                     }
 
@@ -159,8 +151,7 @@ macro_rules! json_object_struct {
                     }
                 }
 
-                deserializer
-                    .deserialize_map(JsonObjectVisitor(std::marker::PhantomData))
+                deserializer.deserialize_map(JsonObjectVisitor(std::marker::PhantomData))
             }
         }
 

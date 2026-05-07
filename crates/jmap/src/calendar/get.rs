@@ -1,10 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{
-    calendar_event::Alert,
-    core::field::Field,
-    Get,
-};
+use crate::{Get, calendar_event::Alert, core::field::Field};
 
 use super::{Calendar, CalendarRights, IncludeInAvailability};
 

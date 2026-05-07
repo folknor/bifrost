@@ -1,10 +1,7 @@
 use crate::{
-    client::Client,
-    core::{
-        changes::ChangesResponse,
-        set::SetObject,
-    },
     Get,
+    client::Client,
+    core::{changes::ChangesResponse, set::SetObject},
 };
 
 use super::{Identity, IdentityChanges, IdentityGet, IdentitySet, Property};
@@ -18,12 +15,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = IdentitySet::new(&account_id);
-        let id = set
-            .create()
-            .name(name)
-            .email(email)
-            .create_id()
-            .unwrap();
+        let id = set.create().name(name).email(email).create_id().unwrap();
         let handle = request.call(set)?;
         let mut response = request.send().await?;
         response.get(&handle)?.created(&id)

@@ -1,4 +1,4 @@
-use crate::{email::EmailAddress, Get};
+use crate::{Get, email::EmailAddress};
 
 use super::Identity;
 

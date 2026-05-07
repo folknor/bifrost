@@ -1,19 +1,13 @@
 use crate::{
-    client::Client,
-    core::{
-        changes::ChangesResponse,
-        set::SetObject,
-    },
     Get,
+    client::Client,
+    core::{changes::ChangesResponse, set::SetObject},
 };
 
 use super::{AddressBook, AddressBookChanges, AddressBookGet, AddressBookSet, Property};
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
-    pub async fn address_book_create(
-        &self,
-        name: impl Into<String>,
-    ) -> crate::Result<AddressBook> {
+    pub async fn address_book_create(&self, name: impl Into<String>) -> crate::Result<AddressBook> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = AddressBookSet::new(&account_id);
@@ -28,11 +22,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         response.get(&handle)?.created(&id)
     }
 
-    pub async fn address_book_destroy(
-        &self,
-        id: &str,
-        remove_contents: bool,
-    ) -> crate::Result<()> {
+    pub async fn address_book_destroy(&self, id: &str, remove_contents: bool) -> crate::Result<()> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = AddressBookSet::new(&account_id);

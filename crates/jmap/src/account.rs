@@ -1,9 +1,6 @@
 use crate::{
     client::Client,
-    core::{
-        id::AccountId,
-        transport::HttpTransport,
-    },
+    core::{id::AccountId, transport::HttpTransport},
 };
 
 /// An account-scoped view of a [`Client`].
@@ -20,7 +17,7 @@ use crate::{
 /// let emails = response.get(&handle)?;
 /// ```
 ///
-/// This is an unchecked view — the account ID is not validated
+/// This is an unchecked view - the account ID is not validated
 /// against the session. Use [`Client::session()`] to check
 /// available accounts.
 pub struct AccountScope<'a, Tr: HttpTransport> {

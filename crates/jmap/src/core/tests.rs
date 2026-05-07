@@ -4,12 +4,12 @@ use serde_json::json;
 
 use std::marker::PhantomData;
 
-use super::response::Response;
-use super::request::CallHandle;
-use super::method::JmapMethod;
 use super::get::{GetObject, GetResponse};
+use super::method::JmapMethod;
 use super::query::QueryObject;
-use crate::{Get, Set, Error};
+use super::request::CallHandle;
+use super::response::Response;
+use crate::{Error, Get, Set};
 
 // -- Minimal test types --
 
@@ -42,11 +42,15 @@ impl std::fmt::Display for TestProp {
 
 impl super::Object for TestObj<Set> {
     type Property = TestProp;
-    fn requires_account_id() -> bool { true }
+    fn requires_account_id() -> bool {
+        true
+    }
 }
 impl super::Object for TestObj<Get> {
     type Property = TestProp;
-    fn requires_account_id() -> bool { true }
+    fn requires_account_id() -> bool {
+        true
+    }
 }
 impl GetObject for TestObj<Set> {
     type GetArguments = ();
@@ -56,16 +60,24 @@ impl GetObject for TestObj<Get> {
 }
 impl super::set::SetObject for TestObj<Set> {
     type SetArguments = ();
-    fn create_id(&self) -> Option<String> { None }
+    fn create_id(&self) -> Option<String> {
+        None
+    }
 }
 impl super::set::SetObjectCreatable for TestObj<Set> {
     fn new(_: Option<usize>) -> Self {
-        TestObj { _state: Default::default(), id: None, name: None }
+        TestObj {
+            _state: Default::default(),
+            id: None,
+            name: None,
+        }
     }
 }
 impl super::set::SetObject for TestObj<Get> {
     type SetArguments = ();
-    fn create_id(&self) -> Option<String> { None }
+    fn create_id(&self) -> Option<String> {
+        None
+    }
 }
 impl super::changes::ChangesObject for TestObj<Set> {
     type ChangesResponse = ();
@@ -79,17 +91,18 @@ impl QueryObject for TestObj<Set> {
     type Sort = ();
 }
 
-// Define test method types (allow dead_code — some macro-generated methods unused in tests)
-#[allow(dead_code)]
 crate::define_get_method!(
-    TestGet, TestObj<Set>, "Test/get",
+    TestGet,
+    TestObj<Set>,
+    "Test/get",
     crate::core::capability::Core,
     GetResponse<TestObj<Get>>
 );
 
-#[allow(dead_code)]
 crate::define_query_method!(
-    TestQuery, TestObj<Set>, "Test/query",
+    TestQuery,
+    TestObj<Set>,
+    "Test/query",
     crate::core::capability::Core
 );
 
@@ -185,16 +198,16 @@ fn response_mixed_success_and_error() {
 
     let mut response: Response = serde_json::from_value(raw_json).unwrap();
 
-    // Extract get — succeeds
+    // Extract get - succeeds
     let handle_get = make_handle::<TestGet>("s0");
     let get_result = response.get(&handle_get).unwrap();
     assert_eq!(get_result.list().len(), 1);
 
-    // Extract error call — returns MethodError
+    // Extract error call - returns MethodError
     let handle_err = make_handle::<TestGet>("s1");
     assert!(matches!(response.get(&handle_err), Err(Error::Method(_))));
 
-    // Extract query — succeeds
+    // Extract query - succeeds
     let handle_query = make_handle::<TestQuery>("s2");
     let query_result = response.get(&handle_query).unwrap();
     assert_eq!(query_result.ids().len(), 2);
@@ -220,7 +233,7 @@ fn response_get_consumes_entry() {
     // First extraction succeeds
     let _ = response.get(&handle).unwrap();
 
-    // Second extraction fails — entry consumed
+    // Second extraction fails - entry consumed
     assert!(matches!(response.get(&handle), Err(Error::CallNotFound(_))));
 }
 
@@ -244,10 +257,7 @@ fn problem_details_from_transport_error() {
         "status": 429
     });
 
-    let err = TransportError::with_body(
-        "HTTP 429",
-        serde_json::to_vec(&problem_json).unwrap(),
-    );
+    let err = TransportError::with_body("HTTP 429", serde_json::to_vec(&problem_json).unwrap());
 
     let error: Error = err.into();
     assert!(matches!(error, Error::Problem(_)));
@@ -265,7 +275,7 @@ fn transport_error_without_body_stays_transport() {
 #[test]
 fn set_response_deserializes_without_creatable() {
     // SetResponse<TestObj<Get>> must work even though TestObj<Get>
-    // does not implement SetObjectCreatable — only SetObject.
+    // does not implement SetObjectCreatable - only SetObject.
     use super::set::SetResponse;
 
     let raw = json!({

@@ -32,7 +32,7 @@ See `plans/SMIME.md`.
 
 - Additional `Email/get` properties: `smimeStatus`, `smimeErrors`, `smimeVerifiedAt`
 - Additional `Email/query` filters: `hasSmime`, `hasVerifiedSmime`
-- Server-side verification — low client effort.
+- Server-side verification - low client effort.
 
 ### Pre-1.0 API stabilization
 
@@ -40,10 +40,10 @@ The JMAP coverage is feature-complete for ratatoskr's needs; the focus before 1.
 
 ## Design principles
 
-- **Trait-based method dispatch** — `JmapMethod` trait, no central enums. Adding a method touches only its own module.
-- **Transport-generic** — `Client<T: HttpTransport>`, `SseTransport` for EventSource. `ReqwestTransport` as default.
-- **JSON map backing for JSCalendar/JSContact** — `CalendarEvent` and `ContactCard` use `serde_json::Map` for extension-property round-trip fidelity.
-- **Feature-gated per RFC** — `mail`, `calendars`, `contacts`, `blob`, `quota` features gate modules independently.
+- **Trait-based method dispatch** - `JmapMethod` trait, no central enums. Adding a method touches only its own module.
+- **Transport-generic** - `Client<T: HttpTransport>`, `SseTransport` for EventSource. `ReqwestTransport` as default.
+- **JSON map backing for JSCalendar/JSContact** - `CalendarEvent` and `ContactCard` use `serde_json::Map` for extension-property round-trip fidelity.
+- **Feature-gated per RFC** - `mail`, `calendars`, `contacts`, `blob`, `quota` features gate modules independently.
 - **Implement from the RFCs.** Do not copy from server code under incompatible licenses.
 - **Async-only.**
 - **Apache-2.0 / MIT dual license.**

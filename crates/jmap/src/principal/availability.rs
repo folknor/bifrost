@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-
 /// Request for `Principal/getAvailability`.
 ///
 /// Given a principal and time range, returns free/busy availability.

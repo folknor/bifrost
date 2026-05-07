@@ -1,4 +1,4 @@
-use crate::{core::field::Field, Get};
+use crate::{Get, core::field::Field};
 
 use super::{CalendarEvent, GetArguments};
 
@@ -21,9 +21,7 @@ impl CalendarEvent<Get> {
         self.properties.get("uid")?.as_str()
     }
 
-    pub fn calendar_ids(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn calendar_ids(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("calendarIds")?.as_object()
     }
 
@@ -92,9 +90,7 @@ impl CalendarEvent<Get> {
         self.properties.get("recurrenceRules")?.as_array()
     }
 
-    pub fn recurrence_overrides(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn recurrence_overrides(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("recurrenceOverrides")?.as_object()
     }
 
@@ -136,15 +132,11 @@ impl CalendarEvent<Get> {
         }
     }
 
-    pub fn keywords(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn keywords(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("keywords")?.as_object()
     }
 
-    pub fn categories(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn categories(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("categories")?.as_object()
     }
 
@@ -152,15 +144,11 @@ impl CalendarEvent<Get> {
         self.properties.get("prodId")?.as_str()
     }
 
-    pub fn reply_to(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn reply_to(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("replyTo")?.as_object()
     }
 
-    pub fn participants(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn participants(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("participants")?.as_object()
     }
 
@@ -170,9 +158,7 @@ impl CalendarEvent<Get> {
 
     /// Returns `Omitted` if absent, `Null` if explicitly null (no alerts),
     /// `Value(map)` if set to an alerts object.
-    pub fn alerts(
-        &self,
-    ) -> Field<&serde_json::Map<String, serde_json::Value>> {
+    pub fn alerts(&self) -> Field<&serde_json::Map<String, serde_json::Value>> {
         match self.properties.get("alerts") {
             None => Field::Omitted,
             Some(v) if v.is_null() => Field::Null,
@@ -183,27 +169,19 @@ impl CalendarEvent<Get> {
         }
     }
 
-    pub fn locations(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn locations(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("locations")?.as_object()
     }
 
-    pub fn virtual_locations(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn virtual_locations(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("virtualLocations")?.as_object()
     }
 
-    pub fn links(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn links(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("links")?.as_object()
     }
 
-    pub fn related_to(
-        &self,
-    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    pub fn related_to(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         self.properties.get("relatedTo")?.as_object()
     }
 

@@ -61,7 +61,6 @@ impl ChangesRequest {
         self.max_changes = Some(max_changes);
         self
     }
-
 }
 
 impl<O: ChangesObject> ChangesResponse<O> {

@@ -1,12 +1,6 @@
-use crate::{
-    client::Client,
-    core::changes::ChangesResponse,
-    Get,
-};
+use crate::{Get, client::Client, core::changes::ChangesResponse};
 
-use super::{
-    ParticipantIdentity, ParticipantIdentityChanges, ParticipantIdentityGet, Property,
-};
+use super::{ParticipantIdentity, ParticipantIdentityChanges, ParticipantIdentityGet, Property};
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn participant_identity_get(

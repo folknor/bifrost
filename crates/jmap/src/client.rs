@@ -110,7 +110,7 @@ impl ClientBuilder {
 
     pub async fn connect(self, url: &str) -> crate::Result<Client> {
         let credentials = self.credentials.ok_or_else(|| {
-            crate::core::transport::TransportError::new("Missing credentials — call .credentials() before .connect()")
+            crate::core::transport::TransportError::new("Missing credentials - call .credentials() before .connect()")
         })?;
         let authorization = match credentials {
             Credentials::Basic(s) => format!("Basic {s}"),

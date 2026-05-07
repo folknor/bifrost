@@ -4,14 +4,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// "not set", "explicitly null", and "has a value".
 ///
 /// This replaces `Option<Option<T>>` with clearer semantics:
-/// - `Field::Omitted` — property was not included (skip serialization)
-/// - `Field::Null` — property was explicitly set to null
-/// - `Field::Value(T)` — property has a value
+/// - `Field::Omitted` - property was not included (skip serialization)
+/// - `Field::Null` - property was explicitly set to null
+/// - `Field::Value(T)` - property has a value
 ///
 /// Serializes as: omitted → absent, null → JSON null, value → JSON value.
 /// Deserializes from: absent → Omitted, null → Null, value → Value(T).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Field<T> {
     /// Property not included / not requested.
     #[default]
@@ -21,7 +20,6 @@ pub enum Field<T> {
     /// Property has a value.
     Value(T),
 }
-
 
 impl<T> Field<T> {
     /// Returns `true` if the field is `Omitted`.
@@ -65,7 +63,7 @@ impl<T: Serialize> Serialize for Field<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Field::Omitted => Err(serde::ser::Error::custom(
-                "Field::Omitted must be skipped via #[serde(skip_serializing_if = \"Field::is_omitted\")]"
+                "Field::Omitted must be skipped via #[serde(skip_serializing_if = \"Field::is_omitted\")]",
             )),
             Field::Null => serializer.serialize_none(),
             Field::Value(v) => v.serialize(serializer),

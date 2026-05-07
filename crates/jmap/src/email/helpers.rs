@@ -1,19 +1,19 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
         query_changes::QueryChangesResponse,
     },
-    Get,
 };
 
 use super::{
+    BodyProperty, Email, EmailChanges, EmailCopy, EmailGet, EmailQuery, EmailQueryChanges,
+    EmailSet, Property,
     import::EmailImportRequest,
     parse::EmailParseRequest,
     search_snippet::{SearchSnippetGetRequest, SearchSnippetGetResponse},
-    BodyProperty, Email, EmailChanges, EmailCopy, EmailGet, EmailQuery, EmailQueryChanges,
-    EmailSet, Property,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
@@ -60,9 +60,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
             .take_blob_id();
         let mut request = self.build();
         let mut import = EmailImportRequest::new(account_id);
-        let import_item = import
-            .email(blob_id)
-            .mailbox_ids(mailbox_ids);
+        let import_item = import.email(blob_id).mailbox_ids(mailbox_ids);
 
         if let Some(keywords) = keywords {
             import_item.keywords(keywords);

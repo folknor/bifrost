@@ -1,5 +1,9 @@
 use super::{ACLPatch, Mailbox, Role, SetArguments};
-use crate::{core::set::{SetObject, SetObjectCreatable}, principal::ACL, Get, Set};
+use crate::{
+    Get, Set,
+    core::set::{SetObject, SetObjectCreatable},
+    principal::ACL,
+};
 use std::collections::HashMap;
 
 impl Mailbox<Set> {

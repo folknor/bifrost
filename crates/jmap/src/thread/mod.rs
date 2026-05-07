@@ -33,6 +33,16 @@ impl Display for Property {
 }
 
 // Method structs for the new architecture
-crate::define_get_method!(ThreadGet, Thread, "Thread/get", crate::core::capability::Mail, crate::core::get::GetResponse<Thread>);
-crate::define_changes_method!(ThreadChanges, "Thread/changes", crate::core::capability::Mail, crate::core::changes::ChangesResponse<Thread>);
-
+crate::define_get_method!(
+    ThreadGet,
+    Thread,
+    "Thread/get",
+    crate::core::capability::Mail,
+    crate::core::get::GetResponse<Thread>
+);
+crate::define_changes_method!(
+    ThreadChanges,
+    "Thread/changes",
+    crate::core::capability::Mail,
+    crate::core::changes::ChangesResponse<Thread>
+);

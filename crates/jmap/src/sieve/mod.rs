@@ -73,6 +73,23 @@ crate::impl_jmap_object!(SieveScript<State>, Property, true);
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(SieveScriptGet, SieveScript<Set>, "SieveScript/get", crate::core::capability::Sieve, crate::core::get::GetResponse<SieveScript<Get>>);
-crate::define_set_method!(SieveScriptSet, SieveScript<Set>, "SieveScript/set", crate::core::capability::Sieve, crate::core::set::SetResponse<SieveScript<Get>>);
-crate::define_query_method!(SieveScriptQuery, SieveScript<Set>, "SieveScript/query", crate::core::capability::Sieve);
+crate::define_get_method!(
+    SieveScriptGet,
+    SieveScript<Set>,
+    "SieveScript/get",
+    crate::core::capability::Sieve,
+    crate::core::get::GetResponse<SieveScript<Get>>
+);
+crate::define_set_method!(
+    SieveScriptSet,
+    SieveScript<Set>,
+    "SieveScript/set",
+    crate::core::capability::Sieve,
+    crate::core::set::SetResponse<SieveScript<Get>>
+);
+crate::define_query_method!(
+    SieveScriptQuery,
+    SieveScript<Set>,
+    "SieveScript/query",
+    crate::core::capability::Sieve
+);

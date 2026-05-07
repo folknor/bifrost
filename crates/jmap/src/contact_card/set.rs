@@ -25,11 +25,7 @@ impl ContactCard<Set> {
         self
     }
 
-    pub fn address_book_id(
-        &mut self,
-        address_book_id: impl Into<String>,
-        set: bool,
-    ) -> &mut Self {
+    pub fn address_book_id(&mut self, address_book_id: impl Into<String>, set: bool) -> &mut Self {
         let entry = self
             .properties
             .entry("addressBookIds")
@@ -53,10 +49,7 @@ impl ContactCard<Set> {
         self
     }
 
-    pub fn name(
-        &mut self,
-        name: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn name(&mut self, name: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("name".into(), serde_json::Value::Object(name));
         self
@@ -71,19 +64,13 @@ impl ContactCard<Set> {
         self
     }
 
-    pub fn emails(
-        &mut self,
-        emails: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn emails(&mut self, emails: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("emails".into(), serde_json::Value::Object(emails));
         self
     }
 
-    pub fn phones(
-        &mut self,
-        phones: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn phones(&mut self, phones: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("phones".into(), serde_json::Value::Object(phones));
         self
@@ -120,10 +107,7 @@ impl ContactCard<Set> {
         self
     }
 
-    pub fn notes(
-        &mut self,
-        notes: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn notes(&mut self, notes: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("notes".into(), serde_json::Value::Object(notes));
         self
@@ -131,11 +115,7 @@ impl ContactCard<Set> {
 
     /// Set any property by name. Use this for extension properties or
     /// less-common JSContact properties not covered by typed methods.
-    pub fn set_property(
-        &mut self,
-        name: impl Into<String>,
-        value: serde_json::Value,
-    ) -> &mut Self {
+    pub fn set_property(&mut self, name: impl Into<String>, value: serde_json::Value) -> &mut Self {
         self.properties.insert(name.into(), value);
         self
     }

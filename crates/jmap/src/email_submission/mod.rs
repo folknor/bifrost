@@ -3,15 +3,12 @@ pub mod helpers;
 pub mod query;
 pub mod set;
 
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::{
-    email::Email,
-    Get, Set,
-};
+use crate::{Get, Set, email::Email};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SetArguments {
@@ -184,8 +181,35 @@ crate::impl_jmap_object!(EmailSubmission<State>, Property, true);
 // The Mail capability will be auto-added when needed through the request.
 
 // Method structs for the new architecture
-crate::define_get_method!(EmailSubmissionGet, EmailSubmission<Set>, "EmailSubmission/get", crate::core::capability::Submission, crate::core::get::GetResponse<EmailSubmission<Get>>);
-crate::define_set_method!(EmailSubmissionSet, EmailSubmission<Set>, "EmailSubmission/set", crate::core::capability::Submission, crate::core::set::SetResponse<EmailSubmission<Get>>);
-crate::define_changes_method!(EmailSubmissionChanges, "EmailSubmission/changes", crate::core::capability::Submission, crate::core::changes::ChangesResponse<EmailSubmission<Get>>);
-crate::define_query_method!(EmailSubmissionQuery, EmailSubmission<Set>, "EmailSubmission/query", crate::core::capability::Submission);
-crate::define_query_changes_method!(EmailSubmissionQueryChanges, EmailSubmission<Set>, "EmailSubmission/queryChanges", crate::core::capability::Submission);
+crate::define_get_method!(
+    EmailSubmissionGet,
+    EmailSubmission<Set>,
+    "EmailSubmission/get",
+    crate::core::capability::Submission,
+    crate::core::get::GetResponse<EmailSubmission<Get>>
+);
+crate::define_set_method!(
+    EmailSubmissionSet,
+    EmailSubmission<Set>,
+    "EmailSubmission/set",
+    crate::core::capability::Submission,
+    crate::core::set::SetResponse<EmailSubmission<Get>>
+);
+crate::define_changes_method!(
+    EmailSubmissionChanges,
+    "EmailSubmission/changes",
+    crate::core::capability::Submission,
+    crate::core::changes::ChangesResponse<EmailSubmission<Get>>
+);
+crate::define_query_method!(
+    EmailSubmissionQuery,
+    EmailSubmission<Set>,
+    "EmailSubmission/query",
+    crate::core::capability::Submission
+);
+crate::define_query_changes_method!(
+    EmailSubmissionQueryChanges,
+    EmailSubmission<Set>,
+    "EmailSubmission/queryChanges",
+    crate::core::capability::Submission
+);

@@ -1,11 +1,11 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
         query_changes::QueryChangesResponse,
     },
-    Get,
 };
 
 use super::{Property, Quota, QuotaChanges, QuotaGet, QuotaQuery, QuotaQueryChanges};

@@ -1,4 +1,4 @@
-use crate::{Get, DataType};
+use crate::{DataType, Get};
 
 use super::{Keys, PushSubscription};
 

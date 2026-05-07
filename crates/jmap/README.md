@@ -10,25 +10,25 @@ A **JSON Meta Application Protocol (JMAP)** client library for Rust with full co
 
 | Spec | Status |
 |------|--------|
-| [RFC 8620](https://datatracker.ietf.org/doc/html/rfc8620) — JMAP Core | Complete |
-| [RFC 8621](https://datatracker.ietf.org/doc/html/rfc8621) — JMAP for Mail | Complete |
-| [RFC 8887](https://datatracker.ietf.org/doc/html/rfc8887) — JMAP over WebSocket | Complete |
-| [draft-ietf-jmap-calendars-26](https://www.ietf.org/archive/id/draft-ietf-jmap-calendars-26.html) — JMAP for Calendars | Complete |
-| [RFC 9610](https://www.rfc-editor.org/rfc/rfc9610) — JMAP for Contacts | Complete |
-| [RFC 9404](https://www.rfc-editor.org/rfc/rfc9404) — JMAP Blob Management | Complete |
-| [RFC 9425](https://www.rfc-editor.org/rfc/rfc9425) — JMAP Quotas | Complete |
-| [RFC 9670](https://www.rfc-editor.org/rfc/rfc9670) — JMAP Sharing | Complete |
-| [draft-ietf-jmap-sieve-14](https://www.ietf.org/archive/id/draft-ietf-jmap-sieve-14.html) — JMAP for Sieve Scripts | Complete |
+| [RFC 8620](https://datatracker.ietf.org/doc/html/rfc8620) - JMAP Core | Complete |
+| [RFC 8621](https://datatracker.ietf.org/doc/html/rfc8621) - JMAP for Mail | Complete |
+| [RFC 8887](https://datatracker.ietf.org/doc/html/rfc8887) - JMAP over WebSocket | Complete |
+| [draft-ietf-jmap-calendars-26](https://www.ietf.org/archive/id/draft-ietf-jmap-calendars-26.html) - JMAP for Calendars | Complete |
+| [RFC 9610](https://www.rfc-editor.org/rfc/rfc9610) - JMAP for Contacts | Complete |
+| [RFC 9404](https://www.rfc-editor.org/rfc/rfc9404) - JMAP Blob Management | Complete |
+| [RFC 9425](https://www.rfc-editor.org/rfc/rfc9425) - JMAP Quotas | Complete |
+| [RFC 9670](https://www.rfc-editor.org/rfc/rfc9670) - JMAP Sharing | Complete |
+| [draft-ietf-jmap-sieve-14](https://www.ietf.org/archive/id/draft-ietf-jmap-sieve-14.html) - JMAP for Sieve Scripts | Complete |
 
 ## Features
 
-- **Trait-based method dispatch** — `JmapMethod` trait, typed `CallHandle<M>`, compile-time safe response extraction.
-- **Transport-generic** — `Client<T: HttpTransport>` with `ReqwestTransport` default. Zero-copy `Bytes` responses. Custom transports for testing/WASM.
-- **Async-only** — powered by `reqwest` + `tokio`.
+- **Trait-based method dispatch** - `JmapMethod` trait, typed `CallHandle<M>`, compile-time safe response extraction.
+- **Transport-generic** - `Client<T: HttpTransport>` with `ReqwestTransport` default. Zero-copy `Bytes` responses. Custom transports for testing/WASM.
+- **Async-only** - powered by `reqwest` + `tokio`.
 - **WebSocket and EventSource** streaming.
-- **Feature-gated per RFC** — compile only what you need.
-- **`Field<T>`** — clean three-state nullable semantics (Omitted/Null/Value).
-- **Structured errors** — every variant matchable, no string catch-alls.
+- **Feature-gated per RFC** - compile only what you need.
+- **`Field<T>`** - clean three-state nullable semantics (Omitted/Null/Value).
+- **Structured errors** - every variant matchable, no string catch-alls.
 
 ## Cargo Features
 

@@ -1,5 +1,4 @@
-pub type ContactCardParseResponse =
-    crate::core::parse::ParseResponse<Vec<super::ContactCard>>;
+pub type ContactCardParseResponse = crate::core::parse::ParseResponse<Vec<super::ContactCard>>;
 
 crate::define_parse_method!(
     ContactCardParseRequest,

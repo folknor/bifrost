@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use serde::de;
 use serde::Deserialize;
+use serde::de;
 
 use super::error::MethodError;
 use super::method::JmapMethod;
@@ -40,10 +40,10 @@ pub struct Response {
     created_ids: Option<HashMap<String, String>>,
 }
 
-/// A single method call result — either success data or a method error.
+/// A single method call result - either success data or a method error.
 #[derive(Debug)]
 enum RawCallResult {
-    /// Raw JSON bytes — deserialized lazily in Response::get().
+    /// Raw JSON bytes - deserialized lazily in Response::get().
     Success(Box<serde_json::value::RawValue>),
     Error(MethodError),
 }
@@ -53,17 +53,12 @@ impl Response {
     ///
     /// Compile-time safe: the handle's type parameter ensures the response
     /// is deserialized into the correct type.
-    pub fn get<M: JmapMethod>(
-        &mut self,
-        handle: &CallHandle<M>,
-    ) -> crate::Result<M::Response> {
+    pub fn get<M: JmapMethod>(&mut self, handle: &CallHandle<M>) -> crate::Result<M::Response> {
         let pos = self
             .raw
             .iter()
             .position(|(_, _, id)| id == &handle.call_id)
-            .ok_or_else(|| {
-                crate::Error::CallNotFound(handle.call_id.clone())
-            })?;
+            .ok_or_else(|| crate::Error::CallNotFound(handle.call_id.clone()))?;
 
         let (_, result, _) = self.raw.swap_remove(pos);
 

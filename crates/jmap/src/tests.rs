@@ -9,10 +9,10 @@ use serde_json::json;
 #[cfg(all(feature = "calendars", feature = "contacts"))]
 mod patch_object_null_semantics {
     use super::*;
+    use crate::Set;
     use crate::calendar_event::CalendarEvent;
     use crate::contact_card::ContactCard;
     use crate::core::set::SetObjectCreatable;
-    use crate::Set;
 
     #[test]
     fn calendar_event_calendar_id_false_produces_null() {
@@ -24,8 +24,7 @@ mod patch_object_null_semantics {
         let entry = calendar_ids.get("cal-1").expect("cal-1 missing");
         assert!(
             entry.is_null(),
-            "calendar_id(id, false) must produce null, got {:?}",
-            entry
+            "calendar_id(id, false) must produce null, got {entry:?}"
         );
     }
 
@@ -46,14 +45,11 @@ mod patch_object_null_semantics {
         card.address_book_id("ab-1", false);
 
         let value = serde_json::to_value(&card).unwrap();
-        let ab_ids = value
-            .get("addressBookIds")
-            .expect("addressBookIds missing");
+        let ab_ids = value.get("addressBookIds").expect("addressBookIds missing");
         let entry = ab_ids.get("ab-1").expect("ab-1 missing");
         assert!(
             entry.is_null(),
-            "address_book_id(id, false) must produce null, got {:?}",
-            entry
+            "address_book_id(id, false) must produce null, got {entry:?}"
         );
     }
 
@@ -75,9 +71,9 @@ mod patch_object_null_semantics {
 
 #[cfg(feature = "calendars")]
 mod calendar_event_nullable_getters {
+    use crate::Get;
     use crate::calendar_event::CalendarEvent;
     use crate::core::field::Field;
-    use crate::Get;
 
     /// Helper: deserialize a CalendarEvent<Get> from a JSON string.
     fn from_json(s: &str) -> CalendarEvent<Get> {
@@ -155,7 +151,10 @@ mod calendar_event_nullable_getters {
     #[test]
     fn alerts_null_returns_null() {
         let event = from_json(r#"{"alerts":null}"#);
-        assert!(event.alerts().is_null(), "null alerts should give Field::Null");
+        assert!(
+            event.alerts().is_null(),
+            "null alerts should give Field::Null"
+        );
     }
 
     #[test]
@@ -176,9 +175,9 @@ mod calendar_event_nullable_getters {
 #[cfg(all(feature = "calendars", feature = "contacts"))]
 mod extension_property_round_trip {
     use super::*;
+    use crate::Get;
     use crate::calendar_event::CalendarEvent;
     use crate::contact_card::ContactCard;
-    use crate::Get;
 
     #[test]
     fn calendar_event_preserves_extension_properties() {
@@ -201,10 +200,7 @@ mod extension_property_round_trip {
             event.property("example.com:custom-field"),
             Some(&json!("custom-value"))
         );
-        assert_eq!(
-            event.property("vendor.io:priority"),
-            Some(&json!(42))
-        );
+        assert_eq!(event.property("vendor.io:priority"), Some(&json!(42)));
 
         // Reserialize and verify extension properties survive
         let output = serde_json::to_value(&event).unwrap();
@@ -224,8 +220,7 @@ mod extension_property_round_trip {
             "example.com:department": "Engineering"
         });
 
-        let card: ContactCard<Get> =
-            serde_json::from_value(input.clone()).expect("deser failed");
+        let card: ContactCard<Get> = serde_json::from_value(input.clone()).expect("deser failed");
 
         assert_eq!(card.uid(), Some("card-1"));
         assert_eq!(card.kind(), Some("individual"));
@@ -275,7 +270,10 @@ mod property_enum_round_trip {
             (CEProperty::RecurrenceIdTimeZone, "recurrenceIdTimeZone"),
             (CEProperty::RecurrenceRules, "recurrenceRules"),
             (CEProperty::RecurrenceOverrides, "recurrenceOverrides"),
-            (CEProperty::ExcludedRecurrenceRules, "excludedRecurrenceRules"),
+            (
+                CEProperty::ExcludedRecurrenceRules,
+                "excludedRecurrenceRules",
+            ),
             (CEProperty::Priority, "priority"),
             (CEProperty::Color, "color"),
             (CEProperty::Locale, "locale"),
@@ -302,9 +300,9 @@ mod property_enum_round_trip {
         for (prop, wire_name) in ce_known_variants() {
             // Display -> &str -> From<&str>
             let displayed = prop.to_string();
-            assert_eq!(displayed, wire_name, "Display mismatch for {:?}", prop);
+            assert_eq!(displayed, wire_name, "Display mismatch for {prop:?}");
             let parsed = CEProperty::from(displayed.as_str());
-            assert_eq!(parsed, prop, "From<&str> mismatch for {}", wire_name);
+            assert_eq!(parsed, prop, "From<&str> mismatch for {wire_name}");
         }
     }
 
@@ -357,9 +355,9 @@ mod property_enum_round_trip {
     fn contact_card_property_display_round_trip() {
         for (prop, wire_name) in cc_known_variants() {
             let displayed = prop.to_string();
-            assert_eq!(displayed, wire_name, "Display mismatch for {:?}", prop);
+            assert_eq!(displayed, wire_name, "Display mismatch for {prop:?}");
             let parsed = CCProperty::from(displayed.as_str());
-            assert_eq!(parsed, prop, "From<&str> mismatch for {}", wire_name);
+            assert_eq!(parsed, prop, "From<&str> mismatch for {wire_name}");
         }
     }
 
@@ -490,9 +488,9 @@ mod query_filter_serialization {
 #[cfg(feature = "calendars")]
 mod calendar_option_option_serialization {
     use super::*;
+    use crate::Set;
     use crate::calendar::Calendar;
     use crate::core::set::SetObjectCreatable;
-    use crate::Set;
 
     #[test]
     fn calendar_description_none_serializes_as_null() {
@@ -517,7 +515,7 @@ mod calendar_option_option_serialization {
     fn calendar_description_unset_is_absent() {
         let mut cal = Calendar::<Set>::new(Some(0));
         cal.name("Test Calendar");
-        // Do NOT call cal.description() — leave it as outer None
+        // Do NOT call cal.description() - leave it as outer None
 
         let value = serde_json::to_value(&cal).unwrap();
         assert!(
@@ -534,10 +532,7 @@ mod calendar_option_option_serialization {
         cal.description(Some("A nice calendar"));
 
         let value = serde_json::to_value(&cal).unwrap();
-        assert_eq!(
-            value.get("description"),
-            Some(&json!("A nice calendar"))
-        );
+        assert_eq!(value.get("description"), Some(&json!("A nice calendar")));
     }
 }
 
@@ -548,9 +543,7 @@ mod calendar_option_option_serialization {
 #[cfg(feature = "blob")]
 mod blob_data_source_serialization {
     use super::*;
-    use crate::blob::manage::{
-        DataSource, DataSourceBase64, DataSourceBlob, DataSourceText,
-    };
+    use crate::blob::manage::{DataSource, DataSourceBase64, DataSourceBlob, DataSourceText};
 
     #[test]
     fn data_source_text_serialization() {
@@ -705,26 +698,19 @@ mod session_capabilities_deserialization {
         {
             let blob = session.blob_capabilities().expect("blob missing");
             assert_eq!(blob.max_size_blob_set(), Some(100_000_000));
-            assert_eq!(
-                blob.supported_digest_algorithms(),
-                &["sha", "sha-256"]
-            );
+            assert_eq!(blob.supported_digest_algorithms(), &["sha", "sha-256"]);
         }
 
         #[cfg(feature = "calendars")]
         {
-            let cals = session
-                .calendars_capabilities()
-                .expect("calendars missing");
+            let cals = session.calendars_capabilities().expect("calendars missing");
             assert!(cals.may_create_calendar());
             assert_eq!(cals.max_calendars_per_event(), None);
         }
 
         #[cfg(feature = "contacts")]
         {
-            let contacts = session
-                .contacts_capabilities()
-                .expect("contacts missing");
+            let contacts = session.contacts_capabilities().expect("contacts missing");
             assert!(contacts.may_create_address_book());
         }
 
@@ -732,14 +718,8 @@ mod session_capabilities_deserialization {
         let principals = session
             .principals_capabilities()
             .expect("principals missing");
-        assert_eq!(
-            principals.current_user_principal_id(),
-            Some("user-1")
-        );
-        assert_eq!(
-            principals.account_id_for_principal(),
-            Some("acct-1")
-        );
+        assert_eq!(principals.current_user_principal_id(), Some("user-1"));
+        assert_eq!(principals.account_id_for_principal(), Some("acct-1"));
 
         // unknown vendor capability -> Other
         let vendor = session
@@ -749,10 +729,7 @@ mod session_capabilities_deserialization {
             Capabilities::Other(v) => {
                 assert_eq!(v.get("someField"), Some(&json!("someValue")));
             }
-            other => panic!(
-                "expected Capabilities::Other for vendor cap, got {:?}",
-                other
-            ),
+            other => panic!("expected Capabilities::Other for vendor cap, got {other:?}"),
         }
     }
 
@@ -776,7 +753,6 @@ mod session_capabilities_deserialization {
 // 9. AlertTrigger deserialization
 // ---------------------------------------------------------------------------
 #[cfg(feature = "calendars")]
-
 mod alert_trigger_deserialization {
     use super::*;
     use crate::calendar_event::{AlertTrigger, RelativeTo};
@@ -793,7 +769,7 @@ mod alert_trigger_deserialization {
                 assert_eq!(offset, "-PT15M");
                 assert_eq!(relative_to, Some(RelativeTo::Start));
             }
-            other => panic!("expected OffsetTrigger, got {:?}", other),
+            other => panic!("expected OffsetTrigger, got {other:?}"),
         }
     }
 
@@ -809,20 +785,19 @@ mod alert_trigger_deserialization {
                 assert_eq!(offset, "PT0S");
                 assert_eq!(relative_to, None);
             }
-            other => panic!("expected OffsetTrigger, got {:?}", other),
+            other => panic!("expected OffsetTrigger, got {other:?}"),
         }
     }
 
     #[test]
     fn absolute_trigger_deserializes() {
-        let json_str =
-            r#"{"@type":"AbsoluteTrigger","when":"2025-06-15T09:00:00Z"}"#;
+        let json_str = r#"{"@type":"AbsoluteTrigger","when":"2025-06-15T09:00:00Z"}"#;
         let trigger: AlertTrigger = serde_json::from_str(json_str).unwrap();
         match trigger {
             AlertTrigger::AbsoluteTrigger { when } => {
                 assert_eq!(when, "2025-06-15T09:00:00Z");
             }
-            other => panic!("expected AbsoluteTrigger, got {:?}", other),
+            other => panic!("expected AbsoluteTrigger, got {other:?}"),
         }
     }
 
@@ -833,8 +808,7 @@ mod alert_trigger_deserialization {
         let trigger: AlertTrigger = serde_json::from_str(json_str).unwrap();
         assert!(
             matches!(trigger, AlertTrigger::Unknown),
-            "expected Unknown, got {:?}",
-            trigger
+            "expected Unknown, got {trigger:?}"
         );
     }
 
@@ -927,8 +901,8 @@ mod blob_get_request_serialization {
 
 mod share_notification_serde {
     use super::*;
-    use crate::share_notification::ShareNotification;
     use crate::Get;
+    use crate::share_notification::ShareNotification;
 
     fn from_json(s: &str) -> ShareNotification<Get> {
         serde_json::from_str(s).expect("failed to deserialize ShareNotification<Get>")
@@ -1019,8 +993,8 @@ mod share_notification_serde {
 
 mod principal_rfc9670 {
     use super::*;
-    use crate::principal::Principal;
     use crate::Get;
+    use crate::principal::Principal;
 
     #[test]
     fn principal_with_accounts_deserializes() {
@@ -1066,7 +1040,11 @@ mod principal_rfc9670 {
         assert_eq!(acct1.name(), Some("alice@example.com"));
         assert!(acct1.is_personal());
         assert!(!acct1.is_read_only());
-        assert!(acct1.account_capabilities().contains_key("urn:ietf:params:jmap:mail"));
+        assert!(
+            acct1
+                .account_capabilities()
+                .contains_key("urn:ietf:params:jmap:mail")
+        );
 
         let acct2 = &accounts["acct-2"];
         assert_eq!(acct2.name(), Some("shared"));
@@ -1151,8 +1129,7 @@ mod principals_owner_capability {
             "state": "abc123"
         });
 
-        let session: crate::core::session::Session =
-            serde_json::from_value(session_json).unwrap();
+        let session: crate::core::session::Session = serde_json::from_value(session_json).unwrap();
 
         // Session-level principals capability (empty object → all fields None)
         let principals = session.principals_capabilities().unwrap();
@@ -1165,7 +1142,9 @@ mod principals_owner_capability {
 
         // Account-level principals capability
         let account = session.account("acct-1").unwrap();
-        let acct_principals = account.capability("urn:ietf:params:jmap:principals").unwrap();
+        let acct_principals = account
+            .capability("urn:ietf:params:jmap:principals")
+            .unwrap();
         match acct_principals {
             crate::core::session::Capabilities::Principals(c) => {
                 assert_eq!(c.current_user_principal_id(), Some("p-user"));
@@ -1174,7 +1153,9 @@ mod principals_owner_capability {
         }
 
         // Account-level principals:owner capability
-        let acct_owner = account.capability("urn:ietf:params:jmap:principals:owner").unwrap();
+        let acct_owner = account
+            .capability("urn:ietf:params:jmap:principals:owner")
+            .unwrap();
         match acct_owner {
             crate::core::session::Capabilities::PrincipalsOwner(c) => {
                 assert_eq!(c.account_id_for_principal(), Some("acct-principals"));

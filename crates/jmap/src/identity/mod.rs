@@ -5,7 +5,7 @@ pub mod set;
 use std::fmt::Display;
 
 use crate::core::set::skip_if_empty_list;
-use crate::{email::EmailAddress, Get};
+use crate::{Get, email::EmailAddress};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +90,23 @@ crate::impl_jmap_object!(Identity<State>, Property, true);
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(IdentityGet, Identity<Set>, "Identity/get", crate::core::capability::Submission, crate::core::get::GetResponse<Identity<Get>>);
-crate::define_set_method!(IdentitySet, Identity<Set>, "Identity/set", crate::core::capability::Submission, crate::core::set::SetResponse<Identity<Get>>);
-crate::define_changes_method!(IdentityChanges, "Identity/changes", crate::core::capability::Submission, crate::core::changes::ChangesResponse<Identity<Get>>);
+crate::define_get_method!(
+    IdentityGet,
+    Identity<Set>,
+    "Identity/get",
+    crate::core::capability::Submission,
+    crate::core::get::GetResponse<Identity<Get>>
+);
+crate::define_set_method!(
+    IdentitySet,
+    Identity<Set>,
+    "Identity/set",
+    crate::core::capability::Submission,
+    crate::core::set::SetResponse<Identity<Get>>
+);
+crate::define_changes_method!(
+    IdentityChanges,
+    "Identity/changes",
+    crate::core::capability::Submission,
+    crate::core::changes::ChangesResponse<Identity<Get>>
+);

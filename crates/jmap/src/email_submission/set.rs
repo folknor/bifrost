@@ -1,5 +1,9 @@
 use super::{Address, EmailSubmission, Envelope, SetArguments, UndoStatus};
-use crate::{core::set::{SetObject, SetObjectCreatable}, email::Email, Get, Set};
+use crate::{
+    Get, Set,
+    core::set::{SetObject, SetObjectCreatable},
+    email::Email,
+};
 use std::collections::HashMap;
 
 impl EmailSubmission<Set> {

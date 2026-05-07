@@ -1,4 +1,8 @@
-use crate::{core::set::{SetObject, SetObjectCreatable}, email::EmailAddress, Get, Set};
+use crate::{
+    Get, Set,
+    core::set::{SetObject, SetObjectCreatable},
+    email::EmailAddress,
+};
 
 use super::Identity;
 

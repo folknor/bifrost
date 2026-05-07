@@ -1,6 +1,6 @@
 use bifrost_jmap::{
     client::Client,
-    mailbox::{query::Filter, Role},
+    mailbox::{Role, query::Filter},
 };
 
 async fn mailboxes() {

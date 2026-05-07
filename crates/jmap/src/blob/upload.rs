@@ -1,9 +1,6 @@
 use serde::Deserialize;
 
-use crate::{
-    client::Client,
-    core::session::URLPart,
-};
+use crate::{client::Client, core::session::URLPart};
 
 #[derive(Debug, Deserialize)]
 pub struct UploadResponse {

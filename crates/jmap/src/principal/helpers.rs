@@ -1,16 +1,15 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
         set::SetObject,
     },
-    Get,
 };
 
 use super::{
-    Principal, PrincipalChanges, PrincipalGet, PrincipalQuery,
-    PrincipalSet, Property, Type, DKIM,
+    DKIM, Principal, PrincipalChanges, PrincipalGet, PrincipalQuery, PrincipalSet, Property, Type,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {

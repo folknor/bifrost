@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// ```ignore
 /// let email_id: Id<Email> = Id::from("msg-123");
 /// let mailbox_id: Id<Mailbox> = Id::from("mbox-1");
-/// // email_id == mailbox_id  // compile error — different types
+/// // email_id == mailbox_id  // compile error - different types
 /// ```
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

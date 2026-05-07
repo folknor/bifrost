@@ -5,8 +5,8 @@ pub mod query;
 pub mod set;
 
 use crate::core::set::{skip_if_empty_list, skip_if_empty_map, skip_if_empty_str};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 
 use crate::Get;
@@ -96,11 +96,7 @@ pub struct PrincipalAccount {
 }
 
 impl PrincipalAccount {
-    pub fn new(
-        name: impl Into<String>,
-        is_personal: bool,
-        is_read_only: bool,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, is_personal: bool, is_read_only: bool) -> Self {
         PrincipalAccount {
             name: Some(name.into()),
             is_personal,
@@ -109,11 +105,7 @@ impl PrincipalAccount {
         }
     }
 
-    pub fn account_capability(
-        mut self,
-        uri: impl Into<String>,
-        config: serde_json::Value,
-    ) -> Self {
+    pub fn account_capability(mut self, uri: impl Into<String>, config: serde_json::Value) -> Self {
         self.account_capabilities.insert(uri.into(), config);
         self
     }
@@ -283,8 +275,35 @@ crate::impl_jmap_object!(Principal<State>, Property, true);
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(PrincipalGet, Principal<Set>, "Principal/get", crate::core::capability::Principals, crate::core::get::GetResponse<Principal<Get>>);
-crate::define_set_method!(PrincipalSet, Principal<Set>, "Principal/set", crate::core::capability::Principals, crate::core::set::SetResponse<Principal<Get>>);
-crate::define_changes_method!(PrincipalChanges, "Principal/changes", crate::core::capability::Principals, crate::core::changes::ChangesResponse<Principal<Get>>);
-crate::define_query_method!(PrincipalQuery, Principal<Set>, "Principal/query", crate::core::capability::Principals);
-crate::define_query_changes_method!(PrincipalQueryChanges, Principal<Set>, "Principal/queryChanges", crate::core::capability::Principals);
+crate::define_get_method!(
+    PrincipalGet,
+    Principal<Set>,
+    "Principal/get",
+    crate::core::capability::Principals,
+    crate::core::get::GetResponse<Principal<Get>>
+);
+crate::define_set_method!(
+    PrincipalSet,
+    Principal<Set>,
+    "Principal/set",
+    crate::core::capability::Principals,
+    crate::core::set::SetResponse<Principal<Get>>
+);
+crate::define_changes_method!(
+    PrincipalChanges,
+    "Principal/changes",
+    crate::core::capability::Principals,
+    crate::core::changes::ChangesResponse<Principal<Get>>
+);
+crate::define_query_method!(
+    PrincipalQuery,
+    Principal<Set>,
+    "Principal/query",
+    crate::core::capability::Principals
+);
+crate::define_query_changes_method!(
+    PrincipalQueryChanges,
+    Principal<Set>,
+    "Principal/queryChanges",
+    crate::core::capability::Principals
+);

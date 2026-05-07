@@ -1,5 +1,5 @@
 use super::{Mailbox, MailboxRights, Role};
-use crate::{principal::ACL, Get};
+use crate::{Get, principal::ACL};
 use std::collections::HashMap;
 
 impl Mailbox<Get> {

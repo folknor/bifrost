@@ -1,8 +1,8 @@
 #[cfg(feature = "mail")]
 use crate::email::{MailCapabilities, SubmissionCapabilities};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -92,7 +92,7 @@ where
 
     /// Deserialize a capability value as a typed struct, falling back to
     /// `Other(original_value)` on parse failure. Serializes to a string
-    /// first to avoid cloning the Value — `from_value` consumes on error.
+    /// first to avoid cloning the Value - `from_value` consumes on error.
     macro_rules! try_cap {
         ($value:expr, $variant:ident) => {{
             let s = serde_json::to_string(&$value).unwrap();
@@ -190,7 +190,7 @@ pub struct SieveCapabilities {
 
 /// Capabilities for `urn:ietf:params:jmap:quota` (RFC 9425).
 ///
-/// Empty capability object per spec — presence indicates quota support.
+/// Empty capability object per spec - presence indicates quota support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaCapabilities {}
 
@@ -291,17 +291,79 @@ impl Session {
         serde_json::from_value(value).ok()
     }
 
-    session_cap_accessor!(websocket_capabilities, crate::core::capability::WebSocket, WebSocket, WebSocketCapabilities);
-    session_cap_accessor!(core_capabilities, crate::core::capability::Core, Core, CoreCapabilities);
-    session_cap_accessor!(#[cfg(feature = "mail")] mail_capabilities, crate::core::capability::Mail, Mail, MailCapabilities);
-    session_cap_accessor!(#[cfg(feature = "mail")] submission_capabilities, crate::core::capability::Submission, Submission, SubmissionCapabilities);
-    session_cap_accessor!(#[cfg(feature = "mail")] sieve_capabilities, crate::core::capability::Sieve, Sieve, SieveCapabilities);
-    session_cap_accessor!(#[cfg(feature = "quota")] quota_capabilities, crate::core::capability::Quota, Quota, QuotaCapabilities);
-    session_cap_accessor!(#[cfg(feature = "blob")] blob_capabilities, crate::core::capability::Blob, Blob, BlobCapabilities);
-    session_cap_accessor!(#[cfg(feature = "calendars")] calendars_capabilities, crate::core::capability::Calendars, Calendars, CalendarsCapabilities);
-    session_cap_accessor!(#[cfg(feature = "contacts")] contacts_capabilities, crate::core::capability::Contacts, Contacts, ContactsCapabilities);
-    session_cap_accessor!(principals_capabilities, crate::core::capability::Principals, Principals, PrincipalsCapabilities);
-    session_cap_accessor!(principals_owner_capabilities, crate::core::capability::PrincipalsOwner, PrincipalsOwner, PrincipalsOwnerCapabilities);
+    session_cap_accessor!(
+        websocket_capabilities,
+        crate::core::capability::WebSocket,
+        WebSocket,
+        WebSocketCapabilities
+    );
+    session_cap_accessor!(
+        core_capabilities,
+        crate::core::capability::Core,
+        Core,
+        CoreCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        mail_capabilities,
+        crate::core::capability::Mail,
+        Mail,
+        MailCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        submission_capabilities,
+        crate::core::capability::Submission,
+        Submission,
+        SubmissionCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "mail")]
+        sieve_capabilities,
+        crate::core::capability::Sieve,
+        Sieve,
+        SieveCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "quota")]
+        quota_capabilities,
+        crate::core::capability::Quota,
+        Quota,
+        QuotaCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "blob")]
+        blob_capabilities,
+        crate::core::capability::Blob,
+        Blob,
+        BlobCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "calendars")]
+        calendars_capabilities,
+        crate::core::capability::Calendars,
+        Calendars,
+        CalendarsCapabilities
+    );
+    session_cap_accessor!(
+        #[cfg(feature = "contacts")]
+        contacts_capabilities,
+        crate::core::capability::Contacts,
+        Contacts,
+        ContactsCapabilities
+    );
+    session_cap_accessor!(
+        principals_capabilities,
+        crate::core::capability::Principals,
+        Principals,
+        PrincipalsCapabilities
+    );
+    session_cap_accessor!(
+        principals_owner_capabilities,
+        crate::core::capability::PrincipalsOwner,
+        PrincipalsOwner,
+        PrincipalsOwnerCapabilities
+    );
 
     pub fn accounts(&self) -> impl Iterator<Item = &String> {
         self.accounts.keys()

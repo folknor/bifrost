@@ -117,8 +117,35 @@ crate::impl_jmap_object!(CalendarEventNotification<State>, Property, true);
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(CalendarEventNotificationGet, CalendarEventNotification<Set>, "CalendarEventNotification/get", crate::core::capability::Calendars, crate::core::get::GetResponse<CalendarEventNotification<Get>>);
-crate::define_set_method!(CalendarEventNotificationSet, CalendarEventNotification<Set>, "CalendarEventNotification/set", crate::core::capability::Calendars, crate::core::set::SetResponse<CalendarEventNotification<Get>>);
-crate::define_changes_method!(CalendarEventNotificationChanges, "CalendarEventNotification/changes", crate::core::capability::Calendars, crate::core::changes::ChangesResponse<CalendarEventNotification<Get>>);
-crate::define_query_method!(CalendarEventNotificationQuery, CalendarEventNotification<Set>, "CalendarEventNotification/query", crate::core::capability::Calendars);
-crate::define_query_changes_method!(CalendarEventNotificationQueryChanges, CalendarEventNotification<Set>, "CalendarEventNotification/queryChanges", crate::core::capability::Calendars);
+crate::define_get_method!(
+    CalendarEventNotificationGet,
+    CalendarEventNotification<Set>,
+    "CalendarEventNotification/get",
+    crate::core::capability::Calendars,
+    crate::core::get::GetResponse<CalendarEventNotification<Get>>
+);
+crate::define_set_method!(
+    CalendarEventNotificationSet,
+    CalendarEventNotification<Set>,
+    "CalendarEventNotification/set",
+    crate::core::capability::Calendars,
+    crate::core::set::SetResponse<CalendarEventNotification<Get>>
+);
+crate::define_changes_method!(
+    CalendarEventNotificationChanges,
+    "CalendarEventNotification/changes",
+    crate::core::capability::Calendars,
+    crate::core::changes::ChangesResponse<CalendarEventNotification<Get>>
+);
+crate::define_query_method!(
+    CalendarEventNotificationQuery,
+    CalendarEventNotification<Set>,
+    "CalendarEventNotification/query",
+    crate::core::capability::Calendars
+);
+crate::define_query_changes_method!(
+    CalendarEventNotificationQueryChanges,
+    CalendarEventNotification<Set>,
+    "CalendarEventNotification/queryChanges",
+    crate::core::capability::Calendars
+);

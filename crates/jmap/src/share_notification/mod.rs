@@ -1,7 +1,7 @@
 //! JMAP ShareNotification (RFC 9670).
 //!
 //! Records when permissions change on shared objects. ShareNotifications are
-//! read-only — only destroy is permitted via `ShareNotification/set`.
+//! read-only - only destroy is permitted via `ShareNotification/set`.
 
 pub mod get;
 pub mod helpers;
@@ -128,8 +128,35 @@ crate::impl_jmap_object!(ShareNotification<State>, Property, true);
 
 use crate::Set;
 
-crate::define_get_method!(ShareNotificationGet, ShareNotification<Set>, "ShareNotification/get", crate::core::capability::Principals, crate::core::get::GetResponse<ShareNotification<Get>>);
-crate::define_set_method!(ShareNotificationSet, ShareNotification<Set>, "ShareNotification/set", crate::core::capability::Principals, crate::core::set::SetResponse<ShareNotification<Get>>);
-crate::define_changes_method!(ShareNotificationChanges, "ShareNotification/changes", crate::core::capability::Principals, crate::core::changes::ChangesResponse<ShareNotification<Get>>);
-crate::define_query_method!(ShareNotificationQuery, ShareNotification<Set>, "ShareNotification/query", crate::core::capability::Principals);
-crate::define_query_changes_method!(ShareNotificationQueryChanges, ShareNotification<Set>, "ShareNotification/queryChanges", crate::core::capability::Principals);
+crate::define_get_method!(
+    ShareNotificationGet,
+    ShareNotification<Set>,
+    "ShareNotification/get",
+    crate::core::capability::Principals,
+    crate::core::get::GetResponse<ShareNotification<Get>>
+);
+crate::define_set_method!(
+    ShareNotificationSet,
+    ShareNotification<Set>,
+    "ShareNotification/set",
+    crate::core::capability::Principals,
+    crate::core::set::SetResponse<ShareNotification<Get>>
+);
+crate::define_changes_method!(
+    ShareNotificationChanges,
+    "ShareNotification/changes",
+    crate::core::capability::Principals,
+    crate::core::changes::ChangesResponse<ShareNotification<Get>>
+);
+crate::define_query_method!(
+    ShareNotificationQuery,
+    ShareNotification<Set>,
+    "ShareNotification/query",
+    crate::core::capability::Principals
+);
+crate::define_query_changes_method!(
+    ShareNotificationQueryChanges,
+    ShareNotification<Set>,
+    "ShareNotification/queryChanges",
+    crate::core::capability::Principals
+);

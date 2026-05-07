@@ -1,9 +1,6 @@
 use crate::client::Client;
 
-use super::{
-    copy::CopyBlobRequest,
-    manage::BlobUploadRequest,
-};
+use super::{copy::CopyBlobRequest, manage::BlobUploadRequest};
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn blob_copy(

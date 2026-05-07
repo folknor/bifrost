@@ -1,10 +1,10 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
     },
-    Get,
 };
 
 use super::{

@@ -1,15 +1,15 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
     },
-    Get,
 };
 
 use super::{
-    parse::CalendarEventParseRequest,
-    CalendarEvent, CalendarEventChanges, CalendarEventGet, CalendarEventQuery, CalendarEventSet, Property,
+    CalendarEvent, CalendarEventChanges, CalendarEventGet, CalendarEventQuery, CalendarEventSet,
+    Property, parse::CalendarEventParseRequest,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {

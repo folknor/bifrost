@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    validate::SieveScriptValidateRequest,
     Property, SieveScript, SieveScriptGet, SieveScriptQuery, SieveScriptSet,
+    validate::SieveScriptValidateRequest,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
@@ -29,8 +29,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
             .create_id()
             .unwrap();
         if activate {
-            set.arguments()
-                .on_success_activate_script(id.clone());
+            set.arguments().on_success_activate_script(id.clone());
         }
         let handle = request.call(set)?;
         let mut response = request.send().await?;

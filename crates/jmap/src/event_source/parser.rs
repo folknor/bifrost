@@ -1,8 +1,6 @@
-
 const MAX_EVENT_SIZE: usize = 1024 * 1024;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum EventType {
     Ping,
@@ -12,7 +10,6 @@ pub enum EventType {
     CalendarAlert,
 }
 
-
 #[derive(Default, Debug)]
 pub struct Event {
     pub event: EventType,
@@ -20,8 +17,7 @@ pub struct Event {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Copy, Clone)]
-#[derive(Default)]
+#[derive(Debug, Copy, Clone, Default)]
 enum EventParserState {
     #[default]
     Init,
@@ -29,7 +25,6 @@ enum EventParserState {
     Field,
     Value,
 }
-
 
 #[derive(Default, Debug)]
 pub struct EventParser {
@@ -49,7 +44,6 @@ impl EventParser {
     pub fn needs_bytes(&self) -> bool {
         self.bytes.is_none()
     }
-
 }
 
 impl Iterator for EventParser {
@@ -91,9 +85,11 @@ impl Iterator for EventParser {
                     }
                     _ => {
                         if self.field.len() >= MAX_EVENT_SIZE {
-                            return Some(Err(crate::Error::Transport(crate::core::transport::TransportError::new(
-                                "EventSource response is too long.",
-                            ))));
+                            return Some(Err(crate::Error::Transport(
+                                crate::core::transport::TransportError::new(
+                                    "EventSource response is too long.",
+                                ),
+                            )));
                         }
 
                         self.field.push(*byte);
@@ -136,9 +132,11 @@ impl Iterator for EventParser {
                     }
                     _ => {
                         if (self.field.len() + self.value.len()) >= MAX_EVENT_SIZE {
-                            return Some(Err(crate::Error::Transport(crate::core::transport::TransportError::new(
-                                "EventSource response is too long.",
-                            ))));
+                            return Some(Err(crate::Error::Transport(
+                                crate::core::transport::TransportError::new(
+                                    "EventSource response is too long.",
+                                ),
+                            )));
                         }
 
                         self.value.push(*byte);
@@ -221,12 +219,12 @@ mod tests {
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
-                    data: "".to_string()
+                    id: String::new(),
+                    data: String::new()
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
+                    id: String::new(),
                     data: "YHOO\n+2\n10".to_string()
                 },
                 EventString {
@@ -236,22 +234,22 @@ mod tests {
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
+                    id: String::new(),
                     data: "second event".to_string()
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
+                    id: String::new(),
                     data: "third event".to_string()
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
+                    id: String::new(),
                     data: "hello".to_string()
                 },
                 EventString {
                     event: EventType::State,
-                    id: "".to_string(),
+                    id: String::new(),
                     data: "world".to_string()
                 }
             ]

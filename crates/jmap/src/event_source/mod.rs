@@ -1,11 +1,11 @@
 pub mod parser;
 pub mod stream;
 
-use crate::{core::session::URLParser, DataType};
 #[cfg(feature = "calendars")]
 use crate::CalendarAlert;
-use std::collections::HashMap;
+use crate::{DataType, core::session::URLParser};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[non_exhaustive]
 pub enum URLParameter {

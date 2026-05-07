@@ -2,7 +2,7 @@
 
 A side-by-side of today's surface and where we think it should land, with the
 tradeoffs spelled out. The goal is to commit (or consciously reject) each shift
-before doing the work — not to drift into a half-migration.
+before doing the work - not to drift into a half-migration.
 
 This is the long-form companion to `TODO.md` § "API ergonomics (pre-1.0 breaking
 changes)". `TODO.md` lists the five ergonomics fixes consumer feedback called
@@ -10,7 +10,7 @@ out; this doc places them inside the larger structural decisions and folds in
 three rounds of external review.
 
 > **Read order matters.** §2 is the load-bearing decision. §1 is shaped by the
-> §2 outcome — read §2 first, then §1.
+> §2 outcome - read §2 first, then §1.
 
 ---
 
@@ -23,7 +23,7 @@ Two parallel vocabularies for every JMAP method:
 | Operation | Helper | Builder |
 |---|---|---|
 | Get one email | `client.email_get(id, props)` | `EmailGet::new(acc).ids([id])` + send + take |
-| Get all mailboxes | *(no helper — `mailbox_get` is single)* | `MailboxGet::new(acc)` + send + take |
+| Get all mailboxes | *(no helper - `mailbox_get` is single)* | `MailboxGet::new(acc)` + send + take |
 | Create mailbox | `client.mailbox_create(name, parent, role)` | `MailboxSet::new(acc).create()...` |
 
 Plus a *third* vocabulary for cross-account variants (`email_import` +
@@ -33,7 +33,7 @@ parallel: singular (`email_get`), plural (`quota_get_all`), and
 
 ### Options on the table
 
-#### B — bare builder + sugar
+#### B - bare builder + sugar
 
 Delete the helper layer entirely. Every operation goes through the builder. Add
 `Account::call(M)` as the build-send-extract single-method path.
@@ -54,7 +54,7 @@ plurality drift; matches the protocol shape exactly. **Cons:** every
 existing helper call site changes; common single-method flows are slightly
 more verbose than today's helpers.
 
-#### D — type-namespaced scopes
+#### D - type-namespaced scopes
 
 One sub-scope per JMAP type. Each owns a small set of methods.
 
@@ -71,9 +71,9 @@ mirrors the spec. **Cons:** ~16 sub-scope structs, each with an audited
 method set; adding a new method still touches a per-type scope; mirrors the
 protocol, not consumer workflows.
 
-#### B++ — bare builder + curated workflow facade (recommended)
+#### B++ - bare builder + curated workflow facade (recommended)
 
-B's protocol layer plus a small domain facade for actual workflows — *not* a
+B's protocol layer plus a small domain facade for actual workflows - *not* a
 1:1 helper per JMAP method, but a curated API around what consumers actually do.
 
 ```rust
@@ -93,7 +93,7 @@ let messages = mail.emails()
 ```
 
 The facade is hand-curated workflows, not generated method-by-method. Most
-JMAP methods do *not* get a facade entry — only flows we observe consumers
+JMAP methods do *not* get a facade entry - only flows we observe consumers
 actually doing.
 
 **Pros:** protocol is fully accessible (B); common workflows get a
@@ -107,7 +107,7 @@ using it (probably with ratatoskr as the proving ground).
 
 All three reviewers rejected A. The "stay disciplined under a written rule"
 hope behind A is the kind of bet that loses on a multi-year horizon. C was
-already rejected in the prior pass — doubles the surface forever, makes
+already rejected in the prior pass - doubles the surface forever, makes
 batching consumers second-class.
 
 ### Decision: B++
@@ -118,15 +118,15 @@ read, move to mailbox, send, search). Grow the facade as ratatoskr demands.
 
 **Only `mail()` ships in this release.** `calendar()` and `contacts()`
 facades are not shipped until a real ratatoskr workflow demands a specific
-shape — shipping facades on speculation reintroduces the same accretion
+shape - shipping facades on speculation reintroduces the same accretion
 problem we're getting out of. The protocol layer (B) is fully sufficient
 for calendar and contacts work in the meantime.
 
-D was the defensible alternative — protocol-shaped vs. task-shaped. We
+D was the defensible alternative - protocol-shaped vs. task-shaped. We
 optimize for the actual consumer (task-shaped) over the hypothetical
 protocol-reader (spec-shaped). One consumer, one shape.
 
-§1 (next) collapses substantially — there are no helpers to relocate.
+§1 (next) collapses substantially - there are no helpers to relocate.
 
 #### Constructor rule
 
@@ -151,12 +151,12 @@ source account); the calling `Account` is the destination, injected by
 
 #### Builder style: value builders, not `&mut self`
 
-Today's builder methods are `&mut self -> &mut Self` — chaining requires
+Today's builder methods are `&mut self -> &mut Self` - chaining requires
 `let mut x = ...; x.a(...); x.b(...);` and breaks the fluent
 `EmailGet::new().ids([id]).fetch_text_body_values(true)` shape used in
 every example in this doc.
 
-**Decision:** flip method-struct builder methods to value builders —
+**Decision:** flip method-struct builder methods to value builders -
 `fn ids(self, ...) -> Self`. Chains compose without `let mut`.
 
 ```rust
@@ -194,13 +194,13 @@ methods live on `Client` and call `request.default_account_id().to_string()`
 
 Two latent problems beyond ergonomics:
 
-- **Implicit default account** — every helper silently uses
+- **Implicit default account** - every helper silently uses
   `default_account_id()`. Consumers can't tell from the call site which
   account they hit.
 - **Capability-per-account.** JMAP allows different account IDs per
   capability. One login can have a mail account ID and a different calendar
   account ID. `default_account_id()` flattens that into one ID and uses it
-  everywhere — true on most servers, not spec-guaranteed.
+  everywhere - true on most servers, not spec-guaranteed.
 
 ### Target
 
@@ -214,7 +214,7 @@ pub struct Account<Tr: HttpTransport = ReqwestTransport> {
 }
 ```
 
-Make `Client` itself cheap-clone — `Client<Tr>` becomes `Arc<ClientInner<Tr>>`.
+Make `Client` itself cheap-clone - `Client<Tr>` becomes `Arc<ClientInner<Tr>>`.
 This is the standard shape (reqwest, sqlx, every async client of consequence).
 Lifetime parameters in handles passed to long-lived structs are friction with
 no upside.
@@ -227,16 +227,16 @@ let calendar_account = client.primary_account::<cap::Calendars>()?;
 // May be the same AccountId, may not. The type system stops assuming.
 ```
 
-`Account` is parameterized only by transport, not by capability — a single
+`Account` is parameterized only by transport, not by capability - a single
 account can carry multiple capabilities. The capability marker on
 `primary_account` is the *selection criterion*, not a permanent type tag.
 
 `Account` exposes:
-- `call<M>(method) -> Result<M::Response>` — single-method protocol path.
-- `build()` — batch builder (unchanged).
+- `call<M>(method) -> Result<M::Response>` - single-method protocol path.
+- `build()` - batch builder (unchanged).
 - `upload` (see §7); `download` lives on `Client`.
-- `mail()` — the one workflow facade entrypoint shipped this release,
-  feature-gated under `mail`. No `calendar()` / `contacts()` — protocol
+- `mail()` - the one workflow facade entrypoint shipped this release,
+  feature-gated under `mail`. No `calendar()` / `contacts()` - protocol
   layer suffices for those until ratatoskr drives a concrete shape.
 
 If §2 = B, drop the facade entrypoints entirely.
@@ -248,7 +248,7 @@ If §2 = B, drop the facade entrypoints entirely.
   type level instead of lurking in a runtime assumption.
 - **Pro:** `Arc<ClientInner>` shape lets consumers store, clone, spawn, and
   pass `Account` and `Client` around without lifetime acrobatics.
-- **Con:** `Client` becoming `Arc<ClientInner>` is a structural refactor —
+- **Con:** `Client` becoming `Arc<ClientInner>` is a structural refactor -
   not large, but touches client.rs, transport plumbing, and tests.
 - **Con:** capability-per-account changes the session inspection API.
   `client.default_account_id()` either disappears or gains a capability
@@ -266,8 +266,8 @@ Borrow vs. Arc: **Arc.** All three reviewers agreed; the borrow-based
 ### Today
 
 `Id<T>` exists in `core/id.rs` with three markers (`Account`, `BlobMarker`,
-`StateMarker`) — and with three different naming conventions. Everything else
-is `&str` / `String`. `max_changes` is `usize` — `0` is a valid value to
+`StateMarker`) - and with three different naming conventions. Everything else
+is `&str` / `String`. `max_changes` is `usize` - `0` is a valid value to
 construct, invalid per spec, rejected at runtime.
 
 ### Target
@@ -295,14 +295,14 @@ While breaking everything, rename existing markers for consistency:
 
 Method-struct builder methods, facade APIs, filter values that take IDs
 (`inMailbox`, `hasAttachment` references), changes APIs, and result
-references — all take `&Id<T>`.
+references - all take `&Id<T>`.
 
 #### Type the rest of the protocol identity layer
 
 - `BlobRef { account_id: AccountId, blob_id: BlobId, name: Option<String>,
-  content_type: Option<String> }` — see §7. Replaces bare `BlobId` at API
+  content_type: Option<String> }` - see §7. Replaces bare `BlobId` at API
   boundaries that need URL construction.
-- `CreatedId<T>` — typed wrapper for create-id references (`#draft1`).
+- `CreatedId<T>` - typed wrapper for create-id references (`#draft1`).
 - Result-reference values (`#/ids` etc.) get typed handles.
 
 #### `NonZeroUsize` for `max_changes`
@@ -344,7 +344,7 @@ Mixed. From `mailbox/get.rs`:
 | `name()` | `Option<&str>` | `None` |
 | `parent_id()` | `Option<&str>` | `None` |
 | `role()` | `Role` | `Role::None` (sentinel) |
-| `total_emails()` | `usize` | `0` (sentinel — indistinguishable from real 0) |
+| `total_emails()` | `usize` | `0` (sentinel - indistinguishable from real 0) |
 | `is_subscribed()` | `bool` | `false` (sentinel) |
 
 The sentinels are a bug: JMAP lets the server omit any property, so "totalEmails: 0"
@@ -352,7 +352,7 @@ and "server didn't include totalEmails" are reported the same.
 
 ### Target
 
-Two getters per property — ergonomic and explicit:
+Two getters per property - ergonomic and explicit:
 
 ```rust
 impl Mailbox {
@@ -380,7 +380,7 @@ the docs.
 
 - **Pro:** matches `Field<T>` storage layer; the getter stops lying about
   three-state data.
-- **Pro:** ergonomic path is `Option<T>` — most consumers never touch
+- **Pro:** ergonomic path is `Option<T>` - most consumers never touch
   `*_field()`.
 - **Con:** twice the getters per property. Mechanical, but verbose.
 - **Con:** consumers migrate sentinel-comparison code (`if mb.role() ==
@@ -388,7 +388,7 @@ the docs.
 
 ### Open question (resolved)
 
-Expose `Field<T>` at the getter layer? **Yes — both.** Disagreement among
+Expose `Field<T>` at the getter layer? **Yes - both.** Disagreement among
 reviewers; we side with "expose both" because ratatoskr's patch path needs
 the three-state distinction and YAGNI doesn't apply when the consumer
 already exists.
@@ -453,7 +453,7 @@ let emails = result.into_list();
 let id = result.into_id();
 ```
 
-Drops the inner `let mut`. The outer one stays — `Response::get` does
+Drops the inner `let mut`. The outer one stays - `Response::get` does
 `swap_remove` on an internal Vec, which is an implementation choice we don't
 unwind in this release.
 
@@ -470,7 +470,7 @@ let (query_result, get_result) = batch
 `Batch::send` takes a tuple of method structs and returns a tuple of typed
 results. No `Response`, no `Handle`, no `let mut`, no `swap_remove`.
 
-This is a significant refactor of the request envelope — possibly bigger
+This is a significant refactor of the request envelope - possibly bigger
 than the rest of this release combined. Two reviewers flagged it; one said
 "v2 territory," one said "do it now." We file it as a stretch goal: do it
 if `Account` + `Arc<ClientInner>` + facade work goes faster than expected;
@@ -507,10 +507,10 @@ to which the record with the blobId belongs"). Today's API:
 2. Silently substitutes `default_account_id()`. Wrong if the blob belongs
    to a different account (cross-account email, calendar attachment in a
    shared account, etc.).
-3. Hardcodes `name` and `type` to placeholder strings — losing the
+3. Hardcodes `name` and `type` to placeholder strings - losing the
    consumer's ability to specify either.
 
-`TODO.md` files this under "explicitly not changing — current shape is
+`TODO.md` files this under "explicitly not changing - current shape is
 correct." That's wrong. Reviewer #3 caught it; verified against the source.
 
 ### Target
@@ -536,13 +536,13 @@ impl<Tr: HttpTransport> Account<Tr> {
 
 Asymmetric placement is intentional:
 
-- **`download` lives on `Client`** because `BlobRef` is self-describing —
+- **`download` lives on `Client`** because `BlobRef` is self-describing -
   it already carries the account ID. Routing through `Account` would either
   duplicate that information (and require a mismatch check) or silently
   ignore the `Account` and use the ref's account anyway. Both are worse
   than just putting it on `Client`.
 - **`upload` lives on `Account`** because the upload URL is templated with
-  `accountId` — there's no `BlobRef` yet to pull it from. The upload's
+  `accountId` - there's no `BlobRef` yet to pull it from. The upload's
   account context comes from the `Account` handle, and the returned
   `BlobRef` records that binding for subsequent reads.
 
@@ -593,7 +593,7 @@ pub struct MailboxPatch   { /* ... */ }
 - **Pro:** user-facing types stop carrying serde implementation detail in
   their names.
 - **Pro:** create/patch shapes can omit fields the server would never
-  accept (server-assigned IDs, computed totals, etc.) — the type system
+  accept (server-assigned IDs, computed totals, etc.) - the type system
   enforces it.
 - **Con:** ~10 typed JMAP objects × 3 roles = ~30 new public types. Big
   surface change.
@@ -606,7 +606,7 @@ pub struct MailboxPatch   { /* ... */ }
 ### Decision: defer, with eyes open
 
 This is the one big compromise in the release. We claim "last pre-1.0 API
-revolution" and then leave `Email<Get>` / `Email<Set>` standing — that is
+revolution" and then leave `Email<Get>` / `Email<Set>` standing - that is
 philosophically a wart and we should not pretend otherwise.
 
 The deferral rationale: bundling §8 turns a ~6-week release into a ~3-month
@@ -617,7 +617,7 @@ site, plus a macro decision for shared field definitions).
 **Consequence we accept:** there will be one more breaking release after
 this one, dedicated to the type-state split, before 1.0. That's the honest
 plan. If we'd rather *not* have another breaking release, §8 needs to be
-in this one — make that call now, not later.
+in this one - make that call now, not later.
 
 ---
 
@@ -625,13 +625,13 @@ in this one — make that call now, not later.
 
 Pruned from `TODO.md`'s "Explicitly not changing" list, with rationale:
 
-- **`changes.created()` returning `&[String]`** — matches storage;
+- **`changes.created()` returning `&[String]`** - matches storage;
   `.map(String::as_str)` is idiomatic. Stays.
-- **Filter type inference requiring an explicit binding** — a generics
+- **Filter type inference requiring an explicit binding** - a generics
   limitation; fixing it would need a less-generic API. Stays.
-- **`take_id()` / `take_list()` requiring `let mut`** — addressed in §6
+- **`take_id()` / `take_list()` requiring `let mut`** - addressed in §6
   via `into_*` consuming `self`. Removed from "not changing."
-- **`download(blob_id)` signature** — wrong; addressed in §7. Removed
+- **`download(blob_id)` signature** - wrong; addressed in §7. Removed
   from "not changing."
 
 ---
@@ -640,23 +640,23 @@ Pruned from `TODO.md`'s "Explicitly not changing" list, with rationale:
 
 If we accept the recommendations above, the pre-1.0 release contains:
 
-1. **`Client` becomes `Arc<ClientInner<Tr>>`** — cheap-clone, no public
+1. **`Client` becomes `Arc<ClientInner<Tr>>`** - cheap-clone, no public
    lifetime.
-2. **`AccountScope` → `Account`** — owned, cheap-clone, capability-aware
+2. **`AccountScope` → `Account`** - owned, cheap-clone, capability-aware
    selection (`primary_account::<cap::Mail>()`).
-3. **§2 = B++** — delete helpers, add `Account::call<M>()`, ship one
+3. **§2 = B++** - delete helpers, add `Account::call<M>()`, ship one
    `mail()` workflow facade. `calendar()` and `contacts()` facades are
-   *not* in this release — protocol layer suffices until ratatoskr proves
+   *not* in this release - protocol layer suffices until ratatoskr proves
    a concrete workflow shape.
-4. **`Id<T>` adoption everywhere** — markers private, typedefs public,
+4. **`Id<T>` adoption everywhere** - markers private, typedefs public,
    ~16 typed IDs across helpers/builders/filters/results.
-5. **`NonZeroUsize` for `max_changes`** — supersedes runtime validation.
-6. **`BlobRef`** — replaces bare `BlobId` at API boundaries; fixes
+5. **`NonZeroUsize` for `max_changes`** - supersedes runtime validation.
+6. **`BlobRef`** - replaces bare `BlobId` at API boundaries; fixes
    `download` correctness (§7).
-7. **`Option<T>` getters + `*_field()` accessors** — sentinel bugs gone,
+7. **`Option<T>` getters + `*_field()` accessors** - sentinel bugs gone,
    `Field<T>` exposed where needed.
 8. **Lifted method arguments** (§5).
-9. **Value-builder method structs** — `fn ids(self, ...) -> Self`,
+9. **Value-builder method structs** - `fn ids(self, ...) -> Self`,
    not `&mut self -> &mut Self` (see §2 builder-style rule).
 10. **`take_*` → `into_*`** (§6 baseline).
 11. **Stretch:** typed batch results (§6 stretch). Defer if blocking.
@@ -664,10 +664,10 @@ If we accept the recommendations above, the pre-1.0 release contains:
 ### What this release does *not* do
 
 - **Type-state split** (`Email<Get>` → `Email`/`EmailCreate`/`EmailPatch`).
-  Deferred to a follow-up breaking release before 1.0 — see §8.
+  Deferred to a follow-up breaking release before 1.0 - see §8.
 - MDN (RFC 9007), S/MIME (RFC 9219). See `plans/MDN.md`, `plans/SMIME.md`.
 - Optimization items 1, 3, 4 from `TODO.md` (capability_config round-trip,
-  CallHandle.call_id, SSE Bytes copy) — accepted trade-offs.
+  CallHandle.call_id, SSE Bytes copy) - accepted trade-offs.
 - JSON-map vs typed-struct unification for CalendarEvent / ContactCard.
   Acknowledged as **structural debt**, not "intentional design": the
   typed-struct path silently drops vendor extension properties on
@@ -689,12 +689,12 @@ If we accept the recommendations above, the pre-1.0 release contains:
    compromise.
 6. **Account-scoped method-struct constructors don't take `accountId`.**
    `Account::call`/`Batch` injects it (see §2 constructor rule).
-7. **Method-struct builders are value builders** — `fn ids(self) -> Self`
+7. **Method-struct builders are value builders** - `fn ids(self) -> Self`
    throughout (see §2 builder-style rule).
 8. **`download` lives on `Client`, `upload` on `Account`** (see §7).
 
 ### Still open
 
 - **Typed batch results (§6 stretch).** Bundle if scope allows, defer
-  otherwise. Decide during implementation, not now — it depends on how
+  otherwise. Decide during implementation, not now - it depends on how
   much budget the rest of the release consumes.

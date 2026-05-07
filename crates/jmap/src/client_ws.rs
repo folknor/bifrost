@@ -2,29 +2,29 @@ use std::pin::Pin;
 #[cfg(feature = "tls-rustls")]
 use std::sync::Arc;
 
-use std::collections::HashMap;
-use futures_util::{stream::SplitSink, SinkExt, Stream, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use reqwest::header::SEC_WEBSOCKET_PROTOCOL;
 #[cfg(feature = "tls-rustls")]
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     ClientConfig, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    tungstenite::{client::IntoClientRequest, Message},
     Connector, MaybeTlsStream, WebSocketStream,
+    tungstenite::{Message, client::IntoClientRequest},
 };
 
 use crate::{
+    DataType, PushObject,
     client::Client,
     core::{
         error::{ProblemDetails, ProblemType},
         request::Request,
         response::Response,
     },
-    DataType, PushObject,
 };
 
 #[derive(Debug, Serialize)]
@@ -60,7 +60,6 @@ pub(crate) struct WebSocketResponse {
     #[serde(rename = "sessionState")]
     session_state: String,
 }
-
 
 #[derive(Debug, Serialize)]
 struct WebSocketPushEnable {
@@ -119,7 +118,6 @@ pub(crate) struct WebSocketError {
     detail: Option<String>,
     limit: Option<String>,
 }
-
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "@type")]
@@ -203,9 +201,9 @@ impl Client {
         &self,
     ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>> + use<>>>> {
         let session = self.session();
-        let capabilities = session.websocket_capabilities().ok_or_else(|| {
-            crate::Error::WebSocketNotConnected
-        })?;
+        let capabilities = session
+            .websocket_capabilities()
+            .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
 
         let mut request = capabilities.url().into_client_request()?;
         request
@@ -228,17 +226,10 @@ impl Client {
                 native_tls::TlsConnector::builder()
                     .danger_accept_invalid_certs(true)
                     .build()
-                    .map_err(|e| {
-                        tokio_tungstenite::tungstenite::error::Error::Tls(e.into())
-                    })?,
+                    .map_err(|e| tokio_tungstenite::tungstenite::error::Error::Tls(e.into()))?,
             );
-            tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                None,
-                false,
-                connector.into(),
-            )
-            .await?
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector.into())
+                .await?
         } else {
             tokio_tungstenite::connect_async(request).await?
         };
@@ -293,8 +284,8 @@ impl Client {
         let request_id = ws.req_id.to_string();
         ws.req_id += 1;
 
-        let method_calls = serde_json::to_value(&request.method_calls)
-            .unwrap_or(serde_json::Value::Array(vec![]));
+        let method_calls =
+            serde_json::to_value(&request.method_calls).unwrap_or(serde_json::Value::Array(vec![]));
         ws.tx
             .send(Message::text(
                 serde_json::to_string(&WebSocketRequest {

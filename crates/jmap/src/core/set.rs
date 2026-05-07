@@ -1,10 +1,10 @@
 use crate::Error;
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use super::{request::ResultReference, Object};
+use super::{Object, request::ResultReference};
 
 pub trait SetObject: Object {
     type SetArguments: Default;
@@ -198,7 +198,10 @@ impl<O: SetObject> SetRequest<O> {
 
 impl<O: SetObjectCreatable> SetRequest<O> {
     pub fn create(&mut self) -> &mut O {
-        let create_id = self.create.as_ref().map_or(0, std::collections::HashMap::len);
+        let create_id = self
+            .create
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len);
         let create_id_str = format!("c{create_id}");
         self.create
             .get_or_insert_with(HashMap::new)
@@ -215,7 +218,10 @@ impl<O: SetObjectCreatable> SetRequest<O> {
     }
 
     pub fn create_item(&mut self, item: O) -> String {
-        let create_id = self.create.as_ref().map_or(0, std::collections::HashMap::len);
+        let create_id = self
+            .create
+            .as_ref()
+            .map_or(0, std::collections::HashMap::len);
         let create_id_str = format!("c{create_id}");
         self.create
             .get_or_insert_with(HashMap::new)
@@ -298,9 +304,7 @@ impl<O: SetObject> SetResponse<O> {
     }
 
     pub fn take_updated_ids(&mut self) -> Option<Vec<String>> {
-        self.updated
-            .take()
-            .map(|map| map.into_keys().collect())
+        self.updated.take().map(|map| map.into_keys().collect())
     }
 
     pub fn destroyed_ids(&self) -> Option<impl Iterator<Item = &String>> {
@@ -337,17 +341,19 @@ impl<O: SetObject> SetResponse<O> {
 
     pub fn unwrap_update_errors(&self) -> crate::Result<()> {
         if let Some(errors) = &self.not_updated
-            && let Some(err) = errors.values().next() {
-                return Err(err.to_string_error().into());
-            }
+            && let Some(err) = errors.values().next()
+        {
+            return Err(err.to_string_error().into());
+        }
         Ok(())
     }
 
     pub fn unwrap_create_errors(&self) -> crate::Result<()> {
         if let Some(errors) = &self.not_created
-            && let Some(err) = errors.values().next() {
-                return Err(err.to_string_error().into());
-            }
+            && let Some(err) = errors.values().next()
+        {
+            return Err(err.to_string_error().into());
+        }
         Ok(())
     }
 }

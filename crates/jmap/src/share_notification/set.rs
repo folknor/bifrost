@@ -1,8 +1,8 @@
-//! ShareNotification is destroy-only — no create or update is permitted
+//! ShareNotification is destroy-only - no create or update is permitted
 //! (RFC 9670). Only `SetObject` is implemented, not `SetObjectCreatable`,
 //! so `create()` and `update()` are unavailable at compile time.
 
-use crate::{core::set::SetObject, Get, Set};
+use crate::{Get, Set, core::set::SetObject};
 
 use super::ShareNotification;
 

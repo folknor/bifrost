@@ -4,12 +4,12 @@ pub mod set;
 
 use std::fmt::Display;
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+use crate::Get;
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
-use crate::Get;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressBook<State = Get> {
@@ -141,6 +141,23 @@ crate::impl_jmap_object!(AddressBook<State>, Property, true);
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(AddressBookGet, AddressBook<Set>, "AddressBook/get", crate::core::capability::Contacts, crate::core::get::GetResponse<AddressBook<Get>>);
-crate::define_set_method!(AddressBookSet, AddressBook<Set>, "AddressBook/set", crate::core::capability::Contacts, crate::core::set::SetResponse<AddressBook<Get>>);
-crate::define_changes_method!(AddressBookChanges, "AddressBook/changes", crate::core::capability::Contacts, crate::core::changes::ChangesResponse<AddressBook<Get>>);
+crate::define_get_method!(
+    AddressBookGet,
+    AddressBook<Set>,
+    "AddressBook/get",
+    crate::core::capability::Contacts,
+    crate::core::get::GetResponse<AddressBook<Get>>
+);
+crate::define_set_method!(
+    AddressBookSet,
+    AddressBook<Set>,
+    "AddressBook/set",
+    crate::core::capability::Contacts,
+    crate::core::set::SetResponse<AddressBook<Get>>
+);
+crate::define_changes_method!(
+    AddressBookChanges,
+    "AddressBook/changes",
+    crate::core::capability::Contacts,
+    crate::core::changes::ChangesResponse<AddressBook<Get>>
+);

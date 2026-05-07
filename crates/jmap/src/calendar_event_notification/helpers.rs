@@ -1,16 +1,15 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
     },
-    Get,
 };
 
 use super::{
     CalendarEventNotification, CalendarEventNotificationChanges, CalendarEventNotificationGet,
-    CalendarEventNotificationQuery,
-    CalendarEventNotificationSet, Property,
+    CalendarEventNotificationQuery, CalendarEventNotificationSet, Property,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
@@ -58,9 +57,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn calendar_event_notification_query(
         &self,
         filter: Option<impl Into<Filter<super::query::Filter>>>,
-        sort: Option<
-            impl IntoIterator<Item = Comparator<super::query::Comparator>>,
-        >,
+        sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();

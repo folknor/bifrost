@@ -1,4 +1,4 @@
-# TODO — jmap-client
+# TODO - jmap-client
 
 Items below have been evaluated and consciously deferred. Each includes the rationale for deferral and the conditions under which it should be revisited.
 
@@ -20,7 +20,7 @@ Items below have been evaluated and consciously deferred. Each includes the rati
 
 Every convenience helper method (e.g., `email_get`, `mailbox_create`, `calendar_event_query`) calls `request.default_account_id().to_string()` to pass the account ID to method struct constructors. This allocates one `String` per helper call.
 
-**Why accepted:** The allocation is small (account IDs are typically 10-30 bytes) and happens once per JMAP operation — dwarfed by the HTTP request cost. Fixing would require changing all method constructors to accept `&str` and store `Cow<'_, str>`, or passing the account ID by reference through the entire builder chain. That's ~90 call sites of mechanical churn for a sub-microsecond improvement.
+**Why accepted:** The allocation is small (account IDs are typically 10-30 bytes) and happens once per JMAP operation - dwarfed by the HTTP request cost. Fixing would require changing all method constructors to accept `&str` and store `Cow<'_, str>`, or passing the account ID by reference through the entire builder chain. That's ~90 call sites of mechanical churn for a sub-microsecond improvement.
 
 **Revisit when:** If profiling shows helper method overhead is significant relative to network I/O, or if the `AccountScope` type grows helper methods that can pass the account ID by reference internally.
 
@@ -30,7 +30,7 @@ Every convenience helper method (e.g., `email_get`, `mailbox_create`, `calendar_
 
 `CallHandle` stores `call_id: String` which is always a short string like `"s0"`, `"s1"`. This allocates 2-3 bytes on the heap per method call (plus the `String` header overhead). The call_id is also cloned into `RawMethodCall`.
 
-**Why accepted:** Two tiny allocations per method call. A typical JMAP request has 1-5 method calls. The total overhead is ~100 bytes of heap allocation per request — noise compared to the JSON serialization and HTTP transfer. Fixing would require using `usize` internally and formatting to string only during serialization, which adds complexity to `CallHandle`, `ResultReference`, and the response lookup path.
+**Why accepted:** Two tiny allocations per method call. A typical JMAP request has 1-5 method calls. The total overhead is ~100 bytes of heap allocation per request - noise compared to the JSON serialization and HTTP transfer. Fixing would require using `usize` internally and formatting to string only during serialization, which adds complexity to `CallHandle`, `ResultReference`, and the response lookup path.
 
 **Revisit when:** If the crate is used in an extremely high-throughput scenario where per-request overhead matters at the sub-microsecond level.
 
@@ -56,7 +56,7 @@ Surfaced by downstream consumer feedback. All are breaking; bundle into a single
 
 **Change:** Return `Option<Role>` / `Option<usize>` etc. where the JMAP spec allows the property to be absent.
 
-**Why:** Sentinel values are un-Rusty and surprise users who reach for `if let Some(role)`. The `Field<T>` machinery already distinguishes omitted/null/value internally — the getter layer is flattening that away incorrectly.
+**Why:** Sentinel values are un-Rusty and surprise users who reach for `if let Some(role)`. The `Field<T>` machinery already distinguishes omitted/null/value internally - the getter layer is flattening that away incorrectly.
 
 ---
 
@@ -84,7 +84,7 @@ Surfaced by downstream consumer feedback. All are breaking; bundle into a single
 
 `mailbox_changes(since_state, 0)` compiles and sends, but `0` violates the JMAP spec (must be > 0). Server rejects at runtime.
 
-**Change:** Validate at the call site (return `Error::InvalidArgument` for `0`), or redefine `0` to mean "server default" and document it. Likely the former — silent semantic overloading is worse than an error.
+**Change:** Validate at the call site (return `Error::InvalidArgument` for `0`), or redefine `0` to mean "server default" and document it. Likely the former - silent semantic overloading is worse than an error.
 
 **Why:** Catch the bug before the network round-trip.
 
@@ -94,7 +94,7 @@ Surfaced by downstream consumer feedback. All are breaking; bundle into a single
 
 `email_submission_create(email_id, identity_id)` takes two string-ish IDs. Consumers pass an account ID by mistake because there's no type-level distinction.
 
-**Change:** Use the phantom-typed `Id<T>` wrapper (`Id<IdentityId>`, `Id<EmailId>`) on helper signatures so mix-ups fail to compile. `Id<T>` already exists in the crate (per CLAUDE.md "Available for incremental adoption") — this is the incremental adoption.
+**Change:** Use the phantom-typed `Id<T>` wrapper (`Id<IdentityId>`, `Id<EmailId>`) on helper signatures so mix-ups fail to compile. `Id<T>` already exists in the crate (per CLAUDE.md "Available for incremental adoption") - this is the incremental adoption.
 
 **Why:** The type system should enforce what the parameter name only suggests.
 
@@ -104,10 +104,10 @@ Surfaced by downstream consumer feedback. All are breaking; bundle into a single
 
 These came up in the same feedback but are Rust-isms, not API bugs:
 
-- `take_id()` / `take_list()` needing `let mut response` — ownership semantics, correct as-is.
-- `changes.created()` returning `&[String]` not `&[&str]` — matches storage, `.map(String::as_str)` is idiomatic.
-- Filter type inference requiring an explicit binding — a generics limitation; fixing it would need a less-generic API.
-- `download(blob_id)` signature — consumer expected a wrong signature; current shape is correct.
+- `take_id()` / `take_list()` needing `let mut response` - ownership semantics, correct as-is.
+- `changes.created()` returning `&[String]` not `&[&str]` - matches storage, `.map(String::as_str)` is idiomatic.
+- Filter type inference requiring an explicit binding - a generics limitation; fixing it would need a less-generic API.
+- `download(blob_id)` signature - consumer expected a wrong signature; current shape is correct.
 
 ---
 
@@ -115,5 +115,5 @@ These came up in the same feedback but are Rust-isms, not API bugs:
 
 Implementation plans for additional JMAP specifications are in the `plans/` directory:
 
-- **MDN (RFC 9007)** — `plans/MDN.md` — Read receipts (MDN/send, MDN/parse)
-- **S/MIME (RFC 9219)** — `plans/SMIME.md` — Email signature verification properties and filters
+- **MDN (RFC 9007)** - `plans/MDN.md` - Read receipts (MDN/send, MDN/parse)
+- **S/MIME (RFC 9219)** - `plans/SMIME.md` - Email signature verification properties and filters

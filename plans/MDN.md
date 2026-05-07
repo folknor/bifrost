@@ -1,4 +1,4 @@
-# JMAP MDN Handling — Implementation Reference
+# JMAP MDN Handling - Implementation Reference
 
 Spec: [RFC 9007](https://www.rfc-editor.org/rfc/rfc9007) (published March 2021)
 
@@ -18,31 +18,31 @@ Send a disposition notification (read receipt) back to the original sender.
 
 **Request properties:**
 - `accountId` (Id)
-- `identityId` (Id) — Identity to send the MDN from
-- `send` (Id[MDN]) — Map of creation ID → MDN object
-- `onSuccessUpdateEmail` (Id[PatchObject]|null) — Patches to apply to the original email after successful send (typically sets `$mdnsent` keyword)
+- `identityId` (Id) - Identity to send the MDN from
+- `send` (Id[MDN]) - Map of creation ID → MDN object
+- `onSuccessUpdateEmail` (Id[PatchObject]|null) - Patches to apply to the original email after successful send (typically sets `$mdnsent` keyword)
 
 **MDN object properties:**
-- `forEmailId` (Id) — Required. The email being acknowledged
-- `subject` (String|null) — Subject of the MDN message
-- `textBody` (String|null) — Human-readable body
-- `reportingUA` (String|null) — User agent identifier
-- `disposition` (Disposition) — Required. The disposition object
-- `finalRecipient` (String|null) — Server auto-fills from identity if null
+- `forEmailId` (Id) - Required. The email being acknowledged
+- `subject` (String|null) - Subject of the MDN message
+- `textBody` (String|null) - Human-readable body
+- `reportingUA` (String|null) - User agent identifier
+- `disposition` (Disposition) - Required. The disposition object
+- `finalRecipient` (String|null) - Server auto-fills from identity if null
 - `originalRecipient` (String|null)
-- `originalMessageId` (String|null) — Server auto-fills from email if null
-- `error` (String[]|null) — Error descriptions
-- `extensionFields` (String[String]|null) — Non-standard header fields
+- `originalMessageId` (String|null) - Server auto-fills from email if null
+- `error` (String[]|null) - Error descriptions
+- `extensionFields` (String[String]|null) - Non-standard header fields
 
 **Disposition object:**
-- `actionMode` (String) — `"manual-action"` or `"automatic-action"`
-- `sendingMode` (String) — `"mdn-sent-manually"` or `"mdn-sent-automatically"`
-- `type` (String) — `"deleted"`, `"dispatched"`, `"displayed"`, or `"processed"`
+- `actionMode` (String) - `"manual-action"` or `"automatic-action"`
+- `sendingMode` (String) - `"mdn-sent-manually"` or `"mdn-sent-automatically"`
+- `type` (String) - `"deleted"`, `"dispatched"`, `"displayed"`, or `"processed"`
 
 All values must be lowercase.
 
 **Errors:**
-- `mdnAlreadySent` — The email already has the `$mdnsent` keyword
+- `mdnAlreadySent` - The email already has the `$mdnsent` keyword
 - Standard SetError types (notFound, forbidden, etc.)
 
 ### MDN/parse
@@ -52,9 +52,9 @@ Parse MDN data from message blobs.
 **Request:** `accountId`, `blobIds` (Id[])
 
 **Response:**
-- `parsed` (Id[MDN]) — Successfully parsed MDN objects keyed by blob ID
-- `notParsable` (Id[]) — Blob IDs that couldn't be parsed as MDN
-- `notFound` (Id[]) — Missing blob IDs
+- `parsed` (Id[MDN]) - Successfully parsed MDN objects keyed by blob ID
+- `notParsable` (Id[]) - Blob IDs that couldn't be parsed as MDN
+- `notFound` (Id[]) - Missing blob IDs
 
 ## Workflow
 
@@ -75,7 +75,7 @@ Include `Disposition-Notification-To` header in outgoing email pointing to the a
 
 ## Relevance to Ratatoskr
 
-- "Read receipts (outgoing)" is already in TODO.md — this is the JMAP-native implementation
+- "Read receipts (outgoing)" is already in TODO.md - this is the JMAP-native implementation
 - Send side: add `Disposition-Notification-To` header in compose when user enables read receipt
 - Receive side: detect MDN messages, offer "Send read receipt?" prompt
 - Parse side: show "Read by X at Y" status on sent messages that received MDNs

@@ -164,7 +164,6 @@ impl<O: QueryObject> QueryRequest<O> {
     pub fn arguments(&mut self) -> &mut O::QueryArguments {
         &mut self.arguments
     }
-
 }
 
 impl QueryResponse {
@@ -266,7 +265,10 @@ impl<T> Filter<T> {
     {
         Filter::FilterOperator(FilterOperator {
             operator: Operator::And,
-            conditions: conditions.into_iter().map(std::convert::Into::into).collect(),
+            conditions: conditions
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
         })
     }
 
@@ -277,7 +279,10 @@ impl<T> Filter<T> {
     {
         Filter::FilterOperator(FilterOperator {
             operator: Operator::Or,
-            conditions: conditions.into_iter().map(std::convert::Into::into).collect(),
+            conditions: conditions
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
         })
     }
 
@@ -288,7 +293,10 @@ impl<T> Filter<T> {
     {
         Filter::FilterOperator(FilterOperator {
             operator: Operator::Not,
-            conditions: conditions.into_iter().map(std::convert::Into::into).collect(),
+            conditions: conditions
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
         })
     }
 }

@@ -1,4 +1,4 @@
-use super::{Principal, PrincipalAccount, Type, ACL, DKIM};
+use super::{ACL, DKIM, Principal, PrincipalAccount, Type};
 use crate::Get;
 use std::collections::HashMap;
 

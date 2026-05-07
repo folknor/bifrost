@@ -1,17 +1,17 @@
+#[cfg(feature = "calendars")]
+use crate::event_source::CalendarAlert;
 use crate::{
+    DataType, PushObject,
     client::Client,
     core::{
         session::URLPart,
         transport::{HttpTransport, SseTransport},
     },
     event_source::{
-        parser::{EventParser, EventType},
         Changes, PushNotification,
+        parser::{EventParser, EventType},
     },
-    DataType, PushObject,
 };
-#[cfg(feature = "calendars")]
-use crate::event_source::CalendarAlert;
 use futures_util::{Stream, StreamExt};
 
 impl<T: HttpTransport + SseTransport> Client<T> {
@@ -44,8 +44,7 @@ impl<T: HttpTransport + SseTransport> Client<T> {
                         }
                     }
                     super::URLParameter::CloseAfter => {
-                        event_source_url
-                            .push_str(if close_after_state { "state" } else { "no" });
+                        event_source_url.push_str(if close_after_state { "state" } else { "no" });
                     }
                     super::URLParameter::Ping => {
                         if let Some(ping) = ping {

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::{core::set::{SetObject, SetObjectCreatable}, Get, Set};
+use crate::{
+    Get, Set,
+    core::set::{SetObject, SetObjectCreatable},
+};
 
 use super::ParticipantIdentity;
 

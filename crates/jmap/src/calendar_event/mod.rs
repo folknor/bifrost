@@ -1,6 +1,6 @@
 //! CalendarEvent wraps a JSCalendar Event (RFC 8984) object.
 //!
-//! Unlike Email or Mailbox, a CalendarEvent IS a JSCalendar object — its
+//! Unlike Email or Mailbox, a CalendarEvent IS a JSCalendar object - its
 //! property set is open-ended and includes vendor extension properties
 //! (e.g. `example.com:custom-field`). The struct therefore stores all
 //! properties in a `serde_json::Map` for round-trip fidelity.
@@ -115,18 +115,12 @@ pub struct GetArguments {
 }
 
 impl GetArguments {
-    pub fn recurrence_overrides_before(
-        &mut self,
-        before: impl Into<String>,
-    ) -> &mut Self {
+    pub fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
         self.recurrence_overrides_before = Some(before.into());
         self
     }
 
-    pub fn recurrence_overrides_after(
-        &mut self,
-        after: impl Into<String>,
-    ) -> &mut Self {
+    pub fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
         self.recurrence_overrides_after = Some(after.into());
         self
     }
@@ -240,9 +234,42 @@ crate::define_open_property_enum! {
 use crate::{Get, Set};
 
 // Method structs for the new architecture
-crate::define_get_method!(CalendarEventGet, CalendarEvent<Set>, "CalendarEvent/get", crate::core::capability::Calendars, crate::core::get::GetResponse<CalendarEvent<Get>>);
-crate::define_set_method!(CalendarEventSet, CalendarEvent<Set>, "CalendarEvent/set", crate::core::capability::Calendars, crate::core::set::SetResponse<CalendarEvent<Get>>);
-crate::define_changes_method!(CalendarEventChanges, "CalendarEvent/changes", crate::core::capability::Calendars, crate::core::changes::ChangesResponse<CalendarEvent<Get>>);
-crate::define_query_method!(CalendarEventQuery, CalendarEvent<Set>, "CalendarEvent/query", crate::core::capability::Calendars);
-crate::define_query_changes_method!(CalendarEventQueryChanges, CalendarEvent<Set>, "CalendarEvent/queryChanges", crate::core::capability::Calendars);
-crate::define_copy_method!(CalendarEventCopy, CalendarEvent<Set>, "CalendarEvent/copy", crate::core::capability::Calendars, crate::core::copy::CopyResponse<CalendarEvent<Get>>);
+crate::define_get_method!(
+    CalendarEventGet,
+    CalendarEvent<Set>,
+    "CalendarEvent/get",
+    crate::core::capability::Calendars,
+    crate::core::get::GetResponse<CalendarEvent<Get>>
+);
+crate::define_set_method!(
+    CalendarEventSet,
+    CalendarEvent<Set>,
+    "CalendarEvent/set",
+    crate::core::capability::Calendars,
+    crate::core::set::SetResponse<CalendarEvent<Get>>
+);
+crate::define_changes_method!(
+    CalendarEventChanges,
+    "CalendarEvent/changes",
+    crate::core::capability::Calendars,
+    crate::core::changes::ChangesResponse<CalendarEvent<Get>>
+);
+crate::define_query_method!(
+    CalendarEventQuery,
+    CalendarEvent<Set>,
+    "CalendarEvent/query",
+    crate::core::capability::Calendars
+);
+crate::define_query_changes_method!(
+    CalendarEventQueryChanges,
+    CalendarEvent<Set>,
+    "CalendarEvent/queryChanges",
+    crate::core::capability::Calendars
+);
+crate::define_copy_method!(
+    CalendarEventCopy,
+    CalendarEvent<Set>,
+    "CalendarEvent/copy",
+    crate::core::capability::Calendars,
+    crate::core::copy::CopyResponse<CalendarEvent<Get>>
+);

@@ -1,4 +1,5 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
@@ -6,13 +7,9 @@ use crate::{
         set::SetObject,
     },
     principal::ACL,
-    Get,
 };
 
-use super::{
-    Mailbox, MailboxChanges, MailboxGet, MailboxQuery, MailboxSet, Property,
-    Role,
-};
+use super::{Mailbox, MailboxChanges, MailboxGet, MailboxQuery, MailboxSet, Property, Role};
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn mailbox_create(

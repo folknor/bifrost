@@ -1,5 +1,8 @@
-use super::{Principal, PrincipalAccount, Property, Type, ACL, DKIM};
-use crate::{core::set::{SetObject, SetObjectCreatable}, Get, Set};
+use super::{ACL, DKIM, Principal, PrincipalAccount, Property, Type};
+use crate::{
+    Get, Set,
+    core::set::{SetObject, SetObjectCreatable},
+};
 use std::collections::HashMap;
 
 impl Principal<Set> {
@@ -79,10 +82,7 @@ impl Principal<Set> {
     }
 
     /// RFC 9670: Set accounts accessible to this principal.
-    pub fn accounts(
-        &mut self,
-        accounts: Option<HashMap<String, PrincipalAccount>>,
-    ) -> &mut Self {
+    pub fn accounts(&mut self, accounts: Option<HashMap<String, PrincipalAccount>>) -> &mut Self {
         self.accounts = accounts;
         self
     }

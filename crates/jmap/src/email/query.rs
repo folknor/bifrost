@@ -2,11 +2,11 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::{
+    Set,
     core::{
         query::{self, QueryObject},
         set::from_timestamp,
     },
-    Set,
 };
 
 use super::{Email, QueryArguments};

@@ -77,14 +77,10 @@ pub trait HttpTransport: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 
     /// Download a blob (GET, returns raw bytes).
-    fn download(&self, url: &str)
-        -> impl Future<Output = Result<Bytes, TransportError>> + Send;
+    fn download(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 
     /// Fetch the session resource (GET, returns JSON).
-    fn get_session(
-        &self,
-        url: &str,
-    ) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
+    fn get_session(&self, url: &str) -> impl Future<Output = Result<Bytes, TransportError>> + Send;
 }
 
 /// Streaming transport for Server-Sent Events (EventSource).
@@ -93,9 +89,7 @@ pub trait HttpTransport: Send + Sync + 'static {
 /// The default implementation uses reqwest's byte streaming.
 pub trait SseTransport: Send + Sync + 'static {
     /// The byte stream type returned by the SSE connection.
-    type ByteStream: futures_util::Stream<Item = Result<Vec<u8>, TransportError>>
-        + Send
-        + Unpin;
+    type ByteStream: futures_util::Stream<Item = Result<Vec<u8>, TransportError>> + Send + Unpin;
 
     /// Open an SSE connection to the given URL.
     ///

@@ -105,10 +105,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
 
     /// Add a method call to the batch. Returns a typed handle for
     /// extracting the response later.
-    pub fn call<M: JmapMethod>(
-        &mut self,
-        method: M,
-    ) -> Result<CallHandle<M>, crate::Error> {
+    pub fn call<M: JmapMethod>(&mut self, method: M) -> Result<CallHandle<M>, crate::Error> {
         let call_id = format!("s{}", self.method_calls.len());
 
         // Auto-add capability
@@ -157,7 +154,6 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         let mut response = self.send().await?;
         response.get(handle)
     }
-
 }
 
 #[cfg(feature = "websockets")]

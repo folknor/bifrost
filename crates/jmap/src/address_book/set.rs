@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use crate::{core::field::Field, core::set::{SetObject, SetObjectCreatable}, Get, Set};
+use crate::{
+    Get, Set,
+    core::field::Field,
+    core::set::{SetObject, SetObjectCreatable},
+};
 
 use super::{AddressBook, AddressBookRights, AddressBookSetArguments};
 

@@ -34,9 +34,9 @@ pub mod mailbox;
 pub mod participant_identity;
 pub mod principal;
 pub mod push_subscription;
-pub mod share_notification;
 #[cfg(feature = "quota")]
 pub mod quota;
+pub mod share_notification;
 #[cfg(feature = "mail")]
 pub mod sieve;
 #[cfg(feature = "mail")]
@@ -50,8 +50,8 @@ pub use bytes::Bytes;
 use crate::core::error::MethodError;
 use crate::core::error::ProblemDetails;
 use crate::core::set::SetError;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 
 #[cfg(feature = "websockets")]
@@ -218,9 +218,10 @@ impl std::error::Error for Error {}
 impl From<core::transport::TransportError> for Error {
     fn from(e: core::transport::TransportError) -> Self {
         if let Some(ref body) = e.body
-            && let Ok(problem) = serde_json::from_slice::<ProblemDetails>(body) {
-                return Error::Problem(Box::new(problem));
-            }
+            && let Ok(problem) = serde_json::from_slice::<ProblemDetails>(body)
+        {
+            return Error::Problem(Box::new(problem));
+        }
         Error::Transport(e)
     }
 }

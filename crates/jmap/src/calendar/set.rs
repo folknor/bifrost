@@ -1,6 +1,11 @@
 use std::collections::HashMap;
 
-use crate::{calendar_event::Alert, core::field::Field, core::set::{SetObject, SetObjectCreatable}, Get, Set};
+use crate::{
+    Get, Set,
+    calendar_event::Alert,
+    core::field::Field,
+    core::set::{SetObject, SetObjectCreatable},
+};
 
 use super::{Calendar, CalendarRights, CalendarSetArguments, IncludeInAvailability};
 
@@ -41,10 +46,7 @@ impl Calendar<Set> {
         self
     }
 
-    pub fn include_in_availability(
-        &mut self,
-        include: IncludeInAvailability,
-    ) -> &mut Self {
+    pub fn include_in_availability(&mut self, include: IncludeInAvailability) -> &mut Self {
         self.include_in_availability = Some(include);
         self
     }
@@ -79,10 +81,7 @@ impl Calendar<Set> {
         self
     }
 
-    pub fn share_with(
-        &mut self,
-        share_with: Option<HashMap<String, CalendarRights>>,
-    ) -> &mut Self {
+    pub fn share_with(&mut self, share_with: Option<HashMap<String, CalendarRights>>) -> &mut Self {
         self.share_with = match share_with {
             Some(sw) => Field::Value(sw),
             None => Field::Null,

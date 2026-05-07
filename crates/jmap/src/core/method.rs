@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::capability::Capability;
 
@@ -118,15 +118,9 @@ macro_rules! define_changes_method {
         }
 
         impl $name {
-            pub fn new(
-                account_id: impl Into<String>,
-                since_state: impl Into<String>,
-            ) -> Self {
+            pub fn new(account_id: impl Into<String>, since_state: impl Into<String>) -> Self {
                 Self {
-                    inner: $crate::core::changes::ChangesRequest::new(
-                        account_id,
-                        since_state,
-                    ),
+                    inner: $crate::core::changes::ChangesRequest::new(account_id, since_state),
                 }
             }
         }
@@ -247,15 +241,9 @@ macro_rules! define_copy_method {
         }
 
         impl $name {
-            pub fn new(
-                account_id: impl Into<String>,
-                from_account_id: impl Into<String>,
-            ) -> Self {
+            pub fn new(account_id: impl Into<String>, from_account_id: impl Into<String>) -> Self {
                 Self {
-                    inner: $crate::core::copy::CopyRequest::new(
-                        account_id,
-                        from_account_id,
-                    ),
+                    inner: $crate::core::copy::CopyRequest::new(account_id, from_account_id),
                 }
             }
         }

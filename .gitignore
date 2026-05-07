@@ -11,3 +11,4 @@ Cargo.lock
 
 .claude
 .plans
+.phase1a-client.diff

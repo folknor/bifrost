@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::request::ResultReference;
 use super::Object;
+use super::request::ResultReference;
 
 pub trait GetObject: Object {
     type GetArguments: Default;
@@ -113,7 +113,6 @@ impl<O: GetObject> GetRequest<O> {
     pub fn arguments(&mut self) -> &mut O::GetArguments {
         &mut self.arguments
     }
-
 }
 
 impl<O> GetResponse<O> {

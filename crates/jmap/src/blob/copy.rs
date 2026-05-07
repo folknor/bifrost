@@ -1,10 +1,7 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::{
-    core::set::SetError,
-    Error,
-};
+use crate::{Error, core::set::SetError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CopyBlobRequest {

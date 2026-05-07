@@ -1,8 +1,8 @@
 use serde::Serialize;
 
 use crate::{
-    core::query::{self, QueryObject},
     Set,
+    core::query::{self, QueryObject},
 };
 
 use super::Quota;

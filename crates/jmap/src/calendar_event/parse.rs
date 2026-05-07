@@ -1,5 +1,4 @@
-pub type CalendarEventParseResponse =
-    crate::core::parse::ParseResponse<Vec<super::CalendarEvent>>;
+pub type CalendarEventParseResponse = crate::core::parse::ParseResponse<Vec<super::CalendarEvent>>;
 
 crate::define_parse_method!(
     CalendarEventParseRequest,

@@ -1,19 +1,13 @@
 use crate::{
-    client::Client,
-    core::{
-        changes::ChangesResponse,
-        set::SetObject,
-    },
     Get,
+    client::Client,
+    core::{changes::ChangesResponse, set::SetObject},
 };
 
 use super::{Calendar, CalendarChanges, CalendarGet, CalendarSet, Property};
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
-    pub async fn calendar_create(
-        &self,
-        name: impl Into<String>,
-    ) -> crate::Result<Calendar> {
+    pub async fn calendar_create(&self, name: impl Into<String>) -> crate::Result<Calendar> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = CalendarSet::new(&account_id);
@@ -29,11 +23,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         response.get(&handle)?.created(&id)
     }
 
-    pub async fn calendar_destroy(
-        &self,
-        id: &str,
-        remove_events: bool,
-    ) -> crate::Result<()> {
+    pub async fn calendar_destroy(&self, id: &str, remove_events: bool) -> crate::Result<()> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = CalendarSet::new(&account_id);

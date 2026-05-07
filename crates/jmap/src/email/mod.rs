@@ -5,27 +5,57 @@ pub mod parse;
 pub mod query;
 pub mod search_snippet;
 pub mod set;
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
-use serde::{de::Visitor, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Visitor};
+use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use crate::{
-    core::request::ResultReference,
-    Get,
-};
+use crate::{Get, core::request::ResultReference};
 
 crate::impl_jmap_object!(Email<State>, Property, true);
 
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(EmailGet, Email<Set>, "Email/get", crate::core::capability::Mail, crate::core::get::GetResponse<Email<Get>>);
-crate::define_set_method!(EmailSet, Email<Set>, "Email/set", crate::core::capability::Mail, crate::core::set::SetResponse<Email<Get>>);
-crate::define_changes_method!(EmailChanges, "Email/changes", crate::core::capability::Mail, crate::core::changes::ChangesResponse<Email<Get>>);
-crate::define_query_method!(EmailQuery, Email<Set>, "Email/query", crate::core::capability::Mail);
-crate::define_query_changes_method!(EmailQueryChanges, Email<Set>, "Email/queryChanges", crate::core::capability::Mail);
-crate::define_copy_method!(EmailCopy, Email<Set>, "Email/copy", crate::core::capability::Mail, crate::core::copy::CopyResponse<Email<Get>>);
+crate::define_get_method!(
+    EmailGet,
+    Email<Set>,
+    "Email/get",
+    crate::core::capability::Mail,
+    crate::core::get::GetResponse<Email<Get>>
+);
+crate::define_set_method!(
+    EmailSet,
+    Email<Set>,
+    "Email/set",
+    crate::core::capability::Mail,
+    crate::core::set::SetResponse<Email<Get>>
+);
+crate::define_changes_method!(
+    EmailChanges,
+    "Email/changes",
+    crate::core::capability::Mail,
+    crate::core::changes::ChangesResponse<Email<Get>>
+);
+crate::define_query_method!(
+    EmailQuery,
+    Email<Set>,
+    "Email/query",
+    crate::core::capability::Mail
+);
+crate::define_query_changes_method!(
+    EmailQueryChanges,
+    Email<Set>,
+    "Email/queryChanges",
+    crate::core::capability::Mail
+);
+crate::define_copy_method!(
+    EmailCopy,
+    Email<Set>,
+    "Email/copy",
+    crate::core::capability::Mail,
+    crate::core::copy::CopyResponse<Email<Get>>
+);
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Email<State = Get> {
@@ -429,9 +459,8 @@ impl<'de> Visitor<'de> for PropertyVisitor {
     where
         E: serde::de::Error,
     {
-        Property::parse(v).ok_or_else(|| {
-            serde::de::Error::custom(format!("Failed to parse JMAP property '{v}'"))
-        })
+        Property::parse(v)
+            .ok_or_else(|| serde::de::Error::custom(format!("Failed to parse JMAP property '{v}'")))
     }
 }
 
@@ -582,11 +611,7 @@ impl Display for Header {
         write!(f, "header:")?;
         self.name.fmt(f)?;
         self.form.fmt(f)?;
-        if self.all {
-            write!(f, ":all")
-        } else {
-            Ok(())
-        }
+        if self.all { write!(f, ":all") } else { Ok(()) }
     }
 }
 

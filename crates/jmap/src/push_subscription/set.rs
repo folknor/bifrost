@@ -1,6 +1,6 @@
 use crate::{
-    core::set::{from_timestamp, SetObject, SetObjectCreatable},
-    Get, Set, DataType,
+    DataType, Get, Set,
+    core::set::{SetObject, SetObjectCreatable, from_timestamp},
 };
 
 use super::{Keys, PushSubscription};

@@ -2,7 +2,7 @@
 
 Rust clients for email/calendar/contact protocols, built for [ratatoskr](https://github.com/folknor/ratatoskr).
 
-> **Bifrost** — the rainbow bridge that connects Asgard to the other realms in Norse cosmology. These crates connect a single client to many email-server realms.
+> **Bifrost** - the rainbow bridge that connects Asgard to the other realms in Norse cosmology. These crates connect a single client to many email-server realms.
 
 ## Crates
 

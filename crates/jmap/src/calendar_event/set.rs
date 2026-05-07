@@ -25,11 +25,7 @@ impl CalendarEvent<Set> {
         self
     }
 
-    pub fn calendar_id(
-        &mut self,
-        calendar_id: impl Into<String>,
-        set: bool,
-    ) -> &mut Self {
+    pub fn calendar_id(&mut self, calendar_id: impl Into<String>, set: bool) -> &mut Self {
         let entry = self
             .properties
             .entry("calendarIds")
@@ -61,10 +57,7 @@ impl CalendarEvent<Set> {
         self
     }
 
-    pub fn description_content_type(
-        &mut self,
-        content_type: impl Into<String>,
-    ) -> &mut Self {
+    pub fn description_content_type(&mut self, content_type: impl Into<String>) -> &mut Self {
         self.properties.insert(
             "descriptionContentType".into(),
             serde_json::Value::String(content_type.into()),
@@ -104,10 +97,8 @@ impl CalendarEvent<Set> {
     }
 
     pub fn status(&mut self, status: impl Into<String>) -> &mut Self {
-        self.properties.insert(
-            "status".into(),
-            serde_json::Value::String(status.into()),
-        );
+        self.properties
+            .insert("status".into(), serde_json::Value::String(status.into()));
         self
     }
 
@@ -145,8 +136,7 @@ impl CalendarEvent<Set> {
     }
 
     pub fn priority(&mut self, priority: u8) -> &mut Self {
-        self.properties
-            .insert("priority".into(), json!(priority));
+        self.properties.insert("priority".into(), json!(priority));
         self
     }
 
@@ -172,10 +162,7 @@ impl CalendarEvent<Set> {
         self
     }
 
-    pub fn keywords(
-        &mut self,
-        keywords: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn keywords(&mut self, keywords: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("keywords".into(), serde_json::Value::Object(keywords));
         self
@@ -185,17 +172,12 @@ impl CalendarEvent<Set> {
         &mut self,
         categories: serde_json::Map<String, serde_json::Value>,
     ) -> &mut Self {
-        self.properties.insert(
-            "categories".into(),
-            serde_json::Value::Object(categories),
-        );
+        self.properties
+            .insert("categories".into(), serde_json::Value::Object(categories));
         self
     }
 
-    pub fn reply_to(
-        &mut self,
-        reply_to: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn reply_to(&mut self, reply_to: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("replyTo".into(), serde_json::Value::Object(reply_to));
         self
@@ -252,10 +234,7 @@ impl CalendarEvent<Set> {
         self
     }
 
-    pub fn links(
-        &mut self,
-        links: serde_json::Map<String, serde_json::Value>,
-    ) -> &mut Self {
+    pub fn links(&mut self, links: serde_json::Map<String, serde_json::Value>) -> &mut Self {
         self.properties
             .insert("links".into(), serde_json::Value::Object(links));
         self
@@ -263,11 +242,7 @@ impl CalendarEvent<Set> {
 
     /// Set any property by name. Use this for extension properties or
     /// less-common JSCalendar properties not covered by typed methods.
-    pub fn set_property(
-        &mut self,
-        name: impl Into<String>,
-        value: serde_json::Value,
-    ) -> &mut Self {
+    pub fn set_property(&mut self, name: impl Into<String>, value: serde_json::Value) -> &mut Self {
         self.properties.insert(name.into(), value);
         self
     }

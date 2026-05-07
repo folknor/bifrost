@@ -1,6 +1,6 @@
 //! ContactCard wraps a JSContact Card (RFC 9553) object.
 //!
-//! Unlike Email or Mailbox, a ContactCard IS a JSContact object — its
+//! Unlike Email or Mailbox, a ContactCard IS a JSContact object - its
 //! property set is open-ended and includes vendor extension properties.
 //! The struct therefore stores all properties in a `serde_json::Map`
 //! for round-trip fidelity.
@@ -54,9 +54,42 @@ crate::define_open_property_enum! {
 use crate::{Get, Set};
 
 // Method structs for the new architecture
-crate::define_get_method!(ContactCardGet, ContactCard<Set>, "ContactCard/get", crate::core::capability::Contacts, crate::core::get::GetResponse<ContactCard<Get>>);
-crate::define_set_method!(ContactCardSet, ContactCard<Set>, "ContactCard/set", crate::core::capability::Contacts, crate::core::set::SetResponse<ContactCard<Get>>);
-crate::define_changes_method!(ContactCardChanges, "ContactCard/changes", crate::core::capability::Contacts, crate::core::changes::ChangesResponse<ContactCard<Get>>);
-crate::define_query_method!(ContactCardQuery, ContactCard<Set>, "ContactCard/query", crate::core::capability::Contacts);
-crate::define_query_changes_method!(ContactCardQueryChanges, ContactCard<Set>, "ContactCard/queryChanges", crate::core::capability::Contacts);
-crate::define_copy_method!(ContactCardCopy, ContactCard<Set>, "ContactCard/copy", crate::core::capability::Contacts, crate::core::copy::CopyResponse<ContactCard<Get>>);
+crate::define_get_method!(
+    ContactCardGet,
+    ContactCard<Set>,
+    "ContactCard/get",
+    crate::core::capability::Contacts,
+    crate::core::get::GetResponse<ContactCard<Get>>
+);
+crate::define_set_method!(
+    ContactCardSet,
+    ContactCard<Set>,
+    "ContactCard/set",
+    crate::core::capability::Contacts,
+    crate::core::set::SetResponse<ContactCard<Get>>
+);
+crate::define_changes_method!(
+    ContactCardChanges,
+    "ContactCard/changes",
+    crate::core::capability::Contacts,
+    crate::core::changes::ChangesResponse<ContactCard<Get>>
+);
+crate::define_query_method!(
+    ContactCardQuery,
+    ContactCard<Set>,
+    "ContactCard/query",
+    crate::core::capability::Contacts
+);
+crate::define_query_changes_method!(
+    ContactCardQueryChanges,
+    ContactCard<Set>,
+    "ContactCard/queryChanges",
+    crate::core::capability::Contacts
+);
+crate::define_copy_method!(
+    ContactCardCopy,
+    ContactCard<Set>,
+    "ContactCard/copy",
+    crate::core::capability::Contacts,
+    crate::core::copy::CopyResponse<ContactCard<Get>>
+);

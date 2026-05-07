@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Client as HttpClient;
 use reqwest::header;
 use reqwest::redirect;
-use reqwest::Client as HttpClient;
 
 use crate::core::transport::{HttpTransport, SseTransport, TransportError};
 use futures_util::Stream;
@@ -68,7 +68,7 @@ impl ReqwestTransport {
     }
 
     #[cfg(feature = "websockets")]
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub(crate) fn trusted_hosts(&self) -> &Arc<HashSet<String>> {
         &self.trusted_hosts
     }
@@ -84,20 +84,13 @@ impl ReqwestTransport {
             Ok(body)
         } else {
             // Return the full body so the caller can parse ProblemDetails
-            Err(TransportError::with_body(
-                format!("HTTP {status}"),
-                body,
-            ))
+            Err(TransportError::with_body(format!("HTTP {status}"), body))
         }
     }
 }
 
 impl HttpTransport for ReqwestTransport {
-    async fn api_request(
-        &self,
-        url: &str,
-        body: Vec<u8>,
-    ) -> Result<bytes::Bytes, TransportError> {
+    async fn api_request(&self, url: &str, body: Vec<u8>) -> Result<bytes::Bytes, TransportError> {
         let response = self
             .client
             .post(url)
@@ -156,11 +149,15 @@ impl SseTransport for ReqwestTransport {
         url: &str,
         last_event_id: Option<&str>,
     ) -> Result<Self::ByteStream, TransportError> {
-        let mut request = self.client.get(url).header(header::ACCEPT, "text/event-stream");
+        let mut request = self
+            .client
+            .get(url)
+            .header(header::ACCEPT, "text/event-stream");
         if let Some(id) = last_event_id {
             request = request.header("Last-Event-ID", id);
         }
-        let response = request.send()
+        let response = request
+            .send()
             .await
             .map_err(|e| TransportError::with_source("SSE connection failed", e))?;
 

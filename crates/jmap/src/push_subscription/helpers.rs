@@ -1,8 +1,4 @@
-use crate::{
-    client::Client,
-    core::set::SetObject,
-    DataType,
-};
+use crate::{DataType, client::Client, core::set::SetObject};
 
 use super::{Keys, PushSubscription, PushSubscriptionSet};
 
@@ -16,10 +12,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         let mut request = self.build();
         let account_id = request.default_account_id().to_string();
         let mut set = PushSubscriptionSet::new(&account_id);
-        let create_req = set
-            .create()
-            .device_client_id(device_client_id)
-            .url(url);
+        let create_req = set.create().device_client_id(device_client_id).url(url);
 
         if let Some(keys) = keys {
             create_req.keys(keys);

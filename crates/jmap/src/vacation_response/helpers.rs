@@ -1,7 +1,4 @@
-use crate::{
-    client::Client,
-    core::set::SetObject,
-};
+use crate::{client::Client, core::set::SetObject};
 
 use super::{Property, VacationResponse, VacationResponseGet, VacationResponseSet};
 

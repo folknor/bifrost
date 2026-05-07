@@ -1,4 +1,8 @@
-use crate::{core::field::Field, core::set::{SetObject, SetObjectCreatable}, Get, Set};
+use crate::{
+    Get, Set,
+    core::field::Field,
+    core::set::{SetObject, SetObjectCreatable},
+};
 
 use super::Quota;
 
@@ -65,7 +69,7 @@ impl Quota<Get> {
 
 crate::impl_get_object!(Quota, ());
 
-/// Quota is read-only — SetObject is implemented only to satisfy trait
+/// Quota is read-only - SetObject is implemented only to satisfy trait
 /// bounds required by the framework (GetResponse, ChangesResponse).
 impl SetObject for Quota<Set> {
     type SetArguments = ();

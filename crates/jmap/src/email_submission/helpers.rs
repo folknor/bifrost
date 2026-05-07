@@ -1,15 +1,16 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
         set::SetObject,
     },
-    Get,
 };
 
 use super::{
-    Address, EmailSubmission, EmailSubmissionChanges, EmailSubmissionGet, EmailSubmissionQuery, EmailSubmissionSet, Property, UndoStatus,
+    Address, EmailSubmission, EmailSubmissionChanges, EmailSubmissionGet, EmailSubmissionQuery,
+    EmailSubmissionSet, Property, UndoStatus,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {

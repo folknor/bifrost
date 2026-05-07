@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{
-    core::field::Field,
-    Get,
-};
+use crate::{Get, core::field::Field};
 
 use super::{AddressBook, AddressBookRights};
 

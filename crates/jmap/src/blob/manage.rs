@@ -1,15 +1,15 @@
-//! RFC 9404 JMAP Blob Management — Blob/upload, Blob/get, Blob/lookup.
+//! RFC 9404 JMAP Blob Management - Blob/upload, Blob/get, Blob/lookup.
 //!
 //! These are JMAP method calls (not HTTP endpoint operations).
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::Error;
 
 // ---- Blob/upload (RFC 9404 §4.1) ----
 
-/// Request for `Blob/upload` — create blobs via JMAP method call.
+/// Request for `Blob/upload` - create blobs via JMAP method call.
 #[derive(Debug, Clone, Serialize)]
 pub struct BlobUploadRequest {
     #[serde(rename = "accountId")]
@@ -137,9 +137,7 @@ impl BlobUploadRequest {
         self.create.insert(
             create_id.clone(),
             BlobUploadCreate {
-                data: vec![DataSource::Text(DataSourceText {
-                    value: text.into(),
-                })],
+                data: vec![DataSource::Text(DataSourceText { value: text.into() })],
                 type_: type_.map(std::convert::Into::into),
             },
         );
@@ -232,7 +230,7 @@ impl BlobUploadResponse {
 
 // ---- Blob/get (RFC 9404 §4.2) ----
 
-/// Request for `Blob/get` — retrieve blob content.
+/// Request for `Blob/get` - retrieve blob content.
 ///
 /// Unlike most JMAP /get methods, the `properties` here are dynamic
 /// names like `"data:asText"`, `"data:asBase64"`, `"digest:sha-256"`,
@@ -335,7 +333,8 @@ impl BlobGetRequest {
         U: IntoIterator<Item = V>,
         V: Into<String>,
     {
-        self.ids.extend(ids.into_iter().map(std::convert::Into::into));
+        self.ids
+            .extend(ids.into_iter().map(std::convert::Into::into));
         self
     }
 
@@ -347,7 +346,12 @@ impl BlobGetRequest {
         U: IntoIterator<Item = V>,
         V: Into<String>,
     {
-        self.properties = Some(properties.into_iter().map(std::convert::Into::into).collect());
+        self.properties = Some(
+            properties
+                .into_iter()
+                .map(std::convert::Into::into)
+                .collect(),
+        );
         self
     }
 
@@ -384,7 +388,7 @@ impl BlobGetResponse {
 
 // ---- Blob/lookup (RFC 9404 §4.3) ----
 
-/// Request for `Blob/lookup` — reverse lookup which objects reference a blob.
+/// Request for `Blob/lookup` - reverse lookup which objects reference a blob.
 ///
 /// **Important**: The JMAP request's `using` array must include the
 /// capability that defines each type listed in `typeNames`. For example,
@@ -446,7 +450,10 @@ impl BlobLookupRequest {
         U: IntoIterator<Item = V>,
         V: Into<String>,
     {
-        self.type_names = type_names.into_iter().map(std::convert::Into::into).collect();
+        self.type_names = type_names
+            .into_iter()
+            .map(std::convert::Into::into)
+            .collect();
         self
     }
 

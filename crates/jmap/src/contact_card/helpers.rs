@@ -1,16 +1,15 @@
 use crate::{
+    Get,
     client::Client,
     core::{
         changes::ChangesResponse,
         query::{Comparator, Filter, QueryResponse},
     },
-    Get,
 };
 
 use super::{
+    ContactCard, ContactCardChanges, ContactCardGet, ContactCardQuery, ContactCardSet, Property,
     parse::ContactCardParseRequest,
-    ContactCard, ContactCardChanges, ContactCardGet, ContactCardQuery,
-    ContactCardSet, Property,
 };
 
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {

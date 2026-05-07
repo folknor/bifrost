@@ -1,7 +1,7 @@
 /*
  * Result Reference Example
  *
- * Demonstrates JMAP result references — chaining method calls so that
+ * Demonstrates JMAP result references - chaining method calls so that
  * the output of one call feeds into the input of the next, all in a
  * single HTTP request.
  */
@@ -45,17 +45,13 @@ async fn result_reference_example() -> bifrost_jmap::Result<()> {
     ]);
     let get_handle = request.call(get)?;
 
-    // Send the batch — one HTTP round-trip for both calls
+    // Send the batch - one HTTP round-trip for both calls
     let mut response = request.send().await?;
 
     // Extract typed results using the handles
     let emails = response.get(&get_handle)?;
     for email in emails.list() {
-        println!(
-            "Subject: {:?}, From: {:?}",
-            email.subject(),
-            email.from()
-        );
+        println!("Subject: {:?}, From: {:?}", email.subject(), email.from());
     }
 
     // --- Second example: mailbox query + get ---

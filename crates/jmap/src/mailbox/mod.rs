@@ -3,12 +3,12 @@ pub mod helpers;
 pub mod query;
 pub mod set;
 
+use crate::Get;
 use crate::core::set::{skip_if_empty_map, skip_if_empty_str};
 use crate::mailbox::set::role_not_set;
 use crate::principal::ACL;
-use crate::Get;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -221,16 +221,48 @@ impl ChangesResponse {
     }
 }
 
-crate::impl_jmap_object!(Mailbox<State>, Property, true, changes_response = ChangesResponse);
+crate::impl_jmap_object!(
+    Mailbox<State>,
+    Property,
+    true,
+    changes_response = ChangesResponse
+);
 
 use crate::Set;
 
 // Method structs for the new architecture
-crate::define_get_method!(MailboxGet, Mailbox<Set>, "Mailbox/get", crate::core::capability::Mail, crate::core::get::GetResponse<Mailbox<Get>>);
-crate::define_set_method!(MailboxSet, Mailbox<Set>, "Mailbox/set", crate::core::capability::Mail, crate::core::set::SetResponse<Mailbox<Get>>);
-crate::define_changes_method!(MailboxChanges, "Mailbox/changes", crate::core::capability::Mail, crate::core::changes::ChangesResponse<Mailbox<Get>>);
-crate::define_query_method!(MailboxQuery, Mailbox<Set>, "Mailbox/query", crate::core::capability::Mail);
-crate::define_query_changes_method!(MailboxQueryChanges, Mailbox<Set>, "Mailbox/queryChanges", crate::core::capability::Mail);
+crate::define_get_method!(
+    MailboxGet,
+    Mailbox<Set>,
+    "Mailbox/get",
+    crate::core::capability::Mail,
+    crate::core::get::GetResponse<Mailbox<Get>>
+);
+crate::define_set_method!(
+    MailboxSet,
+    Mailbox<Set>,
+    "Mailbox/set",
+    crate::core::capability::Mail,
+    crate::core::set::SetResponse<Mailbox<Get>>
+);
+crate::define_changes_method!(
+    MailboxChanges,
+    "Mailbox/changes",
+    crate::core::capability::Mail,
+    crate::core::changes::ChangesResponse<Mailbox<Get>>
+);
+crate::define_query_method!(
+    MailboxQuery,
+    Mailbox<Set>,
+    "Mailbox/query",
+    crate::core::capability::Mail
+);
+crate::define_query_changes_method!(
+    MailboxQueryChanges,
+    Mailbox<Set>,
+    "Mailbox/queryChanges",
+    crate::core::capability::Mail
+);
 
 impl<'de> Deserialize<'de> for Role {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
