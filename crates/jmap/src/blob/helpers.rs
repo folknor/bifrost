@@ -10,8 +10,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     ) -> crate::Result<String> {
         let blob_id = blob_id.into();
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut copy = CopyBlobRequest::new(&account_id, from_account_id);
+        let mut copy = CopyBlobRequest::new(from_account_id);
         copy.blob_id(&blob_id);
         let handle = request.call(copy)?;
         let mut response = request.send().await?;
@@ -24,8 +23,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         type_: Option<impl Into<String>>,
     ) -> crate::Result<String> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut upload = BlobUploadRequest::new(&account_id);
+        let mut upload = BlobUploadRequest::new();
         let id = upload.create_from_text(text, type_);
         let handle = request.call(upload)?;
         let mut response = request.send().await?;

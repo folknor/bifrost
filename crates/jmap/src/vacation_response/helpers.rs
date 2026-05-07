@@ -10,8 +10,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         html_body: Option<impl Into<String>>,
     ) -> crate::Result<VacationResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = VacationResponseSet::new(&account_id);
+        let mut set = VacationResponseSet::new();
         let created_id = set
             .create()
             .is_enabled(true)
@@ -33,8 +32,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         html_body: Option<impl Into<String>>,
     ) -> crate::Result<Option<VacationResponse>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = VacationResponseSet::new(&account_id);
+        let mut set = VacationResponseSet::new();
         set.update("singleton")
             .is_enabled(true)
             .subject(Some(subject))
@@ -48,8 +46,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn vacation_response_disable(&self) -> crate::Result<Option<VacationResponse>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = VacationResponseSet::new(&account_id);
+        let mut set = VacationResponseSet::new();
         set.update("singleton").is_enabled(false);
 
         let handle = request.call(set)?;
@@ -63,8 +60,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         to_date: Option<i64>,
     ) -> crate::Result<Option<VacationResponse>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = VacationResponseSet::new(&account_id);
+        let mut set = VacationResponseSet::new();
         set.update("singleton")
             .is_enabled(true)
             .from_date(from_date)
@@ -80,8 +76,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<VacationResponse>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = VacationResponseGet::new(&account_id);
+        let mut get = VacationResponseGet::new();
         get.ids(["singleton"]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -93,8 +88,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn vacation_response_destroy(&self) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = VacationResponseSet::new(&account_id);
+        let mut set = VacationResponseSet::new();
         set.destroy(["singleton"]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;

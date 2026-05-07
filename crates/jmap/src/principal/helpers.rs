@@ -20,8 +20,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         name: impl Into<String>,
     ) -> crate::Result<Principal> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         let id = set
             .create()
             .name(name)
@@ -37,8 +36,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn domain_create(&self, name: impl Into<String>) -> crate::Result<Principal> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         let id = set
             .create()
             .name(name)
@@ -58,8 +56,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         expiration: Option<i64>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id)
             .secret(key)
             .dkim(DKIM::new(Some(selector), expiration));
@@ -75,8 +72,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         members: impl IntoIterator<Item = impl Into<String>>,
     ) -> crate::Result<Principal> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         let id = set
             .create()
             .name(name)
@@ -97,8 +93,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         members: impl IntoIterator<Item = impl Into<String>>,
     ) -> crate::Result<Principal> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         let id = set
             .create()
             .name(name)
@@ -118,8 +113,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         name: impl Into<String>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).name(name);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -132,8 +126,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         secret: impl Into<String>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).secret(secret);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -146,8 +139,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         email: impl Into<String>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).email(email);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -160,8 +152,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         timezone: Option<impl Into<String>>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).timezone(timezone);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -174,8 +165,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         members: Option<impl IntoIterator<Item = impl Into<String>>>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).members(members);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -188,8 +178,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         aliases: Option<impl IntoIterator<Item = impl Into<String>>>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).aliases(aliases);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -203,8 +192,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         capabilities: Option<std::collections::HashMap<String, serde_json::Value>>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.update(id).capabilities(capabilities);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -213,8 +201,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn principal_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PrincipalSet::new(&account_id);
+        let mut set = PrincipalSet::new();
         set.destroy([id]).arguments();
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -227,8 +214,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<Principal>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = PrincipalGet::new(&account_id);
+        let mut get = PrincipalGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -244,8 +230,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = PrincipalQuery::new(&account_id);
+        let mut query = PrincipalQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -263,8 +248,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<Principal<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = PrincipalChanges::new(&account_id, since_state);
+        let mut changes = PrincipalChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

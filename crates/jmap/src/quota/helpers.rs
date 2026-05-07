@@ -14,8 +14,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     /// Fetch all quotas for the default account.
     pub async fn quota_get_all(&self) -> crate::Result<Vec<Quota>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let get = QuotaGet::new(&account_id);
+        let get = QuotaGet::new();
         let handle = request.call(get)?;
         let mut response = request.send().await?;
         response.get(&handle).map(|mut r| r.take_list())
@@ -27,8 +26,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<Quota>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = QuotaGet::new(&account_id);
+        let mut get = QuotaGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -44,8 +42,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<Quota<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = QuotaChanges::new(&account_id, since_state);
+        let mut changes = QuotaChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;
@@ -58,8 +55,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = QuotaQuery::new(&account_id);
+        let mut query = QuotaQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -77,8 +73,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         filter: Option<impl Into<Filter<super::query::Filter>>>,
     ) -> crate::Result<QueryChangesResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = QuotaQueryChanges::new(&account_id, since_query_state);
+        let mut query = QuotaQueryChanges::new(since_query_state);
         if let Some(filter) = filter {
             query.filter(filter);
         }

@@ -56,12 +56,22 @@ impl crate::core::method::JmapMethod for EmailParseRequest {
     const NAME: &'static str = "Email/parse";
     type Cap = crate::core::capability::Mail;
     type Response = EmailParseResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
+}
+
+impl Default for EmailParseRequest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EmailParseRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         EmailParseRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             blob_ids: Vec::new(),
             properties: None,
             body_properties: None,

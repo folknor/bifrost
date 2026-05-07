@@ -70,12 +70,22 @@ impl crate::core::method::JmapMethod for EmailImportRequest {
     const NAME: &'static str = "Email/import";
     type Cap = crate::core::capability::Mail;
     type Response = EmailImportResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
+}
+
+impl Default for EmailImportRequest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EmailImportRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         EmailImportRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             if_in_state: None,
             emails: HashMap::new(),
         }

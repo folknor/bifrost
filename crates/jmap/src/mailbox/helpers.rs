@@ -19,8 +19,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         role: Role,
     ) -> crate::Result<Mailbox> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         let id = set
             .create()
             .name(name)
@@ -39,8 +38,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         name: impl Into<String>,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.update(id).name(name);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -53,8 +51,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         parent_id: Option<impl Into<String>>,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.update(id).parent_id(parent_id);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -67,8 +64,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         role: Role,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.update(id).role(role);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -82,8 +78,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         acl: impl IntoIterator<Item = ACL>,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let default_account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&default_account_id);
+        let mut set = MailboxSet::new();
         set.update(id).acl(account_id, acl);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -96,8 +91,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort_order: u32,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.update(id).sort_order(sort_order);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -110,8 +104,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         is_subscribed: bool,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.update(id).is_subscribed(is_subscribed);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -120,8 +113,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn mailbox_destroy(&self, id: &str, delete_emails: bool) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = MailboxSet::new(&account_id);
+        let mut set = MailboxSet::new();
         set.destroy([id])
             .arguments()
             .on_destroy_remove_emails(delete_emails);
@@ -136,8 +128,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<Mailbox>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = MailboxGet::new(&account_id);
+        let mut get = MailboxGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -153,8 +144,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = MailboxQuery::new(&account_id);
+        let mut query = MailboxQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -172,8 +162,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<Mailbox<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = MailboxChanges::new(&account_id, since_state);
+        let mut changes = MailboxChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

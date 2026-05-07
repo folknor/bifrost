@@ -9,8 +9,7 @@ use super::{Calendar, CalendarChanges, CalendarGet, CalendarSet, Property};
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn calendar_create(&self, name: impl Into<String>) -> crate::Result<Calendar> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = CalendarSet::new(&account_id);
+        let mut set = CalendarSet::new();
         let id = set
             .create()
             .name(name)
@@ -25,8 +24,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn calendar_destroy(&self, id: &str, remove_events: bool) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = CalendarSet::new(&account_id);
+        let mut set = CalendarSet::new();
         set.destroy([id])
             .arguments()
             .on_destroy_remove_events(remove_events);
@@ -41,8 +39,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<Calendar>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = CalendarGet::new(&account_id);
+        let mut get = CalendarGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -58,8 +55,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<Calendar<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = CalendarChanges::new(&account_id, since_state);
+        let mut changes = CalendarChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

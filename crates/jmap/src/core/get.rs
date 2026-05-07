@@ -60,10 +60,14 @@ pub struct GetResponse<T> {
 }
 
 impl<O: GetObject> GetRequest<O> {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    /// Construct an empty `GetRequest`. The `accountId` field is left
+    /// unset (or `None` for non-account-scoped objects); it is filled
+    /// in by [`crate::core::request::Request::call`] when the method
+    /// is added to a request batch.
+    pub fn new() -> Self {
         GetRequest {
             account_id: if O::requires_account_id() {
-                Some(account_id.into())
+                Some(String::new())
             } else {
                 None
             },
@@ -112,6 +116,12 @@ impl<O: GetObject> GetRequest<O> {
 
     pub fn arguments(&mut self) -> &mut O::GetArguments {
         &mut self.arguments
+    }
+}
+
+impl<O: GetObject> Default for GetRequest<O> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -19,8 +19,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<CalendarEventNotification>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = CalendarEventNotificationGet::new(&account_id);
+        let mut get = CalendarEventNotificationGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -32,8 +31,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn calendar_event_notification_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = CalendarEventNotificationSet::new(&account_id);
+        let mut set = CalendarEventNotificationSet::new();
         set.destroy([id]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -46,8 +44,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<CalendarEventNotification<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = CalendarEventNotificationChanges::new(&account_id, since_state);
+        let mut changes = CalendarEventNotificationChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;
@@ -60,8 +57,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = CalendarEventNotificationQuery::new(&account_id);
+        let mut query = CalendarEventNotificationQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }

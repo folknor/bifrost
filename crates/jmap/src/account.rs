@@ -1,6 +1,6 @@
 use crate::{
     client::Client,
-    core::{capability::Capability, id::AccountId, transport::HttpTransport},
+    core::{capability::Capability, id::AccountId, method::JmapMethod, transport::HttpTransport},
 };
 
 /// An account-scoped view of a [`Client`].
@@ -70,6 +70,27 @@ impl<Tr: HttpTransport> Account<Tr> {
         self.client
             .build()
             .account_id(self.account_id.as_str().to_string())
+    }
+
+    /// Send a single method call against this account and return its
+    /// typed response.
+    ///
+    /// This is the protocol-layer entry point for one-off method
+    /// calls. For batched / cross-method workflows (using result
+    /// references, multiple calls in one round-trip, etc.), use
+    /// [`Account::build`] to construct a [`Request`] and add calls via
+    /// [`Request::call`] manually.
+    ///
+    /// The method's `accountId` field is injected from this account,
+    /// so callers do not pass it through the method-struct
+    /// constructor.
+    ///
+    /// [`Request`]: crate::core::request::Request
+    /// [`Request::call`]: crate::core::request::Request::call
+    pub async fn call<M: JmapMethod>(&self, method: M) -> crate::Result<M::Response> {
+        let mut request = self.build();
+        let handle = request.call(method)?;
+        request.send_single(&handle).await
     }
 }
 

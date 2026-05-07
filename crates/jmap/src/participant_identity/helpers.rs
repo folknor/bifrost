@@ -9,8 +9,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<Vec<Property>>,
     ) -> crate::Result<Option<ParticipantIdentity>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = ParticipantIdentityGet::new(&account_id);
+        let mut get = ParticipantIdentityGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -26,8 +25,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<ParticipantIdentity<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = ParticipantIdentityChanges::new(&account_id, since_state);
+        let mut changes = ParticipantIdentityChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

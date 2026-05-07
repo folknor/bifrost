@@ -51,6 +51,7 @@ Do not use your Memory functionality. Do not read, write, or update memories. Do
 - Never chain/pipe commands with `|`. Exception: piping into `review` is allowed (writing scratch prompt files is wasteful).
 - Never capture stdout into env vars (`UUID=$(...)`).
 - Never read or write from `/tmp`. All data lives in the project.
+- Never redirect command output to scratch files (`> .check.log`, `> out.txt`, etc.) just to read it back. The terminal output is the channel - read it inline, or use the tool's own filtering / `--json` mode if the volume is too high.
 - Never run raw `cargo`, `curl`, `pkill`. Use `brokkr`.
 - Never run `git` with `-C <path>`. Run `git` from the current working directory.
 

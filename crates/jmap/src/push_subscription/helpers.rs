@@ -10,8 +10,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         keys: Option<Keys>,
     ) -> crate::Result<PushSubscription> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PushSubscriptionSet::new(&account_id);
+        let mut set = PushSubscriptionSet::new();
         let create_req = set.create().device_client_id(device_client_id).url(url);
 
         if let Some(keys) = keys {
@@ -30,8 +29,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         verification_code: impl Into<String>,
     ) -> crate::Result<Option<PushSubscription>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PushSubscriptionSet::new(&account_id);
+        let mut set = PushSubscriptionSet::new();
         set.update(id).verification_code(verification_code);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -44,8 +42,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         types: Option<impl IntoIterator<Item = DataType>>,
     ) -> crate::Result<Option<PushSubscription>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PushSubscriptionSet::new(&account_id);
+        let mut set = PushSubscriptionSet::new();
         set.update(id).types(types);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -54,8 +51,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn push_subscription_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = PushSubscriptionSet::new(&account_id);
+        let mut set = PushSubscriptionSet::new();
         set.destroy([id]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;

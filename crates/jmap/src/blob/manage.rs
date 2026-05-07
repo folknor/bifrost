@@ -105,24 +105,42 @@ impl crate::core::method::JmapMethod for BlobUploadRequest {
     const NAME: &'static str = "Blob/upload";
     type Cap = crate::core::capability::Blob;
     type Response = BlobUploadResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
 }
 
 impl crate::core::method::JmapMethod for BlobGetRequest {
     const NAME: &'static str = "Blob/get";
     type Cap = crate::core::capability::Blob;
     type Response = BlobGetResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
 }
 
 impl crate::core::method::JmapMethod for BlobLookupRequest {
     const NAME: &'static str = "Blob/lookup";
     type Cap = crate::core::capability::Blob;
     type Response = BlobLookupResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
+}
+
+impl Default for BlobUploadRequest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlobUploadRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         BlobUploadRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             create: HashMap::new(),
         }
     }
@@ -316,10 +334,16 @@ impl BlobGetResult {
     }
 }
 
+impl Default for BlobGetRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlobGetRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         BlobGetRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             ids: Vec::new(),
             properties: None,
             offset: None,
@@ -432,10 +456,16 @@ pub struct BlobLookupResult {
     pub matched_ids: HashMap<String, Vec<String>>,
 }
 
+impl Default for BlobLookupRequest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BlobLookupRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         BlobLookupRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             type_names: Vec::new(),
             ids: Vec::new(),
         }

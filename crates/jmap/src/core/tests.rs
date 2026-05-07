@@ -300,7 +300,8 @@ fn set_response_deserializes_without_creatable() {
 
 #[test]
 fn request_serializes_correctly() {
-    let get = TestGet::new("account-1");
+    let mut get = TestGet::new();
+    get.set_account_id("account-1");
     let value = serde_json::to_value(&get).unwrap();
     assert_eq!(value.get("accountId"), Some(&json!("account-1")));
 }

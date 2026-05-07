@@ -16,6 +16,20 @@ pub trait JmapMethod: Serialize + Send {
 
     /// The deserialized response type.
     type Response: DeserializeOwned + Send;
+
+    /// Inject the request's account ID into this method's `accountId`
+    /// field just before serialization.
+    ///
+    /// Called by [`crate::core::request::Request::call`] (and through
+    /// it by [`crate::Account::call`]) so callers no longer pass the
+    /// account ID through every method-struct constructor. The default
+    /// no-op suits methods that do not carry an `accountId` (e.g.
+    /// `Core/echo`); account-scoped methods override it.
+    ///
+    /// Cross-account methods (`Email/copy`) only inject the
+    /// destination here; the source `fromAccountId` is supplied at
+    /// construction time.
+    fn set_account_id(&mut self, _account_id: &str) {}
 }
 
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
@@ -32,18 +46,23 @@ macro_rules! define_get_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $response;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>) -> Self {
+            pub fn new() -> Self {
                 Self {
-                    inner: $crate::core::get::GetRequest::new(account_id),
+                    inner: $crate::core::get::GetRequest::new(),
                 }
             }
+        }
 
-            /// Access the underlying GetRequest for builder methods.
-            pub fn request(&mut self) -> &mut $crate::core::get::GetRequest<$obj> {
-                &mut self.inner
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
             }
         }
 
@@ -76,13 +95,23 @@ macro_rules! define_set_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $response;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>) -> Self {
+            pub fn new() -> Self {
                 Self {
-                    inner: $crate::core::set::SetRequest::new(account_id),
+                    inner: $crate::core::set::SetRequest::new(),
                 }
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
             }
         }
 
@@ -115,12 +144,16 @@ macro_rules! define_changes_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $response;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>, since_state: impl Into<String>) -> Self {
+            pub fn new(since_state: impl Into<String>) -> Self {
                 Self {
-                    inner: $crate::core::changes::ChangesRequest::new(account_id, since_state),
+                    inner: $crate::core::changes::ChangesRequest::new(since_state),
                 }
             }
         }
@@ -154,13 +187,23 @@ macro_rules! define_query_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $crate::core::query::QueryResponse;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>) -> Self {
+            pub fn new() -> Self {
                 Self {
-                    inner: $crate::core::query::QueryRequest::new(account_id),
+                    inner: $crate::core::query::QueryRequest::new(),
                 }
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
             }
         }
 
@@ -193,18 +236,16 @@ macro_rules! define_query_changes_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $crate::core::query_changes::QueryChangesResponse;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(
-                account_id: impl Into<String>,
-                since_query_state: impl Into<String>,
-            ) -> Self {
+            pub fn new(since_query_state: impl Into<String>) -> Self {
                 Self {
-                    inner: $crate::core::query_changes::QueryChangesRequest::new(
-                        account_id,
-                        since_query_state,
-                    ),
+                    inner: $crate::core::query_changes::QueryChangesRequest::new(since_query_state),
                 }
             }
         }
@@ -225,6 +266,10 @@ macro_rules! define_query_changes_method {
 }
 
 /// Generates a JMAP /copy method struct that wraps `CopyRequest<O>`.
+///
+/// The destination `accountId` is injected by `Request::call`; the
+/// source `fromAccountId` is the only constructor argument, since it
+/// is genuinely a per-call value (the account being copied *from*).
 #[macro_export]
 macro_rules! define_copy_method {
     ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
@@ -238,12 +283,16 @@ macro_rules! define_copy_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $response;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.inner.account_id(account_id);
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>, from_account_id: impl Into<String>) -> Self {
+            pub fn new(from_account_id: impl Into<String>) -> Self {
                 Self {
-                    inner: $crate::core::copy::CopyRequest::new(account_id, from_account_id),
+                    inner: $crate::core::copy::CopyRequest::new(from_account_id),
                 }
             }
         }
@@ -349,12 +398,16 @@ macro_rules! define_parse_method {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
             type Response = $response;
+
+            fn set_account_id(&mut self, account_id: &str) {
+                self.account_id = account_id.to_string();
+            }
         }
 
         impl $name {
-            pub fn new(account_id: impl Into<String>) -> Self {
+            pub fn new() -> Self {
                 Self {
-                    account_id: account_id.into(),
+                    account_id: String::new(),
                     blob_ids: Vec::new(),
                     properties: None,
                 }
@@ -375,6 +428,12 @@ macro_rules! define_parse_method {
             ) -> &mut Self {
                 self.properties = Some(properties.into_iter().collect());
                 self
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
             }
         }
     };

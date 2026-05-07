@@ -19,8 +19,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<ContactCard>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = ContactCardGet::new(&account_id);
+        let mut get = ContactCardGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -32,8 +31,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn contact_card_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = ContactCardSet::new(&account_id);
+        let mut set = ContactCardSet::new();
         set.destroy([id]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -46,8 +44,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: Option<usize>,
     ) -> crate::Result<ChangesResponse<ContactCard<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = ContactCardChanges::new(&account_id, since_state);
+        let mut changes = ContactCardChanges::new(since_state);
         if let Some(max_changes) = max_changes {
             changes.max_changes(max_changes);
         }
@@ -62,8 +59,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = ContactCardQuery::new(&account_id);
+        let mut query = ContactCardQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -81,8 +77,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Vec<ContactCard>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut parse = ContactCardParseRequest::new(&account_id);
+        let mut parse = ContactCardParseRequest::new();
         parse.blob_ids([blob_id]);
         if let Some(properties) = properties {
             parse.properties(properties);

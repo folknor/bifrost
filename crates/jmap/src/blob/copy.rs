@@ -29,13 +29,23 @@ impl crate::core::method::JmapMethod for CopyBlobRequest {
     const NAME: &'static str = "Blob/copy";
     type Cap = crate::core::capability::Core;
     type Response = CopyBlobResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
 }
 
 impl CopyBlobRequest {
-    pub fn new(account_id: impl Into<String>, from_account_id: impl Into<String>) -> Self {
+    /// Construct a `CopyBlobRequest`. The destination `accountId` is
+    /// left empty and filled in by
+    /// [`crate::core::request::Request::call`] when the method is
+    /// added to a request batch (the destination is the account that
+    /// owns the request). The source `fromAccountId` is the only
+    /// account argument here, since it is genuinely a per-call value.
+    pub fn new(from_account_id: impl Into<String>) -> Self {
         CopyBlobRequest {
             from_account_id: from_account_id.into(),
-            account_id: account_id.into(),
+            account_id: String::new(),
             blob_ids: vec![],
         }
     }

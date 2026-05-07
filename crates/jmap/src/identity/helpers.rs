@@ -13,8 +13,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         email: impl Into<String>,
     ) -> crate::Result<Identity> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = IdentitySet::new(&account_id);
+        let mut set = IdentitySet::new();
         let id = set.create().name(name).email(email).create_id().unwrap();
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -23,8 +22,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn identity_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = IdentitySet::new(&account_id);
+        let mut set = IdentitySet::new();
         set.destroy([id]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -37,8 +35,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<Vec<Property>>,
     ) -> crate::Result<Option<Identity>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = IdentityGet::new(&account_id);
+        let mut get = IdentityGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -54,8 +51,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<Identity<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = IdentityChanges::new(&account_id, since_state);
+        let mut changes = IdentityChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

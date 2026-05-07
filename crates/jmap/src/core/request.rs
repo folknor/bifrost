@@ -105,7 +105,12 @@ impl<'x, T: HttpTransport> Request<'x, T> {
 
     /// Add a method call to the batch. Returns a typed handle for
     /// extracting the response later.
-    pub fn call<M: JmapMethod>(&mut self, method: M) -> Result<CallHandle<M>, crate::Error> {
+    ///
+    /// The request's account ID is injected into the method via
+    /// [`JmapMethod::set_account_id`] just before serialization, so
+    /// callers no longer pass `accountId` through every method-struct
+    /// constructor.
+    pub fn call<M: JmapMethod>(&mut self, mut method: M) -> Result<CallHandle<M>, crate::Error> {
         let call_id = format!("s{}", self.method_calls.len());
 
         // Auto-add capability
@@ -113,6 +118,10 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         if !self.using.contains(&uri) {
             self.using.push(uri);
         }
+
+        // Inject the request's account ID into the method's accountId
+        // field. No-op for methods that don't carry an accountId.
+        method.set_account_id(&self.account_id);
 
         // Serialize method arguments once as raw JSON
         let arguments = serde_json::value::to_raw_value(&method)?;

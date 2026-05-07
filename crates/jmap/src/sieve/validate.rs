@@ -24,12 +24,16 @@ impl crate::core::method::JmapMethod for SieveScriptValidateRequest {
     const NAME: &'static str = "SieveScript/validate";
     type Cap = crate::core::capability::Sieve;
     type Response = SieveScriptValidateResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
 }
 
 impl SieveScriptValidateRequest {
-    pub fn new(account_id: impl Into<String>, blob_id: impl Into<String>) -> Self {
+    pub fn new(blob_id: impl Into<String>) -> Self {
         SieveScriptValidateRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             blob_id: blob_id.into(),
         }
     }

@@ -54,11 +54,17 @@ pub struct CopyResponse<O: SetObject> {
 }
 
 impl<T: SetObjectCreatable> CopyRequest<T> {
-    pub fn new(account_id: impl Into<String>, from_account_id: impl Into<String>) -> Self {
+    /// Construct a `CopyRequest`. The destination `accountId` is left
+    /// empty and filled in by
+    /// [`crate::core::request::Request::call`] when the method is
+    /// added to a request batch (the destination is the account that
+    /// owns the request). The source `fromAccountId` is the only
+    /// account argument here, since it is genuinely a per-call value.
+    pub fn new(from_account_id: impl Into<String>) -> Self {
         CopyRequest {
             from_account_id: from_account_id.into(),
             if_from_in_state: None,
-            account_id: account_id.into(),
+            account_id: String::new(),
             if_in_state: None,
             create: HashMap::new(),
             on_success_destroy_original: false,

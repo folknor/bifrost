@@ -107,9 +107,13 @@ pub struct QueryResponse {
 }
 
 impl<O: QueryObject> QueryRequest<O> {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    /// Construct an empty `QueryRequest`. The `accountId` field is
+    /// left empty; it is filled in by
+    /// [`crate::core::request::Request::call`] when the method is
+    /// added to a request batch.
+    pub fn new() -> Self {
         QueryRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             filter: None,
             sort: None,
             position: None,
@@ -163,6 +167,12 @@ impl<O: QueryObject> QueryRequest<O> {
 
     pub fn arguments(&mut self) -> &mut O::QueryArguments {
         &mut self.arguments
+    }
+}
+
+impl<O: QueryObject> Default for QueryRequest<O> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

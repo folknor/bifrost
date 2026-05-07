@@ -58,8 +58,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
             .upload(account_id.into(), raw_message, None)
             .await?
             .take_blob_id();
-        let mut request = self.build();
-        let mut import = EmailImportRequest::new(account_id);
+        let mut request = self.build().account_id(account_id.to_string());
+        let mut import = EmailImportRequest::new();
         let import_item = import.email(blob_id).mailbox_ids(mailbox_ids);
 
         if let Some(keywords) = keywords {
@@ -83,8 +83,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         set: bool,
     ) -> crate::Result<Option<Email>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut email_set = EmailSet::new(&account_id);
+        let mut email_set = EmailSet::new();
         email_set.update(id).mailbox_id(mailbox_id, set);
         let handle = request.call(email_set)?;
         let mut response = request.send().await?;
@@ -101,8 +100,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         U: Into<String>,
     {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut email_set = EmailSet::new(&account_id);
+        let mut email_set = EmailSet::new();
         email_set.update(id).mailbox_ids(mailbox_ids);
         let handle = request.call(email_set)?;
         let mut response = request.send().await?;
@@ -116,8 +114,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         set: bool,
     ) -> crate::Result<Option<Email>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut email_set = EmailSet::new(&account_id);
+        let mut email_set = EmailSet::new();
         email_set.update(id).keyword(keyword, set);
         let handle = request.call(email_set)?;
         let mut response = request.send().await?;
@@ -134,8 +131,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         U: Into<String>,
     {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut email_set = EmailSet::new(&account_id);
+        let mut email_set = EmailSet::new();
         email_set.update(id).keywords(keywords);
         let handle = request.call(email_set)?;
         let mut response = request.send().await?;
@@ -144,8 +140,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn email_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut email_set = EmailSet::new(&account_id);
+        let mut email_set = EmailSet::new();
         email_set.destroy([id]);
         let handle = request.call(email_set)?;
         let mut response = request.send().await?;
@@ -158,8 +153,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<Email<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = EmailGet::new(&account_id);
+        let mut get = EmailGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -175,8 +169,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: Option<usize>,
     ) -> crate::Result<ChangesResponse<Email<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = EmailChanges::new(&account_id, since_state);
+        let mut changes = EmailChanges::new(since_state);
         if let Some(max_changes) = max_changes {
             changes.max_changes(max_changes);
         }
@@ -191,8 +184,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = EmailQuery::new(&account_id);
+        let mut query = EmailQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -210,8 +202,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         filter: Option<impl Into<Filter<super::query::Filter>>>,
     ) -> crate::Result<QueryChangesResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut query = EmailQueryChanges::new(&account_id, since_query_state);
+        let mut query = EmailQueryChanges::new(since_query_state);
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -228,8 +219,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_body_value_bytes: Option<usize>,
     ) -> crate::Result<Email> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut parse = EmailParseRequest::new(&account_id);
+        let mut parse = EmailParseRequest::new();
         parse.blob_ids([blob_id]);
         if let Some(properties) = properties {
             parse.properties(properties);
@@ -266,8 +256,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     {
         let id = id.into();
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut copy = EmailCopy::new(&account_id, from_account_id);
+        let mut copy = EmailCopy::new(from_account_id);
         let email = copy.create(id.clone()).mailbox_ids(mailbox_ids);
 
         if let Some(keywords) = keywords {
@@ -289,8 +278,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         email_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> crate::Result<SearchSnippetGetResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut snippet = SearchSnippetGetRequest::new(&account_id);
+        let mut snippet = SearchSnippetGetRequest::new();
         if let Some(filter) = filter {
             snippet.filter(filter);
         }

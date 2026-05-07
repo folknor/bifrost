@@ -44,9 +44,13 @@ pub struct ChangesResponse<O: ChangesObject> {
 }
 
 impl ChangesRequest {
-    pub fn new(account_id: impl Into<String>, since_state: impl Into<String>) -> Self {
+    /// Construct a `ChangesRequest` with `accountId` left empty; the
+    /// account ID is filled in by
+    /// [`crate::core::request::Request::call`] when the method is
+    /// added to a request batch.
+    pub fn new(since_state: impl Into<String>) -> Self {
         ChangesRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             since_state: since_state.into(),
             max_changes: None,
         }

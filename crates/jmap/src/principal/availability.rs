@@ -54,17 +54,20 @@ impl crate::core::method::JmapMethod for PrincipalGetAvailabilityRequest {
     const NAME: &'static str = "Principal/getAvailability";
     type Cap = crate::core::capability::Principals;
     type Response = PrincipalGetAvailabilityResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
 }
 
 impl PrincipalGetAvailabilityRequest {
     pub fn new(
-        account_id: impl Into<String>,
         id: impl Into<String>,
         utc_start: impl Into<String>,
         utc_end: impl Into<String>,
     ) -> Self {
         PrincipalGetAvailabilityRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             id: id.into(),
             utc_start: utc_start.into(),
             utc_end: utc_end.into(),

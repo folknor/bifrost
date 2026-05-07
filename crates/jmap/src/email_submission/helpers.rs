@@ -20,9 +20,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         identity_id: impl Into<String>,
     ) -> crate::Result<EmailSubmission<Get>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut set = EmailSubmissionSet::new(&account_id);
+        let mut set = EmailSubmissionSet::new();
         let id = set
             .create()
             .email_id(email_id)
@@ -47,9 +46,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         U: Into<Address>,
     {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut set = EmailSubmissionSet::new(&account_id);
+        let mut set = EmailSubmissionSet::new();
         let id = set
             .create()
             .email_id(email_id)
@@ -68,9 +66,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         undo_status: UndoStatus,
     ) -> crate::Result<Option<EmailSubmission>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut set = EmailSubmissionSet::new(&account_id);
+        let mut set = EmailSubmissionSet::new();
         set.update(id).undo_status(undo_status);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -79,9 +76,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn email_submission_destroy(&self, id: &str) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut set = EmailSubmissionSet::new(&account_id);
+        let mut set = EmailSubmissionSet::new();
         set.destroy([id]);
         let handle = request.call(set)?;
         let mut response = request.send().await?;
@@ -94,9 +90,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<Vec<Property>>,
     ) -> crate::Result<Option<EmailSubmission>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut get = EmailSubmissionGet::new(&account_id);
+        let mut get = EmailSubmissionGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -112,9 +107,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         sort: Option<impl IntoIterator<Item = Comparator<super::query::Comparator>>>,
     ) -> crate::Result<QueryResponse> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut query = EmailSubmissionQuery::new(&account_id);
+        let mut query = EmailSubmissionQuery::new();
         if let Some(filter) = filter {
             query.filter(filter);
         }
@@ -132,9 +126,8 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<EmailSubmission<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
         request.add_capability::<crate::core::capability::Mail>();
-        let mut changes = EmailSubmissionChanges::new(&account_id, since_state);
+        let mut changes = EmailSubmissionChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

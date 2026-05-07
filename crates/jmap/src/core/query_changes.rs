@@ -56,9 +56,13 @@ pub struct AddedItem {
 }
 
 impl<O: QueryObject> QueryChangesRequest<O> {
-    pub fn new(account_id: impl Into<String>, since_query_state: impl Into<String>) -> Self {
+    /// Construct a `QueryChangesRequest` with `accountId` left empty;
+    /// the account ID is filled in by
+    /// [`crate::core::request::Request::call`] when the method is
+    /// added to a request batch.
+    pub fn new(since_query_state: impl Into<String>) -> Self {
         QueryChangesRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             filter: None,
             sort: None,
             since_query_state: since_query_state.into(),

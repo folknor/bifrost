@@ -9,8 +9,7 @@ use super::{AddressBook, AddressBookChanges, AddressBookGet, AddressBookSet, Pro
 impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
     pub async fn address_book_create(&self, name: impl Into<String>) -> crate::Result<AddressBook> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = AddressBookSet::new(&account_id);
+        let mut set = AddressBookSet::new();
         let id = set
             .create()
             .name(name)
@@ -24,8 +23,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
 
     pub async fn address_book_destroy(&self, id: &str, remove_contents: bool) -> crate::Result<()> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut set = AddressBookSet::new(&account_id);
+        let mut set = AddressBookSet::new();
         set.destroy([id])
             .arguments()
             .on_destroy_remove_contents(remove_contents);
@@ -40,8 +38,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         properties: Option<impl IntoIterator<Item = Property>>,
     ) -> crate::Result<Option<AddressBook>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut get = AddressBookGet::new(&account_id);
+        let mut get = AddressBookGet::new();
         get.ids([id]);
         if let Some(properties) = properties {
             get.properties(properties);
@@ -57,8 +54,7 @@ impl<Tr: crate::core::transport::HttpTransport> Client<Tr> {
         max_changes: usize,
     ) -> crate::Result<ChangesResponse<AddressBook<Get>>> {
         let mut request = self.build();
-        let account_id = request.default_account_id().to_string();
-        let mut changes = AddressBookChanges::new(&account_id, since_state);
+        let mut changes = AddressBookChanges::new(since_state);
         changes.max_changes(max_changes);
         let handle = request.call(changes)?;
         let mut response = request.send().await?;

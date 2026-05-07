@@ -144,11 +144,14 @@ pub enum SetErrorType {
 }
 
 impl<O: SetObject> SetRequest<O> {
-    pub fn new(account_id: impl Into<String>) -> Self {
-        let account_id = account_id.into();
+    /// Construct an empty `SetRequest`. The `accountId` field is left
+    /// unset (or `None` for non-account-scoped objects); it is filled
+    /// in by [`crate::core::request::Request::call`] when the method
+    /// is added to a request batch.
+    pub fn new() -> Self {
         Self {
             account_id: if O::requires_account_id() {
-                Some(account_id)
+                Some(String::new())
             } else {
                 None
             },
@@ -193,6 +196,12 @@ impl<O: SetObject> SetRequest<O> {
 
     pub fn arguments(&mut self) -> &mut O::SetArguments {
         &mut self.arguments
+    }
+}
+
+impl<O: SetObject> Default for SetRequest<O> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

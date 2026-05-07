@@ -44,12 +44,22 @@ impl crate::core::method::JmapMethod for SearchSnippetGetRequest {
     const NAME: &'static str = "SearchSnippet/get";
     type Cap = crate::core::capability::Mail;
     type Response = SearchSnippetGetResponse;
+
+    fn set_account_id(&mut self, account_id: &str) {
+        self.account_id = account_id.to_string();
+    }
+}
+
+impl Default for SearchSnippetGetRequest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SearchSnippetGetRequest {
-    pub fn new(account_id: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         SearchSnippetGetRequest {
-            account_id: account_id.into(),
+            account_id: String::new(),
             filter: None,
             email_ids: None,
             email_ids_ref: None,
