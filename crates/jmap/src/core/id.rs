@@ -12,9 +12,19 @@ use serde::{Deserialize, Serialize};
 /// let mailbox_id: Id<Mailbox> = Id::from("mbox-1");
 /// // email_id == mailbox_id  // compile error - different types
 /// ```
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);
+
+// Manual Clone impl: the derived form requires `T: Clone`, but `T` is
+// a phantom marker (often an uninhabited enum like `Account`), so a
+// trait bound on it is bogus. The string is `Clone` and `PhantomData`
+// is always `Clone`.
+impl<T: ?Sized> Clone for Id<T> {
+    fn clone(&self) -> Self {
+        Id(self.0.clone(), std::marker::PhantomData)
+    }
+}
 
 impl<T: ?Sized> Id<T> {
     pub fn new(id: impl Into<String>) -> Self {

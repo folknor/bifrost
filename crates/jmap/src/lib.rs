@@ -205,6 +205,12 @@ pub enum Error {
     NotParsable(String),
     /// URL template parsing failure.
     InvalidUrl(String),
+    /// The session lists no primary account for the requested capability.
+    NoPrimaryAccount {
+        /// The capability URI that was looked up (e.g.
+        /// `urn:ietf:params:jmap:mail`).
+        capability: &'static str,
+    },
     #[cfg(feature = "websockets")]
     /// WebSocket transport error.
     WebSocket(tokio_tungstenite::tungstenite::error::Error),
@@ -270,6 +276,10 @@ impl Display for Error {
             Error::EmptyResponse => write!(f, "Server returned no results"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
+            Error::NoPrimaryAccount { capability } => write!(
+                f,
+                "Session lists no primary account for capability {capability}"
+            ),
             #[cfg(feature = "websockets")]
             Error::WebSocket(e) => write!(f, "WebSocket error: {e}"),
             #[cfg(feature = "websockets")]

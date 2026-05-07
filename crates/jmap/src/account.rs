@@ -1,32 +1,49 @@
 use crate::{
     client::Client,
-    core::{id::AccountId, transport::HttpTransport},
+    core::{capability::Capability, id::AccountId, transport::HttpTransport},
 };
 
 /// An account-scoped view of a [`Client`].
 ///
-/// Pairs a client reference with a specific account ID. Use
-/// [`Account::build()`] to create request batches pre-scoped to
-/// this account, avoiding the need to thread account IDs manually.
+/// Pairs an owned `Client` (cheap `Arc`-clone, see [`Client`]) with a
+/// specific account ID. Use [`Account::build`] to create request batches
+/// pre-scoped to this account, avoiding the need to thread account IDs
+/// manually.
+///
+/// `Account` carries no public lifetime: it can be stored in long-lived
+/// structs, cloned freely, and moved across tasks.
 ///
 /// ```ignore
-/// let account = client.account_scope(client.default_account());
-/// let mut request = account.build();
-/// let handle = request.call(EmailGet::new(account.id_str()))?;
-/// let mut response = request.send().await?;
-/// let emails = response.get(&handle)?;
+/// use bifrost_jmap::core::capability;
+///
+/// let mail_account = client.primary_account::<capability::Mail>()?;
+/// let mut request = mail_account.build();
+/// // ... add method calls scoped to this account ...
 /// ```
 ///
-/// This is an unchecked view - the account ID is not validated
-/// against the session. Use [`Client::session()`] to check
-/// available accounts.
-pub struct AccountScope<'a, Tr: HttpTransport> {
-    client: &'a Client<Tr>,
+/// JMAP allows different primary account IDs per capability (RFC 8620
+/// §2). Use [`Client::primary_account`] with a capability marker to
+/// pick the correct one rather than assuming
+/// [`Client::default_account_id`] applies to every capability.
+pub struct Account<Tr: HttpTransport> {
+    client: Client<Tr>,
     account_id: AccountId,
 }
 
-impl<'a, Tr: HttpTransport> AccountScope<'a, Tr> {
-    pub fn new(client: &'a Client<Tr>, account_id: impl Into<AccountId>) -> Self {
+impl<Tr: HttpTransport> Clone for Account<Tr> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            account_id: self.account_id.clone(),
+        }
+    }
+}
+
+impl<Tr: HttpTransport> Account<Tr> {
+    /// Construct an `Account` directly. The account ID is not validated
+    /// against the session; prefer [`Client::primary_account`] for
+    /// capability-aware selection.
+    pub fn new(client: Client<Tr>, account_id: impl Into<AccountId>) -> Self {
         Self {
             client,
             account_id: account_id.into(),
@@ -44,8 +61,8 @@ impl<'a, Tr: HttpTransport> AccountScope<'a, Tr> {
     }
 
     /// Access the underlying client.
-    pub fn client(&self) -> &'a Client<Tr> {
-        self.client
+    pub fn client(&self) -> &Client<Tr> {
+        &self.client
     }
 
     /// Build a request batch scoped to this account.
@@ -57,12 +74,32 @@ impl<'a, Tr: HttpTransport> AccountScope<'a, Tr> {
 }
 
 impl<Tr: HttpTransport> Client<Tr> {
-    /// Create an account-scoped view of this client.
+    /// Resolve the primary account for a given capability.
+    ///
+    /// JMAP servers advertise per-capability primary accounts in the
+    /// session's `primaryAccounts` map (RFC 8620 §2). The mail and
+    /// calendar primary accounts may share an ID or differ; passing the
+    /// capability marker forces an explicit choice at the type level
+    /// rather than silently using whichever primary the session
+    /// happens to list first.
+    ///
+    /// Returns [`crate::Error::NoPrimaryAccount`] if the server does
+    /// not list a primary account for `C::URI`.
     ///
     /// ```ignore
-    /// let account = client.account_scope(client.default_account());
+    /// use bifrost_jmap::core::capability;
+    ///
+    /// let mail = client.primary_account::<capability::Mail>()?;
+    /// let cal  = client.primary_account::<capability::Calendars>()?;
     /// ```
-    pub fn account_scope(&self, account_id: impl Into<AccountId>) -> AccountScope<'_, Tr> {
-        AccountScope::new(self, account_id)
+    pub fn primary_account<C: Capability>(&self) -> crate::Result<Account<Tr>> {
+        let session = self.session();
+        let account_id = session
+            .primary_accounts()
+            .find(|(uri, _)| uri.as_str() == C::URI)
+            .map(|(_, id)| id.clone())
+            .ok_or(crate::Error::NoPrimaryAccount { capability: C::URI })?;
+
+        Ok(Account::new(self.clone(), AccountId::new(&account_id)))
     }
 }
