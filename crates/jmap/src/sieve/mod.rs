@@ -9,6 +9,12 @@ use std::fmt::Display;
 use crate::Get;
 use serde::{Deserialize, Serialize};
 
+mod marker {
+    pub enum SieveScript {}
+}
+/// Strongly-typed SieveScript ID.
+pub type SieveScriptId = crate::core::id::Id<marker::SieveScript>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SieveScript<State = Get> {
     #[serde(skip)]

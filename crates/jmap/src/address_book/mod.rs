@@ -11,6 +11,12 @@ use crate::Get;
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 
+mod marker {
+    pub enum AddressBook {}
+}
+/// Strongly-typed AddressBook ID.
+pub type AddressBookId = crate::core::id::Id<marker::AddressBook>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddressBook<State = Get> {
     #[serde(skip)]

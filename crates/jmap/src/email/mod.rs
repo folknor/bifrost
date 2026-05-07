@@ -12,6 +12,13 @@ use std::fmt::{self, Display, Formatter};
 
 use crate::{Get, core::request::ResultReference};
 
+mod marker {
+    pub enum Email {}
+}
+/// Strongly-typed Email ID. Distinct from `MailboxId`, `ThreadId`,
+/// etc. at compile time.
+pub type EmailId = crate::core::id::Id<marker::Email>;
+
 crate::impl_jmap_object!(Email<State>, Property, true);
 
 use crate::Set;

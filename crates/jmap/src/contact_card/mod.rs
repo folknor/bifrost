@@ -18,6 +18,12 @@ pub mod parse;
 pub mod query;
 pub mod set;
 
+mod marker {
+    pub enum ContactCard {}
+}
+/// Strongly-typed ContactCard ID.
+pub type ContactCardId = crate::core::id::Id<marker::ContactCard>;
+
 crate::json_object_struct!(ContactCard, "a JSContact object", Property, ());
 
 // ---- Property enum ----

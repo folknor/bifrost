@@ -11,6 +11,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
+mod marker {
+    pub enum Mailbox {}
+}
+/// Strongly-typed Mailbox ID.
+pub type MailboxId = crate::core::id::Id<marker::Mailbox>;
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SetArguments {
     #[serde(rename = "onDestroyRemoveEmails")]

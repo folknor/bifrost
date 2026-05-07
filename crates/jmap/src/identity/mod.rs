@@ -8,6 +8,12 @@ use crate::core::set::skip_if_empty_list;
 use crate::{Get, email::EmailAddress};
 use serde::{Deserialize, Serialize};
 
+mod marker {
+    pub enum Identity {}
+}
+/// Strongly-typed Identity ID.
+pub type IdentityId = crate::core::id::Id<marker::Identity>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity<State = Get> {
     #[serde(skip)]

@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::Get;
 
+mod marker {
+    pub enum ShareNotification {}
+}
+/// Strongly-typed ShareNotification ID.
+pub type ShareNotificationId = crate::core::id::Id<marker::ShareNotification>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareNotification<State = Get> {
     #[serde(skip)]

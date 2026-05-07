@@ -10,6 +10,12 @@ use std::fmt::Display;
 
 use crate::{Get, Set, email::Email};
 
+mod marker {
+    pub enum EmailSubmission {}
+}
+/// Strongly-typed EmailSubmission ID.
+pub type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>;
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SetArguments {
     #[serde(rename = "onSuccessUpdateEmail")]

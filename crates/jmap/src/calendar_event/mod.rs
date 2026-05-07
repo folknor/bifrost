@@ -20,6 +20,12 @@ pub mod set;
 
 use serde::{Deserialize, Serialize};
 
+mod marker {
+    pub enum CalendarEvent {}
+}
+/// Strongly-typed CalendarEvent ID.
+pub type CalendarEventId = crate::core::id::Id<marker::CalendarEvent>;
+
 crate::json_object_struct!(CalendarEvent, "a JSCalendar object", Property, SetArguments);
 
 // ---- Alert type (used by both CalendarEvent and Calendar default alerts) ----

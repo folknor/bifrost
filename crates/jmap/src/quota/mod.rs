@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::Get;
 use crate::core::field::Field;
 
+mod marker {
+    pub enum Quota {}
+}
+/// Strongly-typed Quota ID.
+pub type QuotaId = crate::core::id::Id<marker::Quota>;
+
 /// A quota object representing a storage or count limit (RFC 9425).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quota<State = Get> {

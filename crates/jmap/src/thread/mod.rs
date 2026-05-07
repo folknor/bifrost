@@ -5,6 +5,12 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
+mod marker {
+    pub enum Thread {}
+}
+/// Strongly-typed Thread ID.
+pub type ThreadId = crate::core::id::Id<marker::Thread>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     id: String,

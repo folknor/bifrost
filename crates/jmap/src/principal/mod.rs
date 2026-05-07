@@ -11,6 +11,12 @@ use std::fmt::Display;
 
 use crate::Get;
 
+mod marker {
+    pub enum Principal {}
+}
+/// Strongly-typed Principal ID.
+pub type PrincipalId = crate::core::id::Id<marker::Principal>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal<State = Get> {
     #[serde(skip)]

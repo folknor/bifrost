@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::core::set::skip_if_empty_list;
 use crate::{DataType, Get, Set};
 
+mod marker {
+    pub enum PushSubscription {}
+}
+/// Strongly-typed PushSubscription ID.
+pub type PushSubscriptionId = crate::core::id::Id<marker::PushSubscription>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushSubscription<State = Get> {
     #[serde(skip)]

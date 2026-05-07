@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::Get;
 
+mod marker {
+    pub enum CalendarEventNotification {}
+}
+/// Strongly-typed CalendarEventNotification ID.
+pub type CalendarEventNotificationId = crate::core::id::Id<marker::CalendarEventNotification>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CalendarEventNotification<State = Get> {
     #[serde(skip)]

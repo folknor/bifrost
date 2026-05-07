@@ -10,6 +10,12 @@ use std::collections::HashMap;
 use crate::Get;
 use crate::core::set::skip_if_empty_map;
 
+mod marker {
+    pub enum ParticipantIdentity {}
+}
+/// Strongly-typed ParticipantIdentity ID.
+pub type ParticipantIdentityId = crate::core::id::Id<marker::ParticipantIdentity>;
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ParticipantIdentitySetArguments {
     #[serde(rename = "onSuccessSetIsDefault")]

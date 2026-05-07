@@ -13,6 +13,12 @@ use crate::core::set::skip_if_empty_str;
 
 use crate::calendar_event::Alert;
 
+mod marker {
+    pub enum Calendar {}
+}
+/// Strongly-typed Calendar ID.
+pub type CalendarId = crate::core::id::Id<marker::Calendar>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Calendar<State = Get> {
     #[serde(skip)]

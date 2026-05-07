@@ -5,11 +5,14 @@ use serde::{Deserialize, Serialize};
 /// A strongly-typed JMAP identifier.
 ///
 /// Wraps a `String` with a phantom type parameter to prevent mixing
-/// IDs from different object types at compile time.
+/// IDs from different object types at compile time. The phantom is a
+/// module-private uninhabited marker; consumers spell the public
+/// typedef (`AccountId`, `BlobId`, `EmailId`, etc.) and never see the
+/// marker name.
 ///
 /// ```ignore
-/// let email_id: Id<Email> = Id::from("msg-123");
-/// let mailbox_id: Id<Mailbox> = Id::from("mbox-1");
+/// let email_id: bifrost_jmap::email::EmailId = "msg-123".into();
+/// let mailbox_id: bifrost_jmap::mailbox::MailboxId = "mbox-1".into();
 /// // email_id == mailbox_id  // compile error - different types
 /// ```
 #[derive(Serialize, Deserialize)]
@@ -18,9 +21,9 @@ pub struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);
 
 // Manual Clone / PartialEq / Eq / Hash impls: the derived forms each
 // require `T: Trait`, but `T` is a phantom marker (often an
-// uninhabited enum like `Account`), so any trait bound on it is
-// bogus. The string already implements all of these and `PhantomData`
-// implements them unconditionally.
+// uninhabited enum), so any trait bound on it is bogus. The string
+// already implements all of these and `PhantomData` implements them
+// unconditionally.
 impl<T: ?Sized> Clone for Id<T> {
     fn clone(&self) -> Self {
         Id(self.0.clone(), std::marker::PhantomData)
@@ -91,17 +94,17 @@ impl<T: ?Sized> From<Id<T>> for String {
     }
 }
 
-// Marker types for common JMAP object IDs.
-// These are zero-sized types used only as phantom parameters.
+/// Per-object phantom marker types. The module is private to the
+/// crate; only the typedefs below (`AccountId`, `BlobId`, `State`) are
+/// part of the public API. Per-object typedefs (`EmailId`,
+/// `MailboxId`, etc.) live in their own modules under the same
+/// "marker private, typedef public" pattern.
+mod marker {
+    pub enum Account {}
+    pub enum Blob {}
+    pub enum State {}
+}
 
-/// Marker for account IDs.
-pub enum Account {}
-/// Marker for blob IDs.
-pub enum BlobMarker {}
-/// Marker for JMAP state tokens.
-pub enum StateMarker {}
-
-/// Convenience type aliases.
-pub type AccountId = Id<Account>;
-pub type BlobId = Id<BlobMarker>;
-pub type State = Id<StateMarker>;
+pub type AccountId = Id<marker::Account>;
+pub type BlobId = Id<marker::Blob>;
+pub type State = Id<marker::State>;
