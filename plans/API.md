@@ -149,6 +149,39 @@ Cross-account methods (`Email/copy`) take a *second* `&AccountId` (the
 source account); the calling `Account` is the destination, injected by
 `call`/`Batch`.
 
+#### Builder style: value builders, not `&mut self`
+
+Today's builder methods are `&mut self -> &mut Self` — chaining requires
+`let mut x = ...; x.a(...); x.b(...);` and breaks the fluent
+`EmailGet::new().ids([id]).fetch_text_body_values(true)` shape used in
+every example in this doc.
+
+**Decision:** flip method-struct builder methods to value builders —
+`fn ids(self, ...) -> Self`. Chains compose without `let mut`.
+
+```rust
+// before:
+let mut get = EmailGet::new(&acc);
+get.ids([id]);
+get.arguments().fetch_text_body_values(true);
+
+// after:
+let get = EmailGet::new()
+    .ids([id])
+    .fetch_text_body_values(true);
+```
+
+Tradeoffs:
+- **Pro:** the fluent shape works; no `let mut`; matches every other
+  modern Rust builder (reqwest, sqlx-query, axum router).
+- **Pro:** `Account::call(EmailGet::new().ids([id]))` reads as one
+  expression, which is the whole point of the redesign.
+- **Con:** consumers who *want* to mutate piecemeal (build a method
+  struct over several conditional branches) lose the `&mut self` form.
+  Rebinding (`let q = q.filter(...);`) covers this; mildly more verbose.
+- **Con:** mechanical rewrite of every builder method on every method
+  struct in the crate. Large but straightforward.
+
 ---
 
 ## 1. Account scoping (post-§2)
@@ -198,15 +231,13 @@ let calendar_account = client.primary_account::<cap::Calendars>()?;
 account can carry multiple capabilities. The capability marker on
 `primary_account` is the *selection criterion*, not a permanent type tag.
 
-If §2 = B++, `Account` exposes:
+`Account` exposes:
 - `call<M>(method) -> Result<M::Response>` — single-method protocol path.
 - `build()` — batch builder (unchanged).
-- `upload`, `download` (see §7).
-- Domain facade entrypoints — `mail()`, `calendar()`, `contacts()` —
-  feature-gated, returning small handle structs.
-
-If §2 = D, replace facade entrypoints with type-namespaced scopes
-(`email()`, `mailbox()`, etc.).
+- `upload` (see §7); `download` lives on `Client`.
+- `mail()` — the one workflow facade entrypoint shipped this release,
+  feature-gated under `mail`. No `calendar()` / `contacts()` — protocol
+  layer suffices for those until ratatoskr drives a concrete shape.
 
 If §2 = B, drop the facade entrypoints entirely.
 
@@ -262,9 +293,9 @@ While breaking everything, rename existing markers for consistency:
 
 #### Adopt `Id<T>` everywhere, including filters
 
-Helper signatures, method-struct constructors, filter values that take IDs
-(`inMailbox`, `hasAttachment` references), changes APIs, result references
-— all take `&Id<T>`.
+Method-struct builder methods, facade APIs, filter values that take IDs
+(`inMailbox`, `hasAttachment` references), changes APIs, and result
+references — all take `&Id<T>`.
 
 #### Type the rest of the protocol identity layer
 
@@ -625,13 +656,15 @@ If we accept the recommendations above, the pre-1.0 release contains:
 7. **`Option<T>` getters + `*_field()` accessors** — sentinel bugs gone,
    `Field<T>` exposed where needed.
 8. **Lifted method arguments** (§5).
-9. **`take_*` → `into_*`** (§6 baseline).
-10. **Stretch:** typed batch results (§6 stretch). Defer if blocking.
+9. **Value-builder method structs** — `fn ids(self, ...) -> Self`,
+   not `&mut self -> &mut Self` (see §2 builder-style rule).
+10. **`take_*` → `into_*`** (§6 baseline).
+11. **Stretch:** typed batch results (§6 stretch). Defer if blocking.
 
 ### What this release does *not* do
 
 - **Type-state split** (`Email<Get>` → `Email`/`EmailCreate`/`EmailPatch`).
-  Filed as post-1.0 roadmap — see §8.
+  Deferred to a follow-up breaking release before 1.0 — see §8.
 - MDN (RFC 9007), S/MIME (RFC 9219). See `plans/MDN.md`, `plans/SMIME.md`.
 - Optimization items 1, 3, 4 from `TODO.md` (capability_config round-trip,
   CallHandle.call_id, SSE Bytes copy) — accepted trade-offs.
@@ -656,7 +689,9 @@ If we accept the recommendations above, the pre-1.0 release contains:
    compromise.
 6. **Account-scoped method-struct constructors don't take `accountId`.**
    `Account::call`/`Batch` injects it (see §2 constructor rule).
-7. **`download` lives on `Client`, `upload` on `Account`** (see §7).
+7. **Method-struct builders are value builders** — `fn ids(self) -> Self`
+   throughout (see §2 builder-style rule).
+8. **`download` lives on `Client`, `upload` on `Account`** (see §7).
 
 ### Still open
 
