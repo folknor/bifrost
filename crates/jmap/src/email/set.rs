@@ -2,14 +2,16 @@ use super::{
     EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailCreate, EmailHeader,
     EmailPatch, Header, HeaderValue,
 };
+use crate::core::id::BlobId;
 use crate::core::{request::ResultReference, set::from_timestamp};
+use crate::mailbox::MailboxId;
 use std::collections::HashMap;
 
 impl EmailCreate {
     pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<MailboxId>,
     {
         self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
         self.mailbox_ids_ref = None;
@@ -183,7 +185,7 @@ impl EmailCreate {
 
 impl EmailPatch {
     /// Set/clear a single mailbox membership via dotted-path patch.
-    pub fn mailbox_id(&mut self, mailbox_id: &str, set: bool) -> &mut Self {
+    pub fn mailbox_id(&mut self, mailbox_id: &MailboxId, set: bool) -> &mut Self {
         self.mailbox_ids = None;
         self.patch.get_or_insert_with(HashMap::new).insert(
             format!("mailboxIds/{mailbox_id}"),
@@ -199,7 +201,7 @@ impl EmailPatch {
     pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<MailboxId>,
     {
         self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
         self
@@ -244,7 +246,7 @@ impl EmailBodyPart {
         self
     }
 
-    pub fn with_blob_id(mut self, blob_id: impl Into<String>) -> Self {
+    pub fn with_blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
         self.blob_id = Some(blob_id.into());
         self
     }

@@ -239,11 +239,11 @@ pub struct ContactsCapabilities {
 pub struct PrincipalsCapabilities {
     #[serde(rename = "currentUserPrincipalId")]
     #[serde(default)]
-    current_user_principal_id: Option<String>,
+    current_user_principal_id: Option<crate::principal::PrincipalId>,
 
     #[serde(rename = "accountIdForPrincipal")]
     #[serde(default)]
-    account_id_for_principal: Option<String>,
+    account_id_for_principal: Option<crate::core::id::AccountId>,
 }
 
 macro_rules! session_cap_accessor {
@@ -539,30 +539,30 @@ impl ContactsCapabilities {
 pub struct PrincipalsOwnerCapabilities {
     #[serde(rename = "accountIdForPrincipal")]
     #[serde(default)]
-    account_id_for_principal: Option<String>,
+    account_id_for_principal: Option<crate::core::id::AccountId>,
 
     #[serde(rename = "principalId")]
     #[serde(default)]
-    principal_id: Option<String>,
+    principal_id: Option<crate::principal::PrincipalId>,
 }
 
 impl PrincipalsOwnerCapabilities {
-    pub fn account_id_for_principal(&self) -> Option<&str> {
-        self.account_id_for_principal.as_deref()
+    pub fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
+        self.account_id_for_principal.as_ref()
     }
 
-    pub fn principal_id(&self) -> Option<&str> {
-        self.principal_id.as_deref()
+    pub fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+        self.principal_id.as_ref()
     }
 }
 
 impl PrincipalsCapabilities {
-    pub fn current_user_principal_id(&self) -> Option<&str> {
-        self.current_user_principal_id.as_deref()
+    pub fn current_user_principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+        self.current_user_principal_id.as_ref()
     }
 
-    pub fn account_id_for_principal(&self) -> Option<&str> {
-        self.account_id_for_principal.as_deref()
+    pub fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
+        self.account_id_for_principal.as_ref()
     }
 }
 

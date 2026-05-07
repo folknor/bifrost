@@ -20,7 +20,7 @@ pub type CalendarId = crate::core::id::Id<marker::Calendar>;
 pub struct Calendar {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<CalendarId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,6 +303,7 @@ impl Display for Property {
 
 impl crate::core::Object for Calendar {
     type Property = Property;
+    type Id = CalendarId;
     fn requires_account_id() -> bool {
         true
     }

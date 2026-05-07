@@ -1,13 +1,14 @@
-use super::{ACL, DKIM, Principal, PrincipalAccount, Type};
+use super::{ACL, DKIM, Principal, PrincipalAccount, PrincipalId, Type};
+use crate::core::id::AccountId;
 use std::collections::HashMap;
 
 impl Principal {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&PrincipalId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> PrincipalId {
+        self.id.take().unwrap_or_else(|| PrincipalId::new(""))
     }
 
     pub fn ptype(&self) -> Option<&Type> {
@@ -46,7 +47,7 @@ impl Principal {
         self.capabilities.as_ref()
     }
 
-    pub fn accounts(&self) -> Option<&HashMap<String, PrincipalAccount>> {
+    pub fn accounts(&self) -> Option<&HashMap<AccountId, PrincipalAccount>> {
         self.accounts.as_ref()
     }
 
@@ -54,7 +55,7 @@ impl Principal {
         self.aliases.as_deref()
     }
 
-    pub fn members(&self) -> Option<&[String]> {
+    pub fn members(&self) -> Option<&[PrincipalId]> {
         self.members.as_deref()
     }
 
@@ -62,7 +63,7 @@ impl Principal {
         self.dkim.as_ref()
     }
 
-    pub fn acl(&self) -> Option<&HashMap<String, Vec<ACL>>> {
+    pub fn acl(&self) -> Option<&HashMap<PrincipalId, Vec<ACL>>> {
         self.acl.as_ref()
     }
 }

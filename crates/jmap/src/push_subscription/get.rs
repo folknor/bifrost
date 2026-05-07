@@ -1,14 +1,16 @@
 use crate::DataType;
 
-use super::{Keys, PushSubscription};
+use super::{Keys, PushSubscription, PushSubscriptionId};
 
 impl PushSubscription {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&PushSubscriptionId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> PushSubscriptionId {
+        self.id
+            .take()
+            .unwrap_or_else(|| PushSubscriptionId::new(""))
     }
 
     pub fn device_client_id(&self) -> Option<&str> {

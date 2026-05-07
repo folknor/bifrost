@@ -5,8 +5,10 @@ use crate::core::{
     query::{self, QueryObject},
     set::from_timestamp,
 };
+use crate::mailbox::MailboxId;
+use crate::thread::ThreadId;
 
-use super::{Email, QueryArguments};
+use super::{Email, EmailId, QueryArguments};
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -14,11 +16,11 @@ use super::{Email, QueryArguments};
 pub enum Filter {
     InMailbox {
         #[serde(rename = "inMailbox")]
-        value: String,
+        value: MailboxId,
     },
     InMailboxOtherThan {
         #[serde(rename = "inMailboxOtherThan")]
-        value: Vec<String>,
+        value: Vec<MailboxId>,
     },
     Before {
         #[serde(rename = "before")]
@@ -96,7 +98,7 @@ pub enum Filter {
     // Non-standard
     Id {
         #[serde(rename = "id")]
-        value: Vec<String>,
+        value: Vec<EmailId>,
     },
     SentBefore {
         #[serde(rename = "sentBefore")]
@@ -108,7 +110,7 @@ pub enum Filter {
     },
     InThread {
         #[serde(rename = "inThread")]
-        value: String,
+        value: ThreadId,
     },
 }
 
@@ -141,7 +143,7 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn in_mailbox(value: impl Into<String>) -> Self {
+    pub fn in_mailbox(value: impl Into<MailboxId>) -> Self {
         Filter::InMailbox {
             value: value.into(),
         }
@@ -150,7 +152,7 @@ impl Filter {
     pub fn in_mailbox_other_than<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<MailboxId>,
     {
         Filter::InMailboxOtherThan {
             value: value.into_iter().map(std::convert::Into::into).collect(),
@@ -266,7 +268,7 @@ impl Filter {
     pub fn id<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<EmailId>,
     {
         Filter::Id {
             value: value.into_iter().map(std::convert::Into::into).collect(),
@@ -285,7 +287,7 @@ impl Filter {
         }
     }
 
-    pub fn in_thread(value: impl Into<String>) -> Self {
+    pub fn in_thread(value: impl Into<ThreadId>) -> Self {
         Filter::InThread {
             value: value.into(),
         }

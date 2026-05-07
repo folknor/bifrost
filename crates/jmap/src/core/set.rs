@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
+use super::id::AccountId;
 use super::{Object, SetCreate, request::ResultReference};
 
 /// Implemented by a JMAP object's canonical (Get-shape) type. Declares
@@ -26,7 +27,7 @@ pub trait SetObject: Object {
 pub struct SetRequest<O: SetObject> {
     #[serde(rename = "accountId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_id: Option<String>,
+    account_id: Option<AccountId>,
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,10 +37,10 @@ pub struct SetRequest<O: SetObject> {
     create: Option<HashMap<String, O::Create>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    update: Option<HashMap<String, O::Patch>>,
+    update: Option<HashMap<O::Id, O::Patch>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    destroy: Option<Vec<String>>,
+    destroy: Option<Vec<O::Id>>,
 
     #[serde(rename = "#destroy")]
     #[serde(skip_deserializing)]
@@ -53,7 +54,7 @@ pub struct SetRequest<O: SetObject> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetResponse<O: SetObject> {
     #[serde(rename = "accountId")]
-    account_id: Option<String>,
+    account_id: Option<AccountId>,
 
     #[serde(rename = "oldState")]
     old_state: Option<String>,
@@ -61,23 +62,29 @@ pub struct SetResponse<O: SetObject> {
     #[serde(rename = "newState")]
     new_state: Option<String>,
 
+    /// Successful creates, keyed by the consumer-provided create-id
+    /// (e.g. "c1"). Create-ids are not real server IDs and stay
+    /// `String`-keyed.
     #[serde(rename = "created")]
     created: Option<HashMap<String, O>>,
 
+    /// Successful updates, keyed by the real server ID.
     #[serde(rename = "updated")]
-    updated: Option<HashMap<String, Option<O>>>,
+    updated: Option<HashMap<O::Id, Option<O>>>,
 
+    /// Successfully destroyed real server IDs.
     #[serde(rename = "destroyed")]
-    destroyed: Option<Vec<String>>,
+    destroyed: Option<Vec<O::Id>>,
 
+    /// Failed creates, keyed by the consumer-provided create-id.
     #[serde(rename = "notCreated")]
     not_created: Option<HashMap<String, SetError<O::Property>>>,
 
     #[serde(rename = "notUpdated")]
-    not_updated: Option<HashMap<String, SetError<O::Property>>>,
+    not_updated: Option<HashMap<O::Id, SetError<O::Property>>>,
 
     #[serde(rename = "notDestroyed")]
-    not_destroyed: Option<HashMap<String, SetError<O::Property>>>,
+    not_destroyed: Option<HashMap<O::Id, SetError<O::Property>>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,7 +164,7 @@ impl<O: SetObject> SetRequest<O> {
     pub fn new() -> Self {
         Self {
             account_id: if O::requires_account_id() {
-                Some(String::new())
+                Some(AccountId::new(""))
             } else {
                 None
             },
@@ -170,7 +177,7 @@ impl<O: SetObject> SetRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<String>) -> &mut Self {
+    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         if O::requires_account_id() {
             self.account_id = Some(account_id.into());
         }
@@ -185,7 +192,7 @@ impl<O: SetObject> SetRequest<O> {
     pub fn destroy<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<O::Id>,
     {
         self.destroy
             .get_or_insert_with(Vec::new)
@@ -242,7 +249,7 @@ where
         create_id_str
     }
 
-    pub fn update_item(&mut self, id: impl Into<String>, item: O::Patch) {
+    pub fn update_item(&mut self, id: impl Into<O::Id>, item: O::Patch) {
         self.update
             .get_or_insert_with(HashMap::new)
             .insert(id.into(), item);
@@ -253,8 +260,8 @@ impl<O: SetObject> SetRequest<O>
 where
     O::Patch: Default,
 {
-    pub fn update(&mut self, id: impl Into<String>) -> &mut O::Patch {
-        let id: String = id.into();
+    pub fn update(&mut self, id: impl Into<O::Id>) -> &mut O::Patch {
+        let id: O::Id = id.into();
         self.update
             .get_or_insert_with(HashMap::new)
             .entry(id)
@@ -269,8 +276,8 @@ impl<O: SetObject> Default for SetRequest<O> {
 }
 
 impl<O: SetObject> SetResponse<O> {
-    pub fn account_id(&self) -> Option<&str> {
-        self.account_id.as_deref()
+    pub fn account_id(&self) -> Option<&AccountId> {
+        self.account_id.as_ref()
     }
 
     pub fn old_state(&self) -> Option<&str> {
@@ -285,6 +292,7 @@ impl<O: SetObject> SetResponse<O> {
         self.new_state.unwrap_or_default()
     }
 
+    /// Look up a successful or failed create by its create-id (e.g. "c1").
     pub fn created(&mut self, id: &str) -> crate::Result<O> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
@@ -295,7 +303,7 @@ impl<O: SetObject> SetResponse<O> {
         }
     }
 
-    pub fn updated(&mut self, id: &str) -> crate::Result<Option<O>> {
+    pub fn updated(&mut self, id: &O::Id) -> crate::Result<Option<O>> {
         if let Some(result) = self.updated.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_updated.as_mut().and_then(|r| r.remove(id)) {
@@ -305,7 +313,7 @@ impl<O: SetObject> SetResponse<O> {
         }
     }
 
-    pub fn destroyed(&mut self, id: &str) -> crate::Result<()> {
+    pub fn destroyed(&mut self, id: &O::Id) -> crate::Result<()> {
         if self
             .destroyed
             .as_ref()
@@ -319,35 +327,39 @@ impl<O: SetObject> SetResponse<O> {
         }
     }
 
+    /// Iterate the create-ids of successful creates. Create-ids are
+    /// the "c1"/"c2"/... identifiers the consumer passed in, not real
+    /// server IDs - real IDs live on each `O` value.
     pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
 
-    pub fn updated_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.updated.as_ref().map(|map| map.keys())
     }
 
-    pub fn into_updated_ids(self) -> Option<Vec<String>> {
+    pub fn into_updated_ids(self) -> Option<Vec<O::Id>> {
         self.updated.map(|map| map.into_keys().collect())
     }
 
-    pub fn destroyed_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.destroyed.as_ref().map(|list| list.iter())
     }
 
-    pub fn into_destroyed_ids(self) -> Option<Vec<String>> {
+    pub fn into_destroyed_ids(self) -> Option<Vec<O::Id>> {
         self.destroyed
     }
 
+    /// Iterate failed-create create-ids (consumer-provided, not real IDs).
     pub fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.not_created.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_updated_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn not_updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.not_updated.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_destroyed_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn not_destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.not_destroyed.as_ref().map(|map| map.keys())
     }
 

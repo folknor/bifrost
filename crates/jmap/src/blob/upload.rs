@@ -22,10 +22,10 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct UploadResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "blobId")]
-    blob_id: String,
+    blob_id: BlobId,
 
     #[serde(rename = "type")]
     type_: String,
@@ -105,10 +105,7 @@ impl<Tr: HttpTransport> Account<Tr> {
             .upload_to(self.id(), data, content_type)
             .await?;
 
-        let mut blob = BlobRef::new(
-            AccountId::new(&response.account_id),
-            BlobId::new(&response.blob_id),
-        );
+        let mut blob = BlobRef::new(response.account_id, response.blob_id);
         if !response.type_.is_empty() {
             blob.content_type = Some(response.type_);
         }
@@ -117,11 +114,11 @@ impl<Tr: HttpTransport> Account<Tr> {
 }
 
 impl UploadResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn blob_id(&self) -> &str {
+    pub fn blob_id(&self) -> &BlobId {
         &self.blob_id
     }
 
@@ -133,7 +130,7 @@ impl UploadResponse {
         self.size
     }
 
-    pub fn into_blob_id(self) -> String {
+    pub fn into_blob_id(self) -> BlobId {
         self.blob_id
     }
 }

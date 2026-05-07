@@ -17,7 +17,7 @@ pub type PrincipalId = crate::core::id::Id<marker::Principal>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<PrincipalId>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,7 +39,7 @@ pub struct Principal {
     pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+    pub(super) accounts: Option<HashMap<crate::core::id::AccountId, PrincipalAccount>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) aliases: Option<Vec<String>>,
@@ -57,10 +57,10 @@ pub struct Principal {
     pub(super) picture: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) members: Option<Vec<String>>,
+    pub(super) members: Option<Vec<PrincipalId>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
+    pub(super) acl: Option<HashMap<PrincipalId, Vec<ACL>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,7 +88,7 @@ pub struct PrincipalCreate {
     pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+    pub(super) accounts: Option<HashMap<crate::core::id::AccountId, PrincipalAccount>>,
 
     #[serde(skip_serializing_if = "skip_if_empty_list")]
     pub(super) aliases: Option<Vec<String>>,
@@ -106,10 +106,10 @@ pub struct PrincipalCreate {
     pub(super) picture: Option<String>,
 
     #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub(super) members: Option<Vec<String>>,
+    pub(super) members: Option<Vec<PrincipalId>>,
 
     #[serde(skip_serializing_if = "skip_if_empty_map")]
-    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
+    pub(super) acl: Option<HashMap<PrincipalId, Vec<ACL>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -134,7 +134,7 @@ pub struct PrincipalPatch {
     pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+    pub(super) accounts: Option<HashMap<crate::core::id::AccountId, PrincipalAccount>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) aliases: Option<Vec<String>>,
@@ -152,10 +152,10 @@ pub struct PrincipalPatch {
     pub(super) picture: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) members: Option<Vec<String>>,
+    pub(super) members: Option<Vec<PrincipalId>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
+    pub(super) acl: Option<HashMap<PrincipalId, Vec<ACL>>>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,6 +359,7 @@ impl Display for ACL {
 
 impl crate::core::Object for Principal {
     type Property = Property;
+    type Id = PrincipalId;
     fn requires_account_id() -> bool {
         true
     }

@@ -2,7 +2,8 @@ use serde::Serialize;
 
 use crate::core::query::{self, QueryObject};
 
-use super::ContactCard;
+use super::{ContactCard, ContactCardId};
+use crate::address_book::AddressBookId;
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -10,7 +11,7 @@ use super::ContactCard;
 pub enum Filter {
     InAddressBook {
         #[serde(rename = "inAddressBook")]
-        value: String,
+        value: AddressBookId,
     },
     Uid {
         #[serde(rename = "uid")]
@@ -18,7 +19,7 @@ pub enum Filter {
     },
     HasMember {
         #[serde(rename = "hasMember")]
-        value: String,
+        value: ContactCardId,
     },
     Kind {
         #[serde(rename = "kind")]
@@ -107,7 +108,7 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn in_address_book(value: impl Into<String>) -> Self {
+    pub fn in_address_book(value: impl Into<AddressBookId>) -> Self {
         Filter::InAddressBook {
             value: value.into(),
         }
@@ -119,7 +120,7 @@ impl Filter {
         }
     }
 
-    pub fn has_member(value: impl Into<String>) -> Self {
+    pub fn has_member(value: impl Into<ContactCardId>) -> Self {
         Filter::HasMember {
             value: value.into(),
         }

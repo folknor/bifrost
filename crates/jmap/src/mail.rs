@@ -31,10 +31,10 @@ use crate::{
         transport::HttpTransport,
     },
     email::{
-        Email, EmailGet, EmailQuery, EmailSet, Property,
+        Email, EmailGet, EmailId, EmailQuery, EmailSet, Property,
         query::{self as eq, Filter as EmailFilter},
     },
-    mailbox::{Mailbox, MailboxGet, MailboxQuery},
+    mailbox::{Mailbox, MailboxGet, MailboxId, MailboxQuery},
 };
 
 /// The mail workflow facade. Construct via [`Account::mail`].
@@ -67,12 +67,12 @@ impl<Tr: HttpTransport> Mail<Tr> {
     /// the server reports the id as `notFound`.
     pub async fn fetch(
         &self,
-        id: &str,
+        id: &EmailId,
         properties: impl IntoIterator<Item = Property>,
     ) -> crate::Result<Option<Email>> {
         let response = self
             .account
-            .call(EmailGet::new().ids([id]).properties(properties))
+            .call(EmailGet::new().ids([id.clone()]).properties(properties))
             .await?;
         Ok(response.into_list().into_iter().next())
     }
@@ -86,23 +86,23 @@ impl<Tr: HttpTransport> Mail<Tr> {
     /// Set / unset a single keyword on an email.
     pub async fn set_keyword(
         &self,
-        id: &str,
+        id: &EmailId,
         keyword: &str,
         value: bool,
     ) -> crate::Result<Option<Email>> {
         let mut set = EmailSet::new();
-        set.update(id).keyword(keyword, value);
+        set.update(id.clone()).keyword(keyword, value);
         let mut response = self.account.call(set).await?;
         response.updated(id)
     }
 
     /// Mark an email as read (`$seen` keyword set).
-    pub async fn mark_read(&self, id: &str) -> crate::Result<Option<Email>> {
+    pub async fn mark_read(&self, id: &EmailId) -> crate::Result<Option<Email>> {
         self.set_keyword(id, "$seen", true).await
     }
 
     /// Mark an email as unread (`$seen` keyword unset).
-    pub async fn mark_unread(&self, id: &str) -> crate::Result<Option<Email>> {
+    pub async fn mark_unread(&self, id: &EmailId) -> crate::Result<Option<Email>> {
         self.set_keyword(id, "$seen", false).await
     }
 
@@ -111,12 +111,12 @@ impl<Tr: HttpTransport> Mail<Tr> {
     /// set. Other mailbox memberships are not touched.
     pub async fn move_email(
         &self,
-        id: &str,
-        from_mailbox: &str,
-        to_mailbox: &str,
+        id: &EmailId,
+        from_mailbox: &MailboxId,
+        to_mailbox: &MailboxId,
     ) -> crate::Result<Option<Email>> {
         let mut set = EmailSet::new();
-        set.update(id)
+        set.update(id.clone())
             .mailbox_id(from_mailbox, false)
             .mailbox_id(to_mailbox, true);
         let mut response = self.account.call(set).await?;
@@ -124,9 +124,9 @@ impl<Tr: HttpTransport> Mail<Tr> {
     }
 
     /// Destroy an email by ID.
-    pub async fn destroy(&self, id: &str) -> crate::Result<()> {
+    pub async fn destroy(&self, id: &EmailId) -> crate::Result<()> {
         self.account
-            .call(EmailSet::new().destroy([id]))
+            .call(EmailSet::new().destroy([id.clone()]))
             .await?
             .destroyed(id)
     }
@@ -168,7 +168,7 @@ impl<'a, Tr: HttpTransport> EmailsQuery<'a, Tr> {
 
     /// Restrict to messages in the given mailbox.
     #[must_use]
-    pub fn in_mailbox(mut self, mailbox_id: impl Into<String>) -> Self {
+    pub fn in_mailbox(mut self, mailbox_id: impl Into<MailboxId>) -> Self {
         self.filters.push(eq::Filter::in_mailbox(mailbox_id));
         self
     }
@@ -178,7 +178,7 @@ impl<'a, Tr: HttpTransport> EmailsQuery<'a, Tr> {
     pub fn not_in_mailbox<I, S>(mut self, mailbox_ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<MailboxId>,
     {
         self.filters
             .push(eq::Filter::in_mailbox_other_than(mailbox_ids));
@@ -217,7 +217,7 @@ impl<'a, Tr: HttpTransport> EmailsQuery<'a, Tr> {
 
     /// Resolve to the matching IDs only (one round-trip,
     /// `Email/query`).
-    pub async fn ids(self) -> crate::Result<Vec<String>> {
+    pub async fn ids(self) -> crate::Result<Vec<EmailId>> {
         let query = self.build_query();
         Ok(self.account.call(query).await?.into_ids())
     }

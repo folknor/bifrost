@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 use crate::{calendar_event::Alert, core::field::Field};
 
-use super::{Calendar, CalendarRights, IncludeInAvailability};
+use super::{Calendar, CalendarId, CalendarRights, IncludeInAvailability};
 
 impl Calendar {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&CalendarId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> CalendarId {
+        self.id.take().unwrap_or_else(|| CalendarId::new(""))
     }
 
     pub fn name(&self) -> Option<&str> {

@@ -4,27 +4,29 @@ use serde::Deserialize;
 
 use crate::Error;
 
+use super::id::{AccountId, BlobId};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParseResponse<T> {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "parsed")]
-    parsed: Option<HashMap<String, T>>,
+    parsed: Option<HashMap<BlobId, T>>,
 
     #[serde(rename = "notParsable")]
-    not_parsable: Option<Vec<String>>,
+    not_parsable: Option<Vec<BlobId>>,
 
     #[serde(rename = "notFound")]
-    not_found: Option<Vec<String>>,
+    not_found: Option<Vec<BlobId>>,
 }
 
 impl<T> ParseResponse<T> {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn parsed(&mut self, blob_id: &str) -> crate::Result<T> {
+    pub fn parsed(&mut self, blob_id: &BlobId) -> crate::Result<T> {
         if let Some(result) = self.parsed.as_mut().and_then(|r| r.remove(blob_id)) {
             Ok(result)
         } else if self
@@ -38,15 +40,15 @@ impl<T> ParseResponse<T> {
         }
     }
 
-    pub fn parsed_list(&self) -> Option<impl Iterator<Item = (&String, &T)>> {
+    pub fn parsed_list(&self) -> Option<impl Iterator<Item = (&BlobId, &T)>> {
         self.parsed.as_ref().map(|map| map.iter())
     }
 
-    pub fn not_parsable(&self) -> Option<&[String]> {
+    pub fn not_parsable(&self) -> Option<&[BlobId]> {
         self.not_parsable.as_deref()
     }
 
-    pub fn not_found(&self) -> Option<&[String]> {
+    pub fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }

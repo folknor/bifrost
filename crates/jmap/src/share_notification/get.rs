@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 
-use super::{ChangedBy, ShareNotification};
+use super::{ChangedBy, ShareNotification, ShareNotificationId};
+use crate::core::id::AccountId;
 
 impl ShareNotification {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&ShareNotificationId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> ShareNotificationId {
+        self.id
+            .take()
+            .unwrap_or_else(|| ShareNotificationId::new(""))
     }
 
     /// UTCDate when this notification was created.
@@ -27,8 +30,8 @@ impl ShareNotification {
     }
 
     /// The account ID where the shared object resides.
-    pub fn object_account_id(&self) -> Option<&str> {
-        self.object_account_id.as_deref()
+    pub fn object_account_id(&self) -> Option<&AccountId> {
+        self.object_account_id.as_ref()
     }
 
     /// The ID of the shared object.

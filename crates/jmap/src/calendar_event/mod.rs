@@ -207,6 +207,7 @@ crate::define_open_property_enum! {
 
 impl crate::core::Object for CalendarEvent {
     type Property = Property;
+    type Id = CalendarEventId;
     fn requires_account_id() -> bool {
         true
     }

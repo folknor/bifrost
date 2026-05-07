@@ -2,15 +2,15 @@ use std::collections::HashMap;
 
 use crate::core::field::Field;
 
-use super::{AddressBook, AddressBookRights};
+use super::{AddressBook, AddressBookId, AddressBookRights};
 
 impl AddressBook {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&AddressBookId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> AddressBookId {
+        self.id.take().unwrap_or_else(|| AddressBookId::new(""))
     }
 
     pub fn name(&self) -> Option<&str> {

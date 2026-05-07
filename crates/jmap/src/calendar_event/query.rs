@@ -3,6 +3,7 @@ use serde::Serialize;
 use crate::core::query::{self, QueryObject};
 
 use super::{CalendarEvent, QueryArguments};
+use crate::calendar::CalendarId;
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -11,12 +12,12 @@ pub enum Filter {
     /// Filter by calendar ID (singular). Used by Stalwart.
     InCalendar {
         #[serde(rename = "inCalendar")]
-        value: String,
+        value: CalendarId,
     },
     /// Filter by calendar IDs (plural, spec draft).
     InCalendars {
         #[serde(rename = "inCalendars")]
-        value: Vec<String>,
+        value: Vec<CalendarId>,
     },
     Uid {
         #[serde(rename = "uid")]
@@ -74,7 +75,7 @@ pub enum Comparator {
 
 impl Filter {
     /// Filter by a single calendar ID. Used by Stalwart.
-    pub fn in_calendar(value: impl Into<String>) -> Self {
+    pub fn in_calendar(value: impl Into<CalendarId>) -> Self {
         Filter::InCalendar {
             value: value.into(),
         }
@@ -84,7 +85,7 @@ impl Filter {
     pub fn in_calendars<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<CalendarId>,
     {
         Filter::InCalendars {
             value: value.into_iter().map(std::convert::Into::into).collect(),

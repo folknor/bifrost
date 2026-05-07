@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::{CalendarEventCreate, CalendarEventPatch};
+use crate::calendar::CalendarId;
 
 macro_rules! ce_setters {
     ($t:ty) => {
@@ -14,25 +15,29 @@ macro_rules! ce_setters {
             pub fn calendar_ids<U, V>(&mut self, calendar_ids: U) -> &mut Self
             where
                 U: IntoIterator<Item = V>,
-                V: Into<String>,
+                V: Into<CalendarId>,
             {
                 let map: serde_json::Map<String, serde_json::Value> = calendar_ids
                     .into_iter()
-                    .map(|id| (id.into(), json!(true)))
+                    .map(|id| (id.into().into_string(), json!(true)))
                     .collect();
                 self.properties
                     .insert("calendarIds".into(), serde_json::Value::Object(map));
                 self
             }
 
-            pub fn calendar_id(&mut self, calendar_id: impl Into<String>, set: bool) -> &mut Self {
+            pub fn calendar_id(
+                &mut self,
+                calendar_id: impl Into<CalendarId>,
+                set: bool,
+            ) -> &mut Self {
                 let entry = self
                     .properties
                     .entry("calendarIds")
                     .or_insert_with(|| json!({}));
                 if let Some(map) = entry.as_object_mut() {
                     map.insert(
-                        calendar_id.into(),
+                        calendar_id.into().into_string(),
                         if set {
                             serde_json::Value::Bool(true)
                         } else {

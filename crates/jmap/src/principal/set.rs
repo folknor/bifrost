@@ -1,4 +1,7 @@
-use super::{ACL, DKIM, PrincipalAccount, PrincipalCreate, PrincipalPatch, Property, Type};
+use super::{
+    ACL, DKIM, PrincipalAccount, PrincipalCreate, PrincipalId, PrincipalPatch, Property, Type,
+};
+use crate::core::id::AccountId;
 use std::collections::HashMap;
 
 macro_rules! principal_setters {
@@ -49,7 +52,7 @@ macro_rules! principal_setters {
                 self
             }
 
-            pub fn acl(&mut self, acl: Option<HashMap<String, Vec<ACL>>>) -> &mut Self {
+            pub fn acl(&mut self, acl: Option<HashMap<PrincipalId, Vec<ACL>>>) -> &mut Self {
                 self.acl = acl;
                 self
             }
@@ -74,7 +77,7 @@ macro_rules! principal_setters {
 
             pub fn accounts(
                 &mut self,
-                accounts: Option<HashMap<String, PrincipalAccount>>,
+                accounts: Option<HashMap<AccountId, PrincipalAccount>>,
             ) -> &mut Self {
                 self.accounts = accounts;
                 self
@@ -83,7 +86,7 @@ macro_rules! principal_setters {
             pub fn members<T, U>(&mut self, members: Option<T>) -> &mut Self
             where
                 T: IntoIterator<Item = U>,
-                U: Into<String>,
+                U: Into<PrincipalId>,
             {
                 self.members =
                     members.map(|l| l.into_iter().map(std::convert::Into::into).collect());

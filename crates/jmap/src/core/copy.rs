@@ -3,24 +3,26 @@ use std::collections::HashMap;
 
 use crate::Error;
 
+use super::id::AccountId;
 use super::set::{SetError, SetObject};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CopyRequest<O: SetObject> {
     #[serde(rename = "fromAccountId")]
-    from_account_id: String,
+    from_account_id: AccountId,
 
     #[serde(rename = "ifFromInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
     if_from_in_state: Option<String>,
 
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
     if_in_state: Option<String>,
 
+    /// Create entries keyed by consumer-provided create-id (e.g. "c1").
     #[serde(rename = "create")]
     create: HashMap<String, O::Create>,
 
@@ -35,10 +37,10 @@ pub struct CopyRequest<O: SetObject> {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CopyResponse<O: SetObject> {
     #[serde(rename = "fromAccountId")]
-    from_account_id: String,
+    from_account_id: AccountId,
 
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "oldState")]
     old_state: Option<String>,
@@ -46,19 +48,21 @@ pub struct CopyResponse<O: SetObject> {
     #[serde(rename = "newState")]
     new_state: String,
 
+    /// Successful copies, keyed by the consumer-provided create-id.
     #[serde(rename = "created")]
     created: Option<HashMap<String, O>>,
 
+    /// Failed copies, keyed by the consumer-provided create-id.
     #[serde(rename = "notCreated")]
     not_created: Option<HashMap<String, SetError<O::Property>>>,
 }
 
 impl<O: SetObject> CopyRequest<O> {
-    pub fn new(from_account_id: impl Into<String>) -> Self {
+    pub fn new(from_account_id: impl Into<AccountId>) -> Self {
         CopyRequest {
             from_account_id: from_account_id.into(),
             if_from_in_state: None,
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             if_in_state: None,
             create: HashMap::new(),
             on_success_destroy_original: false,
@@ -66,7 +70,7 @@ impl<O: SetObject> CopyRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<String>) -> &mut Self {
+    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
@@ -108,11 +112,11 @@ where
 }
 
 impl<O: SetObject> CopyResponse<O> {
-    pub fn from_account_id(&self) -> &str {
+    pub fn from_account_id(&self) -> &AccountId {
         &self.from_account_id
     }
 
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 

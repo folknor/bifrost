@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::hash::Hash;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -26,6 +27,12 @@ mod tests;
 /// The base trait for a JMAP object's server-returned (Get) shape.
 pub trait Object: Sized {
     type Property: Display + Serialize + DeserializeOwned;
+    /// The strongly-typed ID for this object (`EmailId`, `MailboxId`,
+    /// etc.). Used as the typed key/value type in generic core
+    /// `SetRequest`/`SetResponse`/`GetRequest`/`GetResponse`/`Changes`/
+    /// `Query`. Per-object impls set this to their `Id<marker::Foo>`
+    /// typedef.
+    type Id: Clone + Hash + Eq + Display + Serialize + DeserializeOwned + From<String> + Send;
     fn requires_account_id() -> bool;
 }
 

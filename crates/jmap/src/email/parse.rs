@@ -2,15 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use super::{BodyProperty, Email, Property};
 use crate::Error;
+use crate::core::id::{AccountId, BlobId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailParseRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "blobIds")]
-    blob_ids: Vec<String>,
+    blob_ids: Vec<BlobId>,
 
     #[serde(rename = "properties")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,16 +41,17 @@ pub struct EmailParseRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailParseResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
+    /// Successfully parsed emails, keyed by the source blob id.
     #[serde(rename = "parsed")]
-    parsed: Option<HashMap<String, Email>>,
+    parsed: Option<HashMap<BlobId, Email>>,
 
     #[serde(rename = "notParsable")]
-    not_parsable: Option<Vec<String>>,
+    not_parsable: Option<Vec<BlobId>>,
 
     #[serde(rename = "notFound")]
-    not_found: Option<Vec<String>>,
+    not_found: Option<Vec<BlobId>>,
 }
 
 impl crate::core::method::JmapMethod for EmailParseRequest {
@@ -57,8 +59,8 @@ impl crate::core::method::JmapMethod for EmailParseRequest {
     type Cap = crate::core::capability::Mail;
     type Response = EmailParseResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -71,7 +73,7 @@ impl Default for EmailParseRequest {
 impl EmailParseRequest {
     pub fn new() -> Self {
         EmailParseRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             blob_ids: Vec::new(),
             properties: None,
             body_properties: None,
@@ -86,7 +88,7 @@ impl EmailParseRequest {
     pub fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<BlobId>,
     {
         self.blob_ids = blob_ids.into_iter().map(std::convert::Into::into).collect();
         self
@@ -133,11 +135,11 @@ impl EmailParseRequest {
 }
 
 impl EmailParseResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn parsed(&mut self, blob_id: &str) -> crate::Result<Email> {
+    pub fn parsed(&mut self, blob_id: &BlobId) -> crate::Result<Email> {
         if let Some(result) = self.parsed.as_mut().and_then(|r| r.remove(blob_id)) {
             Ok(result)
         } else if self
@@ -152,15 +154,15 @@ impl EmailParseResponse {
         }
     }
 
-    pub fn parsed_list(&self) -> Option<impl Iterator<Item = (&String, &Email)>> {
+    pub fn parsed_list(&self) -> Option<impl Iterator<Item = (&BlobId, &Email)>> {
         self.parsed.as_ref().map(|map| map.iter())
     }
 
-    pub fn not_parsable(&self) -> Option<&[String]> {
+    pub fn not_parsable(&self) -> Option<&[BlobId]> {
         self.not_parsable.as_deref()
     }
 
-    pub fn not_found(&self) -> Option<&[String]> {
+    pub fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }

@@ -566,12 +566,15 @@ Remove `download(blob_id)` from "Explicitly not changing." It is changing.
 
 ## ✅ STATUS
 
-§8 (type-state split) and §6 stretch (typed batch results) are
-landed. §3 (Id<T> call-site adoption sweep) is intentionally deferred
-to a ratatoskr-driven follow-up: the typedefs exist, but flipping
-every `&str` ID parameter and `String` ID return value across method
-signatures, filters, and result accessors is best done when the
-consumer's actual API needs drive specific shapes.
+§8 (type-state split), §6 stretch (typed batch results), and §3
+(Id<T> call-site adoption sweep) are landed. The sweep added a
+required `Object::Id` associated type, threaded `O::Id` through
+every generic core request/response (Get, Set, Changes, Query,
+QueryChanges, Copy, Parse), and converted method-struct builder
+parameters, filter constructors, and per-object getters/setters
+to typed IDs. JSON-map-backed objects (`CalendarEvent`,
+`ContactCard`) return owned `XxxId` from `id()`/`take_id()` since
+their JSON-map storage cannot lend a `&XxxId`.
 
 ## 8. Type-state on object types: open structural question
 

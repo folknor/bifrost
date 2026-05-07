@@ -1,25 +1,31 @@
-use super::{Address, Delivered, DeliveryStatus, Displayed, EmailSubmission, UndoStatus};
+use super::{
+    Address, Delivered, DeliveryStatus, Displayed, EmailSubmission, EmailSubmissionId, UndoStatus,
+};
+use crate::core::id::BlobId;
+use crate::email::EmailId;
+use crate::identity::IdentityId;
+use crate::thread::ThreadId;
 use std::collections::HashMap;
 
 impl EmailSubmission {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&EmailSubmissionId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> EmailSubmissionId {
+        self.id.take().unwrap_or_else(|| EmailSubmissionId::new(""))
     }
 
-    pub fn identity_id(&self) -> Option<&str> {
-        self.identity_id.as_deref()
+    pub fn identity_id(&self) -> Option<&IdentityId> {
+        self.identity_id.as_ref()
     }
 
-    pub fn email_id(&self) -> Option<&str> {
-        self.email_id.as_deref()
+    pub fn email_id(&self) -> Option<&EmailId> {
+        self.email_id.as_ref()
     }
 
-    pub fn thread_id(&self) -> Option<&str> {
-        self.thread_id.as_deref()
+    pub fn thread_id(&self) -> Option<&ThreadId> {
+        self.thread_id.as_ref()
     }
 
     pub fn mail_from(&self) -> Option<&Address> {
@@ -46,11 +52,11 @@ impl EmailSubmission {
         self.delivery_status.as_ref()
     }
 
-    pub fn dsn_blob_ids(&self) -> Option<&[String]> {
+    pub fn dsn_blob_ids(&self) -> Option<&[BlobId]> {
         self.dsn_blob_ids.as_deref()
     }
 
-    pub fn mdn_blob_ids(&self) -> Option<&[String]> {
+    pub fn mdn_blob_ids(&self) -> Option<&[BlobId]> {
         self.mdn_blob_ids.as_deref()
     }
 }

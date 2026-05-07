@@ -88,6 +88,12 @@ impl<T: ?Sized> From<&str> for Id<T> {
     }
 }
 
+impl<T: ?Sized> From<&Id<T>> for Id<T> {
+    fn from(id: &Id<T>) -> Self {
+        id.clone()
+    }
+}
+
 impl<T: ?Sized> From<Id<T>> for String {
     fn from(id: Id<T>) -> Self {
         id.0
@@ -108,3 +114,10 @@ mod marker {
 pub type AccountId = Id<marker::Account>;
 pub type BlobId = Id<marker::Blob>;
 pub type State = Id<marker::State>;
+
+/// `serde(skip_serializing_if)` predicate for `Option<Id<T>>` fields
+/// that treat an empty string the same as `None`. Mirrors the semantics
+/// of `skip_if_empty_str` for the typed-id storage migration.
+pub fn skip_if_empty_id<T: ?Sized>(id: &Option<Id<T>>) -> bool {
+    matches!(id, Some(id) if id.as_str().is_empty())
+}

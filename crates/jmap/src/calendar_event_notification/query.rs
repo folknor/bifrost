@@ -14,7 +14,7 @@ pub enum Filter {
     },
     CalendarEventId {
         #[serde(rename = "calendarEventId")]
-        value: String,
+        value: crate::calendar_event::CalendarEventId,
     },
 }
 
@@ -33,7 +33,7 @@ impl Filter {
         }
     }
 
-    pub fn calendar_event_id(value: impl Into<String>) -> Self {
+    pub fn calendar_event_id(value: impl Into<crate::calendar_event::CalendarEventId>) -> Self {
         Filter::CalendarEventId {
             value: value.into(),
         }

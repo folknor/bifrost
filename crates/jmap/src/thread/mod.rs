@@ -12,9 +12,9 @@ pub type ThreadId = crate::core::id::Id<marker::Thread>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
-    id: String,
+    id: ThreadId,
     #[serde(rename = "emailIds")]
-    email_ids: Vec<String>,
+    email_ids: Vec<crate::email::EmailId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -28,6 +28,7 @@ pub enum Property {
 
 impl crate::core::Object for Thread {
     type Property = Property;
+    type Id = ThreadId;
     fn requires_account_id() -> bool {
         true
     }

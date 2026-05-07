@@ -1,9 +1,11 @@
 use crate::{
     Error,
     core::{
+        id::{AccountId, BlobId},
         request::ResultReference,
         set::{SetError, from_timestamp},
     },
+    mailbox::MailboxId,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,7 +16,7 @@ use super::{Email, Property};
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailImportRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "ifInState")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -29,11 +31,11 @@ pub struct EmailImport {
     create_id: usize,
 
     #[serde(rename = "blobId")]
-    blob_id: String,
+    blob_id: BlobId,
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    mailbox_ids: Option<HashMap<String, bool>>,
+    mailbox_ids: Option<HashMap<MailboxId, bool>>,
 
     #[serde(rename = "#mailboxIds")]
     #[serde(skip_deserializing)]
@@ -51,7 +53,7 @@ pub struct EmailImport {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmailImportResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "oldState")]
     old_state: Option<String>,
@@ -71,8 +73,8 @@ impl crate::core::method::JmapMethod for EmailImportRequest {
     type Cap = crate::core::capability::Mail;
     type Response = EmailImportResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -85,7 +87,7 @@ impl Default for EmailImportRequest {
 impl EmailImportRequest {
     pub fn new() -> Self {
         EmailImportRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             if_in_state: None,
             emails: HashMap::new(),
         }
@@ -94,7 +96,7 @@ impl EmailImportRequest {
     /// Internal account-id setter. Prefer `JmapMethod::set_account_id`
     /// (called automatically by `Request::call`); kept on the struct
     /// for the few call sites that build a request directly.
-    pub fn set_account_id_inplace(&mut self, account_id: impl Into<String>) -> &mut Self {
+    pub fn set_account_id_inplace(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
@@ -107,7 +109,7 @@ impl EmailImportRequest {
 
     /// Add an email entry. Stays imperative because the returned
     /// `&mut EmailImport` writes into a HashMap entry.
-    pub fn email(&mut self, blob_id: impl Into<String>) -> &mut EmailImport {
+    pub fn email(&mut self, blob_id: impl Into<BlobId>) -> &mut EmailImport {
         let create_id = self.emails.len();
         let create_id_str = format!("i{create_id}");
         self.emails.insert(
@@ -119,7 +121,7 @@ impl EmailImportRequest {
 }
 
 impl EmailImport {
-    fn new(blob_id: String, create_id: usize) -> Self {
+    fn new(blob_id: BlobId, create_id: usize) -> Self {
         EmailImport {
             create_id,
             blob_id,
@@ -133,7 +135,7 @@ impl EmailImport {
     pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
-        U: Into<String>,
+        U: Into<MailboxId>,
     {
         self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
         self.mailbox_ids_ref = None;
@@ -166,7 +168,7 @@ impl EmailImport {
 }
 
 impl EmailImportResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 

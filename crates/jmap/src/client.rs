@@ -44,7 +44,7 @@ pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
     download_url: Vec<URLPart<blob::URLParameter>>,
     event_source_url: Vec<URLPart<crate::event_source::URLParameter>>,
 
-    default_account_id: String,
+    default_account_id: crate::core::id::AccountId,
     timeout: Duration,
     /// Used only by the websocket transport; without that feature, the
     /// field is otherwise unread but kept on the struct for build-shape
@@ -196,8 +196,8 @@ impl ClientBuilder {
         let default_account_id = session
             .primary_accounts()
             .next()
-            .map(|a| a.1.clone())
-            .unwrap_or_default();
+            .map(|a| crate::core::id::AccountId::new(a.1.clone()))
+            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
 
         Ok(Client {
             inner: Arc::new(ClientInner {
@@ -238,8 +238,8 @@ impl<T: HttpTransport> Client<T> {
         let default_account_id = session
             .primary_accounts()
             .next()
-            .map(|a| a.1.clone())
-            .unwrap_or_default();
+            .map(|a| crate::core::id::AccountId::new(a.1.clone()))
+            .unwrap_or_else(|| crate::core::id::AccountId::new(""));
 
         Ok(Client {
             inner: Arc::new(ClientInner {
@@ -282,13 +282,8 @@ impl<T: HttpTransport> Client<T> {
         &self.inner.session_url
     }
 
-    pub fn default_account_id(&self) -> &str {
+    pub fn default_account_id(&self) -> &crate::core::id::AccountId {
         &self.inner.default_account_id
-    }
-
-    /// Get the default account ID as a typed `AccountId`.
-    pub fn default_account(&self) -> crate::core::id::AccountId {
-        crate::core::id::AccountId::new(&self.inner.default_account_id)
     }
 
     pub(crate) fn download_url(&self) -> &[URLPart<blob::URLParameter>] {

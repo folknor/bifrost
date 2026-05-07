@@ -27,7 +27,7 @@ pub enum Filter {
     /// Match by the account ID where the shared object resides.
     ObjectAccountId {
         #[serde(rename = "objectAccountId")]
-        value: String,
+        value: crate::core::id::AccountId,
     },
 }
 
@@ -59,7 +59,7 @@ impl Filter {
         }
     }
 
-    pub fn object_account_id(value: impl Into<String>) -> Self {
+    pub fn object_account_id(value: impl Into<crate::core::id::AccountId>) -> Self {
         Filter::ObjectAccountId {
             value: value.into(),
         }

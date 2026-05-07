@@ -16,7 +16,7 @@ pub type CalendarEventNotificationId = crate::core::id::Id<marker::CalendarEvent
 pub struct CalendarEventNotification {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<CalendarEventNotificationId>,
 
     #[serde(rename = "created")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,7 +28,7 @@ pub struct CalendarEventNotification {
 
     #[serde(rename = "calendarEventId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) calendar_event_id: Option<String>,
+    pub(super) calendar_event_id: Option<crate::calendar_event::CalendarEventId>,
 
     #[serde(rename = "isDraft")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,7 +66,7 @@ pub struct ChangedBy {
 
     #[serde(rename = "principalId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub principal_id: Option<String>,
+    pub principal_id: Option<crate::principal::PrincipalId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +118,7 @@ impl Display for Property {
 
 impl crate::core::Object for CalendarEventNotification {
     type Property = Property;
+    type Id = CalendarEventNotificationId;
     fn requires_account_id() -> bool {
         true
     }

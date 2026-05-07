@@ -2,7 +2,8 @@ use serde::Serialize;
 
 use crate::core::query::{self, QueryObject};
 
-use super::{Principal, Type};
+use super::{Principal, PrincipalId, Type};
+use crate::core::id::AccountId;
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -13,7 +14,7 @@ pub enum Filter {
     /// in serde's untagged trial order (no other variant uses an array).
     AccountIds {
         #[serde(rename = "accountIds")]
-        value: Vec<String>,
+        value: Vec<AccountId>,
     },
     Email {
         #[serde(rename = "email")]
@@ -41,7 +42,7 @@ pub enum Filter {
     },
     Members {
         #[serde(rename = "members")]
-        value: String,
+        value: PrincipalId,
     },
     QuotaLt {
         #[serde(rename = "quotaLowerThan")]
@@ -67,7 +68,7 @@ pub enum Comparator {
 
 impl Filter {
     /// RFC 9670: Match principals owning the specified accounts.
-    pub fn account_ids(value: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn account_ids(value: impl IntoIterator<Item = impl Into<AccountId>>) -> Self {
         Filter::AccountIds {
             value: value.into_iter().map(Into::into).collect(),
         }
@@ -103,7 +104,7 @@ impl Filter {
         }
     }
 
-    pub fn members(value: impl Into<String>) -> Self {
+    pub fn members(value: impl Into<PrincipalId>) -> Self {
         Filter::Members {
             value: value.into(),
         }

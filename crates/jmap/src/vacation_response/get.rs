@@ -1,8 +1,8 @@
-use super::VacationResponse;
+use super::{VacationResponse, VacationResponseId};
 
 impl VacationResponse {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&VacationResponseId> {
+        self.id.as_ref()
     }
 
     pub fn is_enabled(&self) -> bool {

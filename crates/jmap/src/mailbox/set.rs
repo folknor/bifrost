@@ -1,4 +1,4 @@
-use super::{ACLPatch, MailboxCreate, MailboxPatch, Role, SetArguments};
+use super::{ACLPatch, MailboxCreate, MailboxId, MailboxPatch, Role, SetArguments};
 use crate::principal::ACL;
 use std::collections::HashMap;
 
@@ -8,13 +8,13 @@ impl MailboxCreate {
         self
     }
 
-    pub fn parent_id(&mut self, parent_id: Option<impl Into<String>>) -> &mut Self {
+    pub fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
         self.parent_id = parent_id.map(std::convert::Into::into);
         self
     }
 
     pub fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
-        self.parent_id = format!("#{parent_id_ref}").into();
+        self.parent_id = Some(MailboxId::new(format!("#{parent_id_ref}")));
         self
     }
 
@@ -58,13 +58,13 @@ impl MailboxPatch {
         self
     }
 
-    pub fn parent_id(&mut self, parent_id: Option<impl Into<String>>) -> &mut Self {
+    pub fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
         self.parent_id = parent_id.map(std::convert::Into::into);
         self
     }
 
     pub fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
-        self.parent_id = format!("#{parent_id_ref}").into();
+        self.parent_id = Some(MailboxId::new(format!("#{parent_id_ref}")));
         self
     }
 

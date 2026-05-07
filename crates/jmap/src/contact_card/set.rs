@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::{ContactCardCreate, ContactCardPatch};
+use crate::address_book::AddressBookId;
 
 macro_rules! cc_setters {
     ($t:ty) => {
@@ -14,11 +15,11 @@ macro_rules! cc_setters {
             pub fn address_book_ids<U, V>(&mut self, address_book_ids: U) -> &mut Self
             where
                 U: IntoIterator<Item = V>,
-                V: Into<String>,
+                V: Into<AddressBookId>,
             {
                 let map: serde_json::Map<String, serde_json::Value> = address_book_ids
                     .into_iter()
-                    .map(|id| (id.into(), json!(true)))
+                    .map(|id| (id.into().into_string(), json!(true)))
                     .collect();
                 self.properties
                     .insert("addressBookIds".into(), serde_json::Value::Object(map));
@@ -27,7 +28,7 @@ macro_rules! cc_setters {
 
             pub fn address_book_id(
                 &mut self,
-                address_book_id: impl Into<String>,
+                address_book_id: impl Into<AddressBookId>,
                 set: bool,
             ) -> &mut Self {
                 let entry = self
@@ -36,7 +37,7 @@ macro_rules! cc_setters {
                     .or_insert_with(|| json!({}));
                 if let Some(map) = entry.as_object_mut() {
                     map.insert(
-                        address_book_id.into(),
+                        address_book_id.into().into_string(),
                         if set {
                             serde_json::Value::Bool(true)
                         } else {

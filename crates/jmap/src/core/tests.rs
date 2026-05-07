@@ -14,6 +14,11 @@ use crate::Error;
 
 // -- Minimal test types --
 
+mod test_marker {
+    pub enum TestObj {}
+}
+pub type TestObjId = crate::core::id::Id<test_marker::TestObj>;
+
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TestObj {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +60,7 @@ impl std::fmt::Display for TestProp {
 
 impl super::Object for TestObj {
     type Property = TestProp;
+    type Id = TestObjId;
     fn requires_account_id() -> bool {
         true
     }
@@ -283,7 +289,7 @@ fn set_response_deserializes() {
 #[test]
 fn request_serializes_correctly() {
     let mut get = TestGet::new();
-    get.set_account_id("account-1");
+    get.set_account_id(&crate::core::id::AccountId::new("account-1"));
     let value = serde_json::to_value(&get).unwrap();
     assert_eq!(value.get("accountId"), Some(&json!("account-1")));
 }

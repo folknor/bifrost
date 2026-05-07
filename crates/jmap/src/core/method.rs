@@ -1,6 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 
 use super::capability::Capability;
+use super::id::AccountId;
 
 /// A self-describing JMAP method call.
 pub trait JmapMethod: Serialize + Send {
@@ -8,7 +9,7 @@ pub trait JmapMethod: Serialize + Send {
     type Cap: Capability;
     type Response: DeserializeOwned + Send;
 
-    fn set_account_id(&mut self, _account_id: &str) {}
+    fn set_account_id(&mut self, _account_id: &AccountId) {}
 }
 
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
@@ -26,8 +27,8 @@ macro_rules! define_get_method {
             type Cap = $cap;
             type Response = $crate::core::get::GetResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
@@ -47,7 +48,7 @@ macro_rules! define_get_method {
             pub fn ids<U, V>(mut self, ids: U) -> Self
             where
                 U: IntoIterator<Item = V>,
-                V: Into<String>,
+                V: Into<<$obj as $crate::core::Object>::Id>,
             {
                 self.inner.ids(ids);
                 self
@@ -114,8 +115,8 @@ macro_rules! define_set_method {
             type Cap = $cap;
             type Response = $crate::core::set::SetResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
@@ -136,7 +137,7 @@ macro_rules! define_set_method {
             pub fn destroy<U, V>(mut self, ids: U) -> Self
             where
                 U: IntoIterator<Item = V>,
-                V: Into<String>,
+                V: Into<<$obj as $crate::core::Object>::Id>,
             {
                 self.inner.destroy(ids);
                 self
@@ -188,8 +189,8 @@ macro_rules! define_changes_method {
             type Cap = $cap;
             type Response = $crate::core::changes::ChangesResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
@@ -235,10 +236,10 @@ macro_rules! define_query_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $crate::core::query::QueryResponse;
+            type Response = $crate::core::query::QueryResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
@@ -339,10 +340,10 @@ macro_rules! define_query_changes_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $crate::core::query_changes::QueryChangesResponse;
+            type Response = $crate::core::query_changes::QueryChangesResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
@@ -384,7 +385,10 @@ macro_rules! define_query_changes_method {
             }
 
             #[must_use]
-            pub fn up_to_id(mut self, up_to_id: impl Into<String>) -> Self {
+            pub fn up_to_id(
+                mut self,
+                up_to_id: impl Into<<$obj as $crate::core::Object>::Id>,
+            ) -> Self {
                 self.inner.up_to_id(up_to_id);
                 self
             }
@@ -426,13 +430,13 @@ macro_rules! define_copy_method {
             type Cap = $cap;
             type Response = $crate::core::copy::CopyResponse<$obj>;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.inner.account_id(account_id);
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.inner.account_id(account_id.clone());
             }
         }
 
         impl $name {
-            pub fn new(from_account_id: impl Into<String>) -> Self {
+            pub fn new(from_account_id: impl Into<$crate::core::id::AccountId>) -> Self {
                 Self {
                     inner: $crate::core::copy::CopyRequest::new(from_account_id),
                 }
@@ -554,10 +558,10 @@ macro_rules! define_parse_method {
         #[derive(Debug, Clone, serde::Serialize)]
         pub struct $name {
             #[serde(rename = "accountId")]
-            account_id: String,
+            account_id: $crate::core::id::AccountId,
 
             #[serde(rename = "blobIds")]
-            blob_ids: Vec<String>,
+            blob_ids: Vec<$crate::core::id::BlobId>,
 
             #[serde(rename = "properties")]
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,15 +573,15 @@ macro_rules! define_parse_method {
             type Cap = $cap;
             type Response = $response;
 
-            fn set_account_id(&mut self, account_id: &str) {
-                self.account_id = account_id.to_string();
+            fn set_account_id(&mut self, account_id: &$crate::core::id::AccountId) {
+                self.account_id = account_id.clone();
             }
         }
 
         impl $name {
             pub fn new() -> Self {
                 Self {
-                    account_id: String::new(),
+                    account_id: $crate::core::id::AccountId::new(""),
                     blob_ids: Vec::new(),
                     properties: None,
                 }
@@ -587,7 +591,7 @@ macro_rules! define_parse_method {
             pub fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
             where
                 U: IntoIterator<Item = V>,
-                V: Into<String>,
+                V: Into<$crate::core::id::BlobId>,
             {
                 self.blob_ids = blob_ids.into_iter().map(std::convert::Into::into).collect();
                 self

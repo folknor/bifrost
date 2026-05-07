@@ -7,6 +7,7 @@ use crate::client::Client;
 use crate::core::transport::HttpTransport;
 
 use super::capability::Capability;
+use super::id::AccountId;
 use super::method::JmapMethod;
 use super::response::Response;
 
@@ -63,7 +64,7 @@ impl Serialize for RawMethodCall {
 /// A JMAP request batch.
 pub struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
     client: &'x Client<T>,
-    account_id: String,
+    account_id: AccountId,
     pub(crate) using: Vec<&'static str>,
     pub(crate) method_calls: Vec<RawMethodCall>,
     pub(crate) created_ids: Option<std::collections::HashMap<String, String>>,
@@ -88,18 +89,18 @@ impl<'x, T: HttpTransport> Request<'x, T> {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
             created_ids: None,
-            account_id: client.default_account_id().to_string(),
+            account_id: client.default_account_id().clone(),
             client,
         }
     }
 
-    pub fn account_id(mut self, account_id: impl Into<String>) -> Self {
+    pub fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {
         self.account_id = account_id.into();
         self
     }
 
     /// The default account ID for this request.
-    pub fn default_account_id(&self) -> &str {
+    pub fn default_account_id(&self) -> &AccountId {
         &self.account_id
     }
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::Error;
+use crate::core::id::{AccountId, BlobId};
 
 // ---- Blob/upload (RFC 9404 §4.1) ----
 
@@ -13,8 +14,9 @@ use crate::Error;
 #[derive(Debug, Clone, Serialize)]
 pub struct BlobUploadRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
+    /// Create entries keyed by consumer-provided create-id (e.g. "b1").
     #[serde(rename = "create")]
     create: HashMap<String, BlobUploadCreate>,
 }
@@ -50,7 +52,7 @@ pub enum DataSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct DataSourceBlob {
     #[serde(rename = "blobId")]
-    pub blob_id: String,
+    pub blob_id: BlobId,
 
     #[serde(rename = "offset")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,11 +77,12 @@ pub struct DataSourceBase64 {
     pub value: String,
 }
 
-/// Response for `Blob/upload`.
+/// Response for `Blob/upload`. Created/notCreated maps are keyed by
+/// the consumer-provided create-id (e.g. "b1"), not real blob IDs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobUploadResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "created")]
     created: Option<HashMap<String, BlobUploadCreated>>,
@@ -92,7 +95,7 @@ pub struct BlobUploadResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobUploadCreated {
     #[serde(rename = "id")]
-    pub id: String,
+    pub id: BlobId,
 
     #[serde(rename = "type")]
     pub type_: Option<String>,
@@ -106,8 +109,8 @@ impl crate::core::method::JmapMethod for BlobUploadRequest {
     type Cap = crate::core::capability::Blob;
     type Response = BlobUploadResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -116,8 +119,8 @@ impl crate::core::method::JmapMethod for BlobGetRequest {
     type Cap = crate::core::capability::Blob;
     type Response = BlobGetResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -126,8 +129,8 @@ impl crate::core::method::JmapMethod for BlobLookupRequest {
     type Cap = crate::core::capability::Blob;
     type Response = BlobLookupResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -140,7 +143,7 @@ impl Default for BlobUploadRequest {
 impl BlobUploadRequest {
     pub fn new() -> Self {
         BlobUploadRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             create: HashMap::new(),
         }
     }
@@ -185,7 +188,7 @@ impl BlobUploadRequest {
     /// Returns the create id.
     pub fn create_from_blob(
         &mut self,
-        blob_id: impl Into<String>,
+        blob_id: impl Into<BlobId>,
         offset: Option<u64>,
         length: Option<u64>,
         type_: Option<impl Into<String>>,
@@ -225,10 +228,11 @@ impl BlobUploadRequest {
 }
 
 impl BlobUploadResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
+    /// Look up a successful or failed create by its create-id (e.g. "b1").
     pub fn created(&mut self, id: &str) -> crate::Result<BlobUploadCreated> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
@@ -241,6 +245,9 @@ impl BlobUploadResponse {
         }
     }
 
+    /// Iterate the create-ids of successful uploads (consumer-provided
+    /// "b1"/"b2"/..., not real blob IDs - real IDs live on each
+    /// `BlobUploadCreated.id`).
     pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
@@ -256,10 +263,10 @@ impl BlobUploadResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct BlobGetRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "ids")]
-    ids: Vec<String>,
+    ids: Vec<BlobId>,
 
     #[serde(rename = "properties")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,13 +285,13 @@ pub struct BlobGetRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobGetResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "list")]
     list: Vec<BlobGetResult>,
 
     #[serde(rename = "notFound")]
-    not_found: Option<Vec<String>>,
+    not_found: Option<Vec<BlobId>>,
 }
 
 /// Result for a single blob get entry.
@@ -296,7 +303,7 @@ pub struct BlobGetResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobGetResult {
     #[serde(rename = "id")]
-    pub id: String,
+    pub id: BlobId,
 
     #[serde(rename = "size")]
     pub size: Option<u64>,
@@ -343,7 +350,7 @@ impl Default for BlobGetRequest {
 impl BlobGetRequest {
     pub fn new() -> Self {
         BlobGetRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             ids: Vec::new(),
             properties: None,
             offset: None,
@@ -356,7 +363,7 @@ impl BlobGetRequest {
     pub fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<BlobId>,
     {
         self.ids
             .extend(ids.into_iter().map(std::convert::Into::into));
@@ -397,7 +404,7 @@ impl BlobGetRequest {
 }
 
 impl BlobGetResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
@@ -409,7 +416,7 @@ impl BlobGetResponse {
         self.list
     }
 
-    pub fn not_found(&self) -> Option<&[String]> {
+    pub fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }
@@ -427,33 +434,33 @@ impl BlobGetResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct BlobLookupRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "typeNames")]
     type_names: Vec<String>,
 
     #[serde(rename = "ids")]
-    ids: Vec<String>,
+    ids: Vec<BlobId>,
 }
 
 /// Response for `Blob/lookup`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobLookupResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "list")]
     list: Vec<BlobLookupResult>,
 
     #[serde(rename = "notFound")]
-    not_found: Option<Vec<String>>,
+    not_found: Option<Vec<BlobId>>,
 }
 
 /// Result for a single blob lookup entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlobLookupResult {
     #[serde(rename = "id")]
-    pub id: String,
+    pub id: BlobId,
 
     /// Map of type name → list of object IDs that reference this blob.
     #[serde(rename = "matchedIds")]
@@ -469,7 +476,7 @@ impl Default for BlobLookupRequest {
 impl BlobLookupRequest {
     pub fn new() -> Self {
         BlobLookupRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             type_names: Vec::new(),
             ids: Vec::new(),
         }
@@ -497,7 +504,7 @@ impl BlobLookupRequest {
     pub fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<BlobId>,
     {
         self.ids = ids.into_iter().map(std::convert::Into::into).collect();
         self
@@ -505,7 +512,7 @@ impl BlobLookupRequest {
 }
 
 impl BlobLookupResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
@@ -517,7 +524,7 @@ impl BlobLookupResponse {
         self.list
     }
 
-    pub fn not_found(&self) -> Option<&[String]> {
+    pub fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }

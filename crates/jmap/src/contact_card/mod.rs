@@ -41,6 +41,7 @@ crate::define_open_property_enum! {
 
 impl crate::core::Object for ContactCard {
     type Property = Property;
+    type Id = ContactCardId;
     fn requires_account_id() -> bool {
         true
     }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Object;
+use super::id::AccountId;
 use super::request::ResultReference;
 
 pub trait GetObject: Object {
@@ -11,10 +12,10 @@ pub trait GetObject: Object {
 pub struct GetRequest<O: GetObject> {
     #[serde(rename = "accountId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    account_id: Option<String>,
+    account_id: Option<AccountId>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    ids: Option<Vec<String>>,
+    ids: Option<Vec<O::Id>>,
 
     #[serde(rename = "#ids")]
     #[serde(skip_deserializing)]
@@ -34,23 +35,23 @@ pub struct GetRequest<O: GetObject> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct GetResponse<T> {
+pub struct GetResponse<O: Object> {
     #[serde(rename = "accountId")]
-    account_id: Option<String>,
+    account_id: Option<AccountId>,
 
     state: String,
 
-    list: Vec<T>,
+    list: Vec<O>,
 
     #[serde(rename = "notFound")]
-    not_found: Vec<String>,
+    not_found: Vec<O::Id>,
 }
 
 impl<O: GetObject> GetRequest<O> {
     pub fn new() -> Self {
         GetRequest {
             account_id: if O::requires_account_id() {
-                Some(String::new())
+                Some(AccountId::new(""))
             } else {
                 None
             },
@@ -62,7 +63,7 @@ impl<O: GetObject> GetRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<String>) -> &mut Self {
+    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         if O::requires_account_id() {
             self.account_id = Some(account_id.into());
         }
@@ -72,7 +73,7 @@ impl<O: GetObject> GetRequest<O> {
     pub fn ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<O::Id>,
     {
         self.ids = Some(ids.into_iter().map(std::convert::Into::into).collect());
         self.ids_ref = None;
@@ -108,9 +109,9 @@ impl<O: GetObject> Default for GetRequest<O> {
     }
 }
 
-impl<O> GetResponse<O> {
-    pub fn account_id(&self) -> Option<&str> {
-        self.account_id.as_deref()
+impl<O: Object> GetResponse<O> {
+    pub fn account_id(&self) -> Option<&AccountId> {
+        self.account_id.as_ref()
     }
 
     pub fn state(&self) -> &str {
@@ -125,7 +126,7 @@ impl<O> GetResponse<O> {
         &self.list
     }
 
-    pub fn not_found(&self) -> &[String] {
+    pub fn not_found(&self) -> &[O::Id] {
         &self.not_found
     }
 
@@ -137,7 +138,7 @@ impl<O> GetResponse<O> {
         self.list.pop()
     }
 
-    pub fn into_not_found(self) -> Vec<String> {
+    pub fn into_not_found(self) -> Vec<O::Id> {
         self.not_found
     }
 }

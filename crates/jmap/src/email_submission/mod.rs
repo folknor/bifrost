@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::email::{Email, EmailPatch};
+use crate::email::{Email, EmailId, EmailPatch};
+use crate::identity::IdentityId;
+use crate::thread::ThreadId;
 
 mod marker {
     pub enum EmailSubmission {}
@@ -17,6 +19,9 @@ pub type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>;
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SetArguments {
+    /// Patches to apply to the referenced email on successful submit,
+    /// keyed by `EmailSubmission` create-id (e.g. "c0") or by real
+    /// `EmailSubmission` id with `#` prefix per RFC 8621.
     #[serde(rename = "onSuccessUpdateEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_success_update_email: Option<HashMap<String, EmailPatch>>,
@@ -29,19 +34,19 @@ pub struct SetArguments {
 pub struct EmailSubmission {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<EmailSubmissionId>,
 
     #[serde(rename = "identityId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) identity_id: Option<String>,
+    pub(super) identity_id: Option<IdentityId>,
 
     #[serde(rename = "emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) email_id: Option<String>,
+    pub(super) email_id: Option<EmailId>,
 
     #[serde(rename = "threadId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) thread_id: Option<String>,
+    pub(super) thread_id: Option<ThreadId>,
 
     #[serde(rename = "envelope")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,11 +66,11 @@ pub struct EmailSubmission {
 
     #[serde(rename = "dsnBlobIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) dsn_blob_ids: Option<Vec<String>>,
+    pub(super) dsn_blob_ids: Option<Vec<crate::core::id::BlobId>>,
 
     #[serde(rename = "mdnBlobIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mdn_blob_ids: Option<Vec<String>>,
+    pub(super) mdn_blob_ids: Option<Vec<crate::core::id::BlobId>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,11 +80,11 @@ pub struct EmailSubmissionCreate {
 
     #[serde(rename = "identityId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) identity_id: Option<String>,
+    pub(super) identity_id: Option<IdentityId>,
 
     #[serde(rename = "emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) email_id: Option<String>,
+    pub(super) email_id: Option<EmailId>,
 
     #[serde(rename = "envelope")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +206,7 @@ impl Display for Property {
 
 impl crate::core::Object for EmailSubmission {
     type Property = Property;
+    type Id = EmailSubmissionId;
     fn requires_account_id() -> bool {
         true
     }

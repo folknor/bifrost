@@ -1,42 +1,40 @@
 use super::{
-    Email, EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailHeader, Header,
-    HeaderValue,
+    Email, EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailHeader, EmailId,
+    Header, HeaderValue,
 };
+use crate::core::id::BlobId;
+use crate::mailbox::MailboxId;
+use crate::thread::ThreadId;
 
 impl Email {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&EmailId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> EmailId {
+        self.id.take().unwrap_or_else(|| EmailId::new(""))
     }
 
-    pub fn blob_id(&self) -> Option<&str> {
-        self.blob_id.as_deref()
+    pub fn blob_id(&self) -> Option<&BlobId> {
+        self.blob_id.as_ref()
     }
 
-    pub fn take_blob_id(&mut self) -> String {
-        self.blob_id.take().unwrap_or_default()
+    pub fn take_blob_id(&mut self) -> BlobId {
+        self.blob_id.take().unwrap_or_else(|| BlobId::new(""))
     }
 
-    pub fn thread_id(&self) -> Option<&str> {
-        self.thread_id.as_deref()
+    pub fn thread_id(&self) -> Option<&ThreadId> {
+        self.thread_id.as_ref()
     }
 
-    pub fn take_thread_id(&mut self) -> Option<String> {
+    pub fn take_thread_id(&mut self) -> Option<ThreadId> {
         self.thread_id.take()
     }
 
-    pub fn mailbox_ids(&self) -> Vec<&str> {
+    pub fn mailbox_ids(&self) -> Vec<&MailboxId> {
         self.mailbox_ids
             .as_ref()
-            .map(|m| {
-                m.iter()
-                    .filter(|(_, v)| **v)
-                    .map(|(k, _)| k.as_str())
-                    .collect()
-            })
+            .map(|m| m.iter().filter(|(_, v)| **v).map(|(k, _)| k).collect())
             .unwrap_or_default()
     }
 
@@ -183,8 +181,8 @@ impl EmailBodyPart {
         self.part_id.as_deref()
     }
 
-    pub fn blob_id(&self) -> Option<&str> {
-        self.blob_id.as_deref()
+    pub fn blob_id(&self) -> Option<&BlobId> {
+        self.blob_id.as_ref()
     }
 
     pub fn size(&self) -> usize {

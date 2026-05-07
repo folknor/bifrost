@@ -1,12 +1,15 @@
-use super::{CalendarEventNotification, ChangedBy, NotificationType};
+use super::{CalendarEventNotification, CalendarEventNotificationId, ChangedBy, NotificationType};
+use crate::calendar_event::CalendarEventId;
 
 impl CalendarEventNotification {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&CalendarEventNotificationId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> CalendarEventNotificationId {
+        self.id
+            .take()
+            .unwrap_or_else(|| CalendarEventNotificationId::new(""))
     }
 
     pub fn created(&self) -> Option<&str> {
@@ -17,8 +20,8 @@ impl CalendarEventNotification {
         self.changed_by.as_ref()
     }
 
-    pub fn calendar_event_id(&self) -> Option<&str> {
-        self.calendar_event_id.as_deref()
+    pub fn calendar_event_id(&self) -> Option<&CalendarEventId> {
+        self.calendar_event_id.as_ref()
     }
 
     pub fn is_draft(&self) -> Option<bool> {

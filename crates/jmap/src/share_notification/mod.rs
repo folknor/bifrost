@@ -18,7 +18,7 @@ pub type ShareNotificationId = crate::core::id::Id<marker::ShareNotification>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<ShareNotificationId>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) created: Option<String>,
@@ -33,8 +33,11 @@ pub struct ShareNotification {
 
     #[serde(rename = "objectAccountId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) object_account_id: Option<String>,
+    pub(super) object_account_id: Option<crate::core::id::AccountId>,
 
+    /// Server-side ID of the shared object. Its concrete type depends
+    /// on `objectType` (Mailbox, Calendar, AddressBook, ...) so this
+    /// stays `String`-typed at the schema layer.
     #[serde(rename = "objectId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) object_id: Option<String>,
@@ -73,7 +76,7 @@ pub struct ChangedBy {
 
     #[serde(rename = "principalId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    principal_id: Option<String>,
+    principal_id: Option<crate::principal::PrincipalId>,
 }
 
 impl ChangedBy {
@@ -85,8 +88,8 @@ impl ChangedBy {
         self.email.as_deref()
     }
 
-    pub fn principal_id(&self) -> Option<&str> {
-        self.principal_id.as_deref()
+    pub fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+        self.principal_id.as_ref()
     }
 }
 
@@ -131,6 +134,7 @@ impl Display for Property {
 
 impl crate::core::Object for ShareNotification {
     type Property = Property;
+    type Id = ShareNotificationId;
     fn requires_account_id() -> bool {
         true
     }

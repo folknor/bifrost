@@ -713,8 +713,18 @@ mod session_capabilities_deserialization {
         let principals = session
             .principals_capabilities()
             .expect("principals missing");
-        assert_eq!(principals.current_user_principal_id(), Some("user-1"));
-        assert_eq!(principals.account_id_for_principal(), Some("acct-1"));
+        assert_eq!(
+            principals
+                .current_user_principal_id()
+                .map(crate::core::id::Id::as_str),
+            Some("user-1")
+        );
+        assert_eq!(
+            principals
+                .account_id_for_principal()
+                .map(crate::core::id::Id::as_str),
+            Some("acct-1")
+        );
 
         // unknown vendor capability -> Other
         let vendor = session
@@ -835,7 +845,7 @@ mod blob_get_request_serialization {
         let mut req = BlobGetRequest::new()
             .ids(["blob-1", "blob-2"])
             .properties(["data:asText", "size"]);
-        req.set_account_id("acct-1");
+        req.set_account_id(&crate::core::id::AccountId::new("acct-1"));
 
         let value = serde_json::to_value(&req).unwrap();
 
@@ -865,7 +875,7 @@ mod blob_get_request_serialization {
             .ids(["blob-1"])
             .offset(100)
             .length(500);
-        req.set_account_id("acct-1");
+        req.set_account_id(&crate::core::id::AccountId::new("acct-1"));
 
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value.get("offset"), Some(&json!(100)));
@@ -876,7 +886,7 @@ mod blob_get_request_serialization {
     fn blob_get_request_without_optional_fields() {
         use crate::core::method::JmapMethod;
         let mut req = BlobGetRequest::new().ids(["blob-1"]);
-        req.set_account_id("acct-1");
+        req.set_account_id(&crate::core::id::AccountId::new("acct-1"));
 
         let value = serde_json::to_value(&req).unwrap();
         // properties, offset, length should be absent
@@ -930,10 +940,13 @@ mod share_notification_serde {
         });
 
         let notif: ShareNotification = serde_json::from_value(input).unwrap();
-        assert_eq!(notif.id(), Some("notif-1"));
+        assert_eq!(notif.id().map(crate::core::id::Id::as_str), Some("notif-1"));
         assert_eq!(notif.created(), Some("2024-11-15T10:30:00Z"));
         assert_eq!(notif.object_type(), Some("Calendar"));
-        assert_eq!(notif.object_account_id(), Some("acct-bob"));
+        assert_eq!(
+            notif.object_account_id().map(crate::core::id::Id::as_str),
+            Some("acct-bob")
+        );
         assert_eq!(notif.object_id(), Some("cal-team"));
         assert_eq!(notif.name(), Some("Team Calendar"));
         assert!(notif.old_rights().is_none());
@@ -944,13 +957,16 @@ mod share_notification_serde {
         let changed_by = notif.changed_by().unwrap();
         assert_eq!(changed_by.name(), Some("Alice"));
         assert_eq!(changed_by.email(), Some("alice@example.com"));
-        assert_eq!(changed_by.principal_id(), Some("p-alice"));
+        assert_eq!(
+            changed_by.principal_id().map(crate::core::id::Id::as_str),
+            Some("p-alice")
+        );
     }
 
     #[test]
     fn minimal_notification_deserializes() {
         let notif = from_json(r#"{"id":"n1"}"#);
-        assert_eq!(notif.id(), Some("n1"));
+        assert_eq!(notif.id().map(crate::core::id::Id::as_str), Some("n1"));
         assert!(notif.created().is_none());
         assert!(notif.changed_by().is_none());
         assert!(notif.object_type().is_none());
@@ -1024,7 +1040,10 @@ mod principal_rfc9670 {
         });
 
         let principal: Principal = serde_json::from_value(input).unwrap();
-        assert_eq!(principal.id(), Some("p-alice"));
+        assert_eq!(
+            principal.id().map(crate::core::id::Id::as_str),
+            Some("p-alice")
+        );
         assert_eq!(principal.name(), Some("Alice"));
 
         let caps = principal.capabilities().unwrap();
@@ -1034,7 +1053,7 @@ mod principal_rfc9670 {
         let accounts = principal.accounts().unwrap();
         assert_eq!(accounts.len(), 2);
 
-        let acct1 = &accounts["acct-1"];
+        let acct1 = &accounts[&crate::core::id::AccountId::new("acct-1")];
         assert_eq!(acct1.name(), Some("alice@example.com"));
         assert!(acct1.is_personal());
         assert!(!acct1.is_read_only());
@@ -1044,7 +1063,7 @@ mod principal_rfc9670 {
                 .contains_key("urn:ietf:params:jmap:mail")
         );
 
-        let acct2 = &accounts["acct-2"];
+        let acct2 = &accounts[&crate::core::id::AccountId::new("acct-2")];
         assert_eq!(acct2.name(), Some("shared"));
         assert!(!acct2.is_personal());
         assert!(acct2.is_read_only());
@@ -1059,7 +1078,10 @@ mod principal_rfc9670 {
         });
 
         let principal: Principal = serde_json::from_value(input).unwrap();
-        assert_eq!(principal.id(), Some("p-bob"));
+        assert_eq!(
+            principal.id().map(crate::core::id::Id::as_str),
+            Some("p-bob")
+        );
         assert!(principal.accounts().is_none());
         assert!(principal.capabilities().is_none());
     }
@@ -1135,8 +1157,16 @@ mod principals_owner_capability {
 
         // Session-level principals:owner capability
         let owner = session.principals_owner_capabilities().unwrap();
-        assert_eq!(owner.account_id_for_principal(), Some("acct-principals"));
-        assert_eq!(owner.principal_id(), Some("p-owner"));
+        assert_eq!(
+            owner
+                .account_id_for_principal()
+                .map(crate::core::id::Id::as_str),
+            Some("acct-principals")
+        );
+        assert_eq!(
+            owner.principal_id().map(crate::core::id::Id::as_str),
+            Some("p-owner")
+        );
 
         // Account-level principals capability
         let account = session.account("acct-1").unwrap();
@@ -1145,7 +1175,11 @@ mod principals_owner_capability {
             .unwrap();
         match acct_principals {
             crate::core::session::Capabilities::Principals(c) => {
-                assert_eq!(c.current_user_principal_id(), Some("p-user"));
+                assert_eq!(
+                    c.current_user_principal_id()
+                        .map(crate::core::id::Id::as_str),
+                    Some("p-user")
+                );
             }
             _ => panic!("expected Principals variant"),
         }
@@ -1156,8 +1190,15 @@ mod principals_owner_capability {
             .unwrap();
         match acct_owner {
             crate::core::session::Capabilities::PrincipalsOwner(c) => {
-                assert_eq!(c.account_id_for_principal(), Some("acct-principals"));
-                assert_eq!(c.principal_id(), Some("p-user"));
+                assert_eq!(
+                    c.account_id_for_principal()
+                        .map(crate::core::id::Id::as_str),
+                    Some("acct-principals")
+                );
+                assert_eq!(
+                    c.principal_id().map(crate::core::id::Id::as_str),
+                    Some("p-user")
+                );
             }
             _ => panic!("expected PrincipalsOwner variant"),
         }

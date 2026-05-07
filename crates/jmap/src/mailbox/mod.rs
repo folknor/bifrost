@@ -2,7 +2,7 @@ pub mod get;
 pub mod query;
 pub mod set;
 
-use crate::core::set::{skip_if_empty_map, skip_if_empty_str};
+use crate::core::set::skip_if_empty_map;
 use crate::mailbox::set::role_not_set;
 use crate::principal::ACL;
 use serde::{Deserialize, Serialize};
@@ -65,7 +65,7 @@ pub struct ChangesResponse {
 pub struct Mailbox {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<MailboxId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +73,7 @@ pub struct Mailbox {
 
     #[serde(rename = "parentId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) parent_id: Option<String>,
+    pub(super) parent_id: Option<MailboxId>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,8 +123,8 @@ pub struct MailboxCreate {
     pub(super) name: Option<String>,
 
     #[serde(rename = "parentId")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub(super) parent_id: Option<String>,
+    #[serde(skip_serializing_if = "crate::core::id::skip_if_empty_id")]
+    pub(super) parent_id: Option<MailboxId>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "role_not_set")]
@@ -152,7 +152,7 @@ pub struct MailboxPatch {
 
     #[serde(rename = "parentId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) parent_id: Option<String>,
+    pub(super) parent_id: Option<MailboxId>,
 
     #[serde(rename = "role")]
     #[serde(skip_serializing_if = "role_not_set")]
@@ -306,6 +306,7 @@ impl ChangesResponse {
 
 impl crate::core::Object for Mailbox {
     type Property = Property;
+    type Id = MailboxId;
     fn requires_account_id() -> bool {
         true
     }
@@ -334,7 +335,7 @@ impl crate::core::SetCreate for MailboxCreate {
         MailboxCreate {
             _create_id: create_id,
             name: None,
-            parent_id: String::new().into(),
+            parent_id: Some(MailboxId::new("")),
             role: Role::None.into(),
             sort_order: None,
             is_subscribed: None,

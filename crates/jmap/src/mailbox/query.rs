@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::core::query::{self, QueryObject};
 
-use super::{Mailbox, QueryArguments, Role};
+use super::{Mailbox, MailboxId, QueryArguments, Role};
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
@@ -10,7 +10,7 @@ use super::{Mailbox, QueryArguments, Role};
 pub enum Filter {
     ParentId {
         #[serde(rename = "parentId")]
-        value: Option<String>,
+        value: Option<MailboxId>,
     },
     Name {
         #[serde(rename = "name")]
@@ -43,7 +43,7 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn parent_id(value: Option<impl Into<String>>) -> Self {
+    pub fn parent_id(value: Option<impl Into<MailboxId>>) -> Self {
         Filter::ParentId {
             value: value.map(Into::into),
         }

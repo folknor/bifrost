@@ -1,4 +1,5 @@
-use super::{SetArguments, SieveScriptCreate, SieveScriptPatch, SieveScriptSet};
+use super::{SetArguments, SieveScriptCreate, SieveScriptId, SieveScriptPatch, SieveScriptSet};
+use crate::core::id::BlobId;
 
 macro_rules! sieve_setters {
     ($t:ty) => {
@@ -8,7 +9,7 @@ macro_rules! sieve_setters {
                 self
             }
 
-            pub fn blob_id(&mut self, blob_id: impl Into<String>) -> &mut Self {
+            pub fn blob_id(&mut self, blob_id: impl Into<BlobId>) -> &mut Self {
                 self.blob_id = Some(blob_id.into());
                 self
             }
@@ -20,12 +21,15 @@ sieve_setters!(SieveScriptCreate);
 sieve_setters!(SieveScriptPatch);
 
 impl SetArguments {
-    pub fn on_success_activate_script(&mut self, id: impl Into<String>) -> &mut Self {
-        self.on_success_activate_script = Some(format!("#{}", id.into()));
+    /// Activate the script identified by the create-id from the same
+    /// `set` request. Wraps the value with `#` per JMAP create-id refs.
+    pub fn on_success_activate_script(&mut self, create_id: impl Into<String>) -> &mut Self {
+        self.on_success_activate_script =
+            Some(SieveScriptId::new(format!("#{}", create_id.into())));
         self
     }
 
-    pub fn on_success_activate_script_id(&mut self, id: impl Into<String>) -> &mut Self {
+    pub fn on_success_activate_script_id(&mut self, id: impl Into<SieveScriptId>) -> &mut Self {
         self.on_success_activate_script = Some(id.into());
         self
     }
@@ -38,13 +42,13 @@ impl SetArguments {
 
 impl SieveScriptSet {
     #[must_use]
-    pub fn on_success_activate_script(mut self, id: impl Into<String>) -> Self {
-        self.arguments().on_success_activate_script(id);
+    pub fn on_success_activate_script(mut self, create_id: impl Into<String>) -> Self {
+        self.arguments().on_success_activate_script(create_id);
         self
     }
 
     #[must_use]
-    pub fn on_success_activate_script_id(mut self, id: impl Into<String>) -> Self {
+    pub fn on_success_activate_script_id(mut self, id: impl Into<SieveScriptId>) -> Self {
         self.arguments().on_success_activate_script_id(id);
         self
     }

@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
-use super::ParticipantIdentity;
+use super::{ParticipantIdentity, ParticipantIdentityId};
 
 impl ParticipantIdentity {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&ParticipantIdentityId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> ParticipantIdentityId {
+        self.id
+            .take()
+            .unwrap_or_else(|| ParticipantIdentityId::new(""))
     }
 
     pub fn name(&self) -> Option<&str> {

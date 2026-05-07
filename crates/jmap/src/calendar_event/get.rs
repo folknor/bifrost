@@ -1,20 +1,26 @@
 use crate::core::field::Field;
 
-use super::CalendarEvent;
+use super::{CalendarEvent, CalendarEventId};
 
 impl CalendarEvent {
-    pub fn id(&self) -> Option<&str> {
-        self.properties.get("id")?.as_str()
+    /// The calendar event ID. Returns an owned `CalendarEventId` (one
+    /// allocation): JSON-map storage means there is no `&CalendarEventId`
+    /// to borrow.
+    pub fn id(&self) -> Option<CalendarEventId> {
+        self.properties
+            .get("id")?
+            .as_str()
+            .map(CalendarEventId::from)
     }
 
-    pub fn take_id(&mut self) -> String {
+    pub fn take_id(&mut self) -> CalendarEventId {
         self.properties
             .remove("id")
             .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::String(s) => Some(CalendarEventId::from(s)),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| CalendarEventId::new(""))
     }
 
     pub fn uid(&self) -> Option<&str> {

@@ -1,18 +1,21 @@
-use super::ContactCard;
+use super::{ContactCard, ContactCardId};
 
 impl ContactCard {
-    pub fn id(&self) -> Option<&str> {
-        self.properties.get("id")?.as_str()
+    /// The contact card ID. Returns an owned `ContactCardId` (one
+    /// allocation): JSON-map storage means there is no
+    /// `&ContactCardId` to borrow.
+    pub fn id(&self) -> Option<ContactCardId> {
+        self.properties.get("id")?.as_str().map(ContactCardId::from)
     }
 
-    pub fn take_id(&mut self) -> String {
+    pub fn take_id(&mut self) -> ContactCardId {
         self.properties
             .remove("id")
             .and_then(|v| match v {
-                serde_json::Value::String(s) => Some(s),
+                serde_json::Value::String(s) => Some(ContactCardId::from(s)),
                 _ => None,
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| ContactCardId::new(""))
     }
 
     pub fn uid(&self) -> Option<&str> {

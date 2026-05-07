@@ -8,11 +8,17 @@ use crate::core::set::skip_if_zero_date;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod marker {
+    pub enum VacationResponse {}
+}
+/// Strongly-typed VacationResponse ID (singleton; spec mandates "singleton").
+pub type VacationResponseId = crate::core::id::Id<marker::VacationResponse>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VacationResponse {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<VacationResponseId>,
 
     #[serde(rename = "isEnabled")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +137,7 @@ impl Display for Property {
 
 impl crate::core::Object for VacationResponse {
     type Property = Property;
+    type Id = VacationResponseId;
     fn requires_account_id() -> bool {
         true
     }

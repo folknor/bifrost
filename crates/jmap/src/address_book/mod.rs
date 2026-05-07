@@ -20,7 +20,7 @@ pub type AddressBookId = crate::core::id::Id<marker::AddressBook>;
 pub struct AddressBook {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<AddressBookId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +182,7 @@ impl Display for Property {
 
 impl crate::core::Object for AddressBook {
     type Property = Property;
+    type Id = AddressBookId;
     fn requires_account_id() -> bool {
         true
     }

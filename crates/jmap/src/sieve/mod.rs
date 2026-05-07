@@ -7,6 +7,8 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::id::BlobId;
+
 mod marker {
     pub enum SieveScript {}
 }
@@ -17,7 +19,7 @@ pub type SieveScriptId = crate::core::id::Id<marker::SieveScript>;
 pub struct SieveScript {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<SieveScriptId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -25,7 +27,7 @@ pub struct SieveScript {
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) blob_id: Option<String>,
+    pub(super) blob_id: Option<BlobId>,
 
     #[serde(rename = "isActive")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,7 +45,7 @@ pub struct SieveScriptCreate {
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) blob_id: Option<String>,
+    pub(super) blob_id: Option<BlobId>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -54,14 +56,14 @@ pub struct SieveScriptPatch {
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) blob_id: Option<String>,
+    pub(super) blob_id: Option<BlobId>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SetArguments {
     #[serde(rename = "onSuccessActivateScript")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    on_success_activate_script: Option<String>,
+    on_success_activate_script: Option<SieveScriptId>,
     #[serde(rename = "onSuccessDeactivateScript")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_success_deactivate_script: Option<bool>,
@@ -93,6 +95,7 @@ impl Display for Property {
 
 impl crate::core::Object for SieveScript {
     type Property = Property;
+    type Id = SieveScriptId;
     fn requires_account_id() -> bool {
         true
     }

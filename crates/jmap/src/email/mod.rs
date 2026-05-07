@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize, de::Visitor};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
+use crate::core::id::BlobId;
 use crate::core::request::ResultReference;
+use crate::mailbox::MailboxId;
+use crate::thread::ThreadId;
 
 mod marker {
     pub enum Email {}
@@ -22,19 +25,19 @@ pub type EmailId = crate::core::id::Id<marker::Email>;
 pub struct Email {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<EmailId>,
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) blob_id: Option<String>,
+    pub(super) blob_id: Option<BlobId>,
 
     #[serde(rename = "threadId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) thread_id: Option<String>,
+    pub(super) thread_id: Option<ThreadId>,
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
+    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
 
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,7 +155,7 @@ pub struct EmailCreate {
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
+    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
 
     #[serde(rename = "#mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,7 +242,7 @@ pub struct EmailCreate {
 pub struct EmailPatch {
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
+    pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
 
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,7 +267,7 @@ pub struct EmailBodyPart {
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) blob_id: Option<String>,
+    pub(super) blob_id: Option<BlobId>,
 
     #[serde(rename = "size")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -856,6 +859,7 @@ impl GetArguments {
 
 impl crate::core::Object for Email {
     type Property = Property;
+    type Id = EmailId;
     fn requires_account_id() -> bool {
         true
     }

@@ -1,22 +1,22 @@
-use super::{Mailbox, MailboxRights, Role};
+use super::{Mailbox, MailboxId, MailboxRights, Role};
 use crate::principal::ACL;
 use std::collections::HashMap;
 
 impl Mailbox {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&MailboxId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> MailboxId {
+        self.id.take().unwrap_or_else(|| MailboxId::new(""))
     }
 
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
-    pub fn parent_id(&self) -> Option<&str> {
-        self.parent_id.as_deref()
+    pub fn parent_id(&self) -> Option<&MailboxId> {
+        self.parent_id.as_ref()
     }
 
     pub fn role(&self) -> Option<&Role> {

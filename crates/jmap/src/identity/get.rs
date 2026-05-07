@@ -1,14 +1,14 @@
 use crate::email::EmailAddress;
 
-use super::Identity;
+use super::{Identity, IdentityId};
 
 impl Identity {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&IdentityId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> IdentityId {
+        self.id.take().unwrap_or_else(|| IdentityId::new(""))
     }
 
     pub fn name(&self) -> Option<&str> {

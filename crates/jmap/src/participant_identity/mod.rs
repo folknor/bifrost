@@ -18,11 +18,11 @@ pub type ParticipantIdentityId = crate::core::id::Id<marker::ParticipantIdentity
 pub struct ParticipantIdentitySetArguments {
     #[serde(rename = "onSuccessSetIsDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_success_set_is_default: Option<String>,
+    pub on_success_set_is_default: Option<ParticipantIdentityId>,
 }
 
 impl ParticipantIdentitySetArguments {
-    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+    pub fn on_success_set_is_default(&mut self, id: impl Into<ParticipantIdentityId>) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
     }
@@ -32,7 +32,7 @@ impl ParticipantIdentitySetArguments {
 pub struct ParticipantIdentity {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<ParticipantIdentityId>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +98,7 @@ impl Display for Property {
 
 impl crate::core::Object for ParticipantIdentity {
     type Property = Property;
+    type Id = ParticipantIdentityId;
     fn requires_account_id() -> bool {
         true
     }
@@ -152,7 +153,7 @@ crate::define_changes_method!(
 
 impl ParticipantIdentitySet {
     #[must_use]
-    pub fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
+    pub fn on_success_set_is_default(mut self, id: impl Into<ParticipantIdentityId>) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

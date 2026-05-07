@@ -1,28 +1,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::{Error, core::set::SetError};
+use crate::{
+    Error,
+    core::{
+        id::{AccountId, BlobId},
+        set::SetError,
+    },
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CopyBlobRequest {
     #[serde(rename = "fromAccountId")]
-    from_account_id: String,
+    from_account_id: AccountId,
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
     #[serde(rename = "blobIds")]
-    blob_ids: Vec<String>,
+    blob_ids: Vec<BlobId>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CopyBlobResponse {
     #[serde(rename = "fromAccountId")]
-    from_account_id: String,
+    from_account_id: AccountId,
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
     #[serde(rename = "copied")]
-    copied: Option<HashMap<String, String>>,
+    copied: Option<HashMap<BlobId, BlobId>>,
     #[serde(rename = "notCopied")]
-    not_copied: Option<HashMap<String, SetError<String>>>,
+    not_copied: Option<HashMap<BlobId, SetError<String>>>,
 }
 
 impl crate::core::method::JmapMethod for CopyBlobRequest {
@@ -30,8 +36,8 @@ impl crate::core::method::JmapMethod for CopyBlobRequest {
     type Cap = crate::core::capability::Core;
     type Response = CopyBlobResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
@@ -42,31 +48,31 @@ impl CopyBlobRequest {
     /// added to a request batch (the destination is the account that
     /// owns the request). The source `fromAccountId` is the only
     /// account argument here, since it is genuinely a per-call value.
-    pub fn new(from_account_id: impl Into<String>) -> Self {
+    pub fn new(from_account_id: impl Into<AccountId>) -> Self {
         CopyBlobRequest {
             from_account_id: from_account_id.into(),
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             blob_ids: vec![],
         }
     }
 
     #[must_use]
-    pub fn blob_id(mut self, blob_id: impl Into<String>) -> Self {
+    pub fn blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
         self.blob_ids.push(blob_id.into());
         self
     }
 }
 
 impl CopyBlobResponse {
-    pub fn from_account_id(&self) -> &str {
+    pub fn from_account_id(&self) -> &AccountId {
         &self.from_account_id
     }
 
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn copied(&mut self, id: &str) -> crate::Result<String> {
+    pub fn copied(&mut self, id: &BlobId) -> crate::Result<BlobId> {
         if let Some(result) = self.copied.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_copied.as_mut().and_then(|r| r.remove(id)) {
@@ -76,15 +82,15 @@ impl CopyBlobResponse {
         }
     }
 
-    pub fn copied_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
         self.copied.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_copied_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub fn not_copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
         self.not_copied.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_copied_reason(&self, id: &str) -> Option<&SetError<String>> {
+    pub fn not_copied_reason(&self, id: &BlobId) -> Option<&SetError<String>> {
         self.not_copied.as_ref().and_then(|map| map.get(id))
     }
 }

@@ -1,14 +1,14 @@
 use crate::core::field::Field;
 
-use super::Quota;
+use super::{Quota, QuotaId};
 
 impl Quota {
-    pub fn id(&self) -> Option<&str> {
-        self.id.as_deref()
+    pub fn id(&self) -> Option<&QuotaId> {
+        self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> String {
-        self.id.take().unwrap_or_default()
+    pub fn take_id(&mut self) -> QuotaId {
+        self.id.take().unwrap_or_else(|| QuotaId::new(""))
     }
 
     pub fn resource_type(&self) -> Option<&str> {

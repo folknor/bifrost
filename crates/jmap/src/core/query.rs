@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Object;
+use super::id::AccountId;
 
 pub trait QueryObject: Object {
     type QueryArguments: Default + Serialize;
@@ -11,7 +12,7 @@ pub trait QueryObject: Object {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryRequest<O: QueryObject> {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "filter")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,9 +84,9 @@ pub struct Comparator<A> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct QueryResponse {
+pub struct QueryResponse<O: Object> {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "queryState")]
     query_state: String,
@@ -97,7 +98,7 @@ pub struct QueryResponse {
     position: i32,
 
     #[serde(rename = "ids")]
-    ids: Vec<String>,
+    ids: Vec<O::Id>,
 
     #[serde(rename = "total")]
     total: Option<usize>,
@@ -113,7 +114,7 @@ impl<O: QueryObject> QueryRequest<O> {
     /// added to a request batch.
     pub fn new() -> Self {
         QueryRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             filter: None,
             sort: None,
             position: None,
@@ -125,7 +126,7 @@ impl<O: QueryObject> QueryRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<String>) -> &mut Self {
+    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
@@ -176,20 +177,20 @@ impl<O: QueryObject> Default for QueryRequest<O> {
     }
 }
 
-impl QueryResponse {
-    pub fn account_id(&self) -> &str {
+impl<O: Object> QueryResponse<O> {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn ids(&self) -> &[String] {
+    pub fn ids(&self) -> &[O::Id] {
         &self.ids
     }
 
-    pub fn id(&self, pos: usize) -> Option<&str> {
-        self.ids.get(pos).map(std::string::String::as_str)
+    pub fn id(&self, pos: usize) -> Option<&O::Id> {
+        self.ids.get(pos)
     }
 
-    pub fn into_ids(self) -> Vec<String> {
+    pub fn into_ids(self) -> Vec<O::Id> {
         self.ids
     }
 

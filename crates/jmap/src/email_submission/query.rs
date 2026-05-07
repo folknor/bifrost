@@ -5,6 +5,9 @@ use crate::core::{
     query::{self, QueryObject},
     set::from_timestamp,
 };
+use crate::email::EmailId;
+use crate::identity::IdentityId;
+use crate::thread::ThreadId;
 
 use super::{EmailSubmission, UndoStatus};
 
@@ -14,15 +17,15 @@ use super::{EmailSubmission, UndoStatus};
 pub enum Filter {
     IdentityIds {
         #[serde(rename = "identityIds")]
-        value: Vec<String>,
+        value: Vec<IdentityId>,
     },
     EmailIds {
         #[serde(rename = "emailIds")]
-        value: Vec<String>,
+        value: Vec<EmailId>,
     },
     ThreadIds {
         #[serde(rename = "threadIds")]
-        value: Vec<String>,
+        value: Vec<ThreadId>,
     },
     UndoStatus {
         #[serde(rename = "undoStatus")]
@@ -54,7 +57,7 @@ impl Filter {
     pub fn identity_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<IdentityId>,
     {
         Filter::IdentityIds {
             value: value.into_iter().map(std::convert::Into::into).collect(),
@@ -64,7 +67,7 @@ impl Filter {
     pub fn email_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<EmailId>,
     {
         Filter::EmailIds {
             value: value.into_iter().map(std::convert::Into::into).collect(),
@@ -74,7 +77,7 @@ impl Filter {
     pub fn thread_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
-        V: Into<String>,
+        V: Into<ThreadId>,
     {
         Filter::ThreadIds {
             value: value.into_iter().map(std::convert::Into::into).collect(),

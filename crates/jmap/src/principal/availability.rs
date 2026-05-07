@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+use crate::core::id::AccountId;
+use crate::principal::PrincipalId;
+
 /// Request for `Principal/getAvailability`.
 ///
 /// Given a principal and time range, returns free/busy availability.
 #[derive(Debug, Clone, Serialize)]
 pub struct PrincipalGetAvailabilityRequest {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "id")]
-    id: String,
+    id: PrincipalId,
 
     #[serde(rename = "utcStart")]
     utc_start: String,
@@ -26,7 +29,7 @@ pub struct PrincipalGetAvailabilityRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PrincipalGetAvailabilityResponse {
     #[serde(rename = "accountId")]
-    account_id: String,
+    account_id: AccountId,
 
     #[serde(rename = "list")]
     list: Vec<AvailabilityEntry>,
@@ -55,19 +58,19 @@ impl crate::core::method::JmapMethod for PrincipalGetAvailabilityRequest {
     type Cap = crate::core::capability::Principals;
     type Response = PrincipalGetAvailabilityResponse;
 
-    fn set_account_id(&mut self, account_id: &str) {
-        self.account_id = account_id.to_string();
+    fn set_account_id(&mut self, account_id: &AccountId) {
+        self.account_id = account_id.clone();
     }
 }
 
 impl PrincipalGetAvailabilityRequest {
     pub fn new(
-        id: impl Into<String>,
+        id: impl Into<PrincipalId>,
         utc_start: impl Into<String>,
         utc_end: impl Into<String>,
     ) -> Self {
         PrincipalGetAvailabilityRequest {
-            account_id: String::new(),
+            account_id: AccountId::new(""),
             id: id.into(),
             utc_start: utc_start.into(),
             utc_end: utc_end.into(),
@@ -83,7 +86,7 @@ impl PrincipalGetAvailabilityRequest {
 }
 
 impl PrincipalGetAvailabilityResponse {
-    pub fn account_id(&self) -> &str {
+    pub fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 

@@ -19,7 +19,7 @@ pub type PushSubscriptionId = crate::core::id::Id<marker::PushSubscription>;
 pub struct PushSubscription {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) id: Option<String>,
+    pub(super) id: Option<PushSubscriptionId>,
 
     #[serde(rename = "deviceClientId")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +132,7 @@ pub struct Keys {
 
 impl crate::core::Object for PushSubscription {
     type Property = Property;
+    type Id = PushSubscriptionId;
     fn requires_account_id() -> bool {
         false
     }
