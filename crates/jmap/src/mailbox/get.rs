@@ -19,32 +19,54 @@ impl Mailbox<Get> {
         self.parent_id.as_deref()
     }
 
-    pub fn role(&self) -> Role {
-        self.role.as_ref().cloned().unwrap_or(Role::None)
+    /// The mailbox's role.
+    ///
+    /// Returns `None` if the server did not include a `role` value
+    /// (RFC 8621 lets an implementation omit the property when no
+    /// role applies). Returns `Some(Role::None)` when the server
+    /// explicitly sent the JMAP-defined "no specific role" value -
+    /// distinct from "server omitted the property" but rarely
+    /// distinguished by callers in practice.
+    pub fn role(&self) -> Option<&Role> {
+        self.role.as_ref()
     }
 
-    pub fn sort_order(&self) -> u32 {
-        self.sort_order.as_ref().copied().unwrap_or(0)
+    /// The mailbox's `sortOrder` if the server included one. Was
+    /// previously `usize` with a silent `0` for omitted - that
+    /// collapsed "server omitted" with "explicit 0".
+    pub fn sort_order(&self) -> Option<u32> {
+        self.sort_order
     }
 
-    pub fn total_emails(&self) -> usize {
-        self.total_emails.as_ref().copied().unwrap_or(0)
+    /// Total emails in this mailbox if the server reported it.
+    /// `None` when the server omitted the property (e.g. count not
+    /// yet computed); was previously `usize` with a silent `0` for
+    /// omitted.
+    pub fn total_emails(&self) -> Option<usize> {
+        self.total_emails
     }
 
-    pub fn unread_emails(&self) -> usize {
-        self.unread_emails.as_ref().copied().unwrap_or(0)
+    /// Unread emails in this mailbox if the server reported it.
+    /// `None` semantics match [`Self::total_emails`].
+    pub fn unread_emails(&self) -> Option<usize> {
+        self.unread_emails
     }
 
-    pub fn total_threads(&self) -> usize {
-        self.total_threads.as_ref().copied().unwrap_or(0)
+    /// Total threads in this mailbox if the server reported it.
+    pub fn total_threads(&self) -> Option<usize> {
+        self.total_threads
     }
 
-    pub fn unread_threads(&self) -> usize {
-        self.unread_threads.as_ref().copied().unwrap_or(0)
+    /// Unread threads in this mailbox if the server reported it.
+    pub fn unread_threads(&self) -> Option<usize> {
+        self.unread_threads
     }
 
-    pub fn is_subscribed(&self) -> bool {
-        *self.is_subscribed.as_ref().unwrap_or(&false)
+    /// Whether the user is subscribed to this mailbox, if the server
+    /// reported it. Was previously `bool` returning `false` for
+    /// omitted - which conflicted with "explicitly unsubscribed".
+    pub fn is_subscribed(&self) -> Option<bool> {
+        self.is_subscribed
     }
 
     pub fn my_rights(&self) -> Option<&MailboxRights> {

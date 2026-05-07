@@ -72,7 +72,7 @@ async fn result_reference_example() -> bifrost_jmap::Result<()> {
         println!(
             "Mailbox: {} (role: {:?})",
             mailbox.name().unwrap_or("?"),
-            mailbox.role()
+            mailbox.role().cloned().unwrap_or(mailbox::Role::None)
         );
     }
 
