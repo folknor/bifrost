@@ -564,6 +564,15 @@ Remove `download(blob_id)` from "Explicitly not changing." It is changing.
 
 ---
 
+## ✅ STATUS
+
+§8 (type-state split) and §6 stretch (typed batch results) are
+landed. §3 (Id<T> call-site adoption sweep) is intentionally deferred
+to a ratatoskr-driven follow-up: the typedefs exist, but flipping
+every `&str` ID parameter and `String` ID return value across method
+signatures, filters, and result accessors is best done when the
+consumer's actual API needs drive specific shapes.
+
 ## 8. Type-state on object types: open structural question
 
 ### Today
@@ -603,21 +612,25 @@ pub struct MailboxPatch   { /* ... */ }
 - **Con:** every existing call site (helpers, builder, getters, set
   methods) changes.
 
-### Decision: defer, with eyes open
+### Decision: implemented this release
 
-This is the one big compromise in the release. We claim "last pre-1.0 API
-revolution" and then leave `Email<Get>` / `Email<Set>` standing - that is
-philosophically a wart and we should not pretend otherwise.
+The split landed: `Mailbox`/`MailboxCreate`/`MailboxPatch` and so on
+across every typed JMAP object. ShareNotification and
+CalendarEventNotification declare `Create`/`Patch` as uninhabitable
+enums, so `SetRequest::create()` / `update()` do not resolve at
+compile time for those destroy-only types - the spec's read-only
+semantics are enforced by the type system rather than documentation.
 
-The deferral rationale: bundling §8 turns a ~6-week release into a ~3-month
-release, and §8 is more invasive than the rest of the release combined
-(every typed object, every getter, every set-method, every helper-or-call
-site, plus a macro decision for shared field definitions).
+`SetCreate` (the new contract for the create-shape input type) is a
+separate trait from `SetObject` (which lives on the canonical type).
+`SetRequest::create()` is gated on `O::Create: SetCreate` and
+`SetRequest::update()` on `O::Patch: Default`, so destroy-only objects
+opt out cleanly.
 
-**Consequence we accept:** there will be one more breaking release after
-this one, dedicated to the type-state split, before 1.0. That's the honest
-plan. If we'd rather *not* have another breaking release, §8 needs to be
-in this one - make that call now, not later.
+JSON-map-backed objects (`CalendarEvent`, `ContactCard`) use the
+extended `json_object_struct!` macro which now emits a trio. The
+patch shape's setters allow dotted-path keys for nested patches;
+the create shape uses plain property names.
 
 ---
 
