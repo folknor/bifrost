@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::Get;
-
 mod marker {
     pub enum Principal {}
 }
@@ -17,69 +15,153 @@ mod marker {
 pub type PrincipalId = crate::core::id::Id<marker::Principal>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Principal<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct Principal {
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    ptype: Option<Type>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    name: Option<String>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    description: Option<String>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    email: Option<String>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    timezone: Option<String>,
-
-    /// RFC 9670: Map of JMAP capability URI to domain-specific metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    capabilities: Option<HashMap<String, serde_json::Value>>,
-
-    /// RFC 9670: Map of account ID to account info for each JMAP account
-    /// accessible to this principal, or null if none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    accounts: Option<HashMap<String, PrincipalAccount>>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    aliases: Option<Vec<String>>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    secret: Option<String>,
+    pub(super) ptype: Option<Type>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    dkim: Option<DKIM>,
+    pub(super) name: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    quota: Option<u32>,
+    pub(super) description: Option<String>,
 
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    picture: Option<String>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    members: Option<Vec<String>>,
-
-    #[serde(skip_serializing_if = "skip_if_empty_map")]
-    acl: Option<HashMap<String, Vec<ACL>>>,
-
-    #[serde(flatten)]
-    #[serde(skip_deserializing)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    property_patch: Option<HashMap<String, bool>>,
+    pub(super) email: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) timezone: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) aliases: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) secret: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dkim: Option<DKIM>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quota: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) picture: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) members: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
 }
 
-/// Account info within a Principal's `accounts` map (RFC 9670).
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ptype: Option<Type>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) name: Option<String>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) description: Option<String>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) email: Option<String>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) timezone: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) aliases: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) secret: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dkim: Option<DKIM>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quota: Option<u32>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) picture: Option<String>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) members: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "skip_if_empty_map")]
+    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PrincipalPatch {
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ptype: Option<Type>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) email: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) timezone: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) capabilities: Option<HashMap<String, serde_json::Value>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) accounts: Option<HashMap<String, PrincipalAccount>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) aliases: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) secret: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dkim: Option<DKIM>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) quota: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) picture: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) members: Option<Vec<String>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) acl: Option<HashMap<String, Vec<ACL>>>,
+
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) property_patch: Option<HashMap<String, bool>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrincipalAccount {
     #[serde(rename = "name")]
@@ -275,40 +357,80 @@ impl Display for ACL {
     }
 }
 
-crate::impl_jmap_object!(Principal<State>, Property, true);
+impl crate::core::Object for Principal {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for Principal {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for Principal {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for Principal {
+    type Create = PrincipalCreate;
+    type Patch = PrincipalPatch;
+    type SetArguments = ();
+}
+
+impl crate::core::SetCreate for PrincipalCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        PrincipalCreate {
+            _create_id: create_id,
+            ptype: None,
+            name: String::new().into(),
+            description: String::new().into(),
+            email: String::new().into(),
+            timezone: String::new().into(),
+            capabilities: None,
+            accounts: None,
+            aliases: Vec::with_capacity(0).into(),
+            secret: String::new().into(),
+            dkim: None,
+            quota: None,
+            picture: String::new().into(),
+            members: Vec::with_capacity(0).into(),
+            acl: HashMap::with_capacity(0).into(),
+        }
+    }
+}
+
 crate::define_get_method!(
     PrincipalGet,
-    Principal<Set>,
+    Principal,
     "Principal/get",
-    crate::core::capability::Principals,
-    crate::core::get::GetResponse<Principal<Get>>
+    crate::core::capability::Principals
 );
 crate::define_set_method!(
     PrincipalSet,
-    Principal<Set>,
+    Principal,
     "Principal/set",
-    crate::core::capability::Principals,
-    crate::core::set::SetResponse<Principal<Get>>
+    crate::core::capability::Principals
 );
 crate::define_changes_method!(
     PrincipalChanges,
+    Principal,
     "Principal/changes",
-    crate::core::capability::Principals,
-    crate::core::changes::ChangesResponse<Principal<Get>>
+    crate::core::capability::Principals
 );
 crate::define_query_method!(
     PrincipalQuery,
-    Principal<Set>,
+    Principal,
     "Principal/query",
     crate::core::capability::Principals
 );
 crate::define_query_changes_method!(
     PrincipalQueryChanges,
-    Principal<Set>,
+    Principal,
     "Principal/queryChanges",
     crate::core::capability::Principals
 );

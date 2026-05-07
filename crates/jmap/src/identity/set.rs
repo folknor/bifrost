@@ -1,12 +1,8 @@
-use crate::{
-    Get, Set,
-    core::set::{SetObject, SetObjectCreatable},
-    email::EmailAddress,
-};
+use crate::email::EmailAddress;
 
-use super::Identity;
+use super::{IdentityCreate, IdentityPatch};
 
-impl Identity<Set> {
+impl IdentityCreate {
     pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
@@ -46,35 +42,37 @@ impl Identity<Set> {
     }
 }
 
-impl SetObject for Identity<Set> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+impl IdentityPatch {
+    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+        self.name = Some(name.into());
+        self
     }
-}
 
-impl SetObjectCreatable for Identity<Set> {
-    fn new(_create_id: Option<usize>) -> Self {
-        Identity {
-            _create_id,
-            _state: Default::default(),
-            id: None,
-            name: None,
-            email: None,
-            reply_to: Vec::with_capacity(0).into(),
-            bcc: Vec::with_capacity(0).into(),
-            text_signature: None,
-            html_signature: None,
-            may_delete: None,
-        }
+    pub fn bcc<T, U>(&mut self, bcc: Option<T>) -> &mut Self
+    where
+        T: Iterator<Item = U>,
+        U: Into<EmailAddress>,
+    {
+        self.bcc = bcc.map(|s| s.map(std::convert::Into::into).collect());
+        self
     }
-}
 
-impl SetObject for Identity<Get> {
-    type SetArguments = ();
+    pub fn reply_to<T, U>(&mut self, reply_to: Option<T>) -> &mut Self
+    where
+        T: Iterator<Item = U>,
+        U: Into<EmailAddress>,
+    {
+        self.reply_to = reply_to.map(|s| s.map(std::convert::Into::into).collect());
+        self
+    }
 
-    fn create_id(&self) -> Option<String> {
-        None
+    pub fn text_signature(&mut self, text_signature: impl Into<String>) -> &mut Self {
+        self.text_signature = Some(text_signature.into());
+        self
+    }
+
+    pub fn html_signature(&mut self, html_signature: impl Into<String>) -> &mut Self {
+        self.html_signature = Some(html_signature.into());
+        self
     }
 }

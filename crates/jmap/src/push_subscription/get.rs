@@ -1,8 +1,8 @@
-use crate::{DataType, Get};
+use crate::DataType;
 
 use super::{Keys, PushSubscription};
 
-impl PushSubscription<Get> {
+impl PushSubscription {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -47,5 +47,3 @@ impl Keys {
         URL_SAFE.decode(&self.auth).ok()
     }
 }
-
-crate::impl_get_object!(PushSubscription, ());

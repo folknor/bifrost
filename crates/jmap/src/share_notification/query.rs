@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::ShareNotification;
 
@@ -75,7 +72,7 @@ impl Comparator {
     }
 }
 
-impl QueryObject for ShareNotification<Set> {
+impl QueryObject for ShareNotification {
     type QueryArguments = ();
     type Filter = Filter;
     type Sort = Comparator;

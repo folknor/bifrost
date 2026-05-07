@@ -1,8 +1,8 @@
-use crate::{Get, email::EmailAddress};
+use crate::email::EmailAddress;
 
 use super::Identity;
 
-impl Identity<Get> {
+impl Identity {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -39,5 +39,3 @@ impl Identity<Get> {
         self.may_delete.unwrap_or(false)
     }
 }
-
-crate::impl_get_object!(Identity, ());

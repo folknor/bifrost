@@ -3,45 +3,18 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::capability::Capability;
 
 /// A self-describing JMAP method call.
-///
-/// Each JMAP method (Email/get, CalendarEvent/query, etc.) is a concrete
-/// type implementing this trait. The trait carries the wire name,
-/// required capability, and associated response type.
 pub trait JmapMethod: Serialize + Send {
-    /// Wire method name, e.g. `"Email/get"`.
     const NAME: &'static str;
-
-    /// The capability required for this method.
     type Cap: Capability;
-
-    /// The deserialized response type.
     type Response: DeserializeOwned + Send;
 
-    /// Inject the request's account ID into this method's `accountId`
-    /// field just before serialization.
-    ///
-    /// Called by [`crate::core::request::Request::call`] (and through
-    /// it by [`crate::Account::call`]) so callers no longer pass the
-    /// account ID through every method-struct constructor. The default
-    /// no-op suits methods that do not carry an `accountId` (e.g.
-    /// `Core/echo`); account-scoped methods override it.
-    ///
-    /// Cross-account methods (`Email/copy`) only inject the
-    /// destination here; the source `fromAccountId` is supplied at
-    /// construction time.
     fn set_account_id(&mut self, _account_id: &str) {}
 }
 
 /// Generates a JMAP /get method struct that wraps `GetRequest<O>`.
-///
-/// The macro emits value-builder forwarders (`fn ids(self, ...) -> Self`)
-/// on the outer struct so callers can chain
-/// `EmailGet::new().ids([id]).properties([...])`. The inner
-/// `GetRequest`'s `&mut self` setters stay as-is for internal use; the
-/// outer simply delegates and returns `Self` by value.
 #[macro_export]
 macro_rules! define_get_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
+    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub struct $name {
             #[serde(flatten)]
@@ -51,13 +24,18 @@ macro_rules! define_get_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $response;
+            type Response = $crate::core::get::GetResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &str) {
                 self.inner.account_id(account_id);
             }
         }
 
+        // Methods are part of the crate's public API surface; downstream
+        // consumers (e.g. ratatoskr) call them. `dead_code` triggers
+        // because the bifrost-jmap test/example tree happens not to use
+        // every variant.
+        #[allow(dead_code)]
         impl $name {
             pub fn new() -> Self {
                 Self {
@@ -122,13 +100,9 @@ macro_rules! define_get_method {
 }
 
 /// Generates a JMAP /set method struct that wraps `SetRequest<O>`.
-///
-/// `create()` and `update()` accessors return `&mut entry` so callers
-/// can populate or patch entries in place; those stay imperative even
-/// in the value-builder world.
 #[macro_export]
 macro_rules! define_set_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
+    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub struct $name {
             #[serde(flatten)]
@@ -138,7 +112,7 @@ macro_rules! define_set_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $response;
+            type Response = $crate::core::set::SetResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &str) {
                 self.inner.account_id(account_id);
@@ -176,15 +150,6 @@ macro_rules! define_set_method {
                 self.inner.destroy_ref(reference);
                 self
             }
-
-            // `create` / `update` are not lifted onto the outer here:
-            // they only exist for objects that impl
-            // `SetObjectCreatable`, and Rust resolves their existence
-            // at impl-block expansion time. Callers reach them via
-            // Deref/DerefMut into the inner SetRequest, which keeps
-            // the conditional-impl shape intact and avoids generating
-            // dead methods on non-creatable Set types like
-            // ShareNotificationSet.
         }
 
         impl Default for $name {
@@ -211,7 +176,7 @@ macro_rules! define_set_method {
 /// Generates a JMAP /changes method struct that wraps `ChangesRequest`.
 #[macro_export]
 macro_rules! define_changes_method {
-    ($name:ident, $method_name:expr, $cap:ty, $response:ty) => {
+    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub struct $name {
             #[serde(flatten)]
@@ -221,7 +186,7 @@ macro_rules! define_changes_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $response;
+            type Response = $crate::core::changes::ChangesResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &str) {
                 self.inner.account_id(account_id);
@@ -277,6 +242,7 @@ macro_rules! define_query_method {
             }
         }
 
+        #[allow(dead_code)]
         impl $name {
             pub fn new() -> Self {
                 Self {
@@ -446,13 +412,9 @@ macro_rules! define_query_changes_method {
 }
 
 /// Generates a JMAP /copy method struct that wraps `CopyRequest<O>`.
-///
-/// The destination `accountId` is injected by `Request::call`; the
-/// source `fromAccountId` is the only constructor argument. `create()`
-/// stays imperative for the same HashMap-entry reason as `set`.
 #[macro_export]
 macro_rules! define_copy_method {
-    ($name:ident, $obj:ty, $method_name:expr, $cap:ty, $response:ty) => {
+    ($name:ident, $obj:ty, $method_name:expr, $cap:ty) => {
         #[derive(Debug, Clone, serde::Serialize)]
         pub struct $name {
             #[serde(flatten)]
@@ -462,7 +424,7 @@ macro_rules! define_copy_method {
         impl $crate::core::method::JmapMethod for $name {
             const NAME: &'static str = $method_name;
             type Cap = $cap;
-            type Response = $response;
+            type Response = $crate::core::copy::CopyResponse<$obj>;
 
             fn set_account_id(&mut self, account_id: &str) {
                 self.inner.account_id(account_id);
@@ -503,10 +465,6 @@ macro_rules! define_copy_method {
                     .destroy_from_if_in_state(destroy_from_if_in_state);
                 self
             }
-
-            // `create` reaches through Deref/DerefMut into the inner
-            // CopyRequest (which conditionally provides it when the
-            // object implements `SetObjectCreatable`).
         }
 
         impl std::ops::Deref for $name {
@@ -589,8 +547,7 @@ macro_rules! define_open_property_enum {
     };
 }
 
-/// Generates a JMAP /parse method struct with `JmapMethod` impl and
-/// value-builder methods.
+/// Generates a JMAP /parse method struct.
 #[macro_export]
 macro_rules! define_parse_method {
     ($name:ident, $property:ty, $method_name:expr, $cap:ty, $response:ty) => {

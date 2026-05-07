@@ -24,7 +24,6 @@
 //! speculative API.
 
 use crate::{
-    Get,
     account::Account,
     core::{
         query::{Comparator, Filter},
@@ -70,7 +69,7 @@ impl<Tr: HttpTransport> Mail<Tr> {
         &self,
         id: &str,
         properties: impl IntoIterator<Item = Property>,
-    ) -> crate::Result<Option<Email<Get>>> {
+    ) -> crate::Result<Option<Email>> {
         let response = self
             .account
             .call(EmailGet::new().ids([id]).properties(properties))
@@ -79,7 +78,7 @@ impl<Tr: HttpTransport> Mail<Tr> {
     }
 
     /// List mailboxes. Use [`Mail::emails`] for messages within them.
-    pub async fn mailboxes(&self) -> crate::Result<Vec<Mailbox<Get>>> {
+    pub async fn mailboxes(&self) -> crate::Result<Vec<Mailbox>> {
         let response = self.account.call(MailboxGet::new()).await?;
         Ok(response.into_list())
     }
@@ -90,7 +89,7 @@ impl<Tr: HttpTransport> Mail<Tr> {
         id: &str,
         keyword: &str,
         value: bool,
-    ) -> crate::Result<Option<Email<Get>>> {
+    ) -> crate::Result<Option<Email>> {
         let mut set = EmailSet::new();
         set.update(id).keyword(keyword, value);
         let mut response = self.account.call(set).await?;
@@ -98,12 +97,12 @@ impl<Tr: HttpTransport> Mail<Tr> {
     }
 
     /// Mark an email as read (`$seen` keyword set).
-    pub async fn mark_read(&self, id: &str) -> crate::Result<Option<Email<Get>>> {
+    pub async fn mark_read(&self, id: &str) -> crate::Result<Option<Email>> {
         self.set_keyword(id, "$seen", true).await
     }
 
     /// Mark an email as unread (`$seen` keyword unset).
-    pub async fn mark_unread(&self, id: &str) -> crate::Result<Option<Email<Get>>> {
+    pub async fn mark_unread(&self, id: &str) -> crate::Result<Option<Email>> {
         self.set_keyword(id, "$seen", false).await
     }
 
@@ -115,7 +114,7 @@ impl<Tr: HttpTransport> Mail<Tr> {
         id: &str,
         from_mailbox: &str,
         to_mailbox: &str,
-    ) -> crate::Result<Option<Email<Get>>> {
+    ) -> crate::Result<Option<Email>> {
         let mut set = EmailSet::new();
         set.update(id)
             .mailbox_id(from_mailbox, false)
@@ -229,7 +228,7 @@ impl<'a, Tr: HttpTransport> EmailsQuery<'a, Tr> {
     pub async fn fetch(
         self,
         properties: impl IntoIterator<Item = Property>,
-    ) -> crate::Result<Vec<Email<Get>>> {
+    ) -> crate::Result<Vec<Email>> {
         let properties: Vec<Property> = properties.into_iter().collect();
         let query = self.build_query();
 

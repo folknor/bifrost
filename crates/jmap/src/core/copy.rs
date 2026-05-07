@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use crate::Error;
 
-use super::set::{SetError, SetObject, SetObjectCreatable};
+use super::set::{SetError, SetObject};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CopyRequest<O: SetObject> {
@@ -22,7 +22,7 @@ pub struct CopyRequest<O: SetObject> {
     if_in_state: Option<String>,
 
     #[serde(rename = "create")]
-    create: HashMap<String, O>,
+    create: HashMap<String, O::Create>,
 
     #[serde(rename = "onSuccessDestroyOriginal")]
     on_success_destroy_original: bool,
@@ -53,13 +53,7 @@ pub struct CopyResponse<O: SetObject> {
     not_created: Option<HashMap<String, SetError<O::Property>>>,
 }
 
-impl<T: SetObjectCreatable> CopyRequest<T> {
-    /// Construct a `CopyRequest`. The destination `accountId` is left
-    /// empty and filled in by
-    /// [`crate::core::request::Request::call`] when the method is
-    /// added to a request batch (the destination is the account that
-    /// owns the request). The source `fromAccountId` is the only
-    /// account argument here, since it is genuinely a per-call value.
+impl<O: SetObject> CopyRequest<O> {
     pub fn new(from_account_id: impl Into<String>) -> Self {
         CopyRequest {
             from_account_id: from_account_id.into(),
@@ -87,12 +81,6 @@ impl<T: SetObjectCreatable> CopyRequest<T> {
         self
     }
 
-    pub fn create(&mut self, id: impl Into<String>) -> &mut T {
-        let id = id.into();
-        self.create.insert(id.clone(), T::new(None));
-        self.create.get_mut(&id).unwrap()
-    }
-
     pub fn on_success_destroy_original(&mut self, on_success_destroy_original: bool) -> &mut Self {
         self.on_success_destroy_original = on_success_destroy_original;
         self
@@ -104,6 +92,18 @@ impl<T: SetObjectCreatable> CopyRequest<T> {
     ) -> &mut Self {
         self.destroy_from_if_in_state = Some(destroy_from_if_in_state.into());
         self
+    }
+}
+
+impl<O: SetObject> CopyRequest<O>
+where
+    O::Create: crate::core::SetCreate,
+{
+    pub fn create(&mut self, id: impl Into<String>) -> &mut O::Create {
+        use crate::core::SetCreate;
+        let id = id.into();
+        self.create.insert(id.clone(), O::Create::new(None));
+        self.create.get_mut(&id).unwrap()
     }
 }
 

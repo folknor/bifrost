@@ -6,8 +6,8 @@ use std::fmt::Display;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::DataType;
 use crate::core::set::skip_if_empty_list;
-use crate::{DataType, Get, Set};
 
 mod marker {
     pub enum PushSubscription {}
@@ -16,40 +16,79 @@ mod marker {
 pub type PushSubscriptionId = crate::core::id::Id<marker::PushSubscription>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushSubscription<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct PushSubscription {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "deviceClientId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    device_client_id: Option<String>,
+    pub(super) device_client_id: Option<String>,
 
     #[serde(rename = "url")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
+    pub(super) url: Option<String>,
 
     #[serde(rename = "keys")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    keys: Option<Keys>,
+    pub(super) keys: Option<Keys>,
 
     #[serde(rename = "verificationCode")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    verification_code: Option<String>,
+    pub(super) verification_code: Option<String>,
 
     #[serde(rename = "expires")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    expires: Option<DateTime<Utc>>,
+    pub(super) expires: Option<DateTime<Utc>>,
+
+    #[serde(rename = "types")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) types: Option<Vec<DataType>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PushSubscriptionCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "deviceClientId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) device_client_id: Option<String>,
+
+    #[serde(rename = "url")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) url: Option<String>,
+
+    #[serde(rename = "keys")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) keys: Option<Keys>,
+
+    #[serde(rename = "verificationCode")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) verification_code: Option<String>,
+
+    #[serde(rename = "expires")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) expires: Option<DateTime<Utc>>,
 
     #[serde(rename = "types")]
     #[serde(skip_serializing_if = "skip_if_empty_list")]
-    types: Option<Vec<DataType>>,
+    pub(super) types: Option<Vec<DataType>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PushSubscriptionPatch {
+    #[serde(rename = "verificationCode")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) verification_code: Option<String>,
+
+    #[serde(rename = "expires")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) expires: Option<DateTime<Utc>>,
+
+    #[serde(rename = "types")]
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) types: Option<Vec<DataType>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -91,20 +130,54 @@ pub struct Keys {
     auth: String,
 }
 
-crate::impl_jmap_object!(PushSubscription<State>, Property, false);
+impl crate::core::Object for PushSubscription {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        false
+    }
+}
 
-// Method structs for the new architecture
+impl crate::core::changes::ChangesObject for PushSubscription {
+    type ChangesResponse = ();
+}
+
+impl crate::core::get::GetObject for PushSubscription {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for PushSubscription {
+    type Create = PushSubscriptionCreate;
+    type Patch = PushSubscriptionPatch;
+    type SetArguments = ();
+}
+
+impl crate::core::SetCreate for PushSubscriptionCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        PushSubscriptionCreate {
+            _create_id: create_id,
+            device_client_id: None,
+            url: None,
+            keys: None,
+            verification_code: None,
+            expires: None,
+            types: Vec::with_capacity(0).into(),
+        }
+    }
+}
+
 crate::define_get_method!(
     PushSubscriptionGet,
-    PushSubscription<Set>,
+    PushSubscription,
     "PushSubscription/get",
-    crate::core::capability::Core,
-    crate::core::get::GetResponse<PushSubscription<Get>>
+    crate::core::capability::Core
 );
 crate::define_set_method!(
     PushSubscriptionSet,
-    PushSubscription<Set>,
+    PushSubscription,
     "PushSubscription/set",
-    crate::core::capability::Core,
-    crate::core::set::SetResponse<PushSubscription<Get>>
+    crate::core::capability::Core
 );

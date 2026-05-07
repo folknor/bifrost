@@ -1,8 +1,8 @@
-use crate::{Get, core::field::Field};
+use crate::core::field::Field;
 
-use super::{CalendarEvent, GetArguments};
+use super::CalendarEvent;
 
-impl CalendarEvent<Get> {
+impl CalendarEvent {
     pub fn id(&self) -> Option<&str> {
         self.properties.get("id")?.as_str()
     }
@@ -57,8 +57,6 @@ impl CalendarEvent<Get> {
         self.properties.get("duration")?.as_str()
     }
 
-    /// Returns `Omitted` if the property is absent, `Null` if explicitly
-    /// null, or `Value(tz)` if set to a timezone string.
     pub fn time_zone(&self) -> Field<&str> {
         match self.properties.get("timeZone") {
             None => Field::Omitted,
@@ -106,8 +104,6 @@ impl CalendarEvent<Get> {
         self.properties.get("priority")?.as_u64()
     }
 
-    /// Returns `Omitted` if absent, `Null` if explicitly null,
-    /// `Value(color)` if set.
     pub fn color(&self) -> Field<&str> {
         match self.properties.get("color") {
             None => Field::Omitted,
@@ -119,8 +115,6 @@ impl CalendarEvent<Get> {
         }
     }
 
-    /// Returns `Omitted` if absent, `Null` if explicitly null,
-    /// `Value(locale)` if set.
     pub fn locale(&self) -> Field<&str> {
         match self.properties.get("locale") {
             None => Field::Omitted,
@@ -156,8 +150,6 @@ impl CalendarEvent<Get> {
         self.properties.get("useDefaultAlerts")?.as_bool()
     }
 
-    /// Returns `Omitted` if absent, `Null` if explicitly null (no alerts),
-    /// `Value(map)` if set to an alerts object.
     pub fn alerts(&self) -> Field<&serde_json::Map<String, serde_json::Value>> {
         match self.properties.get("alerts") {
             None => Field::Omitted,
@@ -193,16 +185,11 @@ impl CalendarEvent<Get> {
         self.properties.get("sequence")?.as_u64()
     }
 
-    /// Access any property as a raw JSON value, including extension
-    /// properties not covered by the typed accessors.
     pub fn property(&self, name: &str) -> Option<&serde_json::Value> {
         self.properties.get(name)
     }
 
-    /// Access the full underlying JSCalendar properties map.
     pub fn as_properties(&self) -> &serde_json::Map<String, serde_json::Value> {
         &self.properties
     }
 }
-
-crate::impl_get_object!(CalendarEvent, GetArguments);

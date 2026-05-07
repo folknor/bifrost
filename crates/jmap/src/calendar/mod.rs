@@ -6,9 +6,7 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Get;
 use crate::core::field::Field;
-use crate::core::set::skip_if_empty_str;
 
 use crate::calendar_event::Alert;
 
@@ -19,74 +17,165 @@ mod marker {
 pub type CalendarId = crate::core::id::Id<marker::Calendar>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Calendar<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct Calendar {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "name")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
 
     #[serde(rename = "description")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub description: Field<String>,
+    pub(super) description: Field<String>,
 
     #[serde(rename = "color")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub color: Field<String>,
+    pub(super) color: Field<String>,
 
     #[serde(rename = "sortOrder")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort_order: Option<u32>,
+    pub(super) sort_order: Option<u32>,
 
     #[serde(rename = "isSubscribed")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_subscribed: Option<bool>,
+    pub(super) is_subscribed: Option<bool>,
 
     #[serde(rename = "isVisible")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_visible: Option<bool>,
+    pub(super) is_visible: Option<bool>,
 
     #[serde(rename = "isDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_default: Option<bool>,
+    pub(super) is_default: Option<bool>,
 
     #[serde(rename = "includeInAvailability")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_in_availability: Option<IncludeInAvailability>,
+    pub(super) include_in_availability: Option<IncludeInAvailability>,
 
     #[serde(rename = "defaultAlertsWithTime")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub default_alerts_with_time: Field<HashMap<String, Alert>>,
+    pub(super) default_alerts_with_time: Field<HashMap<String, Alert>>,
 
     #[serde(rename = "defaultAlertsWithoutTime")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub default_alerts_without_time: Field<HashMap<String, Alert>>,
+    pub(super) default_alerts_without_time: Field<HashMap<String, Alert>>,
 
     #[serde(rename = "timeZone")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub time_zone: Field<String>,
+    pub(super) time_zone: Field<String>,
 
     #[serde(rename = "shareWith")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub share_with: Field<HashMap<String, CalendarRights>>,
+    pub(super) share_with: Field<HashMap<String, CalendarRights>>,
 
     #[serde(rename = "myRights")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub my_rights: Option<CalendarRights>,
+    pub(super) my_rights: Option<CalendarRights>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CalendarCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "description")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
+
+    #[serde(rename = "color")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) color: Field<String>,
+
+    #[serde(rename = "sortOrder")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sort_order: Option<u32>,
+
+    #[serde(rename = "isSubscribed")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_subscribed: Option<bool>,
+
+    #[serde(rename = "isVisible")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_visible: Option<bool>,
+
+    #[serde(rename = "includeInAvailability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) include_in_availability: Option<IncludeInAvailability>,
+
+    #[serde(rename = "defaultAlertsWithTime")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) default_alerts_with_time: Field<HashMap<String, Alert>>,
+
+    #[serde(rename = "defaultAlertsWithoutTime")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) default_alerts_without_time: Field<HashMap<String, Alert>>,
+
+    #[serde(rename = "timeZone")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) time_zone: Field<String>,
+
+    #[serde(rename = "shareWith")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) share_with: Field<HashMap<String, CalendarRights>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CalendarPatch {
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "description")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
+
+    #[serde(rename = "color")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) color: Field<String>,
+
+    #[serde(rename = "sortOrder")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sort_order: Option<u32>,
+
+    #[serde(rename = "isSubscribed")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_subscribed: Option<bool>,
+
+    #[serde(rename = "isVisible")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_visible: Option<bool>,
+
+    #[serde(rename = "includeInAvailability")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) include_in_availability: Option<IncludeInAvailability>,
+
+    #[serde(rename = "defaultAlertsWithTime")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) default_alerts_with_time: Field<HashMap<String, Alert>>,
+
+    #[serde(rename = "defaultAlertsWithoutTime")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) default_alerts_without_time: Field<HashMap<String, Alert>>,
+
+    #[serde(rename = "timeZone")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) time_zone: Field<String>,
+
+    #[serde(rename = "shareWith")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) share_with: Field<HashMap<String, CalendarRights>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,8 +224,6 @@ pub struct CalendarRights {
     pub may_delete: Option<bool>,
 }
 
-// ---- Calendar/set arguments ----
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct CalendarSetArguments {
     #[serde(rename = "onDestroyRemoveEvents")]
@@ -154,8 +241,6 @@ impl CalendarSetArguments {
         self
     }
 
-    /// Set the given calendar as default after a successful create/update.
-    /// The value is a creation id reference (e.g. `"#c0"`) or an existing id.
     pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
@@ -216,33 +301,68 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(Calendar<State>, Property, true);
+impl crate::core::Object for Calendar {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for Calendar {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for Calendar {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for Calendar {
+    type Create = CalendarCreate;
+    type Patch = CalendarPatch;
+    type SetArguments = CalendarSetArguments;
+}
+
+impl crate::core::SetCreate for CalendarCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        CalendarCreate {
+            _create_id: create_id,
+            name: None,
+            description: Field::Omitted,
+            color: Field::Omitted,
+            sort_order: None,
+            is_subscribed: None,
+            is_visible: None,
+            include_in_availability: None,
+            default_alerts_with_time: Field::Omitted,
+            default_alerts_without_time: Field::Omitted,
+            time_zone: Field::Omitted,
+            share_with: Field::Omitted,
+        }
+    }
+}
+
 crate::define_get_method!(
     CalendarGet,
-    Calendar<Set>,
+    Calendar,
     "Calendar/get",
-    crate::core::capability::Calendars,
-    crate::core::get::GetResponse<Calendar<Get>>
+    crate::core::capability::Calendars
 );
 crate::define_set_method!(
     CalendarSet,
-    Calendar<Set>,
+    Calendar,
     "Calendar/set",
-    crate::core::capability::Calendars,
-    crate::core::set::SetResponse<Calendar<Get>>
+    crate::core::capability::Calendars
 );
 crate::define_changes_method!(
     CalendarChanges,
+    Calendar,
     "Calendar/changes",
-    crate::core::capability::Calendars,
-    crate::core::changes::ChangesResponse<Calendar<Get>>
+    crate::core::capability::Calendars
 );
-
-// -- Lifted method arguments (plans/API.md §5) --
 
 impl CalendarSet {
     #[must_use]

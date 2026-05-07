@@ -4,7 +4,7 @@ pub mod set;
 use std::fmt::Display;
 
 use crate::core::set::skip_if_empty_list;
-use crate::{Get, email::EmailAddress};
+use crate::email::EmailAddress;
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -13,45 +13,93 @@ mod marker {
 /// Strongly-typed Identity ID.
 pub type IdentityId = crate::core::id::Id<marker::Identity>;
 
+/// Server-returned Identity object (RFC 8621 §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Identity<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct Identity {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 
     #[serde(rename = "email")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
+    pub(super) email: Option<String>,
 
     #[serde(rename = "replyTo")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub reply_to: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reply_to: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "bcc")]
-    #[serde(skip_serializing_if = "skip_if_empty_list")]
-    pub bcc: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) bcc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "textSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_signature: Option<String>,
+    pub(super) text_signature: Option<String>,
 
     #[serde(rename = "htmlSignature")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub html_signature: Option<String>,
+    pub(super) html_signature: Option<String>,
 
     #[serde(rename = "mayDelete")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_delete: Option<bool>,
+    pub(super) may_delete: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentityCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "email")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) email: Option<String>,
+
+    #[serde(rename = "replyTo")]
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) reply_to: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "bcc")]
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) bcc: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "textSignature")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text_signature: Option<String>,
+
+    #[serde(rename = "htmlSignature")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) html_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IdentityPatch {
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "replyTo")]
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) reply_to: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "bcc")]
+    #[serde(skip_serializing_if = "skip_if_empty_list")]
+    pub(super) bcc: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "textSignature")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text_signature: Option<String>,
+
+    #[serde(rename = "htmlSignature")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) html_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -90,28 +138,60 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(Identity<State>, Property, true);
+impl crate::core::Object for Identity {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for Identity {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for Identity {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for Identity {
+    type Create = IdentityCreate;
+    type Patch = IdentityPatch;
+    type SetArguments = ();
+}
+
+impl crate::core::SetCreate for IdentityCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        IdentityCreate {
+            _create_id: create_id,
+            name: None,
+            email: None,
+            reply_to: Vec::with_capacity(0).into(),
+            bcc: Vec::with_capacity(0).into(),
+            text_signature: None,
+            html_signature: None,
+        }
+    }
+}
+
 crate::define_get_method!(
     IdentityGet,
-    Identity<Set>,
+    Identity,
     "Identity/get",
-    crate::core::capability::Submission,
-    crate::core::get::GetResponse<Identity<Get>>
+    crate::core::capability::Submission
 );
 crate::define_set_method!(
     IdentitySet,
-    Identity<Set>,
+    Identity,
     "Identity/set",
-    crate::core::capability::Submission,
-    crate::core::set::SetResponse<Identity<Get>>
+    crate::core::capability::Submission
 );
 crate::define_changes_method!(
     IdentityChanges,
+    Identity,
     "Identity/changes",
-    crate::core::capability::Submission,
-    crate::core::changes::ChangesResponse<Identity<Get>>
+    crate::core::capability::Submission
 );

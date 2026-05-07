@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use crate::{Get, calendar_event::Alert, core::field::Field};
+use crate::{calendar_event::Alert, core::field::Field};
 
 use super::{Calendar, CalendarRights, IncludeInAvailability};
 
-impl Calendar<Get> {
+impl Calendar {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -21,7 +21,6 @@ impl Calendar<Get> {
         self.description.as_value().map(String::as_str)
     }
 
-    /// Full three-state access to the description field.
     pub fn description_field(&self) -> &Field<String> {
         &self.description
     }
@@ -30,7 +29,6 @@ impl Calendar<Get> {
         self.color.as_value().map(String::as_str)
     }
 
-    /// Full three-state access to the color field.
     pub fn color_field(&self) -> &Field<String> {
         &self.color
     }
@@ -59,7 +57,6 @@ impl Calendar<Get> {
         self.default_alerts_with_time.as_value()
     }
 
-    /// Full three-state access to the default_alerts_with_time field.
     pub fn default_alerts_with_time_field(&self) -> &Field<HashMap<String, Alert>> {
         &self.default_alerts_with_time
     }
@@ -68,7 +65,6 @@ impl Calendar<Get> {
         self.default_alerts_without_time.as_value()
     }
 
-    /// Full three-state access to the default_alerts_without_time field.
     pub fn default_alerts_without_time_field(&self) -> &Field<HashMap<String, Alert>> {
         &self.default_alerts_without_time
     }
@@ -77,7 +73,6 @@ impl Calendar<Get> {
         self.time_zone.as_value().map(String::as_str)
     }
 
-    /// Full three-state access to the time_zone field.
     pub fn time_zone_field(&self) -> &Field<String> {
         &self.time_zone
     }
@@ -86,7 +81,6 @@ impl Calendar<Get> {
         self.share_with.as_value()
     }
 
-    /// Full three-state access to the share_with field.
     pub fn share_with_field(&self) -> &Field<HashMap<String, CalendarRights>> {
         &self.share_with
     }
@@ -95,5 +89,3 @@ impl Calendar<Get> {
         self.my_rights.as_ref()
     }
 }
-
-crate::impl_get_object!(Calendar, ());

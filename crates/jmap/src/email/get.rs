@@ -1,11 +1,9 @@
-use crate::Get;
-
 use super::{
-    Email, EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailHeader,
-    GetArguments, Header, HeaderValue,
+    Email, EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailHeader, Header,
+    HeaderValue,
 };
 
-impl Email<Get> {
+impl Email {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -180,7 +178,7 @@ impl Email<Get> {
     }
 }
 
-impl EmailBodyPart<Get> {
+impl EmailBodyPart {
     pub fn part_id(&self) -> Option<&str> {
         self.part_id.as_deref()
     }
@@ -234,7 +232,7 @@ impl EmailBodyPart<Get> {
     }
 }
 
-impl EmailBodyValue<Get> {
+impl EmailBodyValue {
     pub fn value(&self) -> &str {
         self.value.as_str()
     }
@@ -248,7 +246,7 @@ impl EmailBodyValue<Get> {
     }
 }
 
-impl EmailAddress<Get> {
+impl EmailAddress {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -262,7 +260,7 @@ impl EmailAddress<Get> {
     }
 }
 
-impl EmailAddressGroup<Get> {
+impl EmailAddressGroup {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
@@ -272,7 +270,7 @@ impl EmailAddressGroup<Get> {
     }
 }
 
-impl EmailHeader<Get> {
+impl EmailHeader {
     pub fn name(&self) -> &str {
         self.name.as_str()
     }
@@ -281,5 +279,3 @@ impl EmailHeader<Get> {
         self.value.as_str()
     }
 }
-
-crate::impl_get_object!(Email, GetArguments);

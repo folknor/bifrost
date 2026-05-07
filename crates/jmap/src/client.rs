@@ -46,6 +46,10 @@ pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
 
     default_account_id: String,
     timeout: Duration,
+    /// Used only by the websocket transport; without that feature, the
+    /// field is otherwise unread but kept on the struct for build-shape
+    /// stability across feature flags.
+    #[cfg_attr(not(feature = "websockets"), allow(dead_code))]
     pub(crate) accept_invalid_certs: bool,
 
     #[cfg(feature = "websockets")]

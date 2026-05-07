@@ -9,14 +9,13 @@ use serde_json::json;
 #[cfg(all(feature = "calendars", feature = "contacts"))]
 mod patch_object_null_semantics {
     use super::*;
-    use crate::Set;
-    use crate::calendar_event::CalendarEvent;
-    use crate::contact_card::ContactCard;
-    use crate::core::set::SetObjectCreatable;
+    use crate::calendar_event::CalendarEventCreate;
+    use crate::contact_card::ContactCardCreate;
+    use crate::core::SetCreate;
 
     #[test]
     fn calendar_event_calendar_id_false_produces_null() {
-        let mut event = CalendarEvent::<Set>::new(Some(0));
+        let mut event = CalendarEventCreate::new(Some(0));
         event.calendar_id("cal-1", false);
 
         let value = serde_json::to_value(&event).unwrap();
@@ -30,7 +29,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn calendar_event_calendar_id_true_produces_true() {
-        let mut event = CalendarEvent::<Set>::new(Some(0));
+        let mut event = CalendarEventCreate::new(Some(0));
         event.calendar_id("cal-1", true);
 
         let value = serde_json::to_value(&event).unwrap();
@@ -41,7 +40,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn contact_card_address_book_id_false_produces_null() {
-        let mut card = ContactCard::<Set>::new(Some(0));
+        let mut card = ContactCardCreate::new(Some(0));
         card.address_book_id("ab-1", false);
 
         let value = serde_json::to_value(&card).unwrap();
@@ -55,7 +54,7 @@ mod patch_object_null_semantics {
 
     #[test]
     fn contact_card_address_book_id_true_produces_true() {
-        let mut card = ContactCard::<Set>::new(Some(0));
+        let mut card = ContactCardCreate::new(Some(0));
         card.address_book_id("ab-1", true);
 
         let value = serde_json::to_value(&card).unwrap();
@@ -71,13 +70,12 @@ mod patch_object_null_semantics {
 
 #[cfg(feature = "calendars")]
 mod calendar_event_nullable_getters {
-    use crate::Get;
     use crate::calendar_event::CalendarEvent;
     use crate::core::field::Field;
 
-    /// Helper: deserialize a CalendarEvent<Get> from a JSON string.
-    fn from_json(s: &str) -> CalendarEvent<Get> {
-        serde_json::from_str(s).expect("failed to deserialize CalendarEvent<Get>")
+    /// Helper: deserialize a CalendarEvent from a JSON string.
+    fn from_json(s: &str) -> CalendarEvent {
+        serde_json::from_str(s).expect("failed to deserialize CalendarEvent")
     }
 
     // -- time_zone --
@@ -175,7 +173,6 @@ mod calendar_event_nullable_getters {
 #[cfg(all(feature = "calendars", feature = "contacts"))]
 mod extension_property_round_trip {
     use super::*;
-    use crate::Get;
     use crate::calendar_event::CalendarEvent;
     use crate::contact_card::ContactCard;
 
@@ -188,8 +185,7 @@ mod extension_property_round_trip {
             "vendor.io:priority": 42
         });
 
-        let event: CalendarEvent<Get> =
-            serde_json::from_value(input.clone()).expect("deser failed");
+        let event: CalendarEvent = serde_json::from_value(input.clone()).expect("deser failed");
 
         // Verify typed accessors work
         assert_eq!(event.uid(), Some("evt-1"));
@@ -220,7 +216,7 @@ mod extension_property_round_trip {
             "example.com:department": "Engineering"
         });
 
-        let card: ContactCard<Get> = serde_json::from_value(input.clone()).expect("deser failed");
+        let card: ContactCard = serde_json::from_value(input.clone()).expect("deser failed");
 
         assert_eq!(card.uid(), Some("card-1"));
         assert_eq!(card.kind(), Some("individual"));
@@ -488,13 +484,12 @@ mod query_filter_serialization {
 #[cfg(feature = "calendars")]
 mod calendar_option_option_serialization {
     use super::*;
-    use crate::Set;
-    use crate::calendar::Calendar;
-    use crate::core::set::SetObjectCreatable;
+    use crate::calendar::CalendarCreate;
+    use crate::core::SetCreate;
 
     #[test]
     fn calendar_description_none_serializes_as_null() {
-        let mut cal = Calendar::<Set>::new(Some(0));
+        let mut cal = CalendarCreate::new(Some(0));
         cal.name("Test Calendar");
         cal.description(None::<String>);
 
@@ -513,7 +508,7 @@ mod calendar_option_option_serialization {
 
     #[test]
     fn calendar_description_unset_is_absent() {
-        let mut cal = Calendar::<Set>::new(Some(0));
+        let mut cal = CalendarCreate::new(Some(0));
         cal.name("Test Calendar");
         // Do NOT call cal.description() - leave it as outer None
 
@@ -527,7 +522,7 @@ mod calendar_option_option_serialization {
 
     #[test]
     fn calendar_description_some_serializes_as_string() {
-        let mut cal = Calendar::<Set>::new(Some(0));
+        let mut cal = CalendarCreate::new(Some(0));
         cal.name("Test Calendar");
         cal.description(Some("A nice calendar"));
 
@@ -906,11 +901,10 @@ mod blob_get_request_serialization {
 
 mod share_notification_serde {
     use super::*;
-    use crate::Get;
     use crate::share_notification::ShareNotification;
 
-    fn from_json(s: &str) -> ShareNotification<Get> {
-        serde_json::from_str(s).expect("failed to deserialize ShareNotification<Get>")
+    fn from_json(s: &str) -> ShareNotification {
+        serde_json::from_str(s).expect("failed to deserialize ShareNotification")
     }
 
     #[test]
@@ -935,7 +929,7 @@ mod share_notification_serde {
             "name": "Team Calendar"
         });
 
-        let notif: ShareNotification<Get> = serde_json::from_value(input).unwrap();
+        let notif: ShareNotification = serde_json::from_value(input).unwrap();
         assert_eq!(notif.id(), Some("notif-1"));
         assert_eq!(notif.created(), Some("2024-11-15T10:30:00Z"));
         assert_eq!(notif.object_type(), Some("Calendar"));
@@ -998,7 +992,6 @@ mod share_notification_serde {
 
 mod principal_rfc9670 {
     use super::*;
-    use crate::Get;
     use crate::principal::Principal;
 
     #[test]
@@ -1030,7 +1023,7 @@ mod principal_rfc9670 {
             }
         });
 
-        let principal: Principal<Get> = serde_json::from_value(input).unwrap();
+        let principal: Principal = serde_json::from_value(input).unwrap();
         assert_eq!(principal.id(), Some("p-alice"));
         assert_eq!(principal.name(), Some("Alice"));
 
@@ -1065,7 +1058,7 @@ mod principal_rfc9670 {
             "name": "Bob"
         });
 
-        let principal: Principal<Get> = serde_json::from_value(input).unwrap();
+        let principal: Principal = serde_json::from_value(input).unwrap();
         assert_eq!(principal.id(), Some("p-bob"));
         assert!(principal.accounts().is_none());
         assert!(principal.capabilities().is_none());

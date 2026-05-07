@@ -1,9 +1,8 @@
-use crate::Get;
 use std::collections::HashMap;
 
 use super::{ChangedBy, ShareNotification};
 
-impl ShareNotification<Get> {
+impl ShareNotification {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -52,5 +51,3 @@ impl ShareNotification<Get> {
         self.name.as_deref()
     }
 }
-
-crate::impl_get_object!(ShareNotification, ());

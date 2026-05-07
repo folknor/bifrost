@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use crate::{Get, core::field::Field};
+use crate::core::field::Field;
 
 use super::{AddressBook, AddressBookRights};
 
-impl AddressBook<Get> {
+impl AddressBook {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -21,7 +21,6 @@ impl AddressBook<Get> {
         self.description.as_value().map(String::as_str)
     }
 
-    /// Full three-state access to the description field.
     pub fn description_field(&self) -> &Field<String> {
         &self.description
     }
@@ -42,7 +41,6 @@ impl AddressBook<Get> {
         self.share_with.as_value()
     }
 
-    /// Full three-state access to the share_with field.
     pub fn share_with_field(&self) -> &Field<HashMap<String, AddressBookRights>> {
         &self.share_with
     }
@@ -51,5 +49,3 @@ impl AddressBook<Get> {
         self.my_rights.as_ref()
     }
 }
-
-crate::impl_get_object!(AddressBook, ());

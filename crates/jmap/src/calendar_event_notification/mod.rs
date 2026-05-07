@@ -6,8 +6,6 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Get;
-
 mod marker {
     pub enum CalendarEventNotification {}
 }
@@ -15,45 +13,46 @@ mod marker {
 pub type CalendarEventNotificationId = crate::core::id::Id<marker::CalendarEventNotification>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarEventNotification<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct CalendarEventNotification {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "created")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub created: Option<String>,
+    pub(super) created: Option<String>,
 
     #[serde(rename = "changedBy")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub changed_by: Option<ChangedBy>,
+    pub(super) changed_by: Option<ChangedBy>,
 
     #[serde(rename = "calendarEventId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub calendar_event_id: Option<String>,
+    pub(super) calendar_event_id: Option<String>,
 
     #[serde(rename = "isDraft")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_draft: Option<bool>,
+    pub(super) is_draft: Option<bool>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub type_: Option<NotificationType>,
+    pub(super) type_: Option<NotificationType>,
 
     #[serde(rename = "event")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event: Option<serde_json::Value>,
+    pub(super) event: Option<serde_json::Value>,
 
     #[serde(rename = "eventPatch")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_patch: Option<serde_json::Value>,
+    pub(super) event_patch: Option<serde_json::Value>,
 }
+
+/// Uninhabitable - notifications are server-generated, only destroy is allowed.
+#[derive(Debug, Clone, Serialize)]
+pub enum CalendarEventNotificationCreate {}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum CalendarEventNotificationPatch {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangedBy {
@@ -117,40 +116,54 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(CalendarEventNotification<State>, Property, true);
+impl crate::core::Object for CalendarEventNotification {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for CalendarEventNotification {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for CalendarEventNotification {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for CalendarEventNotification {
+    type Create = CalendarEventNotificationCreate;
+    type Patch = CalendarEventNotificationPatch;
+    type SetArguments = ();
+}
+
 crate::define_get_method!(
     CalendarEventNotificationGet,
-    CalendarEventNotification<Set>,
+    CalendarEventNotification,
     "CalendarEventNotification/get",
-    crate::core::capability::Calendars,
-    crate::core::get::GetResponse<CalendarEventNotification<Get>>
+    crate::core::capability::Calendars
 );
 crate::define_set_method!(
     CalendarEventNotificationSet,
-    CalendarEventNotification<Set>,
+    CalendarEventNotification,
     "CalendarEventNotification/set",
-    crate::core::capability::Calendars,
-    crate::core::set::SetResponse<CalendarEventNotification<Get>>
+    crate::core::capability::Calendars
 );
 crate::define_changes_method!(
     CalendarEventNotificationChanges,
+    CalendarEventNotification,
     "CalendarEventNotification/changes",
-    crate::core::capability::Calendars,
-    crate::core::changes::ChangesResponse<CalendarEventNotification<Get>>
+    crate::core::capability::Calendars
 );
 crate::define_query_method!(
     CalendarEventNotificationQuery,
-    CalendarEventNotification<Set>,
+    CalendarEventNotification,
     "CalendarEventNotification/query",
     crate::core::capability::Calendars
 );
 crate::define_query_changes_method!(
     CalendarEventNotificationQueryChanges,
-    CalendarEventNotification<Set>,
+    CalendarEventNotification,
     "CalendarEventNotification/queryChanges",
     crate::core::capability::Calendars
 );

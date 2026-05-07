@@ -5,7 +5,6 @@ pub mod validate;
 
 use std::fmt::Display;
 
-use crate::Get;
 use serde::{Deserialize, Serialize};
 
 mod marker {
@@ -15,28 +14,47 @@ mod marker {
 pub type SieveScriptId = crate::core::id::Id<marker::SieveScript>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SieveScript<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct SieveScript {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob_id: Option<String>,
+    pub(super) blob_id: Option<String>,
 
     #[serde(rename = "isActive")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_active: Option<bool>,
+    pub(super) is_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SieveScriptCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "blobId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) blob_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SieveScriptPatch {
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "blobId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) blob_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -73,28 +91,56 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(SieveScript<State>, Property, true);
+impl crate::core::Object for SieveScript {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for SieveScript {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for SieveScript {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for SieveScript {
+    type Create = SieveScriptCreate;
+    type Patch = SieveScriptPatch;
+    type SetArguments = SetArguments;
+}
+
+impl crate::core::SetCreate for SieveScriptCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        SieveScriptCreate {
+            _create_id: create_id,
+            name: None,
+            blob_id: None,
+        }
+    }
+}
+
 crate::define_get_method!(
     SieveScriptGet,
-    SieveScript<Set>,
+    SieveScript,
     "SieveScript/get",
-    crate::core::capability::Sieve,
-    crate::core::get::GetResponse<SieveScript<Get>>
+    crate::core::capability::Sieve
 );
 crate::define_set_method!(
     SieveScriptSet,
-    SieveScript<Set>,
+    SieveScript,
     "SieveScript/set",
-    crate::core::capability::Sieve,
-    crate::core::set::SetResponse<SieveScript<Get>>
+    crate::core::capability::Sieve
 );
 crate::define_query_method!(
     SieveScriptQuery,
-    SieveScript<Set>,
+    SieveScript,
     "SieveScript/query",
     crate::core::capability::Sieve
 );

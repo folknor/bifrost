@@ -1,8 +1,6 @@
-use crate::Get;
-
 use super::VacationResponse;
 
-impl VacationResponse<Get> {
+impl VacationResponse {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -31,5 +29,3 @@ impl VacationResponse<Get> {
         self.html_body.as_deref()
     }
 }
-
-crate::impl_get_object!(VacationResponse, ());

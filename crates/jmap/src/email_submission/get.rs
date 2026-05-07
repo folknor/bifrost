@@ -1,8 +1,7 @@
 use super::{Address, Delivered, DeliveryStatus, Displayed, EmailSubmission, UndoStatus};
-use crate::Get;
 use std::collections::HashMap;
 
-impl EmailSubmission<Get> {
+impl EmailSubmission {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -56,7 +55,7 @@ impl EmailSubmission<Get> {
     }
 }
 
-impl Address<Get> {
+impl Address {
     pub fn email(&self) -> &str {
         &self.email
     }
@@ -95,5 +94,3 @@ impl DeliveryStatus {
         &self.displayed
     }
 }
-
-crate::impl_get_object!(EmailSubmission, ());

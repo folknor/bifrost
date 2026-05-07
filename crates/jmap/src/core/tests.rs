@@ -4,21 +4,34 @@ use serde_json::json;
 
 use std::marker::PhantomData;
 
+use super::SetCreate;
 use super::get::{GetObject, GetResponse};
 use super::method::JmapMethod;
 use super::query::QueryObject;
 use super::request::CallHandle;
 use super::response::Response;
-use crate::{Error, Get, Set};
+use crate::Error;
 
 // -- Minimal test types --
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TestObj<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TestObj {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TestObjCreate {
+    #[serde(skip)]
+    _create_id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TestObjPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
@@ -40,84 +53,60 @@ impl std::fmt::Display for TestProp {
     }
 }
 
-impl super::Object for TestObj<Set> {
+impl super::Object for TestObj {
     type Property = TestProp;
     fn requires_account_id() -> bool {
         true
     }
 }
-impl super::Object for TestObj<Get> {
-    type Property = TestProp;
-    fn requires_account_id() -> bool {
-        true
-    }
-}
-impl GetObject for TestObj<Set> {
+
+impl GetObject for TestObj {
     type GetArguments = ();
 }
-impl GetObject for TestObj<Get> {
-    type GetArguments = ();
-}
-impl super::set::SetObject for TestObj<Set> {
+
+impl super::set::SetObject for TestObj {
+    type Create = TestObjCreate;
+    type Patch = TestObjPatch;
     type SetArguments = ();
-    fn create_id(&self) -> Option<String> {
-        None
-    }
 }
-impl super::set::SetObjectCreatable for TestObj<Set> {
-    fn new(_: Option<usize>) -> Self {
-        TestObj {
-            _state: Default::default(),
-            id: None,
+
+impl SetCreate for TestObjCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+    fn new(create_id: Option<usize>) -> Self {
+        TestObjCreate {
+            _create_id: create_id,
             name: None,
         }
     }
 }
-impl super::set::SetObject for TestObj<Get> {
-    type SetArguments = ();
-    fn create_id(&self) -> Option<String> {
-        None
-    }
-}
-impl super::changes::ChangesObject for TestObj<Set> {
+
+impl super::changes::ChangesObject for TestObj {
     type ChangesResponse = ();
 }
-impl super::changes::ChangesObject for TestObj<Get> {
-    type ChangesResponse = ();
-}
-impl QueryObject for TestObj<Set> {
+
+impl QueryObject for TestObj {
     type QueryArguments = ();
     type Filter = ();
     type Sort = ();
 }
 
-crate::define_get_method!(
-    TestGet,
-    TestObj<Set>,
-    "Test/get",
-    crate::core::capability::Core,
-    GetResponse<TestObj<Get>>
-);
-
+crate::define_get_method!(TestGet, TestObj, "Test/get", crate::core::capability::Core);
 crate::define_query_method!(
     TestQuery,
-    TestObj<Set>,
+    TestObj,
     "Test/query",
     crate::core::capability::Core
 );
 
-// -- Helper: build a CallHandle without going through Request --
-
 fn make_handle<M: JmapMethod>(call_id: &str) -> CallHandle<M> {
-    // CallHandle fields are pub(crate), accessible from tests
     CallHandle {
         call_id: call_id.to_string(),
         method_name: M::NAME,
         _phantom: PhantomData,
     }
 }
-
-// -- Tests --
 
 #[test]
 fn response_get_extracts_typed_result() {
@@ -135,7 +124,7 @@ fn response_get_extracts_typed_result() {
 
     let mut response: Response = serde_json::from_value(raw_json).unwrap();
     let handle = make_handle::<TestGet>("s0");
-    let result: GetResponse<TestObj<Get>> = response.get(&handle).unwrap();
+    let result: GetResponse<TestObj> = response.get(&handle).unwrap();
 
     assert_eq!(result.state(), "s1");
     assert_eq!(result.list().len(), 1);
@@ -198,16 +187,13 @@ fn response_mixed_success_and_error() {
 
     let mut response: Response = serde_json::from_value(raw_json).unwrap();
 
-    // Extract get - succeeds
     let handle_get = make_handle::<TestGet>("s0");
     let get_result = response.get(&handle_get).unwrap();
     assert_eq!(get_result.list().len(), 1);
 
-    // Extract error call - returns MethodError
     let handle_err = make_handle::<TestGet>("s1");
     assert!(matches!(response.get(&handle_err), Err(Error::Method(_))));
 
-    // Extract query - succeeds
     let handle_query = make_handle::<TestQuery>("s2");
     let query_result = response.get(&handle_query).unwrap();
     assert_eq!(query_result.ids().len(), 2);
@@ -230,10 +216,8 @@ fn response_get_consumes_entry() {
     let mut response: Response = serde_json::from_value(raw_json).unwrap();
     let handle = make_handle::<TestGet>("s0");
 
-    // First extraction succeeds
     let _ = response.get(&handle).unwrap();
 
-    // Second extraction fails - entry consumed
     assert!(matches!(response.get(&handle), Err(Error::CallNotFound(_))));
 }
 
@@ -273,9 +257,7 @@ fn transport_error_without_body_stays_transport() {
 }
 
 #[test]
-fn set_response_deserializes_without_creatable() {
-    // SetResponse<TestObj<Get>> must work even though TestObj<Get>
-    // does not implement SetObjectCreatable - only SetObject.
+fn set_response_deserializes() {
     use super::set::SetResponse;
 
     let raw = json!({
@@ -292,7 +274,7 @@ fn set_response_deserializes_without_creatable() {
         "notDestroyed": null
     });
 
-    let mut response: SetResponse<TestObj<Get>> = serde_json::from_value(raw).unwrap();
+    let mut response: SetResponse<TestObj> = serde_json::from_value(raw).unwrap();
     assert_eq!(response.new_state(), "s2");
     let created = response.created("c0").unwrap();
     assert_eq!(created.name.as_deref(), Some("created-obj"));

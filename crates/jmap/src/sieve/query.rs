@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::SieveScript;
 
@@ -53,7 +50,7 @@ impl Comparator {
     }
 }
 
-impl QueryObject for SieveScript<Set> {
+impl QueryObject for SieveScript {
     type QueryArguments = ();
 
     type Filter = Filter;

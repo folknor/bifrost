@@ -1,8 +1,6 @@
-use crate::Get;
-
 use super::ContactCard;
 
-impl ContactCard<Get> {
+impl ContactCard {
     pub fn id(&self) -> Option<&str> {
         self.properties.get("id")?.as_str()
     }
@@ -84,5 +82,3 @@ impl ContactCard<Get> {
         &self.properties
     }
 }
-
-crate::impl_get_object!(ContactCard, ());

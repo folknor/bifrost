@@ -1,8 +1,7 @@
 use super::{ACL, DKIM, Principal, PrincipalAccount, Type};
-use crate::Get;
 use std::collections::HashMap;
 
-impl Principal<Get> {
+impl Principal {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -43,12 +42,10 @@ impl Principal<Get> {
         self.quota
     }
 
-    /// RFC 9670: Map of JMAP capability URI to domain-specific metadata.
     pub fn capabilities(&self) -> Option<&HashMap<String, serde_json::Value>> {
         self.capabilities.as_ref()
     }
 
-    /// RFC 9670: Map of account ID to account info accessible to this principal.
     pub fn accounts(&self) -> Option<&HashMap<String, PrincipalAccount>> {
         self.accounts.as_ref()
     }
@@ -69,5 +66,3 @@ impl Principal<Get> {
         self.acl.as_ref()
     }
 }
-
-crate::impl_get_object!(Principal, ());

@@ -6,7 +6,6 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Get;
 use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 
@@ -16,47 +15,91 @@ mod marker {
 /// Strongly-typed AddressBook ID.
 pub type AddressBookId = crate::core::id::Id<marker::AddressBook>;
 
+/// Server-returned AddressBook (RFC 8887).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddressBook<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct AddressBook {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "name")]
-    #[serde(skip_serializing_if = "skip_if_empty_str")]
-    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
 
     #[serde(rename = "description")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub description: Field<String>,
+    pub(super) description: Field<String>,
 
     #[serde(rename = "sortOrder")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort_order: Option<u32>,
+    pub(super) sort_order: Option<u32>,
 
     #[serde(rename = "isDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_default: Option<bool>,
+    pub(super) is_default: Option<bool>,
 
     #[serde(rename = "isSubscribed")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_subscribed: Option<bool>,
+    pub(super) is_subscribed: Option<bool>,
 
     #[serde(rename = "shareWith")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub share_with: Field<HashMap<String, AddressBookRights>>,
+    pub(super) share_with: Field<HashMap<String, AddressBookRights>>,
 
     #[serde(rename = "myRights")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub my_rights: Option<AddressBookRights>,
+    pub(super) my_rights: Option<AddressBookRights>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressBookCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "skip_if_empty_str")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "description")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
+
+    #[serde(rename = "sortOrder")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sort_order: Option<u32>,
+
+    #[serde(rename = "isSubscribed")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_subscribed: Option<bool>,
+
+    #[serde(rename = "shareWith")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) share_with: Field<HashMap<String, AddressBookRights>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AddressBookPatch {
+    #[serde(rename = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) name: Option<String>,
+
+    #[serde(rename = "description")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) description: Field<String>,
+
+    #[serde(rename = "sortOrder")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sort_order: Option<u32>,
+
+    #[serde(rename = "isSubscribed")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_subscribed: Option<bool>,
+
+    #[serde(rename = "shareWith")]
+    #[serde(skip_serializing_if = "Field::is_omitted")]
+    pub(super) share_with: Field<HashMap<String, AddressBookRights>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,8 +121,6 @@ pub struct AddressBookRights {
     pub may_delete: Option<bool>,
 }
 
-// ---- AddressBook/set arguments ----
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AddressBookSetArguments {
     #[serde(rename = "onDestroyRemoveContents")]
@@ -97,8 +138,6 @@ impl AddressBookSetArguments {
         self
     }
 
-    /// Set the given address book as default after a successful create/update.
-    /// The value is a creation id reference (e.g. `"#c0"`) or an existing id.
     pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
@@ -141,33 +180,62 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(AddressBook<State>, Property, true);
+impl crate::core::Object for AddressBook {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for AddressBook {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for AddressBook {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for AddressBook {
+    type Create = AddressBookCreate;
+    type Patch = AddressBookPatch;
+    type SetArguments = AddressBookSetArguments;
+}
+
+impl crate::core::SetCreate for AddressBookCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        AddressBookCreate {
+            _create_id: create_id,
+            name: None,
+            description: Field::Omitted,
+            sort_order: None,
+            is_subscribed: None,
+            share_with: Field::Omitted,
+        }
+    }
+}
+
 crate::define_get_method!(
     AddressBookGet,
-    AddressBook<Set>,
+    AddressBook,
     "AddressBook/get",
-    crate::core::capability::Contacts,
-    crate::core::get::GetResponse<AddressBook<Get>>
+    crate::core::capability::Contacts
 );
 crate::define_set_method!(
     AddressBookSet,
-    AddressBook<Set>,
+    AddressBook,
     "AddressBook/set",
-    crate::core::capability::Contacts,
-    crate::core::set::SetResponse<AddressBook<Get>>
+    crate::core::capability::Contacts
 );
 crate::define_changes_method!(
     AddressBookChanges,
+    AddressBook,
     "AddressBook/changes",
-    crate::core::capability::Contacts,
-    crate::core::changes::ChangesResponse<AddressBook<Get>>
+    crate::core::capability::Contacts
 );
-
-// -- Lifted method arguments (plans/API.md §5) --
 
 impl AddressBookSet {
     #[must_use]

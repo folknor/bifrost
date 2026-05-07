@@ -1,12 +1,58 @@
-use super::{ACLPatch, Mailbox, Role, SetArguments};
-use crate::{
-    Get, Set,
-    core::set::{SetObject, SetObjectCreatable},
-    principal::ACL,
-};
+use super::{ACLPatch, MailboxCreate, MailboxPatch, Role, SetArguments};
+use crate::principal::ACL;
 use std::collections::HashMap;
 
-impl Mailbox<Set> {
+impl MailboxCreate {
+    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn parent_id(&mut self, parent_id: Option<impl Into<String>>) -> &mut Self {
+        self.parent_id = parent_id.map(std::convert::Into::into);
+        self
+    }
+
+    pub fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
+        self.parent_id = format!("#{parent_id_ref}").into();
+        self
+    }
+
+    pub fn role(&mut self, role: Role) -> &mut Self {
+        if !matches!(role, Role::None) {
+            self.role = Some(role);
+        } else {
+            self.role = None;
+        }
+        self
+    }
+
+    pub fn sort_order(&mut self, sort_order: u32) -> &mut Self {
+        self.sort_order = sort_order.into();
+        self
+    }
+
+    pub fn is_subscribed(&mut self, is_subscribed: bool) -> &mut Self {
+        self.is_subscribed = is_subscribed.into();
+        self
+    }
+
+    pub fn acls<T, U, V>(&mut self, acls: T) -> &mut Self
+    where
+        T: IntoIterator<Item = (U, V)>,
+        U: Into<String>,
+        V: IntoIterator<Item = ACL>,
+    {
+        self.share_with = Some(
+            acls.into_iter()
+                .map(|(id, acls)| (id.into(), acls.into_iter().map(|acl| (acl, true)).collect()))
+                .collect(),
+        );
+        self
+    }
+}
+
+impl MailboxPatch {
     pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
@@ -73,44 +119,6 @@ impl Mailbox<Set> {
 
 pub fn role_not_set(role: &Option<Role>) -> bool {
     matches!(role, Some(Role::None))
-}
-
-impl SetObject for Mailbox<Set> {
-    type SetArguments = SetArguments;
-
-    fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
-    }
-}
-
-impl SetObjectCreatable for Mailbox<Set> {
-    fn new(_create_id: Option<usize>) -> Self {
-        Mailbox {
-            _create_id,
-            _state: Default::default(),
-            id: None,
-            name: None,
-            parent_id: String::new().into(),
-            role: Role::None.into(),
-            sort_order: None,
-            total_emails: None,
-            unread_emails: None,
-            total_threads: None,
-            unread_threads: None,
-            my_rights: None,
-            is_subscribed: None,
-            share_with: HashMap::with_capacity(0).into(),
-            acl_patch: None,
-        }
-    }
-}
-
-impl SetObject for Mailbox<Get> {
-    type SetArguments = SetArguments;
-
-    fn create_id(&self) -> Option<String> {
-        None
-    }
 }
 
 impl SetArguments {

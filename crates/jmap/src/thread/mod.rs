@@ -26,7 +26,16 @@ pub enum Property {
     EmailIds,
 }
 
-crate::impl_jmap_object!(Thread, Property, true);
+impl crate::core::Object for Thread {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
+
+impl crate::core::changes::ChangesObject for Thread {
+    type ChangesResponse = ();
+}
 
 impl Display for Property {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,17 +46,15 @@ impl Display for Property {
     }
 }
 
-// Method structs for the new architecture
 crate::define_get_method!(
     ThreadGet,
     Thread,
     "Thread/get",
-    crate::core::capability::Mail,
-    crate::core::get::GetResponse<Thread>
+    crate::core::capability::Mail
 );
 crate::define_changes_method!(
     ThreadChanges,
+    Thread,
     "Thread/changes",
-    crate::core::capability::Mail,
-    crate::core::changes::ChangesResponse<Thread>
+    crate::core::capability::Mail
 );

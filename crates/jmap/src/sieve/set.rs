@@ -1,42 +1,23 @@
-use crate::{
-    Get, Set,
-    core::set::{SetObject, SetObjectCreatable},
-};
+use super::{SetArguments, SieveScriptCreate, SieveScriptPatch, SieveScriptSet};
 
-use super::{SetArguments, SieveScript};
+macro_rules! sieve_setters {
+    ($t:ty) => {
+        impl $t {
+            pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+                self.name = Some(name.into());
+                self
+            }
 
-impl SieveScript<Set> {
-    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    pub fn blob_id(&mut self, blob_id: impl Into<String>) -> &mut Self {
-        self.blob_id = Some(blob_id.into());
-        self
-    }
-}
-
-impl SetObject for SieveScript<Set> {
-    type SetArguments = SetArguments;
-
-    fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
-    }
-}
-
-impl SetObjectCreatable for SieveScript<Set> {
-    fn new(_create_id: Option<usize>) -> Self {
-        SieveScript {
-            _create_id,
-            _state: Default::default(),
-            id: None,
-            name: None,
-            blob_id: None,
-            is_active: None,
+            pub fn blob_id(&mut self, blob_id: impl Into<String>) -> &mut Self {
+                self.blob_id = Some(blob_id.into());
+                self
+            }
         }
-    }
+    };
 }
+
+sieve_setters!(SieveScriptCreate);
+sieve_setters!(SieveScriptPatch);
 
 impl SetArguments {
     pub fn on_success_activate_script(&mut self, id: impl Into<String>) -> &mut Self {
@@ -54,18 +35,6 @@ impl SetArguments {
         self
     }
 }
-
-impl SetObject for SieveScript<Get> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        None
-    }
-}
-
-// -- Lifted method arguments (plans/API.md §5) --
-
-use super::SieveScriptSet;
 
 impl SieveScriptSet {
     #[must_use]

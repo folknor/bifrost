@@ -1,8 +1,6 @@
-use crate::Get;
-
 use super::{CalendarEventNotification, ChangedBy, NotificationType};
 
-impl CalendarEventNotification<Get> {
+impl CalendarEventNotification {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -39,5 +37,3 @@ impl CalendarEventNotification<Get> {
         self.event_patch.as_ref()
     }
 }
-
-crate::impl_get_object!(CalendarEventNotification, ());

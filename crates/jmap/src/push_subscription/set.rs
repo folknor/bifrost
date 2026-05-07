@@ -1,11 +1,8 @@
-use crate::{
-    DataType, Get, Set,
-    core::set::{SetObject, SetObjectCreatable, from_timestamp},
-};
+use crate::{DataType, core::set::from_timestamp};
 
-use super::{Keys, PushSubscription};
+use super::{Keys, PushSubscriptionCreate, PushSubscriptionPatch};
 
-impl PushSubscription<Set> {
+impl PushSubscriptionCreate {
     pub fn device_client_id(&mut self, device_client_id: impl Into<String>) -> &mut Self {
         self.device_client_id = Some(device_client_id.into());
         self
@@ -37,35 +34,20 @@ impl PushSubscription<Set> {
     }
 }
 
-impl SetObject for PushSubscription<Set> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+impl PushSubscriptionPatch {
+    pub fn verification_code(&mut self, verification_code: impl Into<String>) -> &mut Self {
+        self.verification_code = Some(verification_code.into());
+        self
     }
-}
 
-impl SetObjectCreatable for PushSubscription<Set> {
-    fn new(_create_id: Option<usize>) -> Self {
-        PushSubscription {
-            _create_id,
-            _state: Default::default(),
-            id: None,
-            device_client_id: None,
-            url: None,
-            keys: None,
-            verification_code: None,
-            expires: None,
-            types: Vec::with_capacity(0).into(),
-        }
+    pub fn expires(&mut self, expires: i64) -> &mut Self {
+        self.expires = Some(from_timestamp(expires));
+        self
     }
-}
 
-impl SetObject for PushSubscription<Get> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        None
+    pub fn types(&mut self, types: Option<impl IntoIterator<Item = DataType>>) -> &mut Self {
+        self.types = types.map(|s| s.into_iter().collect());
+        self
     }
 }
 

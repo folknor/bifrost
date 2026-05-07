@@ -5,7 +5,6 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Get;
 use crate::core::field::Field;
 
 mod marker {
@@ -15,56 +14,51 @@ mod marker {
 pub type QuotaId = crate::core::id::Id<marker::Quota>;
 
 /// A quota object representing a storage or count limit (RFC 9425).
+/// Quota is read-only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Quota<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct Quota {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "resourceType")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_type: Option<String>,
+    pub(super) resource_type: Option<String>,
 
     #[serde(rename = "used")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub used: Option<u64>,
+    pub(super) used: Option<u64>,
 
     #[serde(rename = "hardLimit")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hard_limit: Option<u64>,
+    pub(super) hard_limit: Option<u64>,
 
     #[serde(rename = "scope")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
+    pub(super) scope: Option<String>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(super) name: Option<String>,
 
     #[serde(rename = "types")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub types: Option<Vec<String>>,
+    pub(super) types: Option<Vec<String>>,
 
     #[serde(rename = "warnLimit")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub warn_limit: Field<u64>,
+    pub(super) warn_limit: Field<u64>,
 
     #[serde(rename = "softLimit")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub soft_limit: Field<u64>,
+    pub(super) soft_limit: Field<u64>,
 
     #[serde(rename = "description")]
     #[serde(default)]
     #[serde(skip_serializing_if = "Field::is_omitted")]
-    pub description: Field<String>,
+    pub(super) description: Field<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -109,33 +103,37 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(Quota<State>, Property, true);
+impl crate::core::Object for Quota {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for Quota {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
-crate::define_get_method!(
-    QuotaGet,
-    Quota<Set>,
-    "Quota/get",
-    crate::core::capability::Quota,
-    crate::core::get::GetResponse<Quota<Get>>
-);
+impl crate::core::get::GetObject for Quota {
+    type GetArguments = ();
+}
+
+crate::define_get_method!(QuotaGet, Quota, "Quota/get", crate::core::capability::Quota);
 crate::define_changes_method!(
     QuotaChanges,
+    Quota,
     "Quota/changes",
-    crate::core::capability::Quota,
-    crate::core::changes::ChangesResponse<Quota<Get>>
+    crate::core::capability::Quota
 );
 crate::define_query_method!(
     QuotaQuery,
-    Quota<Set>,
+    Quota,
     "Quota/query",
     crate::core::capability::Quota
 );
 crate::define_query_changes_method!(
     QuotaQueryChanges,
-    Quota<Set>,
+    Quota,
     "Quota/queryChanges",
     crate::core::capability::Quota
 );

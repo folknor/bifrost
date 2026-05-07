@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::{Principal, Type};
 
@@ -139,7 +136,7 @@ impl Comparator {
     }
 }
 
-impl QueryObject for Principal<Set> {
+impl QueryObject for Principal {
     type QueryArguments = ();
 
     type Filter = Filter;

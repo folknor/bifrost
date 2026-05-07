@@ -1,11 +1,12 @@
 use std::num::NonZeroUsize;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Object;
 
 pub trait ChangesObject: Object {
-    type ChangesResponse;
+    type ChangesResponse: DeserializeOwned;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,10 +47,6 @@ pub struct ChangesResponse<O: ChangesObject> {
 }
 
 impl ChangesRequest {
-    /// Construct a `ChangesRequest` with `accountId` left empty; the
-    /// account ID is filled in by
-    /// [`crate::core::request::Request::call`] when the method is
-    /// added to a request batch.
     pub fn new(since_state: impl Into<String>) -> Self {
         ChangesRequest {
             account_id: String::new(),
@@ -63,9 +60,6 @@ impl ChangesRequest {
         self
     }
 
-    /// Cap the response at most `max_changes` ID entries. RFC 8620
-    /// requires this to be a positive integer; using `NonZeroUsize`
-    /// rejects `0` at compile time.
     pub fn max_changes(&mut self, max_changes: NonZeroUsize) -> &mut Self {
         self.max_changes = Some(max_changes);
         self

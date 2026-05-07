@@ -177,11 +177,6 @@ pub struct CalendarAlert {
     pub alert_id: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct Get;
-#[derive(Debug, Clone)]
-pub struct Set;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]

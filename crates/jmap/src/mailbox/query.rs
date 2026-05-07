@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::{Mailbox, QueryArguments, Role};
 
@@ -103,7 +100,7 @@ impl QueryArguments {
     }
 }
 
-impl QueryObject for Mailbox<Set> {
+impl QueryObject for Mailbox {
     type QueryArguments = QueryArguments;
 
     type Filter = Filter;

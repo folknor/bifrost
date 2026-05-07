@@ -4,16 +4,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use super::{Object, request::ResultReference};
+use super::{Object, SetCreate, request::ResultReference};
 
+/// Implemented by a JMAP object's canonical (Get-shape) type. Declares
+/// the input shapes used by `SetRequest`/`CopyRequest`.
+///
+/// `Create` and `Patch` only need to be `Serialize`. The
+/// constructable / creatable side is gated by separate trait bounds
+/// (`Create: SetCreate`, `Patch: Default`) on the methods that need
+/// them, so destroy-only objects (like `ShareNotification` which
+/// cannot be created or updated) can declare uninhabited or unit-like
+/// `Create`/`Patch` types and have `create()`/`update()` simply not
+/// resolve.
 pub trait SetObject: Object {
-    type SetArguments: Default;
-
-    fn create_id(&self) -> Option<String>;
-}
-
-pub trait SetObjectCreatable: SetObject {
-    fn new(create_id: Option<usize>) -> Self;
+    type Create: Serialize + Send;
+    type Patch: Serialize + Send;
+    type SetArguments: Default + Serialize + Send;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,10 +33,10 @@ pub struct SetRequest<O: SetObject> {
     if_in_state: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    create: Option<HashMap<String, O>>,
+    create: Option<HashMap<String, O::Create>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    update: Option<HashMap<String, O>>,
+    update: Option<HashMap<String, O::Patch>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     destroy: Option<Vec<String>>,
@@ -160,7 +166,7 @@ impl<O: SetObject> SetRequest<O> {
             update: None,
             destroy: None,
             destroy_ref: None,
-            arguments: Default::default(),
+            arguments: O::SetArguments::default(),
         }
     }
 
@@ -199,14 +205,12 @@ impl<O: SetObject> SetRequest<O> {
     }
 }
 
-impl<O: SetObject> Default for SetRequest<O> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<O: SetObjectCreatable> SetRequest<O> {
-    pub fn create(&mut self) -> &mut O {
+impl<O: SetObject> SetRequest<O>
+where
+    O::Create: SetCreate,
+{
+    /// Get or insert a fresh create entry with auto-assigned `cN` id.
+    pub fn create(&mut self) -> &mut O::Create {
         let create_id = self
             .create
             .as_ref()
@@ -215,18 +219,18 @@ impl<O: SetObjectCreatable> SetRequest<O> {
         self.create
             .get_or_insert_with(HashMap::new)
             .entry(create_id_str)
-            .or_insert_with(|| O::new(create_id.into()))
+            .or_insert_with(|| O::Create::new(Some(create_id)))
     }
 
-    pub fn create_with_id(&mut self, create_id: impl Into<String>) -> &mut O {
+    pub fn create_with_id(&mut self, create_id: impl Into<String>) -> &mut O::Create {
         let create_id = create_id.into();
         self.create
             .get_or_insert_with(HashMap::new)
             .entry(create_id)
-            .or_insert_with(|| O::new(0.into()))
+            .or_insert_with(|| O::Create::new(None))
     }
 
-    pub fn create_item(&mut self, item: O) -> String {
+    pub fn create_item(&mut self, item: O::Create) -> String {
         let create_id = self
             .create
             .as_ref()
@@ -238,18 +242,29 @@ impl<O: SetObjectCreatable> SetRequest<O> {
         create_id_str
     }
 
-    pub fn update(&mut self, id: impl Into<String>) -> &mut O {
+    pub fn update_item(&mut self, id: impl Into<String>, item: O::Patch) {
+        self.update
+            .get_or_insert_with(HashMap::new)
+            .insert(id.into(), item);
+    }
+}
+
+impl<O: SetObject> SetRequest<O>
+where
+    O::Patch: Default,
+{
+    pub fn update(&mut self, id: impl Into<String>) -> &mut O::Patch {
         let id: String = id.into();
         self.update
             .get_or_insert_with(HashMap::new)
             .entry(id)
-            .or_insert_with(|| O::new(None))
+            .or_default()
     }
+}
 
-    pub fn update_item(&mut self, id: impl Into<String>, item: O) {
-        self.update
-            .get_or_insert_with(HashMap::new)
-            .insert(id.into(), item);
+impl<O: SetObject> Default for SetRequest<O> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -1,17 +1,11 @@
 use super::{
-    Email, EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailHeader, Header,
-    HeaderValue,
+    EmailAddress, EmailAddressGroup, EmailBodyPart, EmailBodyValue, EmailCreate, EmailHeader,
+    EmailPatch, Header, HeaderValue,
 };
-use crate::{
-    Get, Set,
-    core::{
-        request::ResultReference,
-        set::{SetObject, SetObjectCreatable, from_timestamp},
-    },
-};
+use crate::core::{request::ResultReference, set::from_timestamp};
 use std::collections::HashMap;
 
-impl Email<Set> {
+impl EmailCreate {
     pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
@@ -28,38 +22,12 @@ impl Email<Set> {
         self
     }
 
-    pub fn mailbox_id(&mut self, mailbox_id: &str, set: bool) -> &mut Self {
-        self.mailbox_ids = None;
-        self.patch.get_or_insert_with(HashMap::new).insert(
-            format!("mailboxIds/{mailbox_id}"),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
-        );
-        self
-    }
-
     pub fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
     {
         self.keywords = Some(keywords.into_iter().map(|s| (s.into(), true)).collect());
-        self
-    }
-
-    pub fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
-        self.keywords = None;
-        self.patch.get_or_insert_with(HashMap::new).insert(
-            format!("keywords/{keyword}"),
-            if set {
-                serde_json::Value::Bool(true)
-            } else {
-                serde_json::Value::Null
-            },
-        );
         self
     }
 
@@ -181,21 +149,21 @@ impl Email<Set> {
         self
     }
 
-    pub fn text_body(&mut self, text_body: impl Into<EmailBodyPart<Get>>) -> &mut Self {
+    pub fn text_body(&mut self, text_body: impl Into<EmailBodyPart>) -> &mut Self {
         self.text_body
             .get_or_insert_with(Vec::new)
             .push(text_body.into());
         self
     }
 
-    pub fn html_body(&mut self, html_body: impl Into<EmailBodyPart<Get>>) -> &mut Self {
+    pub fn html_body(&mut self, html_body: impl Into<EmailBodyPart>) -> &mut Self {
         self.html_body
             .get_or_insert_with(Vec::new)
             .push(html_body.into());
         self
     }
 
-    pub fn attachment(&mut self, attachment: impl Into<EmailBodyPart<Get>>) -> &mut Self {
+    pub fn attachment(&mut self, attachment: impl Into<EmailBodyPart>) -> &mut Self {
         self.attachments
             .get_or_insert_with(Vec::new)
             .push(attachment.into());
@@ -213,128 +181,90 @@ impl Email<Set> {
     }
 }
 
-impl SetObject for Email<Set> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        self._create_id.map(|id| format!("c{id}"))
+impl EmailPatch {
+    /// Set/clear a single mailbox membership via dotted-path patch.
+    pub fn mailbox_id(&mut self, mailbox_id: &str, set: bool) -> &mut Self {
+        self.mailbox_ids = None;
+        self.patch.get_or_insert_with(HashMap::new).insert(
+            format!("mailboxIds/{mailbox_id}"),
+            if set {
+                serde_json::Value::Bool(true)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        self
     }
-}
 
-impl SetObjectCreatable for Email<Set> {
-    fn new(_create_id: Option<usize>) -> Email<Set> {
-        Email {
-            _create_id,
-            _state: Default::default(),
-            id: Default::default(),
-            blob_id: Default::default(),
-            thread_id: Default::default(),
-            mailbox_ids: Default::default(),
-            mailbox_ids_ref: Default::default(),
-            keywords: Default::default(),
-            size: Default::default(),
-            received_at: Default::default(),
-            message_id: Default::default(),
-            in_reply_to: Default::default(),
-            references: Default::default(),
-            sender: Default::default(),
-            from: Default::default(),
-            to: Default::default(),
-            cc: Default::default(),
-            bcc: Default::default(),
-            reply_to: Default::default(),
-            subject: Default::default(),
-            sent_at: Default::default(),
-            body_structure: Default::default(),
-            body_values: Default::default(),
-            text_body: Default::default(),
-            html_body: Default::default(),
-            attachments: Default::default(),
-            has_attachment: Default::default(),
-            preview: Default::default(),
-            headers: Default::default(),
-            patch: Default::default(),
-        }
+    pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
+    where
+        T: IntoIterator<Item = U>,
+        U: Into<String>,
+    {
+        self.mailbox_ids = Some(mailbox_ids.into_iter().map(|s| (s.into(), true)).collect());
+        self
     }
-}
 
-impl SetObject for Email<Get> {
-    type SetArguments = ();
+    /// Set/clear a single keyword via dotted-path patch.
+    pub fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
+        self.keywords = None;
+        self.patch.get_or_insert_with(HashMap::new).insert(
+            format!("keywords/{keyword}"),
+            if set {
+                serde_json::Value::Bool(true)
+            } else {
+                serde_json::Value::Null
+            },
+        );
+        self
+    }
 
-    fn create_id(&self) -> Option<String> {
-        None
+    pub fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
+    where
+        T: IntoIterator<Item = U>,
+        U: Into<String>,
+    {
+        self.keywords = Some(keywords.into_iter().map(|s| (s.into(), true)).collect());
+        self
+    }
+
+    pub fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
+        self.subject = Some(subject.into());
+        self
     }
 }
 
 impl EmailBodyPart {
-    pub fn new() -> EmailBodyPart<Set> {
-        EmailBodyPart {
-            part_id: None,
-            blob_id: None,
-            size: None,
-            headers: None,
-            name: None,
-            type_: None,
-            charset: None,
-            disposition: None,
-            cid: None,
-            language: None,
-            location: None,
-            sub_parts: None,
-            header: None,
-            _state: Default::default(),
-        }
+    pub fn new() -> EmailBodyPart {
+        EmailBodyPart::default()
     }
-}
 
-impl From<EmailBodyPart<Set>> for EmailBodyPart<Get> {
-    fn from(part: EmailBodyPart<Set>) -> Self {
-        EmailBodyPart {
-            part_id: part.part_id,
-            blob_id: part.blob_id,
-            size: part.size,
-            headers: part.headers,
-            name: part.name,
-            type_: part.type_,
-            charset: part.charset,
-            disposition: part.disposition,
-            cid: part.cid,
-            language: part.language,
-            location: part.location,
-            sub_parts: part.sub_parts,
-            header: part.header,
-            _state: Default::default(),
-        }
-    }
-}
-
-impl EmailBodyPart<Set> {
-    pub fn part_id(mut self, part_id: impl Into<String>) -> Self {
+    pub fn with_part_id(mut self, part_id: impl Into<String>) -> Self {
         self.part_id = Some(part_id.into());
         self
     }
 
-    pub fn blob_id(mut self, blob_id: impl Into<String>) -> Self {
+    pub fn with_blob_id(mut self, blob_id: impl Into<String>) -> Self {
         self.blob_id = Some(blob_id.into());
         self
     }
 
-    pub fn name(mut self, name: impl Into<String>) -> Self {
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn content_type(mut self, content_type: impl Into<String>) -> Self {
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
         self.type_ = Some(content_type.into());
         self
     }
 
-    pub fn content_id(mut self, content_id: impl Into<String>) -> Self {
+    pub fn with_content_id(mut self, content_id: impl Into<String>) -> Self {
         self.cid = Some(content_id.into());
         self
     }
 
-    pub fn content_language<T, U>(mut self, content_language: T) -> Self
+    pub fn with_content_language<T, U>(mut self, content_language: T) -> Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -348,12 +278,12 @@ impl EmailBodyPart<Set> {
         self
     }
 
-    pub fn content_location(mut self, content_location: impl Into<String>) -> Self {
+    pub fn with_content_location(mut self, content_location: impl Into<String>) -> Self {
         self.location = Some(content_location.into());
         self
     }
 
-    pub fn sub_part(mut self, sub_part: EmailBodyPart) -> Self {
+    pub fn with_sub_part(mut self, sub_part: EmailBodyPart) -> Self {
         self.sub_parts.get_or_insert_with(Vec::new).push(sub_part);
         self
     }
@@ -365,7 +295,6 @@ impl From<String> for EmailBodyValue {
             value,
             is_encoding_problem: None,
             is_truncated: None,
-            _state: Default::default(),
         }
     }
 }
@@ -376,23 +305,16 @@ impl From<&str> for EmailBodyValue {
             value: value.to_string(),
             is_encoding_problem: None,
             is_truncated: None,
-            _state: Default::default(),
         }
     }
 }
 
 impl EmailAddress {
-    pub fn new(email: String) -> EmailAddress<Set> {
-        EmailAddress {
-            _state: Default::default(),
-            name: None,
-            email,
-        }
+    pub fn new(email: String) -> EmailAddress {
+        EmailAddress { name: None, email }
     }
-}
 
-impl EmailAddress<Set> {
-    pub fn name(mut self, name: String) -> Self {
+    pub fn with_name(mut self, name: String) -> Self {
         self.name = Some(name);
         self
     }
@@ -400,18 +322,13 @@ impl EmailAddress<Set> {
 
 impl From<String> for EmailAddress {
     fn from(email: String) -> Self {
-        EmailAddress {
-            _state: Default::default(),
-            name: None,
-            email,
-        }
+        EmailAddress { name: None, email }
     }
 }
 
 impl From<(String, String)> for EmailAddress {
     fn from(parts: (String, String)) -> Self {
         EmailAddress {
-            _state: Default::default(),
             name: parts.0.into(),
             email: parts.1,
         }
@@ -421,7 +338,6 @@ impl From<(String, String)> for EmailAddress {
 impl From<&str> for EmailAddress {
     fn from(email: &str) -> Self {
         EmailAddress {
-            _state: Default::default(),
             name: None,
             email: email.to_string(),
         }
@@ -431,7 +347,6 @@ impl From<&str> for EmailAddress {
 impl From<(&str, &str)> for EmailAddress {
     fn from(parts: (&str, &str)) -> Self {
         EmailAddress {
-            _state: Default::default(),
             name: parts.0.to_string().into(),
             email: parts.1.to_string(),
         }
@@ -439,54 +354,32 @@ impl From<(&str, &str)> for EmailAddress {
 }
 
 impl EmailAddressGroup {
-    pub fn new() -> EmailAddressGroup<Set> {
+    pub fn new() -> EmailAddressGroup {
         EmailAddressGroup {
-            _state: Default::default(),
             name: None,
             addresses: Vec::new(),
         }
     }
-}
 
-impl EmailAddressGroup<Set> {
-    pub fn name(mut self, name: impl Into<String>) -> Self {
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn address(mut self, address: impl Into<EmailAddress>) -> Self {
+    pub fn with_address(mut self, address: impl Into<EmailAddress>) -> Self {
         self.addresses.push(address.into());
         self
     }
 }
 
-impl EmailHeader {
-    pub fn new(name: String, value: String) -> EmailHeader<Set> {
-        EmailHeader {
-            _state: Default::default(),
-            name,
-            value,
-        }
+impl Default for EmailAddressGroup {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mailbox_id_false_serializes_as_null_patch() {
-        let mut e = <Email<Set> as SetObjectCreatable>::new(None);
-        e.mailbox_id("mb_inbox", false);
-        let v = serde_json::to_value(&e).expect("json");
-        assert_eq!(v.get("mailboxIds/mb_inbox"), Some(&serde_json::Value::Null));
-    }
-
-    #[test]
-    fn keyword_false_serializes_as_null_patch() {
-        let mut e = <Email<Set> as SetObjectCreatable>::new(None);
-        e.keyword("$seen", false);
-        let v = serde_json::to_value(&e).expect("json");
-        assert_eq!(v.get("keywords/$seen"), Some(&serde_json::Value::Null));
+impl EmailHeader {
+    pub fn new(name: String, value: String) -> EmailHeader {
+        EmailHeader { name, value }
     }
 }

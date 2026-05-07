@@ -7,7 +7,7 @@
 
 use bifrost_jmap::{
     client::Client,
-    core::{capability, set::SetObject},
+    core::{SetCreate, capability},
     mailbox::{MailboxGet, MailboxQuery, MailboxSet, Role, query::Filter},
 };
 

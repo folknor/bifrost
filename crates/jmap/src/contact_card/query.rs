@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::ContactCard;
 
@@ -253,7 +250,7 @@ impl Comparator {
     }
 }
 
-impl QueryObject for ContactCard<Set> {
+impl QueryObject for ContactCard {
     type QueryArguments = ();
     type Filter = Filter;
     type Sort = Comparator;

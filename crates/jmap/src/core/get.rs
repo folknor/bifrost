@@ -4,20 +4,7 @@ use super::Object;
 use super::request::ResultReference;
 
 pub trait GetObject: Object {
-    type GetArguments: Default;
-}
-
-/// Generates dual `GetObject` impls for `$type<Set>` and `$type<Get>`.
-#[macro_export]
-macro_rules! impl_get_object {
-    ($type:ident, $args:ty) => {
-        impl $crate::core::get::GetObject for $type<$crate::Set> {
-            type GetArguments = $args;
-        }
-        impl $crate::core::get::GetObject for $type<$crate::Get> {
-            type GetArguments = $args;
-        }
-    };
+    type GetArguments: Default + Serialize;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,10 +47,6 @@ pub struct GetResponse<T> {
 }
 
 impl<O: GetObject> GetRequest<O> {
-    /// Construct an empty `GetRequest`. The `accountId` field is left
-    /// unset (or `None` for non-account-scoped objects); it is filled
-    /// in by [`crate::core::request::Request::call`] when the method
-    /// is added to a request batch.
     pub fn new() -> Self {
         GetRequest {
             account_id: if O::requires_account_id() {
@@ -134,8 +117,6 @@ impl<O> GetResponse<O> {
         &self.state
     }
 
-    /// Consume `self` and return the state token. Renamed from
-    /// `take_state` (plans/API.md §6).
     pub fn into_state(self) -> String {
         self.state
     }
@@ -148,8 +129,6 @@ impl<O> GetResponse<O> {
         &self.not_found
     }
 
-    /// Consume `self` and return the result list. Renamed from
-    /// `take_list` (plans/API.md §6).
     pub fn into_list(self) -> Vec<O> {
         self.list
     }
@@ -158,8 +137,6 @@ impl<O> GetResponse<O> {
         self.list.pop()
     }
 
-    /// Consume `self` and return the not-found list. Renamed from
-    /// `take_not_found` (plans/API.md §6).
     pub fn into_not_found(self) -> Vec<String> {
         self.not_found
     }

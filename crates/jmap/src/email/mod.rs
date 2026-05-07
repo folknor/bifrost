@@ -4,105 +4,49 @@ pub mod parse;
 pub mod query;
 pub mod search_snippet;
 pub mod set;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::Visitor};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
-use crate::{Get, core::request::ResultReference};
+use crate::core::request::ResultReference;
 
 mod marker {
     pub enum Email {}
 }
-/// Strongly-typed Email ID. Distinct from `MailboxId`, `ThreadId`,
-/// etc. at compile time.
+/// Strongly-typed Email ID.
 pub type EmailId = crate::core::id::Id<marker::Email>;
 
-crate::impl_jmap_object!(Email<State>, Property, true);
-
-use crate::Set;
-
-// Method structs for the new architecture
-crate::define_get_method!(
-    EmailGet,
-    Email<Set>,
-    "Email/get",
-    crate::core::capability::Mail,
-    crate::core::get::GetResponse<Email<Get>>
-);
-crate::define_set_method!(
-    EmailSet,
-    Email<Set>,
-    "Email/set",
-    crate::core::capability::Mail,
-    crate::core::set::SetResponse<Email<Get>>
-);
-crate::define_changes_method!(
-    EmailChanges,
-    "Email/changes",
-    crate::core::capability::Mail,
-    crate::core::changes::ChangesResponse<Email<Get>>
-);
-crate::define_query_method!(
-    EmailQuery,
-    Email<Set>,
-    "Email/query",
-    crate::core::capability::Mail
-);
-crate::define_query_changes_method!(
-    EmailQueryChanges,
-    Email<Set>,
-    "Email/queryChanges",
-    crate::core::capability::Mail
-);
-crate::define_copy_method!(
-    EmailCopy,
-    Email<Set>,
-    "Email/copy",
-    crate::core::capability::Mail,
-    crate::core::copy::CopyResponse<Email<Get>>
-);
-
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Email<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct Email {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    blob_id: Option<String>,
+    pub(super) blob_id: Option<String>,
 
     #[serde(rename = "threadId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
 
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    mailbox_ids: Option<HashMap<String, bool>>,
-
-    #[serde(rename = "#mailboxIds")]
-    #[serde(skip_deserializing)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mailbox_ids_ref: Option<ResultReference>,
+    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
 
     #[serde(rename = "keywords")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    keywords: Option<HashMap<String, bool>>,
+    pub(super) keywords: Option<HashMap<String, bool>>,
 
     #[serde(rename = "size")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<usize>,
+    pub(super) size: Option<usize>,
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    received_at: Option<DateTime<Utc>>,
+    pub(super) received_at: Option<DateTime<Utc>>,
 
     #[cfg_attr(
         not(feature = "debug"),
@@ -110,7 +54,7 @@ pub struct Email<State = Get> {
     )]
     #[serde(rename = "messageId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    message_id: Option<Vec<String>>,
+    pub(super) message_id: Option<Vec<String>>,
 
     #[serde(rename = "inReplyTo")]
     #[cfg_attr(
@@ -118,7 +62,7 @@ pub struct Email<State = Get> {
         serde(alias = "header:In-Reply-To:asMessageIds")
     )]
     #[serde(skip_serializing_if = "Option::is_none")]
-    in_reply_to: Option<Vec<String>>,
+    pub(super) in_reply_to: Option<Vec<String>>,
 
     #[serde(rename = "references")]
     #[cfg_attr(
@@ -126,186 +70,277 @@ pub struct Email<State = Get> {
         serde(alias = "header:References:asMessageIds")
     )]
     #[serde(skip_serializing_if = "Option::is_none")]
-    references: Option<Vec<String>>,
+    pub(super) references: Option<Vec<String>>,
 
     #[serde(rename = "sender")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Sender:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    sender: Option<Vec<EmailAddress>>,
+    pub(super) sender: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "from")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:From:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    from: Option<Vec<EmailAddress>>,
+    pub(super) from: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "to")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:To:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    to: Option<Vec<EmailAddress>>,
+    pub(super) to: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "cc")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Cc:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    cc: Option<Vec<EmailAddress>>,
+    pub(super) cc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "bcc")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Bcc:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    bcc: Option<Vec<EmailAddress>>,
+    pub(super) bcc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "replyTo")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Reply-To:asAddresses"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<Vec<EmailAddress>>,
+    pub(super) reply_to: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "subject")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Subject:asText"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    subject: Option<String>,
+    pub(super) subject: Option<String>,
 
     #[serde(rename = "sentAt")]
     #[cfg_attr(not(feature = "debug"), serde(alias = "header:Date:asDate"))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    sent_at: Option<DateTime<Utc>>,
+    pub(super) sent_at: Option<DateTime<Utc>>,
 
     #[serde(rename = "bodyStructure")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    body_structure: Option<Box<EmailBodyPart>>,
+    pub(super) body_structure: Option<Box<EmailBodyPart>>,
 
     #[serde(rename = "bodyValues")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    body_values: Option<HashMap<String, EmailBodyValue>>,
+    pub(super) body_values: Option<HashMap<String, EmailBodyValue>>,
 
     #[serde(rename = "textBody")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    text_body: Option<Vec<EmailBodyPart>>,
+    pub(super) text_body: Option<Vec<EmailBodyPart>>,
 
     #[serde(rename = "htmlBody")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    html_body: Option<Vec<EmailBodyPart>>,
+    pub(super) html_body: Option<Vec<EmailBodyPart>>,
 
     #[serde(rename = "attachments")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    attachments: Option<Vec<EmailBodyPart>>,
+    pub(super) attachments: Option<Vec<EmailBodyPart>>,
 
     #[serde(rename = "hasAttachment")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    has_attachment: Option<bool>,
+    pub(super) has_attachment: Option<bool>,
 
     #[serde(rename = "preview")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    preview: Option<String>,
+    pub(super) preview: Option<String>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
-    headers: HashMap<Header, Option<HeaderValue>>,
-
-    #[serde(flatten)]
-    #[serde(skip_deserializing)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    patch: Option<HashMap<String, serde_json::Value>>,
+    pub(super) headers: HashMap<Header, Option<HeaderValue>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailBodyPart<State = Get> {
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EmailCreate {
     #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
+    pub(super) _create_id: Option<usize>,
 
+    #[serde(rename = "mailboxIds")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
+
+    #[serde(rename = "#mailboxIds")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mailbox_ids_ref: Option<ResultReference>,
+
+    #[serde(rename = "keywords")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) keywords: Option<HashMap<String, bool>>,
+
+    #[serde(rename = "receivedAt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) received_at: Option<DateTime<Utc>>,
+
+    #[serde(rename = "messageId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) message_id: Option<Vec<String>>,
+
+    #[serde(rename = "inReplyTo")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) in_reply_to: Option<Vec<String>>,
+
+    #[serde(rename = "references")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) references: Option<Vec<String>>,
+
+    #[serde(rename = "sender")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sender: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "from")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) from: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "to")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) to: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "cc")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cc: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "bcc")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) bcc: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "replyTo")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reply_to: Option<Vec<EmailAddress>>,
+
+    #[serde(rename = "subject")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+
+    #[serde(rename = "sentAt")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sent_at: Option<DateTime<Utc>>,
+
+    #[serde(rename = "bodyStructure")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) body_structure: Option<Box<EmailBodyPart>>,
+
+    #[serde(rename = "bodyValues")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) body_values: Option<HashMap<String, EmailBodyValue>>,
+
+    #[serde(rename = "textBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text_body: Option<Vec<EmailBodyPart>>,
+
+    #[serde(rename = "htmlBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) html_body: Option<Vec<EmailBodyPart>>,
+
+    #[serde(rename = "attachments")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) attachments: Option<Vec<EmailBodyPart>>,
+
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub(super) headers: HashMap<Header, Option<HeaderValue>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EmailPatch {
+    #[serde(rename = "mailboxIds")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mailbox_ids: Option<HashMap<String, bool>>,
+
+    #[serde(rename = "keywords")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) keywords: Option<HashMap<String, bool>>,
+
+    #[serde(rename = "subject")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+
+    /// Dotted-path patch entries (`mailboxIds/<id>`, `keywords/<flag>`, etc.)
+    /// flatten directly into the body.
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) patch: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct EmailBodyPart {
     #[serde(rename = "partId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    part_id: Option<String>,
+    pub(super) part_id: Option<String>,
 
     #[serde(rename = "blobId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    blob_id: Option<String>,
+    pub(super) blob_id: Option<String>,
 
     #[serde(rename = "size")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<usize>,
+    pub(super) size: Option<usize>,
 
     #[serde(rename = "headers")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    headers: Option<Vec<EmailHeader>>,
+    pub(super) headers: Option<Vec<EmailHeader>>,
 
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    pub(super) name: Option<String>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    type_: Option<String>,
+    pub(super) type_: Option<String>,
 
     #[serde(rename = "charset")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    charset: Option<String>,
+    pub(super) charset: Option<String>,
 
     #[serde(rename = "disposition")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    disposition: Option<String>,
+    pub(super) disposition: Option<String>,
 
     #[serde(rename = "cid")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    cid: Option<String>,
+    pub(super) cid: Option<String>,
 
     #[serde(rename = "language")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    language: Option<Vec<String>>,
+    pub(super) language: Option<Vec<String>>,
 
     #[serde(rename = "location")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    location: Option<String>,
+    pub(super) location: Option<String>,
 
     #[serde(rename = "subParts")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    sub_parts: Option<Vec<EmailBodyPart>>,
+    pub(super) sub_parts: Option<Vec<EmailBodyPart>>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    header: Option<HashMap<Header, HeaderValue>>,
+    pub(super) header: Option<HashMap<Header, HeaderValue>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailBodyValue<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct EmailBodyValue {
     #[serde(rename = "value")]
-    value: String,
+    pub(super) value: String,
 
     #[serde(rename = "isEncodingProblem")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    is_encoding_problem: Option<bool>,
+    pub(super) is_encoding_problem: Option<bool>,
 
     #[serde(rename = "isTruncated")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    is_truncated: Option<bool>,
+    pub(super) is_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailAddress<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
-    name: Option<String>,
-    email: String,
+pub struct EmailAddress {
+    pub(super) name: Option<String>,
+    pub(super) email: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailAddressGroup<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
-    name: Option<String>,
-    addresses: Vec<EmailAddress>,
+pub struct EmailAddressGroup {
+    pub(super) name: Option<String>,
+    pub(super) addresses: Vec<EmailAddress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailHeader<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
-    name: String,
-    value: String,
+pub struct EmailHeader {
+    pub(super) name: String,
+    pub(super) value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -344,7 +379,6 @@ pub enum Property {
 #[serde(untagged)]
 #[non_exhaustive]
 pub enum HeaderValue {
-    // Most-specific (nested) variants first for correct untagged deserialization.
     AsGroupedAddressesAll(Vec<Vec<EmailAddressGroup>>),
     AsGroupedAddresses(Vec<EmailAddressGroup>),
     AsAddressesAll(Vec<Vec<EmailAddress>>),
@@ -537,7 +571,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_text(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -545,7 +578,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_addresses(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -553,7 +585,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_grouped_addresses(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -561,7 +592,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_message_ids(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -569,7 +599,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_date(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -577,7 +606,6 @@ impl Header {
             all,
         }
     }
-
     pub fn as_urls(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
@@ -593,13 +621,9 @@ impl Header {
         for (pos, part) in value.split(':').enumerate() {
             match pos {
                 0 if part == "header" => (),
-                1 => {
-                    header = part.into();
-                }
+                1 => header = part.into(),
                 2 | 3 if part == "all" => all = true,
-                2 => {
-                    form = HeaderForm::parse(part)?;
-                }
+                2 => form = HeaderForm::parse(part)?,
                 _ => return None,
             }
         }
@@ -830,8 +854,66 @@ impl GetArguments {
     }
 }
 
-// -- Lifted method arguments (plans/API.md §5) - value-builder shape
-// (plans/API.md §2 builder-style rule).
+impl crate::core::Object for Email {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
+
+impl crate::core::changes::ChangesObject for Email {
+    type ChangesResponse = ();
+}
+
+impl crate::core::get::GetObject for Email {
+    type GetArguments = GetArguments;
+}
+
+impl crate::core::set::SetObject for Email {
+    type Create = EmailCreate;
+    type Patch = EmailPatch;
+    type SetArguments = ();
+}
+
+impl crate::core::SetCreate for EmailCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        EmailCreate {
+            _create_id: create_id,
+            ..Default::default()
+        }
+    }
+}
+
+crate::define_get_method!(EmailGet, Email, "Email/get", crate::core::capability::Mail);
+crate::define_set_method!(EmailSet, Email, "Email/set", crate::core::capability::Mail);
+crate::define_changes_method!(
+    EmailChanges,
+    Email,
+    "Email/changes",
+    crate::core::capability::Mail
+);
+crate::define_query_method!(
+    EmailQuery,
+    Email,
+    "Email/query",
+    crate::core::capability::Mail
+);
+crate::define_query_changes_method!(
+    EmailQueryChanges,
+    Email,
+    "Email/queryChanges",
+    crate::core::capability::Mail
+);
+crate::define_copy_method!(
+    EmailCopy,
+    Email,
+    "Email/copy",
+    crate::core::capability::Mail
+);
 
 impl EmailGet {
     #[must_use]

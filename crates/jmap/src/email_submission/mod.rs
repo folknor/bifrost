@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::{Get, Set, email::Email};
+use crate::email::{Email, EmailPatch};
 
 mod marker {
     pub enum EmailSubmission {}
@@ -19,77 +19,97 @@ pub type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>;
 pub struct SetArguments {
     #[serde(rename = "onSuccessUpdateEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    on_success_update_email: Option<HashMap<String, Email<Set>>>,
+    on_success_update_email: Option<HashMap<String, EmailPatch>>,
     #[serde(rename = "onSuccessDestroyEmail")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_success_destroy_email: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailSubmission<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct EmailSubmission {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "identityId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    identity_id: Option<String>,
+    pub(super) identity_id: Option<String>,
 
     #[serde(rename = "emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    email_id: Option<String>,
+    pub(super) email_id: Option<String>,
 
     #[serde(rename = "threadId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    thread_id: Option<String>,
+    pub(super) thread_id: Option<String>,
 
     #[serde(rename = "envelope")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    envelope: Option<Envelope>,
+    pub(super) envelope: Option<Envelope>,
 
     #[serde(rename = "sendAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    send_at: Option<DateTime<Utc>>,
+    pub(super) send_at: Option<DateTime<Utc>>,
 
     #[serde(rename = "undoStatus")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    undo_status: Option<UndoStatus>,
+    pub(super) undo_status: Option<UndoStatus>,
 
     #[serde(rename = "deliveryStatus")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    delivery_status: Option<HashMap<String, DeliveryStatus>>,
+    pub(super) delivery_status: Option<HashMap<String, DeliveryStatus>>,
 
     #[serde(rename = "dsnBlobIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    dsn_blob_ids: Option<Vec<String>>,
+    pub(super) dsn_blob_ids: Option<Vec<String>>,
 
     #[serde(rename = "mdnBlobIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    mdn_blob_ids: Option<Vec<String>>,
+    pub(super) mdn_blob_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailSubmissionCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "identityId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) identity_id: Option<String>,
+
+    #[serde(rename = "emailId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) email_id: Option<String>,
+
+    #[serde(rename = "envelope")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) envelope: Option<Envelope>,
+
+    #[serde(rename = "undoStatus")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) undo_status: Option<UndoStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EmailSubmissionPatch {
+    #[serde(rename = "undoStatus")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) undo_status: Option<UndoStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     #[serde(rename = "mailFrom")]
-    mail_from: Address,
+    pub(super) mail_from: Address,
 
     #[serde(rename = "rcptTo")]
-    rcpt_to: Vec<Address>,
+    pub(super) rcpt_to: Vec<Address>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Address<State = Get> {
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
-    email: String,
-    parameters: Option<HashMap<String, Option<String>>>,
+pub struct Address {
+    pub(super) email: String,
+    pub(super) parameters: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,42 +199,75 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(EmailSubmission<State>, Property, true);
+impl crate::core::Object for EmailSubmission {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-// Note: EmailSubmission needs both Mail and Submission capabilities.
-// The macros only support one capability, so we use Submission here.
-// The Mail capability will be auto-added when needed through the request.
+impl crate::core::changes::ChangesObject for EmailSubmission {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for EmailSubmission {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for EmailSubmission {
+    type Create = EmailSubmissionCreate;
+    type Patch = EmailSubmissionPatch;
+    type SetArguments = SetArguments;
+}
+
+impl crate::core::SetCreate for EmailSubmissionCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        EmailSubmissionCreate {
+            _create_id: create_id,
+            identity_id: None,
+            email_id: None,
+            envelope: None,
+            undo_status: None,
+        }
+    }
+}
+
 crate::define_get_method!(
     EmailSubmissionGet,
-    EmailSubmission<Set>,
+    EmailSubmission,
     "EmailSubmission/get",
-    crate::core::capability::Submission,
-    crate::core::get::GetResponse<EmailSubmission<Get>>
+    crate::core::capability::Submission
 );
 crate::define_set_method!(
     EmailSubmissionSet,
-    EmailSubmission<Set>,
+    EmailSubmission,
     "EmailSubmission/set",
-    crate::core::capability::Submission,
-    crate::core::set::SetResponse<EmailSubmission<Get>>
+    crate::core::capability::Submission
 );
 crate::define_changes_method!(
     EmailSubmissionChanges,
+    EmailSubmission,
     "EmailSubmission/changes",
-    crate::core::capability::Submission,
-    crate::core::changes::ChangesResponse<EmailSubmission<Get>>
+    crate::core::capability::Submission
 );
 crate::define_query_method!(
     EmailSubmissionQuery,
-    EmailSubmission<Set>,
+    EmailSubmission,
     "EmailSubmission/query",
     crate::core::capability::Submission
 );
 crate::define_query_changes_method!(
     EmailSubmissionQueryChanges,
-    EmailSubmission<Set>,
+    EmailSubmission,
     "EmailSubmission/queryChanges",
     crate::core::capability::Submission
 );
+
+// Reference to suppress unused-import warning if Email isn't used after refactor.
+#[doc(hidden)]
+#[allow(dead_code)]
+type _EmailRef = Email;

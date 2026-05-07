@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use crate::Get;
-
 use super::ParticipantIdentity;
 
-impl ParticipantIdentity<Get> {
+impl ParticipantIdentity {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -25,5 +23,3 @@ impl ParticipantIdentity<Get> {
         self.is_default
     }
 }
-
-crate::impl_get_object!(ParticipantIdentity, ());

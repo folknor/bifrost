@@ -3,47 +3,97 @@ pub mod set;
 
 use std::fmt::Display;
 
-use crate::Get;
 use crate::core::set::skip_if_empty_str;
 use crate::core::set::skip_if_zero_date;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VacationResponse<State = Get> {
-    #[serde(skip)]
-    _create_id: Option<usize>,
-
-    #[serde(skip)]
-    _state: std::marker::PhantomData<State>,
-
+pub struct VacationResponse {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
+    pub(super) id: Option<String>,
 
     #[serde(rename = "isEnabled")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    is_enabled: Option<bool>,
+    pub(super) is_enabled: Option<bool>,
+
+    #[serde(rename = "fromDate")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) from_date: Option<DateTime<Utc>>,
+
+    #[serde(rename = "toDate")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) to_date: Option<DateTime<Utc>>,
+
+    #[serde(rename = "subject")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+
+    #[serde(rename = "textBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text_body: Option<String>,
+
+    #[serde(rename = "htmlBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) html_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VacationResponseCreate {
+    #[serde(skip)]
+    pub(super) _create_id: Option<usize>,
+
+    #[serde(rename = "isEnabled")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_enabled: Option<bool>,
 
     #[serde(rename = "fromDate")]
     #[serde(skip_serializing_if = "skip_if_zero_date")]
-    from_date: Option<DateTime<Utc>>,
+    pub(super) from_date: Option<DateTime<Utc>>,
 
     #[serde(rename = "toDate")]
     #[serde(skip_serializing_if = "skip_if_zero_date")]
-    to_date: Option<DateTime<Utc>>,
+    pub(super) to_date: Option<DateTime<Utc>>,
 
     #[serde(rename = "subject")]
     #[serde(skip_serializing_if = "skip_if_empty_str")]
-    subject: Option<String>,
+    pub(super) subject: Option<String>,
 
     #[serde(rename = "textBody")]
     #[serde(skip_serializing_if = "skip_if_empty_str")]
-    text_body: Option<String>,
+    pub(super) text_body: Option<String>,
 
     #[serde(rename = "htmlBody")]
     #[serde(skip_serializing_if = "skip_if_empty_str")]
-    html_body: Option<String>,
+    pub(super) html_body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VacationResponsePatch {
+    #[serde(rename = "isEnabled")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) is_enabled: Option<bool>,
+
+    #[serde(rename = "fromDate")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) from_date: Option<DateTime<Utc>>,
+
+    #[serde(rename = "toDate")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) to_date: Option<DateTime<Utc>>,
+
+    #[serde(rename = "subject")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subject: Option<String>,
+
+    #[serde(rename = "textBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) text_body: Option<String>,
+
+    #[serde(rename = "htmlBody")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) html_body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
@@ -79,22 +129,55 @@ impl Display for Property {
     }
 }
 
-crate::impl_jmap_object!(VacationResponse<State>, Property, true);
+impl crate::core::Object for VacationResponse {
+    type Property = Property;
+    fn requires_account_id() -> bool {
+        true
+    }
+}
 
-use crate::Set;
+impl crate::core::changes::ChangesObject for VacationResponse {
+    type ChangesResponse = ();
+}
 
-// Method structs for the new architecture
+impl crate::core::get::GetObject for VacationResponse {
+    type GetArguments = ();
+}
+
+impl crate::core::set::SetObject for VacationResponse {
+    type Create = VacationResponseCreate;
+    type Patch = VacationResponsePatch;
+    type SetArguments = ();
+}
+
+impl crate::core::SetCreate for VacationResponseCreate {
+    fn create_id(&self) -> Option<String> {
+        self._create_id.map(|id| format!("c{id}"))
+    }
+
+    fn new(create_id: Option<usize>) -> Self {
+        use crate::core::set::from_timestamp;
+        VacationResponseCreate {
+            _create_id: create_id,
+            is_enabled: None,
+            from_date: from_timestamp(0).into(),
+            to_date: from_timestamp(0).into(),
+            subject: String::new().into(),
+            text_body: String::new().into(),
+            html_body: String::new().into(),
+        }
+    }
+}
+
 crate::define_get_method!(
     VacationResponseGet,
-    VacationResponse<Set>,
+    VacationResponse,
     "VacationResponse/get",
-    crate::core::capability::VacationResponseCap,
-    crate::core::get::GetResponse<VacationResponse<Get>>
+    crate::core::capability::VacationResponseCap
 );
 crate::define_set_method!(
     VacationResponseSet,
-    VacationResponse<Set>,
+    VacationResponse,
     "VacationResponse/set",
-    crate::core::capability::VacationResponseCap,
-    crate::core::set::SetResponse<VacationResponse<Get>>
+    crate::core::capability::VacationResponseCap
 );

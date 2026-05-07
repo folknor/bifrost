@@ -1,8 +1,6 @@
-use crate::Get;
-
 use super::SieveScript;
 
-impl SieveScript<Get> {
+impl SieveScript {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -23,5 +21,3 @@ impl SieveScript<Get> {
         self.is_active.unwrap_or(false)
     }
 }
-
-crate::impl_get_object!(SieveScript, ());

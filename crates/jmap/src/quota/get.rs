@@ -1,12 +1,8 @@
-use crate::{
-    Get, Set,
-    core::field::Field,
-    core::set::{SetObject, SetObjectCreatable},
-};
+use crate::core::field::Field;
 
 use super::Quota;
 
-impl Quota<Get> {
+impl Quota {
     pub fn id(&self) -> Option<&str> {
         self.id.as_deref()
     }
@@ -43,7 +39,6 @@ impl Quota<Get> {
         self.warn_limit.as_value().copied()
     }
 
-    /// Full three-state access to the warn_limit field.
     pub fn warn_limit_field(&self) -> &Field<u64> {
         &self.warn_limit
     }
@@ -52,7 +47,6 @@ impl Quota<Get> {
         self.soft_limit.as_value().copied()
     }
 
-    /// Full three-state access to the soft_limit field.
     pub fn soft_limit_field(&self) -> &Field<u64> {
         &self.soft_limit
     }
@@ -61,47 +55,7 @@ impl Quota<Get> {
         self.description.as_value().map(String::as_str)
     }
 
-    /// Full three-state access to the description field.
     pub fn description_field(&self) -> &Field<String> {
         &self.description
-    }
-}
-
-crate::impl_get_object!(Quota, ());
-
-/// Quota is read-only - SetObject is implemented only to satisfy trait
-/// bounds required by the framework (GetResponse, ChangesResponse).
-impl SetObject for Quota<Set> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        None
-    }
-}
-
-impl SetObjectCreatable for Quota<Set> {
-    fn new(_create_id: Option<usize>) -> Self {
-        Quota {
-            _create_id,
-            _state: Default::default(),
-            id: None,
-            resource_type: None,
-            used: None,
-            hard_limit: None,
-            scope: None,
-            name: None,
-            types: None,
-            warn_limit: Field::Omitted,
-            soft_limit: Field::Omitted,
-            description: Field::Omitted,
-        }
-    }
-}
-
-impl SetObject for Quota<Get> {
-    type SetArguments = ();
-
-    fn create_id(&self) -> Option<String> {
-        None
     }
 }

@@ -1,9 +1,6 @@
 use serde::Serialize;
 
-use crate::{
-    Set,
-    core::query::{self, QueryObject},
-};
+use crate::core::query::{self, QueryObject};
 
 use super::CalendarEventNotification;
 
@@ -49,7 +46,7 @@ impl Comparator {
     }
 }
 
-impl QueryObject for CalendarEventNotification<Set> {
+impl QueryObject for CalendarEventNotification {
     type QueryArguments = ();
     type Filter = Filter;
     type Sort = Comparator;
