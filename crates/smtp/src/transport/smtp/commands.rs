@@ -222,7 +222,9 @@ impl Display for Auth {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let encoded_response = self.response.as_ref().map(crate::base64::encode);
 
-        if self.mechanism.supports_initial_response() {
+        if self.challenge.is_some() {
+            f.write_str(&encoded_response.unwrap())?;
+        } else if self.mechanism.supports_initial_response() {
             write!(f, "AUTH {} {}", self.mechanism, encoded_response.unwrap())?;
         } else {
             match encoded_response {
@@ -352,7 +354,7 @@ mod test {
         assert_eq!(format!("{}", Vrfy::new("test".to_owned())), "VRFY test\r\n");
         assert_eq!(format!("{}", Expn::new("test".to_owned())), "EXPN test\r\n");
         assert_eq!(format!("{Rset}"), "RSET\r\n");
-        let credentials = Credentials::new("user".to_owned(), "password".to_owned());
+        let credentials = Credentials::password("user".to_owned(), "password".to_owned());
         assert_eq!(
             format!(
                 "{}",
@@ -366,6 +368,37 @@ mod test {
                 Auth::new(Mechanism::Login, credentials, None).unwrap()
             ),
             "AUTH LOGIN\r\n"
+        );
+        let credentials = Credentials::oauth2("user".to_owned(), "token".to_owned());
+        assert_eq!(
+            format!(
+                "{}",
+                Auth::new(Mechanism::Xoauth2, credentials.clone(), None).unwrap()
+            ),
+            "AUTH XOAUTH2 dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Auth::new(Mechanism::OAuthBearer, credentials.clone(), None).unwrap()
+            ),
+            "AUTH OAUTHBEARER bixhPXVzZXIsAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
+        );
+        let continuation = Response::new(
+            crate::transport::smtp::response::Code {
+                severity: crate::transport::smtp::response::Severity::PositiveIntermediate,
+                category: crate::transport::smtp::response::Category::Unspecified3,
+                detail: crate::transport::smtp::response::Detail::Four,
+            },
+            vec![crate::base64::encode("{}")],
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Auth::new_from_response(Mechanism::OAuthBearer, credentials, &continuation)
+                    .unwrap()
+            ),
+            "AQ==\r\n"
         );
     }
 }

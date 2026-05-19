@@ -214,7 +214,6 @@ impl SmtpTransport {
     /// ```rust,no_run
     /// use bifrost_smtp::{
     ///     Message, SmtpTransport, Transport, message::header::ContentType,
-    ///     transport::smtp::authentication::Credentials,
     /// };
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -292,14 +291,37 @@ impl SmtpTransportBuilder {
     }
 
     /// Set the authentication credentials to use
+    ///
+    /// Unless [`Self::authentication`] was called explicitly, this also selects
+    /// the default mechanisms for the credential kind.
     pub fn credentials(mut self, credentials: Credentials) -> Self {
-        self.info.credentials = Some(credentials);
+        self.info.set_credentials(credentials);
         self
+    }
+
+    /// Set username and password authentication credentials.
+    pub fn password<U, P>(self, username: U, password: P) -> Self
+    where
+        U: Into<String>,
+        P: Into<String>,
+    {
+        self.credentials(Credentials::password(username.into(), password.into()))
+    }
+
+    /// Set OAuth 2.0 bearer-token authentication credentials.
+    ///
+    /// This configures `OAUTHBEARER` and `XOAUTH2`, in that preference order.
+    pub fn oauth2<I, T>(self, identity: I, access_token: T) -> Self
+    where
+        I: Into<String>,
+        T: Into<String>,
+    {
+        self.credentials(Credentials::oauth2(identity.into(), access_token.into()))
     }
 
     /// Set the authentication mechanism to use
     pub fn authentication(mut self, mechanisms: Vec<Mechanism>) -> Self {
-        self.info.authentication = mechanisms;
+        self.info.set_authentication(mechanisms);
         self
     }
 
@@ -425,7 +447,10 @@ impl SmtpClient {
 mod tests {
     use crate::{
         SmtpTransport,
-        transport::smtp::{authentication::Credentials, client::Tls},
+        transport::smtp::{
+            authentication::{Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS},
+            client::Tls,
+        },
     };
 
     #[test]
@@ -442,7 +467,7 @@ mod tests {
         assert_eq!(builder.info.port, 465);
         assert_eq!(
             builder.info.credentials,
-            Some(Credentials::new(
+            Some(Credentials::password(
                 "username".to_owned(),
                 "password".to_owned()
             ))
@@ -458,7 +483,7 @@ mod tests {
         assert_eq!(builder.info.port, 465);
         assert_eq!(
             builder.info.credentials,
-            Some(Credentials::new(
+            Some(Credentials::password(
                 "user@example.com".to_owned(),
                 "pa$$word?\"!".to_owned()
             ))
@@ -473,7 +498,7 @@ mod tests {
         assert_eq!(builder.info.port, 587);
         assert_eq!(
             builder.info.credentials,
-            Some(Credentials::new(
+            Some(Credentials::password(
                 "username".to_owned(),
                 "password".to_owned()
             ))
@@ -493,5 +518,54 @@ mod tests {
         assert_eq!(builder.info.port, 465);
         assert_eq!(builder.info.credentials, None);
         assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
+    }
+
+    #[test]
+    fn password_helper_uses_password_mechanisms() {
+        let builder =
+            SmtpTransport::builder_dangerous("smtp.example.com").password("username", "password");
+
+        assert_eq!(
+            builder.info.credentials,
+            Some(Credentials::password(
+                "username".to_owned(),
+                "password".to_owned()
+            ))
+        );
+        assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+    }
+
+    #[test]
+    fn oauth2_helper_prefers_standard_bearer_mechanism() {
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
+            .oauth2("user@example.com", "token");
+
+        assert_eq!(
+            builder.info.credentials,
+            Some(Credentials::oauth2(
+                "user@example.com".to_owned(),
+                "token".to_owned()
+            ))
+        );
+        assert_eq!(builder.info.authentication, OAUTH2_MECHANISMS);
+        assert_eq!(
+            builder.info.authentication,
+            [Mechanism::OAuthBearer, Mechanism::Xoauth2]
+        );
+    }
+
+    #[test]
+    fn credentials_preserve_explicit_authentication_mechanisms() {
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
+            .authentication(vec![Mechanism::Xoauth2])
+            .oauth2("user@example.com", "token");
+
+        assert_eq!(builder.info.authentication, [Mechanism::Xoauth2]);
+
+        let builder = SmtpTransport::builder_dangerous("smtp.example.com")
+            .authentication(vec![Mechanism::Plain])
+            .password("username", "password");
+
+        assert_eq!(builder.info.authentication, [Mechanism::Plain]);
     }
 }

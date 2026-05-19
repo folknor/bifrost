@@ -58,7 +58,6 @@
 //! # fn main() -> Result<(), Box<dyn Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport, message::header::ContentType,
-//!     transport::smtp::authentication::Credentials,
 //! };
 //!
 //! let email = Message::builder()
@@ -69,11 +68,9 @@
 //!     .header(ContentType::TEXT_PLAIN)
 //!     .body(String::from("Be happy!"))?;
 //!
-//! let creds = Credentials::new("smtp_username".to_owned(), "smtp_password".to_owned());
-//!
 //! // Open a remote connection to the SMTP relay server
 //! let mailer = SmtpTransport::relay("smtp.gmail.com")?
-//!     .credentials(creds)
+//!     .password("smtp_username", "smtp_password")
 //!     .build();
 //!
 //! // Send the email

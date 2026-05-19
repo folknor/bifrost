@@ -163,6 +163,9 @@ impl ServerInfo {
                             "XOAUTH2" => {
                                 features.insert(Extension::Authentication(Mechanism::Xoauth2));
                             }
+                            "OAUTHBEARER" => {
+                                features.insert(Extension::Authentication(Mechanism::OAuthBearer));
+                            }
                             _ => (),
                         }
                     }
@@ -312,6 +315,10 @@ mod test {
             format!("{}", Extension::Authentication(Mechanism::Plain)),
             "AUTH PLAIN".to_owned()
         );
+        assert_eq!(
+            format!("{}", Extension::Authentication(Mechanism::OAuthBearer)),
+            "AUTH OAUTHBEARER".to_owned()
+        );
     }
 
     #[test]
@@ -390,7 +397,7 @@ mod test {
             ),
             vec![
                 "me".to_owned(),
-                "AUTH PLAIN CRAM-MD5 XOAUTH2 OTHER".to_owned(),
+                "AUTH PLAIN CRAM-MD5 XOAUTH2 OAUTHBEARER OTHER".to_owned(),
                 "8BITMIME".to_owned(),
                 "SIZE 42".to_owned(),
             ],
@@ -400,6 +407,7 @@ mod test {
         assert!(features2.insert(Extension::EightBitMime));
         assert!(features2.insert(Extension::Authentication(Mechanism::Plain),));
         assert!(features2.insert(Extension::Authentication(Mechanism::Xoauth2),));
+        assert!(features2.insert(Extension::Authentication(Mechanism::OAuthBearer),));
 
         let server_info2 = ServerInfo {
             name: "me".to_owned(),
@@ -410,6 +418,7 @@ mod test {
 
         assert!(server_info2.supports_feature(Extension::EightBitMime));
         assert!(server_info2.supports_auth_mechanism(Mechanism::Plain));
+        assert!(server_info2.supports_auth_mechanism(Mechanism::OAuthBearer));
         assert!(!server_info2.supports_feature(Extension::StartTls));
     }
 }

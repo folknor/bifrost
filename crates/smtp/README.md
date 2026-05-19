@@ -8,7 +8,6 @@ See the workspace `NOTICE` file for upstream attribution.
 
 ```rust,no_run
 use bifrost_smtp::message::{Mailbox, header::ContentType};
-use bifrost_smtp::transport::smtp::authentication::Credentials;
 use bifrost_smtp::{Message, SmtpTransport, Transport};
 
 fn main() {
@@ -21,13 +20,15 @@ fn main() {
         .body(String::from("Be happy!"))
         .unwrap();
 
-    let creds = Credentials::new("smtp_username".to_owned(), "smtp_password".to_owned());
-
     let mailer = SmtpTransport::relay("smtp.example.com")
         .unwrap()
-        .credentials(creds)
+        .password("smtp_username", "smtp_password")
         .build();
 
     mailer.send(&email).unwrap();
 }
 ```
+
+OAuth 2.0 access tokens can be used with `.oauth2(identity, access_token)`.
+That configures `OAUTHBEARER` and `XOAUTH2`, in that preference order; the
+transport uses the first configured mechanism advertised by the server.

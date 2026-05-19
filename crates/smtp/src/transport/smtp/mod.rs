@@ -51,10 +51,7 @@
 //! // Create the SMTPS transport
 //! let sender = SmtpTransport::relay("smtp.example.com")?
 //!     // Add credentials for authentication
-//!     .credentials(Credentials::new(
-//!         "username".to_owned(),
-//!         "password".to_owned(),
-//!     ))
+//!     .password("username", "password")
 //!     // Optionally configure expected authentication mechanism
 //!     .authentication(vec![Mechanism::Plain])
 //!     .build();
@@ -78,7 +75,7 @@
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
-//!     transport::smtp::authentication::{Credentials, Mechanism},
+//!     transport::smtp::authentication::Mechanism,
 //! };
 //!
 //! let email = Message::builder()
@@ -151,7 +148,6 @@
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
-//!     transport::smtp::{PoolConfig, authentication::Credentials},
 //! };
 //! #
 //! # type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -250,6 +246,8 @@ struct SmtpInfo {
     tls: Tls,
     /// Optional enforced authentication mechanism
     authentication: Vec<Mechanism>,
+    /// Whether the authentication mechanism list was explicitly configured.
+    authentication_configured: bool,
     /// Credentials
     credentials: Option<Credentials>,
     /// Define network timeout
@@ -265,8 +263,23 @@ impl Default for SmtpInfo {
             hello_name: ClientId::default(),
             credentials: None,
             authentication: DEFAULT_MECHANISMS.into(),
+            authentication_configured: false,
             timeout: Some(DEFAULT_TIMEOUT),
             tls: Tls::None,
         }
+    }
+}
+
+impl SmtpInfo {
+    fn set_credentials(&mut self, credentials: Credentials) {
+        if !self.authentication_configured {
+            self.authentication = credentials.preferred_mechanisms().into();
+        }
+        self.credentials = Some(credentials);
+    }
+
+    fn set_authentication(&mut self, mechanisms: Vec<Mechanism>) {
+        self.authentication = mechanisms;
+        self.authentication_configured = true;
     }
 }

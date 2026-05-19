@@ -123,7 +123,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
                 .map(Cow::into_owned)
                 .map_err(error::connection)
         };
-        let credentials = Credentials::new(
+        let credentials = Credentials::password(
             percent_decode(connection_url.username())?,
             percent_decode(password)?,
         );

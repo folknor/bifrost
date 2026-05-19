@@ -3,10 +3,7 @@ use std::fs;
 use bifrost_smtp::{
     Message, SmtpTransport, Transport,
     message::header::ContentType,
-    transport::smtp::{
-        authentication::Credentials,
-        client::{Certificate, Tls, TlsParameters},
-    },
+    transport::smtp::client::{Certificate, Tls, TlsParameters},
 };
 
 fn main() {
@@ -29,13 +26,11 @@ fn main() {
         .build()
         .unwrap();
 
-    let creds = Credentials::new("smtp_username".to_owned(), "smtp_password".to_owned());
-
     // Open a remote connection to the smtp server
     let mailer = SmtpTransport::builder_dangerous("smtp.server.com")
         .port(465)
         .tls(Tls::Wrapper(tls))
-        .credentials(creds)
+        .password("smtp_username", "smtp_password")
         .build();
 
     // Send the email

@@ -1,6 +1,5 @@
 use bifrost_smtp::{
     AsyncSmtpTransport, AsyncStd1Executor, AsyncTransport, Message, message::header::ContentType,
-    transport::smtp::authentication::Credentials,
 };
 
 #[async_std::main]
@@ -16,13 +15,11 @@ async fn main() {
         .body(String::from("Be happy with async!"))
         .unwrap();
 
-    let creds = Credentials::new("smtp_username".to_owned(), "smtp_password".to_owned());
-
     // Open a remote connection to gmail
     let mailer: AsyncSmtpTransport<AsyncStd1Executor> =
         AsyncSmtpTransport::<AsyncStd1Executor>::relay("smtp.gmail.com")
             .unwrap()
-            .credentials(creds)
+            .password("smtp_username", "smtp_password")
             .build();
 
     // Send the email

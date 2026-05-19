@@ -4,25 +4,79 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use crate::transport::smtp::error::{self, Error};
 
-/// Accepted authentication mechanisms
+/// Accepted password authentication mechanisms.
 ///
 /// Trying LOGIN last as it is deprecated.
-pub const DEFAULT_MECHANISMS: &[Mechanism] = &[Mechanism::Plain, Mechanism::Login];
+pub const PASSWORD_MECHANISMS: &[Mechanism] = &[Mechanism::Plain, Mechanism::Login];
+
+/// Accepted OAuth 2.0 bearer-token authentication mechanisms.
+///
+/// `OAUTHBEARER` is the standard mechanism. `XOAUTH2` is kept for providers
+/// that only expose the older non-standard mechanism.
+pub const OAUTH2_MECHANISMS: &[Mechanism] = &[Mechanism::OAuthBearer, Mechanism::Xoauth2];
+
+/// Default authentication mechanisms.
+pub const DEFAULT_MECHANISMS: &[Mechanism] = PASSWORD_MECHANISMS;
 
 /// Contains user credentials
 #[derive(PartialEq, Eq, Clone, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Credentials {
-    authentication_identity: String,
-    secret: String,
+pub enum Credentials {
+    /// Username and password credentials.
+    Password {
+        /// Authentication identity.
+        username: String,
+        /// Password or app password.
+        password: String,
+    },
+    /// OAuth 2.0 bearer-token credentials.
+    OAuth2 {
+        /// Authorization identity, usually the email address being accessed.
+        identity: String,
+        /// OAuth 2.0 access token.
+        access_token: String,
+    },
 }
 
 impl Credentials {
-    /// Create a `Credentials` struct from username and password
-    pub fn new(username: String, password: String) -> Credentials {
-        Credentials {
-            authentication_identity: username,
-            secret: password,
+    /// Create username and password credentials.
+    pub fn password(username: String, password: String) -> Credentials {
+        Credentials::Password { username, password }
+    }
+
+    /// Create OAuth 2.0 bearer-token credentials.
+    pub fn oauth2(identity: String, access_token: String) -> Credentials {
+        Credentials::OAuth2 {
+            identity,
+            access_token,
+        }
+    }
+
+    pub(crate) fn preferred_mechanisms(&self) -> &'static [Mechanism] {
+        match self {
+            Credentials::Password { .. } => PASSWORD_MECHANISMS,
+            Credentials::OAuth2 { .. } => OAUTH2_MECHANISMS,
+        }
+    }
+
+    fn password_parts(&self) -> Result<(&str, &str), Error> {
+        match self {
+            Credentials::Password { username, password } => Ok((username, password)),
+            Credentials::OAuth2 { .. } => Err(error::client(
+                "OAuth2 credentials cannot be used with password authentication mechanisms",
+            )),
+        }
+    }
+
+    fn oauth2_parts(&self) -> Result<(&str, &str), Error> {
+        match self {
+            Credentials::OAuth2 {
+                identity,
+                access_token,
+            } => Ok((identity, access_token)),
+            Credentials::Password { .. } => Err(error::client(
+                "password credentials cannot be used with OAuth2 authentication mechanisms",
+            )),
         }
     }
 }
@@ -33,13 +87,16 @@ where
     T: Into<String>,
 {
     fn from((username, password): (S, T)) -> Self {
-        Credentials::new(username.into(), password.into())
+        Credentials::password(username.into(), password.into())
     }
 }
 
 impl Debug for Credentials {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credentials").finish()
+        match self {
+            Credentials::Password { .. } => f.debug_struct("Credentials::Password").finish(),
+            Credentials::OAuth2 { .. } => f.debug_struct("Credentials::OAuth2").finish(),
+        }
     }
 }
 
@@ -58,6 +115,9 @@ pub enum Mechanism {
     /// Non-standard XOAUTH2 mechanism, defined in
     /// [xoauth2-protocol](https://developers.google.com/gmail/imap/xoauth2-protocol)
     Xoauth2,
+    /// OAUTHBEARER authentication mechanism, defined in
+    /// [RFC 7628](https://www.rfc-editor.org/rfc/rfc7628.html)
+    OAuthBearer,
 }
 
 impl Display for Mechanism {
@@ -66,6 +126,7 @@ impl Display for Mechanism {
             Mechanism::Plain => "PLAIN",
             Mechanism::Login => "LOGIN",
             Mechanism::Xoauth2 => "XOAUTH2",
+            Mechanism::OAuthBearer => "OAUTHBEARER",
         })
     }
 }
@@ -74,7 +135,7 @@ impl Mechanism {
     /// Does the mechanism support initial response?
     pub fn supports_initial_response(self) -> bool {
         match self {
-            Mechanism::Plain | Mechanism::Xoauth2 => true,
+            Mechanism::Plain | Mechanism::Xoauth2 | Mechanism::OAuthBearer => true,
             Mechanism::Login => false,
         }
     }
@@ -89,12 +150,13 @@ impl Mechanism {
         match self {
             Mechanism::Plain => match challenge {
                 Some(_) => Err(error::client("This mechanism does not expect a challenge")),
-                None => Ok(format!(
-                    "\u{0}{}\u{0}{}",
-                    credentials.authentication_identity, credentials.secret
-                )),
+                None => {
+                    let (username, password) = credentials.password_parts()?;
+                    Ok(format!("\u{0}{username}\u{0}{password}"))
+                }
             },
             Mechanism::Login => {
+                let (username, password) = credentials.password_parts()?;
                 let decoded_challenge = challenge
                     .ok_or_else(|| error::client("This mechanism does expect a challenge"))?;
 
@@ -102,27 +164,51 @@ impl Mechanism {
                     decoded_challenge,
                     ["User Name", "Username:", "Username", "User Name\0"],
                 ) {
-                    return Ok(credentials.authentication_identity.clone());
+                    return Ok(username.to_owned());
                 }
 
                 if contains_ignore_ascii_case(
                     decoded_challenge,
                     ["Password", "Password:", "Password\0"],
                 ) {
-                    return Ok(credentials.secret.clone());
+                    return Ok(password.to_owned());
                 }
 
                 Err(error::client("Unrecognized challenge"))
             }
             Mechanism::Xoauth2 => match challenge {
                 Some(_) => Err(error::client("This mechanism does not expect a challenge")),
-                None => Ok(format!(
-                    "user={}\x01auth=Bearer {}\x01\x01",
-                    credentials.authentication_identity, credentials.secret
-                )),
+                None => {
+                    let (identity, access_token) = credentials.oauth2_parts()?;
+                    Ok(format!(
+                        "user={identity}\x01auth=Bearer {access_token}\x01\x01"
+                    ))
+                }
+            },
+            Mechanism::OAuthBearer => match challenge {
+                Some(_) => Ok("\x01".to_owned()),
+                None => {
+                    let (identity, access_token) = credentials.oauth2_parts()?;
+                    let identity = gs2_escape(identity);
+                    Ok(format!(
+                        "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"
+                    ))
+                }
             },
         }
     }
+}
+
+fn gs2_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            ',' => escaped.push_str("=2C"),
+            '=' => escaped.push_str("=3D"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn contains_ignore_ascii_case<'a>(
@@ -142,7 +228,7 @@ mod test {
     fn test_plain() {
         let mechanism = Mechanism::Plain;
 
-        let credentials = Credentials::new("username".to_owned(), "password".to_owned());
+        let credentials = Credentials::password("username".to_owned(), "password".to_owned());
 
         assert_eq!(
             mechanism.response(&credentials, None).unwrap(),
@@ -155,7 +241,7 @@ mod test {
     fn test_login() {
         let mechanism = Mechanism::Login;
 
-        let credentials = Credentials::new("alice".to_owned(), "wonderland".to_owned());
+        let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
 
         assert_eq!(
             mechanism.response(&credentials, Some("Username")).unwrap(),
@@ -172,7 +258,7 @@ mod test {
     fn test_login_case_insensitive() {
         let mechanism = Mechanism::Login;
 
-        let credentials = Credentials::new("alice".to_owned(), "wonderland".to_owned());
+        let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
 
         assert_eq!(
             mechanism.response(&credentials, Some("username")).unwrap(),
@@ -189,7 +275,7 @@ mod test {
     fn test_xoauth2() {
         let mechanism = Mechanism::Xoauth2;
 
-        let credentials = Credentials::new(
+        let credentials = Credentials::oauth2(
             "username".to_owned(),
             "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
         );
@@ -202,9 +288,65 @@ mod test {
     }
 
     #[test]
+    fn test_oauthbearer() {
+        let mechanism = Mechanism::OAuthBearer;
+
+        let credentials = Credentials::oauth2(
+            "user@example.com".to_owned(),
+            "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
+        );
+
+        assert_eq!(
+            mechanism.response(&credentials, None).unwrap(),
+            "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
+        );
+        assert_eq!(
+            mechanism.response(&credentials, Some("{}")).unwrap(),
+            "\x01"
+        );
+        assert_eq!(
+            mechanism
+                .response(&credentials, Some(r#"{"status":"invalid_token"}"#))
+                .unwrap(),
+            "\x01"
+        );
+    }
+
+    #[test]
+    fn test_oauthbearer_escapes_gs2_identity() {
+        let mechanism = Mechanism::OAuthBearer;
+        let credentials = Credentials::oauth2("a,b=c".to_owned(), "token".to_owned());
+
+        assert_eq!(
+            mechanism.response(&credentials, None).unwrap(),
+            "n,a=a=2Cb=3Dc,\x01auth=Bearer token\x01\x01"
+        );
+    }
+
+    #[test]
+    fn test_rejects_wrong_credential_kind() {
+        assert!(
+            Mechanism::Plain
+                .response(
+                    &Credentials::oauth2("alice".to_owned(), "token".to_owned()),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            Mechanism::Xoauth2
+                .response(
+                    &Credentials::password("alice".to_owned(), "wonderland".to_owned()),
+                    None,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_from_user_pass_for_credentials() {
         assert_eq!(
-            Credentials::new("alice".to_owned(), "wonderland".to_owned()),
+            Credentials::password("alice".to_owned(), "wonderland".to_owned()),
             Credentials::from(("alice", "wonderland"))
         );
     }
