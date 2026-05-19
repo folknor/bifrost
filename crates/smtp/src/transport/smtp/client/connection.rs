@@ -200,9 +200,18 @@ impl SmtpConnection {
         self.stream.get_mut().set_write_timeout(duration)
     }
 
-    /// Checks if the server is connected using the NOOP SMTP command
+    /// Checks if the server is connected using the NOOP SMTP command.
+    ///
+    /// A failed check marks the connection broken and closes it. A connection
+    /// that cannot answer NOOP is not safe to keep in the pool.
     pub fn test_connected(&mut self) -> bool {
-        self.command(Noop).is_ok()
+        match self.command(Noop) {
+            Ok(_) => true,
+            Err(_) => {
+                self.abort();
+                false
+            }
+        }
     }
 
     /// Sends an AUTH command with the given mechanism, and handles the challenge if needed
@@ -382,6 +391,35 @@ mod test {
             !observed.contains("QUIT"),
             "abort must close without sending QUIT, got {observed:?}"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn failed_test_connected_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            let mut noop = String::new();
+            reader.read_line(&mut noop).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+
+        assert!(!connection.test_connected());
+        assert!(connection.has_broken());
         handle.join().unwrap();
     }
 

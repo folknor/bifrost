@@ -36,16 +36,6 @@ impl PoolConfig {
         self
     }
 
-    /// Connection timeout
-    ///
-    /// Defaults to `30 seconds`
-    #[doc(hidden)]
-    #[deprecated(note = "The Connection timeout is already configured on the SMTP transport")]
-    pub fn connection_timeout(self, connection_timeout: Duration) -> Self {
-        let _ = connection_timeout;
-        self
-    }
-
     /// Connection idle timeout
     ///
     /// Defaults to `60 seconds`

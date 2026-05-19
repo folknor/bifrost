@@ -60,15 +60,6 @@ impl Display for ClientId {
     }
 }
 
-impl ClientId {
-    #[doc(hidden)]
-    #[deprecated(since = "0.10.0", note = "Please use ClientId::Domain(domain) instead")]
-    /// Creates a new `ClientId` from a fully qualified domain name
-    pub fn new(domain: String) -> Self {
-        Self::Domain(domain)
-    }
-}
-
 /// Supported ESMTP keywords
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

@@ -112,6 +112,18 @@ enum InnerDkimSigningKey {
     Ed25519(ed25519_dalek::SigningKey),
 }
 
+impl From<RsaPrivateKey> for DkimSigningKey {
+    fn from(value: RsaPrivateKey) -> Self {
+        Self(InnerDkimSigningKey::Rsa(value))
+    }
+}
+
+impl From<ed25519_dalek::SigningKey> for DkimSigningKey {
+    fn from(value: ed25519_dalek::SigningKey) -> Self {
+        Self(InnerDkimSigningKey::Ed25519(value))
+    }
+}
+
 impl DkimSigningKey {
     pub fn new(
         private_key: &str,
@@ -415,6 +427,7 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
 #[cfg(test)]
 mod test {
     use pretty_assertions::assert_eq;
+    use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
 
     use super::{
         super::{
@@ -535,6 +548,28 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         );
 
         assert_eq!(config.canonicalization.to_string(), "relaxed/relaxed");
+    }
+
+    #[test]
+    fn signing_key_can_wrap_rsa_key_object() {
+        let key = RsaPrivateKey::from_pkcs1_pem(KEY_RSA).unwrap();
+        let signing_key = DkimSigningKey::from(key);
+
+        assert!(matches!(
+            signing_key.get_signing_algorithm(),
+            DkimSigningAlgorithm::Rsa
+        ));
+    }
+
+    #[test]
+    fn signing_key_can_wrap_ed25519_key_object() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let signing_key = DkimSigningKey::from(key);
+
+        assert!(matches!(
+            signing_key.get_signing_algorithm(),
+            DkimSigningAlgorithm::Ed25519
+        ));
     }
 
     #[test]

@@ -391,3 +391,103 @@ Final SMTP-only verification after concurrent IMAP edits:
 Root-level `brokkr check` is currently blocked by gremlin findings in concurrent
 IMAP proto files, so these verification runs were scoped to the SMTP crate
 without rewriting IMAP files.
+
+## Upstream issue 743: stale pooled connections
+
+Upstream issue: https://github.com/lettre/lettre/issues/743
+
+Problem:
+
+- The pool checks a parked connection with `NOOP` before reuse, but
+  `test_connected()` returned `false` without marking the connection broken.
+- Public `test_connection()` with pooling could therefore test a dead
+  connection, return `false`, drop the pooled wrapper, and recycle that same
+  dead connection back into the pool.
+- The async-std transport path also sent `QUIT` unconditionally after
+  `send_raw`, which meant an async-std pooled connection could be gracefully
+  closed and then recycled.
+
+Implemented:
+
+- Sync and async `test_connected()` now abort the connection when `NOOP` fails,
+  so pooled wrappers drop it instead of recycling it.
+- `test_connected()` docs now explicitly say failed checks close and mark the
+  connection broken.
+- Async-std `send_raw` now matches the sync and tokio paths: it only aborts a
+  successfully used connection when the pool feature is disabled.
+- Cleaned up async-std feature compilation after the native-TLS-only fork:
+  async URL parsing is exposed only for tokio native-tls, and async-std no
+  longer trips over tokio-only imports or private SMTP error helpers.
+- Added comments on the async URL parsing cfg gate because the tokio TLS /
+  plaintext-only async split is easy to misread.
+- Added sync and tokio regression tests proving failed `test_connected()` marks
+  the connection broken.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --features builder` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- failed_test_connected_marks_connection_broken`
+  passed.
+
+## Upstream PRs 1123 and 1124: DKIM key objects
+
+Upstream PRs:
+
+- https://github.com/lettre/lettre/pull/1123
+- https://github.com/lettre/lettre/pull/1124
+
+Decision:
+
+- Prefer PR 1123's narrower API over PR 1124's public inner enum. Callers can
+  pass an already parsed key object without making bifrost expose its internal
+  signing-key representation.
+
+Implemented:
+
+- Added `From<rsa::RsaPrivateKey> for DkimSigningKey`.
+- Added `From<ed25519_dalek::SigningKey> for DkimSigningKey`.
+- Added regression coverage for both conversions.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features dkim -- -- signing_key_can_wrap`
+  passed.
+- From `crates/smtp`: `brokkr check --features dkim` passed.
+
+## Small v0.12 deprecated API cleanup
+
+Context:
+
+- #1028 calls out removing deprecated features and APIs.
+
+Implemented:
+
+- Removed hidden deprecated `ClientId::new(domain)`. Use
+  `ClientId::Domain(domain)` directly.
+- Removed hidden deprecated `PoolConfig::connection_timeout(...)`. Connection
+  timeout is configured on the SMTP transport builder, not the pool.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features builder` passed.
+
+Final SMTP-only verification for this batch:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features builder` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --features dkim` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- failed_test_connected_marks_connection_broken`
+  passed.
+
+Review follow-up verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features builder` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- failed_test_connected_marks_connection_broken`
+  passed.

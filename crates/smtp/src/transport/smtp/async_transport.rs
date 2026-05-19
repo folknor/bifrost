@@ -95,7 +95,8 @@ impl AsyncTransport for AsyncSmtpTransport<AsyncStd1Executor> {
 
         let result = conn.send(envelope, email).await?;
 
-        conn.quit().await?;
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
 
         Ok(result)
     }
@@ -272,8 +273,8 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    #[cfg(feature = "tokio1-native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }

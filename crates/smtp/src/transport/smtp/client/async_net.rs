@@ -1,6 +1,10 @@
+#[cfg(feature = "tokio1-native-tls")]
+use std::mem;
+#[cfg(feature = "tokio1")]
+use std::{fmt, net::IpAddr};
 use std::{
-    fmt, io, mem,
-    net::{IpAddr, SocketAddr},
+    io,
+    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
