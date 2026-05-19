@@ -520,6 +520,21 @@ fn test_status() {
         rsp => panic!("unexpected response {rsp:?}"),
     }
 
+    match parse_response(b"* STATUS INBOX (MESSAGES 4 DELETED 2 SIZE 4294967296)\r\n") {
+        Ok((_, Response::MailboxData(MailboxDatum::Status { mailbox, status }))) => {
+            assert_eq!(mailbox, "INBOX");
+            assert_eq!(
+                status,
+                [
+                    StatusAttribute::Messages(4),
+                    StatusAttribute::Deleted(2),
+                    StatusAttribute::Size(4_294_967_296),
+                ]
+            );
+        }
+        rsp => panic!("unexpected response {rsp:?}"),
+    }
+
     // Outlook server sends a STATUS response with a space in the end.
     match parse_response(b"* STATUS Sent (UIDNEXT 107) \r\n") {
         Ok((_, Response::MailboxData(MailboxDatum::Status { mailbox, status }))) => {
@@ -678,6 +693,22 @@ fn test_response_codes() {
         rsp => panic!("unexpected response {rsp:?}"),
     }
 
+    match parse_response(b"* OK [CAPABILITY IMAP4rev2 ENABLE] Logged in\r\n") {
+        Ok((
+            _,
+            Response::Data {
+                status: Status::Ok,
+                code: Some(ResponseCode::Capabilities(c)),
+                information: Some(Cow::Borrowed("Logged in")),
+            },
+        )) => {
+            assert_eq!(c.len(), 2);
+            assert_eq!(c[0], Capability::Imap4rev2);
+            assert_eq!(c[1], Capability::Atom(Cow::Borrowed("ENABLE")));
+        }
+        rsp => panic!("unexpected response {rsp:?}"),
+    }
+
     match parse_response(b"* OK [CAPABILITY UIDPLUS IMAP4rev1 IDLE] Logged in\r\n") {
         Ok((
             _,
@@ -695,7 +726,7 @@ fn test_response_codes() {
         rsp => panic!("unexpected response {rsp:?}"),
     }
 
-    // Missing IMAP4rev1
+    // Missing an IMAP4rev capability.
     match parse_response(b"* OK [CAPABILITY UIDPLUS IDLE] Logged in\r\n") {
         Ok((
             _,
@@ -799,6 +830,17 @@ fn test_enabled() {
             Response::Capabilities(vec![
                 Capability::Atom(Cow::Borrowed("QRESYNC")),
                 Capability::Atom(Cow::Borrowed("X-GOOD-IDEA")),
+            ])
+        ),
+        rsp => panic!("Unexpected response: {rsp:?}"),
+    }
+
+    match parse_response(b"* ENABLED IMAP4rev2 QRESYNC\r\n") {
+        Ok((_, capabilities)) => assert_eq!(
+            capabilities,
+            Response::Capabilities(vec![
+                Capability::Imap4rev2,
+                Capability::Atom(Cow::Borrowed("QRESYNC")),
             ])
         ),
         rsp => panic!("Unexpected response: {rsp:?}"),

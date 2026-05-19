@@ -6,26 +6,41 @@ use imap_proto::types::Capability as CapabilityRef;
 use crate::authenticator::SaslAuthenticator;
 
 const IMAP4REV1_CAPABILITY: &str = "IMAP4rev1";
+const IMAP4REV2_CAPABILITY: &str = "IMAP4rev2";
 const AUTH_CAPABILITY_PREFIX: &str = "AUTH=";
 
 /// List of available Capabilities.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Capability {
-    /// The crucial imap capability.
+    /// IMAP4rev1 protocol support.
     Imap4rev1,
+    /// IMAP4rev2 protocol support.
+    Imap4rev2,
     /// Auth type capability.
     Auth(String),
     /// Any other atoms.
     Atom(String),
 }
 
+/// Highest IMAP protocol revision advertised by the server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum ProtocolRevision {
+    /// RFC 3501 IMAP4rev1.
+    Imap4rev1,
+    /// RFC 9051 IMAP4rev2.
+    Imap4rev2,
+}
+
 impl From<&CapabilityRef<'_>> for Capability {
     fn from(c: &CapabilityRef<'_>) -> Self {
         match c {
             CapabilityRef::Imap4rev1 => Capability::Imap4rev1,
+            CapabilityRef::Imap4rev2 => Capability::Imap4rev2,
             CapabilityRef::Auth(s) => Capability::Auth(s.clone().into_owned()),
             CapabilityRef::Atom(s) => Capability::Atom(s.clone().into_owned()),
+            _ => Capability::Atom(format!("{c:?}")),
         }
     }
 }
@@ -34,6 +49,7 @@ impl Capability {
     fn matches(&self, other: &Capability) -> bool {
         match (self, other) {
             (Capability::Imap4rev1, Capability::Imap4rev1) => true,
+            (Capability::Imap4rev2, Capability::Imap4rev2) => true,
             (Capability::Auth(a), Capability::Auth(b))
             | (Capability::Atom(a), Capability::Atom(b)) => a.eq_ignore_ascii_case(b),
             _ => false,
@@ -44,12 +60,12 @@ impl Capability {
 /// From [section 7.2.1 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-7.2.1).
 ///
 /// A list of capabilities that the server supports.
-/// The capability list will include the atom "IMAP4rev1".
+/// The capability list will include `IMAP4rev1`, `IMAP4rev2`, or both.
 ///
-/// In addition, all servers implement the `STARTTLS`, `LOGINDISABLED`, and `AUTH=PLAIN` (described
-/// in [IMAP-TLS](https://tools.ietf.org/html/rfc2595)) capabilities. See the [Security
-/// Considerations section of the RFC](https://tools.ietf.org/html/rfc3501#section-11) for
-/// important information.
+/// In addition, IMAP4rev1 servers implement the `STARTTLS`, `LOGINDISABLED`, and `AUTH=PLAIN`
+/// (described in [IMAP-TLS](https://tools.ietf.org/html/rfc2595)) capabilities. See the
+/// [Security Considerations section of the RFC](https://tools.ietf.org/html/rfc3501#section-11)
+/// for important information.
 ///
 /// A capability name which begins with `AUTH=` indicates that the server supports that particular
 /// authentication mechanism.
@@ -60,12 +76,11 @@ impl Capability {
 /// `LOGIN` command if the server advertises the `LOGINDISABLED` capability.
 ///
 /// Other capability names indicate that the server supports an extension, revision, or amendment
-/// to the IMAP4rev1 protocol. Capability names either begin with `X` or they are standard or
-/// standards-track [RFC 3501](https://tools.ietf.org/html/rfc3501) extensions, revisions, or
-/// amendments registered with IANA.
+/// to the IMAP protocol. Capability names either begin with `X` or they are standard or
+/// standards-track extensions, revisions, or amendments registered with IANA.
 ///
-/// Client implementations SHOULD NOT require any capability name other than `IMAP4rev1`, and MUST
-/// ignore any unknown capability names.
+/// Client implementations SHOULD NOT require any capability name other than an IMAP4 protocol
+/// revision, and MUST ignore any unknown capability names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities(pub(crate) HashSet<Capability>);
 
@@ -85,6 +100,9 @@ impl Capabilities {
         if s.eq_ignore_ascii_case(IMAP4REV1_CAPABILITY) {
             return self.has(&Capability::Imap4rev1);
         }
+        if s.eq_ignore_ascii_case(IMAP4REV2_CAPABILITY) {
+            return self.has(&Capability::Imap4rev2);
+        }
         if s.len() > AUTH_CAPABILITY_PREFIX.len() {
             let (pre, val) = s.split_at(AUTH_CAPABILITY_PREFIX.len());
             if pre.eq_ignore_ascii_case(AUTH_CAPABILITY_PREFIX) {
@@ -92,6 +110,35 @@ impl Capabilities {
             }
         }
         self.has_atom(s)
+    }
+
+    /// Returns true if the server advertised `IMAP4rev1`.
+    pub fn supports_imap4rev1(&self) -> bool {
+        self.has(&Capability::Imap4rev1)
+    }
+
+    /// Returns true if the server advertised `IMAP4rev2`.
+    pub fn supports_imap4rev2(&self) -> bool {
+        self.has(&Capability::Imap4rev2)
+    }
+
+    /// Highest IMAP protocol revision advertised by the server.
+    pub fn protocol_revision(&self) -> Option<ProtocolRevision> {
+        if self.supports_imap4rev2() {
+            Some(ProtocolRevision::Imap4rev2)
+        } else if self.supports_imap4rev1() {
+            Some(ProtocolRevision::Imap4rev1)
+        } else {
+            None
+        }
+    }
+
+    /// Returns true when `IMAP4rev2` is advertised alongside `IMAP4rev1`.
+    ///
+    /// RFC 9051 keeps those sessions in IMAP4rev1 mode until the client sends
+    /// `ENABLE IMAP4rev2`.
+    pub fn imap4rev2_requires_enable(&self) -> bool {
+        self.supports_imap4rev1() && self.supports_imap4rev2()
     }
 
     /// Check if the server advertised an extension or capability atom.

@@ -295,7 +295,7 @@ mod name;
 pub use self::name::{Name, NameAttribute};
 
 mod capabilities;
-pub use self::capabilities::{Capabilities, Capability};
+pub use self::capabilities::{Capabilities, Capability, ProtocolRevision};
 
 mod notify;
 pub use self::notify::{NotifyEvent, NotifyEvents, NotifyFilter, NotifyGroup, NotifySettings};

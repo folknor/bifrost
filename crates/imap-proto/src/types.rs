@@ -198,8 +198,10 @@ impl<'a> ResponseCode<'a> {
 #[non_exhaustive]
 pub enum StatusAttribute {
     HighestModSeq(u64), // RFC 4551
+    Deleted(u32),       // RFC 9051
     Messages(u32),
     Recent(u32),
+    Size(u64), // RFC 9051
     UidNext(u32),
     UidValidity(u32),
     Unseen(u32),
@@ -289,8 +291,10 @@ impl<'a> MailboxDatum<'a> {
 }
 
 #[derive(Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub enum Capability<'a> {
     Imap4rev1,
+    Imap4rev2,
     Auth(Cow<'a, str>),
     Atom(Cow<'a, str>),
 }
@@ -299,6 +303,7 @@ impl<'a> Capability<'a> {
     pub fn into_owned(self) -> Capability<'static> {
         match self {
             Capability::Imap4rev1 => Capability::Imap4rev1,
+            Capability::Imap4rev2 => Capability::Imap4rev2,
             Capability::Auth(v) => Capability::Auth(to_owned_cow(v)),
             Capability::Atom(v) => Capability::Atom(to_owned_cow(v)),
         }

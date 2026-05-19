@@ -64,6 +64,10 @@ Last scan: 2026-05-19 with `gh api`.
 - Added `ImapTransport`, `BoxedTransport`, `BoxedClient`, and `BoxedSession`
   for callers that need one client type across runtime-selected plain/TLS
   transports.
+- Started IMAP4rev2 groundwork: `IMAP4rev2` is now a typed capability in
+  `imap-proto` and `bifrost-imap`, `ENABLED IMAP4rev2` remains typed after
+  `ENABLE`, and RFC 9051 `STATUS` data items `DELETED` and `SIZE` are parsed
+  into `Mailbox`.
 
 ## Already covered by the vendored import
 
@@ -147,7 +151,10 @@ P3 or skip for now
   protocol work, but broader than IMAP consolidation and probably belongs in a
   SASL/TLS authentication design pass.
 - `chatmail/async-imap` #126 and `djc/tokio-imap` #186: IMAP4rev2. Track as a
-  larger protocol feature after rev1 behavior is stable.
+  larger protocol feature after rev1 behavior is stable. Current local
+  groundwork covers typed `IMAP4rev2` capabilities and RFC 9051 `STATUS`
+  `DELETED`/`SIZE` response data, but not the full rev2 command/response
+  surface.
 - `chatmail/async-imap` #11: UIDPLUS. Parser and several client pieces already
   exist locally; `APPENDUID` and `COPYUID` are now surfaced by the relevant
   commands, and `expunge_deleted_uids` covers the common UID EXPUNGE fallback

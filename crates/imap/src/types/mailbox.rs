@@ -4,6 +4,7 @@ use std::fmt;
 /// Meta-information about an IMAP mailbox, as returned by
 /// [`SELECT`](https://tools.ietf.org/html/rfc3501#section-6.3.1) and friends.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Default)]
+#[non_exhaustive]
 pub struct Mailbox {
     /// Defined flags in the mailbox.  See the description of the [FLAGS
     /// response](https://tools.ietf.org/html/rfc3501#section-7.2.6) for more detail.
@@ -16,6 +17,9 @@ pub struct Mailbox {
     /// The number of messages with the \Recent flag set. See the description of the [RECENT
     /// response](https://tools.ietf.org/html/rfc3501#section-7.3.2) for more detail.
     pub recent: u32,
+
+    /// The number of messages with the \Deleted flag set.
+    pub deleted: Option<u32>,
 
     /// The message sequence number of the first unseen message in the mailbox.  If this is
     /// missing, the client can not make any assumptions about the first unseen message in the
@@ -38,6 +42,9 @@ pub struct Mailbox {
 
     /// Highest mailbox mod-sequence as defined in [RFC-7162](https://tools.ietf.org/html/rfc7162).
     pub highest_modseq: Option<u64>,
+
+    /// Total mailbox size in octets when the server returned the RFC 9051 `SIZE` status item.
+    pub size: Option<u64>,
 }
 
 impl fmt::Display for Mailbox {
@@ -45,14 +52,16 @@ impl fmt::Display for Mailbox {
         write!(
             f,
             "flags: {:?}, exists: {}, recent: {}, unseen: {:?}, permanent_flags: {:?},\
-             uid_next: {:?}, uid_validity: {:?}",
+             uid_next: {:?}, uid_validity: {:?}, deleted: {:?}, size: {:?}",
             self.flags,
             self.exists,
             self.recent,
             self.unseen,
             self.permanent_flags,
             self.uid_next,
-            self.uid_validity
+            self.uid_validity,
+            self.deleted,
+            self.size
         )
     }
 }

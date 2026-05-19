@@ -706,8 +706,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     }
 
     /// The [`CAPABILITY` command](https://tools.ietf.org/html/rfc3501#section-6.1.1) requests a
-    /// listing of capabilities that the server supports.  The server will include "IMAP4rev1" as
-    /// one of the listed capabilities. See [`Capabilities`] for further details.
+    /// listing of capabilities that the server supports. The server will include `IMAP4rev1`,
+    /// `IMAP4rev2`, or both as one of the listed capabilities. See [`Capabilities`] for further
+    /// details.
     pub async fn capabilities(&mut self) -> Result<Capabilities> {
         let id = self.run_command("CAPABILITY").await?;
         let c = parse_capabilities(
@@ -1287,8 +1288,10 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// The currently defined status data items that can be requested are:
     ///
+    ///  - `DELETED`: The number of messages with [`Flag::Deleted`] set.
     ///  - `MESSAGES`: The number of messages in the mailbox.
     ///  - `RECENT`: The number of messages with [`Flag::Recent`] set.
+    ///  - `SIZE`: The total mailbox size in octets.
     ///  - `UIDNEXT`: The next [`Uid`] of the mailbox.
     ///  - `UIDVALIDITY`: The unique identifier validity value of the mailbox (see [`Uid`]).
     ///  - `UNSEEN`: The number of messages which do not have [`Flag::Seen`] set.
@@ -2664,11 +2667,13 @@ mod tests {
             ],
             exists: 1,
             recent: 1,
+            deleted: None,
             unseen: Some(1),
             permanent_flags: vec![],
             uid_next: Some(2),
             uid_validity: Some(1257842737),
             highest_modseq: None,
+            size: None,
         };
         let mailbox_name = "INBOX";
         let command = format!("A0001 EXAMINE {}\r\n", quote!(mailbox_name));
@@ -2706,6 +2711,7 @@ mod tests {
             ],
             exists: 1,
             recent: 1,
+            deleted: None,
             unseen: Some(1),
             permanent_flags: vec![
                 Flag::MayCreate,
@@ -2718,6 +2724,7 @@ mod tests {
             uid_next: Some(2),
             uid_validity: Some(1257842737),
             highest_modseq: Some(90060115205545359),
+            size: None,
         };
         let mailbox_name = "INBOX";
         let command = format!("A0001 SELECT {}\r\n", quote!(mailbox_name));
@@ -2801,6 +2808,12 @@ mod tests {
         for e in expected_capabilities {
             assert!(capabilities.contains(e));
         }
+        assert!(capabilities.supports_imap4rev1());
+        assert!(!capabilities.supports_imap4rev2());
+        assert_eq!(
+            capabilities.protocol_revision(),
+            Some(ProtocolRevision::Imap4rev1)
+        );
         assert!(capabilities.supports_sasl("gssapi"));
     }
 
@@ -2823,6 +2836,31 @@ mod tests {
         assert_eq!(enabled.len(), 2);
         assert!(enabled.contains("qresync"));
         assert!(enabled.contains("CONDSTORE"));
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn enable_imap4rev2_returns_typed_capability() {
+        let response = b"* ENABLED IMAP4rev2\r\n\
+            A0001 OK ENABLE completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let enabled = session.enable(["IMAP4rev2"]).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 ENABLE IMAP4rev2\r\n".to_vec(),
+            "Invalid enable command"
+        );
+        assert_eq!(enabled.len(), 1);
+        assert!(enabled.contains("IMAP4rev2"));
+        assert!(enabled.supports_imap4rev2());
+        assert_eq!(
+            enabled.protocol_revision(),
+            Some(ProtocolRevision::Imap4rev2)
+        );
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
@@ -3573,6 +3611,22 @@ mod tests {
             );
             assert_eq!(status.uid_next, Some(44292));
             assert_eq!(status.exists, 231);
+        }
+
+        {
+            let response = b"* STATUS INBOX (DELETED 2 SIZE 4294967296)\r\n\
+                A0001 OK STATUS completed\r\n"
+                .to_vec();
+
+            let mock_stream = MockStream::new(response);
+            let mut session = mock_session!(mock_stream);
+            let status = session.status("INBOX", "(DELETED SIZE)").await.unwrap();
+            assert_eq!(
+                session.stream.inner.written_buf,
+                b"A0001 STATUS \"INBOX\" (DELETED SIZE)\r\n".to_vec()
+            );
+            assert_eq!(status.deleted, Some(2));
+            assert_eq!(status.size, Some(4_294_967_296));
         }
     }
 

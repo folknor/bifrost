@@ -214,6 +214,7 @@ fn resp_text_code(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
 
 fn capability(i: &[u8]) -> IResult<&[u8], Capability<'_>> {
     alt((
+        map(tag_no_case("IMAP4rev2"), |_| Capability::Imap4rev2),
         map(tag_no_case("IMAP4rev1"), |_| Capability::Imap4rev1),
         map(
             map(preceded(tag_no_case("AUTH="), atom), Cow::Borrowed),
@@ -227,7 +228,10 @@ fn capability(i: &[u8]) -> IResult<&[u8], Capability<'_>> {
 fn ensure_capabilities_contains_imap4rev(
     capabilities: Vec<Capability<'_>>,
 ) -> Result<Vec<Capability<'_>>, ()> {
-    if capabilities.contains(&Capability::Imap4rev1) {
+    if capabilities
+        .iter()
+        .any(|capability| matches!(capability, Capability::Imap4rev1 | Capability::Imap4rev2))
+    {
         Ok(capabilities)
     } else {
         Err(())
@@ -346,12 +350,20 @@ fn status_att(i: &[u8]) -> IResult<&[u8], StatusAttribute> {
     alt((
         rfc4551::status_att_val_highest_mod_seq,
         map(
+            preceded(tag_no_case("DELETED "), number),
+            StatusAttribute::Deleted,
+        ),
+        map(
             preceded(tag_no_case("MESSAGES "), number),
             StatusAttribute::Messages,
         ),
         map(
             preceded(tag_no_case("RECENT "), number),
             StatusAttribute::Recent,
+        ),
+        map(
+            preceded(tag_no_case("SIZE "), number_64),
+            StatusAttribute::Size,
         ),
         map(
             preceded(tag_no_case("UIDNEXT "), number),
@@ -968,6 +980,13 @@ mod tests {
         );
 
         assert_matches!(
+            super::capability_data(b"CAPABILITY IMAP4rev2\r\n"),
+            Ok((_, capabilities)) => {
+                assert_eq!(capabilities, vec![Capability::Imap4rev2]);
+            }
+        );
+
+        assert_matches!(
             super::capability_data(b"CAPABILITY XPIG-LATIN IMAP4rev1 STARTTLS AUTH=GSSAPI\r\n"),
             Ok((_, capabilities)) => {
                 assert_eq!(capabilities, vec![
@@ -990,7 +1009,18 @@ mod tests {
             }
         );
 
-        // Capability command must contain IMAP4rev1
+        assert_matches!(
+            super::capability_data(b"CAPABILITY IMAP4rev1 IMAP4rev2 ENABLE\r\n"),
+            Ok((_, capabilities)) => {
+                assert_eq!(capabilities, vec![
+                    Capability::Imap4rev1,
+                    Capability::Imap4rev2,
+                    Capability::Atom(Cow::Borrowed("ENABLE")),
+                ]);
+            }
+        );
+
+        // Capability command must contain an IMAP4rev capability.
         assert_matches!(
             super::capability_data(b"CAPABILITY AUTH=GSSAPI AUTH=PLAIN\r\n"),
             Err(_)

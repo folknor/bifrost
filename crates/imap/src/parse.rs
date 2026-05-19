@@ -150,11 +150,13 @@ pub(crate) async fn parse_status<T: Stream<Item = io::Result<ResponseData>> + Un
             {
                 for attribute in status {
                     match attribute {
+                        StatusAttribute::Deleted(deleted) => mbox.deleted = Some(*deleted),
                         StatusAttribute::HighestModSeq(highest_modseq) => {
                             mbox.highest_modseq = Some(*highest_modseq);
                         }
                         StatusAttribute::Messages(exists) => mbox.exists = *exists,
                         StatusAttribute::Recent(recent) => mbox.recent = *recent,
+                        StatusAttribute::Size(size) => mbox.size = Some(*size),
                         StatusAttribute::UidNext(uid_next) => mbox.uid_next = Some(*uid_next),
                         StatusAttribute::UidValidity(uid_validity) => {
                             mbox.uid_validity = Some(*uid_validity);
@@ -508,6 +510,54 @@ mod tests {
         }
         assert!(capabilities.supports_sasl("gssapi"));
         assert!(capabilities.contains("auth=gssapi"));
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn parse_capability_imap4rev2_test() {
+        let responses = input_stream(&[
+            "* CAPABILITY IMAP4rev2 ENABLE UIDPLUS\r\n",
+            "A0001 OK CAPABILITY completed\r\n",
+        ]);
+
+        let mut stream = async_std::stream::from_iter(responses);
+        let (send, recv) = bounded(10);
+        let id = RequestId("A0001".into());
+        let capabilities = parse_capabilities(&mut stream, send, id).await.unwrap();
+
+        assert!(recv.is_empty());
+        assert_eq!(capabilities.len(), 3);
+        assert!(capabilities.contains("IMAP4rev2"));
+        assert!(capabilities.supports_imap4rev2());
+        assert!(!capabilities.supports_imap4rev1());
+        assert_eq!(
+            capabilities.protocol_revision(),
+            Some(ProtocolRevision::Imap4rev2)
+        );
+        assert!(!capabilities.imap4rev2_requires_enable());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn parse_capability_imap4rev2_requires_enable_test() {
+        let responses = input_stream(&[
+            "* CAPABILITY IMAP4rev1 IMAP4rev2 ENABLE\r\n",
+            "A0001 OK CAPABILITY completed\r\n",
+        ]);
+
+        let mut stream = async_std::stream::from_iter(responses);
+        let (send, recv) = bounded(10);
+        let id = RequestId("A0001".into());
+        let capabilities = parse_capabilities(&mut stream, send, id).await.unwrap();
+
+        assert!(recv.is_empty());
+        assert!(capabilities.supports_imap4rev1());
+        assert!(capabilities.supports_imap4rev2());
+        assert_eq!(
+            capabilities.protocol_revision(),
+            Some(ProtocolRevision::Imap4rev2)
+        );
+        assert!(capabilities.imap4rev2_requires_enable());
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]

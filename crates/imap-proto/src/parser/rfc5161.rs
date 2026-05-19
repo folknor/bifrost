@@ -5,8 +5,8 @@
 //!
 
 use nom::{
-    IResult, Parser, bytes::streaming::tag_no_case, character::streaming::char, combinator::map,
-    multi::many0, sequence::preceded,
+    IResult, Parser, branch::alt, bytes::streaming::tag_no_case, character::streaming::char,
+    combinator::map, multi::many0, sequence::preceded,
 };
 use std::borrow::Cow;
 
@@ -30,5 +30,10 @@ fn enabled_data(i: &[u8]) -> IResult<&[u8], Vec<Capability<'_>>> {
 }
 
 fn capability(i: &[u8]) -> IResult<&[u8], Capability<'_>> {
-    map(map(atom, Cow::Borrowed), Capability::Atom).parse(i)
+    alt((
+        map(tag_no_case("IMAP4rev2"), |_| Capability::Imap4rev2),
+        map(tag_no_case("IMAP4rev1"), |_| Capability::Imap4rev1),
+        map(map(atom, Cow::Borrowed), Capability::Atom),
+    ))
+    .parse(i)
 }
