@@ -611,6 +611,8 @@ mod tests {
             "* 26 FETCH (X-GM-THRID 1278455344230334865)\r\n",
             "* 27 FETCH (FLAGS ())\r\n",
             "* 28 FETCH (UID 99)\r\n",
+            "* 29 FETCH (EMAILID (M6d952b5c6f82bfd8) THREADID (T64b4c7e452f961e2))\r\n",
+            "* 30 FETCH (THREADID NIL)\r\n",
             "a OK FETCH completed\r\n",
         ]);
         let mut stream = async_std::stream::from_iter(responses);
@@ -622,7 +624,7 @@ mod tests {
             .unwrap();
         assert!(recv.is_empty());
 
-        assert_eq!(fetches.len(), 5);
+        assert_eq!(fetches.len(), 7);
         assert_eq!(fetches[0].message, 24);
         assert_eq!(fetches[0].flags().collect::<Vec<_>>(), vec![Flag::Seen]);
         let populated_flags = fetches[0].flags_attribute().unwrap();
@@ -654,6 +656,16 @@ mod tests {
         assert_eq!(fetches[4].message, 28);
         assert!(fetches[4].flags_attribute().is_none());
         assert!(fetches[4].flags().next().is_none());
+        assert_eq!(fetches[5].message, 29);
+        assert_eq!(fetches[5].email_id(), Some("M6d952b5c6f82bfd8"));
+        assert_eq!(fetches[5].thread_id(), Some("T64b4c7e452f961e2"));
+        assert_eq!(
+            fetches[5].thread_id_attribute(),
+            Some(Some("T64b4c7e452f961e2"))
+        );
+        assert_eq!(fetches[6].message, 30);
+        assert_eq!(fetches[6].thread_id(), None);
+        assert_eq!(fetches[6].thread_id_attribute(), Some(None));
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]

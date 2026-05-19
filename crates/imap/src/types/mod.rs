@@ -147,6 +147,32 @@ pub struct MoveResponse {
     pub copy_uid: Option<CopyUid>,
 }
 
+/// Strategy used by [`Session::expunge_deleted_uids`](crate::Session::expunge_deleted_uids).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UidExpungeStrategy {
+    /// No UIDs were supplied, so no command was sent.
+    Noop,
+    /// The server advertised UIDPLUS and `UID EXPUNGE` was used.
+    UidPlus,
+    /// UIDPLUS was unavailable, so the method used a best-effort
+    /// `UID SEARCH DELETED`, `UID STORE`, `EXPUNGE`, and restore sequence.
+    StoreFallback {
+        /// UIDs that had `\Deleted` temporarily removed before `EXPUNGE`.
+        protected_uids: Vec<Uid>,
+    },
+}
+
+/// Result data returned by [`Session::expunge_deleted_uids`](crate::Session::expunge_deleted_uids).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct UidExpungeResult {
+    /// Sequence numbers returned by `EXPUNGE` responses.
+    pub expunged: Vec<Seq>,
+    /// The protocol strategy used.
+    pub strategy: UidExpungeStrategy,
+}
+
 /// From section [2.3.1.2 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-2.3.1.2).
 ///
 /// A relative position from 1 to the number of messages in the mailbox.

@@ -413,6 +413,26 @@ fn test_body_text() {
 }
 
 #[test]
+fn test_body_numbered_section() {
+    match parse_response(b"* 20763 FETCH (BODY[1] {5}\r\nhello)\r\nA008 OK Success\r\n") {
+        Ok((remaining, Response::Fetch(_, attrs))) => {
+            let body = &attrs[0];
+            assert_eq!(remaining, b"A008 OK Success\r\n");
+            assert_eq!(
+                body,
+                &AttributeValue::BodySection {
+                    section: Some(SectionPath::Part(vec![1], None)),
+                    index: None,
+                    data: Some(Cow::Borrowed(b"hello")),
+                },
+                "body = {body:?}"
+            );
+        }
+        rsp => panic!("unexpected response {rsp:?}"),
+    }
+}
+
+#[test]
 fn test_body_structure() {
     const RESPONSE: &[u8] = b"* 15 FETCH (BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"iso-8859-1\") NIL NIL \"QUOTED-PRINTABLE\" 1315 42 NIL NIL NIL NIL))\r\n";
     match parse_response(RESPONSE) {

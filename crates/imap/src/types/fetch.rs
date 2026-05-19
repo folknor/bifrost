@@ -365,4 +365,40 @@ impl Fetch {
             unreachable!()
         }
     }
+
+    /// Extract the RFC 8474 `EMAILID` of a `FETCH` response.
+    pub fn email_id(&self) -> Option<&str> {
+        if let Response::Fetch(_, attrs) = self.response.parsed() {
+            attrs.iter().find_map(|av| match av {
+                AttributeValue::EmailId(id) => Some(id.as_ref()),
+                _ => None,
+            })
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Extract the RFC 8474 `THREADID` of a `FETCH` response.
+    ///
+    /// This returns `None` both when the server did not include `THREADID` and
+    /// when the server explicitly returned `THREADID NIL`. Use
+    /// [`Fetch::thread_id_attribute`] when that distinction matters.
+    pub fn thread_id(&self) -> Option<&str> {
+        self.thread_id_attribute().flatten()
+    }
+
+    /// Extract the RFC 8474 `THREADID` attribute of a `FETCH` response.
+    ///
+    /// The outer `Option` is absent when the server did not include `THREADID`.
+    /// The inner `Option` is absent when the server returned `THREADID NIL`.
+    pub fn thread_id_attribute(&self) -> Option<Option<&str>> {
+        if let Response::Fetch(_, attrs) = self.response.parsed() {
+            attrs.iter().find_map(|av| match av {
+                AttributeValue::ThreadId(id) => Some(id.as_deref()),
+                _ => None,
+            })
+        } else {
+            unreachable!()
+        }
+    }
 }

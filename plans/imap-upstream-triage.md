@@ -50,6 +50,20 @@ Last scan: 2026-05-19 with `gh api`.
 - Added RFC 5465 `Session::notify` and `Session::notify_none` with typed
   `NotifySettings`, mailbox filters, events, and validation for the RFC event
   constraints before writing to the stream.
+- Added bounded parser lenience for malformed ENVELOPE address display names
+  where real servers emit extra unescaped quote fragments, while keeping the
+  remaining address fields on the normal nstring parser.
+- Added parser coverage for numbered `BODY[1]` fetch sections and public
+  `Fetch::email_id`, `Fetch::thread_id`, and `Fetch::thread_id_attribute`
+  accessors for RFC 8474 IDs already parsed by vendored `imap-proto`.
+- Added `Session::expunge_deleted_uids` as a high-level UIDPLUS-aware helper
+  that uses `UID EXPUNGE` when available and a best-effort
+  search/protect/expunge/restore fallback otherwise. The fallback restores
+  protected flags even when `EXPUNGE` returns `NO` or `BAD`, and preserves the
+  original `EXPUNGE` error if the restore command also fails.
+- Added `ImapTransport`, `BoxedTransport`, `BoxedClient`, and `BoxedSession`
+  for callers that need one client type across runtime-selected plain/TLS
+  transports.
 
 ## Already covered by the vendored import
 
@@ -102,9 +116,10 @@ P2: parser hardening for recursion
 P2: mailbox/parser edge cases
 
 - Source: `djc/tokio-imap` #171 and `chatmail/async-imap` #71.
-- Status: reports need reduced repros against current vendored parser. Do not
-  chase without failing local tests. #71 may overlap with literal/body section
-  parsing and current parser improvements.
+- Status: #171 has a local lenient fallback for malformed ENVELOPE address
+  display names. #71 has local parser coverage for numbered `BODY[1]` sections;
+  the available upstream repro was malformed by copy/paste, so no stream-layer
+  change without a real failing byte sequence.
 
 P2: IDLE ergonomics and NOTIFY
 
@@ -113,6 +128,14 @@ P2: IDLE ergonomics and NOTIFY
   helpers. Later follow-up: decide whether unsolicited STATUS/LIST/FETCH
   responses from NOTIFY should get higher-level event wrappers or remain on the
   existing unsolicited response channel.
+
+P2: generic boxed transport type
+
+- Source: `chatmail/async-imap` #18.
+- Problem: applications that choose between plain TCP and TLS streams at runtime
+  need a single erased client/session type without building their own wrapper.
+- Status: fixed locally with `ImapTransport`, `BoxedTransport`, `BoxedClient`,
+  and `BoxedSession`.
 
 P3 or skip for now
 
@@ -127,5 +150,5 @@ P3 or skip for now
   larger protocol feature after rev1 behavior is stable.
 - `chatmail/async-imap` #11: UIDPLUS. Parser and several client pieces already
   exist locally; `APPENDUID` and `COPYUID` are now surfaced by the relevant
-  commands. Remaining later audit: whether UIDPLUS should get higher-level
-  helpers around UID EXPUNGE fallback behavior.
+  commands, and `expunge_deleted_uids` covers the common UID EXPUNGE fallback
+  workflow.

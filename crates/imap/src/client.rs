@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
@@ -75,6 +75,26 @@ impl<T: Read + Write + Unpin + fmt::Debug> AsMut<T> for Session<T> {
 pub struct Client<T: Read + Write + Unpin + fmt::Debug> {
     conn: Connection<T>,
 }
+
+/// Object-safe transport trait for code that needs one IMAP client type across
+/// different stream implementations.
+///
+/// This is useful when runtime configuration may choose either a TLS stream or
+/// a plain TCP stream. Rust does not allow `Box<dyn Read + Write + Debug>`
+/// directly because that combines multiple non-auto traits in one trait object;
+/// `Box<dyn ImapTransport>` gives those bounds a single object-safe name.
+pub trait ImapTransport: Read + Write + Unpin + fmt::Debug + Send {}
+
+impl<T> ImapTransport for T where T: Read + Write + Unpin + fmt::Debug + Send {}
+
+/// Boxed IMAP transport object.
+pub type BoxedTransport = Box<dyn ImapTransport>;
+
+/// [`Client`] using a boxed transport object.
+pub type BoxedClient = Client<BoxedTransport>;
+
+/// [`Session`] using a boxed transport object.
+pub type BoxedSession = Session<BoxedTransport>;
 
 /// The underlying primitives type. Both `Client`(unauthenticated) and `Session`(after succesful
 /// login) use a `Connection` internally for the TCP stream primitives.
@@ -757,9 +777,12 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// This command is particularly useful for disconnected use clients. By using `uid_expunge`
     /// instead of [`Self::expunge`] when resynchronizing with the server, the client can ensure that it
-    /// does not inadvertantly remove any messages that have been marked as [`Flag::Deleted`] by
+    /// does not inadvertently remove any messages that have been marked as [`Flag::Deleted`] by
     /// other clients between the time that the client was last connected and the time the client
     /// resynchronizes.
+    ///
+    /// Like [`Self::expunge`], the returned stream contains message sequence numbers for the
+    /// removed messages. `EXPUNGE` responses never carry UIDs.
     ///
     /// This command requires that the server supports [RFC
     /// 4315](https://tools.ietf.org/html/rfc4315) as indicated by the `UIDPLUS` capability (see
@@ -774,7 +797,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     pub async fn uid_expunge<S: AsRef<str>>(
         &mut self,
         uid_set: S,
-    ) -> Result<impl Stream<Item = Result<Uid>> + '_ + Send> {
+    ) -> Result<impl Stream<Item = Result<Seq>> + '_ + Send> {
         let id = self
             .run_command(&format!("UID EXPUNGE {}", uid_set.as_ref()))
             .await?;
@@ -784,6 +807,92 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
             id,
         );
         Ok(res)
+    }
+
+    /// Expunge messages that are already `\Deleted` and whose UID is in `uids`.
+    ///
+    /// When the server advertises `UIDPLUS`, this uses [`Session::uid_expunge`].
+    /// Otherwise it falls back to a best-effort sequence:
+    ///
+    /// 1. `UID SEARCH DELETED`
+    /// 2. `UID STORE <other-deleted-uids> -FLAGS.SILENT (\Deleted)`
+    /// 3. `EXPUNGE`
+    /// 4. `UID STORE <other-deleted-uids> +FLAGS.SILENT (\Deleted)`
+    ///
+    /// The fallback protects messages that are already `\Deleted` when the
+    /// method searches. It cannot protect messages another client marks
+    /// `\Deleted` between that search and the fallback `EXPUNGE`, and it cannot
+    /// roll back the temporary flag changes if the task is cancelled or the
+    /// process exits before the restore command runs.
+    pub async fn expunge_deleted_uids<I>(&mut self, uids: I) -> Result<UidExpungeResult>
+    where
+        I: IntoIterator<Item = Uid>,
+    {
+        let target_uids = uids.into_iter().collect::<BTreeSet<_>>();
+        if target_uids.is_empty() {
+            return Ok(UidExpungeResult {
+                expunged: Vec::new(),
+                strategy: UidExpungeStrategy::Noop,
+            });
+        }
+
+        let uid_set = format_uid_set(target_uids.iter().copied());
+        if self.capabilities().await?.contains("UIDPLUS") {
+            let expunged = self
+                .uid_expunge(&uid_set)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            return Ok(UidExpungeResult {
+                expunged,
+                strategy: UidExpungeStrategy::UidPlus,
+            });
+        }
+
+        let deleted = self.uid_search("DELETED").await?;
+        let protected_uids = deleted
+            .into_iter()
+            .filter(|uid| !target_uids.contains(uid))
+            .collect::<BTreeSet<_>>();
+        let protected_uid_set = format_uid_set(protected_uids.iter().copied());
+        let protected_uids = protected_uids.into_iter().collect::<Vec<_>>();
+
+        if !protected_uid_set.is_empty() {
+            self.uid_store(&protected_uid_set, r"-FLAGS.SILENT (\Deleted)")
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
+
+        let expunge_result = match self.expunge().await {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await,
+            Err(error) => Err(error),
+        };
+
+        let restore_result = if protected_uid_set.is_empty() {
+            Ok(())
+        } else {
+            match self
+                .uid_store(&protected_uid_set, r"+FLAGS.SILENT (\Deleted)")
+                .await
+            {
+                Ok(stream) => stream.try_collect::<Vec<_>>().await.map(|_| ()),
+                Err(error) => Err(error),
+            }
+        };
+
+        let expunged = match expunge_result {
+            Ok(expunged) => {
+                restore_result?;
+                expunged
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(UidExpungeResult {
+            expunged,
+            strategy: UidExpungeStrategy::StoreFallback { protected_uids },
+        })
     }
 
     /// The [`CHECK` command](https://tools.ietf.org/html/rfc3501#section-6.4.1) requests a
@@ -1701,6 +1810,39 @@ fn validate_sasl_mechanism(value: &str) -> Result<String> {
     Ok(value.to_ascii_uppercase())
 }
 
+fn format_uid_set<I>(uids: I) -> String
+where
+    I: IntoIterator<Item = Uid>,
+{
+    let mut uids = uids.into_iter().collect::<BTreeSet<_>>().into_iter();
+    let Some(mut start) = uids.next() else {
+        return String::new();
+    };
+    let mut end = start;
+    let mut ranges = Vec::new();
+
+    for uid in uids {
+        if uid == end.saturating_add(1) {
+            end = uid;
+        } else {
+            push_uid_range(&mut ranges, start, end);
+            start = uid;
+            end = uid;
+        }
+    }
+
+    push_uid_range(&mut ranges, start, end);
+    ranges.join(",")
+}
+
+fn push_uid_range(ranges: &mut Vec<String>, start: Uid, end: Uid) {
+    if start == end {
+        ranges.push(start.to_string());
+    } else {
+        ranges.push(format!("{start}:{end}"));
+    }
+}
+
 fn format_atom_list<I, S>(atoms: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
@@ -2004,6 +2146,12 @@ mod tests {
             source: vec![UidSetMember::Uid(142), UidSetMember::Uid(399)],
             destination: vec![UidSetMember::Range(41..=42)],
         }
+    }
+
+    #[test]
+    fn boxed_transport_client_type_compiles() {
+        let transport: BoxedTransport = Box::<MockStream>::default();
+        let _client: BoxedClient = Client::new(transport);
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
@@ -2351,6 +2499,133 @@ mod tests {
         assert!(
             session.stream.inner.written_buf == b"A0001 UID EXPUNGE 2:4\r\n".to_vec(),
             "Invalid expunge command"
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn expunge_deleted_uids_uses_uidplus() {
+        let response = b"* CAPABILITY IMAP4rev1 UIDPLUS\r\n\
+            A0001 OK CAPABILITY completed\r\n\
+            * 2 EXPUNGE\r\n\
+            * 3 EXPUNGE\r\n\
+            A0002 OK UID EXPUNGE completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let result = session.expunge_deleted_uids([4, 2, 3]).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\nA0002 UID EXPUNGE 2:4\r\n".to_vec()
+        );
+        assert_eq!(
+            result,
+            UidExpungeResult {
+                expunged: vec![2, 3],
+                strategy: UidExpungeStrategy::UidPlus,
+            }
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn expunge_deleted_uids_falls_back_without_uidplus() {
+        let response = b"* CAPABILITY IMAP4rev1\r\n\
+            A0001 OK CAPABILITY completed\r\n\
+            * SEARCH 10 11 12 20\r\n\
+            A0002 OK SEARCH completed\r\n\
+            A0003 OK STORE completed\r\n\
+            * 4 EXPUNGE\r\n\
+            A0004 OK EXPUNGE completed\r\n\
+            A0005 OK STORE completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let result = session.expunge_deleted_uids([11]).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\nA0002 UID SEARCH DELETED\r\nA0003 UID STORE 10,12,20 -FLAGS.SILENT (\\Deleted)\r\nA0004 EXPUNGE\r\nA0005 UID STORE 10,12,20 +FLAGS.SILENT (\\Deleted)\r\n".to_vec()
+        );
+        assert_eq!(
+            result,
+            UidExpungeResult {
+                expunged: vec![4],
+                strategy: UidExpungeStrategy::StoreFallback {
+                    protected_uids: vec![10, 12, 20],
+                },
+            }
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn expunge_deleted_uids_restores_protected_flags_after_expunge_error() {
+        let response = b"* CAPABILITY IMAP4rev1\r\n\
+            A0001 OK CAPABILITY completed\r\n\
+            * SEARCH 10 11\r\n\
+            A0002 OK SEARCH completed\r\n\
+            A0003 OK STORE completed\r\n\
+            A0004 NO EXPUNGE failed\r\n\
+            A0005 OK STORE completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let result = session.expunge_deleted_uids([11]).await;
+
+        assert!(matches!(result, Err(Error::No(_))));
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\nA0002 UID SEARCH DELETED\r\nA0003 UID STORE 10 -FLAGS.SILENT (\\Deleted)\r\nA0004 EXPUNGE\r\nA0005 UID STORE 10 +FLAGS.SILENT (\\Deleted)\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn expunge_deleted_uids_preserves_expunge_error_when_restore_fails() {
+        let response = b"* CAPABILITY IMAP4rev1\r\n\
+            A0001 OK CAPABILITY completed\r\n\
+            * SEARCH 10 11\r\n\
+            A0002 OK SEARCH completed\r\n\
+            A0003 OK STORE completed\r\n\
+            A0004 NO EXPUNGE failed\r\n\
+            A0005 NO STORE failed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let result = session.expunge_deleted_uids([11]).await;
+
+        let Err(Error::No(message)) = result else {
+            panic!("expected EXPUNGE NO error");
+        };
+        assert!(message.contains("EXPUNGE failed"));
+        assert!(!message.contains("STORE failed"));
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\nA0002 UID SEARCH DELETED\r\nA0003 UID STORE 10 -FLAGS.SILENT (\\Deleted)\r\nA0004 EXPUNGE\r\nA0005 UID STORE 10 +FLAGS.SILENT (\\Deleted)\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn expunge_deleted_uids_empty_input_is_noop() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let result = session.expunge_deleted_uids([]).await.unwrap();
+
+        assert!(session.stream.inner.written_buf.is_empty());
+        assert_eq!(
+            result,
+            UidExpungeResult {
+                expunged: Vec::new(),
+                strategy: UidExpungeStrategy::Noop,
+            }
         );
     }
 

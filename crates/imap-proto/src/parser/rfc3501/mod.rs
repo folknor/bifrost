@@ -412,6 +412,10 @@ fn mailbox_data(i: &[u8]) -> IResult<&[u8], MailboxDatum<'_>> {
 // An address structure is a parenthesized list that describes an
 // electronic mail address.
 fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
+    alt((address_strict, address_lenient_name)).parse(i)
+}
+
+fn address_strict(i: &[u8]) -> IResult<&[u8], Address<'_>> {
     paren_delimited(map(
         (
             nstring,
@@ -430,6 +434,53 @@ fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
         },
     ))
     .parse(i)
+}
+
+fn address_lenient_name(i: &[u8]) -> IResult<&[u8], Address<'_>> {
+    if i.first() != Some(&b'(') {
+        return Err(nom::Err::Error(nom::error::make_error(
+            i,
+            nom::error::ErrorKind::Char,
+        )));
+    }
+
+    let inner = &i[1..];
+    for split in 0..inner.len() {
+        if inner[split] != b' ' {
+            continue;
+        }
+
+        let field = &inner[..split];
+        let tail = &inner[split + 1..];
+        if let Ok((remaining, (adl, _, mailbox, _, host, _))) =
+            (nstring, tag(" "), nstring, tag(" "), nstring, char(')')).parse(tail)
+        {
+            return Ok((
+                remaining,
+                Address {
+                    name: lenient_address_name(field),
+                    adl: adl.map(Cow::Borrowed),
+                    mailbox: mailbox.map(Cow::Borrowed),
+                    host: host.map(Cow::Borrowed),
+                },
+            ));
+        }
+    }
+
+    Err(nom::Err::Error(nom::error::make_error(
+        i,
+        nom::error::ErrorKind::TakeWhile1,
+    )))
+}
+
+fn lenient_address_name(field: &[u8]) -> Option<Cow<'_, [u8]>> {
+    if field.eq_ignore_ascii_case(b"NIL") {
+        None
+    } else if let [b'"', inner @ .., b'"'] = field {
+        Some(Cow::Borrowed(inner))
+    } else {
+        Some(Cow::Borrowed(field))
+    }
 }
 
 fn opt_addresses(i: &[u8]) -> IResult<&[u8], Option<Vec<Address<'_>>>> {
@@ -886,6 +937,22 @@ mod tests {
         // Literal non-UTF8 address
         match super::address(b"({12}\r\nJoh\xff Klensin NIL \"KLENSIN\" \"MIT.EDU\") ") {
             Ok((_, _address)) => {}
+            rsp => panic!("unexpected response {rsp:?}"),
+        }
+    }
+
+    #[test]
+    fn test_address_lenient_malformed_name() {
+        match super::address(b"(\"encoded-name\"extra(host)\"\" NIL \"wangyuan\" \"host.com\") ") {
+            Ok((_, address)) => {
+                assert_eq!(
+                    address.name,
+                    Some(Cow::Borrowed(b"encoded-name\"extra(host)\"".as_slice()))
+                );
+                assert_eq!(address.adl, None);
+                assert_eq!(address.mailbox, Some(Cow::Borrowed(b"wangyuan".as_slice())));
+                assert_eq!(address.host, Some(Cow::Borrowed(b"host.com".as_slice())));
+            }
             rsp => panic!("unexpected response {rsp:?}"),
         }
     }
