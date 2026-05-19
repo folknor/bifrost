@@ -14,7 +14,7 @@ This folder contains examples showing how to use Bifrost SMTP in your own projec
 - [smtp_starttls.rs] - Send an email over SMTP with STARTTLS and authenticating with username and password.
 - [smtp_selfsigned.rs] - Send an email over SMTP encrypted with TLS using a self-signed certificate and authenticating with username and password.
 - The [smtp_tls.rs] and [smtp_starttls.rs] examples also feature asynchronous implementations powered by [Tokio](https://tokio.rs/).
-  These files are prefixed with `tokio1_` or `asyncstd1_`.
+  These files are prefixed with `tokio1_`.
 
 [basic_html.rs]: ./basic_html.rs
 [maud_html.rs]: ./maud_html.rs

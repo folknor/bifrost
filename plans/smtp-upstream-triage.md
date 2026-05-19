@@ -26,7 +26,8 @@ The upstream maintainer lists breaking-change candidates:
 - Consider API suggestions: #927, #695.
 - Support boxing transports: #938.
 - Builder and message fixes: #856, #970.
-- Consider rustls as default TLS backend.
+- Consider rustls as default TLS backend. Bifrost rejects this for now because
+  ratatoskr uses native-tls exclusively.
 - Review TODO/FIXME.
 - Remove deprecated features: #1052.
 - Mark `CertificateStore` non-exhaustive.
@@ -92,8 +93,7 @@ Security/API:
 - #965/#940: expose and document SMTP error kinds better.
 - #938/#458/#770: transport trait object and Send/Sync ergonomics.
 - #1138: async-std dependency leakage report. Needs direct manifest check later.
-- #1137: system default SSL request. Probably maps to rustls platform verifier
-  or native TLS defaults.
+- #1137: system default SSL request. Bifrost now uses native TLS defaults only.
 
 ## Current decision
 
@@ -150,3 +150,58 @@ Verification:
 - Decide whether OAUTHBEARER should include `host` and `port` key/value pairs.
   RFC 7628 examples include them, while the bearer-token requirements only make
   them mandatory for keyed message digest schemes.
+
+## Upstream PR 877
+
+Upstream PR: https://github.com/lettre/lettre/pull/877
+
+Decision: apply the behavior. `abort()` should not attempt to send `QUIT`,
+because abort is used after protocol or stream failures and the stream may no
+longer be writable. The graceful path remains `quit()`.
+
+Implemented:
+
+- Sync and async SMTP connection `abort()` now only marks the connection broken
+  and closes the stream.
+- Added sync coverage proving abort does not write `QUIT` after a successful
+  connection.
+
+## Small #1028 cleanup pass
+
+Implemented:
+
+- `CertificateStore` is now `#[non_exhaustive]`.
+- Default SMTP command/connect timeout reduced from 60 seconds to 10 seconds.
+- Removed stale FIXME comments from the time helper around clippy allowances.
+
+## Native TLS simplification
+
+Decision: remove the SMTP TLS backend matrix from the fork. Ratatoskr uses
+native-tls exclusively, so maintaining rustls, rustls provider/verifier
+features, and boring-tls would add review and API weight without product value.
+
+Implemented:
+
+- Removed rustls, rustls provider/verifier, webpki, boring-tls, futures-rustls,
+  tokio-rustls, and tokio-boring dependencies/features from `bifrost-smtp`.
+- Deleted the rustls crypto provider helper.
+- Simplified sync and async network streams to plaintext plus native-tls only.
+- Removed Boring/rustls-only public inspection APIs:
+  `tls_verify_result()` and `certificate_chain()`.
+- Kept `peer_certificate()` for native-tls.
+- Removed async-std TLS examples. Async-std remains available where it does not
+  need SMTP TLS.
+- Applied timeout handling around async DNS lookup and tokio native-tls
+  handshake during connection setup. This does not yet use a shared deadline
+  across phases.
+- Added a tokio regression test matching the sync abort test: `abort()` closes
+  without sending `QUIT`.
+
+Deferred:
+
+- Full timeout semantics for async SMTP command reads/writes, STARTTLS command
+  exchange, `test_connection`, and shared-deadline budgeting
+  (#917/#1027/#978) need a dedicated pass.
+- Focused tests for async DNS and TLS-handshake timeout paths are still needed.
+- Dropping `async-trait` is a larger trait/API rewrite and belongs with the
+  async transport redesign.

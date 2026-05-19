@@ -145,7 +145,7 @@ impl SmtpConnection {
         hello_name: &ClientId,
     ) -> Result<(), Error> {
         if self.server_info.supports_feature(Extension::StartTls) {
-            #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+            #[cfg(feature = "native-tls")]
             {
                 try_smtp!(self.command(Starttls), self);
                 self.stream.get_mut().upgrade_tls(tls_parameters)?;
@@ -155,7 +155,7 @@ impl SmtpConnection {
                 try_smtp!(self.ehlo(hello_name), self);
                 Ok(())
             }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls", feature = "boring-tls")))]
+            #[cfg(not(feature = "native-tls"))]
             // This should never happen as `Tls` can only be created
             // when a TLS library is enabled
             unreachable!("TLS support required but not supported");
@@ -176,11 +176,7 @@ impl SmtpConnection {
     }
 
     pub fn abort(&mut self) {
-        // Only try to quit if we are not already broken
-        if !self.panic {
-            self.panic = true;
-            let _ = self.command(Quit);
-        }
+        self.panic = true;
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
     }
 
@@ -322,36 +318,60 @@ impl SmtpConnection {
     }
 
     /// The X509 certificate of the server (DER encoded)
-    #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls")))
-    )]
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
         self.stream.get_ref().peer_certificate()
     }
+}
 
-    /// Currently this is only avaialable when using Boring TLS and
-    /// returns the result of the verification of the TLS certificate
-    /// presented by the peer, if any. Only the last error encountered
-    /// during verification is presented.
-    /// It can be useful when you don't want to fail outright the TLS
-    /// negotiation, for example when a self-signed certificate is
-    /// encountered, but still want to record metrics or log the fact.
-    /// When using DANE verification, the PKI root of trust moves from
-    /// the CAs to DNS, so self-signed certificates are permitted as long
-    /// as the TLSA records match the leaf or issuer certificates.
-    /// It cannot be called on non Boring TLS streams.
-    #[cfg(feature = "boring-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "boring-tls")))]
-    pub fn tls_verify_result(&self) -> Result<(), Error> {
-        self.stream.get_ref().tls_verify_result()
-    }
+#[cfg(test)]
+mod test {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
-    /// All the X509 certificates of the chain (DER encoded)
-    #[cfg(any(feature = "rustls", feature = "boring-tls"))]
-    #[cfg_attr(docsrs, doc(cfg(any(feature = "rustls", feature = "boring-tls"))))]
-    pub fn certificate_chain(&self) -> Result<Vec<Vec<u8>>, Error> {
-        self.stream.get_ref().certificate_chain()
+    use crate::transport::smtp::{client::SmtpConnection, extension::ClientId};
+
+    #[test]
+    fn abort_closes_without_quit_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            let mut after_abort = String::new();
+            let observed = match reader.read_line(&mut after_abort) {
+                Ok(bytes) => format!("{bytes}:{after_abort}"),
+                Err(error) => format!("error:{:?}", error.kind()),
+            };
+            observed_tx.send(observed).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        connection.abort();
+
+        let observed = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            !observed.contains("QUIT"),
+            "abort must close without sending QUIT, got {observed:?}"
+        );
+        handle.join().unwrap();
     }
 }

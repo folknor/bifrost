@@ -10,11 +10,7 @@ use async_trait::async_trait;
 
 #[cfg(feature = "pool")]
 use super::PoolConfig;
-#[cfg(any(
-    feature = "tokio1-native-tls",
-    feature = "tokio1-rustls",
-    feature = "async-std1-rustls"
-))]
+#[cfg(feature = "tokio1-native-tls")]
 use super::Tls;
 #[cfg(feature = "pool")]
 use super::pool::async_impl::Pool;
@@ -119,19 +115,8 @@ where
     ///
     /// Creates an encrypted transport over submissions port, using the provided domain
     /// to validate TLS certificates.
-    #[cfg(any(
-        feature = "tokio1-native-tls",
-        feature = "tokio1-rustls",
-        feature = "async-std1-rustls"
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "tokio1-native-tls",
-            feature = "tokio1-rustls",
-            feature = "async-std1-rustls"
-        )))
-    )]
+    #[cfg(feature = "tokio1-native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSIONS_PORT, Tls, TlsParameters};
 
@@ -153,19 +138,8 @@ where
     ///
     /// An error is returned if the connection can't be upgraded. No credentials
     /// or emails will be sent to the server, protecting from downgrade attacks.
-    #[cfg(any(
-        feature = "tokio1-native-tls",
-        feature = "tokio1-rustls",
-        feature = "async-std1-rustls"
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "tokio1-native-tls",
-            feature = "tokio1-rustls",
-            feature = "async-std1-rustls"
-        )))
-    )]
+    #[cfg(feature = "tokio1-native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn starttls_relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSION_PORT, Tls, TlsParameters};
 
@@ -189,7 +163,7 @@ where
     ///
     /// * No authentication
     /// * No TLS
-    /// * A 60-seconds timeout for smtp commands
+    /// * A 10-second timeout for SMTP commands
     /// * Port 25
     ///
     /// Consider using [`AsyncSmtpTransport::relay`](#method.relay) or
@@ -297,11 +271,8 @@ where
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls")))
-    )]
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }
@@ -450,19 +421,8 @@ impl AsyncSmtpTransportBuilder {
     ///
     /// Using the incorrect [`Tls`] and [`Self::port`] combination may
     /// lead to hard to debug IO errors coming from the TLS library.
-    #[cfg(any(
-        feature = "tokio1-native-tls",
-        feature = "tokio1-rustls",
-        feature = "async-std1-rustls"
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "tokio1-native-tls",
-            feature = "tokio1-rustls",
-            feature = "async-std1-rustls"
-        )))
-    )]
+    #[cfg(feature = "tokio1-native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self

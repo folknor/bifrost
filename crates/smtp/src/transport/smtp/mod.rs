@@ -32,7 +32,7 @@
 //! do the following:
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", any(feature = "native-tls", feature = "rustls")))]
+//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -70,7 +70,7 @@
 //! For more information take a look at [`SmtpTransport::from_url`] or [`AsyncSmtpTransport::from_url`].
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", any(feature = "native-tls", feature = "rustls")))]
+//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -98,7 +98,7 @@
 //! #### Advanced configuration with custom TLS settings
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", any(feature = "native-tls", feature = "rustls")))]
+//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::fs;
 //!
@@ -143,7 +143,7 @@
 //! In a webserver context it may go about this:
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", any(feature = "native-tls", feature = "rustls")))]
+//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
 //! # fn test() {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -195,7 +195,7 @@ pub use self::{
     error::Error,
     transport::{SmtpTransport, SmtpTransportBuilder},
 };
-#[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+#[cfg(feature = "native-tls")]
 use crate::transport::smtp::client::TlsParameters;
 use crate::transport::smtp::{
     authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism},
@@ -232,7 +232,7 @@ pub const SUBMISSION_PORT: u16 = 587;
 pub const SUBMISSIONS_PORT: u16 = 465;
 
 /// Default timeout
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 struct SmtpInfo {

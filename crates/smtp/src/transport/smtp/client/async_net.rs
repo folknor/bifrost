@@ -12,12 +12,6 @@ use futures_io::{
     AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, Error as IoError,
     Result as IoResult,
 };
-#[cfg(feature = "async-std1-rustls")]
-use futures_rustls::client::TlsStream as AsyncStd1RustlsStream;
-#[cfg(any(feature = "tokio1-rustls", feature = "async-std1-rustls"))]
-use rustls::pki_types::ServerName;
-#[cfg(feature = "tokio1-boring-tls")]
-use tokio1_boring::SslStream as Tokio1SslStream;
 #[cfg(feature = "tokio1")]
 use tokio1_crate::io::{AsyncRead, AsyncWrite, ReadBuf as Tokio1ReadBuf};
 #[cfg(feature = "tokio1")]
@@ -27,15 +21,8 @@ use tokio1_crate::net::{
 };
 #[cfg(feature = "tokio1-native-tls")]
 use tokio1_native_tls_crate::TlsStream as Tokio1TlsStream;
-#[cfg(feature = "tokio1-rustls")]
-use tokio1_rustls::client::TlsStream as Tokio1RustlsStream;
 
-#[cfg(any(
-    feature = "tokio1-native-tls",
-    feature = "tokio1-rustls",
-    feature = "tokio1-boring-tls",
-    feature = "async-std1-rustls"
-))]
+#[cfg(feature = "tokio1-native-tls")]
 use super::InnerTlsParameters;
 use super::TlsParameters;
 #[cfg(feature = "tokio1")]
@@ -77,18 +64,9 @@ enum InnerAsyncNetworkStream {
     /// Encrypted Tokio 1.x TCP stream
     #[cfg(feature = "tokio1-native-tls")]
     Tokio1NativeTls(Tokio1TlsStream<Box<dyn AsyncTokioStream>>),
-    /// Encrypted Tokio 1.x TCP stream
-    #[cfg(feature = "tokio1-rustls")]
-    Tokio1Rustls(Tokio1RustlsStream<Box<dyn AsyncTokioStream>>),
-    /// Encrypted Tokio 1.x TCP stream
-    #[cfg(feature = "tokio1-boring-tls")]
-    Tokio1BoringTls(Tokio1SslStream<Box<dyn AsyncTokioStream>>),
     /// Plain Tokio 1.x TCP stream
     #[cfg(feature = "async-std1")]
     AsyncStd1Tcp(AsyncStd1TcpStream),
-    /// Encrypted Tokio 1.x TCP stream
-    #[cfg(feature = "async-std1-rustls")]
-    AsyncStd1Rustls(AsyncStd1RustlsStream<AsyncStd1TcpStream>),
     /// Can't be built
     None,
 }
@@ -112,14 +90,8 @@ impl AsyncNetworkStream {
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => {
                 s.get_ref().get_ref().get_ref().peer_addr()
             }
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(s) => s.get_ref().0.peer_addr(),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(s) => s.get_ref().peer_addr(),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => s.peer_addr(),
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(s) => s.get_ref().0.peer_addr(),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Err(IoError::other(
@@ -148,10 +120,18 @@ impl AsyncNetworkStream {
             timeout: Option<Duration>,
             local_addr: Option<IpAddr>,
         ) -> Result<Tokio1TcpStream, Error> {
-            let addrs = tokio1_crate::net::lookup_host(server)
-                .await
-                .map_err(error::connection)?
-                .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
+            // Timeout is currently a per-phase budget: DNS, each address
+            // connection attempt, and TLS handshake each get their own window.
+            let lookup = tokio1_crate::net::lookup_host(server);
+            let addrs = if let Some(timeout) = timeout {
+                tokio1_crate::time::timeout(timeout, lookup)
+                    .await
+                    .map_err(|_| error::timeout("DNS lookup timed out"))?
+            } else {
+                lookup.await
+            }
+            .map_err(error::connection)?
+            .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
 
             let mut last_err = None;
 
@@ -197,7 +177,7 @@ impl AsyncNetworkStream {
         let mut stream =
             AsyncNetworkStream::new(InnerAsyncNetworkStream::Tokio1Tcp(Box::new(tcp_stream)));
         if let Some(tls_parameters) = tls_parameters {
-            stream.upgrade_tls(tls_parameters).await?;
+            stream.upgrade_tls(tls_parameters, timeout).await?;
         }
         Ok(stream)
     }
@@ -216,7 +196,12 @@ impl AsyncNetworkStream {
             server: T,
             timeout: Duration,
         ) -> Result<AsyncStd1TcpStream, Error> {
-            let addrs = server.to_socket_addrs().await.map_err(error::connection)?;
+            // Timeout is currently a per-phase budget: DNS and each address
+            // connection attempt each get their own window.
+            let addrs = async_std::future::timeout(timeout, server.to_socket_addrs())
+                .await
+                .map_err(|_| error::timeout("DNS lookup timed out"))?
+                .map_err(error::connection)?;
 
             let mut last_err = None;
 
@@ -249,33 +234,27 @@ impl AsyncNetworkStream {
 
         let mut stream = AsyncNetworkStream::new(InnerAsyncNetworkStream::AsyncStd1Tcp(tcp_stream));
         if let Some(tls_parameters) = tls_parameters {
-            stream.upgrade_tls(tls_parameters).await?;
+            stream.upgrade_tls(tls_parameters, timeout).await?;
         }
         Ok(stream)
     }
 
-    pub async fn upgrade_tls(&mut self, tls_parameters: TlsParameters) -> Result<(), Error> {
+    pub async fn upgrade_tls(
+        &mut self,
+        tls_parameters: TlsParameters,
+        timeout: Option<Duration>,
+    ) -> Result<(), Error> {
         match &self.inner {
-            #[cfg(all(
-                feature = "tokio1",
-                not(any(
-                    feature = "tokio1-native-tls",
-                    feature = "tokio1-rustls",
-                    feature = "tokio1-boring-tls"
-                ))
-            ))]
+            #[cfg(all(feature = "tokio1", not(feature = "tokio1-native-tls")))]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => {
                 let _ = tls_parameters;
-                panic!(
-                    "Trying to upgrade an AsyncNetworkStream without having enabled either the tokio1-native-tls or the tokio1-rustls feature"
+                let _ = timeout;
+                unreachable!(
+                    "Trying to upgrade an AsyncNetworkStream without having enabled the tokio1-native-tls feature"
                 );
             }
 
-            #[cfg(any(
-                feature = "tokio1-native-tls",
-                feature = "tokio1-rustls",
-                feature = "tokio1-boring-tls"
-            ))]
+            #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => {
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerAsyncNetworkStream::None);
@@ -283,144 +262,48 @@ impl AsyncNetworkStream {
                     unreachable!()
                 };
 
-                self.inner = Self::upgrade_tokio1_tls(tcp_stream, tls_parameters)
+                self.inner = Self::upgrade_tokio1_tls(tcp_stream, tls_parameters, timeout)
                     .await
                     .map_err(error::connection)?;
                 Ok(())
             }
-            #[cfg(all(feature = "async-std1", not(feature = "async-std1-rustls")))]
+            #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
                 let _ = tls_parameters;
-                panic!(
-                    "Trying to upgrade an AsyncNetworkStream without having enabled the async-std1-rustls feature"
+                let _ = timeout;
+                unreachable!(
+                    "Trying to upgrade an AsyncNetworkStream with async-std, which does not support native-tls"
                 );
-            }
-
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
-                // get owned TcpStream
-                let tcp_stream = mem::replace(&mut self.inner, InnerAsyncNetworkStream::None);
-                let InnerAsyncNetworkStream::AsyncStd1Tcp(tcp_stream) = tcp_stream else {
-                    unreachable!()
-                };
-
-                self.inner = Self::upgrade_asyncstd1_tls(tcp_stream, tls_parameters)
-                    .await
-                    .map_err(error::connection)?;
-                Ok(())
             }
             _ => Ok(()),
         }
     }
 
     #[allow(unused_variables)]
-    #[cfg(any(
-        feature = "tokio1-native-tls",
-        feature = "tokio1-rustls",
-        feature = "tokio1-boring-tls"
-    ))]
+    #[cfg(feature = "tokio1-native-tls")]
     async fn upgrade_tokio1_tls(
         tcp_stream: Box<dyn AsyncTokioStream>,
         tls_parameters: TlsParameters,
+        timeout: Option<Duration>,
     ) -> Result<InnerAsyncNetworkStream, Error> {
         let domain = tls_parameters.domain().to_owned();
 
         match tls_parameters.connector {
-            #[cfg(feature = "native-tls")]
             InnerTlsParameters::NativeTls { connector } => {
-                #[cfg(not(feature = "tokio1-native-tls"))]
-                panic!("built without the tokio1-native-tls feature");
+                use tokio1_native_tls_crate::TlsConnector;
 
-                #[cfg(feature = "tokio1-native-tls")]
-                return {
-                    use tokio1_native_tls_crate::TlsConnector;
-
-                    let connector = TlsConnector::from(connector);
-                    let stream = connector
-                        .connect(&domain, tcp_stream)
+                let connector = TlsConnector::from(connector);
+                let handshake = connector.connect(&domain, tcp_stream);
+                let stream = if let Some(timeout) = timeout {
+                    tokio1_crate::time::timeout(timeout, handshake)
                         .await
-                        .map_err(error::connection)?;
-                    Ok(InnerAsyncNetworkStream::Tokio1NativeTls(stream))
+                        .map_err(|_| error::timeout("TLS handshake timed out"))?
+                } else {
+                    handshake.await
                 };
-            }
-            #[cfg(feature = "rustls")]
-            InnerTlsParameters::Rustls { config } => {
-                #[cfg(not(feature = "tokio1-rustls"))]
-                panic!("built without the tokio1-rustls feature");
-
-                #[cfg(feature = "tokio1-rustls")]
-                return {
-                    use tokio1_rustls::TlsConnector;
-
-                    let domain = ServerName::try_from(domain.as_str())
-                        .map_err(|_| error::connection("domain isn't a valid DNS name"))?;
-
-                    let connector = TlsConnector::from(config);
-                    let stream = connector
-                        .connect(domain.to_owned(), tcp_stream)
-                        .await
-                        .map_err(error::connection)?;
-                    Ok(InnerAsyncNetworkStream::Tokio1Rustls(stream))
-                };
-            }
-            #[cfg(feature = "boring-tls")]
-            InnerTlsParameters::BoringTls {
-                connector,
-                accept_invalid_hostnames,
-            } => {
-                #[cfg(not(feature = "tokio1-boring-tls"))]
-                panic!("built without the tokio1-boring-tls feature");
-
-                #[cfg(feature = "tokio1-boring-tls")]
-                return {
-                    let mut config = connector.configure().map_err(error::connection)?;
-                    config.set_verify_hostname(!accept_invalid_hostnames);
-
-                    let stream = tokio1_boring::connect(config, &domain, tcp_stream)
-                        .await
-                        .map_err(error::connection)?;
-                    Ok(InnerAsyncNetworkStream::Tokio1BoringTls(stream))
-                };
-            }
-        }
-    }
-
-    #[allow(unused_variables)]
-    #[cfg(feature = "async-std1-rustls")]
-    async fn upgrade_asyncstd1_tls(
-        tcp_stream: AsyncStd1TcpStream,
-        mut tls_parameters: TlsParameters,
-    ) -> Result<InnerAsyncNetworkStream, Error> {
-        let domain = mem::take(&mut tls_parameters.domain);
-
-        match tls_parameters.connector {
-            #[cfg(feature = "native-tls")]
-            InnerTlsParameters::NativeTls { connector } => {
-                panic!("native-tls is not supported with async-std yet");
-            }
-            #[cfg(feature = "rustls")]
-            InnerTlsParameters::Rustls { config } => {
-                #[cfg(not(feature = "async-std1-rustls"))]
-                panic!("built without the async-std1-rustls feature");
-
-                #[cfg(feature = "async-std1-rustls")]
-                return {
-                    use futures_rustls::TlsConnector;
-
-                    let domain = ServerName::try_from(domain.as_str())
-                        .map_err(|_| error::connection("domain isn't a valid DNS name"))?;
-
-                    let connector = TlsConnector::from(config);
-                    let stream = connector
-                        .connect(domain.to_owned(), tcp_stream)
-                        .await
-                        .map_err(error::connection)?;
-                    Ok(InnerAsyncNetworkStream::AsyncStd1Rustls(stream))
-                };
-            }
-            #[cfg(feature = "boring-tls")]
-            InnerTlsParameters::BoringTls { .. } => {
-                panic!("boring-tls isn't supported with async-std yet.");
+                Ok(InnerAsyncNetworkStream::Tokio1NativeTls(
+                    stream.map_err(error::connection)?,
+                ))
             }
         }
     }
@@ -431,86 +314,14 @@ impl AsyncNetworkStream {
             InnerAsyncNetworkStream::Tokio1Tcp(_) => false,
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(_) => true,
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(_) => true,
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(_) => true,
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(_) => false,
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(_) => true,
             InnerAsyncNetworkStream::None => false,
         }
     }
 
-    #[cfg(feature = "boring-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "boring-tls")))]
-    pub fn tls_verify_result(&self) -> Result<(), Error> {
-        match &self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(_) => panic!("Unsupported"),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(_) => panic!("Unsupported"),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(stream) => {
-                stream.ssl().verify_result().map_err(error::tls)
-            }
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(_) => panic!("Unsupported"),
-            InnerAsyncNetworkStream::None => panic!("InnerNetworkStream::None must never be built"),
-        }
-    }
-
-    pub fn certificate_chain(&self) -> Result<Vec<Vec<u8>>, Error> {
-        match &self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(_) => panic!("Unsupported"),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(stream) => Ok(stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .unwrap()
-                .iter()
-                .map(|c| c.to_vec())
-                .collect()),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(stream) => Ok(stream
-                .ssl()
-                .peer_cert_chain()
-                .unwrap()
-                .iter()
-                .map(|c| c.to_der().map_err(error::tls))
-                .collect::<Result<Vec<_>, _>>()?),
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(stream) => Ok(stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .unwrap()
-                .iter()
-                .map(|c| c.to_vec())
-                .collect()),
-            InnerAsyncNetworkStream::None => panic!("InnerNetworkStream::None must never be built"),
-        }
-    }
-
+    #[cfg(feature = "tokio1-native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
         match &self.inner {
             #[cfg(feature = "tokio1")]
@@ -525,35 +336,10 @@ impl AsyncNetworkStream {
                 .unwrap()
                 .to_der()
                 .map_err(error::tls)?),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(stream) => Ok(stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .unwrap()
-                .first()
-                .unwrap()
-                .to_vec()),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(stream) => Ok(stream
-                .ssl()
-                .peer_certificate()
-                .unwrap()
-                .to_der()
-                .map_err(error::tls)?),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
                 Err(error::client("Connection is not encrypted"))
             }
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(stream) => Ok(stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .unwrap()
-                .first()
-                .unwrap()
-                .to_vec()),
             InnerAsyncNetworkStream::None => panic!("InnerNetworkStream::None must never be built"),
         }
     }
@@ -585,28 +371,8 @@ impl FuturesAsyncRead for AsyncNetworkStream {
                     Poll::Pending => Poll::Pending,
                 }
             }
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(s) => {
-                let mut b = Tokio1ReadBuf::new(buf);
-                match Pin::new(s).poll_read(cx, &mut b) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(s) => {
-                let mut b = Tokio1ReadBuf::new(buf);
-                match Pin::new(s).poll_read(cx, &mut b) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(s) => Pin::new(s).poll_read(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
@@ -627,14 +393,8 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(s) => Pin::new(s).poll_write(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
@@ -648,14 +408,8 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(s) => Pin::new(s).poll_flush(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
@@ -669,14 +423,8 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "tokio1-rustls")]
-            InnerAsyncNetworkStream::Tokio1Rustls(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "tokio1-boring-tls")]
-            InnerAsyncNetworkStream::Tokio1BoringTls(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_close(cx),
-            #[cfg(feature = "async-std1-rustls")]
-            InnerAsyncNetworkStream::AsyncStd1Rustls(s) => Pin::new(s).poll_close(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))

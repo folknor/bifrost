@@ -4,7 +4,7 @@ use url::Url;
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 use super::AsyncSmtpTransportBuilder;
-#[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+#[cfg(feature = "native-tls")]
 use super::client::{Tls, TlsParameters};
 use super::{
     Error, SMTP_PORT, SUBMISSION_PORT, SUBMISSIONS_PORT, SmtpTransportBuilder,
@@ -13,7 +13,7 @@ use super::{
 
 pub(crate) trait TransportBuilder {
     fn new<T: Into<String>>(server: T) -> Self;
-    #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self;
     fn port(self, port: u16) -> Self;
     fn credentials(self, credentials: Credentials) -> Self;
@@ -25,7 +25,7 @@ impl TransportBuilder for SmtpTransportBuilder {
         Self::new(server)
     }
 
-    #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self {
         self.tls(tls)
     }
@@ -49,7 +49,7 @@ impl TransportBuilder for AsyncSmtpTransportBuilder {
         Self::new(server)
     }
 
-    #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self {
         self.tls(tls)
     }
@@ -85,19 +85,19 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         ("smtp", None) => {
             builder = builder.port(connection_url.port().unwrap_or(SMTP_PORT));
         }
-        #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+        #[cfg(feature = "native-tls")]
         ("smtp", Some("required")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
                 .tls(Tls::Required(TlsParameters::new(host.into())?));
         }
-        #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+        #[cfg(feature = "native-tls")]
         ("smtp", Some("opportunistic")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
                 .tls(Tls::Opportunistic(TlsParameters::new(host.into())?));
         }
-        #[cfg(any(feature = "native-tls", feature = "rustls", feature = "boring-tls"))]
+        #[cfg(feature = "native-tls")]
         ("smtps", _) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSIONS_PORT))

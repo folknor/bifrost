@@ -40,7 +40,8 @@
 //! * **native-tls** (default): TLS support for the synchronous version of the API
 //! * **tokio1-native-tls**: TLS support for the `tokio1` async version of the API
 //!
-//! NOTE: native-tls isn't supported with `async-std`
+//! NOTE: native-tls for SMTP is only supported with `tokio1`; async-std SMTP
+//! remains plaintext-only.
 //!
 //! ##### Building Bifrost SMTP with OpenSSL
 //!
@@ -52,97 +53,6 @@
 //! | ------------ | -------------------------- | ---------------------------- |
 //! | Debian       | `pkg-config`, `libssl-dev` | `libssl3`, `ca-certificates` |
 //! | Alpine Linux | `pkgconf`, `openssl-dev`   | `libssl3`, `ca-certificates` |
-//!
-//! #### SMTP over TLS via the boring crate (Boring TLS)
-//!
-//! _Secure SMTP connections using TLS from the `boring-tls` crate_
-//!
-//! * **boring-tls**: TLS support for the synchronous version of the API
-//! * **tokio1-boring-tls**: TLS support for the `tokio1` async version of the API
-//!
-//! NOTE: boring-tls isn't supported with `async-std`
-//!
-//! #### SMTP over TLS via the rustls crate
-//!
-//! _Secure SMTP connections using TLS from the `rustls` crate_
-//!
-//! * **rustls**: TLS support for the synchronous version of the API
-//! * **tokio1-rustls**: TLS support for the `tokio1` async version of the API
-//! * **async-std1-rustls**: TLS support for the `async-std1` async version of the API
-//!
-//! ##### rustls crypto backends
-//!
-//! _The crypto implementation to use with rustls_
-//!
-//! When the `rustls` feature is enabled, one of the following crypto backends MUST also
-//! be enabled.
-//!
-//! * **aws-lc-rs**: use [AWS-LC] (via [`aws-lc-rs`]) as the `rustls` crypto backend
-//! * **ring**: use [`ring`] as the `rustls` crypto backend
-//! * **rustls-no-provider**: don't install a default crypto provider, allowing the use
-//!   of a custom one (see [Custom rustls crypto providers](#custom-rustls-crypto-providers) below)
-//!
-//! When enabling `aws-lc-rs`, the `fips` feature can also be enabled to have
-//! rustls use the FIPS certified module of AWS-LC.
-//!
-//! `aws-lc-rs` may require cmake on some platforms to compile.
-//! `fips` always requires cmake and the Go compiler to compile.
-//!
-//! ##### Custom rustls crypto providers
-//!
-//! _Bring your own [`rustls`] crypto provider_
-//!
-//! By enabling the `rustls-no-provider` feature instead of `aws-lc-rs` or `ring`,
-//! you can use any [`rustls`]-compatible crypto provider such as
-//! [`rustls-graviola`], [`rustls-rustcrypto`] or others.
-//!
-//! The provider must be installed before using Bifrost SMTP by calling
-//! [`CryptoProvider::install_default`]:
-//!
-//! ```rust
-//! # mod rustls_graviola {
-//! #     pub struct FakeProvider;
-//! #     impl FakeProvider {
-//! #         pub fn install_default(self) -> Result<(), String> { Ok(()) }
-//! #     }
-//! #     pub fn default_provider() -> FakeProvider { FakeProvider }
-//! # }
-//! // Example using the `rustls-graviola` crypto provider crate.
-//! // Refer to your provider's documentation for the correct setup.
-//! rustls_graviola::default_provider()
-//!     .install_default()
-//!     .expect("Failed to install crypto provider");
-//! ```
-//!
-//! If `aws-lc-rs` or `ring` is enabled alongside `rustls-no-provider`, the
-//! globally installed provider (if any) takes precedence. If none is installed,
-//! Bifrost SMTP falls back to the feature-selected provider.
-//!
-//! [`CryptoProvider::install_default`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#method.install_default
-//! [`rustls-graviola`]: https://crates.io/crates/rustls-graviola
-//! [`rustls-rustcrypto`]: https://crates.io/crates/rustls-rustcrypto
-//!
-//! ##### rustls certificate verification backend
-//!
-//! _The TLS certificate verification backend to use with rustls_
-//!
-//! When the `rustls` feature is enabled, one of the following verification backends
-//! MUST also be enabled.
-//!
-//! * **rustls-platform-verifier**: verify TLS certificate using the OS's native certificate store (see [`rustls-platform-verifier`])
-//! * **rustls-native-certs**: verify TLS certificates using the platform's native certificate store (see [`rustls-native-certs`]) - when in doubt use `rustls-platform-verifier`
-//! * **webpki-roots**: verify TLS certificates against Mozilla's root certificates (see [`webpki-roots`])
-//!
-//! The following packages will need to be installed in order for the build
-//! stage and the compiled program to run properly.
-//!
-//! | Verification backend       | Distro       | Build-time packages        | Runtime packages             |
-//! | ---------------------      | ------------ | -------------------------- | ---------------------------- |
-//! | `rustls-platform-verifier` | Debian       | none                       | `ca-certificates`            |
-//! | `rustls-platform-verifier` | Alpine Linux | none                       | `ca-certificates`            |
-//! | `rustls-native-certs`      | Debian       | none                       | `ca-certificates`            |
-//! | `rustls-native-certs`      | Alpine Linux | none                       | `ca-certificates`            |
-//! | `webpki-roots`             | any          | none                       | none                         |
 //!
 //! ### Sendmail transport
 //!
@@ -169,7 +79,8 @@
 //! * **tokio1**: Allow to asynchronously send emails using [Tokio 1.x]
 //! * **async-std1**: Allow to asynchronously send emails using [async-std 1.x]
 //!
-//! NOTE: native-tls isn't supported with `async-std`
+//! NOTE: native-tls for SMTP is only supported with `tokio1`; async-std SMTP
+//! remains plaintext-only.
 //!
 //! ### Misc features
 //!
@@ -187,12 +98,6 @@
 //! [`ContentType`]: crate::message::header::ContentType
 //! [tokio]: https://docs.rs/tokio/1
 //! [async-std]: https://docs.rs/async-std/1
-//! [AWS-LC]: https://github.com/aws/aws-lc
-//! [`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
-//! [`ring`]: https://crates.io/crates/ring
-//! [`rustls-platform-verifier`]: https://crates.io/crates/rustls-platform-verifier
-//! [`rustls-native-certs`]: https://crates.io/crates/rustls-native-certs
-//! [`webpki-roots`]: https://crates.io/crates/webpki-roots
 //! [Tokio 1.x]: https://docs.rs/tokio/1
 //! [async-std 1.x]: https://docs.rs/async-std/1
 //! [mime 0.3]: https://docs.rs/mime/0.3
@@ -239,68 +144,12 @@
 #[cfg(not(bifrost_smtp_ignore_tls_mismatch))]
 mod compiletime_checks {
     #[cfg(all(
-        feature = "rustls",
-        not(feature = "aws-lc-rs"),
-        not(feature = "ring"),
-        not(feature = "rustls-no-provider")
-    ))]
-    compile_error!(
-        "feature `rustls` also requires either the `aws-lc-rs`, the `ring` or the `rustls-no-provider` feature to be enabled.
-    When using `rustls-no-provider` a custom `rustls` crypto provider must be installed at runtime by calling `install_default()` on the provider before using bifrost_smtp, or it will panic."
-    );
-
-    #[cfg(all(
-        feature = "rustls",
-        not(feature = "rustls-platform-verifier"),
-        not(feature = "rustls-native-certs"),
-        not(feature = "webpki-roots")
-    ))]
-    compile_error!(
-        "feature `rustls` also requires either the `rustls-platform-verifier`, the `rustls-native-certs`
-    or the `webpki-roots` feature to be enabled"
-    );
-
-    #[cfg(all(feature = "native-tls", feature = "boring-tls"))]
-    compile_error!("feature \"native-tls\" and feature \"boring-tls\" cannot be enabled at the same time, otherwise
-    the executable will fail to link.");
-
-    #[cfg(all(
         feature = "tokio1",
         feature = "native-tls",
         not(feature = "tokio1-native-tls")
     ))]
     compile_error!("Bifrost SMTP is being built with the `tokio1` and the `native-tls` features, but the `tokio1-native-tls` feature hasn't been turned on.
-    If you were trying to opt into `rustls` and did not activate `native-tls`, disable the default-features of bifrost_smtp in `Cargo.toml` and manually add the required features.
     Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
-
-    #[cfg(all(feature = "tokio1", feature = "rustls", not(feature = "tokio1-rustls")))]
-    compile_error!("Bifrost SMTP is being built with the `tokio1` and the `rustls` features, but the `tokio1-rustls` feature hasn't been turned on.
-    If you'd like to use `native-tls` make sure that the `rustls` feature hasn't been enabled by mistake.
-    Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
-
-    #[cfg(all(
-        feature = "tokio1",
-        feature = "boring-tls",
-        not(feature = "tokio1-boring-tls")
-    ))]
-    compile_error!("Bifrost SMTP is being built with the `tokio1` and the `boring-tls` features, but the `tokio1-boring-tls` feature hasn't been turned on.
-    If you'd like to use `boring-tls` make sure that the `rustls` feature hasn't been enabled by mistake.
-    Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
-
-    #[cfg(all(feature = "async-std1", feature = "native-tls"))]
-    compile_error!("Bifrost SMTP is being built with the `async-std1` and the `native-tls` features, but the async-std integration doesn't support native-tls yet.
-If you need native-tls with async-std, that support has not been wired into Bifrost SMTP yet.
-If you were trying to opt into `rustls` and did not activate `native-tls`, disable the default-features of bifrost_smtp in `Cargo.toml` and manually add the required features.
-Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
-
-    #[cfg(all(
-        feature = "async-std1",
-        feature = "rustls",
-        not(feature = "async-std1-rustls")
-    ))]
-    compile_error!("Bifrost SMTP is being built with the `async-std1` and the `rustls` features, but the `async-std1-rustls` feature hasn't been turned on.
-If you'd like to use `native-tls` make sure that the `rustls` hasn't been enabled by mistake.
-Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
 }
 
 pub mod address;
@@ -312,8 +161,6 @@ mod executor;
 #[cfg(feature = "builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
 pub mod message;
-#[cfg(feature = "rustls")]
-mod rustls_crypto;
 mod time;
 pub mod transport;
 

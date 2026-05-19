@@ -132,7 +132,7 @@ impl Executor for Tokio1Executor {
     ) -> Result<AsyncSmtpConnection, Error> {
         #[allow(clippy::match_single_binding)]
         let tls_parameters = match tls {
-            #[cfg(any(feature = "tokio1-native-tls", feature = "tokio1-rustls"))]
+            #[cfg(feature = "tokio1-native-tls")]
             Tls::Wrapper(tls_parameters) => Some(tls_parameters.clone()),
             _ => None,
         };
@@ -146,7 +146,7 @@ impl Executor for Tokio1Executor {
         )
         .await?;
 
-        #[cfg(any(feature = "tokio1-native-tls", feature = "tokio1-rustls"))]
+        #[cfg(feature = "tokio1-native-tls")]
         match tls {
             Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
                 conn.starttls(tls_parameters.clone(), hello_name).await?;
@@ -227,33 +227,16 @@ impl Executor for AsyncStd1Executor {
         hello_name: &ClientId,
         tls: &Tls,
     ) -> Result<AsyncSmtpConnection, Error> {
-        #[allow(clippy::match_single_binding)]
-        let tls_parameters = match tls {
-            #[cfg(feature = "async-std1-rustls")]
-            Tls::Wrapper(tls_parameters) => Some(tls_parameters.clone()),
-            _ => None,
-        };
-        #[allow(unused_mut)]
-        let mut conn = AsyncSmtpConnection::connect_asyncstd1(
-            (hostname, port),
-            timeout,
-            hello_name,
-            tls_parameters,
-        )
-        .await?;
-
-        #[cfg(feature = "async-std1-rustls")]
-        match tls {
-            Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
-                conn.starttls(tls_parameters.clone(), hello_name).await?;
-            }
-            Tls::Required(tls_parameters) => {
-                conn.starttls(tls_parameters.clone(), hello_name).await?;
-            }
-            _ => (),
+        #[cfg(feature = "native-tls")]
+        if !matches!(tls, Tls::None) {
+            return Err(crate::transport::smtp::error::client(
+                "native-tls SMTP is not supported with async-std",
+            ));
         }
+        #[cfg(not(feature = "native-tls"))]
+        let _ = tls;
 
-        Ok(conn)
+        AsyncSmtpConnection::connect_asyncstd1((hostname, port), timeout, hello_name, None).await
     }
 
     #[cfg(feature = "file-transport-envelope")]
