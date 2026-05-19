@@ -18,6 +18,8 @@ and is being adapted for ratatoskr. Notable fork-time API breaks so far:
   `AsyncSmtpConnection::connect_tokio1` access, are now internal.
 - Async transports no longer use `async-trait`; custom async transports must be
   `Sync`, and async `send` now takes `&Message`.
+- Added first-class `LmtpTransport` and `AsyncLmtpTransport` APIs. LMTP sends
+  with `LHLO` and returns one `Response` per recipient.
 
 ## bifrost-jmap 0.1.0 - unreleased
 

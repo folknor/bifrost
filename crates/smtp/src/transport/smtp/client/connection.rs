@@ -15,8 +15,9 @@ use crate::transport::smtp::commands::Starttls;
 use crate::{
     address::Envelope,
     transport::smtp::{
+        Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt},
+        commands::{Auth, Data, Ehlo, Lhlo, Mail, Noop, Quit, Rcpt},
         error,
         error::Error,
         extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},
@@ -47,6 +48,8 @@ pub(crate) struct SmtpConnection {
     server_info: ServerInfo,
     /// Client identity used for EHLO.
     hello_name: ClientId,
+    /// Wire protocol used for this connection.
+    protocol: Protocol,
 }
 
 impl SmtpConnection {
@@ -60,12 +63,31 @@ impl SmtpConnection {
     /// Connects to the configured server
     ///
     /// Sends EHLO and parses server information
+    #[cfg(test)]
     pub(crate) fn connect<A: ToSocketAddrs>(
         server: A,
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls_parameters: Option<&TlsParameters>,
         local_address: Option<IpAddr>,
+    ) -> Result<SmtpConnection, Error> {
+        Self::connect_with_protocol(
+            server,
+            timeout,
+            hello_name,
+            tls_parameters,
+            local_address,
+            Protocol::Smtp,
+        )
+    }
+
+    pub(crate) fn connect_with_protocol<A: ToSocketAddrs>(
+        server: A,
+        timeout: Option<Duration>,
+        hello_name: &ClientId,
+        tls_parameters: Option<&TlsParameters>,
+        local_address: Option<IpAddr>,
+        protocol: Protocol,
     ) -> Result<SmtpConnection, Error> {
         let stream = NetworkStream::connect(server, timeout, tls_parameters, local_address)?;
         let stream = BufReader::new(stream);
@@ -74,12 +96,13 @@ impl SmtpConnection {
             panic: false,
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
+            protocol,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
         // TODO log
         let _response = conn.read_response()?;
 
-        conn.ehlo(hello_name)?;
+        conn.hello(hello_name)?;
 
         // Print server information
         #[cfg(feature = "tracing")]
@@ -88,6 +111,74 @@ impl SmtpConnection {
     }
 
     pub(crate) fn send(&mut self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
+        let mail_options = self.mail_options(envelope, email)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options)),
+            self
+        );
+
+        for to_address in envelope.to() {
+            try_smtp!(self.command(Rcpt::new(to_address.clone(), vec![])), self);
+        }
+
+        try_smtp!(self.command(Data), self);
+        let result = try_smtp!(self.message(email), self);
+        Ok(result)
+    }
+
+    pub(crate) fn send_lmtp(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+    ) -> Result<Vec<Response>, Error> {
+        let mail_options = self.mail_options(envelope, email)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options)),
+            self
+        );
+
+        let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
+        let mut accepted_recipients = 0;
+
+        for to_address in envelope.to() {
+            let response = try_smtp!(
+                self.command_accepting_status(Rcpt::new(to_address.clone(), vec![])),
+                self
+            );
+            if response.is_positive() {
+                accepted_recipients += 1;
+                recipient_statuses.push(None);
+            } else {
+                recipient_statuses.push(Some(response));
+            }
+        }
+
+        if accepted_recipients == 0 {
+            return Ok(recipient_statuses
+                .into_iter()
+                .map(|response| response.expect("all recipients were rejected"))
+                .collect());
+        }
+
+        try_smtp!(self.command(Data), self);
+        let mut delivery_statuses =
+            try_smtp!(self.message_lmtp(email, accepted_recipients), self).into_iter();
+
+        Ok(recipient_statuses
+            .into_iter()
+            .map(|response| {
+                response.unwrap_or_else(|| {
+                    delivery_statuses
+                        .next()
+                        .expect("server returned one status per accepted recipient")
+                })
+            })
+            .collect())
+    }
+
+    fn mail_options(&self, envelope: &Envelope, email: &[u8]) -> Result<Vec<MailParameter>, Error> {
         // Mail
         let mut mail_options = vec![];
 
@@ -117,22 +208,7 @@ impl SmtpConnection {
             mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
         }
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
-        );
-
-        // Recipient
-        for to_address in envelope.to() {
-            try_smtp!(self.command(Rcpt::new(to_address.clone(), vec![])), self);
-        }
-
-        // Data
-        try_smtp!(self.command(Data), self);
-
-        // Message content
-        let result = try_smtp!(self.message(email), self);
-        Ok(result)
+        Ok(mail_options)
     }
 
     pub(crate) fn has_broken(&self) -> bool {
@@ -160,8 +236,8 @@ impl SmtpConnection {
                 self.stream.get_mut().upgrade_tls(tls_parameters)?;
                 #[cfg(feature = "tracing")]
                 tracing::debug!("connection encrypted");
-                // Send EHLO again
-                try_smtp!(self.ehlo(hello_name), self);
+                // Send EHLO/LHLO again
+                try_smtp!(self.hello(hello_name), self);
                 self.hello_name = hello_name.clone();
                 Ok(())
             }
@@ -174,10 +250,13 @@ impl SmtpConnection {
         }
     }
 
-    /// Send EHLO and update server info
-    fn ehlo(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        let ehlo_response = try_smtp!(self.command(Ehlo::new(hello_name.clone())), self);
-        self.server_info = try_smtp!(ServerInfo::from_response(&ehlo_response), self);
+    /// Send EHLO or LHLO and update server info
+    fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
+        let response = match self.protocol {
+            Protocol::Smtp => try_smtp!(self.command(Ehlo::new(hello_name.clone())), self),
+            Protocol::Lmtp => try_smtp!(self.command(Lhlo::new(hello_name.clone())), self),
+        };
+        self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())
     }
 
@@ -247,7 +326,7 @@ impl SmtpConnection {
             Err(error::response("Unexpected number of challenges"))
         } else {
             let hello_name = self.hello_name.clone();
-            try_smtp!(self.ehlo(&hello_name), self);
+            try_smtp!(self.hello(&hello_name), self);
             Ok(response)
         }
     }
@@ -255,6 +334,14 @@ impl SmtpConnection {
     /// Sends the message content
     pub(crate) fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message))
+    }
+
+    pub(crate) fn message_lmtp(
+        &mut self,
+        message: &[u8],
+        recipients: usize,
+    ) -> Result<Vec<Response>, Error> {
+        self.message_lmtp_iter(std::iter::once(message), recipients)
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
@@ -275,10 +362,42 @@ impl SmtpConnection {
         self.read_response()
     }
 
+    /// Sends the message content and reads one LMTP status per recipient.
+    pub(crate) fn message_lmtp_iter<I, B>(
+        &mut self,
+        message: I,
+        recipients: usize,
+    ) -> Result<Vec<Response>, Error>
+    where
+        I: Iterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut codec = ClientCodec::new();
+        for message_part in message {
+            let message_part = message_part.as_ref();
+            let mut out_buf = Vec::with_capacity(message_part.len());
+            codec.encode(message_part, &mut out_buf);
+            self.write(out_buf.as_slice())?;
+        }
+        self.write(b"\r\n.\r\n")?;
+
+        let mut responses = Vec::with_capacity(recipients);
+        for _ in 0..recipients {
+            responses.push(self.read_response_accepting_status()?);
+        }
+
+        Ok(responses)
+    }
+
     /// Sends an SMTP command
     pub(crate) fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
         self.write(command.to_string().as_bytes())?;
         self.read_response()
+    }
+
+    fn command_accepting_status<C: Display>(&mut self, command: C) -> Result<Response, Error> {
+        self.write(command.to_string().as_bytes())?;
+        self.read_response_accepting_status()
     }
 
     /// Writes a string to the server
@@ -296,6 +415,14 @@ impl SmtpConnection {
 
     /// Gets the SMTP response
     pub(crate) fn read_response(&mut self) -> Result<Response, Error> {
+        self.read_response_inner(false)
+    }
+
+    fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
+        self.read_response_inner(true)
+    }
+
+    fn read_response_inner(&mut self, accept_negative: bool) -> Result<Response, Error> {
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
 
@@ -312,7 +439,7 @@ impl SmtpConnection {
             tracing::debug!("<< {}", escape_crlf(&buffer));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
-                    return if response.is_positive() {
+                    return if accept_negative || response.is_positive() {
                         Ok(response)
                     } else {
                         Err(error::code(

@@ -21,6 +21,9 @@
 //! * Modern: unicode support for email contents and sender/recipient addresses when compatible
 //! * Fast: supports connection reuse and pooling
 //!
+//! [`LmtpTransport`] and [`AsyncLmtpTransport`] provide the same transport
+//! shape for local delivery over LMTP, returning one status per recipient.
+//!
 //! This client is designed to send emails to a relay server, and should *not* be used to send
 //! emails directly to the destination server.
 //!
@@ -186,7 +189,9 @@
 use std::time::Duration;
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
-pub use self::async_transport::{AsyncSmtpTransport, AsyncSmtpTransportBuilder};
+pub use self::async_transport::{
+    AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
+};
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
@@ -197,7 +202,7 @@ pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilde
 pub use self::pool::PoolConfig;
 pub use self::{
     error::{Error, ErrorKind},
-    transport::{SmtpTransport, SmtpTransportBuilder},
+    transport::{LmtpTransport, LmtpTransportBuilder, SmtpTransport, SmtpTransportBuilder},
 };
 use crate::transport::smtp::{
     authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism},
@@ -225,6 +230,11 @@ pub(super) mod util;
 
 /// Default smtp port
 pub const SMTP_PORT: u16 = 25;
+/// Common LMTP TCP port.
+///
+/// RFC 2033 does not assign a TCP port for LMTP. Port 24 is the closest
+/// deployed convention, notably used by Dovecot for TCP LMTP listeners.
+pub const LMTP_PORT: u16 = 24;
 /// Default submission port
 pub const SUBMISSION_PORT: u16 = 587;
 /// Default submission over TLS port
@@ -235,8 +245,25 @@ pub const SUBMISSIONS_PORT: u16 = 465;
 /// Default timeout
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protocol {
+    Smtp,
+    Lmtp,
+}
+
+impl Protocol {
+    fn default_port(self) -> u16 {
+        match self {
+            Protocol::Smtp => SMTP_PORT,
+            Protocol::Lmtp => LMTP_PORT,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SmtpInfo {
+    /// Wire protocol used for this connection.
+    protocol: Protocol,
     /// Name sent during EHLO
     hello_name: ClientId,
     /// Server we are connecting to
@@ -261,6 +288,7 @@ struct SmtpInfo {
 impl Default for SmtpInfo {
     fn default() -> Self {
         Self {
+            protocol: Protocol::Smtp,
             server: "localhost".to_owned(),
             port: SMTP_PORT,
             hello_name: ClientId::default(),
@@ -275,6 +303,15 @@ impl Default for SmtpInfo {
 }
 
 impl SmtpInfo {
+    fn new<T: Into<String>>(server: T, protocol: Protocol) -> Self {
+        Self {
+            protocol,
+            server: server.into(),
+            port: protocol.default_port(),
+            ..Default::default()
+        }
+    }
+
     fn set_credentials(&mut self, credentials: Credentials) {
         if !self.authentication_configured {
             self.authentication = credentials.preferred_mechanisms().into();
@@ -291,9 +328,13 @@ impl SmtpInfo {
         if encrypted || self.allow_insecure_auth {
             Ok(())
         } else {
-            Err(error::policy(
-                "refusing to authenticate over an unencrypted SMTP connection",
-            ))
+            let protocol = match self.protocol {
+                Protocol::Smtp => "SMTP",
+                Protocol::Lmtp => "LMTP",
+            };
+            Err(error::policy(format!(
+                "refusing to authenticate over an unencrypted {protocol} connection"
+            )))
         }
     }
 }

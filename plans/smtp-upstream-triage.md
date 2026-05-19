@@ -706,3 +706,57 @@ Verification:
 - From `crates/smtp`: `brokkr check --features async-std1` passed.
 - From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- plaintext_auth_is_refused`
   passed.
+
+## Upstream PR 831: LMTP transport support
+
+Upstream PR: https://github.com/lettre/lettre/pull/831
+
+Decision:
+
+- Take the protocol behavior, but not the upstream public const-generic
+  `SmtpTransport<true>` shape.
+- Bifrost exposes first-class `LmtpTransport` and `AsyncLmtpTransport` types.
+  This keeps SMTP and LMTP return types obvious at the call site:
+  SMTP returns one `Response`, while LMTP returns `Vec<Response>` with one
+  status per recipient.
+- Reuse the existing connection, auth, STARTTLS, timeout, and pool machinery
+  internally through a crate-private `Protocol` enum. Public callers do not see
+  that implementation detail.
+
+Implemented:
+
+- Added `LMTP_PORT = 24` and a crate-private `Protocol::{Smtp, Lmtp}`. RFC
+  2033 does not assign a TCP port, but 24 is the deployed convention used by
+  Postfix and Dovecot for TCP LMTP listeners.
+- Added the `LHLO` command.
+- Sync and async connections now send `EHLO` for SMTP and `LHLO` for LMTP.
+  AUTH and STARTTLS capability refreshes repeat the correct greeting.
+- Added LMTP message sending that preserves one status per envelope recipient.
+  Recipients rejected during `RCPT` keep that `RCPT` response; accepted
+  recipients are filled with the post-DATA delivery response in original
+  envelope order.
+- LMTP recipient 4xx/5xx statuses are returned as `Response` values instead of
+  being converted into transport errors. Protocol, parse, and network failures
+  still abort the connection and return `Error`.
+- Added `LmtpTransport`, `LmtpTransportBuilder`,
+  `AsyncLmtpTransport`, and `AsyncLmtpTransportBuilder`.
+- Added an LMTP example.
+- Added sync, tokio, and async-std protocol tests proving `LHLO` is used and
+  mixed per-recipient statuses are returned. The tests cover both an RCPT-time
+  rejection and post-DATA delivery statuses for accepted recipients.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check -- -- lmtp` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features smtp-transport,builder,pool -- -- lmtp`
+  passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool -- -- lmtp`
+  passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features async-std1,smtp-transport,builder,pool -- -- lmtp`
+  passed.
+- From `crates/smtp`: `brokkr check` passed.
+- Review follow-up: changed the LMTP TCP default from 11200 to 24 and preserved
+  RCPT-time failures in the returned per-recipient status vector.
+- Review follow-up verification from `crates/smtp`: `brokkr check -- -- lmtp`
+  passed.

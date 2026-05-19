@@ -6,7 +6,9 @@ use std::{fmt::Debug, time::Duration};
 use super::PoolConfig;
 #[cfg(feature = "pool")]
 use super::pool::sync_impl::Pool;
-use super::{ClientId, Credentials, Error, Mechanism, Response, SmtpConnection, SmtpInfo};
+use super::{
+    ClientId, Credentials, Error, Mechanism, Protocol, Response, SmtpConnection, SmtpInfo,
+};
 #[cfg(feature = "native-tls")]
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
 use crate::transport::smtp::authentication::IntoSecretString;
@@ -46,6 +48,21 @@ pub struct SmtpTransport {
     inner: SmtpClient,
 }
 
+/// Synchronously send emails using the LMTP protocol
+///
+/// `LmtpTransport` is the local-delivery counterpart to [`SmtpTransport`].
+/// LMTP uses `LHLO` for capability discovery and returns one status per
+/// envelope recipient. Rejected recipients carry their `RCPT` response;
+/// accepted recipients carry their post-DATA delivery response.
+#[cfg_attr(docsrs, doc(cfg(feature = "smtp-transport")))]
+#[derive(Clone)]
+pub struct LmtpTransport {
+    #[cfg(feature = "pool")]
+    inner: Arc<Pool>,
+    #[cfg(not(feature = "pool"))]
+    inner: SmtpClient,
+}
+
 impl Transport for SmtpTransport {
     type Ok = Response;
     type Error = Error;
@@ -68,9 +85,39 @@ impl Transport for SmtpTransport {
     }
 }
 
+impl Transport for LmtpTransport {
+    type Ok = Vec<Response>;
+    type Error = Error;
+
+    /// Sends an email and returns one LMTP status per recipient.
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        let mut conn = self.inner.connection()?;
+
+        let result = conn.send_lmtp(envelope, email)?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        Ok(result)
+    }
+
+    fn shutdown(&self) {
+        #[cfg(feature = "pool")]
+        self.inner.shutdown();
+    }
+}
+
 impl Debug for SmtpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut builder = f.debug_struct("SmtpTransport");
+        builder.field("inner", &self.inner);
+        builder.finish()
+    }
+}
+
+impl Debug for LmtpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut builder = f.debug_struct("LmtpTransport");
         builder.field("inner", &self.inner);
         builder.finish()
     }
@@ -254,6 +301,44 @@ impl SmtpTransport {
     }
 }
 
+impl LmtpTransport {
+    /// Creates a new local LMTP client to port 24.
+    ///
+    /// RFC 2033 does not assign an LMTP TCP port. Port 24 is the common TCP
+    /// convention; Unix sockets are also common but are not supported by this
+    /// transport.
+    pub fn unencrypted_localhost() -> LmtpTransport {
+        Self::builder_dangerous("localhost").build()
+    }
+
+    /// Creates a new LMTP client.
+    ///
+    /// Defaults are:
+    ///
+    /// * No authentication
+    /// * No TLS
+    /// * A 10-second timeout for SMTP commands
+    /// * Port 24, the common TCP LMTP convention
+    pub fn builder_dangerous<T: Into<String>>(server: T) -> LmtpTransportBuilder {
+        LmtpTransportBuilder::new(server)
+    }
+
+    /// Tests the LMTP connection.
+    ///
+    /// `test_connection()` tests the connection by using the SMTP NOOP command.
+    /// The connection is closed afterward if a connection pool is not used.
+    pub fn test_connection(&self) -> Result<bool, Error> {
+        let mut conn = self.inner.connection()?;
+
+        let is_connected = conn.test_connected();
+
+        #[cfg(not(feature = "pool"))]
+        conn.quit()?;
+
+        Ok(is_connected)
+    }
+}
+
 /// Contains client configuration.
 /// Instances of this struct can be created using functions of [`SmtpTransport`].
 #[derive(Debug, Clone)]
@@ -263,17 +348,21 @@ pub struct SmtpTransportBuilder {
     pool_config: PoolConfig,
 }
 
+/// Contains LMTP client configuration.
+/// Instances of this struct can be created using functions of [`LmtpTransport`].
+#[derive(Debug, Clone)]
+pub struct LmtpTransportBuilder {
+    info: SmtpInfo,
+    #[cfg(feature = "pool")]
+    pool_config: PoolConfig,
+}
+
 /// Builder for the SMTP `SmtpTransport`
 impl SmtpTransportBuilder {
     // Create new builder with default parameters
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
-        let new = SmtpInfo {
-            server: server.into(),
-            ..Default::default()
-        };
-
         Self {
-            info: new,
+            info: SmtpInfo::new(server, Protocol::Smtp),
             #[cfg(feature = "pool")]
             pool_config: PoolConfig::default(),
         }
@@ -322,7 +411,7 @@ impl SmtpTransportBuilder {
 
     /// Allow credentials to be sent over an unencrypted SMTP connection.
     ///
-    /// By default, Bifrost SMTP refuses to send passwords or bearer tokens
+    /// By default, Bifrost LMTP refuses to send passwords or bearer tokens
     /// unless the connection is already encrypted by TLS or has been upgraded
     /// with STARTTLS. Set this only for trusted local relays or test servers.
     pub fn dangerous_allow_insecure_auth(mut self, allow: bool) -> Self {
@@ -355,7 +444,11 @@ impl SmtpTransportBuilder {
         self
     }
 
-    /// Set the TLS settings to use
+    /// Set the TLS settings to use.
+    ///
+    /// LMTP-over-TLS and STARTTLS are supported through the same TLS modes as
+    /// SMTP. After STARTTLS succeeds, the client refreshes capabilities with
+    /// `LHLO`.
     ///
     /// # Warning
     ///
@@ -400,6 +493,112 @@ impl SmtpTransportBuilder {
     }
 }
 
+/// Builder for the LMTP `LmtpTransport`
+impl LmtpTransportBuilder {
+    // Create new builder with default parameters
+    pub(crate) fn new<T: Into<String>>(server: T) -> Self {
+        Self {
+            info: SmtpInfo::new(server, Protocol::Lmtp),
+            #[cfg(feature = "pool")]
+            pool_config: PoolConfig::default(),
+        }
+    }
+
+    /// Set the name used during LHLO
+    pub fn hello_name(mut self, name: ClientId) -> Self {
+        self.info.hello_name = name;
+        self
+    }
+
+    /// Set the authentication credentials to use
+    ///
+    /// Unless [`Self::authentication`] was called explicitly, this also selects
+    /// the default mechanisms for the credential kind.
+    pub fn credentials(mut self, credentials: Credentials) -> Self {
+        self.info.set_credentials(credentials);
+        self
+    }
+
+    /// Set username and password authentication credentials.
+    pub fn password<U, P>(self, username: U, password: P) -> Self
+    where
+        U: Into<String>,
+        P: IntoSecretString,
+    {
+        self.credentials(Credentials::password(username, password))
+    }
+
+    /// Set OAuth 2.0 bearer-token authentication credentials.
+    ///
+    /// This configures `OAUTHBEARER` and `XOAUTH2`, in that preference order.
+    pub fn oauth2<I, T>(self, identity: I, access_token: T) -> Self
+    where
+        I: Into<String>,
+        T: IntoSecretString,
+    {
+        self.credentials(Credentials::oauth2(identity, access_token))
+    }
+
+    /// Set the authentication mechanism to use
+    pub fn authentication(mut self, mechanisms: Vec<Mechanism>) -> Self {
+        self.info.set_authentication(mechanisms);
+        self
+    }
+
+    /// Allow credentials to be sent over an unencrypted LMTP connection.
+    ///
+    /// By default, Bifrost SMTP refuses to send passwords or bearer tokens
+    /// unless the connection is already encrypted by TLS or has been upgraded
+    /// with STARTTLS. Set this only for trusted local relays or test servers.
+    pub fn dangerous_allow_insecure_auth(mut self, allow: bool) -> Self {
+        self.info.allow_insecure_auth = allow;
+        self
+    }
+
+    /// Set the timeout duration
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.info.timeout = timeout;
+        self
+    }
+
+    /// Set the port to use
+    pub fn port(mut self, port: u16) -> Self {
+        self.info.port = port;
+        self
+    }
+
+    /// Set the TLS settings to use
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    pub fn tls(mut self, tls: Tls) -> Self {
+        self.info.tls = tls;
+        self
+    }
+
+    /// Use a custom configuration for the connection pool
+    ///
+    /// Defaults can be found at [`PoolConfig`]
+    #[cfg(feature = "pool")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
+    pub fn pool_config(mut self, pool_config: PoolConfig) -> Self {
+        self.pool_config = pool_config;
+        self
+    }
+
+    /// Build the transport
+    ///
+    /// If the `pool` feature is enabled, an `Arc` wrapped pool is created.
+    /// Defaults can be found at [`PoolConfig`]
+    pub fn build(self) -> LmtpTransport {
+        let client = SmtpClient { info: self.info };
+
+        #[cfg(feature = "pool")]
+        let client = Pool::new(self.pool_config, client);
+
+        LmtpTransport { inner: client }
+    }
+}
+
 /// Build client
 #[derive(Debug, Clone)]
 pub(super) struct SmtpClient {
@@ -419,12 +618,13 @@ impl SmtpClient {
         };
 
         #[allow(unused_mut)]
-        let mut conn = SmtpConnection::connect::<(&str, u16)>(
+        let mut conn = SmtpConnection::connect_with_protocol::<(&str, u16)>(
             (self.info.server.as_ref(), self.info.port),
             self.info.timeout,
             &self.info.hello_name,
             tls_parameters,
             None,
+            self.info.protocol,
         )?;
 
         #[cfg(feature = "native-tls")]
@@ -459,13 +659,14 @@ mod tests {
     #[cfg(feature = "native-tls")]
     use crate::transport::smtp::Tls;
     use crate::{
-        SmtpTransport,
+        LmtpTransport, SmtpTransport, Transport,
+        address::Envelope,
         transport::smtp::authentication::{
             Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
         },
     };
 
-    use super::SmtpClient;
+    use super::{Protocol, SmtpClient};
 
     #[test]
     fn transport_from_plaintext_url() {
@@ -473,6 +674,103 @@ mod tests {
 
         assert_eq!(builder.info.port, 2525);
         assert_eq!(builder.info.server, "127.0.0.1");
+    }
+
+    #[test]
+    fn lmtp_builder_uses_lmtp_defaults() {
+        let builder = LmtpTransport::builder_dangerous("localhost");
+
+        assert_eq!(builder.info.port, super::super::LMTP_PORT);
+        assert_eq!(builder.info.protocol, Protocol::Lmtp);
+    }
+
+    #[test]
+    fn lmtp_transport_returns_per_recipient_statuses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut lhlo = String::new();
+            reader.read_line(&mut lhlo).unwrap();
+            commands.push(lhlo);
+            stream
+                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
+                .unwrap();
+
+            for response in [
+                b"250 sender ok\r\n".as_slice(),
+                b"250 rcpt ok\r\n".as_slice(),
+                b"550 rcpt rejected\r\n".as_slice(),
+                b"250 rcpt ok\r\n".as_slice(),
+            ] {
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                commands.push(command);
+                stream.write_all(response).unwrap();
+            }
+
+            let mut data = String::new();
+            reader.read_line(&mut data).unwrap();
+            commands.push(data);
+            stream.write_all(b"354 send message\r\n").unwrap();
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(b"250 first recipient ok\r\n451 third recipient deferred\r\n")
+                .unwrap();
+            commands_tx.send(commands).unwrap();
+        });
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer = LmtpTransport::builder_dangerous("127.0.0.1")
+            .port(address.port())
+            .build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(!responses[1].is_positive());
+        assert!(responses[2].has_code(451));
+        assert!(!responses[2].is_positive());
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("LHLO "));
+        assert!(commands[1].starts_with("MAIL FROM:<sender@example.com>"));
+        assert!(commands[2].starts_with("RCPT TO:<first@example.com>"));
+        assert!(commands[3].starts_with("RCPT TO:<second@example.com>"));
+        assert!(commands[4].starts_with("RCPT TO:<third@example.com>"));
+        assert_eq!(commands[5], "DATA\r\n");
+        handle.join().unwrap();
     }
 
     #[test]

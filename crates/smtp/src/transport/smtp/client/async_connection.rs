@@ -15,8 +15,9 @@ use super::{
 use crate::{
     Envelope,
     transport::smtp::{
+        Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt, Starttls},
+        commands::{Auth, Data, Ehlo, Lhlo, Mail, Noop, Quit, Rcpt, Starttls},
         error,
         error::Error,
         extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},
@@ -91,6 +92,8 @@ pub(crate) struct AsyncSmtpConnection {
     server_info: ServerInfo,
     /// Client identity used for EHLO.
     hello_name: ClientId,
+    /// Wire protocol used for this connection.
+    protocol: Protocol,
     /// Timeout applied to each async SMTP I/O operation.
     timeout: Option<Duration>,
     timeout_runtime: TimeoutRuntime,
@@ -137,6 +140,7 @@ impl AsyncSmtpConnection {
     /// # }
     /// ```
     #[cfg(feature = "tokio1")]
+    #[cfg(test)]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
     pub(crate) async fn connect_tokio1<T: tokio1_crate::net::ToSocketAddrs>(
         server: T,
@@ -144,6 +148,26 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         tls_parameters: Option<TlsParameters>,
         local_address: Option<IpAddr>,
+    ) -> Result<AsyncSmtpConnection, Error> {
+        Self::connect_tokio1_with_protocol(
+            server,
+            timeout,
+            hello_name,
+            tls_parameters,
+            local_address,
+            Protocol::Smtp,
+        )
+        .await
+    }
+
+    #[cfg(feature = "tokio1")]
+    pub(crate) async fn connect_tokio1_with_protocol<T: tokio1_crate::net::ToSocketAddrs>(
+        server: T,
+        timeout: Option<Duration>,
+        hello_name: &ClientId,
+        tls_parameters: Option<TlsParameters>,
+        local_address: Option<IpAddr>,
+        protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
         #[allow(deprecated)]
@@ -160,6 +184,7 @@ impl AsyncSmtpConnection {
             timeout,
             TimeoutRuntime::Tokio1,
             TimeoutBudget::SetupDeadline(deadline),
+            protocol,
         )
         .await
     }
@@ -168,12 +193,31 @@ impl AsyncSmtpConnection {
     ///
     /// Sends EHLO and parses server information
     #[cfg(feature = "async-std1")]
+    #[cfg(test)]
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std1")))]
     pub(crate) async fn connect_asyncstd1<T: async_std::net::ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls_parameters: Option<TlsParameters>,
+    ) -> Result<AsyncSmtpConnection, Error> {
+        Self::connect_asyncstd1_with_protocol(
+            server,
+            timeout,
+            hello_name,
+            tls_parameters,
+            Protocol::Smtp,
+        )
+        .await
+    }
+
+    #[cfg(feature = "async-std1")]
+    pub(crate) async fn connect_asyncstd1_with_protocol<T: async_std::net::ToSocketAddrs>(
+        server: T,
+        timeout: Option<Duration>,
+        hello_name: &ClientId,
+        tls_parameters: Option<TlsParameters>,
+        protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
         #[allow(deprecated)]
@@ -185,6 +229,7 @@ impl AsyncSmtpConnection {
             timeout,
             TimeoutRuntime::AsyncStd1,
             TimeoutBudget::SetupDeadline(deadline),
+            protocol,
         )
         .await
     }
@@ -196,6 +241,7 @@ impl AsyncSmtpConnection {
         timeout: Option<Duration>,
         timeout_runtime: TimeoutRuntime,
         setup_budget: TimeoutBudget,
+        protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         let stream = BufReader::new(stream);
         let mut conn = AsyncSmtpConnection {
@@ -203,13 +249,14 @@ impl AsyncSmtpConnection {
             panic: false,
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
+            protocol,
             timeout,
             timeout_runtime,
         };
         // TODO log
         let _response = conn.read_response_with_budget(setup_budget).await?;
 
-        conn.ehlo_with_budget(hello_name, setup_budget).await?;
+        conn.hello_with_budget(hello_name, setup_budget).await?;
 
         // Print server information
         #[cfg(feature = "tracing")]
@@ -222,6 +269,80 @@ impl AsyncSmtpConnection {
         envelope: &Envelope,
         email: &[u8],
     ) -> Result<Response, Error> {
+        let mail_options = self.mail_options(envelope, email)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options))
+                .await,
+            self
+        );
+
+        for to_address in envelope.to() {
+            try_smtp!(
+                self.command(Rcpt::new(to_address.clone(), vec![])).await,
+                self
+            );
+        }
+
+        try_smtp!(self.command(Data).await, self);
+        let result = try_smtp!(self.message(email).await, self);
+        Ok(result)
+    }
+
+    pub(crate) async fn send_lmtp(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+    ) -> Result<Vec<Response>, Error> {
+        let mail_options = self.mail_options(envelope, email)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options))
+                .await,
+            self
+        );
+
+        let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
+        let mut accepted_recipients = 0;
+
+        for to_address in envelope.to() {
+            let response = try_smtp!(
+                self.command_accepting_status(Rcpt::new(to_address.clone(), vec![]))
+                    .await,
+                self
+            );
+            if response.is_positive() {
+                accepted_recipients += 1;
+                recipient_statuses.push(None);
+            } else {
+                recipient_statuses.push(Some(response));
+            }
+        }
+
+        if accepted_recipients == 0 {
+            return Ok(recipient_statuses
+                .into_iter()
+                .map(|response| response.expect("all recipients were rejected"))
+                .collect());
+        }
+
+        try_smtp!(self.command(Data).await, self);
+        let mut delivery_statuses =
+            try_smtp!(self.message_lmtp(email, accepted_recipients).await, self).into_iter();
+
+        Ok(recipient_statuses
+            .into_iter()
+            .map(|response| {
+                response.unwrap_or_else(|| {
+                    delivery_statuses
+                        .next()
+                        .expect("server returned one status per accepted recipient")
+                })
+            })
+            .collect())
+    }
+
+    fn mail_options(&self, envelope: &Envelope, email: &[u8]) -> Result<Vec<MailParameter>, Error> {
         // Mail
         let mut mail_options = vec![];
 
@@ -251,26 +372,7 @@ impl AsyncSmtpConnection {
             mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
         }
 
-        try_smtp!(
-            self.command(Mail::new(envelope.from().cloned(), mail_options))
-                .await,
-            self
-        );
-
-        // Recipient
-        for to_address in envelope.to() {
-            try_smtp!(
-                self.command(Rcpt::new(to_address.clone(), vec![])).await,
-                self
-            );
-        }
-
-        // Data
-        try_smtp!(self.command(Data).await, self);
-
-        // Message content
-        let result = try_smtp!(self.message(email).await, self);
-        Ok(result)
+        Ok(mail_options)
     }
 
     pub(crate) fn has_broken(&self) -> bool {
@@ -305,8 +407,8 @@ impl AsyncSmtpConnection {
                 .await?;
             #[cfg(feature = "tracing")]
             tracing::debug!("connection encrypted");
-            // Send EHLO again
-            try_smtp!(self.ehlo(hello_name).await, self);
+            // Send EHLO/LHLO again
+            try_smtp!(self.hello(hello_name).await, self);
             self.hello_name = hello_name.clone();
             Ok(())
         } else {
@@ -314,23 +416,34 @@ impl AsyncSmtpConnection {
         }
     }
 
-    /// Send EHLO and update server info
-    async fn ehlo(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        self.ehlo_with_budget(hello_name, self.per_operation_budget())
+    /// Send EHLO or LHLO and update server info
+    async fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
+        self.hello_with_budget(hello_name, self.per_operation_budget())
             .await
     }
 
-    async fn ehlo_with_budget(
+    async fn hello_with_budget(
         &mut self,
         hello_name: &ClientId,
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
-        let ehlo_response = try_smtp!(
-            self.command_with_budget(Ehlo::new(hello_name.clone()), budget)
-                .await,
-            self
-        );
-        self.server_info = try_smtp!(ServerInfo::from_response(&ehlo_response), self);
+        let response = match self.protocol {
+            Protocol::Smtp => {
+                try_smtp!(
+                    self.command_with_budget(Ehlo::new(hello_name.clone()), budget)
+                        .await,
+                    self
+                )
+            }
+            Protocol::Lmtp => {
+                try_smtp!(
+                    self.command_with_budget(Lhlo::new(hello_name.clone()), budget)
+                        .await,
+                    self
+                )
+            }
+        };
+        self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())
     }
 
@@ -397,7 +510,7 @@ impl AsyncSmtpConnection {
             Err(error::response("Unexpected number of challenges"))
         } else {
             let hello_name = self.hello_name.clone();
-            try_smtp!(self.ehlo(&hello_name).await, self);
+            try_smtp!(self.hello(&hello_name).await, self);
             Ok(response)
         }
     }
@@ -405,6 +518,15 @@ impl AsyncSmtpConnection {
     /// Sends the message content
     pub(crate) async fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message)).await
+    }
+
+    pub(crate) async fn message_lmtp(
+        &mut self,
+        message: &[u8],
+        recipients: usize,
+    ) -> Result<Vec<Response>, Error> {
+        self.message_lmtp_iter(std::iter::once(message), recipients)
+            .await
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
@@ -425,6 +547,33 @@ impl AsyncSmtpConnection {
         self.read_response().await
     }
 
+    /// Sends the message content and reads one LMTP status per recipient.
+    pub(crate) async fn message_lmtp_iter<I, B>(
+        &mut self,
+        message: I,
+        recipients: usize,
+    ) -> Result<Vec<Response>, Error>
+    where
+        I: Iterator<Item = B>,
+        B: AsRef<[u8]>,
+    {
+        let mut codec = ClientCodec::new();
+        for message_part in message {
+            let message_part = message_part.as_ref();
+            let mut out_buf = Vec::with_capacity(message_part.len());
+            codec.encode(message_part, &mut out_buf);
+            self.write(out_buf.as_slice()).await?;
+        }
+        self.write(b"\r\n.\r\n").await?;
+
+        let mut responses = Vec::with_capacity(recipients);
+        for _ in 0..recipients {
+            responses.push(self.read_response_accepting_status().await?);
+        }
+
+        Ok(responses)
+    }
+
     /// Sends an SMTP command
     pub(crate) async fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
         self.command_with_budget(command, self.per_operation_budget())
@@ -439,6 +588,14 @@ impl AsyncSmtpConnection {
         self.write_with_budget(command.to_string().as_bytes(), budget)
             .await?;
         self.read_response_with_budget(budget).await
+    }
+
+    async fn command_accepting_status<C: Display>(
+        &mut self,
+        command: C,
+    ) -> Result<Response, Error> {
+        self.write(command.to_string().as_bytes()).await?;
+        self.read_response_accepting_status().await
     }
 
     /// Writes a string to the server
@@ -480,9 +637,22 @@ impl AsyncSmtpConnection {
             .await
     }
 
+    async fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
+        self.read_response_with_budget_inner(self.per_operation_budget(), true)
+            .await
+    }
+
     async fn read_response_with_budget(
         &mut self,
         budget: TimeoutBudget,
+    ) -> Result<Response, Error> {
+        self.read_response_with_budget_inner(budget, false).await
+    }
+
+    async fn read_response_with_budget_inner(
+        &mut self,
+        budget: TimeoutBudget,
+        accept_negative: bool,
     ) -> Result<Response, Error> {
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
@@ -509,7 +679,7 @@ impl AsyncSmtpConnection {
             tracing::debug!("<< {}", escape_crlf(&buffer));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
-                    return if response.is_positive() {
+                    return if accept_negative || response.is_positive() {
                         Ok(response)
                     } else {
                         Err(error::code(

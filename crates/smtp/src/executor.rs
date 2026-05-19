@@ -23,6 +23,11 @@ use crate::transport::smtp::Error;
     feature = "smtp-transport",
     any(feature = "tokio1", feature = "async-std1")
 ))]
+use crate::transport::smtp::Protocol;
+#[cfg(all(
+    feature = "smtp-transport",
+    any(feature = "tokio1", feature = "async-std1")
+))]
 use crate::transport::smtp::Tls;
 #[cfg(all(
     feature = "smtp-transport",
@@ -86,6 +91,7 @@ pub(crate) trait SmtpExecutor: Executor {
         timeout: Option<Duration>,
         hello_name: &'a ClientId,
         tls: &'a Tls,
+        protocol: Protocol,
     ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
 }
 
@@ -147,6 +153,7 @@ impl SmtpExecutor for Tokio1Executor {
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls: &Tls,
+        protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         #[allow(clippy::match_single_binding)]
         let tls_parameters = match tls {
@@ -155,12 +162,13 @@ impl SmtpExecutor for Tokio1Executor {
             _ => None,
         };
         #[allow(unused_mut)]
-        let mut conn = AsyncSmtpConnection::connect_tokio1(
+        let mut conn = AsyncSmtpConnection::connect_tokio1_with_protocol(
             (hostname, port),
             timeout,
             hello_name,
             tls_parameters,
             None,
+            protocol,
         )
         .await?;
 
@@ -247,6 +255,7 @@ impl SmtpExecutor for AsyncStd1Executor {
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls: &Tls,
+        protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         #[cfg(feature = "native-tls")]
         if !matches!(tls, Tls::None) {
@@ -257,7 +266,14 @@ impl SmtpExecutor for AsyncStd1Executor {
         #[cfg(not(feature = "native-tls"))]
         let _ = tls;
 
-        AsyncSmtpConnection::connect_asyncstd1((hostname, port), timeout, hello_name, None).await
+        AsyncSmtpConnection::connect_asyncstd1_with_protocol(
+            (hostname, port),
+            timeout,
+            hello_name,
+            None,
+            protocol,
+        )
+        .await
     }
 }
 

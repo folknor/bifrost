@@ -35,3 +35,8 @@ transport uses the first configured mechanism advertised by the server.
 Passwords and bearer tokens are refused on plaintext SMTP connections by
 default. Trusted local test relays can opt in with
 `.dangerous_allow_insecure_auth(true)`.
+
+Local delivery over LMTP is available through `LmtpTransport` and
+`AsyncLmtpTransport`. LMTP sends `LHLO` and returns one SMTP `Response` per
+recipient. Rejected recipients carry their `RCPT` response; accepted recipients
+carry their post-DATA delivery response.

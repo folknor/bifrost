@@ -201,9 +201,9 @@ pub use crate::transport::sendmail::SendmailTransport;
     feature = "smtp-transport",
     any(feature = "tokio1", feature = "async-std1")
 ))]
-pub use crate::transport::smtp::AsyncSmtpTransport;
+pub use crate::transport::smtp::{AsyncLmtpTransport, AsyncSmtpTransport};
 #[cfg(feature = "smtp-transport")]
-pub use crate::transport::smtp::SmtpTransport;
+pub use crate::transport::smtp::{LmtpTransport, SmtpTransport};
 #[doc(inline)]
 pub use crate::transport::{BoxedTransport, Transport};
 use crate::{address::Envelope, error::Error};
