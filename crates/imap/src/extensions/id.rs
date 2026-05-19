@@ -52,7 +52,7 @@ pub(crate) async fn parse_id<T: Stream<Item = io::Result<ResponseData>> + Unpin>
                     m.iter()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect()
-                })
+                });
             }
             _ => {
                 handle_unilateral(resp, unsolicited.clone());

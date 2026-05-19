@@ -1,14 +1,14 @@
 use std::fmt;
 use std::pin::Pin;
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_std::io::{Read, Write, WriteExt};
 use bytes::BytesMut;
 use futures::stream::Stream;
 use futures::task::{Context, Poll};
 use futures::{io, ready};
 use nom::Needed;
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
 use crate::types::{Request, ResponseData};
@@ -162,10 +162,10 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             // even if it is called with 0 as an argument.
             debug_assert!(!buf.is_empty());
 
-            #[cfg(feature = "runtime-async-std")]
+            #[cfg(feature = "async-std1")]
             let num_bytes_read = ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
 
-            #[cfg(feature = "runtime-tokio")]
+            #[cfg(feature = "tokio1")]
             let num_bytes_read = {
                 let buf = &mut tokio::io::ReadBuf::new(buf);
                 let start = buf.filled().len();
@@ -371,7 +371,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "runtime-tokio")]
+    #[cfg(feature = "tokio1")]
     impl Read for FailingStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -389,7 +389,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "runtime-async-std")]
+    #[cfg(feature = "async-std1")]
     impl Read for FailingStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -407,7 +407,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "runtime-tokio")]
+    #[cfg(feature = "tokio1")]
     impl Write for FailingStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -429,7 +429,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "runtime-async-std")]
+    #[cfg(feature = "async-std1")]
     impl Write for FailingStream {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -461,8 +461,8 @@ mod tests {
     /// reading from a network stream
     /// after a temporary error such as a timeout
     /// or returning an inifinite stream of errors.
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn test_imap_stream_error() {
         use futures::StreamExt;
 

@@ -4,7 +4,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_std::{
     future::timeout,
     io::{Read, Write},
@@ -13,7 +13,7 @@ use futures::prelude::*;
 use futures::task::{Context, Poll};
 use imap_proto::{RequestId, Response, Status};
 use stop_token::prelude::*;
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use tokio::{
     io::{AsyncRead as Read, AsyncWrite as Write},
     time::timeout,
@@ -193,14 +193,14 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Handle<T> {
                     information,
                     ..
                 } => {
-                    if tag == self.id.as_ref().unwrap() {
-                        if let Status::Bad = status {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionRefused,
-                                information.as_ref().unwrap().to_string(),
-                            )
-                            .into());
-                        }
+                    if tag == self.id.as_ref().unwrap()
+                        && let Status::Bad = status
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            information.as_ref().unwrap().to_string(),
+                        )
+                        .into());
                     }
                     handle_unilateral(res, self.session.unsolicited_responses_tx.clone());
                 }

@@ -90,7 +90,7 @@ impl From<QuotaRootRef<'_>> for QuotaRoot {
             quota_root_names: root
                 .quota_root_names
                 .iter()
-                .map(|n| n.to_string())
+                .map(ToString::to_string)
                 .collect(),
         }
     }

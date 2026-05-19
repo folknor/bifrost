@@ -3,9 +3,9 @@ use std::io::{Error, ErrorKind, Result};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_std::io::{Read, Write};
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write};
 
 #[derive(Default, Clone, Debug, Eq, PartialEq, Hash)]
@@ -44,7 +44,7 @@ impl MockStream {
     }
 }
 
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 impl Read for MockStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -72,7 +72,7 @@ impl Read for MockStream {
     }
 }
 
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 impl Write for MockStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -92,7 +92,7 @@ impl Write for MockStream {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 impl Read for MockStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -122,7 +122,7 @@ impl Read for MockStream {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 impl Write for MockStream {
     fn poll_write(
         mut self: Pin<&mut Self>,

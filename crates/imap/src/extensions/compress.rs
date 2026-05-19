@@ -6,27 +6,27 @@ use std::task::{Context, Poll};
 
 use pin_project::pin_project;
 
+use crate::Connection;
 use crate::client::Session;
 use crate::error::Result;
 use crate::imap_stream::ImapStream;
 use crate::types::IdGenerator;
-use crate::Connection;
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_std::io::{IoSlice, IoSliceMut, Read, Write};
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use futures::io::BufReader;
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, BufReader, ReadBuf};
 
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use async_compression::tokio::bufread::DeflateDecoder;
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use async_compression::tokio::write::DeflateEncoder;
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_compression::futures::bufread::DeflateDecoder;
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_compression::futures::write::DeflateEncoder;
 
 /// Network stream compressed with DEFLATE.
@@ -61,7 +61,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -72,7 +72,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -91,7 +91,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Read for DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -128,7 +128,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
     }
 }
 
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 impl<T: Read + Write + Unpin + fmt::Debug> Write for DeflateStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,

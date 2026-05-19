@@ -20,7 +20,7 @@ name = "default"
 [[check]]
 name = "minimal"
 no_default_features = true
-features = ["bifrost-jmap/tls-native", "bifrost-imap/runtime-async-std"]
+features = ["bifrost-jmap/tls-native", "bifrost-imap/async-std1"]
 
 [test]
 default_package = "bifrost-jmap"

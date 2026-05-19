@@ -5,14 +5,14 @@ use std::pin::Pin;
 use std::str;
 
 use async_channel::{self as channel, bounded};
-#[cfg(feature = "runtime-async-std")]
+#[cfg(feature = "async-std1")]
 use async_std::io::{Read, Write, WriteExt};
 use base64::Engine as _;
 use extensions::id::{format_identification, parse_id};
 use extensions::quota::parse_get_quota_root;
-use futures::{io, Stream, TryStreamExt};
+use futures::{Stream, TryStreamExt, io};
 use imap_proto::{Metadata, RequestId, Response};
-#[cfg(feature = "runtime-tokio")]
+#[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
 use super::authenticator::Authenticator;
@@ -761,9 +761,9 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// ```no_run
     /// use bifrost_imap::{types::Seq, Session, error::Result};
-    /// #[cfg(feature = "runtime-async-std")]
+    /// #[cfg(feature = "async-std1")]
     /// use async_std::net::TcpStream;
-    /// #[cfg(feature = "runtime-tokio")]
+    /// #[cfg(feature = "tokio1")]
     /// use tokio::net::TcpStream;
     /// use futures::TryStreamExt;
     ///
@@ -1512,8 +1512,8 @@ mod tests {
         };
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn fetch_body() {
         let response = "a0 OK Logged in.\r\n\
                         * 2 FETCH (BODY[TEXT] {3}\r\nfoo)\r\n\
@@ -1523,8 +1523,8 @@ mod tests {
         session.read_response().await.unwrap().unwrap();
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn readline_delay_read() {
         let greeting = "* OK Dovecot ready.\r\n";
         let mock_stream = MockStream::default()
@@ -1543,8 +1543,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn readline_eof() {
         let mock_stream = MockStream::default().with_eof();
         let mut client = mock_client!(mock_stream);
@@ -1552,8 +1552,8 @@ mod tests {
         assert!(res.is_none());
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     #[should_panic]
     async fn readline_err() {
         // TODO Check the error test
@@ -1562,8 +1562,8 @@ mod tests {
         client.read_response().await.unwrap().unwrap();
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn authenticate() {
         let response = b"+ YmFy\r\n\
                          A0001 OK Logged in\r\n"
@@ -1594,8 +1594,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn login() {
         let response = b"A0001 OK Logged in\r\n".to_vec();
         let username = "username";
@@ -1614,8 +1614,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn logout() {
         let response = b"A0001 OK Logout completed.\r\n".to_vec();
         let command = "A0001 LOGOUT\r\n";
@@ -1628,8 +1628,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn rename() {
         let response = b"A0001 OK RENAME completed\r\n".to_vec();
         let current_mailbox_name = "INBOX";
@@ -1651,8 +1651,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn subscribe() {
         let response = b"A0001 OK SUBSCRIBE completed\r\n".to_vec();
         let mailbox = "INBOX";
@@ -1666,8 +1666,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn unsubscribe() {
         let response = b"A0001 OK UNSUBSCRIBE completed\r\n".to_vec();
         let mailbox = "INBOX";
@@ -1681,8 +1681,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn expunge() {
         let response = b"A0001 OK EXPUNGE completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1694,8 +1694,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_expunge() {
         let response = b"* 2 EXPUNGE\r\n\
             * 3 EXPUNGE\r\n\
@@ -1716,8 +1716,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn check() {
         let response = b"A0001 OK CHECK completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1729,8 +1729,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn examine() {
         let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
             * OK [PERMANENTFLAGS ()] Read-only mailbox.\r\n\
@@ -1769,8 +1769,8 @@ mod tests {
         assert_eq!(mailbox, expected_mailbox);
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn select() {
         let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
             * OK [PERMANENTFLAGS (\\* \\Answered \\Flagged \\Deleted \\Draft \\Seen)] \
@@ -1818,8 +1818,8 @@ mod tests {
         assert_eq!(mailbox, expected_mailbox);
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn search() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0001 OK Search completed\r\n"
@@ -1827,16 +1827,16 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let ids = session.search("Unseen").await.unwrap();
-        let ids: HashSet<u32> = ids.iter().cloned().collect();
+        let ids: HashSet<u32> = ids.iter().copied().collect();
         assert!(
             session.stream.inner.written_buf == b"A0001 SEARCH Unseen\r\n".to_vec(),
             "Invalid search command"
         );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
+        assert_eq!(ids, [1, 2, 3, 4, 5].iter().copied().collect());
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_search() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0001 OK Search completed\r\n"
@@ -1844,16 +1844,16 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let ids = session.uid_search("Unseen").await.unwrap();
-        let ids: HashSet<Uid> = ids.iter().cloned().collect();
+        let ids: HashSet<Uid> = ids.iter().copied().collect();
         assert!(
             session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(),
             "Invalid search command"
         );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
+        assert_eq!(ids, [1, 2, 3, 4, 5].iter().copied().collect());
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_search_unordered() {
         let response = b"* SEARCH 1 2 3 4 5\r\n\
             A0002 OK CAPABILITY completed\r\n\
@@ -1862,16 +1862,16 @@ mod tests {
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
         let ids = session.uid_search("Unseen").await.unwrap();
-        let ids: HashSet<Uid> = ids.iter().cloned().collect();
+        let ids: HashSet<Uid> = ids.iter().copied().collect();
         assert!(
             session.stream.inner.written_buf == b"A0001 UID SEARCH Unseen\r\n".to_vec(),
             "Invalid search command"
         );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
+        assert_eq!(ids, [1, 2, 3, 4, 5].iter().copied().collect());
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn capability() {
         let response = b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n\
             A0001 OK CAPABILITY completed\r\n"
@@ -1890,8 +1890,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn create() {
         let response = b"A0001 OK CREATE completed\r\n".to_vec();
         let mailbox_name = "INBOX";
@@ -1905,8 +1905,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn delete() {
         let response = b"A0001 OK DELETE completed\r\n".to_vec();
         let mailbox_name = "INBOX";
@@ -1920,8 +1920,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn noop() {
         let response = b"A0001 OK NOOP completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1933,8 +1933,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn close() {
         let response = b"A0001 OK CLOSE completed\r\n".to_vec();
         let mock_stream = MockStream::new(response);
@@ -1946,8 +1946,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn store() {
         generic_store(" ", |c, set, query| async move {
             c.lock()
@@ -1961,8 +1961,8 @@ mod tests {
         .await;
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_store() {
         generic_store(" UID ", |c, set, query| async move {
             c.lock()
@@ -1989,8 +1989,8 @@ mod tests {
         generic_with_uid(res, "STORE", "2.4", "+FLAGS (\\Deleted)", prefix, op).await;
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn copy() {
         generic_copy(" ", |c, set, query| async move {
             c.lock().await.copy(set, query).await?;
@@ -1999,8 +1999,8 @@ mod tests {
         .await;
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_copy() {
         generic_copy(" UID ", |c, set, query| async move {
             c.lock().await.uid_copy(set, query).await?;
@@ -2021,7 +2021,7 @@ mod tests {
         let session = Arc::new(Mutex::new(mock_session!(MockStream::new(resp))));
 
         {
-            let _ = op(session.clone(), seq, query).await.unwrap();
+            let _ = op(Arc::clone(&session), seq, query).await.unwrap();
         }
         assert!(
             session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(),
@@ -2029,8 +2029,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn mv() {
         let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
             * 2 EXPUNGE\r\n\
@@ -2048,8 +2048,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_mv() {
         let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
             * 2 EXPUNGE\r\n\
@@ -2067,8 +2067,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn fetch() {
         generic_fetch(" ", |c, seq, query| async move {
             c.lock()
@@ -2083,8 +2083,8 @@ mod tests {
         .await;
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_fetch() {
         generic_fetch(" UID ", |c, seq, query| async move {
             c.lock()
@@ -2098,8 +2098,8 @@ mod tests {
         .await;
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn fetch_unexpected_eof() {
         // Connection is lost, there will never be any response.
         let response = b"".to_vec();
@@ -2159,7 +2159,7 @@ mod tests {
         let session = Arc::new(Mutex::new(mock_session!(MockStream::new(resp))));
 
         {
-            let _ = op(session.clone(), seq, query).await.unwrap();
+            let _ = op(Arc::clone(&session), seq, query).await.unwrap();
         }
         assert!(
             session.lock().await.stream.inner.written_buf == line.as_bytes().to_vec(),
@@ -2187,35 +2187,27 @@ mod tests {
 
     #[test]
     fn validate_newline() {
-        if let Err(ref e) = validate_str("test\nstring") {
-            if let Error::Validate(ref ve) = e {
-                if ve.0 == '\n' {
-                    return;
-                }
-            }
-            panic!("Wrong error: {e:?}");
+        match validate_str("test\nstring") {
+            Err(Error::Validate(ve)) if ve.0 == '\n' => {}
+            Err(e) => panic!("Wrong error: {e:?}"),
+            Ok(_) => panic!("No error"),
         }
-        panic!("No error");
     }
 
     #[test]
     #[allow(unreachable_patterns)]
     fn validate_carriage_return() {
-        if let Err(ref e) = validate_str("test\rstring") {
-            if let Error::Validate(ref ve) = e {
-                if ve.0 == '\r' {
-                    return;
-                }
-            }
-            panic!("Wrong error: {e:?}");
+        match validate_str("test\rstring") {
+            Err(Error::Validate(ve)) if ve.0 == '\r' => {}
+            Err(e) => panic!("Wrong error: {e:?}"),
+            Ok(_) => panic!("No error"),
         }
-        panic!("No error");
     }
 
     /// Emulates a server responding to `FETCH` requests
     /// with a body of 76 bytes of headers and N 74-byte lines,
     /// where N is the requested message sequence number.
-    #[cfg(feature = "runtime-tokio")]
+    #[cfg(feature = "tokio1")]
     async fn handle_client(stream: tokio::io::DuplexStream) -> Result<()> {
         use tokio::io::AsyncBufReadExt;
 
@@ -2249,7 +2241,9 @@ mod tests {
             }
             let body_len = body.len();
 
-            let response = format!("* {id} FETCH (RFC822.SIZE {body_len} BODY[] {{{body_len}}}\r\n{body} FLAGS (\\Seen))\r\n");
+            let response = format!(
+                "* {id} FETCH (RFC822.SIZE {body_len} BODY[] {{{body_len}}}\r\n{body} FLAGS (\\Seen))\r\n"
+            );
             writer.write_all(response.as_bytes()).await?;
             writer
                 .write_all(format!("{request_id} OK FETCH completed\r\n").as_bytes())
@@ -2266,9 +2260,9 @@ mod tests {
     /// which sometimes failed to allocate free buffer space,
     /// read into a buffer of zero size and erroneously detected it
     /// as the end of stream.
-    #[cfg(feature = "runtime-tokio")]
+    #[cfg(feature = "tokio1")]
     #[cfg_attr(
-        feature = "runtime-tokio",
+        feature = "tokio1",
         tokio::test(flavor = "multi_thread", worker_threads = 2)
     )]
     async fn large_fetch() -> Result<()> {
@@ -2300,8 +2294,8 @@ mod tests {
         Ok(())
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn status() {
         {
             let response = b"* STATUS INBOX (UIDNEXT 25)\r\n\
@@ -2354,8 +2348,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn append() {
         {
             // APPEND command when INBOX is *not* selected.
@@ -2415,8 +2409,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn get_metadata() {
         {
             let response = b"* METADATA \"INBOX\" (/private/comment \"My own comment\")\r\n\
@@ -2534,8 +2528,8 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn test_get_quota_root() {
         {
             let response = b"* QUOTAROOT Sent Userquota\r\n\
@@ -2545,7 +2539,7 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            let (quotaroots, quota) = dbg!(session.get_quota_root("Sent").await.unwrap());
+            let (quotaroots, quota) = session.get_quota_root("Sent").await.unwrap();
             assert_eq!(
                 str::from_utf8(&session.stream.inner.written_buf).unwrap(),
                 "A0001 GETQUOTAROOT \"Sent\"\r\n"
@@ -2606,20 +2600,22 @@ mod tests {
         }
     }
 
-    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
-    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn test_parsing_error() {
         // Simulate someone connecting to SMTP server with IMAP client.
         let response = b"220 mail.example.org ESMTP Postcow\r\n".to_vec();
         let command = "A0001 NOOP\r\n";
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        assert!(session
-            .noop()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("220 mail.example.org ESMTP Postcow"));
+        assert!(
+            session
+                .noop()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("220 mail.example.org ESMTP Postcow")
+        );
         assert!(
             session.stream.inner.written_buf == command.as_bytes().to_vec(),
             "Invalid NOOP command"
