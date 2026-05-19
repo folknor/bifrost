@@ -1,0 +1,43 @@
+[package]
+name = "bifrost-imap"
+description = "IMAP client for Rust"
+version.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage = "https://github.com/folknor/bifrost"
+license.workspace = true
+edition = "2021"
+
+keywords = ["email", "imap"]
+categories = ["email", "network-programming"]
+
+[features]
+default = ["runtime-async-std"]
+compress = ["async-compression"]
+
+runtime-async-std = ["async-std", "async-compression?/futures-io"]
+runtime-tokio = ["tokio", "async-compression?/tokio"]
+
+[dependencies]
+async-channel = "2.0.0"
+async-compression = { version = "0.4.15", default-features = false, features = ["deflate"], optional = true }
+async-std = { version = "1.8.0", default-features = false, features = ["std", "unstable"], optional = true }
+base64 = "0.22.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+futures = "0.3.15"
+imap-proto = "0.16.4"
+log = "0.4.8"
+nom = "7.0"
+pin-project = "1"
+pin-utils = "0.1.0-alpha.4"
+self_cell = "1.0.1"
+stop-token = "0.7"
+thiserror = "1.0.9"
+tokio = { version = "1", features = ["net", "sync", "time", "io-util"], optional = true }
+
+[dev-dependencies]
+async-std = { version = "1.8.0", features = ["std", "attributes"] }
+pretty_assertions = "1.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

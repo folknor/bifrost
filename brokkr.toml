@@ -1,17 +1,17 @@
 project = "bifrost"
 
-# bifrost-jmap uses native-tls. Two explicit sweeps cover the default and
-# minimum viable feature sets:
+# Two explicit sweeps cover the default and minimum viable feature sets.
+# bifrost-jmap uses native-tls. bifrost-imap needs one runtime selected,
+# including in no-default-features builds:
 #
 #  - "default"  = the default feature set: tls-native, websockets, and
 #                 every RFC feature gate (mail, calendars, contacts,
 #                 blob, quota). Mirrors what consumers get out of the
 #                 box.
 #
-#  - "minimal"  = no-default-features + tls-native. Catches lints in
-#                 always-compiled code that the per-RFC #[cfg] gates
-#                 would otherwise hide. Also the smallest viable build
-#                 (core JMAP only, no mail / calendars / contacts).
+#  - "minimal"  = no-default-features + the smallest viable features.
+#                 Catches lints in always-compiled code that feature gates
+#                 would otherwise hide.
 
 [[check]]
 name = "default"
@@ -20,7 +20,7 @@ name = "default"
 [[check]]
 name = "minimal"
 no_default_features = true
-features = ["tls-native"]
+features = ["bifrost-jmap/tls-native", "bifrost-imap/runtime-async-std"]
 
 [test]
 default_package = "bifrost-jmap"
