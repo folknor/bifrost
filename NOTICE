@@ -17,8 +17,9 @@ Copyright (c) 2018 K. <kayo@illumium.org>
 
 The `bifrost-smtp` crate descends from that work.
 
-This product includes software originally developed by the tokio-imap
-authors as the `imap-proto` crate (https://github.com/djc/tokio-imap),
-licensed under MIT OR Apache-2.0. The vendored `crates/imap-proto`
-crate was imported from a 0.17.0 development snapshot on 2026-05-19;
-local changes include Bifrost workspace metadata and migration to nom 8.
+This product includes software originally developed by Anees Iqbal as the
+`daaki-imap` crate (https://github.com/steelbrain/daaki), licensed under
+MIT. The `bifrost-imap` crate descends from daaki commit
+e81a169c52afee65eb8a2fdfd252f8ebaacdb997; local changes include Bifrost
+workspace metadata, a tokio plus native-tls transport policy, and parser
+migration work for nom 8.

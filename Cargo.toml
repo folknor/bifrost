@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/imap", "crates/imap-proto", "crates/jmap", "crates/smtp"]
+members = ["crates/imap", "crates/jmap", "crates/smtp"]
 resolver = "2"
 
 [workspace.package]

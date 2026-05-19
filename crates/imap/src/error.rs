@@ -1,150 +1,452 @@
-//! IMAP error types.
+//! Error types for IMAP operations.
+//!
+//! Distinguishes protocol errors, I/O errors, auth failures, parse errors, and timeouts.
+//! Server status responses (OK, NO, BAD, BYE) are defined in RFC 3501 Section 7.1
+//! and RFC 9051 Section 7.1.
 
-use std::io::Error as IoError;
-use std::str::Utf8Error;
+use std::sync::Arc;
 
-use base64::DecodeError;
+use crate::types::ResponseCode;
 
-/// A convenience wrapper around `Result` for `imap::Error`.
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// A set of errors that can occur in the IMAP client
-#[derive(thiserror::Error, Debug)]
+/// Error type for IMAP client operations.
+///
+/// Implements `Serialize`/`Deserialize` behind the `serde` feature flag.
+/// The [`Io`](Error::Io) variant is serialized as its
+/// [`ErrorKind`](std::io::ErrorKind) name and message string; on
+/// deserialization an `std::io::Error` is reconstructed from these fields.
 #[non_exhaustive]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
-    /// An `io::Error` that occurred while trying to read or write to a network stream.
-    #[error("io: {0}")]
-    Io(#[from] IoError),
-    /// A BAD response from the IMAP server.
-    #[error("bad response: {0}")]
-    Bad(String),
-    /// A NO response from the IMAP server.
-    #[error("no response: {0}")]
-    No(String),
-    /// The connection was terminated unexpectedly.
-    #[error("connection lost")]
-    ConnectionLost,
-    /// Error parsing a server response.
-    #[error("parse: {0}")]
-    Parse(#[from] ParseError),
-    /// Command inputs were not valid [IMAP
-    /// strings](https://tools.ietf.org/html/rfc3501#section-4.3).
-    #[error("validate: {0}")]
-    Validate(#[from] ValidateError),
-    /// The requested SASL mechanism name was invalid.
-    #[error("invalid SASL mechanism: {0}")]
-    ValidateSaslMechanism(#[from] ValidateSaslMechanismError),
-    /// A command atom was invalid.
-    #[error("invalid atom: {0}")]
-    ValidateAtom(#[from] ValidateAtomError),
-    /// A `NOTIFY` command input was invalid.
-    #[error("invalid notify settings: {0}")]
-    ValidateNotify(#[from] ValidateNotifyError),
-    /// Error appending an e-mail.
-    #[error("could not append mail to mailbox")]
-    Append,
+    /// Underlying I/O error, including TLS transport errors (RFC 3501 Section 2.1).
+    ///
+    /// Wrapped in [`Arc`] so that `Error` can implement `Clone`.
+    #[error("I/O error: {0}")]
+    Io(#[source] Arc<std::io::Error>),
+
+    /// Authentication was rejected by the server (RFC 3501 Section 6.2.2).
+    ///
+    /// The optional [`ResponseCode`] carries the structured reason code
+    /// (e.g., `[AUTHENTICATIONFAILED]`, `[EXPIRED]`, `[PRIVACYREQUIRED]`)
+    /// when the server provides one (RFC 5530 Section 3).
+    #[error("authentication failed: {text}")]
+    Auth {
+        /// Human-readable response text.
+        text: String,
+        /// Structured response code, if present (RFC 5530 Section 3).
+        code: Option<ResponseCode>,
+    },
+
+    /// Server returned a NO response to a command (RFC 3501 Section 7.1.2).
+    ///
+    /// The optional [`ResponseCode`] carries the structured reason code
+    /// (e.g., `[NOPERM]`, `[OVERQUOTA]`) when the server provides one
+    /// (RFC 5530 Section 3).
+    #[error("server rejected command: {text}")]
+    No {
+        /// Human-readable response text.
+        text: String,
+        /// Structured response code, if present (RFC 5530 Section 3).
+        code: Option<ResponseCode>,
+    },
+
+    /// Server returned a BAD response  -  client sent something invalid (RFC 3501 Section 7.1.3).
+    ///
+    /// The optional [`ResponseCode`] carries the structured reason code
+    /// when the server provides one (RFC 5530 Section 3).
+    #[error("server reported bad command: {text}")]
+    Bad {
+        /// Human-readable response text.
+        text: String,
+        /// Structured response code, if present (RFC 5530 Section 3).
+        code: Option<ResponseCode>,
+    },
+
+    /// Server sent BYE  -  closing connection (RFC 3501 Section 7.1.5).
+    ///
+    /// BYE responses can include response codes such as `[ALERT]` or
+    /// `[UNAVAILABLE]` that carry actionable information for the client
+    /// (RFC 3501 Section 7.1.5, RFC 5530 Section 3).
+    /// The `[ALERT]` code in particular MUST be presented to the user
+    /// (RFC 3501 Section 7.1).
+    #[error("server closing connection: {text}")]
+    Bye {
+        /// Human-readable response text.
+        text: String,
+        /// Structured response code, if present (RFC 5530 Section 3).
+        code: Option<ResponseCode>,
+    },
+
+    /// IMAP protocol violation by the server (RFC 3501 Section 7 / RFC 9051 Section 7).
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
+    /// Failed to parse a server response (RFC 3501 Section 7 / RFC 9051 Section 7).
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    /// Operation exceeded the caller-supplied timeout.
+    ///
+    /// This is a client-imposed constraint, not a protocol-level error.
+    /// See RFC 3501 Section 5.4 for the server-side autologout timer;
+    /// client-side timeouts guard against indefinite blocking on I/O.
+    #[error("operation timed out")]
+    Timeout,
+
+    /// The TCP connection has been closed (RFC 3501 Section 2.1).
+    #[error("connection closed")]
+    Closed,
+
+    /// STARTTLS was requested but the server does not advertise it
+    /// (RFC 3501 Section 6.2.1, RFC 9051 Section 6.2.1).
+    #[error("STARTTLS not supported by server")]
+    StartTlsUnavailable,
+
+    /// A capability required for the requested operation is not advertised
+    /// (RFC 3501 Section 6.1.1).
+    #[error("missing required capability: {0}")]
+    MissingCapability(String),
+
+    /// Message exceeds the server's advertised APPENDLIMIT (RFC 7889 Section 3).
+    #[error("message size {size} exceeds server APPENDLIMIT of {limit}")]
+    AppendLimit {
+        /// Size of the message the caller tried to append (RFC 7889 Section 3).
+        size: u64,
+        /// Server-advertised maximum in octets (RFC 7889 Section 5).
+        limit: u64,
+    },
+
+    /// The date-time string supplied to APPEND does not conform to the
+    /// `date-time` production in RFC 3501 Section 9.
+    ///
+    /// ```text
+    /// date-time      = DQUOTE date-day-fixed "-" date-month "-" date-year
+    ///                  SP time SP zone DQUOTE
+    /// date-day-fixed = (SP DIGIT) / 2DIGIT
+    /// date-month     = "Jan" / "Feb" / ... / "Dec"
+    /// time           = 2DIGIT ":" 2DIGIT ":" 2DIGIT
+    /// zone           = ("+" / "-") 4DIGIT
+    /// ```
+    #[error("invalid APPEND date-time: {0}")]
+    InvalidAppendDate(String),
+
+    /// Internal driver error  -  the driver task stub has not been replaced
+    /// by its full implementation yet, or an invariant was violated that
+    /// indicates a bug in the library.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// The driver task panicked. The payload is the panic message
+    /// extracted from the `JoinError` (best-effort  -  non-string panics
+    /// produce a generic description).
+    #[error("driver task panicked: {0}")]
+    DriverPanicked(String),
+
+    /// The driver task exited (cleanly or via cancellation) and the
+    /// command channel is closed, but no panic was observed.
+    #[error("driver task gone")]
+    DriverGone,
 }
 
-/// An error occured while trying to parse a server response.
-#[derive(thiserror::Error, Debug)]
-pub enum ParseError {
-    /// Indicates an error parsing the status response. Such as OK, NO, and BAD.
-    #[error("unable to parse status response")]
-    Invalid(Vec<u8>),
-    /// An unexpected response was encountered.
-    #[error("encountered unexpected parsed response: {0}")]
-    Unexpected(String),
-    /// The client could not find or decode the server's authentication challenge.
-    #[error("unable to parse authentication response: {0} - {1:?}")]
-    Authentication(String, Option<DecodeError>),
-    /// The client received data that was not UTF-8 encoded.
-    #[error("unable to parse data ({0:?}) as UTF-8 text: {1:?}")]
-    DataNotUtf8(Vec<u8>, #[source] Utf8Error),
-    /// The expected response for X was not found
-    #[error("expected response not found for: {0}")]
-    ExpectedResponseNotFound(String),
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(Arc::new(e))
+    }
 }
 
-/// An [invalid character](https://tools.ietf.org/html/rfc3501#section-4.3) was found in an input
-/// string.
-#[derive(thiserror::Error, Debug)]
-#[error("invalid character in input: '{0}'")]
-pub struct ValidateError(pub char);
-
-/// An invalid SASL mechanism name was passed to `AUTHENTICATE`.
-#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ValidateSaslMechanismError {
-    /// SASL mechanism names cannot be empty.
-    #[error("mechanism must not be empty")]
-    Empty,
-    /// SASL mechanism names are limited to 20 ASCII bytes.
-    #[error("mechanism must be at most 20 bytes, got {0}")]
-    TooLong(usize),
-    /// SASL mechanism names can only contain ASCII letters, digits, hyphen, and underscore.
-    #[error("invalid character '{0}'")]
-    InvalidChar(char),
+impl From<crate::types::ValidationError> for Error {
+    fn from(e: crate::types::ValidationError) -> Self {
+        Self::Protocol(e.to_string())
+    }
 }
 
-/// An invalid IMAP atom was passed to a command.
-#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ValidateAtomError {
-    /// IMAP atoms cannot be empty.
-    #[error("atom must not be empty")]
-    Empty,
-    /// Command atom lists cannot be empty.
-    #[error("atom list must not be empty")]
-    EmptyList,
-    /// IMAP atoms cannot contain this character.
-    #[error("invalid character '{0}'")]
-    InvalidChar(char),
+impl From<crate::codec::encode::EncodeError> for Error {
+    fn from(e: crate::codec::encode::EncodeError) -> Self {
+        match e {
+            crate::codec::encode::EncodeError::MissingCapability { cmd, cap } => {
+                Self::MissingCapability(format!("{cmd} requires {cap}"))
+            }
+            crate::codec::encode::EncodeError::Validation(msg) => Self::Protocol(msg),
+        }
+    }
 }
 
-/// Invalid settings were passed to the RFC 5465 `NOTIFY` command.
-#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ValidateNotifyError {
-    /// `NOTIFY SET` needs at least one mailbox event group.
-    #[error("notify settings must include at least one event group")]
-    NoGroups,
-    /// An event list was empty. Use `NotifyEvents::none()` to send `NONE`.
-    #[error("notify event list must not be empty")]
-    EmptyEventList,
-    /// A `SUBTREE` or `MAILBOXES` filter had no mailbox names.
-    #[error("notify mailbox list must not be empty")]
-    EmptyMailboxList,
-    /// `SELECTED` and `SELECTED-DELAYED` cannot both appear in one command.
-    #[error("selected and selected-delayed cannot both be specified")]
-    ConflictingSelectedModes,
-    /// A selected mailbox filter appeared more than once.
-    #[error("selected mailbox filter can only be specified once")]
-    DuplicateSelectedFilter,
-    /// `SELECTED` and `SELECTED-DELAYED` filters only allow message events.
-    #[error("selected mailbox filters only allow message events")]
-    SelectedOnlyMessageEvents,
-    /// `MessageNew` and `MessageExpunge` must be requested together.
-    #[error("MessageNew and MessageExpunge must be specified together")]
-    MessageNewAndExpungeMustBeTogether,
-    /// `FlagChange` requires `MessageNew` and `MessageExpunge`.
-    #[error("FlagChange requires MessageNew and MessageExpunge")]
-    FlagChangeRequiresMessagePair,
-    /// `MessageNew` fetch attributes are only valid for selected mailbox filters.
-    #[error("MessageNew fetch attributes are only valid for selected mailbox filters")]
-    FetchAttributesOnlySelected,
-    /// A `MessageNew` fetch attribute was empty.
-    #[error("MessageNew fetch attributes must not be empty")]
-    EmptyFetchAttribute,
+/// Compares two IMAP errors for equality.
+///
+/// The [`Io`](Error::Io) variant compares by [`std::io::ErrorKind`] only, since
+/// `std::io::Error` does not implement `PartialEq`. Two `Io` errors with the
+/// same `ErrorKind` are considered equal even if their messages differ.
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
+            (Self::Auth { text: t1, code: c1 }, Self::Auth { text: t2, code: c2 })
+            | (Self::No { text: t1, code: c1 }, Self::No { text: t2, code: c2 })
+            | (Self::Bad { text: t1, code: c1 }, Self::Bad { text: t2, code: c2 })
+            | (Self::Bye { text: t1, code: c1 }, Self::Bye { text: t2, code: c2 }) => {
+                t1 == t2 && c1 == c2
+            }
+            (Self::Protocol(a), Self::Protocol(b))
+            | (Self::Parse(a), Self::Parse(b))
+            | (Self::MissingCapability(a), Self::MissingCapability(b))
+            | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
+            | (Self::Internal(a), Self::Internal(b))
+            | (Self::DriverPanicked(a), Self::DriverPanicked(b)) => a == b,
+            (Self::Timeout, Self::Timeout)
+            | (Self::Closed, Self::Closed)
+            | (Self::StartTlsUnavailable, Self::StartTlsUnavailable)
+            | (Self::DriverGone, Self::DriverGone) => true,
+            (
+                Self::AppendLimit {
+                    size: s1,
+                    limit: l1,
+                },
+                Self::AppendLimit {
+                    size: s2,
+                    limit: l2,
+                },
+            ) => s1 == s2 && l1 == l2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Error {}
+
+impl Error {
+    /// Construct an [`Error::No`] with an optional response code (RFC 5530 Section 3).
+    pub(crate) fn no_with_code(text: String, code: Option<ResponseCode>) -> Self {
+        Self::No { text, code }
+    }
+
+    /// Construct an [`Error::Bad`] with an optional response code (RFC 5530 Section 3).
+    pub(crate) fn bad_with_code(text: String, code: Option<ResponseCode>) -> Self {
+        Self::Bad { text, code }
+    }
+
+    /// Construct an [`Error::Auth`] with an optional response code (RFC 5530 Section 3).
+    pub(crate) fn auth_with_code(text: String, code: Option<ResponseCode>) -> Self {
+        Self::Auth { text, code }
+    }
+
+    /// Construct an [`Error::Bye`] with an optional response code
+    /// (RFC 3501 Section 7.1.5, RFC 5530 Section 3).
+    pub(crate) fn bye_with_code(text: String, code: Option<ResponseCode>) -> Self {
+        Self::Bye { text, code }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serde support  -  custom Serialize/Deserialize behind the `serde` feature
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "serde")]
+mod serde_support {
+    use super::{Arc, Error, ResponseCode};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Convert an [`std::io::ErrorKind`] to its stable `Debug` name
+    /// (e.g., `"ConnectionReset"`) for serialization.
+    fn error_kind_to_str(kind: std::io::ErrorKind) -> &'static str {
+        match kind {
+            std::io::ErrorKind::NotFound => "NotFound",
+            std::io::ErrorKind::PermissionDenied => "PermissionDenied",
+            std::io::ErrorKind::ConnectionRefused => "ConnectionRefused",
+            std::io::ErrorKind::ConnectionReset => "ConnectionReset",
+            std::io::ErrorKind::ConnectionAborted => "ConnectionAborted",
+            std::io::ErrorKind::NotConnected => "NotConnected",
+            std::io::ErrorKind::AddrInUse => "AddrInUse",
+            std::io::ErrorKind::AddrNotAvailable => "AddrNotAvailable",
+            std::io::ErrorKind::BrokenPipe => "BrokenPipe",
+            std::io::ErrorKind::AlreadyExists => "AlreadyExists",
+            std::io::ErrorKind::WouldBlock => "WouldBlock",
+            std::io::ErrorKind::InvalidInput => "InvalidInput",
+            std::io::ErrorKind::InvalidData => "InvalidData",
+            std::io::ErrorKind::TimedOut => "TimedOut",
+            std::io::ErrorKind::WriteZero => "WriteZero",
+            std::io::ErrorKind::Interrupted => "Interrupted",
+            std::io::ErrorKind::Unsupported => "Unsupported",
+            std::io::ErrorKind::UnexpectedEof => "UnexpectedEof",
+            std::io::ErrorKind::OutOfMemory => "OutOfMemory",
+            _ => "Other",
+        }
+    }
+
+    /// Reconstruct an [`std::io::ErrorKind`] from its `Debug` name.
+    /// Unrecognised names map to [`std::io::ErrorKind::Other`].
+    fn error_kind_from_str(s: &str) -> std::io::ErrorKind {
+        match s {
+            "NotFound" => std::io::ErrorKind::NotFound,
+            "PermissionDenied" => std::io::ErrorKind::PermissionDenied,
+            "ConnectionRefused" => std::io::ErrorKind::ConnectionRefused,
+            "ConnectionReset" => std::io::ErrorKind::ConnectionReset,
+            "ConnectionAborted" => std::io::ErrorKind::ConnectionAborted,
+            "NotConnected" => std::io::ErrorKind::NotConnected,
+            "AddrInUse" => std::io::ErrorKind::AddrInUse,
+            "AddrNotAvailable" => std::io::ErrorKind::AddrNotAvailable,
+            "BrokenPipe" => std::io::ErrorKind::BrokenPipe,
+            "AlreadyExists" => std::io::ErrorKind::AlreadyExists,
+            "WouldBlock" => std::io::ErrorKind::WouldBlock,
+            "InvalidInput" => std::io::ErrorKind::InvalidInput,
+            "InvalidData" => std::io::ErrorKind::InvalidData,
+            "TimedOut" => std::io::ErrorKind::TimedOut,
+            "WriteZero" => std::io::ErrorKind::WriteZero,
+            "Interrupted" => std::io::ErrorKind::Interrupted,
+            "Unsupported" => std::io::ErrorKind::Unsupported,
+            "UnexpectedEof" => std::io::ErrorKind::UnexpectedEof,
+            "OutOfMemory" => std::io::ErrorKind::OutOfMemory,
+            _ => std::io::ErrorKind::Other,
+        }
+    }
+
+    /// Serializable representation of an [`std::io::Error`].
+    #[derive(Serialize, Deserialize)]
+    struct IoFields {
+        kind: String,
+        message: String,
+    }
+
+    /// Serde-compatible mirror of [`Error`].
+    ///
+    /// Uses adjacently-tagged representation (`"type"` + `"data"`) so that
+    /// unit variants serialize cleanly and struct variants keep their field names.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum ErrorRepr {
+        Io(IoFields),
+        Auth {
+            text: String,
+            code: Option<ResponseCode>,
+        },
+        No {
+            text: String,
+            code: Option<ResponseCode>,
+        },
+        Bad {
+            text: String,
+            code: Option<ResponseCode>,
+        },
+        Bye {
+            text: String,
+            code: Option<ResponseCode>,
+        },
+        Protocol {
+            message: String,
+        },
+        Parse {
+            message: String,
+        },
+        Timeout,
+        Closed,
+        StartTlsUnavailable,
+        MissingCapability {
+            capability: String,
+        },
+        AppendLimit {
+            size: u64,
+            limit: u64,
+        },
+        InvalidAppendDate {
+            date: String,
+        },
+        Internal {
+            message: String,
+        },
+        DriverPanicked {
+            message: String,
+        },
+        DriverGone,
+    }
+
+    impl From<&Error> for ErrorRepr {
+        fn from(err: &Error) -> Self {
+            match err {
+                Error::Io(e) => Self::Io(IoFields {
+                    kind: error_kind_to_str(e.kind()).to_owned(),
+                    message: e.to_string(),
+                }),
+                Error::Auth { text, code } => Self::Auth {
+                    text: text.clone(),
+                    code: code.clone(),
+                },
+                Error::No { text, code } => Self::No {
+                    text: text.clone(),
+                    code: code.clone(),
+                },
+                Error::Bad { text, code } => Self::Bad {
+                    text: text.clone(),
+                    code: code.clone(),
+                },
+                Error::Bye { text, code } => Self::Bye {
+                    text: text.clone(),
+                    code: code.clone(),
+                },
+                Error::Protocol(msg) => Self::Protocol {
+                    message: msg.clone(),
+                },
+                Error::Parse(msg) => Self::Parse {
+                    message: msg.clone(),
+                },
+                Error::Timeout => Self::Timeout,
+                Error::Closed => Self::Closed,
+                Error::StartTlsUnavailable => Self::StartTlsUnavailable,
+                Error::MissingCapability(cap) => Self::MissingCapability {
+                    capability: cap.clone(),
+                },
+                Error::AppendLimit { size, limit } => Self::AppendLimit {
+                    size: *size,
+                    limit: *limit,
+                },
+                Error::InvalidAppendDate(msg) => Self::InvalidAppendDate { date: msg.clone() },
+                Error::Internal(msg) => Self::Internal {
+                    message: msg.clone(),
+                },
+                Error::DriverPanicked(msg) => Self::DriverPanicked {
+                    message: msg.clone(),
+                },
+                Error::DriverGone => Self::DriverGone,
+            }
+        }
+    }
+
+    impl From<ErrorRepr> for Error {
+        fn from(repr: ErrorRepr) -> Self {
+            match repr {
+                ErrorRepr::Io(fields) => {
+                    let kind = error_kind_from_str(&fields.kind);
+                    Self::Io(Arc::new(std::io::Error::new(kind, fields.message)))
+                }
+                ErrorRepr::Auth { text, code } => Self::Auth { text, code },
+                ErrorRepr::No { text, code } => Self::No { text, code },
+                ErrorRepr::Bad { text, code } => Self::Bad { text, code },
+                ErrorRepr::Bye { text, code } => Self::Bye { text, code },
+                ErrorRepr::Protocol { message } => Self::Protocol(message),
+                ErrorRepr::Parse { message } => Self::Parse(message),
+                ErrorRepr::Timeout => Self::Timeout,
+                ErrorRepr::Closed => Self::Closed,
+                ErrorRepr::StartTlsUnavailable => Self::StartTlsUnavailable,
+                ErrorRepr::MissingCapability { capability } => Self::MissingCapability(capability),
+                ErrorRepr::AppendLimit { size, limit } => Self::AppendLimit { size, limit },
+                ErrorRepr::InvalidAppendDate { date } => Self::InvalidAppendDate(date),
+                ErrorRepr::Internal { message } => Self::Internal(message),
+                ErrorRepr::DriverPanicked { message } => Self::DriverPanicked(message),
+                ErrorRepr::DriverGone => Self::DriverGone,
+            }
+        }
+    }
+
+    impl Serialize for Error {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            ErrorRepr::from(self).serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Error {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            ErrorRepr::deserialize(deserializer).map(Self::from)
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn is_send<T: Send>(_t: T) {}
-
-    #[test]
-    fn test_send() {
-        is_send::<Result<usize>>(Ok(3));
-    }
-}
+#[path = "error_tests.rs"]
+mod tests;

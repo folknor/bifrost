@@ -1,105 +1,92 @@
-//! # Bifrost IMAP
+//! Bifrost IMAP client library.
 //!
-//! This crate lets you connect to and interact with servers
-//! that implement the IMAP protocol ([RFC 3501](https://tools.ietf.org/html/rfc3501) and extensions).
-//! After authenticating with the server,
-//! IMAP lets you list, fetch, and search for e-mails,
-//! as well as monitor mailboxes for changes.
+//! An `IMAP4rev1` (RFC 3501) and `IMAP4rev2` (RFC 9051) async client
+//! built on tokio and native-tls. Single crate  -  parser, types, and connection
+//! in one place.
 //!
-//! ## Connecting
+//! # Architecture
 //!
-//! Connect to the server, for example using TLS connection on port 993
-//! or plain TCP connection on port 143 if you plan to use STARTTLS.
-//! can be used.
-//! Pass the stream to [`Client::new()`].
-//! This gives you an unauthenticated [`Client`].
+//! ## Driver task
 //!
-//! Then read the server greeting:
-//! ```ignore
-//! let _greeting = client
-//!     .read_response().await?
-//!     .expect("unexpected end of stream, expected greeting");
-//! ```
+//! [`ImapConnection`] is a lightweight handle  -  it holds an
+//! `mpsc::Sender<DriverCommand>` and a `watch::Receiver` for state
+//! snapshots. A dedicated tokio task (the *driver*) owns the TCP/TLS
+//! stream exclusively. All public methods take `&self`, submit commands
+//! over the channel, and await a result via a `oneshot`. Dropping a
+//! future mid-flight cannot corrupt the stream because no caller-side
+//! future has access to it  -  the driver completes the in-flight command
+//! and only the result is abandoned. This makes `tokio::select!` and
+//! `tokio::time::timeout` safe to use around any operation.
 //!
-//! ## STARTTLS
+//! ## Consumer trait
 //!
-//! If you connected on a non-TLS port, upgrade the connection using STARTTLS:
-//! ```ignore
-//! client.run_command_and_check_ok("STARTTLS", None).await?;
-//! let stream = client.into_inner();
-//! ```
-//! Convert this stream into a TLS stream using a library
-//! such as [`async-native-tls`](https://crates.io/crates/async-native-tls)
-//! or [Rustls](`https://crates.io/crates/rustls`).
-//! Once you have a TLS stream, wrap it back into a [`Client`]:
-//! ```ignore
-//! let client = Client::new(tls_stream);
-//! ```
-//! Note that there is no server greeting after STARTTLS.
+//! Each IMAP command is executed by a [`Consumer`](connection::dispatch)
+//! implementation. The driver feeds the consumer pre-classified responses
+//! via `on_response`, then calls `finalize` when the tagged response
+//! arrives. Consumers never make routing decisions  -  they only accumulate
+//! data they are given. Commands that expect `+` continuations (e.g.
+//! AUTHENTICATE) use the separate `ContinuationConsumer` trait with an
+//! additional `on_continuation` method.
 //!
-//! ## Authentication and session usage
+//! ## Classification truth table
 //!
-//! Once you have an established connection,
-//! authenticate using [`Client::login`] or [`Client::authenticate`]
-//! to perform username/password or challenge/response authentication respectively.
-//! This in turn gives you an authenticated
-//! [`Session`], which lets you access the mailboxes at the server.
-//! For example:
-//! ```ignore
-//! let mut session = client
-//!     .login("alice@example.org", "password").await
-//!     .map_err(|(err, _client)| err)?;
-//! session.select("INBOX").await?;
+//! The function [`classify`](codec::classification::classify) is the
+//! single source of truth for whether an untagged response belongs to
+//! the current command's result or to the asynchronous event queue.
+//! Every row cites the RFC section that defines the routing rule.
+//! The dispatcher calls `classify` before each response and routes
+//! mechanically  -  consumers have no routing decision to make.
 //!
-//! // Fetch message number 1 in this mailbox, along with its RFC 822 field.
-//! // RFC 822 dictates the format of the body of e-mails.
-//! let messages_stream = imap_session.fetch("1", "RFC822").await?;
-//! let messages: Vec<_> = messages_stream.try_collect().await?;
-//! let message = messages.first().expect("found no messages in the INBOX");
+//! ## Typed event queue
 //!
-//! // Extract the message body.
-//! let body = message.body().expect("message did not have a body!");
-//! let body = std::str::from_utf8(body)
-//!     .expect("message was not valid utf-8")
-//!     .to_string();
+//! Asynchronous server notifications  -  ALERTs, EXISTS/EXPUNGE changes,
+//! NOTIFY data, BYE  -  arrive as [`TypedEvent`]s. Poll them with
+//! [`drain_events`](ImapConnection::drain_events) (non-blocking) or
+//! [`next_event`](ImapConnection::next_event) (with timeout). The
+//! driver publishes events via a non-blocking `DriverEventSink` that
+//! can never suspend the driver's select loop.
 //!
-//! session.logout().await?;
-//! ```
+//! ## Wire reader and protocol state
 //!
-//! The documentation within this crate borrows heavily from the various RFCs,
-//! but should not be considered a complete reference.
-//! If anything is unclear,
-//! follow the links to the RFCs embedded in the documentation
-//! for the various types and methods and read the raw text there!
+//! All wire reads flow through a private `WireReader` in `mod wire`,
+//! which is visible only within the `connection` module. All protocol
+//! state mutations flow through
+//! `ProtocolState::apply_side_effects` in `mod state`  -  the primary
+//! mutator. The state module's fields are `pub(self)`, so direct
+//! field assignment from outside `mod state` is a compile error.
 //!
-//! See the `examples/` directory for usage examples.
-#![warn(missing_docs)]
-#![deny(rust_2018_idioms, unsafe_code)]
+//! ## `MailboxName`
+//!
+//! Every mailbox name in every public type is [`MailboxName`]  -  a
+//! validated, decoded UTF-8 newtype with no `From<String>` impl. The
+//! only constructors are `new` (public, validating) and `from_decoded`
+//! (`pub(crate)`, for already-parsed wire data in the codec). The
+//! compiler refuses to smuggle wire-form bytes through any public type.
 
-#[cfg(not(any(feature = "tokio1", feature = "async-std1")))]
-compile_error!("one of 'async-std1' or 'tokio1' features must be enabled");
-
-#[cfg(all(feature = "tokio1", feature = "async-std1"))]
-compile_error!("only one of 'async-std1' or 'tokio1' features must be enabled");
-#[macro_use]
-extern crate pin_utils;
-
-// Reexport imap_proto for easier access.
-pub use imap_proto;
-
-mod authenticator;
-mod client;
 pub mod error;
-pub mod extensions;
-mod imap_stream;
-mod parse;
 pub mod types;
 
-#[cfg(feature = "compress")]
-pub use crate::extensions::compress::DeflateStream;
+mod codec;
+mod connection;
 
-pub use crate::authenticator::{Authenticator, Plain, SaslAuthenticator, XOAuth2};
-pub use crate::client::*;
+/// Re-export the small address type used by IMAP envelope conversion helpers.
+pub use crate::types::Address;
+pub use connection::{
+    IdleEvent, ImapConnection, SearchResult, SessionState, TcpKeepalive, TlsMode,
+    typed_event::TypedEvent,
+};
+pub use error::Error;
+pub use types::{
+    AclEntry, AppendMessage, BinarySection, BodySection, BodyStructure, Capability,
+    ContentDisposition, ContinuationRequest, CopyResult, Envelope, EnvelopeAddress,
+    EsearchResponse, ExpungeResult, FetchAttr, FetchResponse, Flag, GreetingResponse,
+    GreetingStatus, ImapAtom, ListRightsResponse, MailboxAttribute, MailboxFilter, MailboxInfo,
+    MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceDescriptor, NamespaceResponse,
+    NotifyEvent, NotifyEventGroup, NotifySetParams, ObjectId, QresyncParams, QuotaResource,
+    QuotaRootResponse, Response, ResponseCode, SearchCriteria, SelectOptions, SelectedMailbox,
+    SequenceSet, SpecialUse, StatusItem, StatusKind, StatusResult, StoreOperation, StoreResult,
+    TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus, ValidationError,
+};
 
-#[cfg(test)]
-mod mock_stream;
+/// Result type alias for IMAP operations.
+pub type Result<T> = std::result::Result<T, Error>;

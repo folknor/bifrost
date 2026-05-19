@@ -1,0 +1,325 @@
+#![allow(clippy::wildcard_imports)]
+use super::*;
+
+impl ImapConnection {
+    // -----------------------------------------------------------------------
+    // Message operations (sequence-number variants)
+    // -----------------------------------------------------------------------
+
+    /// FETCH by sequence number (RFC 3501 Section 6.4.5).
+    ///
+    /// Prefer [`uid_fetch`](Self::uid_fetch) for stable message references.
+    pub async fn fetch(
+        &self,
+        sequence_set: &SequenceSet,
+        items: &[FetchAttr],
+        timeout: Duration,
+    ) -> Result<Vec<FetchResponse>, Error> {
+        self.validate_requested_fetch_items(items)?;
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        self.fetch_impl(
+            Command::Fetch {
+                sequence_set: sequence_set.clone(),
+                items: format_fetch_attrs(items),
+                changed_since: None,
+            },
+            None,
+            timeout,
+        )
+        .await
+    }
+
+    /// FETCH with CHANGEDSINCE modifier by sequence number (RFC 7162 Section 3.1.4).
+    ///
+    /// Returns only messages whose mod-sequence is greater than `mod_seq`.
+    /// Requires the server to support CONDSTORE (RFC 7162).
+    /// Prefer [`uid_fetch_changed_since`](Self::uid_fetch_changed_since) for stable
+    /// message references.
+    pub async fn fetch_changed_since(
+        &self,
+        sequence_set: &SequenceSet,
+        items: &[FetchAttr],
+        mod_seq: u64,
+        timeout: Duration,
+    ) -> Result<Vec<FetchResponse>, Error> {
+        self.validate_requested_fetch_items(items)?;
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        self.fetch_impl(
+            Command::Fetch {
+                sequence_set: sequence_set.clone(),
+                items: format_fetch_attrs(items),
+                changed_since: Some(mod_seq),
+            },
+            Some(mod_seq),
+            timeout,
+        )
+        .await
+    }
+
+    /// FETCH streaming by sequence number (RFC 3501 Section 6.4.5).
+    ///
+    /// Pushes each [`FetchResponse`] through the provided `tx` channel as it
+    /// arrives from the server, rather than buffering the entire result set
+    /// in memory. The channel is closed when the tagged OK is received.
+    ///
+    /// Prefer [`uid_fetch_streaming`](Self::uid_fetch_streaming) for stable
+    /// message references.
+    pub async fn fetch_streaming(
+        &self,
+        sequence_set: &SequenceSet,
+        items: &[FetchAttr],
+        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        self.validate_requested_fetch_items(items)?;
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        self.fetch_streaming_impl(
+            Command::Fetch {
+                sequence_set: sequence_set.clone(),
+                items: format_fetch_attrs(items),
+                changed_since: None,
+            },
+            tx,
+            timeout,
+        )
+        .await
+    }
+
+    /// SEARCH by sequence number (RFC 3501 Section 6.4.4).
+    ///
+    /// Returns a [`SearchResult`] containing matching sequence numbers and an
+    /// optional MODSEQ value (RFC 7162 Section 3.1.5).
+    /// Prefer [`uid_search`](Self::uid_search) for stable message references.
+    /// Handles both SEARCH and ESEARCH responses. For ESEARCH, the ALL uid-set
+    /// is expanded into individual sequence numbers for backward compatibility.
+    ///
+    /// Accepts anything that implements `AsRef<str>`, including `&str`,
+    /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
+    pub async fn search(
+        &self,
+        criteria: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<SearchResult, Error> {
+        let criteria = criteria.as_ref();
+        self.search_impl(
+            criteria,
+            Command::Search {
+                criteria: criteria.to_owned(),
+            },
+            "SEARCH",
+            timeout,
+        )
+        .await
+    }
+
+    /// SEARCH with RETURN options (RFC 4731 Section 3.2).
+    ///
+    /// Returns the full [`EsearchResponse`] with MIN, MAX, COUNT, and ALL fields.
+    /// Requires the server to advertise the `ESEARCH` capability.
+    ///
+    /// RFC 4731 Section 3.2: an extended SEARCH with RETURN options causes the
+    /// server to return a single ESEARCH response instead of a SEARCH response.
+    ///
+    /// Accepts anything that implements `AsRef<str>`, including `&str`,
+    /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
+    pub async fn search_esearch(
+        &self,
+        criteria: impl AsRef<str>,
+        return_opts: &[&str],
+        timeout: Duration,
+    ) -> Result<EsearchResponse, Error> {
+        let criteria = criteria.as_ref();
+        self.search_esearch_impl(
+            criteria,
+            Command::SearchReturn {
+                criteria: criteria.to_owned(),
+                return_opts: return_opts.iter().map(|s| (*s).to_owned()).collect(),
+            },
+            "SEARCH RETURN",
+            timeout,
+        )
+        .await
+    }
+
+    /// SEARCH RETURN (SAVE) by sequence number (RFC 5182 Section 2).
+    ///
+    /// Saves the search results server-side as `$` for use in subsequent commands.
+    /// Does not return UIDs  -  the results are stored on the server.
+    ///
+    /// Accepts anything that implements `AsRef<str>`, including `&str`,
+    /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
+    pub async fn search_save(
+        &self,
+        criteria: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let criteria = criteria.as_ref();
+        self.search_save_impl(
+            criteria,
+            Command::SearchSave {
+                criteria: criteria.to_owned(),
+            },
+            timeout,
+        )
+        .await
+    }
+
+    /// UID SEARCH RETURN (SAVE) (RFC 5182 Section 2).
+    ///
+    /// Saves the search results server-side as `$` for use in subsequent commands.
+    /// Does not return UIDs  -  the results are stored on the server.
+    ///
+    /// Accepts anything that implements `AsRef<str>`, including `&str`,
+    /// `String`, and [`SearchCriteria`](crate::types::SearchCriteria).
+    pub async fn uid_search_save(
+        &self,
+        criteria: impl AsRef<str>,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let criteria = criteria.as_ref();
+        self.search_save_impl(
+            criteria,
+            Command::UidSearchSave {
+                criteria: criteria.to_owned(),
+            },
+            timeout,
+        )
+        .await
+    }
+
+    /// Shared implementation for SEARCH RETURN (SAVE) and UID SEARCH RETURN (SAVE)
+    /// (RFC 5182 Section 2).
+    pub(super) async fn search_save_impl(
+        &self,
+        criteria: &str,
+        cmd: Command,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        self.require_state(&[SessionState::Selected])?;
+        // RFC 6855 Section 6: SEARCH RETURN (SAVE) remains part of the SEARCH
+        // command family and must be rejected until UTF8=ACCEPT is enabled.
+        self.check_utf8_only_enforced()?;
+        self.validate_search_criteria_capabilities(criteria)?;
+        // RFC 5182 Section 2: SEARCHRES capability is required.
+        self.require_searchres()?;
+        tokio::time::timeout(
+            timeout,
+            self.submit_regular(cmd, dispatch::SearchSaveConsumer::new()),
+        )
+        .await
+        .map_err(|_| Error::Timeout)??
+    }
+
+    /// STORE by sequence number (RFC 3501 Section 6.4.6).
+    ///
+    /// Prefer [`uid_store`](Self::uid_store) for stable message references.
+    ///
+    /// `\Recent` and `\*` are silently filtered per RFC 3501 Section 2.3.2
+    /// (they are not valid in STORE flag lists).
+    pub async fn store(
+        &self,
+        sequence_set: &SequenceSet,
+        operation: StoreOperation,
+        flags: &[Flag],
+        unchanged_since: Option<u64>,
+        timeout: Duration,
+    ) -> Result<StoreResult, Error> {
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        // RFC 3501 Section 2.3.2 / Section 9: \Recent is server-only and \*
+        // is not valid in STORE flag lists. Filter them out before encoding,
+        // consistent with append() (RFC 3501 Section 6.3.11).
+        let filtered_flags = filter_store_flags(flags);
+        self.store_impl(
+            Command::Store {
+                sequence_set: sequence_set.clone(),
+                operation,
+                flags: filtered_flags,
+                unchanged_since,
+            },
+            unchanged_since,
+            timeout,
+        )
+        .await
+    }
+
+    /// COPY by sequence number (RFC 3501 Section 6.4.7, RFC 4315 Section 3).
+    ///
+    /// Prefer [`uid_copy`](Self::uid_copy) for stable message references.
+    ///
+    /// On success, returns the server's response code, which SHOULD be
+    /// `[COPYUID uid-validity source-uids dest-uids]` per RFC 4315 Section 3.
+    pub async fn copy(
+        &self,
+        sequence_set: &SequenceSet,
+        mailbox: &str,
+        timeout: Duration,
+    ) -> Result<CopyResult, Error> {
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        let mbox = MailboxName::new(mailbox)?;
+        self.copy_impl(
+            Command::Copy {
+                sequence_set: sequence_set.clone(),
+                mailbox: mbox,
+            },
+            timeout,
+        )
+        .await
+    }
+
+    /// MOVE by sequence number (RFC 6851 Section 3, RFC 6851 Section 4.3).
+    ///
+    /// Prefer [`uid_move_messages`](Self::uid_move_messages) for stable message references.
+    ///
+    /// Returns a [`MoveResult`] containing:
+    /// - `code`: the server's response code, typically `[COPYUID ...]` per
+    ///   RFC 6851 Section 4.3.
+    /// - `expunged`: the EXPUNGE or VANISHED responses sent before the tagged
+    ///   OK (RFC 6851 Section 3). When QRESYNC is enabled (RFC 7162
+    ///   Section 3.2.10), the server sends VANISHED instead of EXPUNGE.
+    pub async fn move_messages(
+        &self,
+        sequence_set: &SequenceSet,
+        mailbox: &str,
+        timeout: Duration,
+    ) -> Result<MoveResult, Error> {
+        self.require_state(&[SessionState::Selected])?;
+        self.check_utf8_only_enforced()?;
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        // MOVE is a base feature in IMAP4rev2 (RFC 9051 Appendix E item 2).
+        {
+            let snap = self.state_rx.borrow();
+            if !snap.capabilities.contains(&Capability::Move)
+                && !super::auth::is_rev2_from_snapshot(&snap)
+            {
+                return Err(Error::MissingCapability("MOVE".into()));
+            }
+        }
+        let mbox = MailboxName::new(mailbox)?;
+        self.move_native_impl(
+            Command::Move {
+                sequence_set: sequence_set.clone(),
+                mailbox: mbox,
+            },
+            timeout,
+        )
+        .await
+    }
+}

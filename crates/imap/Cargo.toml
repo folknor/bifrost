@@ -9,8 +9,8 @@ homepage = "https://github.com/folknor/bifrost"
 license.workspace = true
 edition.workspace = true
 
-keywords = ["email", "imap"]
-categories = ["email", "network-programming"]
+keywords = ["email", "imap", "async", "tokio"]
+categories = ["email", "network-programming", "asynchronous"]
 
 [lib]
 doctest = false
@@ -19,34 +19,34 @@ doctest = false
 workspace = true
 
 [features]
-default = ["async-std1"]
-compress = ["dep:async-compression"]
-
-async-std1 = ["dep:async-std", "async-compression?/futures-io"]
-tokio1 = ["dep:tokio", "async-compression?/tokio"]
-
-runtime-async-std = ["async-std1"]
-runtime-tokio = ["tokio1"]
+default = []
+serde = ["dep:serde"]
 
 [dependencies]
-async-channel = "2.0.0"
-async-compression = { version = "0.4.15", default-features = false, features = ["deflate"], optional = true }
-async-std = { version = "1.8.0", default-features = false, features = ["std", "unstable"], optional = true }
 base64 = "0.22.1"
 bytes = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
-futures = "0.3.15"
-imap-proto = { path = "../imap-proto" }
-log = "0.4.8"
+encoding_rs = "0.8"
+flate2 = "1"
+getrandom = "0.2"
+hmac = "0.12"
+md-5 = "0.10"
+native-tls = "0.2"
 nom = "8.0.0"
-pin-project = "1"
-pin-utils = "0.1.0-alpha.4"
-self_cell = "1.0.1"
-stop-token = "0.7"
+pbkdf2 = "0.12"
+serde = { version = "1", features = ["derive"], optional = true }
+sha1 = "0.10"
+sha2 = "0.10"
+socket2 = "0.5"
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["net", "sync", "time", "io-util"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "sync", "macros"] }
+tokio-native-tls = "0.3"
+tokio-util = "0.7"
+tracing = "0.1"
+zeroize = "1"
 
 [dev-dependencies]
-async-std = { version = "1.8.0", features = ["std", "attributes"] }
 pretty_assertions = "1.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+proptest = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

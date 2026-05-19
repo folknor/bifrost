@@ -1,404 +1,375 @@
-use std::{borrow::Cow, iter::FusedIterator, slice};
+//! FETCH response and request types, APPEND helpers, and BINARY extension types.
+//!
+//! FETCH responses are defined in RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2.
+//! FETCH command attributes are defined in RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5.
+//! MULTIAPPEND is defined in RFC 3502.
+//! BINARY extension is defined in RFC 3516.
 
-use chrono::{DateTime, FixedOffset};
-use imap_proto::types::{
-    AttributeValue, BodyStructure, Envelope, MessageSection, Response, SectionPath,
-};
+use super::{BodyStructure, Envelope, Flag};
 
-use super::{Flag, Seq, Uid};
-use crate::types::ResponseData;
+/// A parsed FETCH response for a single message
+/// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FetchResponse {
+    /// Message sequence number (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
+    pub seq: u32,
+    /// `UID` value (RFC 3501 Section 2.3.1.1).
+    pub uid: Option<u32>,
+    /// `FLAGS` value (RFC 3501 Section 2.3.2).
+    pub flags: Option<Vec<Flag>>,
+    /// Parsed `ENVELOPE` (RFC 3501 Section 7.4.2).
+    pub envelope: Option<Envelope>,
+    /// Parsed `BODYSTRUCTURE` (RFC 3501 Section 7.4.2).
+    pub body_structure: Option<BodyStructure>,
+    /// `RFC822.SIZE` in bytes (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
+    ///
+    /// RFC 9051 widens this from `number` to `number64` to support messages > 4 GiB.
+    pub rfc822_size: Option<u64>,
+    /// `INTERNALDATE` timestamp string (RFC 3501 Section 7.4.2).
+    ///
+    /// The date-time string in IMAP format, e.g. `"17-Jul-1996 02:44:25 -0700"`.
+    pub internal_date: Option<String>,
+    /// Fetched body sections per `BODY[section]<partial>` (RFC 3501 Section 6.4.5).
+    pub body_sections: Vec<BodySection>,
+    /// `MODSEQ` value (RFC 7162 CONDSTORE Section 3.1.3).
+    pub mod_seq: Option<u64>,
+    /// `SAVEDATE` timestamp string (RFC 8514 Section 3).
+    ///
+    /// The date-time when the message was saved to the mailbox, or `None` if
+    /// the server returned NIL (message predates SAVEDATE tracking).
+    pub save_date: Option<String>,
+    /// `BINARY[section]` data items (RFC 3516 Section 4.2).
+    pub binary_sections: Vec<BinarySection>,
+    /// `BINARY.SIZE[section]` values (RFC 3516 Section 4.3 / RFC 9051 Section 7.5.2).
+    ///
+    /// Each entry is `(section_parts, size_in_bytes)`.
+    /// RFC 9051 Section 9 defines the size as `number` (u32), but stored as
+    /// `u64` for Postel's-law leniency with servers that send larger values.
+    pub binary_sizes: Vec<(Vec<u32>, u64)>,
+    /// `PREVIEW` text (RFC 8970 Section 3).
+    ///
+    /// A short plaintext snippet of the message, or `None` if the server
+    /// returned NIL (e.g., for LAZY requests where the preview is not yet computed).
+    pub preview: Option<String>,
+    /// `EMAILID` value (RFC 8474 Section 4).
+    ///
+    /// A server-assigned unique identifier for this particular instance of a message.
+    /// The value is an `objectid` string (1-255 alphanumeric/dash/underscore characters).
+    pub email_id: Option<String>,
+    /// `THREADID` value (RFC 8474 Section 4).
+    ///
+    /// A server-assigned identifier grouping related messages into threads,
+    /// or `None` if the server returned NIL (no thread association).
+    pub thread_id: Option<String>,
+    /// Gmail `X-GM-MSGID` value.
+    ///
+    /// Gmail assigns this stable unsigned 64-bit identifier to each message.
+    pub gmail_msg_id: Option<u64>,
+    /// Gmail `X-GM-THRID` value.
+    ///
+    /// Gmail assigns this stable unsigned 64-bit identifier to each thread.
+    pub gmail_thread_id: Option<u64>,
+}
 
-/// Format of Date and Time as defined RFC3501.
-/// See `date-time` element in [Formal Syntax](https://tools.ietf.org/html/rfc3501#section-9)
-/// chapter of this RFC.
-const DATE_TIME_FORMAT: &str = "%d-%b-%Y %H:%M:%S %z";
-
-/// An IMAP [`FETCH` response](https://tools.ietf.org/html/rfc3501#section-7.4.2) that contains
-/// data about a particular message.
+/// A single fetched BINARY section (RFC 3516 Section 4.2).
 ///
-/// This response occurs as the result of a `FETCH` or `STORE`
-/// command, as well as by unilateral server decision (e.g., flag updates).
-#[derive(Debug)]
-pub struct Fetch {
-    response: ResponseData,
-    /// The ordinal number of this message in its containing mailbox.
-    pub message: Seq,
-
-    /// A number expressing the unique identifier of the message.
-    /// Only present if `UID` was specified in the query argument to `FETCH` and the server
-    /// supports UIDs.
-    pub uid: Option<Uid>,
-
-    /// A number expressing the [RFC-2822](https://tools.ietf.org/html/rfc2822) size of the message.
-    /// Only present if `RFC822.SIZE` was specified in the query argument to `FETCH`.
-    pub size: Option<u32>,
-
-    /// A number expressing the [RFC-7162](https://tools.ietf.org/html/rfc7162) mod-sequence
-    /// of the message.
-    pub modseq: Option<u64>,
+/// Returned as `BINARY[section]<origin>` in FETCH responses.
+/// The content has been decoded from its Content-Transfer-Encoding
+/// (RFC 3516 Section 4.2).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BinarySection {
+    /// The numeric section path (e.g. `[1, 2, 3]` for `BINARY[1.2.3]`).
+    pub section: Vec<u32>,
+    /// Byte offset if this was a partial fetch (`<origin>` per RFC 3516 Section 4.2).
+    ///
+    /// RFC 9051 Section 7.5.2 widens this from `number` (u32) to `number64` (u64)
+    /// to support messages > 4 GiB.
+    pub origin: Option<u64>,
+    /// The decoded binary data, or `None` if the server returned NIL.
+    pub data: Option<Vec<u8>>,
 }
 
-/// A `FLAGS` attribute returned in a `FETCH` response.
-///
-/// This distinguishes `FLAGS ()` from a `FETCH` response that did not include a
-/// `FLAGS` attribute at all.
-///
-/// `Flags` borrows from the underlying [`Fetch`] and cannot outlive it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Flags<'a> {
-    raw: &'a [Cow<'a, str>],
+/// A single fetched body section (RFC 3501 Section 6.4.5).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BodySection {
+    /// The section specification (e.g. `"HEADER"`, `"1.2"`, `"TEXT"`).
+    pub section: String,
+    /// Byte offset if this was a partial fetch (`<origin.count>`).
+    ///
+    /// RFC 9051 Section 7.5.2 widens this from `number` (u32) to `number64` (u64)
+    /// to support messages > 4 GiB.
+    pub origin: Option<u64>,
+    /// The raw body data, or `None` if the server returned NIL.
+    pub data: Option<Vec<u8>>,
 }
 
-/// Iterator over a [`Flags`] attribute.
-#[derive(Clone, Debug)]
-pub struct FlagsIter<'a> {
-    raw: slice::Iter<'a, Cow<'a, str>>,
+/// FETCH item attributes the client can request
+/// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum FetchAttr {
+    /// UID (RFC 3501 Section 2.3.1.1).
+    Uid,
+    /// FLAGS (RFC 3501 Section 2.3.2).
+    Flags,
+    /// ENVELOPE (RFC 3501 Section 7.4.2).
+    Envelope,
+    /// BODYSTRUCTURE (RFC 3501 Section 7.4.2).
+    BodyStructure,
+    /// RFC822.SIZE (RFC 3501 Section 7.4.2).
+    Rfc822Size,
+    /// INTERNALDATE (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
+    InternalDate,
+    /// RFC822  -  functionally equivalent to `BODY[]` (RFC 3501 Section 6.4.5).
+    Rfc822,
+    /// RFC822.HEADER  -  functionally equivalent to `BODY.PEEK[HEADER]` (RFC 3501 Section 6.4.5).
+    Rfc822Header,
+    /// RFC822.TEXT  -  functionally equivalent to `BODY[TEXT]` (RFC 3501 Section 6.4.5).
+    Rfc822Text,
+    /// `BODY.PEEK[section]<partial>` or `BODY[section]<partial>`
+    /// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
+    ///
+    /// RFC 9051 widens partial ranges from `number` to `number64` / `nz-number64`.
+    BodySection {
+        peek: bool,
+        section: Option<String>,
+        partial: Option<(u64, u64)>,
+    },
+    /// MODSEQ (RFC 7162 CONDSTORE Section 3.1.3).
+    ModSeq,
+    /// SAVEDATE (RFC 8514 Section 3).
+    ///
+    /// Returns the date-time the message was saved to the mailbox.
+    /// Value is a quoted date-time string (same format as INTERNALDATE) or NIL.
+    SaveDate,
+    /// `BINARY[section]<partial>` or `BINARY.PEEK[section]<partial>`
+    /// (RFC 3516 Section 4.5.1).
+    ///
+    /// Fetches the content of a MIME part, decoded from its
+    /// Content-Transfer-Encoding. The section is a dot-separated list of
+    /// part numbers (e.g. `[1, 2]` for section `1.2`).
+    Binary {
+        /// Whether to use `BINARY.PEEK` (no `\Seen` flag set) or `BINARY`.
+        peek: bool,
+        /// Numeric section path (e.g. `[1, 2, 3]`).
+        section: Vec<u32>,
+        /// Optional partial range `(offset, count)`.
+        ///
+        /// RFC 9051 widens partial ranges from `number` to `number64` / `nz-number64`.
+        partial: Option<(u64, u64)>,
+    },
+    /// `BINARY.SIZE[section]` (RFC 3516 Section 4.5.2).
+    ///
+    /// Returns the decoded size in bytes of a MIME part.
+    BinarySize {
+        /// Numeric section path (e.g. `[1, 2, 3]`).
+        section: Vec<u32>,
+    },
+    /// `PREVIEW` (RFC 8970 Section 3).
+    ///
+    /// Returns a short plaintext snippet of the message. The server generates
+    /// the preview text from the message body.
+    Preview,
+    /// `PREVIEW (LAZY)` (RFC 8970 Section 3).
+    ///
+    /// Like `Preview`, but allows the server to return NIL if the preview
+    /// is not yet computed, avoiding delays.
+    PreviewLazy,
+    /// `EMAILID` (RFC 8474 Section 4).
+    ///
+    /// Returns the server-assigned unique identifier for this message instance.
+    EmailId,
+    /// `THREADID` (RFC 8474 Section 4).
+    ///
+    /// Returns the server-assigned thread identifier, or NIL if no thread association.
+    ThreadId,
+    /// Gmail `X-GM-MSGID`.
+    GmailMsgId,
+    /// Gmail `X-GM-THRID`.
+    GmailThreadId,
 }
 
-impl<'a> Iterator for FlagsIter<'a> {
-    type Item = Flag<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next().map(|s| Flag::from(s.as_ref()))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint()
-    }
-}
-
-impl ExactSizeIterator for FlagsIter<'_> {}
-
-impl FusedIterator for FlagsIter<'_> {}
-
-impl<'a> Flags<'a> {
-    /// Iterate over the flags in this `FLAGS` attribute.
-    pub fn iter(&self) -> FlagsIter<'a> {
-        FlagsIter {
-            raw: self.raw.iter(),
-        }
-    }
-
-    /// Returns how many flags are present in this `FLAGS` attribute.
-    pub fn len(&self) -> usize {
-        self.raw.len()
-    }
-
-    /// Returns true if this is an empty `FLAGS ()` attribute.
-    pub fn is_empty(&self) -> bool {
-        self.raw.is_empty()
-    }
-}
-
-impl<'a> IntoIterator for Flags<'a> {
-    type IntoIter = FlagsIter<'a>;
-    type Item = Flag<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl<'a> IntoIterator for &Flags<'a> {
-    type IntoIter = FlagsIter<'a>;
-    type Item = Flag<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl Fetch {
-    pub(crate) fn new(response: ResponseData) -> Self {
-        let (message, uid, size, modseq) =
-            if let Response::Fetch(message, attrs) = response.parsed() {
-                let mut uid = None;
-                let mut size = None;
-                let mut modseq = None;
-
-                for attr in attrs {
-                    match attr {
-                        AttributeValue::Uid(id) => uid = Some(*id),
-                        AttributeValue::Rfc822Size(sz) => size = Some(*sz),
-                        AttributeValue::ModSeq(ms) => modseq = Some(*ms),
-                        _ => {}
-                    }
+impl FetchAttr {
+    /// Serialize this attribute to its IMAP wire representation
+    /// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
+    pub fn to_imap_string(&self) -> String {
+        use std::fmt::Write;
+        match self {
+            Self::Uid => "UID".into(),
+            Self::Flags => "FLAGS".into(),
+            Self::Envelope => "ENVELOPE".into(),
+            Self::BodyStructure => "BODYSTRUCTURE".into(),
+            Self::Rfc822Size => "RFC822.SIZE".into(),
+            Self::InternalDate => "INTERNALDATE".into(),
+            Self::Rfc822 => "RFC822".into(),
+            Self::Rfc822Header => "RFC822.HEADER".into(),
+            Self::Rfc822Text => "RFC822.TEXT".into(),
+            Self::BodySection {
+                peek,
+                section,
+                partial,
+            } => {
+                // RFC 3501 Section 6.4.5: BODY[<section>]<<partial>>
+                // or BODY.PEEK[<section>]<<partial>>.
+                let mut s = if *peek {
+                    "BODY.PEEK[".to_owned()
+                } else {
+                    "BODY[".to_owned()
+                };
+                if let Some(sec) = section {
+                    s.push_str(sec);
                 }
-                (*message, uid, size, modseq)
-            } else {
-                unreachable!()
-            };
-
-        Fetch {
-            response,
-            message,
-            uid,
-            size,
-            modseq,
-        }
-    }
-
-    fn raw_flags(&self) -> Option<&[Cow<'_, str>]> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs.iter().find_map(|attr| match attr {
-                AttributeValue::Flags(raw_flags) => Some(raw_flags.as_slice()),
-                _ => None,
-            })
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// A list of flags that are set for this message.
-    ///
-    /// This returns an empty iterator both when the server returned `FLAGS ()`
-    /// and when the `FETCH` response did not include a `FLAGS` attribute. Use
-    /// [`Fetch::flags_attribute`] when that distinction matters.
-    pub fn flags(&self) -> impl Iterator<Item = Flag<'_>> {
-        self.raw_flags()
-            .into_iter()
-            .flatten()
-            .map(|s| Flag::from(s.as_ref()))
-    }
-
-    /// The `FLAGS` attribute in this `FETCH` response, if one was returned.
-    pub fn flags_attribute(&self) -> Option<Flags<'_>> {
-        self.raw_flags().map(|raw| Flags { raw })
-    }
-
-    /// The bytes that make up the header of this message, if `BODY[HEADER]`, `BODY.PEEK[HEADER]`,
-    /// or `RFC822.HEADER` was included in the `query` argument to `FETCH`.
-    pub fn header(&self) -> Option<&[u8]> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::BodySection {
-                        section: Some(SectionPath::Full(MessageSection::Header)),
-                        data: Some(hdr),
-                        ..
-                    }
-                    | AttributeValue::Rfc822Header(Some(hdr)) => Some(hdr.as_ref()),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// The bytes that make up this message, included if `BODY[]` or `RFC822` was included in the
-    /// `query` argument to `FETCH`. The bytes SHOULD be interpreted by the client according to the
-    /// content transfer encoding, body type, and subtype.
-    pub fn body(&self) -> Option<&[u8]> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::BodySection {
-                        section: None,
-                        data: Some(body),
-                        ..
-                    }
-                    | AttributeValue::Rfc822(Some(body)) => Some(body.as_ref()),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// The bytes that make up the text of this message, included if `BODY[TEXT]`, `RFC822.TEXT`,
-    /// or `BODY.PEEK[TEXT]` was included in the `query` argument to `FETCH`. The bytes SHOULD be
-    /// interpreted by the client according to the content transfer encoding, body type, and
-    /// subtype.
-    pub fn text(&self) -> Option<&[u8]> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::BodySection {
-                        section: Some(SectionPath::Full(MessageSection::Text)),
-                        data: Some(body),
-                        ..
-                    }
-                    | AttributeValue::Rfc822Text(Some(body)) => Some(body.as_ref()),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// The envelope of this message, if `ENVELOPE` was included in the `query` argument to
-    /// `FETCH`. This is computed by the server by parsing the
-    /// [RFC-2822](https://tools.ietf.org/html/rfc2822) header into the component parts, defaulting
-    /// various fields as necessary.
-    ///
-    /// The full description of the format of the envelope is given in [RFC 3501 section
-    /// 7.4.2](https://tools.ietf.org/html/rfc3501#section-7.4.2).
-    pub fn envelope(&self) -> Option<&Envelope<'_>> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::Envelope(env) => Some(&**env),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the bytes that makes up the given `BOD[<section>]` of a `FETCH` response.
-    ///
-    /// See [section 7.4.2 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-7.4.2) for
-    /// details.
-    pub fn section(&self, path: &SectionPath) -> Option<&[u8]> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::BodySection {
-                        section: Some(sp),
-                        data: Some(data),
-                        ..
-                    } if sp == path => Some(data.as_ref()),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the `INTERNALDATE` of a `FETCH` response
-    ///
-    /// See [section 2.3.3 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-2.3.3) for
-    /// details.
-    pub fn internal_date(&self) -> Option<DateTime<FixedOffset>> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::InternalDate(date_time) => Some(date_time.as_ref()),
-                    _ => None,
-                })
-                .next()
-                .and_then(|date_time| DateTime::parse_from_str(date_time, DATE_TIME_FORMAT).ok())
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the `BODYSTRUCTURE` of a `FETCH` response
-    ///
-    /// See [section 2.3.6 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-2.3.6) for
-    /// details.
-    pub fn bodystructure(&self) -> Option<&BodyStructure<'_>> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::BodyStructure(bs) => Some(bs),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the `X-GM-LABELS` of a `FETCH` response
-    ///
-    /// See [Access to Gmail labels: X-GM-LABELS](https://developers.google.com/gmail/imap/imap-extensions#access_to_labels_x-gm-labels)
-    /// for details.
-    pub fn gmail_labels(&self) -> Option<&Vec<Cow<'_, str>>> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::GmailLabels(gl) => Some(gl),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the `X-GM-MSGID` of a `FETCH` response
-    ///
-    /// See [Access to the Gmail unique message ID: X-GM-MSGID](https://developers.google.com/workspace/gmail/imap/imap-extensions#access_to_the_unique_message_id_x-gm-msgid)
-    /// for details.
-    pub fn gmail_msg_id(&self) -> Option<&u64> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::GmailMsgId(id) => Some(id),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the `X-GM-THRID` of a `FETCH` response
-    ///
-    /// See [Access to the Gmail thread ID: X-GM-THRID](https://developers.google.com/workspace/gmail/imap/imap-extensions#access_to_the_gmail_thread_id_x-gm-thrid)
-    /// for details.
-    pub fn gmail_thr_id(&self) -> Option<&u64> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|av| match av {
-                    AttributeValue::GmailThrId(id) => Some(id),
-                    _ => None,
-                })
-                .next()
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the RFC 8474 `EMAILID` of a `FETCH` response.
-    pub fn email_id(&self) -> Option<&str> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs.iter().find_map(|av| match av {
-                AttributeValue::EmailId(id) => Some(id.as_ref()),
-                _ => None,
-            })
-        } else {
-            unreachable!()
-        }
-    }
-
-    /// Extract the RFC 8474 `THREADID` of a `FETCH` response.
-    ///
-    /// This returns `None` both when the server did not include `THREADID` and
-    /// when the server explicitly returned `THREADID NIL`. Use
-    /// [`Fetch::thread_id_attribute`] when that distinction matters.
-    pub fn thread_id(&self) -> Option<&str> {
-        self.thread_id_attribute().flatten()
-    }
-
-    /// Extract the RFC 8474 `THREADID` attribute of a `FETCH` response.
-    ///
-    /// The outer `Option` is absent when the server did not include `THREADID`.
-    /// The inner `Option` is absent when the server returned `THREADID NIL`.
-    pub fn thread_id_attribute(&self) -> Option<Option<&str>> {
-        if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs.iter().find_map(|av| match av {
-                AttributeValue::ThreadId(id) => Some(id.as_deref()),
-                _ => None,
-            })
-        } else {
-            unreachable!()
+                s.push(']');
+                if let Some((offset, count)) = partial {
+                    // RFC 3501 Section 6.4.5: partial range <offset.count>.
+                    let _ = write!(s, "<{offset}.{count}>");
+                }
+                s
+            }
+            Self::ModSeq => "MODSEQ".into(),
+            Self::SaveDate => "SAVEDATE".into(),
+            Self::Binary {
+                peek,
+                section,
+                partial,
+            } => {
+                // RFC 3516 Section 4.5.1: BINARY[section]<partial>
+                // or BINARY.PEEK[section]<partial>.
+                let mut s = if *peek {
+                    "BINARY.PEEK[".to_owned()
+                } else {
+                    "BINARY[".to_owned()
+                };
+                let sec_str: Vec<String> = section
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                s.push_str(&sec_str.join("."));
+                s.push(']');
+                if let Some((offset, count)) = partial {
+                    // RFC 3516 Section 4.5.1: partial range <offset.count>.
+                    let _ = write!(s, "<{offset}.{count}>");
+                }
+                s
+            }
+            Self::BinarySize { section } => {
+                // RFC 3516 Section 4.5.2: BINARY.SIZE[section].
+                let sec_str: Vec<String> = section
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
+                format!("BINARY.SIZE[{}]", sec_str.join("."))
+            }
+            Self::Preview => "PREVIEW".into(),
+            Self::PreviewLazy => "PREVIEW (LAZY)".into(),
+            Self::EmailId => "EMAILID".into(),
+            Self::ThreadId => "THREADID".into(),
+            Self::GmailMsgId => "X-GM-MSGID".into(),
+            Self::GmailThreadId => "X-GM-THRID".into(),
         }
     }
 }
+
+/// Serialize a list of fetch attributes to the parenthesized IMAP wire format
+/// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
+///
+/// A single attribute is serialized without parentheses; multiple attributes
+/// are joined with spaces inside parentheses.
+pub(crate) fn format_fetch_attrs(attrs: &[FetchAttr]) -> String {
+    if attrs.len() == 1 {
+        attrs[0].to_imap_string()
+    } else {
+        let items: Vec<String> = attrs.iter().map(FetchAttr::to_imap_string).collect();
+        format!("({})", items.join(" "))
+    }
+}
+
+/// How flags should be modified in a STORE command
+/// (RFC 3501 Section 6.4.6 / RFC 9051 Section 6.4.6).
+///
+/// RFC 3501 Section 6.4.6 defines:
+/// `store-att-flags = (["+" / "-"] "FLAGS" [".SILENT"]) SP (flag-list / NIL)`
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum StoreOperation {
+    /// `+FLAGS`  -  add flags.
+    Add,
+    /// `-FLAGS`  -  remove flags.
+    Remove,
+    /// `FLAGS`  -  replace all flags.
+    Replace,
+    /// `+FLAGS.SILENT`  -  add flags, suppress implicit FETCH response
+    /// (RFC 3501 Section 6.4.6).
+    AddSilent,
+    /// `-FLAGS.SILENT`  -  remove flags, suppress implicit FETCH response
+    /// (RFC 3501 Section 6.4.6).
+    RemoveSilent,
+    /// `FLAGS.SILENT`  -  replace all flags, suppress implicit FETCH response
+    /// (RFC 3501 Section 6.4.6).
+    ReplaceSilent,
+}
+
+/// Result of a STORE or UID STORE command (RFC 3501 Section 6.4.6, RFC 7162 Section 3.1.3).
+///
+/// When UNCHANGEDSINCE is used (CONDSTORE), the server may return a
+/// `[MODIFIED sequence-set]` response code indicating which messages failed
+/// the precondition check (RFC 7162 Section 3.1.3). `STORE` uses message
+/// sequence numbers, while `UID STORE` uses UIDs. This struct preserves that
+/// information so callers can detect partial failures.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StoreResult {
+    /// Implicit FETCH responses with updated flags (RFC 3501 Section 6.4.6).
+    ///
+    /// Empty when `.SILENT` operations are used.
+    pub fetches: Vec<FetchResponse>,
+    /// Response code from the tagged OK, if any.
+    ///
+    /// When UNCHANGEDSINCE is used, this will be `Some(ResponseCode::Modified(...))`
+    /// for messages that failed the precondition (RFC 7162 Section 3.1.3).
+    /// `None` when no response code was returned.
+    pub code: Option<super::response::ResponseCode>,
+}
+
+/// A message to be appended via MULTIAPPEND (RFC 3502).
+///
+/// Each message carries its own flags, optional internal date, and raw message data.
+/// Multiple `AppendMessage` values are sent in a single APPEND command per
+/// RFC 3502 Section 3.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AppendMessage {
+    /// Flags to set on the appended message (RFC 3501 Section 6.3.11).
+    pub flags: Vec<Flag>,
+    /// Optional INTERNALDATE in IMAP date-time format (RFC 3501 Section 6.3.11).
+    pub date: Option<String>,
+    /// Raw RFC 5322 message data.
+    pub data: Vec<u8>,
+}
+
+impl AppendMessage {
+    /// Create an append message with only the raw data (RFC 3501 Section 6.3.11).
+    ///
+    /// Flags default to empty and date defaults to `None`.
+    pub fn new(data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            flags: Vec::new(),
+            date: None,
+            data: data.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "fetch_tests.rs"]
+mod tests;
