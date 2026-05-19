@@ -13,12 +13,13 @@ use socket2::{Domain, Protocol, Type};
 
 #[cfg(feature = "native-tls")]
 use super::InnerTlsParameters;
-use super::TlsParameters;
+use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
 /// A network stream
 pub(crate) struct NetworkStream {
     inner: InnerNetworkStream,
+    state: ConnectionState,
 }
 
 /// Represents the different types of underlying network streams
@@ -43,11 +44,24 @@ impl NetworkStream {
             debug_assert!(false, "InnerNetworkStream::None must never be built");
         }
 
-        NetworkStream { inner }
+        NetworkStream {
+            inner,
+            state: ConnectionState::Ok,
+        }
+    }
+
+    pub(super) fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    pub(super) fn set_state(&mut self, state: ConnectionState) {
+        self.state = state;
     }
 
     /// Shutdowns the connection
-    pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+    pub(crate) fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
+        self.state = ConnectionState::Closed;
+
         match &self.inner {
             InnerNetworkStream::Tcp(s) => s.shutdown(how),
             #[cfg(feature = "native-tls")]
@@ -123,8 +137,12 @@ impl NetworkStream {
 
     #[cfg(feature = "native-tls")]
     pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
+        self.state.verify()?;
+
         match &self.inner {
             InnerNetworkStream::Tcp(_) => {
+                self.state = ConnectionState::Broken;
+
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerNetworkStream::None);
                 let InnerNetworkStream::Tcp(tcp_stream) = tcp_stream else {
@@ -132,6 +150,7 @@ impl NetworkStream {
                 };
 
                 self.inner = Self::upgrade_tls_impl(tcp_stream, tls_parameters)?;
+                self.state = ConnectionState::Ok;
                 Ok(())
             }
             _ => Ok(()),

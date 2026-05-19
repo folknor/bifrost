@@ -117,16 +117,6 @@ impl Credentials {
     }
 }
 
-impl<S, T> From<(S, T)> for Credentials
-where
-    S: Into<String>,
-    T: Into<String>,
-{
-    fn from((username, password): (S, T)) -> Self {
-        Credentials::password(username.into(), password.into())
-    }
-}
-
 impl Debug for Credentials {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -226,6 +216,10 @@ impl Mechanism {
                 None => {
                     let (identity, access_token) = credentials.oauth2_parts()?;
                     let identity = gs2_escape(identity);
+                    // RFC 7628 examples include host and port, but bearer
+                    // token authentication does not require them. Keeping the
+                    // mechanism encoder transport-agnostic avoids coupling
+                    // credentials to SMTP connection state.
                     Ok(format!(
                         "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"
                     ))
@@ -332,10 +326,13 @@ mod test {
             "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
         );
 
+        let response = mechanism.response(&credentials, None).unwrap();
         assert_eq!(
-            mechanism.response(&credentials, None).unwrap(),
+            response,
             "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
+        assert!(!response.contains("\x01host="));
+        assert!(!response.contains("\x01port="));
         assert_eq!(
             mechanism.response(&credentials, Some("{}")).unwrap(),
             "\x01"
@@ -376,14 +373,6 @@ mod test {
                     None,
                 )
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn test_from_user_pass_for_credentials() {
-        assert_eq!(
-            Credentials::password("alice".to_owned(), "wonderland".to_owned()),
-            Credentials::from(("alice", "wonderland"))
         );
     }
 

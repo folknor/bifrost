@@ -140,16 +140,9 @@ Verification:
 
 ## Follow-up candidates
 
-- Decide whether to remove `Credentials::from((user, pass))` or keep it as a
-  low-friction password-auth helper.
 - Consider replacing the whole auth exchange with rsasl once bifrost's public
   auth API is clearer. If we do this, do it around bifrost-owned wrapper types
   rather than blindly exposing rsasl everywhere.
-- Add focused protocol tests for SMTP `AUTH OAUTHBEARER` success and failure
-  exchanges using an in-process test server.
-- Decide whether OAUTHBEARER should include `host` and `port` key/value pairs.
-  RFC 7628 examples include them, while the bearer-token requirements only make
-  them mandatory for keyed message digest schemes.
 
 ## Upstream PR 877
 
@@ -760,3 +753,82 @@ Verification:
   RCPT-time failures in the returned per-recipient status vector.
 - Review follow-up verification from `crates/smtp`: `brokkr check -- -- lmtp`
   passed.
+
+## Post-LMTP cleanup batch
+
+Scope:
+
+- User asked to continue everything except the rsasl migration and the async
+  DNS/TLS edge-test pass.
+
+Upstream items revisited:
+
+- #994/#948: SMTP connection refactors and cancel-safety.
+- #1010: frequent async DNS lookups.
+- #1087: `TlsParametersV2` and certificate-store ambiguity.
+- #1138: async-std dependency leakage.
+- #1028: TODO/FIXME sweep and breaking API cleanup.
+
+Implemented:
+
+- Removed `Credentials::from((user, pass))`. The explicit
+  `Credentials::password(...)` constructor is now the only password credential
+  path, which avoids reintroducing password-shaped ambiguity next to
+  `Credentials::oauth2(...)`.
+- Added sync and tokio in-process protocol coverage for successful
+  `AUTH OAUTHBEARER`, including GS2 identity escaping and the post-auth EHLO
+  refresh.
+- Added sync and tokio protocol coverage for RFC 7628 failure handling: a
+  server challenge is answered with the required dummy cancel response
+  (`AQ==` on the wire), and the failed exchange marks the connection broken.
+- Immediate AUTH rejection now follows the same abort path as challenge-loop
+  rejection. Sync and tokio tests cover a direct `535` response to the initial
+  `AUTH OAUTHBEARER` command.
+- Documented and tested the current OAUTHBEARER host/port decision. Bifrost
+  does not include `host` or `port` in the initial bearer response because
+  those fields are only required for keyed message-digest schemes, and adding
+  them would couple mechanism encoding to SMTP connection state.
+- Added stream-level connection state for sync and async SMTP network streams.
+  The state is set to broken before writes, flushes, reads, and TLS upgrades,
+  restored to ok only after success, and set to closed by abort/shutdown. This
+  picks up the useful cancel-safety part of upstream #994/#948 while preserving
+  bifrost's no-QUIT abort behavior.
+- Added tokio and async-std coverage proving an externally cancelled command
+  future leaves the connection broken and prevents later reuse.
+- LMTP final delivery-status collection now keeps the async connection marked
+  broken until every accepted recipient status has been read. Dropping the
+  future in the middle of that loop no longer leaves a stream with unread LMTP
+  responses eligible for pool reuse.
+- Removed stale SMTP transport TODO/FIXME comments that no longer reflected the
+  code.
+- Moved the duplicated LMTP mock server used by sync, tokio, and async-std
+  tests into shared test support.
+- Documented that `PoolConfig::min_idle` defaults to zero and that setting it
+  above zero intentionally allows background connection creation and DNS
+  lookups. This resolves the practical #1010 concern for defaults: bifrost does
+  not keep reconnecting in the background unless the caller asks for warm idle
+  connections.
+- Clarified that `CertificateStore::Default` always means the native-tls
+  platform verifier in bifrost-smtp. The upstream #1087 ambiguity was caused by
+  a multi-TLS-backend matrix that this fork has already removed.
+
+Audit notes:
+
+- #1138 does not require a manifest change in bifrost-smtp at this point:
+  `sendmail-transport` uses `async-std?/unstable`, so the sendmail feature only
+  enables the unstable feature on async-std when some other selected feature
+  already pulled async-std in.
+- The remaining `TODO`/`FIXME` items under `crates/smtp/src` are message
+  builder/parser/sendmail notes rather than SMTP transport issues.
+- `test_connected()` intentionally treats any failed NOOP as fatal for that
+  parked connection. A transient blip may close a connection that could have
+  recovered, but the pool default is "discard until proven reusable" rather
+  than trying to resynchronize a long-lived SMTP stream.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features smtp-transport,builder,pool,tokio1,async-std1`
+  passed.
+- From `crates/smtp`: `brokkr check` passed.
+- From workspace root: `git diff --check` passed.

@@ -29,9 +29,9 @@ use tokio1_native_tls_crate::TlsStream as Tokio1TlsStream;
 
 #[cfg(feature = "tokio1-native-tls")]
 use super::InnerTlsParameters;
-use super::TlsParameters;
 #[cfg(feature = "tokio1")]
 use super::net::resolved_address_filter;
+use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +94,7 @@ impl AsyncDeadline {
 )]
 pub(crate) struct AsyncNetworkStream {
     inner: InnerAsyncNetworkStream,
+    state: ConnectionState,
 }
 
 #[cfg(feature = "tokio1")]
@@ -132,7 +133,18 @@ impl AsyncNetworkStream {
             debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
         }
 
-        AsyncNetworkStream { inner }
+        AsyncNetworkStream {
+            inner,
+            state: ConnectionState::Ok,
+        }
+    }
+
+    pub(super) fn state(&self) -> ConnectionState {
+        self.state
+    }
+
+    pub(super) fn set_state(&mut self, state: ConnectionState) {
+        self.state = state;
     }
 
     #[cfg(feature = "tokio1")]
@@ -254,6 +266,8 @@ impl AsyncNetworkStream {
         tls_parameters: TlsParameters,
         deadline: AsyncDeadline,
     ) -> Result<(), Error> {
+        self.state.verify()?;
+
         match &self.inner {
             #[cfg(all(feature = "tokio1", not(feature = "tokio1-native-tls")))]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => {
@@ -266,6 +280,8 @@ impl AsyncNetworkStream {
 
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => {
+                self.state = ConnectionState::Broken;
+
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerAsyncNetworkStream::None);
                 let InnerAsyncNetworkStream::Tokio1Tcp(tcp_stream) = tcp_stream else {
@@ -275,6 +291,7 @@ impl AsyncNetworkStream {
                 self.inner = Self::upgrade_tokio1_tls(tcp_stream, tls_parameters, deadline)
                     .await
                     .map_err(error::connection)?;
+                self.state = ConnectionState::Ok;
                 Ok(())
             }
             #[cfg(feature = "async-std1")]
@@ -400,6 +417,8 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        self.state = ConnectionState::Closed;
+
         match &mut self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_shutdown(cx),

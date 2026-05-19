@@ -8,7 +8,8 @@ use std::{
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
 use super::{
-    ClientCodec, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream, TlsParameters,
+    ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
+    TlsParameters,
 };
 #[cfg(feature = "native-tls")]
 use crate::transport::smtp::commands::Starttls;
@@ -42,8 +43,6 @@ pub(crate) struct SmtpConnection {
     /// TCP stream between client and server
     /// Value is None before connection
     stream: BufReader<NetworkStream>,
-    /// Panic state
-    panic: bool,
     /// Information about the server
     server_info: ServerInfo,
     /// Client identity used for EHLO.
@@ -57,8 +56,6 @@ impl SmtpConnection {
     pub(crate) fn server_info(&self) -> &ServerInfo {
         &self.server_info
     }
-
-    // FIXME add simple connect and rename this one
 
     /// Connects to the configured server
     ///
@@ -93,13 +90,11 @@ impl SmtpConnection {
         let stream = BufReader::new(stream);
         let mut conn = SmtpConnection {
             stream,
-            panic: false,
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
             protocol,
         };
         conn.set_timeout(timeout).map_err(error::network)?;
-        // TODO log
         let _response = conn.read_response()?;
 
         conn.hello(hello_name)?;
@@ -212,7 +207,7 @@ impl SmtpConnection {
     }
 
     pub(crate) fn has_broken(&self) -> bool {
-        self.panic
+        self.stream.get_ref().state() != ConnectionState::Ok
     }
 
     // Without sync native-tls, no public transport path can perform STARTTLS.
@@ -266,7 +261,6 @@ impl SmtpConnection {
     }
 
     pub(crate) fn abort(&mut self) {
-        self.panic = true;
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
     }
 
@@ -308,7 +302,8 @@ impl SmtpConnection {
 
         // Limit challenges to avoid blocking
         let mut challenges = 10;
-        let mut response = self.command(Auth::new(mechanism, credentials.clone(), None)?)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let mut response = try_smtp!(self.command(auth), self);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -402,11 +397,15 @@ impl SmtpConnection {
 
     /// Writes a string to the server
     fn write(&mut self, string: &[u8]) -> Result<(), Error> {
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
         self.stream
             .get_mut()
             .write_all(string)
             .map_err(error::network)?;
         self.stream.get_mut().flush().map_err(error::network)?;
+        self.stream.get_mut().set_state(ConnectionState::Ok);
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Wrote: {}", escape_crlf(&String::from_utf8_lossy(string)));
@@ -423,6 +422,9 @@ impl SmtpConnection {
     }
 
     fn read_response_inner(&mut self, accept_negative: bool) -> Result<Response, Error> {
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
 
@@ -439,6 +441,8 @@ impl SmtpConnection {
             tracing::debug!("<< {}", escape_crlf(&buffer));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
+                    self.stream.get_mut().set_state(ConnectionState::Ok);
+
                     return if accept_negative || response.is_positive() {
                         Ok(response)
                     } else {
@@ -614,6 +618,180 @@ mod test {
         assert!(commands[0].starts_with("EHLO "));
         assert!(commands[1].starts_with("AUTH PLAIN "));
         assert!(commands[2].starts_with("EHLO "));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oauthbearer_auth_sends_initial_response_and_refreshes_ehlo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"235 authenticated\r\n").unwrap();
+
+            let mut post_auth_ehlo = String::new();
+            reader.read_line(&mut post_auth_ehlo).unwrap();
+            commands.push(post_auth_ehlo);
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        let response = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("us,er=one", "token"),
+            )
+            .unwrap();
+
+        assert!(response.has_code(235));
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        assert!(commands[2].starts_with("EHLO "));
+
+        let encoded_response = commands[1]
+            .trim_end()
+            .strip_prefix("AUTH OAUTHBEARER ")
+            .unwrap();
+        let decoded_response = crate::base64::decode(encoded_response).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded_response).unwrap(),
+            "n,a=us=2Cer=3Done,\x01auth=Bearer token\x01\x01"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oauthbearer_immediate_rejection_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"535 rejected\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        let error = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("user", "token"),
+            )
+            .unwrap_err();
+
+        assert!(
+            error.is_permanent(),
+            "expected permanent SMTP error: {error:?}"
+        );
+        assert!(connection.has_broken());
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oauthbearer_failed_challenge_sends_cancel_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"334 e30=\r\n").unwrap();
+
+            let mut cancel = String::new();
+            reader.read_line(&mut cancel).unwrap();
+            commands.push(cancel);
+            stream.write_all(b"535 rejected\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        let error = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("user", "token"),
+            )
+            .unwrap_err();
+
+        assert!(
+            error.is_permanent(),
+            "expected permanent SMTP error: {error:?}"
+        );
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        assert_eq!(commands[2], "AQ==\r\n");
+        assert!(connection.has_broken());
         handle.join().unwrap();
     }
 }

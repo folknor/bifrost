@@ -25,6 +25,8 @@
 #[cfg(feature = "serde")]
 use std::fmt::Debug;
 
+use crate::transport::smtp::{Error, error};
+
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 pub(crate) use self::async_connection::AsyncSmtpConnection;
 pub(crate) use self::connection::SmtpConnection;
@@ -48,6 +50,23 @@ pub(super) const MAX_RESPONSE_BYTES: usize = 100_000;
 
 /// Single-line byte cap (Postfix `line_length_limit`).
 pub(super) const MAX_RESPONSE_LINE_BYTES: usize = 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionState {
+    Ok,
+    Broken,
+    Closed,
+}
+
+impl ConnectionState {
+    fn verify(self) -> Result<(), Error> {
+        match self {
+            ConnectionState::Ok => Ok(()),
+            ConnectionState::Broken => Err(error::connection("SMTP connection is broken")),
+            ConnectionState::Closed => Err(error::connection("SMTP connection is closed")),
+        }
+    }
+}
 
 /// The codec used for transparency
 #[derive(Debug)]

@@ -174,7 +174,6 @@ impl<E: SmtpExecutor> Pool<E> {
                 Some(conn) => {
                     let mut conn = conn.unpark();
 
-                    // TODO: handle the client try another connection if this one isn't good
                     if !conn.test_connected().await {
                         #[cfg(feature = "tracing")]
                         tracing::debug!("dropping a broken connection");

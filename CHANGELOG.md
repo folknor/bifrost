@@ -9,6 +9,8 @@ and is being adapted for ratatoskr. Notable fork-time API breaks so far:
 
 - OAuth credentials are explicit through `Credentials::oauth2(...)` and
   builder `.oauth2(...)` helpers. `OAUTHBEARER` is preferred before `XOAUTH2`.
+  The old tuple conversion to password credentials was removed; use
+  `Credentials::password(...)`.
 - SMTP AUTH refuses plaintext connections by default. Trusted local relays can
   opt in with `.dangerous_allow_insecure_auth(true)`.
 - `transport::smtp::client` is no longer public. TLS configuration types moved
@@ -20,6 +22,9 @@ and is being adapted for ratatoskr. Notable fork-time API breaks so far:
   `Sync`, and async `send` now takes `&Message`.
 - Added first-class `LmtpTransport` and `AsyncLmtpTransport` APIs. LMTP sends
   with `LHLO` and returns one `Response` per recipient.
+- SMTP connections now mark themselves broken during in-flight I/O and LMTP
+  multi-response reads, so dropped async futures cannot return a half-used
+  connection to the pool.
 
 ## bifrost-jmap 0.1.0 - unreleased
 

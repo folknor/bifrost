@@ -89,6 +89,10 @@ impl Debug for Tls {
 pub enum CertificateStore {
     /// Use the platform certificate store selected by native-tls.
     ///
+    /// Since bifrost-smtp only supports native-tls, this variant always means
+    /// the native-tls platform verifier rather than a backend-dependent
+    /// default.
+    ///
     /// This uses schannel on Windows, Security-Framework on macOS, and
     /// OpenSSL directories on Linux.
     #[default]

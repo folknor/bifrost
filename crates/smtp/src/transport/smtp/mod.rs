@@ -221,6 +221,8 @@ pub mod extension;
 #[cfg(feature = "pool")]
 mod pool;
 pub mod response;
+#[cfg(test)]
+mod test_support;
 mod transport;
 pub(super) mod util;
 

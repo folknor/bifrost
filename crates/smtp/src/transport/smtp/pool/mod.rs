@@ -20,7 +20,11 @@ impl PoolConfig {
         Self::default()
     }
 
-    /// Minimum number of idle connections
+    /// Minimum number of idle connections kept warm by the background pool.
+    ///
+    /// Setting this above zero allows the pool task to open replacement
+    /// connections in the background, including any DNS lookup needed for the
+    /// configured server.
     ///
     /// Defaults to `0`
     pub fn min_idle(mut self, min_idle: u32) -> Self {

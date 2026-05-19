@@ -9,7 +9,7 @@ use super::async_net::AsyncDeadline;
 use super::escape_crlf;
 #[allow(deprecated)]
 use super::{
-    ClientCodec, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, TlsParameters,
+    ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, TlsParameters,
     async_net::AsyncNetworkStream,
 };
 use crate::{
@@ -86,8 +86,6 @@ pub(crate) struct AsyncSmtpConnection {
     /// Value is None before connection
     #[allow(deprecated)]
     stream: BufReader<AsyncNetworkStream>,
-    /// Panic state
-    panic: bool,
     /// Information about the server
     server_info: ServerInfo,
     /// Client identity used for EHLO.
@@ -246,14 +244,12 @@ impl AsyncSmtpConnection {
         let stream = BufReader::new(stream);
         let mut conn = AsyncSmtpConnection {
             stream,
-            panic: false,
             server_info: ServerInfo::default(),
             hello_name: hello_name.clone(),
             protocol,
             timeout,
             timeout_runtime,
         };
-        // TODO log
         let _response = conn.read_response_with_budget(setup_budget).await?;
 
         conn.hello_with_budget(hello_name, setup_budget).await?;
@@ -376,7 +372,7 @@ impl AsyncSmtpConnection {
     }
 
     pub(crate) fn has_broken(&self) -> bool {
-        self.panic
+        self.stream.get_ref().state() != ConnectionState::Ok
     }
 
     // Async STARTTLS is only wired for the tokio native-tls feature path.
@@ -453,7 +449,6 @@ impl AsyncSmtpConnection {
     }
 
     pub(crate) async fn abort(&mut self) {
-        self.panic = true;
         let _ = self.stream.close().await;
     }
 
@@ -489,9 +484,8 @@ impl AsyncSmtpConnection {
 
         // Limit challenges to avoid blocking
         let mut challenges: u8 = 10;
-        let mut response = self
-            .command(Auth::new(mechanism, credentials.clone(), None)?)
-            .await?;
+        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let mut response = try_smtp!(self.command(auth).await, self);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -566,11 +560,20 @@ impl AsyncSmtpConnection {
         }
         self.write(b"\r\n.\r\n").await?;
 
+        // A dropped LMTP send cannot safely reuse the stream until every
+        // accepted recipient status has been consumed.
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
         let mut responses = Vec::with_capacity(recipients);
         for _ in 0..recipients {
-            responses.push(self.read_response_accepting_status().await?);
+            responses.push(
+                self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await?,
+            );
         }
 
+        self.stream.get_mut().set_state(ConnectionState::Ok);
         Ok(responses)
     }
 
@@ -609,6 +612,9 @@ impl AsyncSmtpConnection {
         string: &[u8],
         budget: TimeoutBudget,
     ) -> Result<(), Error> {
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
         with_timeout(
             self.timeout_runtime,
             budget,
@@ -625,6 +631,7 @@ impl AsyncSmtpConnection {
         )
         .await?
         .map_err(error::network)?;
+        self.stream.get_mut().set_state(ConnectionState::Ok);
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Wrote: {}", escape_crlf(&String::from_utf8_lossy(string)));
@@ -638,7 +645,7 @@ impl AsyncSmtpConnection {
     }
 
     async fn read_response_accepting_status(&mut self) -> Result<Response, Error> {
-        self.read_response_with_budget_inner(self.per_operation_budget(), true)
+        self.read_response_with_budget_inner(self.per_operation_budget(), true, true)
             .await
     }
 
@@ -646,14 +653,21 @@ impl AsyncSmtpConnection {
         &mut self,
         budget: TimeoutBudget,
     ) -> Result<Response, Error> {
-        self.read_response_with_budget_inner(budget, false).await
+        self.read_response_with_budget_inner(budget, false, true)
+            .await
     }
 
     async fn read_response_with_budget_inner(
         &mut self,
         budget: TimeoutBudget,
         accept_negative: bool,
+        manage_state: bool,
     ) -> Result<Response, Error> {
+        if manage_state {
+            self.stream.get_ref().state().verify()?;
+            self.stream.get_mut().set_state(ConnectionState::Broken);
+        }
+
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
 
@@ -679,6 +693,10 @@ impl AsyncSmtpConnection {
             tracing::debug!("<< {}", escape_crlf(&buffer));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
+                    if manage_state {
+                        self.stream.get_mut().set_state(ConnectionState::Ok);
+                    }
+
                     return if accept_negative || response.is_positive() {
                         Ok(response)
                     } else {
@@ -867,6 +885,189 @@ mod test {
     }
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn oauthbearer_auth_sends_initial_response_and_refreshes_ehlo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"235 authenticated\r\n").unwrap();
+
+            let mut post_auth_ehlo = String::new();
+            reader.read_line(&mut post_auth_ehlo).unwrap();
+            commands.push(post_auth_ehlo);
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let response = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("us,er=one", "token"),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.has_code(235));
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        assert!(commands[2].starts_with("EHLO "));
+
+        let encoded_response = commands[1]
+            .trim_end()
+            .strip_prefix("AUTH OAUTHBEARER ")
+            .unwrap();
+        let decoded_response = crate::base64::decode(encoded_response).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded_response).unwrap(),
+            "n,a=us=2Cer=3Done,\x01auth=Bearer token\x01\x01"
+        );
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn oauthbearer_immediate_rejection_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"535 rejected\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let error = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("user", "token"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.is_permanent(),
+            "expected permanent SMTP error: {error:?}"
+        );
+        assert!(connection.has_broken());
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn oauthbearer_failed_challenge_sends_cancel_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH OAUTHBEARER\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"334 e30=\r\n").unwrap();
+
+            let mut cancel = String::new();
+            reader.read_line(&mut cancel).unwrap();
+            commands.push(cancel);
+            stream.write_all(b"535 rejected\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let error = connection
+            .auth(
+                &[Mechanism::OAuthBearer],
+                &Credentials::oauth2("user", "token"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.is_permanent(),
+            "expected permanent SMTP error: {error:?}"
+        );
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH OAUTHBEARER "));
+        assert_eq!(commands[2], "AQ==\r\n");
+        assert!(connection.has_broken());
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
     async fn connect_times_out_waiting_for_banner() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -970,6 +1171,52 @@ mod test {
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
         handle.join().unwrap();
     }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn cancelled_command_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            let mut noop = String::new();
+            reader.read_line(&mut noop).unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let mut connection = AsyncSmtpConnection::connect_tokio1(
+            address,
+            Some(Duration::from_secs(2)),
+            &ClientId::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result =
+            tokio1_crate::time::timeout(Duration::from_millis(50), connection.command(Noop)).await;
+
+        assert!(result.is_err(), "command future must be cancelled");
+        assert!(connection.has_broken());
+
+        let error = connection.command(Noop).await.unwrap_err();
+        assert!(
+            error.is_connection(),
+            "expected connection error: {error:?}"
+        );
+        handle.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -983,7 +1230,10 @@ mod asyncstd_test {
         time::Duration,
     };
 
-    use crate::transport::smtp::{AsyncSmtpConnection, extension::ClientId};
+    use crate::{
+        address::Envelope,
+        transport::smtp::{AsyncSmtpConnection, Protocol, commands::Noop, extension::ClientId},
+    };
 
     #[async_std::test]
     async fn asyncstd_connect_setup_uses_single_deadline_for_banner_and_ehlo() {
@@ -1021,6 +1271,133 @@ mod asyncstd_test {
         };
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
         assert!(ehlo_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[async_std::test]
+    async fn asyncstd_cancelled_command_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+
+            let mut noop = String::new();
+            reader.read_line(&mut noop).unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let mut connection = AsyncSmtpConnection::connect_asyncstd1(
+            address,
+            Some(Duration::from_secs(2)),
+            &ClientId::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result =
+            async_std::future::timeout(Duration::from_millis(50), connection.command(Noop)).await;
+
+        assert!(result.is_err(), "command future must be cancelled");
+        assert!(connection.has_broken());
+
+        let error = connection.command(Noop).await.unwrap_err();
+        assert!(
+            error.is_connection(),
+            "expected connection error: {error:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[async_std::test]
+    async fn asyncstd_cancelled_lmtp_delivery_status_loop_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut lhlo = String::new();
+            reader.read_line(&mut lhlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
+                .unwrap();
+
+            for response in [
+                b"250 sender ok\r\n".as_slice(),
+                b"250 first ok\r\n".as_slice(),
+                b"250 second ok\r\n".as_slice(),
+            ] {
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                stream.write_all(response).unwrap();
+            }
+
+            let mut data = String::new();
+            reader.read_line(&mut data).unwrap();
+            stream.write_all(b"354 send message\r\n").unwrap();
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+
+            stream.write_all(b"250 first delivered\r\n").unwrap();
+            thread::sleep(Duration::from_millis(250));
+            let _ = stream.write_all(b"250 second delivered\r\n");
+        });
+
+        let mut connection = AsyncSmtpConnection::connect_asyncstd1_with_protocol(
+            address,
+            Some(Duration::from_secs(2)),
+            &ClientId::default(),
+            None,
+            Protocol::Lmtp,
+        )
+        .await
+        .unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let result = async_std::future::timeout(
+            Duration::from_millis(50),
+            connection.send_lmtp(&envelope, b"Subject: test\r\n\r\nHello"),
+        )
+        .await;
+
+        assert!(result.is_err(), "LMTP send future must be cancelled");
+        assert!(connection.has_broken());
+
+        let error = connection.command(Noop).await.unwrap_err();
+        assert!(
+            error.is_connection(),
+            "expected connection error: {error:?}"
+        );
         handle.join().unwrap();
     }
 }

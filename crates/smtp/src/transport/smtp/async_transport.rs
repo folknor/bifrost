@@ -812,7 +812,11 @@ mod tests {
     };
 
     use crate::{
-        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, Tokio1Executor, address::Envelope,
+        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+        address::Envelope,
+        transport::smtp::test_support::{
+            assert_lmtp_delivery_commands, spawn_lmtp_delivery_server,
+        },
     };
 
     use super::{AsyncSmtpClient, Protocol};
@@ -836,58 +840,7 @@ mod tests {
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
     async fn tokio_lmtp_transport_returns_per_recipient_statuses() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut lhlo = String::new();
-            reader.read_line(&mut lhlo).unwrap();
-            commands.push(lhlo);
-            stream
-                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-                .unwrap();
-
-            for response in [
-                b"250 sender ok\r\n".as_slice(),
-                b"250 rcpt ok\r\n".as_slice(),
-                b"550 rcpt rejected\r\n".as_slice(),
-                b"250 rcpt ok\r\n".as_slice(),
-            ] {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-                stream.write_all(response).unwrap();
-            }
-
-            let mut data = String::new();
-            reader.read_line(&mut data).unwrap();
-            commands.push(data);
-            stream.write_all(b"354 send message\r\n").unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-
-            stream
-                .write_all(b"250 first recipient ok\r\n451 third recipient deferred\r\n")
-                .unwrap();
-            commands_tx.send(commands).unwrap();
-        });
+        let server = spawn_lmtp_delivery_server();
 
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
@@ -900,7 +853,7 @@ mod tests {
         .unwrap();
         let mailer: AsyncLmtpTransport<Tokio1Executor> =
             AsyncLmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
-                .port(address.port())
+                .port(server.address.port())
                 .build();
 
         let responses = mailer
@@ -915,14 +868,8 @@ mod tests {
         assert!(responses[2].has_code(451));
         assert!(!responses[2].is_positive());
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("LHLO "));
-        assert!(commands[1].starts_with("MAIL FROM:<sender@example.com>"));
-        assert!(commands[2].starts_with("RCPT TO:<first@example.com>"));
-        assert!(commands[3].starts_with("RCPT TO:<second@example.com>"));
-        assert!(commands[4].starts_with("RCPT TO:<third@example.com>"));
-        assert_eq!(commands[5], "DATA\r\n");
-        handle.join().unwrap();
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
     }
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
@@ -972,15 +919,13 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "async-std1")]
 mod asyncstd_tests {
-    use std::{
-        io::{BufRead, BufReader, Write},
-        net::TcpListener,
-        sync::mpsc,
-        thread,
-        time::Duration,
+    use crate::{
+        AsyncLmtpTransport, AsyncStd1Executor, AsyncTransport,
+        address::Envelope,
+        transport::smtp::test_support::{
+            assert_lmtp_delivery_commands, spawn_lmtp_delivery_server,
+        },
     };
-
-    use crate::{AsyncLmtpTransport, AsyncStd1Executor, AsyncTransport, address::Envelope};
 
     use super::Protocol;
 
@@ -994,58 +939,7 @@ mod asyncstd_tests {
 
     #[async_std::test]
     async fn asyncstd_lmtp_transport_returns_per_recipient_statuses() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (commands_tx, commands_rx) = mpsc::channel();
-
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            stream.write_all(b"220 localhost\r\n").unwrap();
-
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut commands = Vec::new();
-
-            let mut lhlo = String::new();
-            reader.read_line(&mut lhlo).unwrap();
-            commands.push(lhlo);
-            stream
-                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
-                .unwrap();
-
-            for response in [
-                b"250 sender ok\r\n".as_slice(),
-                b"250 rcpt ok\r\n".as_slice(),
-                b"550 rcpt rejected\r\n".as_slice(),
-                b"250 rcpt ok\r\n".as_slice(),
-            ] {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-                stream.write_all(response).unwrap();
-            }
-
-            let mut data = String::new();
-            reader.read_line(&mut data).unwrap();
-            commands.push(data);
-            stream.write_all(b"354 send message\r\n").unwrap();
-
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line == ".\r\n" {
-                    break;
-                }
-            }
-
-            stream
-                .write_all(b"250 first recipient ok\r\n451 third recipient deferred\r\n")
-                .unwrap();
-            commands_tx.send(commands).unwrap();
-        });
+        let server = spawn_lmtp_delivery_server();
 
         let envelope = Envelope::new(
             Some("sender@example.com".parse().unwrap()),
@@ -1058,7 +952,7 @@ mod asyncstd_tests {
         .unwrap();
         let mailer: AsyncLmtpTransport<AsyncStd1Executor> =
             AsyncLmtpTransport::<AsyncStd1Executor>::builder_dangerous("127.0.0.1")
-                .port(address.port())
+                .port(server.address.port())
                 .build();
 
         let responses = mailer
@@ -1073,13 +967,7 @@ mod asyncstd_tests {
         assert!(responses[2].has_code(451));
         assert!(!responses[2].is_positive());
 
-        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(commands[0].starts_with("LHLO "));
-        assert!(commands[1].starts_with("MAIL FROM:<sender@example.com>"));
-        assert!(commands[2].starts_with("RCPT TO:<first@example.com>"));
-        assert!(commands[3].starts_with("RCPT TO:<second@example.com>"));
-        assert!(commands[4].starts_with("RCPT TO:<third@example.com>"));
-        assert_eq!(commands[5], "DATA\r\n");
-        handle.join().unwrap();
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
     }
 }
