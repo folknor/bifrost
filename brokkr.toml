@@ -1,15 +1,14 @@
 project = "bifrost"
 
-# bifrost-jmap has two TLS backends (tls-rustls / tls-native) that are
-# mutually exclusive, so --all-features won't compile. Two explicit
-# sweeps cover the matrix:
+# bifrost-jmap uses native-tls. Two explicit sweeps cover the default and
+# minimum viable feature sets:
 #
-#  - "default"  = the default feature set: tls-rustls, websockets, and
+#  - "default"  = the default feature set: tls-native, websockets, and
 #                 every RFC feature gate (mail, calendars, contacts,
 #                 blob, quota). Mirrors what consumers get out of the
 #                 box.
 #
-#  - "minimal"  = no-default-features + tls-rustls. Catches lints in
+#  - "minimal"  = no-default-features + tls-native. Catches lints in
 #                 always-compiled code that the per-RFC #[cfg] gates
 #                 would otherwise hide. Also the smallest viable build
 #                 (core JMAP only, no mail / calendars / contacts).
@@ -21,7 +20,7 @@ name = "default"
 [[check]]
 name = "minimal"
 no_default_features = true
-features = ["tls-rustls"]
+features = ["tls-native"]
 
 [test]
 default_package = "bifrost-jmap"

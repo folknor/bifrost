@@ -34,8 +34,7 @@ A **JSON Meta Application Protocol (JMAP)** client library for Rust with full co
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `tls-rustls` | Yes | rustls TLS backend |
-| `tls-native` | No | native-tls backend (mutually exclusive with `tls-rustls`) |
+| `tls-native` | Yes | native-tls backend |
 | `websockets` | Yes | JMAP over WebSocket |
 | `mail` | Yes | Email, Mailbox, Thread, Identity, EmailSubmission, Sieve, VacationResponse |
 | `calendars` | Yes | Calendar, CalendarEvent, CalendarEventNotification, ParticipantIdentity |

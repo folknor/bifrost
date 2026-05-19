@@ -1,11 +1,8 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
-#[cfg(all(feature = "tls-rustls", feature = "tls-native"))]
-compile_error!("Features `tls-rustls` and `tls-native` are mutually exclusive. Choose one.");
-
-#[cfg(not(any(feature = "tls-rustls", feature = "tls-native")))]
-compile_error!("Either `tls-rustls` or `tls-native` must be enabled.");
+#[cfg(not(feature = "tls-native"))]
+compile_error!("The `tls-native` feature must be enabled.");
 
 pub mod account;
 #[cfg(feature = "contacts")]
