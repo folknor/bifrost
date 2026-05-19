@@ -538,3 +538,50 @@ Verification:
 - From `crates/smtp`: `brokkr check` reached a clean all-features clippy pass,
   then failed in the test phase because the sendmail integration tests expect a
   working local `sendmail` command.
+
+## Async connection setup deadline
+
+Upstream issues:
+
+- https://github.com/lettre/lettre/issues/917
+- https://github.com/lettre/lettre/issues/1027
+- https://github.com/lettre/lettre/issues/978
+
+Problem:
+
+- The async transport timeout had become a per-operation guard, but connection
+  setup still applied the full configured timeout separately to DNS lookup,
+  each address connect attempt, TLS handshake, banner read, and initial EHLO.
+- A 10-second timeout could therefore still take much longer during setup when
+  several phases were slow in sequence.
+
+Implemented:
+
+- Added an internal `AsyncDeadline` helper for async connection setup.
+- Public deprecated `AsyncNetworkStream::connect_tokio1` and
+  `connect_asyncstd1` keep their signatures, but delegate to internal
+  deadline-aware variants.
+- Async setup now shares one deadline across DNS, connect attempts, implicit
+  TLS handshake, banner read, EHLO write/flush, and EHLO response parsing.
+- The setup deadline lives only until `connect_impl` returns. Normal SMTP
+  commands, pooled `test_connected()` NOOP probes, and other operations on an
+  established connection keep the existing per-operation timeout behavior.
+- `AsyncSmtpConnection::starttls(...)` still uses the configured timeout as a
+  per-operation budget because it is an explicit command on an already-open
+  connection, not part of initial setup.
+- Added a tokio regression test where banner and EHLO each respond within the
+  configured timeout individually, but exceed the single setup deadline
+  together.
+- Added matching async-std coverage for the same banner/EHLO deadline boundary.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- connect_setup_uses_single_deadline`
+  passed.
+- From `crates/smtp`: `brokkr check --features async-std1 -- -- asyncstd_connect_setup_uses_single_deadline`
+  passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool`
+  passed.

@@ -4,6 +4,7 @@ use std::{fmt::Display, future::Future, time::Duration};
 
 use futures_util::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use super::async_net::AsyncDeadline;
 #[cfg(feature = "tokio1")]
 use super::async_net::AsyncTokioStream;
 #[cfg(feature = "tracing")]
@@ -45,15 +46,26 @@ enum TimeoutRuntime {
     AsyncStd1,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TimeoutBudget {
+    PerOperation(Option<Duration>),
+    SetupDeadline(AsyncDeadline),
+}
+
 async fn with_timeout<T, F>(
     runtime: TimeoutRuntime,
-    timeout: Option<Duration>,
+    budget: TimeoutBudget,
     message: &'static str,
     future: F,
 ) -> Result<T, Error>
 where
     F: Future<Output = T>,
 {
+    let timeout = match budget {
+        TimeoutBudget::PerOperation(timeout) => timeout,
+        TimeoutBudget::SetupDeadline(deadline) => deadline.remaining(message)?,
+    };
+
     match timeout {
         None => Ok(future.await),
         Some(timeout) => match runtime {
@@ -92,6 +104,10 @@ impl AsyncSmtpConnection {
         &self.server_info
     }
 
+    fn per_operation_budget(&self) -> TimeoutBudget {
+        TimeoutBudget::PerOperation(self.timeout)
+    }
+
     /// Connects with existing async stream
     ///
     /// Sends EHLO and parses server information
@@ -103,7 +119,14 @@ impl AsyncSmtpConnection {
     ) -> Result<AsyncSmtpConnection, Error> {
         #[allow(deprecated)]
         let stream = AsyncNetworkStream::use_existing_tokio1(stream);
-        Self::connect_impl(stream, hello_name, None, TimeoutRuntime::Tokio1).await
+        Self::connect_impl(
+            stream,
+            hello_name,
+            None,
+            TimeoutRuntime::Tokio1,
+            TimeoutBudget::PerOperation(None),
+        )
+        .await
     }
 
     /// Connects to the configured server
@@ -145,11 +168,23 @@ impl AsyncSmtpConnection {
         tls_parameters: Option<TlsParameters>,
         local_address: Option<IpAddr>,
     ) -> Result<AsyncSmtpConnection, Error> {
+        let deadline = AsyncDeadline::new(timeout);
         #[allow(deprecated)]
-        let stream =
-            AsyncNetworkStream::connect_tokio1(server, timeout, tls_parameters, local_address)
-                .await?;
-        Self::connect_impl(stream, hello_name, timeout, TimeoutRuntime::Tokio1).await
+        let stream = AsyncNetworkStream::connect_tokio1_until(
+            server,
+            deadline,
+            tls_parameters,
+            local_address,
+        )
+        .await?;
+        Self::connect_impl(
+            stream,
+            hello_name,
+            timeout,
+            TimeoutRuntime::Tokio1,
+            TimeoutBudget::SetupDeadline(deadline),
+        )
+        .await
     }
 
     /// Connects to the configured server
@@ -163,9 +198,18 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         tls_parameters: Option<TlsParameters>,
     ) -> Result<AsyncSmtpConnection, Error> {
+        let deadline = AsyncDeadline::new(timeout);
         #[allow(deprecated)]
-        let stream = AsyncNetworkStream::connect_asyncstd1(server, timeout, tls_parameters).await?;
-        Self::connect_impl(stream, hello_name, timeout, TimeoutRuntime::AsyncStd1).await
+        let stream =
+            AsyncNetworkStream::connect_asyncstd1_until(server, deadline, tls_parameters).await?;
+        Self::connect_impl(
+            stream,
+            hello_name,
+            timeout,
+            TimeoutRuntime::AsyncStd1,
+            TimeoutBudget::SetupDeadline(deadline),
+        )
+        .await
     }
 
     #[allow(deprecated)]
@@ -174,6 +218,7 @@ impl AsyncSmtpConnection {
         hello_name: &ClientId,
         timeout: Option<Duration>,
         timeout_runtime: TimeoutRuntime,
+        setup_budget: TimeoutBudget,
     ) -> Result<AsyncSmtpConnection, Error> {
         let stream = BufReader::new(stream);
         let mut conn = AsyncSmtpConnection {
@@ -185,9 +230,9 @@ impl AsyncSmtpConnection {
             timeout_runtime,
         };
         // TODO log
-        let _response = conn.read_response().await?;
+        let _response = conn.read_response_with_budget(setup_budget).await?;
 
-        conn.ehlo(hello_name).await?;
+        conn.ehlo_with_budget(hello_name, setup_budget).await?;
 
         // Print server information
         #[cfg(feature = "tracing")]
@@ -286,7 +331,20 @@ impl AsyncSmtpConnection {
 
     /// Send EHLO and update server info
     async fn ehlo(&mut self, hello_name: &ClientId) -> Result<(), Error> {
-        let ehlo_response = try_smtp!(self.command(Ehlo::new(hello_name.clone())).await, self);
+        self.ehlo_with_budget(hello_name, self.per_operation_budget())
+            .await
+    }
+
+    async fn ehlo_with_budget(
+        &mut self,
+        hello_name: &ClientId,
+        budget: TimeoutBudget,
+    ) -> Result<(), Error> {
+        let ehlo_response = try_smtp!(
+            self.command_with_budget(Ehlo::new(hello_name.clone()), budget)
+                .await,
+            self
+        );
         self.server_info = try_smtp!(ServerInfo::from_response(&ehlo_response), self);
         Ok(())
     }
@@ -389,15 +447,34 @@ impl AsyncSmtpConnection {
 
     /// Sends an SMTP command
     pub async fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
-        self.write(command.to_string().as_bytes()).await?;
-        self.read_response().await
+        self.command_with_budget(command, self.per_operation_budget())
+            .await
+    }
+
+    async fn command_with_budget<C: Display>(
+        &mut self,
+        command: C,
+        budget: TimeoutBudget,
+    ) -> Result<Response, Error> {
+        self.write_with_budget(command.to_string().as_bytes(), budget)
+            .await?;
+        self.read_response_with_budget(budget).await
     }
 
     /// Writes a string to the server
     async fn write(&mut self, string: &[u8]) -> Result<(), Error> {
+        self.write_with_budget(string, self.per_operation_budget())
+            .await
+    }
+
+    async fn write_with_budget(
+        &mut self,
+        string: &[u8],
+        budget: TimeoutBudget,
+    ) -> Result<(), Error> {
         with_timeout(
             self.timeout_runtime,
-            self.timeout,
+            budget,
             "SMTP write timed out",
             self.stream.get_mut().write_all(string),
         )
@@ -405,7 +482,7 @@ impl AsyncSmtpConnection {
         .map_err(error::network)?;
         with_timeout(
             self.timeout_runtime,
-            self.timeout,
+            budget,
             "SMTP flush timed out",
             self.stream.get_mut().flush(),
         )
@@ -419,12 +496,20 @@ impl AsyncSmtpConnection {
 
     /// Gets the SMTP response
     pub async fn read_response(&mut self) -> Result<Response, Error> {
+        self.read_response_with_budget(self.per_operation_budget())
+            .await
+    }
+
+    async fn read_response_with_budget(
+        &mut self,
+        budget: TimeoutBudget,
+    ) -> Result<Response, Error> {
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
 
         while with_timeout(
             self.timeout_runtime,
-            self.timeout,
+            budget,
             "SMTP read timed out",
             self.stream.read_line(&mut buffer),
         )
@@ -665,6 +750,46 @@ mod test {
     }
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn connect_setup_uses_single_deadline_for_banner_and_ehlo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ehlo_tx, ehlo_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            thread::sleep(Duration::from_millis(75));
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            ehlo_tx.send(ehlo.starts_with("EHLO ")).unwrap();
+
+            thread::sleep(Duration::from_millis(75));
+            let _ = stream.write_all(b"250 localhost\r\n");
+        });
+
+        let result = AsyncSmtpConnection::connect_tokio1(
+            address,
+            Some(Duration::from_millis(120)),
+            &ClientId::default(),
+            None,
+            None,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("connect must use one setup deadline across banner and EHLO");
+        };
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        assert!(ehlo_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
     async fn command_times_out_waiting_for_response() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -700,6 +825,59 @@ mod test {
             panic!("NOOP must time out while waiting for response");
         };
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "async-std1")]
+mod asyncstd_test {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use crate::transport::smtp::{client::AsyncSmtpConnection, extension::ClientId};
+
+    #[async_std::test]
+    async fn asyncstd_connect_setup_uses_single_deadline_for_banner_and_ehlo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ehlo_tx, ehlo_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            thread::sleep(Duration::from_millis(75));
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            ehlo_tx.send(ehlo.starts_with("EHLO ")).unwrap();
+
+            thread::sleep(Duration::from_millis(75));
+            let _ = stream.write_all(b"250 localhost\r\n");
+        });
+
+        let result = AsyncSmtpConnection::connect_asyncstd1(
+            address,
+            Some(Duration::from_millis(120)),
+            &ClientId::default(),
+            None,
+        )
+        .await;
+
+        let Err(error) = result else {
+            panic!("connect must use one setup deadline across banner and EHLO");
+        };
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        assert!(ehlo_rx.recv_timeout(Duration::from_secs(3)).unwrap());
         handle.join().unwrap();
     }
 }
