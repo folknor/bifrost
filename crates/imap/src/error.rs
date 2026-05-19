@@ -31,6 +31,9 @@ pub enum Error {
     /// strings](https://tools.ietf.org/html/rfc3501#section-4.3).
     #[error("validate: {0}")]
     Validate(#[from] ValidateError),
+    /// The requested SASL mechanism name was invalid.
+    #[error("invalid SASL mechanism: {0}")]
+    ValidateSaslMechanism(#[from] ValidateSaslMechanismError),
     /// Error appending an e-mail.
     #[error("could not append mail to mailbox")]
     Append,
@@ -61,6 +64,21 @@ pub enum ParseError {
 #[derive(thiserror::Error, Debug)]
 #[error("invalid character in input: '{0}'")]
 pub struct ValidateError(pub char);
+
+/// An invalid SASL mechanism name was passed to `AUTHENTICATE`.
+#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ValidateSaslMechanismError {
+    /// SASL mechanism names cannot be empty.
+    #[error("mechanism must not be empty")]
+    Empty,
+    /// SASL mechanism names are limited to 20 ASCII bytes.
+    #[error("mechanism must be at most 20 bytes, got {0}")]
+    TooLong(usize),
+    /// SASL mechanism names can only contain ASCII letters, digits, hyphen, and underscore.
+    #[error("invalid character '{0}'")]
+    InvalidChar(char),
+}
 
 #[cfg(test)]
 mod tests {

@@ -15,8 +15,8 @@ use imap_proto::{Metadata, RequestId, Response};
 #[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
-use super::authenticator::Authenticator;
-use super::error::{Error, ParseError, Result, ValidateError};
+use super::authenticator::{Authenticator, SaslAuthenticator};
+use super::error::{Error, ParseError, Result, ValidateError, ValidateSaslMechanismError};
 use super::parse::*;
 use super::types::*;
 use crate::extensions::{self, quota::parse_get_quota};
@@ -257,13 +257,25 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         auth_type: S,
         authenticator: A,
     ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+        let auth_type = ok_or_unauth_client_err!(validate_sasl_mechanism(auth_type.as_ref()), self);
         let id = ok_or_unauth_client_err!(
-            self.run_command(&format!("AUTHENTICATE {}", auth_type.as_ref()))
-                .await,
+            self.run_command(&format!("AUTHENTICATE {auth_type}")).await,
             self
         );
         let session = self.do_auth_handshake(id, authenticator).await?;
         Ok(session)
+    }
+
+    /// Authenticate with a typed SASL authenticator.
+    ///
+    /// This is a convenience wrapper around [`Client::authenticate`] for
+    /// authenticators that know their own SASL mechanism, such as
+    /// [`Plain`](crate::Plain) and [`XOAuth2`](crate::XOAuth2).
+    pub async fn authenticate_with<A: SaslAuthenticator>(
+        self,
+        authenticator: A,
+    ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
+        self.authenticate(A::MECHANISM, authenticator).await
     }
 
     /// This func does the handshake process once the authenticate command is made.
@@ -1489,6 +1501,22 @@ fn validate_str(value: &str) -> Result<String> {
     Ok(quoted)
 }
 
+fn validate_sasl_mechanism(value: &str) -> Result<String> {
+    if value.is_empty() {
+        return Err(ValidateSaslMechanismError::Empty.into());
+    }
+    if value.len() > 20 {
+        return Err(ValidateSaslMechanismError::TooLong(value.len()).into());
+    }
+    if let Some(invalid) = value
+        .chars()
+        .find(|c| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_'))
+    {
+        return Err(ValidateSaslMechanismError::InvalidChar(invalid).into());
+    }
+    Ok(value.to_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -1502,6 +1530,32 @@ mod tests {
     use async_std::sync::{Arc, Mutex};
     use futures::StreamExt;
     use imap_proto::Status;
+
+    use crate::{Plain, XOAuth2};
+
+    struct NoopAuthenticator;
+
+    impl Authenticator for NoopAuthenticator {
+        type Response = Vec<u8>;
+
+        fn process(&mut self, _: &[u8]) -> Self::Response {
+            b"unused".to_vec()
+        }
+    }
+
+    struct BadSaslAuthenticator;
+
+    impl Authenticator for BadSaslAuthenticator {
+        type Response = Vec<u8>;
+
+        fn process(&mut self, _: &[u8]) -> Self::Response {
+            b"unused".to_vec()
+        }
+    }
+
+    impl SaslAuthenticator for BadSaslAuthenticator {
+        const MECHANISM: &'static str = "BAD MECHANISM";
+    }
 
     macro_rules! mock_client {
         ($s:expr) => {
@@ -1595,6 +1649,8 @@ mod tests {
         assert!(capabilities.contains("logindisabled"));
         assert!(capabilities.supports_sasl("plain"));
         assert!(capabilities.supports_sasl("XOAUTH2"));
+        assert!(capabilities.supports_sasl_authenticator::<Plain<'_>>());
+        assert!(capabilities.supports_sasl_authenticator::<XOAuth2<'_>>());
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
@@ -1618,7 +1674,7 @@ mod tests {
             }
         }
         let session = client
-            .authenticate("PLAIN", &Authenticate::Auth)
+            .authenticate("plain", &Authenticate::Auth)
             .await
             .ok()
             .unwrap();
@@ -1627,6 +1683,126 @@ mod tests {
             command.as_bytes(),
             "Invalid authenticate command"
         );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_with_plain() {
+        let response = b"+ \r\n\
+                         A0001 OK Logged in\r\n"
+            .to_vec();
+        let command = "A0001 AUTHENTICATE PLAIN\r\n\
+                       AHVzZXJuYW1lAHBhc3N3b3Jk\r\n";
+        let mock_stream = MockStream::new(response);
+        let client = mock_client!(mock_stream);
+
+        let session = client
+            .authenticate_with(Plain::new("username", "password"))
+            .await
+            .ok()
+            .unwrap();
+
+        assert_eq_bytes!(
+            &session.stream.inner.written_buf,
+            command.as_bytes(),
+            "Invalid PLAIN authenticate command"
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_with_xoauth2() {
+        let response = b"+ \r\n\
+                         A0001 OK Logged in\r\n"
+            .to_vec();
+        let command = "A0001 AUTHENTICATE XOAUTH2\r\n\
+                       dXNlcj1hbGljZUBleGFtcGxlLm9yZwFhdXRoPUJlYXJlciB0b2tlbi0xMjMBAQ==\r\n";
+        let mock_stream = MockStream::new(response);
+        let client = mock_client!(mock_stream);
+
+        let session = client
+            .authenticate_with(XOAuth2::new("alice@example.org", "token-123"))
+            .await
+            .ok()
+            .unwrap();
+
+        assert_eq_bytes!(
+            &session.stream.inner.written_buf,
+            command.as_bytes(),
+            "Invalid XOAUTH2 authenticate command"
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_rejects_invalid_sasl_mechanism() {
+        let mock_stream = MockStream::default();
+        let client = mock_client!(mock_stream);
+
+        let (err, client) = client
+            .authenticate("PLAIN BAD", NoopAuthenticator)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateSaslMechanism(ValidateSaslMechanismError::InvalidChar(' '))
+        ));
+        assert!(client.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_rejects_empty_sasl_mechanism() {
+        let mock_stream = MockStream::default();
+        let client = mock_client!(mock_stream);
+
+        let (err, client) = client
+            .authenticate("", NoopAuthenticator)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateSaslMechanism(ValidateSaslMechanismError::Empty)
+        ));
+        assert!(client.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_rejects_too_long_sasl_mechanism() {
+        let mock_stream = MockStream::default();
+        let client = mock_client!(mock_stream);
+
+        let (err, client) = client
+            .authenticate("AAAAAAAAAAAAAAAAAAAAA", NoopAuthenticator)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateSaslMechanism(ValidateSaslMechanismError::TooLong(21))
+        ));
+        assert!(client.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn authenticate_with_rejects_invalid_sasl_mechanism() {
+        let mock_stream = MockStream::default();
+        let client = mock_client!(mock_stream);
+
+        let (err, client) = client
+            .authenticate_with(BadSaslAuthenticator)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateSaslMechanism(ValidateSaslMechanismError::InvalidChar(' '))
+        ));
+        assert!(client.stream.inner.written_buf.is_empty());
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]

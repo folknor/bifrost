@@ -3,6 +3,8 @@ use std::collections::hash_set::Iter;
 
 use imap_proto::types::Capability as CapabilityRef;
 
+use crate::authenticator::SaslAuthenticator;
+
 const IMAP4REV1_CAPABILITY: &str = "IMAP4rev1";
 const AUTH_CAPABILITY_PREFIX: &str = "AUTH=";
 
@@ -108,6 +110,11 @@ impl Capabilities {
         let mechanism = mechanism.as_ref();
         self.sasl_mechanisms()
             .any(|candidate| candidate.eq_ignore_ascii_case(mechanism))
+    }
+
+    /// Returns true if the server advertised the mechanism used by `A`.
+    pub fn supports_sasl_authenticator<A: SaslAuthenticator>(&self) -> bool {
+        self.supports_sasl(A::MECHANISM)
     }
 
     /// Iterate over the advertised SASL mechanisms from `AUTH=<mechanism>`.

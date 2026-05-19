@@ -26,6 +26,11 @@ Last scan: 2026-05-19 with `gh api`.
   `Fetch::gmail_msg_id()`.
 - Added pre-auth `Client::capabilities()` and explicit SASL helpers on
   `Capabilities`: `supports_sasl` and `sasl_mechanisms`.
+- Added typed SASL authenticators for PLAIN and XOAUTH2, plus
+  `Client::authenticate_with` so common auth flows do not duplicate mechanism
+  strings at the call site. Raw `Client::authenticate` now validates SASL
+  mechanism names and normalizes them to uppercase before writing an
+  `AUTHENTICATE` command.
 - Fixed the streamed command status path for `FETCH`, `STORE`, `EXPUNGE`,
   `LIST`, `SEARCH`, `ID`, `GETQUOTA`, `GETQUOTAROOT`, `GETMETADATA`, and
   `NOOP` style parsers. Tagged `NO` or `BAD` now reaches callers instead of
@@ -71,9 +76,11 @@ P0: SASL capability API
 - Source: `chatmail/async-imap` #45.
 - Problem: CAPABILITY is valid in any state, and authentication selection needs
   direct access to advertised `AUTH=<mechanism>` SASL mechanisms.
-- Status: initial API added locally. Continue to review naming and whether auth
-  selection deserves a higher-level helper once the SASL implementation shape is
-  clearer.
+- Status: capability discovery, typed mechanism checks, and common PLAIN/XOAUTH2
+  authenticators are in place. Continue to review whether SCRAM and TLS channel
+  binding belong here or in a shared SASL crate. Future hardening: decide how
+  owned IMAP authenticator secrets should zeroize on drop without pretending
+  borrowed strings can be cleared.
 
 P2: parser hardening for recursion
 

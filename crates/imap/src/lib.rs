@@ -98,7 +98,7 @@ pub mod types;
 #[cfg(feature = "compress")]
 pub use crate::extensions::compress::DeflateStream;
 
-pub use crate::authenticator::Authenticator;
+pub use crate::authenticator::{Authenticator, Plain, SaslAuthenticator, XOAuth2};
 pub use crate::client::*;
 
 #[cfg(test)]
