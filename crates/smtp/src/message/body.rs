@@ -1,12 +1,13 @@
 use std::{mem, ops::Deref};
 
-use crate::message::header::ContentTransferEncoding;
+use crate::message::header::{ContentTransferEncoding, ContentType};
 
 /// A [`Message`][super::Message] or [`SinglePart`][super::SinglePart] body that has already been encoded.
 #[derive(Debug, Clone)]
 pub struct Body {
     buf: Vec<u8>,
     encoding: ContentTransferEncoding,
+    default_content_type: Option<ContentType>,
 }
 
 /// Either a `Vec<u8>` or a `String`.
@@ -36,10 +37,11 @@ impl Body {
     /// get encoded as `base64`.
     pub fn new<B: Into<MaybeString>>(buf: B) -> Self {
         let mut buf: MaybeString = buf.into();
+        let default_content_type = buf.default_content_type();
 
         let encoding = buf.encoding(false);
         buf.encode_crlf();
-        Self::new_impl(buf.into(), encoding)
+        Self::new_impl(buf.into(), encoding, default_content_type)
     }
 
     /// Encode the supplied `buf`, using the provided `encoding`.
@@ -56,6 +58,7 @@ impl Body {
         encoding: ContentTransferEncoding,
     ) -> Result<Self, Vec<u8>> {
         let mut buf: MaybeString = buf.into();
+        let default_content_type = buf.default_content_type();
 
         let best_encoding = buf.encoding(true);
         let ok = match (encoding, best_encoding) {
@@ -77,7 +80,7 @@ impl Body {
         }
 
         buf.encode_crlf();
-        Ok(Self::new_impl(buf.into(), encoding))
+        Ok(Self::new_impl(buf.into(), encoding, default_content_type))
     }
 
     /// Builds a new `Body` using a pre-encoded buffer.
@@ -87,19 +90,35 @@ impl Body {
     /// `buf` shouldn't contain non-ascii characters, lines longer than 1000 characters or nul bytes.
     #[inline]
     pub fn dangerous_pre_encoded(buf: Vec<u8>, encoding: ContentTransferEncoding) -> Self {
-        Self { buf, encoding }
+        Self {
+            buf,
+            encoding,
+            default_content_type: None,
+        }
     }
 
     /// Encodes the supplied `buf` using the provided `encoding`
-    fn new_impl(buf: Vec<u8>, encoding: ContentTransferEncoding) -> Self {
+    fn new_impl(
+        buf: Vec<u8>,
+        encoding: ContentTransferEncoding,
+        default_content_type: Option<ContentType>,
+    ) -> Self {
         match encoding {
             ContentTransferEncoding::SevenBit
             | ContentTransferEncoding::EightBit
-            | ContentTransferEncoding::Binary => Self { buf, encoding },
+            | ContentTransferEncoding::Binary => Self {
+                buf,
+                encoding,
+                default_content_type,
+            },
             ContentTransferEncoding::QuotedPrintable => {
                 let encoded = quoted_printable::encode(buf);
 
-                Self::dangerous_pre_encoded(encoded, ContentTransferEncoding::QuotedPrintable)
+                Self {
+                    buf: encoded,
+                    encoding: ContentTransferEncoding::QuotedPrintable,
+                    default_content_type,
+                }
             }
             ContentTransferEncoding::Base64 => {
                 let len = email_encoding::body::base64::encoded_len(buf.len());
@@ -108,7 +127,11 @@ impl Body {
                 email_encoding::body::base64::encode(&buf, &mut out)
                     .expect("encode body as base64");
 
-                Self::dangerous_pre_encoded(out.into_bytes(), ContentTransferEncoding::Base64)
+                Self {
+                    buf: out.into_bytes(),
+                    encoding: ContentTransferEncoding::Base64,
+                    default_content_type,
+                }
             }
         }
     }
@@ -131,6 +154,10 @@ impl Body {
         self.encoding
     }
 
+    pub(crate) fn default_content_type(&self) -> Option<ContentType> {
+        self.default_content_type.clone()
+    }
+
     /// Consumes `Body` and returns the inner `Vec<u8>`
     #[inline]
     pub fn into_vec(self) -> Vec<u8> {
@@ -139,6 +166,13 @@ impl Body {
 }
 
 impl MaybeString {
+    fn default_content_type(&self) -> Option<ContentType> {
+        match self {
+            Self::String(_) => Some(ContentType::TEXT_PLAIN),
+            Self::Binary(_) => None,
+        }
+    }
+
     /// Suggests the best `Content-Transfer-Encoding` to be used for this `MaybeString`
     ///
     /// The `binary` encoding is never returned

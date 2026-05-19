@@ -3,6 +3,7 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
 use crate::transport::smtp::error::{self, Error};
+pub use zeroize::Zeroizing;
 
 /// Accepted password authentication mechanisms.
 ///
@@ -19,7 +20,7 @@ pub const OAUTH2_MECHANISMS: &[Mechanism] = &[Mechanism::OAuthBearer, Mechanism:
 pub const DEFAULT_MECHANISMS: &[Mechanism] = PASSWORD_MECHANISMS;
 
 /// Contains user credentials
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Credentials {
     /// Username and password credentials.
@@ -27,28 +28,63 @@ pub enum Credentials {
         /// Authentication identity.
         username: String,
         /// Password or app password.
-        password: String,
+        password: Zeroizing<String>,
     },
     /// OAuth 2.0 bearer-token credentials.
     OAuth2 {
         /// Authorization identity, usually the email address being accessed.
         identity: String,
         /// OAuth 2.0 access token.
-        access_token: String,
+        access_token: Zeroizing<String>,
     },
+}
+
+/// Converts owned secret material into a zeroizing string.
+pub trait IntoSecretString {
+    /// Move the secret into zeroizing storage.
+    fn into_secret_string(self) -> Zeroizing<String>;
+}
+
+impl IntoSecretString for String {
+    fn into_secret_string(self) -> Zeroizing<String> {
+        Zeroizing::new(self)
+    }
+}
+
+impl IntoSecretString for &str {
+    fn into_secret_string(self) -> Zeroizing<String> {
+        Zeroizing::new(self.to_owned())
+    }
+}
+
+impl IntoSecretString for Zeroizing<String> {
+    fn into_secret_string(self) -> Zeroizing<String> {
+        self
+    }
 }
 
 impl Credentials {
     /// Create username and password credentials.
-    pub fn password(username: String, password: String) -> Credentials {
-        Credentials::Password { username, password }
+    pub fn password<U, P>(username: U, password: P) -> Credentials
+    where
+        U: Into<String>,
+        P: IntoSecretString,
+    {
+        Credentials::Password {
+            username: username.into(),
+            password: password.into_secret_string(),
+        }
     }
 
     /// Create OAuth 2.0 bearer-token credentials.
-    pub fn oauth2(identity: String, access_token: String) -> Credentials {
+    pub fn oauth2<I, T>(identity: I, access_token: T) -> Credentials
+    where
+        I: Into<String>,
+        T: IntoSecretString,
+    {
         Credentials::OAuth2 {
-            identity,
-            access_token,
+            identity: identity.into(),
+            access_token: access_token.into_secret_string(),
         }
     }
 
@@ -61,7 +97,7 @@ impl Credentials {
 
     fn password_parts(&self) -> Result<(&str, &str), Error> {
         match self {
-            Credentials::Password { username, password } => Ok((username, password)),
+            Credentials::Password { username, password } => Ok((username, password.as_str())),
             Credentials::OAuth2 { .. } => Err(error::client(
                 "OAuth2 credentials cannot be used with password authentication mechanisms",
             )),
@@ -73,7 +109,7 @@ impl Credentials {
             Credentials::OAuth2 {
                 identity,
                 access_token,
-            } => Ok((identity, access_token)),
+            } => Ok((identity, access_token.as_str())),
             Credentials::Password { .. } => Err(error::client(
                 "password credentials cannot be used with OAuth2 authentication mechanisms",
             )),
@@ -222,7 +258,7 @@ fn contains_ignore_ascii_case<'a>(
 
 #[cfg(test)]
 mod test {
-    use super::{Credentials, Mechanism};
+    use super::{Credentials, Mechanism, Zeroizing};
 
     #[test]
     fn test_plain() {
@@ -348,6 +384,19 @@ mod test {
         assert_eq!(
             Credentials::password("alice".to_owned(), "wonderland".to_owned()),
             Credentials::from(("alice", "wonderland"))
+        );
+    }
+
+    #[test]
+    fn test_accepts_zeroizing_secrets() {
+        let credentials = Credentials::oauth2(
+            "alice".to_owned(),
+            Zeroizing::new("access-token".to_owned()),
+        );
+
+        assert_eq!(
+            Mechanism::Xoauth2.response(&credentials, None).unwrap(),
+            "user=alice\x01auth=Bearer access-token\x01\x01"
         );
     }
 }

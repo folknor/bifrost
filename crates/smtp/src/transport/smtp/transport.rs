@@ -9,6 +9,7 @@ use super::pool::sync_impl::Pool;
 use super::{ClientId, Credentials, Error, Mechanism, Response, SmtpConnection, SmtpInfo};
 #[cfg(feature = "native-tls")]
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
+use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Transport, address::Envelope};
 
 /// Synchronously send emails using the SMTP protocol
@@ -294,9 +295,9 @@ impl SmtpTransportBuilder {
     pub fn password<U, P>(self, username: U, password: P) -> Self
     where
         U: Into<String>,
-        P: Into<String>,
+        P: IntoSecretString,
     {
-        self.credentials(Credentials::password(username.into(), password.into()))
+        self.credentials(Credentials::password(username, password))
     }
 
     /// Set OAuth 2.0 bearer-token authentication credentials.
@@ -305,9 +306,9 @@ impl SmtpTransportBuilder {
     pub fn oauth2<I, T>(self, identity: I, access_token: T) -> Self
     where
         I: Into<String>,
-        T: Into<String>,
+        T: IntoSecretString,
     {
-        self.credentials(Credentials::oauth2(identity.into(), access_token.into()))
+        self.credentials(Credentials::oauth2(identity, access_token))
     }
 
     /// Set the authentication mechanism to use

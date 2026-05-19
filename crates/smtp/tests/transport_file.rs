@@ -44,6 +44,7 @@ mod sync {
                 "To: Hei <hei@domain.tld>\r\n",
                 "Subject: Happy new year\r\n",
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Be happy!"
@@ -82,6 +83,7 @@ mod sync {
                 "To: Hei <hei@domain.tld>\r\n",
                 "Subject: Happy new year\r\n",
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Be happy!"
@@ -142,6 +144,7 @@ mod tokio_1 {
                 "To: Hei <hei@domain.tld>\r\n",
                 "Subject: Happy new year\r\n",
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Be happy!"
@@ -193,6 +196,7 @@ mod asyncstd_1 {
                 "To: Hei <hei@domain.tld>\r\n",
                 "Subject: Happy new year\r\n",
                 "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Be happy!"

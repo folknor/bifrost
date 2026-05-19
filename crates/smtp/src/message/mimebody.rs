@@ -67,6 +67,11 @@ impl SinglePartBuilder {
         let maybe_encoding = self.headers.get::<ContentTransferEncoding>();
         let body = body.into_body(maybe_encoding);
 
+        if self.headers.get::<ContentType>().is_none()
+            && let Some(content_type) = body.default_content_type()
+        {
+            self.headers.set(content_type);
+        }
         self.headers.set(body.encoding());
 
         SinglePart {
@@ -260,17 +265,25 @@ impl MultiPartBuilder {
     }
 
     /// Set custom boundary
-    pub fn boundary<S: Into<String>>(self, boundary: S) -> Self {
-        let kind = {
-            let content_type = self.headers.get::<ContentType>().unwrap();
-            MultiPartKind::from_mime(content_type.as_ref()).unwrap()
-        };
+    pub fn boundary<S: Into<String>>(mut self, boundary: S) -> Self {
+        let kind = self
+            .headers
+            .get::<ContentType>()
+            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
+            .unwrap_or(MultiPartKind::Mixed);
         let mime = kind.to_mime(Some(boundary));
-        self.header(ContentType::from_mime(mime))
+        self.headers.set(ContentType::from_mime(mime));
+        self
     }
 
     /// Creates multipart without parts
-    pub fn build(self) -> MultiPart {
+    pub fn build(mut self) -> MultiPart {
+        if self.headers.get::<ContentType>().is_none() {
+            self.headers.set(ContentType::from_mime(
+                MultiPartKind::Mixed.to_mime::<String>(None),
+            ));
+        }
+
         MultiPart {
             headers: self.headers,
             parts: Vec::new(),
@@ -515,6 +528,29 @@ mod test {
             )
         );
     }
+
+    #[test]
+    fn multi_part_builder_defaults_to_mixed() {
+        let part = MultiPart::builder()
+            .boundary("0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
+            .singlepart(SinglePart::plain("hello".to_owned()));
+
+        assert_eq!(
+            String::from_utf8(part.formatted()).unwrap(),
+            concat!(
+                "Content-Type: multipart/mixed;\r\n",
+                " boundary=\"0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\"\r\n",
+                "\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 7bit\r\n",
+                "\r\n",
+                "hello\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n"
+            )
+        );
+    }
+
     #[test]
     fn multi_part_encrypted() {
         let part = MultiPart::encrypted("application/pgp-encrypted".to_owned())

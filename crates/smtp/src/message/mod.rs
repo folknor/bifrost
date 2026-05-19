@@ -289,6 +289,15 @@ impl MessageBuilder {
         self.mailbox(header::ReplyTo(mbox.into()))
     }
 
+    /// Set or add mailboxes to `ReplyTo` header
+    ///
+    /// Defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.2).
+    ///
+    /// Shortcut for `self.mailbox(header::ReplyTo(mailboxes))`.
+    pub fn reply_to_many<M: Into<Mailboxes>>(self, mailboxes: M) -> Self {
+        self.mailbox(header::ReplyTo(mailboxes.into()))
+    }
+
     /// Set or add mailbox to `To` header
     ///
     /// Shortcut for `self.mailbox(header::To(mbox))`.
@@ -413,8 +422,9 @@ impl MessageBuilder {
         // Check for missing required headers
         // https://tools.ietf.org/html/rfc5322#section-3.6
 
-        // Insert Date if missing
-        let mut res = if self.headers.get::<header::Date>().is_none() {
+        // Any caller-supplied Date header wins, even if this crate cannot parse
+        // it. Otherwise valid non-UTC dates would be replaced with "now".
+        let mut res = if self.headers.get_raw(&header::Date::name()).is_none() {
             self.date_now()
         } else {
             self
@@ -459,6 +469,11 @@ impl MessageBuilder {
         let maybe_encoding = self.headers.get::<ContentTransferEncoding>();
         let body = body.into_body(maybe_encoding);
 
+        if self.headers.get::<header::ContentType>().is_none()
+            && let Some(content_type) = body.default_content_type()
+        {
+            self.headers.set(content_type);
+        }
         self.headers.set(body.encoding());
         self.build(MessageBody::Raw(body.into_vec()))
     }
@@ -635,7 +650,11 @@ mod test {
 
     use pretty_assertions::assert_eq;
 
-    use super::{Message, MultiPart, SinglePart, header, mailbox::Mailbox, make_message_id};
+    use super::{
+        Message, MultiPart, SinglePart, header,
+        mailbox::{Mailbox, Mailboxes},
+        make_message_id,
+    };
 
     #[test]
     fn email_missing_originator() {
@@ -697,6 +716,7 @@ mod test {
                 "From: =?utf-8?b?0JrQsNC4?= <kayo@example.com>\r\n",
                 "To: \"Pony O.P.\" <pony@domain.tld>\r\n",
                 "Subject: =?utf-8?b?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Happy new year!"
@@ -738,6 +758,7 @@ mod test {
                 "From: =?utf-8?b?0JrQsNC4?= <kayo@example.com>\r\n",
                 "To: \"Pony O.P.\" <pony@domain.tld>\r\n",
                 "Subject: =?utf-8?b?0Y/So9CwINC10Lsg0LHQtdC705nQvSE=?=\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "Happy new year!"
@@ -802,5 +823,92 @@ mod test {
         for id in ids {
             assert_eq!(36, id.len());
         }
+    }
+
+    #[test]
+    fn text_body_gets_default_content_type() {
+        let email = Message::builder()
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(String::from("Happy new year!"))
+            .unwrap();
+
+        assert!(email.headers().get::<header::ContentType>().is_some());
+        assert!(
+            String::from_utf8(email.formatted())
+                .unwrap()
+                .contains("Content-Type: text/plain; charset=utf-8\r\n")
+        );
+    }
+
+    #[test]
+    fn binary_body_does_not_guess_content_type() {
+        let email = Message::builder()
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(vec![0, 1, 2, 3])
+            .unwrap();
+
+        assert!(email.headers().get::<header::ContentType>().is_none());
+    }
+
+    #[test]
+    fn raw_date_header_is_preserved() {
+        let email = Message::builder()
+            .raw_header(header::HeaderValue::new(
+                header::HeaderName::new_from_ascii_str("Date"),
+                "Wed, 01 Jan 2025 00:00:00 +0800".to_owned(),
+            ))
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(String::from("Happy new year!"))
+            .unwrap();
+
+        assert!(
+            String::from_utf8(email.formatted())
+                .unwrap()
+                .contains("Date: Wed, 01 Jan 2025 00:00:00 +0800\r\n")
+        );
+    }
+
+    #[test]
+    fn unparseable_raw_date_header_is_preserved() {
+        let email = Message::builder()
+            .raw_header(header::HeaderValue::new(
+                header::HeaderName::new_from_ascii_str("Date"),
+                "not a valid date".to_owned(),
+            ))
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(String::from("Happy new year!"))
+            .unwrap();
+
+        assert!(
+            String::from_utf8(email.formatted())
+                .unwrap()
+                .contains("Date: not a valid date\r\n")
+        );
+    }
+
+    #[test]
+    fn reply_to_accepts_address_list() {
+        let replies: Mailboxes = vec![
+            "Alice <alice@example.org>".parse().unwrap(),
+            "Bob <bob@example.org>".parse().unwrap(),
+        ]
+        .into();
+
+        let email = Message::builder()
+            .from("NoBody <nobody@domain.tld>".parse().unwrap())
+            .reply_to_many(replies)
+            .to("NoBody <nobody@domain.tld>".parse().unwrap())
+            .body(String::from("Happy new year!"))
+            .unwrap();
+
+        assert!(
+            String::from_utf8(email.formatted())
+                .unwrap()
+                .contains("Reply-To: Alice <alice@example.org>, Bob <bob@example.org>\r\n")
+        );
     }
 }

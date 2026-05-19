@@ -23,6 +23,7 @@ use crate::AsyncStd1Executor;
 use crate::AsyncTransport;
 #[cfg(feature = "tokio1")]
 use crate::Tokio1Executor;
+use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Envelope, Executor};
 
 /// Asynchronously sends emails using the SMTP protocol
@@ -360,9 +361,9 @@ impl AsyncSmtpTransportBuilder {
     pub fn password<U, P>(self, username: U, password: P) -> Self
     where
         U: Into<String>,
-        P: Into<String>,
+        P: IntoSecretString,
     {
-        self.credentials(Credentials::password(username.into(), password.into()))
+        self.credentials(Credentials::password(username, password))
     }
 
     /// Set OAuth 2.0 bearer-token authentication credentials.
@@ -371,9 +372,9 @@ impl AsyncSmtpTransportBuilder {
     pub fn oauth2<I, T>(self, identity: I, access_token: T) -> Self
     where
         I: Into<String>,
-        T: Into<String>,
+        T: IntoSecretString,
     {
-        self.credentials(Credentials::oauth2(identity.into(), access_token.into()))
+        self.credentials(Credentials::oauth2(identity, access_token))
     }
 
     /// Set the authentication mechanism to use

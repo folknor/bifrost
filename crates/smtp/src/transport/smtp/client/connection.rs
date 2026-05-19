@@ -43,6 +43,8 @@ pub struct SmtpConnection {
     panic: bool,
     /// Information about the server
     server_info: ServerInfo,
+    /// Client identity used for EHLO.
+    hello_name: ClientId,
 }
 
 impl SmtpConnection {
@@ -69,6 +71,7 @@ impl SmtpConnection {
             stream,
             panic: false,
             server_info: ServerInfo::default(),
+            hello_name: hello_name.clone(),
         };
         conn.set_timeout(timeout).map_err(error::network)?;
         // TODO log
@@ -153,6 +156,7 @@ impl SmtpConnection {
                 tracing::debug!("connection encrypted");
                 // Send EHLO again
                 try_smtp!(self.ehlo(hello_name), self);
+                self.hello_name = hello_name.clone();
                 Ok(())
             }
             #[cfg(not(feature = "native-tls"))]
@@ -231,6 +235,8 @@ impl SmtpConnection {
         if challenges == 0 {
             Err(error::response("Unexpected number of challenges"))
         } else {
+            let hello_name = self.hello_name.clone();
+            try_smtp!(self.ehlo(&hello_name), self);
             Ok(response)
         }
     }
@@ -335,7 +341,11 @@ mod test {
         time::Duration,
     };
 
-    use crate::transport::smtp::{client::SmtpConnection, extension::ClientId};
+    use crate::transport::smtp::{
+        authentication::{Credentials, Mechanism},
+        client::SmtpConnection,
+        extension::{ClientId, Extension},
+    };
 
     #[test]
     fn abort_closes_without_quit_command() {
@@ -372,6 +382,78 @@ mod test {
             !observed.contains("QUIT"),
             "abort must close without sending QUIT, got {observed:?}"
         );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn auth_refreshes_server_info_with_ehlo() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut initial_ehlo = String::new();
+            reader.read_line(&mut initial_ehlo).unwrap();
+            commands.push(initial_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            commands.push(auth);
+            stream.write_all(b"235 authenticated\r\n").unwrap();
+
+            let mut post_auth_ehlo = String::new();
+            reader.read_line(&mut post_auth_ehlo).unwrap();
+            commands.push(post_auth_ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250 8BITMIME\r\n")
+                .unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        assert!(
+            connection
+                .server_info()
+                .supports_auth_mechanism(Mechanism::Plain)
+        );
+
+        let response = connection
+            .auth(
+                &[Mechanism::Plain],
+                &Credentials::password("user".to_owned(), "pass".to_owned()),
+            )
+            .unwrap();
+
+        assert!(response.has_code(235));
+        assert!(
+            !connection
+                .server_info()
+                .supports_auth_mechanism(Mechanism::Plain)
+        );
+        assert!(
+            connection
+                .server_info()
+                .supports_feature(Extension::EightBitMime)
+        );
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert!(commands[1].starts_with("AUTH PLAIN "));
+        assert!(commands[2].starts_with("EHLO "));
         handle.join().unwrap();
     }
 }

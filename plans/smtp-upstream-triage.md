@@ -205,3 +205,45 @@ Deferred:
 - Focused tests for async DNS and TLS-handshake timeout paths are still needed.
 - Dropping `async-trait` is a larger trait/API rewrite and belongs with the
   async transport redesign.
+
+## Upstream issue batch: AUTH, message builder, and credential storage
+
+Issues covered:
+
+- #970: resend EHLO after successful AUTH.
+- #856: generated text messages should include `Content-Type`.
+- #796: `MultiPart::builder()` should not create a value that later panics
+  because no multipart kind was configured.
+- #1118: raw `Date` headers with non-UTC offsets should not be ignored and
+  replaced during message build.
+- #1132: store secret credential material in zeroizing memory.
+- #1028 comment: `Reply-To` is an address-list, not just a single mailbox.
+
+Implemented:
+
+- `SmtpConnection` and `AsyncSmtpConnection` now retain their EHLO identity and
+  automatically send EHLO again after successful AUTH. The refreshed
+  `ServerInfo` replaces pre-auth capabilities.
+- Added sync and tokio protocol tests proving AUTH sends a second EHLO and
+  updates advertised capabilities.
+- `MessageBuilder::body(String)` and `SinglePartBuilder::body(String)` now
+  infer `Content-Type: text/plain; charset=utf-8` when the caller did not set a
+  content type. Binary `Vec<u8>` bodies still do not guess a content type.
+- `MultiPart::builder().build()` defaults to `multipart/mixed`; `.boundary(...)`
+  before `.kind(...)` also defaults to mixed instead of unwrapping a missing
+  header.
+- `MessageBuilder` now checks for a raw `Date` header by name before inserting
+  `Date::now()`, so a pre-encoded non-UTC Date survives.
+- Added `MessageBuilder::reply_to_many(...)` for RFC 5322 address-list
+  `Reply-To` values without breaking the existing `.reply_to("...".parse()?)`
+  inference path.
+- `Credentials` now stores passwords and OAuth access tokens as
+  `Zeroizing<String>`.
+- Added `IntoSecretString` so callers can pass either normal strings or an
+  existing `Zeroizing<String>` into `Credentials`, `SmtpTransportBuilder`, and
+  `AsyncSmtpTransportBuilder`.
+
+Verification:
+
+- `brokkr fmt` passed with only the known brokkr history warning.
+- `brokkr check` passed across default and minimal sweeps.
