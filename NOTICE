@@ -6,3 +6,13 @@ This product includes software originally developed by Stalwart Labs LLC
 (https://github.com/stalwartlabs/jmap-client), licensed under Apache-2.0
 OR MIT. The `bifrost-jmap` crate descends from that work; substantial
 portions have been rewritten since the fork point.
+
+This product includes software originally developed by the lettre authors
+as the `lettre` crate (https://github.com/lettre/lettre), licensed under
+MIT:
+
+Copyright (c) 2014-2024 Alexis Mousset <contact@amousset.me>
+Copyright (c) 2019-2025 Paolo Barbolini <paolo@paolo565.org>
+Copyright (c) 2018 K. <kayo@illumium.org>
+
+The `bifrost-smtp` crate descends from that work.

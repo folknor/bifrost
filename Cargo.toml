@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/jmap"]
+members = ["crates/jmap", "crates/smtp"]
 resolver = "2"
 
 [workspace.package]
@@ -44,6 +44,9 @@ cast_possible_wrap = "deny"
 # Safety: no debug/placeholder code
 dbg_macro = "deny"
 todo = "deny"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bifrost_smtp_ignore_tls_mismatch)'] }
 
 [profile.bench]
 debug = true
