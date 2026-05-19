@@ -6,7 +6,6 @@ use std::path::Path;
 #[cfg(feature = "smtp-transport")]
 use std::time::Duration;
 
-use async_trait::async_trait;
 #[cfg(all(feature = "smtp-transport", feature = "async-std1"))]
 use futures_util::future::BoxFuture;
 
@@ -40,7 +39,6 @@ use crate::transport::smtp::extension::ClientId;
 /// [`AsyncSendmailTransport`]: crate::AsyncSendmailTransport
 /// [`AsyncFileTransport`]: crate::AsyncFileTransport
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
-#[async_trait]
 pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
     #[cfg(feature = "smtp-transport")]
     #[allow(private_bounds)]
@@ -61,28 +59,30 @@ pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
 
     #[doc(hidden)]
     #[cfg(feature = "smtp-transport")]
-    async fn connect(
-        hostname: &str,
+    fn connect<'a>(
+        hostname: &'a str,
         port: u16,
         timeout: Option<Duration>,
-        hello_name: &ClientId,
-        tls: &Tls,
-    ) -> Result<AsyncSmtpConnection, Error>;
+        hello_name: &'a ClientId,
+        tls: &'a Tls,
+    ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
 
     #[doc(hidden)]
     #[cfg(feature = "file-transport-envelope")]
-    async fn fs_read(path: &Path) -> IoResult<Vec<u8>>;
+    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_;
 
     #[doc(hidden)]
     #[cfg(feature = "file-transport")]
-    async fn fs_write(path: &Path, contents: &[u8]) -> IoResult<()>;
+    fn fs_write<'a>(
+        path: &'a Path,
+        contents: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a;
 }
 
 #[doc(hidden)]
 #[cfg(feature = "smtp-transport")]
-#[async_trait]
 pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
-    async fn shutdown(&self);
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_;
 }
 
 /// Async [`Executor`] using `tokio` `1.x`
@@ -100,7 +100,6 @@ pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
 #[derive(Debug)]
 pub struct Tokio1Executor;
 
-#[async_trait]
 #[cfg(feature = "tokio1")]
 impl Executor for Tokio1Executor {
     #[cfg(feature = "smtp-transport")]
@@ -161,18 +160,20 @@ impl Executor for Tokio1Executor {
     }
 
     #[cfg(feature = "file-transport-envelope")]
-    async fn fs_read(path: &Path) -> IoResult<Vec<u8>> {
-        tokio1_crate::fs::read(path).await
+    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
+        tokio1_crate::fs::read(path)
     }
 
     #[cfg(feature = "file-transport")]
-    async fn fs_write(path: &Path, contents: &[u8]) -> IoResult<()> {
-        tokio1_crate::fs::write(path, contents).await
+    fn fs_write<'a>(
+        path: &'a Path,
+        contents: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        tokio1_crate::fs::write(path, contents)
     }
 }
 
 #[cfg(all(feature = "smtp-transport", feature = "tokio1"))]
-#[async_trait]
 impl SpawnHandle for tokio1_crate::task::JoinHandle<()> {
     async fn shutdown(&self) {
         self.abort();
@@ -194,7 +195,6 @@ impl SpawnHandle for tokio1_crate::task::JoinHandle<()> {
 #[derive(Debug)]
 pub struct AsyncStd1Executor;
 
-#[async_trait]
 #[cfg(feature = "async-std1")]
 impl Executor for AsyncStd1Executor {
     #[cfg(feature = "smtp-transport")]
@@ -240,18 +240,20 @@ impl Executor for AsyncStd1Executor {
     }
 
     #[cfg(feature = "file-transport-envelope")]
-    async fn fs_read(path: &Path) -> IoResult<Vec<u8>> {
-        async_std::fs::read(path).await
+    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
+        async_std::fs::read(path)
     }
 
     #[cfg(feature = "file-transport")]
-    async fn fs_write(path: &Path, contents: &[u8]) -> IoResult<()> {
-        async_std::fs::write(path, contents).await
+    fn fs_write<'a>(
+        path: &'a Path,
+        contents: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        async_std::fs::write(path, contents)
     }
 }
 
 #[cfg(all(feature = "smtp-transport", feature = "async-std1"))]
-#[async_trait]
 impl SpawnHandle for futures_util::future::AbortHandle {
     async fn shutdown(&self) {
         self.abort();

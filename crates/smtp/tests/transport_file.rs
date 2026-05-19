@@ -130,7 +130,7 @@ mod tokio_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let result = sender.send(email).await;
+        let result = sender.send(&email).await;
         let id = result.unwrap();
 
         let eml_file = temp_dir().join(format!("{id}.eml"));
@@ -182,7 +182,7 @@ mod asyncstd_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let result = sender.send(email).await;
+        let result = sender.send(&email).await;
         let id = result.unwrap();
 
         let eml_file = temp_dir().join(format!("{id}.eml"));

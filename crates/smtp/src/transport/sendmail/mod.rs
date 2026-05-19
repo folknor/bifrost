@@ -47,7 +47,7 @@
 //!     .body(String::from("Be happy!"))?;
 //!
 //! let sender = AsyncSendmailTransport::<Tokio1Executor>::new();
-//! sender.send(email).await?;
+//! sender.send(&email).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -69,7 +69,7 @@
 //!     .body(String::from("Be happy!"))?;
 //!
 //! let sender = AsyncSendmailTransport::<AsyncStd1Executor>::new();
-//! sender.send(email).await?;
+//! sender.send(&email).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -81,9 +81,6 @@ use std::{
     io::Write,
     process::{Command, Stdio},
 };
-
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
-use async_trait::async_trait;
 
 pub use self::error::Error;
 #[cfg(feature = "async-std1")]
@@ -256,7 +253,6 @@ impl Transport for SendmailTransport {
 }
 
 #[cfg(feature = "async-std1")]
-#[async_trait]
 impl AsyncTransport for AsyncSendmailTransport<AsyncStd1Executor> {
     type Ok = ();
     type Error = Error;
@@ -291,7 +287,6 @@ impl AsyncTransport for AsyncSendmailTransport<AsyncStd1Executor> {
 }
 
 #[cfg(feature = "tokio1")]
-#[async_trait]
 impl AsyncTransport for AsyncSendmailTransport<Tokio1Executor> {
     type Ok = ();
     type Error = Error;

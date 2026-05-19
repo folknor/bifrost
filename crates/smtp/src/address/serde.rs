@@ -103,7 +103,7 @@ impl<'de> Deserialize<'de> for Address {
                 }
                 let user: &str = user.ok_or_else(|| DeError::missing_field("user"))?;
                 let domain: &str = domain.ok_or_else(|| DeError::missing_field("domain"))?;
-                Ok(Address::new(user, domain).unwrap())
+                Address::new(user, domain).map_err(DeError::custom)
             }
         }
 

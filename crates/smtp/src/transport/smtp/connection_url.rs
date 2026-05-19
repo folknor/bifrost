@@ -15,9 +15,10 @@ use super::AsyncSmtpTransportBuilder;
 #[cfg(feature = "native-tls")]
 use super::client::{Tls, TlsParameters};
 use super::{
-    Error, SMTP_PORT, SUBMISSION_PORT, SUBMISSIONS_PORT, SmtpTransportBuilder,
-    authentication::Credentials, error, extension::ClientId,
+    Error, SMTP_PORT, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId,
 };
+#[cfg(feature = "native-tls")]
+use super::{SUBMISSION_PORT, SUBMISSIONS_PORT};
 
 pub(crate) trait TransportBuilder {
     fn new<T: Into<String>>(server: T) -> Self;

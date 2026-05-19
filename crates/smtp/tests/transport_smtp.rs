@@ -42,7 +42,7 @@ mod tokio_1 {
             AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
                 .port(2525)
                 .build();
-        sender.send(email).await.unwrap();
+        sender.send(&email).await.unwrap();
     }
 }
 
@@ -70,7 +70,7 @@ mod asyncstd_1 {
             AsyncSmtpTransport::<AsyncStd1Executor>::builder_dangerous("127.0.0.1")
                 .port(2525)
                 .build();
-        sender.send(email).await.unwrap();
+        sender.send(&email).await.unwrap();
     }
 }
 

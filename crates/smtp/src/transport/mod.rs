@@ -100,9 +100,6 @@
 //! [`StubTransport`]: crate::transport::stub::StubTransport
 //! [`AsyncStubTransport`]: crate::transport::stub::AsyncStubTransport
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
-use async_trait::async_trait;
-
 use crate::Envelope;
 #[cfg(feature = "builder")]
 use crate::Message;
@@ -144,10 +141,12 @@ pub trait Transport {
 }
 
 /// Async Transport method for emails
+///
+/// Implementations must be [`Sync`] so borrowed async methods can return
+/// [`Send`] futures.
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
-#[async_trait]
-pub trait AsyncTransport {
+pub trait AsyncTransport: Sync {
     /// Response produced by the Transport
     type Ok;
     /// Error produced by the Transport
@@ -156,19 +155,28 @@ pub trait AsyncTransport {
     /// Sends the email
     #[cfg(feature = "builder")]
     #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
-    // TODO take &Message
-    async fn send(&self, message: Message) -> Result<Self::Ok, Self::Error> {
-        #[cfg(feature = "tracing")]
-        tracing::trace!("starting to send an email");
+    fn send<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        async move {
+            #[cfg(feature = "tracing")]
+            tracing::trace!("starting to send an email");
 
-        let raw = message.formatted();
-        let envelope = message.envelope();
-        self.send_raw(envelope, &raw).await
+            let raw = message.formatted();
+            self.send_raw(message.envelope(), &raw).await
+        }
     }
 
-    async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error>;
+    fn send_raw<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a;
 
     /// Shuts down the transport. Future calls to [`Self::send`] and
     /// [`Self::send_raw`] might fail.
-    async fn shutdown(&self) {}
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
+        async {}
+    }
 }

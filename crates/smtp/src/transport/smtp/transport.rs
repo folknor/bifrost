@@ -205,6 +205,9 @@ impl SmtpTransport {
     /// ```
     ///
     /// The connection URL can then be used in the following way:
+    /// TLS URL forms such as `smtps://` and `?tls=required` require the
+    /// `native-tls` feature. Without it, only plaintext `smtp://` URLs are
+    /// accepted.
     ///
     /// ```rust,no_run
     /// use bifrost_smtp::{
@@ -229,8 +232,6 @@ impl SmtpTransport {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn from_url(connection_url: &str) -> Result<SmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }
@@ -434,21 +435,29 @@ impl SmtpClient {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "native-tls")]
+    use crate::transport::smtp::client::Tls;
     use crate::{
         SmtpTransport,
-        transport::smtp::{
-            authentication::{Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS},
-            client::Tls,
+        transport::smtp::authentication::{
+            Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
         },
     };
 
     #[test]
-    fn transport_from_url() {
+    fn transport_from_plaintext_url() {
         let builder = SmtpTransport::from_url("smtp://127.0.0.1:2525").unwrap();
 
         assert_eq!(builder.info.port, 2525);
-        assert!(matches!(builder.info.tls, Tls::None));
         assert_eq!(builder.info.server, "127.0.0.1");
+    }
+
+    #[test]
+    #[cfg(feature = "native-tls")]
+    fn transport_from_tls_url() {
+        let builder = SmtpTransport::from_url("smtp://127.0.0.1:2525").unwrap();
+
+        assert!(matches!(builder.info.tls, Tls::None));
 
         let builder =
             SmtpTransport::from_url("smtps://username:password@smtp.example.com:465").unwrap();

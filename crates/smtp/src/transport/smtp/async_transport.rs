@@ -6,8 +6,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
-
 #[cfg(feature = "pool")]
 use super::PoolConfig;
 #[cfg(feature = "tokio1-native-tls")]
@@ -60,7 +58,6 @@ pub struct AsyncSmtpTransport<E: Executor> {
 }
 
 #[cfg(feature = "tokio1")]
-#[async_trait]
 impl AsyncTransport for AsyncSmtpTransport<Tokio1Executor> {
     type Ok = Response;
     type Error = Error;
@@ -84,7 +81,6 @@ impl AsyncTransport for AsyncSmtpTransport<Tokio1Executor> {
 }
 
 #[cfg(feature = "async-std1")]
-#[async_trait]
 impl AsyncTransport for AsyncSmtpTransport<AsyncStd1Executor> {
     type Ok = Response;
     type Error = Error;
@@ -269,10 +265,14 @@ where
     ///     .build();
     ///
     /// // Send the email
-    /// mailer.send(email).await?;
+    /// mailer.send(&email).await?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// This helper is currently exposed only for the tokio native-tls path.
+    /// Plain async transports can still be configured with
+    /// [`AsyncSmtpTransport::builder_dangerous`].
     #[cfg(feature = "tokio1-native-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {

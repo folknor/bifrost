@@ -41,7 +41,7 @@ mod tokio_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let result = sender.send(email).await;
+        let result = sender.send(&email).await;
         println!("{result:?}");
         assert!(result.is_ok());
     }
@@ -67,7 +67,7 @@ mod asyncstd_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let result = sender.send(email).await;
+        let result = sender.send(&email).await;
         println!("{result:?}");
         assert!(result.is_ok());
     }

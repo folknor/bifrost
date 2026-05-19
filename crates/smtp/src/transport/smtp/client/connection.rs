@@ -10,11 +10,13 @@ use super::escape_crlf;
 use super::{
     ClientCodec, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream, TlsParameters,
 };
+#[cfg(feature = "native-tls")]
+use crate::transport::smtp::commands::Starttls;
 use crate::{
     address::Envelope,
     transport::smtp::{
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt, Starttls},
+        commands::{Auth, Data, Ehlo, Mail, Noop, Quit, Rcpt},
         error,
         error::Error,
         extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},

@@ -44,8 +44,8 @@ mod tokio_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        sender_ok.send(email.clone()).await.unwrap();
-        sender_ko.send(email.clone()).await.unwrap_err();
+        sender_ok.send(&email).await.unwrap();
+        sender_ko.send(&email).await.unwrap_err();
 
         let expected_messages = [(
             email.envelope().clone(),
@@ -72,8 +72,8 @@ mod asyncstd_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        sender_ok.send(email.clone()).await.unwrap();
-        sender_ko.send(email.clone()).await.unwrap_err();
+        sender_ok.send(&email).await.unwrap();
+        sender_ko.send(&email).await.unwrap_err();
 
         let expected_messages = [(
             email.envelope().clone(),

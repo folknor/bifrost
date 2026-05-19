@@ -6,6 +6,10 @@ use native_tls::{Protocol, TlsConnector};
 #[cfg(feature = "native-tls")]
 use crate::transport::smtp::{Error, error};
 
+#[cfg(not(feature = "native-tls"))]
+#[derive(Clone)]
+struct NoTlsParameters;
+
 /// TLS protocol versions.
 #[derive(Debug, Copy, Clone)]
 #[non_exhaustive]
@@ -99,11 +103,16 @@ pub struct TlsParameters {
     #[cfg(feature = "native-tls")]
     pub(crate) connector: InnerTlsParameters,
     /// The domain name expected in the server TLS certificate.
+    #[cfg(feature = "native-tls")]
     pub(super) domain: String,
+    /// Placeholder for builds where TLS cannot be constructed.
+    #[cfg(not(feature = "native-tls"))]
+    _private: NoTlsParameters,
 }
 
 /// Builder for [`TlsParameters`].
 #[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
 pub struct TlsParametersBuilder {
     domain: String,
     cert_store: CertificateStore,
@@ -266,6 +275,7 @@ impl TlsParameters {
         TlsParametersBuilder::new(domain).build_native()
     }
 
+    #[cfg(feature = "native-tls")]
     pub fn domain(&self) -> &str {
         &self.domain
     }
@@ -298,6 +308,7 @@ impl Certificate {
     }
 }
 
+#[cfg(feature = "native-tls")]
 impl Debug for Certificate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Certificate").finish()
@@ -313,6 +324,7 @@ pub struct Identity {
     native_tls: native_tls::Identity,
 }
 
+#[cfg(feature = "native-tls")]
 impl Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Identity").finish()

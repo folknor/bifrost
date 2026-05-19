@@ -87,7 +87,7 @@
 //!     .header(ContentType::TEXT_PLAIN)
 //!     .body(String::from("Be happy!"))?;
 //!
-//! sender.send(email).await?;
+//! sender.send(&email).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -116,7 +116,7 @@
 //!     .header(ContentType::TEXT_PLAIN)
 //!     .body(String::from("Be happy!"))?;
 //!
-//! sender.send(email).await?;
+//! sender.send(&email).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -149,8 +149,6 @@ use std::{
     str,
 };
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
-use async_trait::async_trait;
 use uuid::Uuid;
 
 pub use self::error::Error;
@@ -316,7 +314,6 @@ impl Transport for FileTransport {
 }
 
 #[cfg(any(feature = "async-std1", feature = "tokio1"))]
-#[async_trait]
 impl<E> AsyncTransport for AsyncFileTransport<E>
 where
     E: Executor,

@@ -1,9 +1,13 @@
 use std::{
     io::{self, Read, Write},
-    mem,
-    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     time::Duration,
 };
+
+#[cfg(feature = "native-tls")]
+use std::mem;
+#[cfg(feature = "native-tls")]
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "native-tls")]
 use native_tls::TlsStream;
@@ -30,11 +34,13 @@ enum InnerNetworkStream {
     #[cfg(feature = "native-tls")]
     NativeTls(TlsStream<TcpStream>),
     /// Can't be built
+    #[cfg(feature = "native-tls")]
     None,
 }
 
 impl NetworkStream {
     fn new(inner: InnerNetworkStream) -> Self {
+        #[cfg(feature = "native-tls")]
         if let InnerNetworkStream::None = inner {
             debug_assert!(false, "InnerNetworkStream::None must never be built");
         }
@@ -48,6 +54,7 @@ impl NetworkStream {
             InnerNetworkStream::Tcp(s) => s.peer_addr(),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.get_ref().peer_addr(),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(SocketAddr::V4(SocketAddrV4::new(
@@ -64,6 +71,7 @@ impl NetworkStream {
             InnerNetworkStream::Tcp(s) => s.shutdown(how),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.get_ref().shutdown(how),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(())
@@ -125,17 +133,16 @@ impl NetworkStream {
         Ok(stream)
     }
 
+    #[cfg(not(feature = "native-tls"))]
+    pub fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
+        let _ = self;
+        let _ = tls_parameters;
+        unreachable!("Trying to upgrade a NetworkStream without having enabled native-tls");
+    }
+
+    #[cfg(feature = "native-tls")]
     pub fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
         match &self.inner {
-            #[cfg(not(feature = "native-tls"))]
-            InnerNetworkStream::Tcp(_) => {
-                let _ = tls_parameters;
-                panic!(
-                    "Trying to upgrade a NetworkStream without having enabled the native-tls feature"
-                );
-            }
-
-            #[cfg(feature = "native-tls")]
             InnerNetworkStream::Tcp(_) => {
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerNetworkStream::None);
@@ -170,6 +177,7 @@ impl NetworkStream {
             InnerNetworkStream::Tcp(_) => false,
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(_) => true,
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 false
@@ -197,6 +205,7 @@ impl NetworkStream {
             InnerNetworkStream::Tcp(stream) => stream.set_read_timeout(duration),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_read_timeout(duration),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(())
@@ -211,6 +220,7 @@ impl NetworkStream {
 
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_write_timeout(duration),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(())
@@ -225,6 +235,7 @@ impl Read for NetworkStream {
             InnerNetworkStream::Tcp(s) => s.read(buf),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.read(buf),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(0)
@@ -239,6 +250,7 @@ impl Write for NetworkStream {
             InnerNetworkStream::Tcp(s) => s.write(buf),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.write(buf),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(0)
@@ -251,6 +263,7 @@ impl Write for NetworkStream {
             InnerNetworkStream::Tcp(s) => s.flush(),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.flush(),
+            #[cfg(feature = "native-tls")]
             InnerNetworkStream::None => {
                 debug_assert!(false, "InnerNetworkStream::None must never be built");
                 Ok(())

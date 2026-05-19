@@ -47,9 +47,6 @@ use std::{
 };
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
-use async_trait::async_trait;
-
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
 use crate::AsyncTransport;
 use crate::{Transport, address::Envelope};
 
@@ -161,7 +158,6 @@ impl Transport for StubTransport {
 }
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
-#[async_trait]
 impl AsyncTransport for AsyncStubTransport {
     type Ok = ();
     type Error = Error;

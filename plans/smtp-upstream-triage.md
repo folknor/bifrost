@@ -491,3 +491,50 @@ Review follow-up verification:
 - From `crates/smtp`: `brokkr check --features async-std1` passed.
 - From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- failed_test_connected_marks_connection_broken`
   passed.
+
+## v0.12 async trait cleanup
+
+Context:
+
+- #1028 calls out dropping `async-trait`.
+- The old macro boxed the async transport and executor futures and forced the
+  async `send` helper to take ownership of `Message`, unlike the blocking
+  transport API.
+
+Implemented:
+
+- Removed the optional `async-trait` dependency from `bifrost-smtp`.
+- Converted `Executor`, `SpawnHandle`, and `AsyncTransport` to native trait
+  futures.
+- Kept public trait declarations on explicit `impl Future + Send` return types
+  so public async trait methods do not hide auto-trait bounds.
+- `AsyncTransport` now requires `Sync` so borrowed async methods can return
+  `Send` futures. This is a public API break for custom async transports.
+- This intentionally gives up the object-safety that `async-trait`'s boxed
+  futures could provide. Transport boxing is still a separate #938 design pass.
+- Converted impl bodies to `async fn` where clippy can verify the desugaring.
+- Changed `AsyncTransport::send` from `send(Message)` to `send(&Message)`,
+  matching `Transport::send` and avoiding unnecessary clones in tests. This is
+  a public API break for callers of async transports.
+- Updated async examples, docs, and tests for borrowed send.
+- Reopened `SmtpTransport::from_url` for plaintext `smtp://` URLs when
+  `native-tls` is disabled; TLS URL forms still require `native-tls`.
+- Left async `from_url` exposed only for the tokio native-tls path for now.
+  Plain async transports can still use `builder_dangerous`; broader async URL
+  parsing belongs with the later transport API pass.
+- Cleaned up native-tls cfg fallout in sync network streams, TLS placeholder
+  types, imports, and URL parsing tests so plaintext tokio builds compile.
+- Fixed a real deserialization bug: malformed serialized `Address` values now
+  return a serde error instead of panicking through `unwrap`.
+- Fixed a small all-features clippy finding in `ContentType` serde formatting.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool`
+  passed.
+- From `crates/smtp`: `brokkr check` reached a clean all-features clippy pass,
+  then failed in the test phase because the sendmail integration tests expect a
+  working local `sendmail` command.
