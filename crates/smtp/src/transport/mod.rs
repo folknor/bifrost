@@ -140,6 +140,53 @@ pub trait Transport {
     fn shutdown(&self) {}
 }
 
+/// Boxed blocking transport trait object.
+pub type BoxedTransport<Ok, Error> = Box<dyn Transport<Ok = Ok, Error = Error> + Send + Sync>;
+
+impl<T> Transport for Box<T>
+where
+    T: Transport + ?Sized,
+{
+    type Ok = T::Ok;
+    type Error = T::Error;
+
+    #[cfg(feature = "builder")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
+    fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
+        (**self).send(message)
+    }
+
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        (**self).send_raw(envelope, email)
+    }
+
+    fn shutdown(&self) {
+        (**self).shutdown();
+    }
+}
+
+impl<T> Transport for std::sync::Arc<T>
+where
+    T: Transport + ?Sized,
+{
+    type Ok = T::Ok;
+    type Error = T::Error;
+
+    #[cfg(feature = "builder")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
+    fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
+        (**self).send(message)
+    }
+
+    fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
+        (**self).send_raw(envelope, email)
+    }
+
+    fn shutdown(&self) {
+        (**self).shutdown();
+    }
+}
+
 /// Async Transport method for emails
 ///
 /// Implementations must be [`Sync`] so borrowed async methods can return
@@ -178,5 +225,138 @@ pub trait AsyncTransport: Sync {
     /// [`Self::send_raw`] might fail.
     fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
         async {}
+    }
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+impl<T> AsyncTransport for Box<T>
+where
+    T: AsyncTransport + ?Sized,
+{
+    type Ok = T::Ok;
+    type Error = T::Error;
+
+    #[cfg(feature = "builder")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
+    fn send<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        (**self).send(message)
+    }
+
+    fn send_raw<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        (**self).send_raw(envelope, email)
+    }
+
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
+        (**self).shutdown()
+    }
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+impl<T> AsyncTransport for std::sync::Arc<T>
+where
+    T: AsyncTransport + Send + Sync + ?Sized,
+{
+    type Ok = T::Ok;
+    type Error = T::Error;
+
+    #[cfg(feature = "builder")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
+    fn send<'a>(
+        &'a self,
+        message: &'a Message,
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        (**self).send(message)
+    }
+
+    fn send_raw<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        (**self).send_raw(envelope, email)
+    }
+
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
+        (**self).shutdown()
+    }
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+trait ErasedAsyncTransport<Ok, Error>: Send + Sync {
+    fn send_raw_boxed<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Ok, Error>> + Send + 'a>>;
+
+    fn shutdown_boxed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+impl<Ok, Error, T> ErasedAsyncTransport<Ok, Error> for T
+where
+    T: AsyncTransport<Ok = Ok, Error = Error> + Send + Sync,
+{
+    fn send_raw_boxed<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Ok, Error>> + Send + 'a>> {
+        Box::pin(self.send_raw(envelope, email))
+    }
+
+    fn shutdown_boxed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.shutdown())
+    }
+}
+
+/// Boxed async transport.
+///
+/// `AsyncTransport` uses native `impl Future` return types and is not object
+/// safe. This adapter provides a stable boxed async transport value without
+/// reintroducing `async-trait`. The wrapped transport must be `Send + Sync +
+/// 'static` because the heap-erased transport can outlive the construction
+/// frame and may be shared between runtime tasks.
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+pub struct BoxedAsyncTransport<Ok, Error> {
+    inner: Box<dyn ErasedAsyncTransport<Ok, Error>>,
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+impl<Ok, Error> BoxedAsyncTransport<Ok, Error> {
+    /// Boxes an async transport.
+    pub fn new<T>(transport: T) -> Self
+    where
+        T: AsyncTransport<Ok = Ok, Error = Error> + Send + Sync + 'static,
+    {
+        Self {
+            inner: Box::new(transport),
+        }
+    }
+}
+
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+impl<Ok, Error> AsyncTransport for BoxedAsyncTransport<Ok, Error> {
+    type Ok = Ok;
+    type Error = Error;
+
+    fn send_raw<'a>(
+        &'a self,
+        envelope: &'a Envelope,
+        email: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Ok, Self::Error>> + Send + 'a {
+        self.inner.send_raw_boxed(envelope, email)
+    }
+
+    fn shutdown(&self) -> impl Future<Output = ()> + Send + '_ {
+        self.inner.shutdown_boxed()
     }
 }

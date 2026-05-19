@@ -535,9 +535,36 @@ Verification:
 - From `crates/smtp`: `brokkr check --features async-std1` passed.
 - From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool`
   passed.
-- From `crates/smtp`: `brokkr check` reached a clean all-features clippy pass,
-  then failed in the test phase because the sendmail integration tests expect a
-  working local `sendmail` command.
+
+## Deterministic sendmail transport tests
+
+Problem:
+
+- The sendmail transport integration tests used `SendmailTransport::new()` and
+  `AsyncSendmailTransport::new()`, so they depended on a working `sendmail`
+  command in the test host's `PATH`.
+- That made `brokkr check` fail after a clean all-features clippy pass on
+  machines without local sendmail configured.
+
+Implemented:
+
+- Added a test-local fake sendmail command generated under
+  `crates/smtp/target/sendmail-tests`.
+- Sync, tokio, and async-std sendmail tests now use `new_with_command(...)`
+  and assert both command-line arguments and stdin message bytes.
+- The fake command directory is recreated per label and process id so repeated
+  runs do not accumulate stale captured files.
+- Added sync, tokio, and async-std coverage for non-zero sendmail exit with
+  stderr propagated as a client error.
+- Added sync coverage for non-zero sendmail exit without stderr.
+- Full SMTP `brokkr check` now passes in this workspace.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features sendmail-transport,builder,tokio1,async-std1 -- -- sendmail_transport`
+  passed.
+- From `crates/smtp`: `brokkr check` passed.
 
 ## Async connection setup deadline
 
@@ -584,4 +611,38 @@ Verification:
 - From `crates/smtp`: `brokkr check --features tokio1-native-tls` passed.
 - From `crates/smtp`: `brokkr check --features async-std1` passed.
 - From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool`
+  passed.
+
+## Upstream issue 938: boxed transport ergonomics
+
+Upstream issue: https://github.com/lettre/lettre/issues/938
+
+Problem:
+
+- Sync transports can be used as trait objects, but `Box<dyn Transport<...>>`
+  did not itself implement `Transport`, so callers had to unwrap or hand-roll
+  forwarding.
+- After dropping `async-trait`, `AsyncTransport` intentionally uses native
+  `impl Future` return types and is not object-safe. Callers still need a
+  concrete way to store an async transport behind one stable type.
+
+Implemented:
+
+- Added `BoxedTransport<Ok, Error>` as a public boxed sync transport trait
+  object alias.
+- Added forwarding `Transport` impls for `Box<T>` and `Arc<T>`.
+- Added forwarding `AsyncTransport` impls for `Box<T>` and `Arc<T>`.
+- Added `BoxedAsyncTransport<Ok, Error>`, which erases any async transport into
+  boxed futures internally without reintroducing `async-trait`.
+- `BoxedAsyncTransport` is intentionally `Send + Sync` only. There is no
+  local/non-Send boxed async transport because `AsyncTransport` itself requires
+  `Sync` for borrowed methods that return `Send` futures.
+- Added sync, tokio, and async-std stub transport coverage for boxed and `Arc`
+  transport forwarding, including compile-time Send/Sync assertions for
+  `BoxedAsyncTransport`.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features builder,tokio1,async-std1 -- -- boxed_stub_transport`
   passed.

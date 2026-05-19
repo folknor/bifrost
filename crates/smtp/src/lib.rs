@@ -174,13 +174,11 @@ pub use self::executor::Executor;
 pub use self::executor::Tokio1Executor;
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 #[doc(inline)]
-pub use self::transport::AsyncTransport;
+pub use self::transport::{AsyncTransport, BoxedAsyncTransport};
 pub use crate::address::Address;
 #[cfg(feature = "builder")]
 #[doc(inline)]
 pub use crate::message::Message;
-#[doc(inline)]
-pub use crate::transport::Transport;
 #[cfg(all(
     feature = "file-transport",
     any(feature = "tokio1", feature = "async-std1")
@@ -206,6 +204,8 @@ pub use crate::transport::sendmail::SendmailTransport;
 pub use crate::transport::smtp::AsyncSmtpTransport;
 #[cfg(feature = "smtp-transport")]
 pub use crate::transport::smtp::SmtpTransport;
+#[doc(inline)]
+pub use crate::transport::{BoxedTransport, Transport};
 use crate::{address::Envelope, error::Error};
 
 #[allow(dead_code)]
