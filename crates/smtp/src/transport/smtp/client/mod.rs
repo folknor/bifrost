@@ -26,23 +26,14 @@
 use std::fmt::Debug;
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
-pub use self::async_connection::AsyncSmtpConnection;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
-#[allow(deprecated)]
-pub use self::async_net::AsyncNetworkStream;
-#[cfg(feature = "tokio1")]
-pub use self::async_net::AsyncTokioStream;
+pub(crate) use self::async_connection::AsyncSmtpConnection;
+pub(crate) use self::connection::SmtpConnection;
 use self::net::NetworkStream;
 #[cfg(feature = "native-tls")]
 pub(super) use self::tls::InnerTlsParameters;
 #[cfg(feature = "native-tls")]
-pub use self::tls::TlsVersion;
-#[cfg(feature = "native-tls")]
 pub use self::tls::{Certificate, Identity};
-pub use self::{
-    connection::SmtpConnection,
-    tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder},
-};
+pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 mod async_connection;

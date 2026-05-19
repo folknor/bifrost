@@ -13,17 +13,17 @@ use futures_util::future::BoxFuture;
     feature = "smtp-transport",
     any(feature = "tokio1", feature = "async-std1")
 ))]
+use crate::transport::smtp::AsyncSmtpConnection;
+#[cfg(all(
+    feature = "smtp-transport",
+    any(feature = "tokio1", feature = "async-std1")
+))]
 use crate::transport::smtp::Error;
 #[cfg(all(
     feature = "smtp-transport",
     any(feature = "tokio1", feature = "async-std1")
 ))]
-use crate::transport::smtp::client::AsyncSmtpConnection;
-#[cfg(all(
-    feature = "smtp-transport",
-    any(feature = "tokio1", feature = "async-std1")
-))]
-use crate::transport::smtp::client::Tls;
+use crate::transport::smtp::Tls;
 #[cfg(all(
     feature = "smtp-transport",
     any(feature = "tokio1", feature = "async-std1")
@@ -58,16 +58,6 @@ pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
     fn sleep(duration: Duration) -> Self::Sleep;
 
     #[doc(hidden)]
-    #[cfg(feature = "smtp-transport")]
-    fn connect<'a>(
-        hostname: &'a str,
-        port: u16,
-        timeout: Option<Duration>,
-        hello_name: &'a ClientId,
-        tls: &'a Tls,
-    ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
-
-    #[doc(hidden)]
     #[cfg(feature = "file-transport-envelope")]
     fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_;
 
@@ -83,6 +73,20 @@ pub trait Executor: Debug + Send + Sync + 'static + private::Sealed {
 #[cfg(feature = "smtp-transport")]
 pub(crate) trait SpawnHandle: Debug + Send + Sync + 'static + private::Sealed {
     fn shutdown(&self) -> impl Future<Output = ()> + Send + '_;
+}
+
+#[cfg(feature = "smtp-transport")]
+pub(crate) trait SmtpExecutor: Executor {
+    // Keep SMTP dialing out of the public `Executor` trait. Public async
+    // transport constructors intentionally use this private sealed bound, so
+    // those call sites carry `#[allow(private_bounds)]`.
+    fn connect<'a>(
+        hostname: &'a str,
+        port: u16,
+        timeout: Option<Duration>,
+        hello_name: &'a ClientId,
+        tls: &'a Tls,
+    ) -> impl Future<Output = Result<AsyncSmtpConnection, Error>> + Send + 'a;
 }
 
 /// Async [`Executor`] using `tokio` `1.x`
@@ -121,7 +125,22 @@ impl Executor for Tokio1Executor {
         tokio1_crate::time::sleep(duration)
     }
 
-    #[cfg(feature = "smtp-transport")]
+    #[cfg(feature = "file-transport-envelope")]
+    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
+        tokio1_crate::fs::read(path)
+    }
+
+    #[cfg(feature = "file-transport")]
+    fn fs_write<'a>(
+        path: &'a Path,
+        contents: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        tokio1_crate::fs::write(path, contents)
+    }
+}
+
+#[cfg(all(feature = "smtp-transport", feature = "tokio1"))]
+impl SmtpExecutor for Tokio1Executor {
     async fn connect(
         hostname: &str,
         port: u16,
@@ -157,19 +176,6 @@ impl Executor for Tokio1Executor {
         }
 
         Ok(conn)
-    }
-
-    #[cfg(feature = "file-transport-envelope")]
-    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
-        tokio1_crate::fs::read(path)
-    }
-
-    #[cfg(feature = "file-transport")]
-    fn fs_write<'a>(
-        path: &'a Path,
-        contents: &'a [u8],
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
-        tokio1_crate::fs::write(path, contents)
     }
 }
 
@@ -219,7 +225,22 @@ impl Executor for AsyncStd1Executor {
         Box::pin(fut)
     }
 
-    #[cfg(feature = "smtp-transport")]
+    #[cfg(feature = "file-transport-envelope")]
+    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
+        async_std::fs::read(path)
+    }
+
+    #[cfg(feature = "file-transport")]
+    fn fs_write<'a>(
+        path: &'a Path,
+        contents: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        async_std::fs::write(path, contents)
+    }
+}
+
+#[cfg(all(feature = "smtp-transport", feature = "async-std1"))]
+impl SmtpExecutor for AsyncStd1Executor {
     async fn connect(
         hostname: &str,
         port: u16,
@@ -237,19 +258,6 @@ impl Executor for AsyncStd1Executor {
         let _ = tls;
 
         AsyncSmtpConnection::connect_asyncstd1((hostname, port), timeout, hello_name, None).await
-    }
-
-    #[cfg(feature = "file-transport-envelope")]
-    fn fs_read(path: &Path) -> impl Future<Output = IoResult<Vec<u8>>> + Send + '_ {
-        async_std::fs::read(path)
-    }
-
-    #[cfg(feature = "file-transport")]
-    fn fs_write<'a>(
-        path: &'a Path,
-        contents: &'a [u8],
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
-        async_std::fs::write(path, contents)
     }
 }
 

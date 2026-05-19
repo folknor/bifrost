@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{
-    super::{Error, client::SmtpConnection},
+    super::{Error, SmtpConnection},
     PoolConfig,
 };
 use crate::transport::smtp::{error, transport::SmtpClient};

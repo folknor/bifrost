@@ -3,7 +3,7 @@ use std::fs;
 use bifrost_smtp::{
     Message, SmtpTransport, Transport,
     message::header::ContentType,
-    transport::smtp::client::{Certificate, Tls, TlsParameters},
+    transport::smtp::{Certificate, Tls, TlsParameters},
 };
 
 fn main() {

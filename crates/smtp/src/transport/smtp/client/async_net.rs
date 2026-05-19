@@ -1,12 +1,12 @@
-#[cfg(feature = "tokio1")]
-use std::io;
 #[cfg(feature = "tokio1-native-tls")]
 use std::mem;
 #[cfg(feature = "tokio1")]
-use std::{fmt, net::IpAddr};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 use std::{
     future::Future,
-    net::SocketAddr,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -15,8 +15,7 @@ use std::{
 #[cfg(feature = "async-std1")]
 use async_std::net::{TcpStream as AsyncStd1TcpStream, ToSocketAddrs as AsyncStd1ToSocketAddrs};
 use futures_io::{
-    AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, Error as IoError,
-    Result as IoResult,
+    AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, Result as IoResult,
 };
 #[cfg(feature = "tokio1")]
 use tokio1_crate::io::{AsyncRead, AsyncWrite, ReadBuf as Tokio1ReadBuf};
@@ -32,7 +31,7 @@ use tokio1_native_tls_crate::TlsStream as Tokio1TlsStream;
 use super::InnerTlsParameters;
 use super::TlsParameters;
 #[cfg(feature = "tokio1")]
-use crate::transport::smtp::client::net::resolved_address_filter;
+use super::net::resolved_address_filter;
 use crate::transport::smtp::{Error, error};
 
 #[derive(Clone, Copy, Debug)]
@@ -93,21 +92,18 @@ impl AsyncDeadline {
     since = "0.11.14",
     note = "This struct was not meant to be made public"
 )]
-pub struct AsyncNetworkStream {
+pub(crate) struct AsyncNetworkStream {
     inner: InnerAsyncNetworkStream,
 }
 
 #[cfg(feature = "tokio1")]
-pub trait AsyncTokioStream: AsyncRead + AsyncWrite + Send + Sync + Unpin + fmt::Debug {
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
+pub(crate) trait AsyncTokioStream:
+    AsyncRead + AsyncWrite + Send + Sync + Unpin + fmt::Debug
+{
 }
 
 #[cfg(feature = "tokio1")]
-impl AsyncTokioStream for Tokio1TcpStream {
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.peer_addr()
-    }
-}
+impl AsyncTokioStream for Tokio1TcpStream {}
 
 /// Represents the different types of underlying network streams
 // usually only one TLS backend at a time is going to be enabled,
@@ -137,49 +133,6 @@ impl AsyncNetworkStream {
         }
 
         AsyncNetworkStream { inner }
-    }
-
-    /// Returns peer's address
-    pub fn peer_addr(&self) -> IoResult<SocketAddr> {
-        match &self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(s) => s.peer_addr(),
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(s) => {
-                s.get_ref().get_ref().get_ref().peer_addr()
-            }
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(s) => s.peer_addr(),
-            InnerAsyncNetworkStream::None => {
-                debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
-                Err(IoError::other(
-                    "InnerAsyncNetworkStream::None must never be built",
-                ))
-            }
-        }
-    }
-
-    #[cfg(feature = "tokio1")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
-    pub fn use_existing_tokio1(stream: Box<dyn AsyncTokioStream>) -> AsyncNetworkStream {
-        AsyncNetworkStream::new(InnerAsyncNetworkStream::Tokio1Tcp(stream))
-    }
-
-    #[cfg(feature = "tokio1")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
-    pub async fn connect_tokio1<T: Tokio1ToSocketAddrs>(
-        server: T,
-        timeout: Option<Duration>,
-        tls_parameters: Option<TlsParameters>,
-        local_addr: Option<IpAddr>,
-    ) -> Result<AsyncNetworkStream, Error> {
-        Self::connect_tokio1_until(
-            server,
-            AsyncDeadline::new(timeout),
-            tls_parameters,
-            local_addr,
-        )
-        .await
     }
 
     #[cfg(feature = "tokio1")]
@@ -241,16 +194,6 @@ impl AsyncNetworkStream {
     }
 
     #[cfg(feature = "async-std1")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "async-std1")))]
-    pub async fn connect_asyncstd1<T: AsyncStd1ToSocketAddrs>(
-        server: T,
-        timeout: Option<Duration>,
-        tls_parameters: Option<TlsParameters>,
-    ) -> Result<AsyncNetworkStream, Error> {
-        Self::connect_asyncstd1_until(server, AsyncDeadline::new(timeout), tls_parameters).await
-    }
-
-    #[cfg(feature = "async-std1")]
     pub(super) async fn connect_asyncstd1_until<T: AsyncStd1ToSocketAddrs>(
         server: T,
         deadline: AsyncDeadline,
@@ -296,7 +239,8 @@ impl AsyncNetworkStream {
         Ok(stream)
     }
 
-    pub async fn upgrade_tls(
+    #[cfg_attr(not(feature = "tokio1-native-tls"), allow(dead_code))]
+    pub(crate) async fn upgrade_tls(
         &mut self,
         tls_parameters: TlsParameters,
         timeout: Option<Duration>,
@@ -370,7 +314,7 @@ impl AsyncNetworkStream {
         }
     }
 
-    pub fn is_encrypted(&self) -> bool {
+    pub(crate) fn is_encrypted(&self) -> bool {
         match &self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => false,
@@ -379,30 +323,6 @@ impl AsyncNetworkStream {
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(_) => false,
             InnerAsyncNetworkStream::None => false,
-        }
-    }
-
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
-    pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        match &self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(stream) => Ok(stream
-                .get_ref()
-                .peer_certificate()
-                .map_err(error::tls)?
-                .unwrap()
-                .to_der()
-                .map_err(error::tls)?),
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
-                Err(error::client("Connection is not encrypted"))
-            }
-            InnerAsyncNetworkStream::None => panic!("InnerNetworkStream::None must never be built"),
         }
     }
 }

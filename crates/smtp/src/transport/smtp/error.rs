@@ -50,6 +50,14 @@ impl Error {
         matches!(self.inner.kind, Kind::Client)
     }
 
+    /// Returns true if the error is a client-side policy refusal.
+    ///
+    /// This includes refusing to transmit credentials over an unencrypted
+    /// SMTP connection.
+    pub fn is_policy(&self) -> bool {
+        matches!(self.inner.kind, Kind::Policy)
+    }
+
     /// Returns true if the error is a transient SMTP 4xx reply.
     ///
     /// This is not the inverse of [`Error::is_permanent`]: parse, client,
@@ -126,6 +134,8 @@ pub enum ErrorKind {
     Response,
     /// Internal client error.
     Client,
+    /// Client-side policy refusal.
+    Policy,
     /// Connection error.
     Connection,
     /// Underlying network I/O error.
@@ -152,6 +162,8 @@ pub(crate) enum Kind {
     Response,
     /// Internal client error
     Client,
+    /// Client-side policy refusal
+    Policy,
     /// Connection error
     Connection,
     /// Underlying network i/o error
@@ -171,6 +183,7 @@ impl Kind {
             Kind::Permanent(code) => ErrorKind::Permanent(code),
             Kind::Response => ErrorKind::Response,
             Kind::Client => ErrorKind::Client,
+            Kind::Policy => ErrorKind::Policy,
             Kind::Connection => ErrorKind::Connection,
             Kind::Network => ErrorKind::Network,
             #[cfg(feature = "native-tls")]
@@ -199,6 +212,7 @@ impl fmt::Display for Error {
         match &self.inner.kind {
             Kind::Response => f.write_str("response error")?,
             Kind::Client => f.write_str("internal client error")?,
+            Kind::Policy => f.write_str("policy error")?,
             Kind::Network => f.write_str("network error")?,
             Kind::Connection => f.write_str("Connection error")?,
             #[cfg(feature = "native-tls")]
@@ -245,6 +259,10 @@ pub(crate) fn client<E: Into<BoxError>>(e: E) -> Error {
     Error::new(Kind::Client, Some(e))
 }
 
+pub(crate) fn policy<E: Into<BoxError>>(e: E) -> Error {
+    Error::new(Kind::Policy, Some(e))
+}
+
 pub(crate) fn network<E: Into<BoxError>>(e: E) -> Error {
     Error::new(Kind::Network, Some(e))
 }
@@ -269,7 +287,7 @@ pub(crate) fn transport_shutdown() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorKind, code, connection, network};
+    use super::{ErrorKind, code, connection, network, policy};
     use crate::transport::smtp::response::{Category, Code, Detail, Severity};
 
     #[test]
@@ -305,5 +323,14 @@ mod tests {
         assert_eq!(error.status(), Some(status));
         assert!(error.is_transient());
         assert!(!error.is_permanent());
+    }
+
+    #[test]
+    fn exposes_policy_kind() {
+        let error = policy("refusing to authenticate over plaintext");
+
+        assert_eq!(error.kind(), ErrorKind::Policy);
+        assert!(error.is_policy());
+        assert!(!error.is_client());
     }
 }

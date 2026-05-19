@@ -188,7 +188,9 @@ Implemented:
 - Simplified sync and async network streams to plaintext plus native-tls only.
 - Removed Boring/rustls-only public inspection APIs:
   `tls_verify_result()` and `certificate_chain()`.
-- Kept `peer_certificate()` for native-tls.
+- Kept `peer_certificate()` for native-tls at this point. This was later
+  removed with the private-client cleanup because the low-level connection API
+  is no longer public.
 - Removed async-std TLS examples. Async-std remains available where it does not
   need SMTP TLS.
 - Applied timeout handling around async DNS lookup and tokio native-tls
@@ -645,4 +647,62 @@ Verification:
 
 - From `crates/smtp`: `brokkr fmt` passed.
 - From `crates/smtp`: `brokkr check --no-default-features --features builder,tokio1,async-std1 -- -- boxed_stub_transport`
+  passed.
+
+## Plaintext auth hardening and client API cleanup
+
+Context:
+
+- Bifrost's SMTP fork is prioritizing bearer-token/OIDC auth, so accidentally
+  sending credentials over plaintext SMTP is worse than a generic convenience
+  footgun.
+- #1028 calls out that `transport::smtp::client` was never meant to be public.
+  Once the module is private, the old low-level connection and network stream
+  APIs should stop shaping the public surface.
+- Upstream PR #994 is still a draft and mainly targets connection shutdown and
+  cancel-safety around errors. We already picked up the important abort/no-QUIT
+  behavior; the remaining design is better handled after the public client
+  namespace is gone.
+- Upstream PR #831 adds LMTP with a protocol generic and multi-response send
+  semantics. That still looks valuable, but it deserves a first-class bifrost
+  API instead of being squeezed into this hardening pass.
+
+Implemented:
+
+- SMTP transports now refuse to run AUTH over an unencrypted connection by
+  default. This covers password credentials and OAuth bearer tokens.
+- Added public `ErrorKind::Policy` and `Error::is_policy()` so callers can
+  distinguish local policy refusals from malformed credentials or other client
+  errors.
+- Added `SmtpTransportBuilder::dangerous_allow_insecure_auth(bool)` and
+  `AsyncSmtpTransportBuilder::dangerous_allow_insecure_auth(bool)` as explicit
+  opt-ins for trusted local relays and tests.
+- Added sync and tokio protocol tests proving plaintext auth is rejected after
+  EHLO and before any AUTH line is sent.
+- Added sync coverage proving the dangerous opt-in still sends AUTH for local
+  plaintext test relays.
+- Reopened async `from_url` for plaintext `smtp://` URLs when `native-tls` is
+  not compiled in. TLS URL forms still require the tokio native-tls path.
+- Made `transport::smtp::client` private.
+- Re-exported TLS configuration types directly from `transport::smtp`.
+- Moved low-level `SmtpConnection`, `AsyncSmtpConnection`, network stream, and
+  async stream hook APIs to crate/internal visibility.
+- Split the SMTP-specific async executor `connect` hook out of the public
+  `Executor` trait into a crate-private `SmtpExecutor` trait, so the public
+  executor API no longer leaks the internal SMTP connection type.
+- Documented why public async transport methods carry `#[allow(private_bounds)]`
+  around the crate-private `SmtpExecutor` bound.
+- Removed now-unused low-level stream hooks such as public peer-address access,
+  `set_stream`, `connect_with_transport`, and native-tls `peer_certificate`.
+- Added a `CHANGELOG.md` entry for the bifrost-smtp breaking API surface
+  changes.
+
+Verification:
+
+- From `crates/smtp`: `brokkr fmt` passed.
+- From `crates/smtp`: `brokkr check --no-default-features --features tokio1,smtp-transport,builder,pool`
+  passed.
+- From `crates/smtp`: `brokkr check` passed.
+- From `crates/smtp`: `brokkr check --features async-std1` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- plaintext_auth_is_refused`
   passed.

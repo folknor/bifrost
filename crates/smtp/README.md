@@ -32,3 +32,6 @@ fn main() {
 OAuth 2.0 access tokens can be used with `.oauth2(identity, access_token)`.
 That configures `OAUTHBEARER` and `XOAUTH2`, in that preference order; the
 transport uses the first configured mechanism advertised by the server.
+Passwords and bearer tokens are refused on plaintext SMTP connections by
+default. Trusted local test relays can opt in with
+`.dangerous_allow_insecure_auth(true)`.

@@ -163,7 +163,7 @@ impl SmtpTransport {
     /// | `smtps` | unset                 | `smtps://user:pass@hostname:port`                  | 465          | SMTP over TLS, recommended method                                                                                                     |
     /// | `smtp`  | `required`            | `smtp://user:pass@hostname:port?tls=required`      | 587          | SMTP with STARTTLS required, when SMTP over TLS is not available                                                                      |
     /// | `smtp`  | `opportunistic`       | `smtp://user:pass@hostname:port?tls=opportunistic` | 587          | SMTP with optionally STARTTLS when supported by the server. Not suitable for production use: vulnerable to a man-in-the-middle attack |
-    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Not suitable for production use: sends all data unencrypted                                                  |
+    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
     ///
     /// IMPORTANT: some parameters like `user` and `pass` cannot simply
     /// be concatenated to construct the final URL because special characters
@@ -207,7 +207,9 @@ impl SmtpTransport {
     /// The connection URL can then be used in the following way:
     /// TLS URL forms such as `smtps://` and `?tls=required` require the
     /// `native-tls` feature. Without it, only plaintext `smtp://` URLs are
-    /// accepted.
+    /// accepted. If a plaintext URL contains credentials, authentication is
+    /// refused at connection time unless
+    /// [`SmtpTransportBuilder::dangerous_allow_insecure_auth`] is enabled.
     ///
     /// ```rust,no_run
     /// use bifrost_smtp::{
@@ -315,6 +317,16 @@ impl SmtpTransportBuilder {
     /// Set the authentication mechanism to use
     pub fn authentication(mut self, mechanisms: Vec<Mechanism>) -> Self {
         self.info.set_authentication(mechanisms);
+        self
+    }
+
+    /// Allow credentials to be sent over an unencrypted SMTP connection.
+    ///
+    /// By default, Bifrost SMTP refuses to send passwords or bearer tokens
+    /// unless the connection is already encrypted by TLS or has been upgraded
+    /// with STARTTLS. Set this only for trusted local relays or test servers.
+    pub fn dangerous_allow_insecure_auth(mut self, allow: bool) -> Self {
+        self.info.allow_insecure_auth = allow;
         self
     }
 
@@ -427,6 +439,7 @@ impl SmtpClient {
         }
 
         if let Some(credentials) = &self.info.credentials {
+            self.info.ensure_can_authenticate(conn.is_encrypted())?;
             conn.auth(&self.info.authentication, credentials)?;
         }
         Ok(conn)
@@ -435,14 +448,24 @@ impl SmtpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
     #[cfg(feature = "native-tls")]
-    use crate::transport::smtp::client::Tls;
+    use crate::transport::smtp::Tls;
     use crate::{
         SmtpTransport,
         transport::smtp::authentication::{
             Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
         },
     };
+
+    use super::SmtpClient;
 
     #[test]
     fn transport_from_plaintext_url() {
@@ -565,5 +588,88 @@ mod tests {
             .password("username", "password");
 
         assert_eq!(builder.info.authentication, [Mechanism::Plain]);
+    }
+
+    #[test]
+    fn plaintext_auth_is_refused_before_auth_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
+                .unwrap();
+
+            let mut after_ehlo = String::new();
+            let read = reader.read_line(&mut after_ehlo).unwrap();
+            observed_tx.send((read, after_ehlo)).unwrap();
+        });
+
+        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
+            .port(address.port())
+            .password("user", "pass");
+        let client = SmtpClient { info: builder.info };
+        let Err(error) = client.connection() else {
+            panic!("plaintext auth must be refused");
+        };
+
+        assert!(error.is_policy(), "expected policy error, got {error:?}");
+        let (read, after_ehlo) = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(read, 0, "client must close instead of sending AUTH");
+        assert_eq!(after_ehlo, "");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn dangerous_allow_insecure_auth_preserves_plaintext_auth_escape_hatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (auth_tx, auth_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
+                .unwrap();
+
+            let mut auth = String::new();
+            reader.read_line(&mut auth).unwrap();
+            stream.write_all(b"235 authenticated\r\n").unwrap();
+
+            let mut post_auth_ehlo = String::new();
+            reader.read_line(&mut post_auth_ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+            auth_tx.send(auth).unwrap();
+        });
+
+        let builder = SmtpTransport::builder_dangerous("127.0.0.1")
+            .port(address.port())
+            .password("user", "pass")
+            .dangerous_allow_insecure_auth(true);
+        let client = SmtpClient { info: builder.info };
+        let mut connection = client.connection().unwrap();
+        connection.abort();
+
+        let auth = auth_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(auth.starts_with("AUTH PLAIN "), "got {auth:?}");
+        handle.join().unwrap();
     }
 }

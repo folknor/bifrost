@@ -5,8 +5,6 @@ use std::{fmt::Display, future::Future, time::Duration};
 use futures_util::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::async_net::AsyncDeadline;
-#[cfg(feature = "tokio1")]
-use super::async_net::AsyncTokioStream;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
 #[allow(deprecated)]
@@ -82,7 +80,7 @@ where
 }
 
 /// Structure that implements the SMTP client
-pub struct AsyncSmtpConnection {
+pub(crate) struct AsyncSmtpConnection {
     /// TCP stream between client and server
     /// Value is None before connection
     #[allow(deprecated)]
@@ -100,33 +98,12 @@ pub struct AsyncSmtpConnection {
 
 impl AsyncSmtpConnection {
     /// Get information about the server
-    pub fn server_info(&self) -> &ServerInfo {
+    pub(crate) fn server_info(&self) -> &ServerInfo {
         &self.server_info
     }
 
     fn per_operation_budget(&self) -> TimeoutBudget {
         TimeoutBudget::PerOperation(self.timeout)
-    }
-
-    /// Connects with existing async stream
-    ///
-    /// Sends EHLO and parses server information
-    #[cfg(feature = "tokio1")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
-    pub async fn connect_with_transport(
-        stream: Box<dyn AsyncTokioStream>,
-        hello_name: &ClientId,
-    ) -> Result<AsyncSmtpConnection, Error> {
-        #[allow(deprecated)]
-        let stream = AsyncNetworkStream::use_existing_tokio1(stream);
-        Self::connect_impl(
-            stream,
-            hello_name,
-            None,
-            TimeoutRuntime::Tokio1,
-            TimeoutBudget::PerOperation(None),
-        )
-        .await
     }
 
     /// Connects to the configured server
@@ -143,7 +120,7 @@ impl AsyncSmtpConnection {
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # use bifrost_smtp::transport::smtp::{client::{AsyncSmtpConnection, TlsParameters}, extension::ClientId};
+    /// # use bifrost_smtp::transport::smtp::{AsyncSmtpConnection, TlsParameters, extension::ClientId};
     /// # use tokio1_crate::{self as tokio, net::ToSocketAddrs as _};
     /// #
     /// # #[tokio::main]
@@ -161,7 +138,7 @@ impl AsyncSmtpConnection {
     /// ```
     #[cfg(feature = "tokio1")]
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio1")))]
-    pub async fn connect_tokio1<T: tokio1_crate::net::ToSocketAddrs>(
+    pub(crate) async fn connect_tokio1<T: tokio1_crate::net::ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
         hello_name: &ClientId,
@@ -192,7 +169,7 @@ impl AsyncSmtpConnection {
     /// Sends EHLO and parses server information
     #[cfg(feature = "async-std1")]
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std1")))]
-    pub async fn connect_asyncstd1<T: async_std::net::ToSocketAddrs>(
+    pub(crate) async fn connect_asyncstd1<T: async_std::net::ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
         hello_name: &ClientId,
@@ -240,7 +217,11 @@ impl AsyncSmtpConnection {
         Ok(conn)
     }
 
-    pub async fn send(&mut self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
+    pub(crate) async fn send(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+    ) -> Result<Response, Error> {
         // Mail
         let mut mail_options = vec![];
 
@@ -292,11 +273,13 @@ impl AsyncSmtpConnection {
         Ok(result)
     }
 
-    pub fn has_broken(&self) -> bool {
+    pub(crate) fn has_broken(&self) -> bool {
         self.panic
     }
 
-    pub fn can_starttls(&self) -> bool {
+    // Async STARTTLS is only wired for the tokio native-tls feature path.
+    #[cfg_attr(not(feature = "tokio1-native-tls"), allow(dead_code))]
+    pub(crate) fn can_starttls(&self) -> bool {
         !self.is_encrypted() && self.server_info.supports_feature(Extension::StartTls)
     }
 
@@ -306,8 +289,10 @@ impl AsyncSmtpConnection {
     ///
     /// [rfc3207]: https://www.rfc-editor.org/rfc/rfc3207
     /// [rfc8314]: https://www.rfc-editor.org/rfc/rfc8314
+    // Async STARTTLS is only wired for the tokio native-tls feature path.
     #[allow(unused_variables)]
-    pub async fn starttls(
+    #[cfg_attr(not(feature = "tokio1-native-tls"), allow(dead_code))]
+    pub(crate) async fn starttls(
         &mut self,
         tls_parameters: TlsParameters,
         hello_name: &ClientId,
@@ -349,23 +334,18 @@ impl AsyncSmtpConnection {
         Ok(())
     }
 
-    pub async fn quit(&mut self) -> Result<Response, Error> {
+    #[cfg_attr(feature = "pool", allow(dead_code))]
+    pub(crate) async fn quit(&mut self) -> Result<Response, Error> {
         Ok(try_smtp!(self.command(Quit).await, self))
     }
 
-    pub async fn abort(&mut self) {
+    pub(crate) async fn abort(&mut self) {
         self.panic = true;
         let _ = self.stream.close().await;
     }
 
-    /// Sets the underlying stream
-    #[allow(deprecated)]
-    pub fn set_stream(&mut self, stream: AsyncNetworkStream) {
-        self.stream = BufReader::new(stream);
-    }
-
     /// Tells if the underlying stream is currently encrypted
-    pub fn is_encrypted(&self) -> bool {
+    pub(crate) fn is_encrypted(&self) -> bool {
         self.stream.get_ref().is_encrypted()
     }
 
@@ -373,7 +353,7 @@ impl AsyncSmtpConnection {
     ///
     /// A failed check marks the connection broken and closes it. A connection
     /// that cannot answer NOOP is not safe to keep in the pool.
-    pub async fn test_connected(&mut self) -> bool {
+    pub(crate) async fn test_connected(&mut self) -> bool {
         match self.command(Noop).await {
             Ok(_) => true,
             Err(_) => {
@@ -384,7 +364,7 @@ impl AsyncSmtpConnection {
     }
 
     /// Sends an AUTH command with the given mechanism, and handles the challenge if needed
-    pub async fn auth(
+    pub(crate) async fn auth(
         &mut self,
         mechanisms: &[Mechanism],
         credentials: &Credentials,
@@ -423,12 +403,12 @@ impl AsyncSmtpConnection {
     }
 
     /// Sends the message content
-    pub async fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
+    pub(crate) async fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message)).await
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
-    pub async fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
+    pub(crate) async fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
     where
         I: Iterator<Item = B>,
         B: AsRef<[u8]>,
@@ -446,7 +426,7 @@ impl AsyncSmtpConnection {
     }
 
     /// Sends an SMTP command
-    pub async fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
+    pub(crate) async fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
         self.command_with_budget(command, self.per_operation_budget())
             .await
     }
@@ -495,7 +475,7 @@ impl AsyncSmtpConnection {
     }
 
     /// Gets the SMTP response
-    pub async fn read_response(&mut self) -> Result<Response, Error> {
+    pub(crate) async fn read_response(&mut self) -> Result<Response, Error> {
         self.read_response_with_budget(self.per_operation_budget())
             .await
     }
@@ -550,13 +530,6 @@ impl AsyncSmtpConnection {
 
         Err(error::response("incomplete response"))
     }
-
-    /// The X509 certificate of the server (DER encoded)
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
-    pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        self.stream.get_ref().peer_certificate()
-    }
 }
 
 #[cfg(test)]
@@ -571,8 +544,8 @@ mod test {
     };
 
     use crate::transport::smtp::{
+        AsyncSmtpConnection,
         authentication::{Credentials, Mechanism},
-        client::AsyncSmtpConnection,
         commands::Noop,
         extension::{ClientId, Extension},
     };
@@ -840,7 +813,7 @@ mod asyncstd_test {
         time::Duration,
     };
 
-    use crate::transport::smtp::{client::AsyncSmtpConnection, extension::ClientId};
+    use crate::transport::smtp::{AsyncSmtpConnection, extension::ClientId};
 
     #[async_std::test]
     async fn asyncstd_connect_setup_uses_single_deadline_for_banner_and_ehlo() {

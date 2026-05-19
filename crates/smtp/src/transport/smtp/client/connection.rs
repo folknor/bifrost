@@ -37,7 +37,7 @@ macro_rules! try_smtp (
 );
 
 /// Structure that implements the SMTP client
-pub struct SmtpConnection {
+pub(crate) struct SmtpConnection {
     /// TCP stream between client and server
     /// Value is None before connection
     stream: BufReader<NetworkStream>,
@@ -51,7 +51,7 @@ pub struct SmtpConnection {
 
 impl SmtpConnection {
     /// Get information about the server
-    pub fn server_info(&self) -> &ServerInfo {
+    pub(crate) fn server_info(&self) -> &ServerInfo {
         &self.server_info
     }
 
@@ -60,7 +60,7 @@ impl SmtpConnection {
     /// Connects to the configured server
     ///
     /// Sends EHLO and parses server information
-    pub fn connect<A: ToSocketAddrs>(
+    pub(crate) fn connect<A: ToSocketAddrs>(
         server: A,
         timeout: Option<Duration>,
         hello_name: &ClientId,
@@ -87,7 +87,7 @@ impl SmtpConnection {
         Ok(conn)
     }
 
-    pub fn send(&mut self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
+    pub(crate) fn send(&mut self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
         // Mail
         let mut mail_options = vec![];
 
@@ -135,16 +135,20 @@ impl SmtpConnection {
         Ok(result)
     }
 
-    pub fn has_broken(&self) -> bool {
+    pub(crate) fn has_broken(&self) -> bool {
         self.panic
     }
 
-    pub fn can_starttls(&self) -> bool {
+    // Without sync native-tls, no public transport path can perform STARTTLS.
+    #[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
+    pub(crate) fn can_starttls(&self) -> bool {
         !self.is_encrypted() && self.server_info.supports_feature(Extension::StartTls)
     }
 
+    // Without sync native-tls, no public transport path can perform STARTTLS.
     #[allow(unused_variables)]
-    pub fn starttls(
+    #[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
+    pub(crate) fn starttls(
         &mut self,
         tls_parameters: &TlsParameters,
         hello_name: &ClientId,
@@ -177,27 +181,23 @@ impl SmtpConnection {
         Ok(())
     }
 
-    pub fn quit(&mut self) -> Result<Response, Error> {
+    #[cfg_attr(feature = "pool", allow(dead_code))]
+    pub(crate) fn quit(&mut self) -> Result<Response, Error> {
         Ok(try_smtp!(self.command(Quit), self))
     }
 
-    pub fn abort(&mut self) {
+    pub(crate) fn abort(&mut self) {
         self.panic = true;
         let _ = self.stream.get_mut().shutdown(std::net::Shutdown::Both);
     }
 
-    /// Sets the underlying stream
-    pub fn set_stream(&mut self, stream: NetworkStream) {
-        self.stream = BufReader::new(stream);
-    }
-
     /// Tells if the underlying stream is currently encrypted
-    pub fn is_encrypted(&self) -> bool {
+    pub(crate) fn is_encrypted(&self) -> bool {
         self.stream.get_ref().is_encrypted()
     }
 
     /// Set timeout
-    pub fn set_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn set_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         self.stream.get_mut().set_read_timeout(duration)?;
         self.stream.get_mut().set_write_timeout(duration)
     }
@@ -206,7 +206,7 @@ impl SmtpConnection {
     ///
     /// A failed check marks the connection broken and closes it. A connection
     /// that cannot answer NOOP is not safe to keep in the pool.
-    pub fn test_connected(&mut self) -> bool {
+    pub(crate) fn test_connected(&mut self) -> bool {
         match self.command(Noop) {
             Ok(_) => true,
             Err(_) => {
@@ -217,7 +217,7 @@ impl SmtpConnection {
     }
 
     /// Sends an AUTH command with the given mechanism, and handles the challenge if needed
-    pub fn auth(
+    pub(crate) fn auth(
         &mut self,
         mechanisms: &[Mechanism],
         credentials: &Credentials,
@@ -253,12 +253,12 @@ impl SmtpConnection {
     }
 
     /// Sends the message content
-    pub fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
+    pub(crate) fn message(&mut self, message: &[u8]) -> Result<Response, Error> {
         self.message_iter(std::iter::once(message))
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
-    pub fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
+    pub(crate) fn message_iter<I, B>(&mut self, message: I) -> Result<Response, Error>
     where
         I: Iterator<Item = B>,
         B: AsRef<[u8]>,
@@ -276,7 +276,7 @@ impl SmtpConnection {
     }
 
     /// Sends an SMTP command
-    pub fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
+    pub(crate) fn command<C: Display>(&mut self, command: C) -> Result<Response, Error> {
         self.write(command.to_string().as_bytes())?;
         self.read_response()
     }
@@ -295,7 +295,7 @@ impl SmtpConnection {
     }
 
     /// Gets the SMTP response
-    pub fn read_response(&mut self) -> Result<Response, Error> {
+    pub(crate) fn read_response(&mut self) -> Result<Response, Error> {
         let mut buffer = String::with_capacity(100);
         let mut pre = 0;
 
@@ -333,13 +333,6 @@ impl SmtpConnection {
 
         Err(error::response("incomplete response"))
     }
-
-    /// The X509 certificate of the server (DER encoded)
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        self.stream.get_ref().peer_certificate()
-    }
 }
 
 #[cfg(test)]
@@ -353,8 +346,8 @@ mod test {
     };
 
     use crate::transport::smtp::{
+        SmtpConnection,
         authentication::{Credentials, Mechanism},
-        client::SmtpConnection,
         extension::{ClientId, Extension},
     };
 

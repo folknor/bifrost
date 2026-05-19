@@ -8,7 +8,7 @@
 //! It implements the following extensions:
 //!
 //! * 8BITMIME ([RFC 6152](https://tools.ietf.org/html/rfc6152))
-//! * AUTH ([RFC 4954](https://tools.ietf.org/html/rfc4954)) with PLAIN, LOGIN and XOAUTH2 mechanisms
+//! * AUTH ([RFC 4954](https://tools.ietf.org/html/rfc4954)) with PLAIN, LOGIN, OAUTHBEARER and XOAUTH2 mechanisms
 //! * STARTTLS ([RFC 2487](https://tools.ietf.org/html/rfc2487))
 //!
 //! #### SMTP Transport
@@ -105,7 +105,7 @@
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
 //!     message::header::ContentType,
-//!     transport::smtp::client::{Certificate, Tls, TlsParameters},
+//!     transport::smtp::{Certificate, Tls, TlsParameters},
 //! };
 //!
 //! let email = Message::builder()
@@ -185,21 +185,22 @@
 
 use std::time::Duration;
 
-use client::Tls;
-
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 pub use self::async_transport::{AsyncSmtpTransport, AsyncSmtpTransportBuilder};
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+pub(crate) use self::client::AsyncSmtpConnection;
+pub(crate) use self::client::SmtpConnection;
+#[cfg(feature = "native-tls")]
+pub use self::client::{Certificate, Identity};
+pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 #[cfg(feature = "pool")]
 pub use self::pool::PoolConfig;
 pub use self::{
     error::{Error, ErrorKind},
     transport::{SmtpTransport, SmtpTransportBuilder},
 };
-#[cfg(feature = "native-tls")]
-use crate::transport::smtp::client::TlsParameters;
 use crate::transport::smtp::{
     authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism},
-    client::SmtpConnection,
     extension::ClientId,
     response::Response,
 };
@@ -207,7 +208,7 @@ use crate::transport::smtp::{
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 mod async_transport;
 pub mod authentication;
-pub mod client;
+mod client;
 pub mod commands;
 mod connection_url;
 pub(crate) mod error;
@@ -250,6 +251,8 @@ struct SmtpInfo {
     authentication_configured: bool,
     /// Credentials
     credentials: Option<Credentials>,
+    /// Allow AUTH over an unencrypted connection.
+    allow_insecure_auth: bool,
     /// Define network timeout
     /// It can be changed later for specific needs (like a different timeout for each SMTP command)
     timeout: Option<Duration>,
@@ -262,6 +265,7 @@ impl Default for SmtpInfo {
             port: SMTP_PORT,
             hello_name: ClientId::default(),
             credentials: None,
+            allow_insecure_auth: false,
             authentication: DEFAULT_MECHANISMS.into(),
             authentication_configured: false,
             timeout: Some(DEFAULT_TIMEOUT),
@@ -281,5 +285,15 @@ impl SmtpInfo {
     fn set_authentication(&mut self, mechanisms: Vec<Mechanism>) {
         self.authentication = mechanisms;
         self.authentication_configured = true;
+    }
+
+    fn ensure_can_authenticate(&self, encrypted: bool) -> Result<(), Error> {
+        if encrypted || self.allow_insecure_auth {
+            Ok(())
+        } else {
+            Err(error::policy(
+                "refusing to authenticate over an unencrypted SMTP connection",
+            ))
+        }
     }
 }

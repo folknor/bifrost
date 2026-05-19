@@ -11,12 +11,12 @@ use futures_util::{
 };
 
 use super::{
-    super::{Error, client::AsyncSmtpConnection},
+    super::{AsyncSmtpConnection, Error},
     PoolConfig,
 };
 use crate::{
     Executor,
-    executor::SpawnHandle,
+    executor::{SmtpExecutor, SpawnHandle},
     transport::smtp::{async_transport::AsyncSmtpClient, error},
 };
 
@@ -37,7 +37,9 @@ pub(crate) struct PooledConnection<E: Executor> {
     pool: Arc<Pool<E>>,
 }
 
-impl<E: Executor> Pool<E> {
+impl<E: SmtpExecutor> Pool<E> {
+    // Pool creation can dial replacement idle connections, so it needs the
+    // private SMTP executor extension. Recycling only spawns cleanup work.
     pub(crate) fn new(config: PoolConfig, client: AsyncSmtpClient<E>) -> Arc<Self> {
         let pool = Arc::new(Self {
             config,
@@ -196,7 +198,9 @@ impl<E: Executor> Pool<E> {
             }
         }
     }
+}
 
+impl<E: Executor> Pool<E> {
     async fn recycle(&self, mut conn: AsyncSmtpConnection) {
         if conn.has_broken() {
             #[cfg(feature = "tracing")]

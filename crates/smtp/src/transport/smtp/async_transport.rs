@@ -12,15 +12,14 @@ use super::PoolConfig;
 use super::Tls;
 #[cfg(feature = "pool")]
 use super::pool::async_impl::Pool;
-use super::{
-    ClientId, Credentials, Error, Mechanism, Response, SmtpInfo, client::AsyncSmtpConnection,
-};
+use super::{AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Response, SmtpInfo};
 #[cfg(feature = "async-std1")]
 use crate::AsyncStd1Executor;
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 use crate::AsyncTransport;
 #[cfg(feature = "tokio1")]
 use crate::Tokio1Executor;
+use crate::executor::SmtpExecutor;
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Envelope, Executor};
 
@@ -151,7 +150,11 @@ where
     /// Creates a new local SMTP client to port 25
     ///
     /// Shortcut for local unencrypted relay (typical local email daemon that will handle relaying)
-    pub fn unencrypted_localhost() -> AsyncSmtpTransport<E> {
+    #[allow(private_bounds)]
+    pub fn unencrypted_localhost() -> AsyncSmtpTransport<E>
+    where
+        E: SmtpExecutor,
+    {
         Self::builder_dangerous("localhost").build()
     }
 
@@ -197,7 +200,7 @@ where
     /// | `smtps` | unset                 | `smtps://user:pass@hostname:port`                  | 465          | SMTP over TLS, recommended method                                                                                                     |
     /// | `smtp`  | `required`            | `smtp://user:pass@hostname:port?tls=required`      | 587          | SMTP with STARTTLS required, when SMTP over TLS is not available                                                                      |
     /// | `smtp`  | `opportunistic`       | `smtp://user:pass@hostname:port?tls=opportunistic` | 587          | SMTP with optionally STARTTLS when supported by the server. Not suitable for production use: vulnerable to a man-in-the-middle attack |
-    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Not suitable for production use: sends all data unencrypted                                                  |
+    /// | `smtp`  | unset                 | `smtp://user:pass@hostname:port`                   | 587          | Always unencrypted SMTP. Credentials are refused by default; message data is still unencrypted                                        |
     ///
     /// IMPORTANT: some parameters like `user` and `pass` cannot simply
     /// be concatenated to construct the final URL because special characters
@@ -270,11 +273,29 @@ where
     /// # }
     /// ```
     ///
-    /// This helper is currently exposed only for the tokio native-tls path.
-    /// Plain async transports can still be configured with
-    /// [`AsyncSmtpTransport::builder_dangerous`].
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
+    /// TLS URL forms such as `smtps://` and `?tls=required` require the
+    /// `tokio1-native-tls` feature. Without `native-tls`, plaintext
+    /// `smtp://` URLs are accepted for both async runtimes. If a plaintext URL
+    /// contains credentials, authentication is refused at connection time
+    /// unless [`AsyncSmtpTransportBuilder::dangerous_allow_insecure_auth`] is
+    /// enabled.
+    #[cfg(any(
+        feature = "tokio1-native-tls",
+        all(
+            any(feature = "tokio1", feature = "async-std1"),
+            not(feature = "native-tls")
+        )
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(
+            feature = "tokio1-native-tls",
+            all(
+                any(feature = "tokio1", feature = "async-std1"),
+                not(feature = "native-tls")
+            )
+        )))
+    )]
     pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }
@@ -283,7 +304,11 @@ where
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
     /// The connection is closed afterward if a connection pool is not used.
-    pub async fn test_connection(&self) -> Result<bool, Error> {
+    #[allow(private_bounds)]
+    pub async fn test_connection(&self) -> Result<bool, Error>
+    where
+        E: SmtpExecutor,
+    {
         let mut conn = self.inner.connection().await?;
 
         let is_connected = conn.test_connected().await;
@@ -384,6 +409,16 @@ impl AsyncSmtpTransportBuilder {
         self
     }
 
+    /// Allow credentials to be sent over an unencrypted SMTP connection.
+    ///
+    /// By default, Bifrost SMTP refuses to send passwords or bearer tokens
+    /// unless the connection is already encrypted by TLS or has been upgraded
+    /// with STARTTLS. Set this only for trusted local relays or test servers.
+    pub fn dangerous_allow_insecure_auth(mut self, allow: bool) -> Self {
+        self.info.allow_insecure_auth = allow;
+        self
+    }
+
     /// Set the port to use
     ///
     /// # Warning
@@ -441,9 +476,10 @@ impl AsyncSmtpTransportBuilder {
     }
 
     /// Build the transport
+    #[allow(private_bounds)]
     pub fn build<E>(self) -> AsyncSmtpTransport<E>
     where
-        E: Executor,
+        E: SmtpExecutor,
     {
         let client = AsyncSmtpClient {
             info: self.info,
@@ -465,7 +501,7 @@ pub(super) struct AsyncSmtpClient<E> {
 
 impl<E> AsyncSmtpClient<E>
 where
-    E: Executor,
+    E: SmtpExecutor,
 {
     /// Creates a new connection directly usable to send emails
     ///
@@ -481,6 +517,7 @@ where
         .await?;
 
         if let Some(credentials) = &self.info.credentials {
+            self.info.ensure_can_authenticate(conn.is_encrypted())?;
             conn.auth(&self.info.authentication, credentials).await?;
         }
         Ok(conn)
@@ -506,5 +543,74 @@ where
             info: self.info.clone(),
             marker_: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "tokio1")]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        marker::PhantomData,
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use crate::{AsyncSmtpTransport, Tokio1Executor};
+
+    use super::AsyncSmtpClient;
+
+    #[test]
+    fn tokio_transport_from_plaintext_url() {
+        let builder =
+            AsyncSmtpTransport::<Tokio1Executor>::from_url("smtp://127.0.0.1:2525").unwrap();
+
+        assert_eq!(builder.info.port, 2525);
+        assert_eq!(builder.info.server, "127.0.0.1");
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn tokio_plaintext_auth_is_refused_before_auth_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
+                .unwrap();
+
+            let mut after_ehlo = String::new();
+            let read = reader.read_line(&mut after_ehlo).unwrap();
+            observed_tx.send((read, after_ehlo)).unwrap();
+        });
+
+        let builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+            .port(address.port())
+            .password("user", "pass");
+        let client = AsyncSmtpClient::<Tokio1Executor> {
+            info: builder.info,
+            marker_: PhantomData,
+        };
+        let Err(error) = client.connection().await else {
+            panic!("plaintext auth must be refused");
+        };
+
+        assert!(error.is_policy(), "expected policy error, got {error:?}");
+        let (read, after_ehlo) = observed_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(read, 0, "client must close instead of sending AUTH");
+        assert_eq!(after_ehlo, "");
+        handle.join().unwrap();
     }
 }

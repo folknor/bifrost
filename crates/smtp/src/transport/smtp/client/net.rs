@@ -6,8 +6,6 @@ use std::{
 
 #[cfg(feature = "native-tls")]
 use std::mem;
-#[cfg(feature = "native-tls")]
-use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[cfg(feature = "native-tls")]
 use native_tls::TlsStream;
@@ -19,7 +17,7 @@ use super::TlsParameters;
 use crate::transport::smtp::{Error, error};
 
 /// A network stream
-pub struct NetworkStream {
+pub(crate) struct NetworkStream {
     inner: InnerNetworkStream,
 }
 
@@ -48,25 +46,8 @@ impl NetworkStream {
         NetworkStream { inner }
     }
 
-    /// Returns peer's address
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        match &self.inner {
-            InnerNetworkStream::Tcp(s) => s.peer_addr(),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(s) => s.get_ref().peer_addr(),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(127, 0, 0, 1),
-                    80,
-                )))
-            }
-        }
-    }
-
     /// Shutdowns the connection
-    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+    pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match &self.inner {
             InnerNetworkStream::Tcp(s) => s.shutdown(how),
             #[cfg(feature = "native-tls")]
@@ -79,7 +60,7 @@ impl NetworkStream {
         }
     }
 
-    pub fn connect<T: ToSocketAddrs>(
+    pub(crate) fn connect<T: ToSocketAddrs>(
         server: T,
         timeout: Option<Duration>,
         tls_parameters: Option<&TlsParameters>,
@@ -134,14 +115,14 @@ impl NetworkStream {
     }
 
     #[cfg(not(feature = "native-tls"))]
-    pub fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
+    pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
         let _ = self;
         let _ = tls_parameters;
         unreachable!("Trying to upgrade a NetworkStream without having enabled native-tls");
     }
 
     #[cfg(feature = "native-tls")]
-    pub fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
+    pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
         match &self.inner {
             InnerNetworkStream::Tcp(_) => {
                 // get owned TcpStream
@@ -172,7 +153,7 @@ impl NetworkStream {
         })
     }
 
-    pub fn is_encrypted(&self) -> bool {
+    pub(crate) fn is_encrypted(&self) -> bool {
         match &self.inner {
             InnerNetworkStream::Tcp(_) => false,
             #[cfg(feature = "native-tls")]
@@ -185,22 +166,7 @@ impl NetworkStream {
         }
     }
 
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn peer_certificate(&self) -> Result<Vec<u8>, Error> {
-        match &self.inner {
-            InnerNetworkStream::Tcp(_) => Err(error::client("Connection is not encrypted")),
-            InnerNetworkStream::NativeTls(stream) => Ok(stream
-                .peer_certificate()
-                .map_err(error::tls)?
-                .unwrap()
-                .to_der()
-                .map_err(error::tls)?),
-            InnerNetworkStream::None => panic!("InnerNetworkStream::None must never be built"),
-        }
-    }
-
-    pub fn set_read_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn set_read_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(stream) => stream.set_read_timeout(duration),
             #[cfg(feature = "native-tls")]
@@ -214,7 +180,7 @@ impl NetworkStream {
     }
 
     /// Set write timeout for IO calls
-    pub fn set_write_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn set_write_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(stream) => stream.set_write_timeout(duration),
 

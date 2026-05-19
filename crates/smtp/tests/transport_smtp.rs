@@ -79,11 +79,11 @@ mod asyncstd_1 {
 mod read_response_caps {
     use std::{io::Write, net::TcpListener, thread, time::Duration};
 
-    use bifrost_smtp::transport::smtp::{client::AsyncSmtpConnection, extension::ClientId};
+    use bifrost_smtp::{AsyncSmtpTransport, Tokio1Executor};
     use tokio1_crate as tokio;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_line_is_bounded() {
+    async fn test_connection_returns_on_oversized_banner_line() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -96,13 +96,10 @@ mod read_response_caps {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            AsyncSmtpConnection::connect_tokio1(
-                addr,
-                None,
-                &ClientId::Domain("test".into()),
-                None,
-                None,
-            ),
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+                .port(addr.port())
+                .build::<Tokio1Executor>()
+                .test_connection(),
         )
         .await
         .expect("connect must return within 5s, not hang");
