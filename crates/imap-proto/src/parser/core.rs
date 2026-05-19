@@ -6,7 +6,7 @@ use nom::{
     character::streaming::{char, digit1, space0},
     combinator::{map, map_res, opt},
     multi::{separated_list0, separated_list1},
-    sequence::{delimited, preceded, tuple},
+    sequence::{delimited, preceded},
 };
 
 use std::borrow::Cow;
@@ -45,7 +45,7 @@ pub fn number_64(i: &[u8]) -> IResult<&[u8], u64> {
 //                    ; these two regardless of order.
 //                    ; seq-number is a nz-number
 pub fn sequence_range(i: &[u8]) -> IResult<&[u8], std::ops::RangeInclusive<u32>> {
-    map(tuple((number, tag(":"), number)), |(s, _, e)| s..=e).parse(i)
+    map((number, tag(":"), number), |(s, _, e)| s..=e).parse(i)
 }
 
 // sequence-set    = (seq-number / seq-range) *("," sequence-set)
@@ -129,7 +129,7 @@ pub fn is_quoted_specials(c: u8) -> bool {
 /// literal = "{" number "}" CRLF *CHAR8
 ///            ; Number represents the number of CHAR8s
 pub fn literal(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    let mut parser = tuple((tag("{"), number, tag("}"), tag("\r\n")));
+    let mut parser = (tag("{"), number, tag("}"), tag("\r\n"));
 
     let (remaining, (_, count, _, _)) = parser.parse(input)?;
 
@@ -255,7 +255,7 @@ where
         separated_list1(char(' '), f),
         // Targeted lenience: Some real-world IMAP servers
         // insert extra whitespace before the closing parenthesis.
-        tuple((space0, char(')'))),
+        (space0, char(')')),
     )
 }
 

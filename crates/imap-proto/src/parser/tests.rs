@@ -69,7 +69,7 @@ fn test_acl_attributes() {
                     mailbox: Cow::Borrowed("INBOX"),
                     acls: vec![],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -101,7 +101,7 @@ fn test_acl_attributes() {
                         ],
                     },],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -125,7 +125,7 @@ fn test_acl_attributes() {
                         ],
                     },],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -163,7 +163,7 @@ fn test_acl_attributes() {
                         },
                     ],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -195,7 +195,7 @@ fn test_acl_attributes() {
                         ],
                     },],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -227,7 +227,7 @@ fn test_acl_attributes() {
                         ],
                     },],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -255,7 +255,7 @@ fn test_list_rights_attributes() {
                     required: vec![],
                     optional: vec![],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -276,7 +276,7 @@ fn test_list_rights_attributes() {
                         AclRight::OldCreate,
                     ],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -292,7 +292,7 @@ fn test_list_rights_attributes() {
                     required: vec![AclRight::Lookup, AclRight::CreateMailbox, AclRight::Read],
                     optional: vec![AclRight::DeleteMailbox, AclRight::OldCreate],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -308,7 +308,7 @@ fn test_list_rights_attributes() {
                     required: vec![AclRight::Lookup, AclRight::CreateMailbox, AclRight::Read],
                     optional: vec![],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -324,7 +324,7 @@ fn test_list_rights_attributes() {
                     required: vec![AclRight::Lookup, AclRight::CreateMailbox, AclRight::Read],
                     optional: vec![AclRight::DeleteMailbox, AclRight::OldCreate],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -350,7 +350,7 @@ fn test_my_rights_attributes() {
                     mailbox: Cow::Borrowed("INBOX"),
                     rights: vec![AclRight::Lookup, AclRight::CreateMailbox, AclRight::Read],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -364,7 +364,7 @@ fn test_my_rights_attributes() {
                     mailbox: Cow::Borrowed("My Folder"),
                     rights: vec![AclRight::Lookup, AclRight::CreateMailbox, AclRight::Read],
                 }
-            )
+            );
         }
         rsp => panic!("unexpected response {rsp:?}"),
     }
@@ -869,9 +869,7 @@ fn test_vanished() {
 
 #[test]
 fn test_uidplus() {
-    match dbg!(parse_response(
-        b"* OK [APPENDUID 38505 3955] APPEND completed\r\n"
-    )) {
+    match parse_response(b"* OK [APPENDUID 38505 3955] APPEND completed\r\n") {
         Ok((
             _,
             Response::Data {
@@ -882,9 +880,7 @@ fn test_uidplus() {
         )) if uid_set == [3955.into()] => {}
         rsp => panic!("Unexpected response: {rsp:?}"),
     }
-    match dbg!(parse_response(
-        b"* OK [COPYUID 38505 304,319:320 3956:3958] Done\r\n"
-    )) {
+    match parse_response(b"* OK [COPYUID 38505 304,319:320 3956:3958] Done\r\n") {
         Ok((
             _,
             Response::Data {
@@ -896,9 +892,7 @@ fn test_uidplus() {
             && uid_set_dst == [(3956..=3958).into()] => {}
         rsp => panic!("Unexpected response: {rsp:?}"),
     }
-    match dbg!(parse_response(
-        b"* NO [UIDNOTSTICKY] Non-persistent UIDs\r\n"
-    )) {
+    match parse_response(b"* NO [UIDNOTSTICKY] Non-persistent UIDs\r\n") {
         Ok((
             _,
             Response::Data {

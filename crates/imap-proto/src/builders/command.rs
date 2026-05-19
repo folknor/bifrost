@@ -329,10 +329,9 @@ fn quoted_string(s: &str) -> Result<Cow<'_, str>, &'static str> {
         if start < bytes.len() {
             new.extend(&bytes[start..]);
         }
-        // Since the argument is a str, it must contain valid UTF-8. Since
-        // this function's transformation preserves the UTF-8 validity,
-        // unwrapping here should be okay.
-        Ok(Cow::Owned(String::from_utf8(new).unwrap()))
+        String::from_utf8(new)
+            .map(Cow::Owned)
+            .map_err(|_| "escaped quoted string was not valid UTF-8")
     }
 }
 

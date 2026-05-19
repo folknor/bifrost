@@ -10,7 +10,6 @@ use nom::{
     bytes::streaming::{tag, tag_no_case},
     combinator::map,
     multi::separated_list0,
-    sequence::tuple,
 };
 use std::borrow::Cow;
 
@@ -136,11 +135,11 @@ fn string_value(i: &[u8]) -> IResult<&[u8], Option<String>> {
 
 fn keyval_list(i: &[u8]) -> IResult<&[u8], Vec<Metadata>> {
     parenthesized_nonempty_list(map(
-        tuple((
+        (
             map(entry_name, slice_to_str),
             tag(" "),
             alt((nil_value, string_value)),
-        )),
+        ),
         |(key, _, value)| Metadata {
             entry: key.to_string(),
             value,
@@ -154,13 +153,13 @@ fn entry_list(i: &[u8]) -> IResult<&[u8], Vec<Cow<'_, str>>> {
 }
 
 fn metadata_common(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (i, (_, mbox, _)) = tuple((tag_no_case("METADATA "), quoted, tag(" "))).parse(i)?;
+    let (i, (_, mbox, _)) = (tag_no_case("METADATA "), quoted, tag(" ")).parse(i)?;
     Ok((i, mbox))
 }
 
 // [RFC5464 - 4.4.1 METADATA Response with values]
 pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (i, (mailbox, values)) = tuple((metadata_common, keyval_list)).parse(i)?;
+    let (i, (mailbox, values)) = (metadata_common, keyval_list).parse(i)?;
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataSolicited {
@@ -172,7 +171,7 @@ pub(crate) fn metadata_solicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 
 // [RFC5464 - 4.4.2 Unsolicited METADATA Response without values]
 pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (i, (mailbox, values)) = tuple((metadata_common, entry_list)).parse(i)?;
+    let (i, (mailbox, values)) = (metadata_common, entry_list).parse(i)?;
     Ok((
         i,
         Response::MailboxData(MailboxDatum::MetadataUnsolicited {
@@ -187,7 +186,7 @@ pub(crate) fn metadata_unsolicited(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 // [RFC5464 - 4.2.1 MAXSIZE GETMETADATA Command Option](https://tools.ietf.org/html/rfc5464#section-4.2.1)
 // [RFC5464 - 5. Formal Syntax - resp-text-code](https://tools.ietf.org/html/rfc5464#section-5)
 pub(crate) fn resp_text_code_metadata_long_entries(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
-    let (i, (_, num)) = tuple((tag_no_case("METADATA LONGENTRIES "), number_64)).parse(i)?;
+    let (i, (_, num)) = (tag_no_case("METADATA LONGENTRIES "), number_64).parse(i)?;
     Ok((i, ResponseCode::MetadataLongEntries(num)))
 }
 
@@ -196,7 +195,7 @@ pub(crate) fn resp_text_code_metadata_long_entries(i: &[u8]) -> IResult<&[u8], R
 // [RFC5464 - 4.3 SETMETADATA Command](https://tools.ietf.org/html/rfc5464#section-4.3)
 // [RFC5464 - 5. Formal Syntax - resp-text-code](https://tools.ietf.org/html/rfc5464#section-5)
 pub(crate) fn resp_text_code_metadata_max_size(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
-    let (i, (_, num)) = tuple((tag_no_case("METADATA MAXSIZE "), number_64)).parse(i)?;
+    let (i, (_, num)) = (tag_no_case("METADATA MAXSIZE "), number_64).parse(i)?;
     Ok((i, ResponseCode::MetadataMaxSize(num)))
 }
 

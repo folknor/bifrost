@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 pub mod builders;
 pub mod parser;
 pub mod types;

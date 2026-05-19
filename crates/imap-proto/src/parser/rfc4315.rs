@@ -10,7 +10,7 @@ use nom::{
     bytes::streaming::{tag, tag_no_case},
     combinator::map,
     multi::separated_list1,
-    sequence::{preceded, tuple},
+    sequence::preceded,
 };
 
 use crate::parser::core::number;
@@ -29,10 +29,7 @@ use crate::types::*;
 /// [RFC4315 - 3 Additional Response Codes](https://tools.ietf.org/html/rfc4315#section-3)
 pub(crate) fn resp_text_code_append_uid(i: &[u8]) -> IResult<&[u8], ResponseCode<'_>> {
     map(
-        preceded(
-            tag_no_case("APPENDUID "),
-            tuple((number, tag(" "), uid_set)),
-        ),
+        preceded(tag_no_case("APPENDUID "), (number, tag(" "), uid_set)),
         |(fst, _, snd)| ResponseCode::AppendUid(fst, snd),
     )
     .parse(i)
@@ -50,7 +47,7 @@ pub(crate) fn resp_text_code_copy_uid(i: &[u8]) -> IResult<&[u8], ResponseCode<'
     map(
         preceded(
             tag_no_case("COPYUID "),
-            tuple((number, tag(" "), uid_set, tag(" "), uid_set)),
+            (number, tag(" "), uid_set, tag(" "), uid_set),
         ),
         |(fst, _, snd, _, trd)| ResponseCode::CopyUid(fst, snd, trd),
     )

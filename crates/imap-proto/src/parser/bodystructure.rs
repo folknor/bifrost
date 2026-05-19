@@ -60,7 +60,8 @@ impl<'a> BodyStructParser<'a> {
                 self.map.insert(vec, node);
 
                 for (i, n) in bodies.iter().enumerate() {
-                    self.iter += i as u32;
+                    let index = u32::try_from(i).expect("body part index exceeds u32");
+                    self.iter += index;
                     self.prefix.push(self.iter);
                     self.parse(n);
                     self.prefix.pop();

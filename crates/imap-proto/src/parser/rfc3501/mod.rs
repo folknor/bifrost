@@ -14,7 +14,7 @@ use nom::{
     character::streaming::char,
     combinator::{map, map_res, opt, recognize, value},
     multi::{many0, many1},
-    sequence::{delimited, pair, preceded, terminated, tuple},
+    sequence::{delimited, pair, preceded, terminated},
 };
 
 use crate::{
@@ -306,13 +306,13 @@ fn mailbox_list(
     i: &[u8],
 ) -> IResult<&[u8], (Vec<NameAttribute<'_>>, Option<Cow<'_, str>>, Cow<'_, str>)> {
     map(
-        tuple((
+        (
             parenthesized_list(name_attribute),
             tag(" "),
             alt((map(quoted_utf8, Some), map(nil, |_| None))),
             tag(" "),
             mailbox,
-        )),
+        ),
         |(name_attributes, _, delimiter, _, name)| (name_attributes, delimiter, name),
     )
     .parse(i)
@@ -378,7 +378,7 @@ fn status_att_list(i: &[u8]) -> IResult<&[u8], Vec<StatusAttribute>> {
 
 fn mailbox_data_status(i: &[u8]) -> IResult<&[u8], MailboxDatum<'_>> {
     map(
-        tuple((tag_no_case("STATUS "), mailbox, tag(" "), status_att_list)),
+        (tag_no_case("STATUS "), mailbox, tag(" "), status_att_list),
         |(_, mailbox, _, status)| MailboxDatum::Status { mailbox, status },
     )
     .parse(i)
@@ -413,7 +413,7 @@ fn mailbox_data(i: &[u8]) -> IResult<&[u8], MailboxDatum<'_>> {
 // electronic mail address.
 fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
     paren_delimited(map(
-        tuple((
+        (
             nstring,
             tag(" "),
             nstring,
@@ -421,7 +421,7 @@ fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
             nstring,
             tag(" "),
             nstring,
-        )),
+        ),
         |(name, _, adl, _, mailbox, _, host)| Address {
             name: name.map(Cow::Borrowed),
             adl: adl.map(Cow::Borrowed),
@@ -468,7 +468,7 @@ fn opt_addresses(i: &[u8]) -> IResult<&[u8], Option<Vec<Address<'_>>>> {
 // env-to          = "(" 1*address ")" / nil
 pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
     paren_delimited(map(
-        tuple((
+        (
             nstring,
             tag(" "),
             nstring,
@@ -488,7 +488,7 @@ pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
             nstring,
             tag(" "),
             nstring,
-        )),
+        ),
         |(
             date,
             _,
@@ -558,7 +558,7 @@ fn msg_att_rfc822(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
 fn msg_att_rfc822_header(i: &[u8]) -> IResult<&[u8], AttributeValue<'_>> {
     // extra space workaround for DavMail
     map(
-        tuple((tag_no_case("RFC822.HEADER "), opt(tag(" ")), nstring)),
+        (tag_no_case("RFC822.HEADER "), opt(tag(" ")), nstring),
         |(_, _, raw)| AttributeValue::Rfc822Header(raw.map(Cow::Borrowed)),
     )
     .parse(i)
@@ -701,7 +701,7 @@ fn msg_att_list(i: &[u8]) -> IResult<&[u8], Vec<AttributeValue<'_>>> {
 // message-data    = nz-number SP ("EXPUNGE" / ("FETCH" SP msg-att))
 fn message_data_fetch(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     map(
-        tuple((number, tag_no_case(" FETCH "), msg_att_list)),
+        (number, tag_no_case(" FETCH "), msg_att_list),
         |(num, _, attrs)| Response::Fetch(num, attrs),
     )
     .parse(i)
@@ -726,7 +726,7 @@ fn imap_tag(i: &[u8]) -> IResult<&[u8], RequestId> {
 // examples of `resp-text` that do not include the trailing space and text.
 #[allow(clippy::type_complexity)]
 fn resp_text(i: &[u8]) -> IResult<&[u8], (Option<ResponseCode<'_>>, Option<Cow<'_, str>>)> {
-    map(tuple((opt(resp_text_code), text)), |(code, text)| {
+    map((opt(resp_text_code), text), |(code, text)| {
         let res = if text.is_empty() {
             None
         } else if code.is_some() {
@@ -747,7 +747,7 @@ fn resp_text(i: &[u8]) -> IResult<&[u8], (Option<ResponseCode<'_>>, Option<Cow<'
 fn trailing_resp_text(
     i: &[u8],
 ) -> IResult<&[u8], (Option<ResponseCode<'_>>, Option<Cow<'_, str>>)> {
-    map(opt(tuple((tag(" "), resp_text))), |resptext| {
+    map(opt((tag(" "), resp_text)), |resptext| {
         resptext.map(|(_, tuple)| tuple).unwrap_or((None, None))
     })
     .parse(i)
@@ -758,7 +758,7 @@ pub(crate) fn continue_req(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     // Some servers do not send the space :/
     // TODO: base64
     map(
-        tuple((tag("+"), opt(tag(" ")), resp_text, tag("\r\n"))),
+        (tag("+"), opt(tag(" ")), resp_text, tag("\r\n")),
         |(_, _, text, _)| Response::Continue {
             code: text.0,
             information: text.1,
@@ -773,7 +773,7 @@ pub(crate) fn continue_req(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 //                     ; Status condition
 pub(crate) fn response_tagged(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     map(
-        tuple((imap_tag, tag(" "), status, trailing_resp_text, tag("\r\n"))),
+        (imap_tag, tag(" "), status, trailing_resp_text, tag("\r\n")),
         |(tag, _, status, text, _)| Response::Done {
             tag,
             status,
@@ -792,7 +792,7 @@ pub(crate) fn response_tagged(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 // resp-cond-state = ("OK" / "NO" / "BAD") SP resp-text
 //                     ; Status condition
 fn resp_cond(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    map(tuple((status, trailing_resp_text)), |(status, text)| {
+    map((status, trailing_resp_text), |(status, text)| {
         Response::Data {
             status,
             code: text.0,
@@ -896,7 +896,7 @@ mod tests {
         assert_matches!(
             super::capability_data(b"CAPABILITY IMAP4rev1\r\n"),
             Ok((_, capabilities)) => {
-                assert_eq!(capabilities, vec![Capability::Imap4rev1])
+                assert_eq!(capabilities, vec![Capability::Imap4rev1]);
             }
         );
 
@@ -908,7 +908,7 @@ mod tests {
                     Capability::Imap4rev1,
                     Capability::Atom(Cow::Borrowed("STARTTLS")),
                     Capability::Auth(Cow::Borrowed("GSSAPI")),
-                ])
+                ]);
             }
         );
 
@@ -919,7 +919,7 @@ mod tests {
                     Capability::Imap4rev1,
                     Capability::Auth(Cow::Borrowed("GSSAPI")),
                     Capability::Auth(Cow::Borrowed("PLAIN")),
-                ])
+                ]);
             }
         );
 
@@ -943,7 +943,7 @@ mod tests {
                         "\\Draft",
                         "\\Seen",
                         "$Forwarded"
-                    ])
+                    ]);
             }
         );
     }

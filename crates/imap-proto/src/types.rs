@@ -255,7 +255,7 @@ impl<'a> MailboxDatum<'a> {
             } => MailboxDatum::List {
                 name_attributes: name_attributes
                     .into_iter()
-                    .map(|named_attribute| named_attribute.into_owned())
+                    .map(NameAttribute::into_owned)
                     .collect(),
                 delimiter: delimiter.map(to_owned_cow),
                 name: to_owned_cow(name),
@@ -454,7 +454,7 @@ impl<'a> BodyStructure<'a> {
             } => BodyStructure::Basic {
                 common: common.into_owned(),
                 other: other.into_owned(),
-                extension: extension.map(|v| v.into_owned()),
+                extension: extension.map(BodyExtension::into_owned),
             },
             BodyStructure::Text {
                 common,
@@ -465,7 +465,7 @@ impl<'a> BodyStructure<'a> {
                 common: common.into_owned(),
                 other: other.into_owned(),
                 lines,
-                extension: extension.map(|v| v.into_owned()),
+                extension: extension.map(BodyExtension::into_owned),
             },
             BodyStructure::Message {
                 common,
@@ -480,7 +480,7 @@ impl<'a> BodyStructure<'a> {
                 envelope: envelope.into_owned(),
                 body: Box::new(body.into_owned()),
                 lines,
-                extension: extension.map(|v| v.into_owned()),
+                extension: extension.map(BodyExtension::into_owned),
             },
             BodyStructure::Multipart {
                 common,
@@ -488,8 +488,8 @@ impl<'a> BodyStructure<'a> {
                 extension,
             } => BodyStructure::Multipart {
                 common: common.into_owned(),
-                bodies: bodies.into_iter().map(|v| v.into_owned()).collect(),
-                extension: extension.map(|v| v.into_owned()),
+                bodies: bodies.into_iter().map(BodyStructure::into_owned).collect(),
+                extension: extension.map(BodyExtension::into_owned),
             },
         }
     }
@@ -507,7 +507,7 @@ impl<'a> BodyContentCommon<'a> {
     pub fn into_owned(self) -> BodyContentCommon<'static> {
         BodyContentCommon {
             ty: self.ty.into_owned(),
-            disposition: self.disposition.map(|v| v.into_owned()),
+            disposition: self.disposition.map(ContentDisposition::into_owned),
             language: self
                 .language
                 .map(|v| v.into_iter().map(to_owned_cow).collect()),
@@ -605,7 +605,7 @@ impl<'a> BodyExtension<'a> {
             BodyExtension::Num(v) => BodyExtension::Num(v),
             BodyExtension::Str(v) => BodyExtension::Str(v.map(to_owned_cow)),
             BodyExtension::List(v) => {
-                BodyExtension::List(v.into_iter().map(|v| v.into_owned()).collect())
+                BodyExtension::List(v.into_iter().map(BodyExtension::into_owned).collect())
             }
         }
     }
@@ -648,22 +648,22 @@ impl<'a> Envelope<'a> {
             subject: self.subject.map(to_owned_cow),
             from: self
                 .from
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             sender: self
                 .sender
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             reply_to: self
                 .reply_to
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             to: self
                 .to
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             cc: self
                 .cc
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             bcc: self
                 .bcc
-                .map(|v| v.into_iter().map(|v| v.into_owned()).collect()),
+                .map(|v| v.into_iter().map(Address::into_owned).collect()),
             in_reply_to: self.in_reply_to.map(to_owned_cow),
             message_id: self.message_id.map(to_owned_cow),
         }
@@ -740,12 +740,12 @@ impl<'a> BodyExt1Part<'a> {
     pub fn into_owned(self) -> BodyExt1Part<'static> {
         BodyExt1Part {
             md5: self.md5.map(to_owned_cow),
-            disposition: self.disposition.map(|v| v.into_owned()),
+            disposition: self.disposition.map(ContentDisposition::into_owned),
             language: self
                 .language
                 .map(|v| v.into_iter().map(to_owned_cow).collect()),
             location: self.location.map(to_owned_cow),
-            extension: self.extension.map(|v| v.into_owned()),
+            extension: self.extension.map(BodyExtension::into_owned),
         }
     }
 }
@@ -762,12 +762,12 @@ impl<'a> BodyExtMPart<'a> {
     pub fn into_owned(self) -> BodyExtMPart<'static> {
         BodyExtMPart {
             param: body_param_owned(self.param),
-            disposition: self.disposition.map(|v| v.into_owned()),
+            disposition: self.disposition.map(ContentDisposition::into_owned),
             language: self
                 .language
                 .map(|v| v.into_iter().map(to_owned_cow).collect()),
             location: self.location.map(to_owned_cow),
-            extension: self.extension.map(|v| v.into_owned()),
+            extension: self.extension.map(BodyExtension::into_owned),
         }
     }
 }
@@ -938,7 +938,11 @@ impl<'a> Quota<'a> {
     pub fn into_owned(self) -> Quota<'static> {
         Quota {
             root_name: to_owned_cow(self.root_name),
-            resources: self.resources.into_iter().map(|r| r.into_owned()).collect(),
+            resources: self
+                .resources
+                .into_iter()
+                .map(QuotaResource::into_owned)
+                .collect(),
         }
     }
 }

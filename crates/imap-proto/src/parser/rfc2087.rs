@@ -12,7 +12,7 @@ use nom::{
     combinator::map,
     multi::many0,
     multi::separated_list0,
-    sequence::{delimited, preceded, tuple},
+    sequence::{delimited, preceded},
 };
 
 use crate::parser::core::astring_utf8;
@@ -25,14 +25,14 @@ use super::core::number_64;
 /// quota_response  ::= "QUOTA" SP astring SP quota_list
 /// ```
 pub(crate) fn quota(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (rest, (_, _, root_name, _, resources)) = tuple((
+    let (rest, (_, _, root_name, _, resources)) = (
         tag_no_case("QUOTA"),
         space1,
         astring_utf8,
         space1,
         quota_list,
-    ))
-    .parse(i)?;
+    )
+        .parse(i)?;
 
     Ok((
         rest,
@@ -55,7 +55,7 @@ pub(crate) fn quota_list(i: &[u8]) -> IResult<&[u8], Vec<QuotaResource<'_>>> {
 /// ```
 pub(crate) fn quota_resource(i: &[u8]) -> IResult<&[u8], QuotaResource<'_>> {
     let (rest, (name, _, usage, _, limit)) =
-        tuple((quota_resource_name, space1, number_64, space1, number_64)).parse(i)?;
+        (quota_resource_name, space1, number_64, space1, number_64).parse(i)?;
 
     Ok((rest, QuotaResource { name, usage, limit }))
 }
@@ -74,13 +74,13 @@ pub(crate) fn quota_resource_name(i: &[u8]) -> IResult<&[u8], QuotaResourceName<
 /// quotaroot_response ::= "QUOTAROOT" SP astring *(SP astring)
 /// ```
 pub(crate) fn quota_root(i: &[u8]) -> IResult<&[u8], Response<'_>> {
-    let (rest, (_, _, mailbox_name, quota_root_names)) = tuple((
+    let (rest, (_, _, mailbox_name, quota_root_names)) = (
         tag_no_case("QUOTAROOT"),
         space1,
         astring_utf8,
         many0(preceded(space1, astring_utf8)),
-    ))
-    .parse(i)?;
+    )
+        .parse(i)?;
 
     Ok((
         rest,

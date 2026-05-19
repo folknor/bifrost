@@ -14,7 +14,7 @@ use nom::{
     character::complete::{char, space0, space1},
     combinator::map,
     multi::many0,
-    sequence::{preceded, separated_pair, tuple},
+    sequence::{preceded, separated_pair},
 };
 
 use crate::{
@@ -35,22 +35,21 @@ fn id_param(i: &[u8]) -> IResult<&[u8], (Cow<'_, str>, Option<Cow<'_, str>>)> {
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
 fn id_param_list_not_nil(i: &[u8]) -> IResult<&[u8], HashMap<Cow<'_, str>, Cow<'_, str>>> {
     map(
-        tuple((
+        (
             char('('),
             id_param,
-            many0(tuple((space1, id_param))),
+            many0((space1, id_param)),
             preceded(space0, char(')')),
-        )),
+        ),
         |(_, first_param, rest_params, _)| {
             let mut params = vec![first_param];
             for (_, p) in rest_params {
-                params.push(p)
+                params.push(p);
             }
 
             params
                 .into_iter()
-                .filter(|(_k, v)| v.is_some())
-                .map(|(k, v)| (k, v.unwrap()))
+                .filter_map(|(k, v)| v.map(|v| (k, v)))
                 .collect()
         },
     )
@@ -69,7 +68,7 @@ fn id_param_list(i: &[u8]) -> IResult<&[u8], Option<HashMap<Cow<'_, str>, Cow<'_
 // [RFC2971 - Formal Syntax](https://tools.ietf.org/html/rfc2971#section-4)
 pub(crate) fn resp_id(i: &[u8]) -> IResult<&[u8], Response<'_>> {
     let (rest, map) = map(
-        tuple((tag_no_case("ID"), space1, id_param_list)),
+        (tag_no_case("ID"), space1, id_param_list),
         |(_id, _sp, p)| p,
     )
     .parse(i)?;

@@ -5,12 +5,8 @@
 //!
 
 use nom::{
-    IResult, Parser,
-    bytes::streaming::tag_no_case,
-    character::streaming::char,
-    combinator::map,
-    multi::many0,
-    sequence::{preceded, tuple},
+    IResult, Parser, bytes::streaming::tag_no_case, character::streaming::char, combinator::map,
+    multi::many0, sequence::preceded,
 };
 use std::borrow::Cow;
 
@@ -25,11 +21,11 @@ pub(crate) fn resp_enabled(i: &[u8]) -> IResult<&[u8], Response<'_>> {
 }
 
 fn enabled_data(i: &[u8]) -> IResult<&[u8], Vec<Capability<'_>>> {
-    let (i, (_, capabilities)) = tuple((
+    let (i, (_, capabilities)) = (
         tag_no_case("ENABLED"),
         many0(preceded(char(' '), capability)),
-    ))
-    .parse(i)?;
+    )
+        .parse(i)?;
     Ok((i, capabilities))
 }
 
