@@ -8,7 +8,7 @@ use imap_proto::{self, RequestId, Response};
 use crate::types::*;
 use crate::{
     error::Result,
-    parse::{filter, handle_unilateral},
+    parse::{handle_unilateral, next_command_response},
 };
 use crate::{
     error::{Error, ParseError},
@@ -21,11 +21,7 @@ pub(crate) async fn parse_get_quota<T: Stream<Item = io::Result<ResponseData>> +
     command_tag: RequestId,
 ) -> Result<Quota> {
     let mut quota = None;
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = next_command_response(stream, &command_tag).await? {
         match resp.parsed() {
             Response::Quota(q) => quota = Some(q.clone().into()),
             _ => {
@@ -50,11 +46,7 @@ pub(crate) async fn parse_get_quota_root<T: Stream<Item = io::Result<ResponseDat
     let mut roots: Vec<QuotaRoot> = Vec::new();
     let mut quotas: Vec<Quota> = Vec::new();
 
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = next_command_response(stream, &command_tag).await? {
         match resp.parsed() {
             Response::QuotaRoot(qr) => {
                 roots.push(qr.clone().into());

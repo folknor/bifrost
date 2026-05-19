@@ -149,6 +149,19 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         conn.into_inner()
     }
 
+    /// Request server capabilities before authentication.
+    ///
+    /// `CAPABILITY` is valid in IMAP's non-authenticated state. This is the
+    /// entry point to inspect advertised SASL mechanisms before choosing
+    /// between [`Client::authenticate`] and [`Client::login`].
+    pub async fn capabilities(&mut self) -> Result<Capabilities> {
+        let id = self.conn.run_command("CAPABILITY").await?;
+        // There is no authenticated session yet, so unilateral responses are
+        // intentionally discarded after parsing.
+        let (unsolicited, _rx) = bounded(100);
+        parse_capabilities(&mut self.conn.stream, unsolicited, id).await
+    }
+
     /// Log in to the IMAP server. Upon success a [`Session`](struct.Session.html) instance is
     /// returned; on error the original `Client` instance is returned in addition to the error.
     /// This is because `login` takes ownership of `self`, so in order to try again (e.g. after
@@ -1564,6 +1577,28 @@ mod tests {
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
     #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn capabilities_before_login() {
+        let response = b"* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2 LOGINDISABLED\r\n\
+                         A0001 OK CAPABILITY completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut client = mock_client!(mock_stream);
+
+        let capabilities = client.capabilities().await.unwrap();
+
+        assert_eq!(
+            client.stream.inner.written_buf,
+            b"A0001 CAPABILITY\r\n".to_vec(),
+            "Invalid capability command"
+        );
+        assert!(capabilities.contains("IMAP4rev1"));
+        assert!(capabilities.contains("logindisabled"));
+        assert!(capabilities.supports_sasl("plain"));
+        assert!(capabilities.supports_sasl("XOAUTH2"));
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn authenticate() {
         let response = b"+ YmFy\r\n\
                          A0001 OK Logged in\r\n"
@@ -1886,8 +1921,9 @@ mod tests {
         );
         assert_eq!(capabilities.len(), 4);
         for e in expected_capabilities {
-            assert!(capabilities.has_str(e));
+            assert!(capabilities.contains(e));
         }
+        assert!(capabilities.supports_sasl("gssapi"));
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]

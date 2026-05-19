@@ -10,7 +10,7 @@ use crate::types::ResponseData;
 use crate::types::*;
 use crate::{
     error::Result,
-    parse::{filter, handle_unilateral},
+    parse::{handle_unilateral, next_command_response},
 };
 
 fn escape(s: &str) -> String {
@@ -41,11 +41,7 @@ pub(crate) async fn parse_id<T: Stream<Item = io::Result<ResponseData>> + Unpin>
     command_tag: RequestId,
 ) -> Result<Option<HashMap<String, String>>> {
     let mut id = None;
-    while let Some(resp) = stream
-        .take_while(|res| filter(res, &command_tag))
-        .try_next()
-        .await?
-    {
+    while let Some(resp) = next_command_response(stream, &command_tag).await? {
         match resp.parsed() {
             Response::Id(res) => {
                 id = res.as_ref().map(|m| {
