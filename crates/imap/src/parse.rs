@@ -593,6 +593,8 @@ mod tests {
             "* 24 FETCH (FLAGS (\\Seen) UID 4827943)\r\n",
             "* 25 FETCH (FLAGS (\\Seen))\r\n",
             "* 26 FETCH (X-GM-THRID 1278455344230334865)\r\n",
+            "* 27 FETCH (FLAGS ())\r\n",
+            "* 28 FETCH (UID 99)\r\n",
             "a OK FETCH completed\r\n",
         ]);
         let mut stream = async_std::stream::from_iter(responses);
@@ -604,9 +606,19 @@ mod tests {
             .unwrap();
         assert!(recv.is_empty());
 
-        assert_eq!(fetches.len(), 3);
+        assert_eq!(fetches.len(), 5);
         assert_eq!(fetches[0].message, 24);
         assert_eq!(fetches[0].flags().collect::<Vec<_>>(), vec![Flag::Seen]);
+        let populated_flags = fetches[0].flags_attribute().unwrap();
+        assert_eq!(populated_flags.iter().collect::<Vec<_>>(), vec![Flag::Seen]);
+        assert_eq!(
+            (&populated_flags).into_iter().collect::<Vec<_>>(),
+            vec![Flag::Seen]
+        );
+        assert_eq!(
+            populated_flags.into_iter().collect::<Vec<_>>(),
+            vec![Flag::Seen]
+        );
         assert_eq!(fetches[0].uid, Some(4827943));
         assert_eq!(fetches[0].body(), None);
         assert_eq!(fetches[0].header(), None);
@@ -617,6 +629,15 @@ mod tests {
         assert_eq!(fetches[1].header(), None);
         assert_eq!(fetches[2].message, 26);
         assert_eq!(fetches[2].gmail_thr_id(), Some(&1278455344230334865));
+        assert!(fetches[2].flags_attribute().is_none());
+        assert_eq!(fetches[3].message, 27);
+        let empty_flags = fetches[3].flags_attribute().unwrap();
+        assert!(empty_flags.is_empty());
+        assert_eq!(empty_flags.len(), 0);
+        assert!(fetches[3].flags().next().is_none());
+        assert_eq!(fetches[4].message, 28);
+        assert!(fetches[4].flags_attribute().is_none());
+        assert!(fetches[4].flags().next().is_none());
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]

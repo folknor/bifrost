@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, iter::FusedIterator, slice};
 
 use chrono::{DateTime, FixedOffset};
 use imap_proto::types::{
@@ -38,6 +38,76 @@ pub struct Fetch {
     pub modseq: Option<u64>,
 }
 
+/// A `FLAGS` attribute returned in a `FETCH` response.
+///
+/// This distinguishes `FLAGS ()` from a `FETCH` response that did not include a
+/// `FLAGS` attribute at all.
+///
+/// `Flags` borrows from the underlying [`Fetch`] and cannot outlive it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Flags<'a> {
+    raw: &'a [Cow<'a, str>],
+}
+
+/// Iterator over a [`Flags`] attribute.
+#[derive(Clone, Debug)]
+pub struct FlagsIter<'a> {
+    raw: slice::Iter<'a, Cow<'a, str>>,
+}
+
+impl<'a> Iterator for FlagsIter<'a> {
+    type Item = Flag<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next().map(|s| Flag::from(s.as_ref()))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.raw.size_hint()
+    }
+}
+
+impl ExactSizeIterator for FlagsIter<'_> {}
+
+impl FusedIterator for FlagsIter<'_> {}
+
+impl<'a> Flags<'a> {
+    /// Iterate over the flags in this `FLAGS` attribute.
+    pub fn iter(&self) -> FlagsIter<'a> {
+        FlagsIter {
+            raw: self.raw.iter(),
+        }
+    }
+
+    /// Returns how many flags are present in this `FLAGS` attribute.
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Returns true if this is an empty `FLAGS ()` attribute.
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for Flags<'a> {
+    type IntoIter = FlagsIter<'a>;
+    type Item = Flag<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &Flags<'a> {
+    type IntoIter = FlagsIter<'a>;
+    type Item = Flag<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 impl Fetch {
     pub(crate) fn new(response: ResponseData) -> Self {
         let (message, uid, size, modseq) =
@@ -68,21 +138,32 @@ impl Fetch {
         }
     }
 
-    /// A list of flags that are set for this message.
-    pub fn flags(&self) -> impl Iterator<Item = Flag<'_>> {
+    fn raw_flags(&self) -> Option<&[Cow<'_, str>]> {
         if let Response::Fetch(_, attrs) = self.response.parsed() {
-            attrs
-                .iter()
-                .filter_map(|attr| match attr {
-                    AttributeValue::Flags(raw_flags) => {
-                        Some(raw_flags.iter().map(|s| Flag::from(s.as_ref())))
-                    }
-                    _ => None,
-                })
-                .flatten()
+            attrs.iter().find_map(|attr| match attr {
+                AttributeValue::Flags(raw_flags) => Some(raw_flags.as_slice()),
+                _ => None,
+            })
         } else {
             unreachable!()
         }
+    }
+
+    /// A list of flags that are set for this message.
+    ///
+    /// This returns an empty iterator both when the server returned `FLAGS ()`
+    /// and when the `FETCH` response did not include a `FLAGS` attribute. Use
+    /// [`Fetch::flags_attribute`] when that distinction matters.
+    pub fn flags(&self) -> impl Iterator<Item = Flag<'_>> {
+        self.raw_flags()
+            .into_iter()
+            .flatten()
+            .map(|s| Flag::from(s.as_ref()))
+    }
+
+    /// The `FLAGS` attribute in this `FETCH` response, if one was returned.
+    pub fn flags_attribute(&self) -> Option<Flags<'_>> {
+        self.raw_flags().map(|raw| Flags { raw })
     }
 
     /// The bytes that make up the header of this message, if `BODY[HEADER]`, `BODY.PEEK[HEADER]`,

@@ -30,6 +30,11 @@ Last scan: 2026-05-19 with `gh api`.
   `LIST`, `SEARCH`, `ID`, `GETQUOTA`, `GETQUOTAROOT`, `GETMETADATA`, and
   `NOOP` style parsers. Tagged `NO` or `BAD` now reaches callers instead of
   being hidden by the old `take_while` stop condition.
+- Added `Fetch::flags_attribute()` with a typed `Flags` view so callers can
+  distinguish `FLAGS ()` from a `FETCH` response with no `FLAGS` attribute.
+- Added explicit recursion limits to vendored `imap-proto` BODYSTRUCTURE and
+  body-extension parsing so hostile nested input fails as a parser error instead
+  of exhausting the Rust stack.
 
 ## Already covered by the vendored import
 
@@ -58,9 +63,8 @@ P1: FETCH flags presence ambiguity
 - Source: `chatmail/async-imap` #98.
 - Problem: `Fetch::flags()` returns an empty iterator for both `FLAGS ()` and a
   FETCH response with no `FLAGS` attribute.
-- Likely approach: keep `flags()` for compatibility and add a presence-aware
-  accessor, probably `flags_opt()` or `flags_present()`, returning `Option<impl
-  Iterator<Item = Flag<'_>>>` or a small wrapper. Need to avoid awkward lifetimes.
+- Status: fixed locally with `Fetch::flags_attribute() -> Option<Flags<'_>>`.
+  Existing `Fetch::flags()` remains as a convenience iterator.
 
 P0: SASL capability API
 
@@ -75,9 +79,8 @@ P2: parser hardening for recursion
 
 - Source: `djc/tokio-imap` #90.
 - Problem: recursive body parsing can stack overflow on hostile or fuzzed input.
-- Likely approach: introduce explicit recursion depth limits around recursive
-  body/body-extension parsing. This should be a bounded parser behavior change
-  with tests.
+- Status: fixed locally with explicit limits around recursive BODYSTRUCTURE body
+  nesting and body-extension list nesting.
 
 P2: mailbox/parser edge cases
 

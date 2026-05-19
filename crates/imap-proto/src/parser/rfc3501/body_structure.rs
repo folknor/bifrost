@@ -14,6 +14,15 @@ use crate::{
     types::*,
 };
 
+const BODY_RECURSION_LIMIT: usize = 64;
+const BODY_EXTENSION_RECURSION_LIMIT: usize = 64;
+
+fn recursion_limit_error(i: &[u8]) -> nom::Err<nom::error::Error<&[u8]>> {
+    // nom has no dedicated depth-limit error. Verify is the closest
+    // recoverable parser error for input refused by parser policy.
+    nom::Err::Error(nom::error::make_error(i, nom::error::ErrorKind::Verify))
+}
+
 // body-fields     = body-fld-param SP body-fld-id SP body-fld-desc SP
 //                   body-fld-enc SP body-fld-octets
 fn body_fields(i: &[u8]) -> IResult<&[u8], BodyFields<'_>> {
@@ -49,7 +58,7 @@ fn body_fields(i: &[u8]) -> IResult<&[u8], BodyFields<'_>> {
 //                   [SP body-fld-loc *(SP body-extension)]]]
 //                     ; MUST NOT be returned on non-extensible
 //                     ; "BODY" fetch
-fn body_ext_1part(i: &[u8]) -> IResult<&[u8], BodyExt1Part<'_>> {
+fn body_ext_1part_with_depth(i: &[u8], extension_depth: usize) -> IResult<&[u8], BodyExt1Part<'_>> {
     let (i, (md5, disposition, language, location, extension)) = (
         // Per RFC 1864, MD5 values are base64-encoded
         opt_opt(preceded(tag(" "), nstring_utf8)),
@@ -57,7 +66,9 @@ fn body_ext_1part(i: &[u8]) -> IResult<&[u8], BodyExt1Part<'_>> {
         opt_opt(preceded(tag(" "), body_lang)),
         // Location appears to reference a URL, which by RFC 1738 (section 2.2) should be ASCII
         opt_opt(preceded(tag(" "), nstring_utf8)),
-        opt(preceded(tag(" "), body_extension)),
+        opt(preceded(tag(" "), move |i| {
+            body_extension_with_depth(i, extension_depth)
+        })),
     )
         .parse(i)?;
     Ok((
@@ -76,14 +87,16 @@ fn body_ext_1part(i: &[u8]) -> IResult<&[u8], BodyExt1Part<'_>> {
 //                   [SP body-fld-loc *(SP body-extension)]]]
 //                     ; MUST NOT be returned on non-extensible
 //                     ; "BODY" fetch
-fn body_ext_mpart(i: &[u8]) -> IResult<&[u8], BodyExtMPart<'_>> {
+fn body_ext_mpart_with_depth(i: &[u8], extension_depth: usize) -> IResult<&[u8], BodyExtMPart<'_>> {
     let (i, (param, disposition, language, location, extension)) = (
         opt_opt(preceded(tag(" "), body_param)),
         opt_opt(preceded(tag(" "), body_disposition)),
         opt_opt(preceded(tag(" "), body_lang)),
         // Location appears to reference a URL, which by RFC 1738 (section 2.2) should be ASCII
         opt_opt(preceded(tag(" "), nstring_utf8)),
-        opt(preceded(tag(" "), body_extension)),
+        opt(preceded(tag(" "), move |i| {
+            body_extension_with_depth(i, extension_depth)
+        })),
     )
         .parse(i)?;
     Ok((
@@ -141,14 +154,24 @@ fn body_param(i: &[u8]) -> IResult<&[u8], BodyParams<'_>> {
     .parse(i)
 }
 
+#[cfg(test)]
 fn body_extension(i: &[u8]) -> IResult<&[u8], BodyExtension<'_>> {
+    body_extension_with_depth(i, 0)
+}
+
+fn body_extension_with_depth(i: &[u8], depth: usize) -> IResult<&[u8], BodyExtension<'_>> {
+    if depth > BODY_EXTENSION_RECURSION_LIMIT {
+        return Err(recursion_limit_error(i));
+    }
+
+    let child_depth = depth + 1;
     alt((
         map(number, BodyExtension::Num),
         // Cannot find documentation on character encoding for body extension values.
         // So far, assuming UTF-8 seems fine, please report if you run into issues here.
         map(nstring_utf8, BodyExtension::Str),
         map(
-            parenthesized_nonempty_list(body_extension),
+            parenthesized_nonempty_list(move |i| body_extension_with_depth(i, child_depth)),
             BodyExtension::List,
         ),
     ))
@@ -166,7 +189,10 @@ fn body_disposition(i: &[u8]) -> IResult<&[u8], Option<ContentDisposition<'_>>> 
     .parse(i)
 }
 
-fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_basic_with_depth(
+    i: &[u8],
+    extension_depth: usize,
+) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         (
             string_utf8,
@@ -174,7 +200,7 @@ fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             string_utf8,
             tag(" "),
             body_fields,
-            body_ext_1part,
+            move |i| body_ext_1part_with_depth(i, extension_depth),
         ),
         |(ty, _, subtype, _, fields, ext)| BodyStructure::Basic {
             common: BodyContentCommon {
@@ -200,7 +226,10 @@ fn body_type_basic(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     .parse(i)
 }
 
-fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_text_with_depth(
+    i: &[u8],
+    extension_depth: usize,
+) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         (
             tag_no_case("\"TEXT\""),
@@ -210,7 +239,7 @@ fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             body_fields,
             tag(" "),
             number,
-            body_ext_1part,
+            move |i| body_ext_1part_with_depth(i, extension_depth),
         ),
         |(_, _, subtype, _, fields, _, lines, ext)| BodyStructure::Text {
             common: BodyContentCommon {
@@ -237,7 +266,11 @@ fn body_type_text(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     .parse(i)
 }
 
-fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_message_with_depth(
+    i: &[u8],
+    body_depth: usize,
+    extension_depth: usize,
+) -> IResult<&[u8], BodyStructure<'_>> {
     map(
         (
             tag_no_case("\"MESSAGE\" \"RFC822\""),
@@ -246,10 +279,10 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
             tag(" "),
             envelope,
             tag(" "),
-            body,
+            move |i| body_with_depth(i, body_depth, extension_depth),
             tag(" "),
             number,
-            body_ext_1part,
+            move |i| body_ext_1part_with_depth(i, extension_depth),
         ),
         |(_, _, fields, _, envelope, _, body, _, lines, ext)| BodyStructure::Message {
             common: BodyContentCommon {
@@ -278,9 +311,18 @@ fn body_type_message(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
     .parse(i)
 }
 
-fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+fn body_type_multipart_with_depth(
+    i: &[u8],
+    body_depth: usize,
+    extension_depth: usize,
+) -> IResult<&[u8], BodyStructure<'_>> {
     map(
-        (many1(body), tag(" "), string_utf8, body_ext_mpart),
+        (
+            many1(move |i| body_with_depth(i, body_depth, extension_depth)),
+            tag(" "),
+            string_utf8,
+            move |i| body_ext_mpart_with_depth(i, extension_depth),
+        ),
         |(bodies, _, subtype, ext)| BodyStructure::Multipart {
             common: BodyContentCommon {
                 ty: ContentType {
@@ -300,11 +342,24 @@ fn body_type_multipart(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
 }
 
 pub(crate) fn body(i: &[u8]) -> IResult<&[u8], BodyStructure<'_>> {
+    body_with_depth(i, 0, 0)
+}
+
+fn body_with_depth(
+    i: &[u8],
+    body_depth: usize,
+    extension_depth: usize,
+) -> IResult<&[u8], BodyStructure<'_>> {
+    if body_depth > BODY_RECURSION_LIMIT {
+        return Err(recursion_limit_error(i));
+    }
+
+    let child_depth = body_depth + 1;
     paren_delimited(alt((
-        body_type_text,
-        body_type_message,
-        body_type_basic,
-        body_type_multipart,
+        move |i| body_type_text_with_depth(i, extension_depth),
+        move |i| body_type_message_with_depth(i, child_depth, extension_depth),
+        move |i| body_type_basic_with_depth(i, extension_depth),
+        move |i| body_type_multipart_with_depth(i, child_depth, extension_depth),
     )))
     .parse(i)
 }
@@ -357,6 +412,22 @@ mod tests {
                 extension: None,
             },
         )
+    }
+
+    fn nested_multipart(depth: usize) -> String {
+        let (mut body, _) = mock_body_text();
+        for _ in 0..depth {
+            body = format!(r#"({body} "MIXED")"#);
+        }
+        body
+    }
+
+    fn nested_body_extension(depth: usize) -> String {
+        let mut extension = r#""value""#.to_string();
+        for _ in 0..depth {
+            extension = format!("({extension})");
+        }
+        extension
     }
 
     #[test]
@@ -415,6 +486,15 @@ mod tests {
                 assert_eq!(list, vec![BodyExtension::Num(1337)]);
             }
         );
+    }
+
+    #[test]
+    fn test_body_extension_recursion_limit() {
+        let extension = nested_body_extension(BODY_EXTENSION_RECURSION_LIMIT);
+        assert!(body_extension(extension.as_bytes()).is_ok());
+
+        let extension = nested_body_extension(BODY_EXTENSION_RECURSION_LIMIT + 1);
+        assert!(body_extension(extension.as_bytes()).is_err());
     }
 
     #[test]
@@ -535,5 +615,14 @@ mod tests {
                 });
             }
         );
+    }
+
+    #[test]
+    fn test_body_structure_recursion_limit() {
+        let body_structure = nested_multipart(BODY_RECURSION_LIMIT);
+        assert!(body(body_structure.as_bytes()).is_ok());
+
+        let body_structure = nested_multipart(BODY_RECURSION_LIMIT + 1);
+        assert!(body(body_structure.as_bytes()).is_err());
     }
 }
