@@ -203,6 +203,22 @@ pub(crate) async fn parse_capabilities<T: Stream<Item = io::Result<ResponseData>
     unsolicited: channel::Sender<UnsolicitedResponse>,
     command_tag: RequestId,
 ) -> Result<Capabilities> {
+    parse_capability_list(stream, unsolicited, command_tag).await
+}
+
+pub(crate) async fn parse_enabled<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
+    stream: &mut T,
+    unsolicited: channel::Sender<UnsolicitedResponse>,
+    command_tag: RequestId,
+) -> Result<Capabilities> {
+    parse_capability_list(stream, unsolicited, command_tag).await
+}
+
+async fn parse_capability_list<T: Stream<Item = io::Result<ResponseData>> + Unpin>(
+    stream: &mut T,
+    unsolicited: channel::Sender<UnsolicitedResponse>,
+    command_tag: RequestId,
+) -> Result<Capabilities> {
     let mut caps: HashSet<Capability> = HashSet::new();
 
     while let Some(resp) = stream.try_next().await? {

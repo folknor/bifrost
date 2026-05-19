@@ -40,6 +40,16 @@ Last scan: 2026-05-19 with `gh api`.
 - Added explicit recursion limits to vendored `imap-proto` BODYSTRUCTURE and
   body-extension parsing so hostile nested input fails as a parser error instead
   of exhausting the Rust stack.
+- Exposed UIDPLUS response data from APPEND, COPY, UID COPY, MOVE, and UID MOVE
+  through typed response values instead of dropping parsed `APPENDUID` and
+  `COPYUID` response codes.
+- Added `Session::enable` for RFC 5161 so clients can opt into extensions such
+  as CONDSTORE or QRESYNC and inspect the returned `ENABLED` capability set.
+- Added `Session::idle_once` as a one-shot ergonomic wrapper around the lower
+  level IDLE handle for the common wait-then-resume workflow.
+- Added RFC 5465 `Session::notify` and `Session::notify_none` with typed
+  `NotifySettings`, mailbox filters, events, and validation for the RFC event
+  constraints before writing to the stream.
 
 ## Already covered by the vendored import
 
@@ -99,9 +109,10 @@ P2: mailbox/parser edge cases
 P2: IDLE ergonomics and NOTIFY
 
 - Sources: `chatmail/async-imap` #55, #89, `djc/tokio-imap` #18.
-- Status: local crate already has IDLE. NOTIFY is not implemented. Main need is
-  ergonomic examples or API review, not first priority while consolidating core
-  command correctness.
+- Status: local crate has IDLE, `idle_once`, and typed RFC 5465 NOTIFY command
+  helpers. Later follow-up: decide whether unsolicited STATUS/LIST/FETCH
+  responses from NOTIFY should get higher-level event wrappers or remain on the
+  existing unsolicited response channel.
 
 P3 or skip for now
 
@@ -115,4 +126,6 @@ P3 or skip for now
 - `chatmail/async-imap` #126 and `djc/tokio-imap` #186: IMAP4rev2. Track as a
   larger protocol feature after rev1 behavior is stable.
 - `chatmail/async-imap` #11: UIDPLUS. Parser and several client pieces already
-  exist locally; audit later for API completeness around APPENDUID/COPYUID/MOVE.
+  exist locally; `APPENDUID` and `COPYUID` are now surfaced by the relevant
+  commands. Remaining later audit: whether UIDPLUS should get higher-level
+  helpers around UID EXPUNGE fallback behavior.

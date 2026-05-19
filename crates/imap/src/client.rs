@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::str;
+use std::time::Duration;
 
 use async_channel::{self as channel, bounded};
 #[cfg(feature = "async-std1")]
@@ -11,12 +13,15 @@ use base64::Engine as _;
 use extensions::id::{format_identification, parse_id};
 use extensions::quota::parse_get_quota_root;
 use futures::{Stream, TryStreamExt, io};
-use imap_proto::{Metadata, RequestId, Response};
+use imap_proto::{Metadata, RequestId, Response, ResponseCode};
 #[cfg(feature = "tokio1")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
 use super::authenticator::{Authenticator, SaslAuthenticator};
-use super::error::{Error, ParseError, Result, ValidateError, ValidateSaslMechanismError};
+use super::error::{
+    Error, ParseError, Result, ValidateAtomError, ValidateError, ValidateNotifyError,
+    ValidateSaslMechanismError,
+};
 use super::parse::*;
 use super::types::*;
 use crate::extensions::{self, quota::parse_get_quota};
@@ -125,6 +130,35 @@ macro_rules! ok_or_unauth_client_err {
             Err(e) => return Err((e.into(), $self)),
         }
     };
+}
+
+#[derive(Default)]
+struct CommandCompletion {
+    append_uid: Option<AppendUid>,
+    copy_uid: Option<CopyUid>,
+}
+
+impl CommandCompletion {
+    fn record_response_code(&mut self, code: &ResponseCode<'_>) -> bool {
+        match code {
+            ResponseCode::AppendUid(uid_validity, uids) => {
+                self.append_uid = Some(AppendUid {
+                    uid_validity: *uid_validity,
+                    uids: uids.iter().map(UidSetMember::from).collect(),
+                });
+                true
+            }
+            ResponseCode::CopyUid(uid_validity, source, destination) => {
+                self.copy_uid = Some(CopyUid {
+                    uid_validity: *uid_validity,
+                    source: source.iter().map(UidSetMember::from).collect(),
+                    destination: destination.iter().map(UidSetMember::from).collect(),
+                });
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
@@ -665,6 +699,43 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         Ok(c)
     }
 
+    /// The [`ENABLE` command](https://www.rfc-editor.org/rfc/rfc5161.html#section-3.1)
+    /// asks the server to enable one or more capabilities for this connection.
+    ///
+    /// The returned [`Capabilities`] value contains the capabilities acknowledged
+    /// by the server's `ENABLED` response. Capability atoms are validated before
+    /// the command is written.
+    pub async fn enable<I, S>(&mut self, capabilities: I) -> Result<Capabilities>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let capabilities = format_atom_list(capabilities)?;
+        let id = self.run_command(format!("ENABLE {capabilities}")).await?;
+        let c = parse_enabled(
+            &mut self.conn.stream,
+            self.unsolicited_responses_tx.clone(),
+            id,
+        )
+        .await?;
+        Ok(c)
+    }
+
+    /// Configure unsolicited server notifications with RFC 5465 `NOTIFY SET`.
+    ///
+    /// Use [`NotifySettings`] to describe the mailbox filters and events the
+    /// client wants to receive. The settings are validated before anything is
+    /// written to the stream.
+    pub async fn notify(&mut self, settings: NotifySettings<'_>) -> Result<()> {
+        let command = format_notify_settings(&settings)?;
+        self.run_command_and_check_ok(command).await
+    }
+
+    /// Cancel all RFC 5465 notification registrations with `NOTIFY NONE`.
+    pub async fn notify_none(&mut self) -> Result<()> {
+        self.run_command_and_check_ok("NOTIFY NONE").await
+    }
+
     /// The [`EXPUNGE` command](https://tools.ietf.org/html/rfc3501#section-6.4.3) permanently
     /// removes all messages that have [`Flag::Deleted`] set from the currently selected mailbox.
     /// The message sequence number of each message that is removed is returned.
@@ -856,36 +927,56 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     ///
     /// If the `COPY` command is unsuccessful for any reason, the server restores the destination
     /// mailbox to its state before the `COPY` attempt.
+    ///
+    /// If the server returns a UIDPLUS `COPYUID` response code, the returned
+    /// [`CopyResponse`] contains the source-to-destination UID mapping.
     pub async fn copy<S1: AsRef<str>, S2: AsRef<str>>(
         &mut self,
         sequence_set: S1,
         mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "COPY {} {}",
-            sequence_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    ) -> Result<CopyResponse> {
+        let id = self
+            .run_command(&format!(
+                "COPY {} {}",
+                sequence_set.as_ref(),
+                validate_str(mailbox_name.as_ref())?
+            ))
+            .await?;
+        let completion = self
+            .conn
+            .check_done_ok_collect(&id, Some(self.unsolicited_responses_tx.clone()))
+            .await?;
 
-        Ok(())
+        Ok(CopyResponse {
+            copy_uid: completion.copy_uid,
+        })
     }
 
     /// Equivalent to [`Session::copy`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
+    ///
+    /// If the server returns a UIDPLUS `COPYUID` response code, the returned
+    /// [`CopyResponse`] contains the source-to-destination UID mapping.
     pub async fn uid_copy<S1: AsRef<str>, S2: AsRef<str>>(
         &mut self,
         uid_set: S1,
         mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "UID COPY {} {}",
-            uid_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    ) -> Result<CopyResponse> {
+        let id = self
+            .run_command(&format!(
+                "UID COPY {} {}",
+                uid_set.as_ref(),
+                validate_str(mailbox_name.as_ref())?
+            ))
+            .await?;
+        let completion = self
+            .conn
+            .check_done_ok_collect(&id, Some(self.unsolicited_responses_tx.clone()))
+            .await?;
 
-        Ok(())
+        Ok(CopyResponse {
+            copy_uid: completion.copy_uid,
+        })
     }
 
     /// The [`MOVE` command](https://tools.ietf.org/html/rfc6851#section-3.1) takes two
@@ -918,38 +1009,58 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// orphaned).  The server will generally not leave any message in both mailboxes (it would be
     /// bad for a partial failure to result in a bunch of duplicate messages).  This is true even
     /// if the server returns with [`Error::No`].
+    ///
+    /// If the server returns a UIDPLUS `COPYUID` response code, the returned
+    /// [`MoveResponse`] contains the source-to-destination UID mapping.
     pub async fn mv<S1: AsRef<str>, S2: AsRef<str>>(
         &mut self,
         sequence_set: S1,
         mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "MOVE {} {}",
-            sequence_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    ) -> Result<MoveResponse> {
+        let id = self
+            .run_command(&format!(
+                "MOVE {} {}",
+                sequence_set.as_ref(),
+                validate_str(mailbox_name.as_ref())?
+            ))
+            .await?;
+        let completion = self
+            .conn
+            .check_done_ok_collect(&id, Some(self.unsolicited_responses_tx.clone()))
+            .await?;
 
-        Ok(())
+        Ok(MoveResponse {
+            copy_uid: completion.copy_uid,
+        })
     }
 
     /// Equivalent to [`Session::copy`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8)
     /// and the [semantics of `MOVE` and `UID
     /// MOVE`](https://tools.ietf.org/html/rfc6851#section-3.3).
+    ///
+    /// If the server returns a UIDPLUS `COPYUID` response code, the returned
+    /// [`MoveResponse`] contains the source-to-destination UID mapping.
     pub async fn uid_mv<S1: AsRef<str>, S2: AsRef<str>>(
         &mut self,
         uid_set: S1,
         mailbox_name: S2,
-    ) -> Result<()> {
-        self.run_command_and_check_ok(&format!(
-            "UID MOVE {} {}",
-            uid_set.as_ref(),
-            validate_str(mailbox_name.as_ref())?
-        ))
-        .await?;
+    ) -> Result<MoveResponse> {
+        let id = self
+            .run_command(&format!(
+                "UID MOVE {} {}",
+                uid_set.as_ref(),
+                validate_str(mailbox_name.as_ref())?
+            ))
+            .await?;
+        let completion = self
+            .conn
+            .check_done_ok_collect(&id, Some(self.unsolicited_responses_tx.clone()))
+            .await?;
 
-        Ok(())
+        Ok(MoveResponse {
+            copy_uid: completion.copy_uid,
+        })
     }
 
     /// The [`LIST` command](https://tools.ietf.org/html/rfc3501#section-6.3.8) returns a subset of
@@ -1118,6 +1229,29 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         extensions::idle::Handle::new(self)
     }
 
+    /// Run a single IDLE wait cycle and return the session.
+    ///
+    /// This is a convenience wrapper around [`Session::idle`] for the common
+    /// case where the caller wants to wait until the server sends one relevant
+    /// response, or until `timeout` elapses, and then resume normal command
+    /// usage on the same session.
+    ///
+    /// This helper cannot be externally interrupted once started. Use
+    /// [`Session::idle`] directly when the caller needs an interrupt handle.
+    pub async fn idle_once(
+        self,
+        timeout: Duration,
+    ) -> Result<(Self, extensions::idle::IdleResponse)> {
+        let mut handle = self.idle();
+        handle.init().await?;
+        let response = {
+            let (wait, _interrupt) = handle.wait_with_timeout(timeout);
+            wait.await?
+        };
+        let session = handle.done().await?;
+        Ok((session, response))
+    }
+
     /// The [`APPEND` command](https://tools.ietf.org/html/rfc3501#section-6.3.11) appends
     /// `content` as a new message to the end of the specified destination `mailbox`.  This
     /// argument SHOULD be in the format of an [RFC-2822](https://tools.ietf.org/html/rfc2822)
@@ -1137,13 +1271,16 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// Specifically, the server will generally notify the client immediately via an untagged
     /// `EXISTS` response.  If the server does not do so, the client MAY issue a `NOOP` command (or
     /// failing that, a `CHECK` command) after one or more `APPEND` commands.
+    ///
+    /// If the server returns a UIDPLUS `APPENDUID` response code, the returned
+    /// [`AppendResponse`] contains the UIDVALIDITY value and assigned UID set.
     pub async fn append(
         &mut self,
         mailbox: impl AsRef<str>,
         flags: Option<&str>,
         internaldate: Option<&str>,
         content: impl AsRef<[u8]>,
-    ) -> Result<()> {
+    ) -> Result<AppendResponse> {
         let content = content.as_ref();
         let id = self
             .run_command(&format!(
@@ -1167,10 +1304,13 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
         self.stream.as_mut().write_all(content).await?;
         self.stream.as_mut().write_all(b"\r\n").await?;
         self.stream.flush().await?;
-        self.conn
-            .check_done_ok(&id, Some(self.unsolicited_responses_tx.clone()))
+        let completion = self
+            .conn
+            .check_done_ok_collect(&id, Some(self.unsolicited_responses_tx.clone()))
             .await?;
-        Ok(())
+        Ok(AppendResponse {
+            append_uid: completion.append_uid,
+        })
     }
 
     /// The [`SEARCH` command](https://tools.ietf.org/html/rfc3501#section-6.4.4) searches the
@@ -1433,32 +1573,76 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
         id: &RequestId,
         unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
     ) -> Result<()> {
-        if let Some(first_res) = self.stream.try_next().await? {
-            self.check_done_ok_from(id, unsolicited, first_res).await
-        } else {
-            Err(Error::ConnectionLost)
-        }
+        self.check_done_ok_collect(id, unsolicited).await?;
+        Ok(())
+    }
+
+    async fn check_done_ok_collect(
+        &mut self,
+        id: &RequestId,
+        unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
+    ) -> Result<CommandCompletion> {
+        let Some(first_res) = self.stream.try_next().await? else {
+            return Err(Error::ConnectionLost);
+        };
+
+        self.check_done_ok_from_collect(id, unsolicited, first_res)
+            .await
     }
 
     pub(crate) async fn check_done_ok_from(
         &mut self,
         id: &RequestId,
         unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
-        mut response: ResponseData,
+        response: ResponseData,
     ) -> Result<()> {
-        loop {
-            if let Response::Done {
-                status,
-                code,
-                information,
-                tag,
-            } = response.parsed()
-            {
-                self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+        self.check_done_ok_from_collect(id, unsolicited, response)
+            .await?;
+        Ok(())
+    }
 
-                if tag == id {
-                    return Ok(());
+    async fn check_done_ok_from_collect(
+        &mut self,
+        id: &RequestId,
+        unsolicited: Option<channel::Sender<UnsolicitedResponse>>,
+        mut response: ResponseData,
+    ) -> Result<CommandCompletion> {
+        let mut completion = CommandCompletion::default();
+
+        loop {
+            match response.parsed() {
+                Response::Done {
+                    status,
+                    code,
+                    information,
+                    tag,
+                } => {
+                    self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+
+                    if tag == id {
+                        if let Some(code) = code {
+                            // If the tagged completion repeats UIDPLUS data,
+                            // treat the terminal response as authoritative.
+                            completion.record_response_code(code);
+                        }
+                        return Ok(completion);
+                    }
                 }
+                Response::Data {
+                    status: imap_proto::Status::Ok,
+                    code: Some(code),
+                    ..
+                } if completion.record_response_code(code) => {
+                    // UIDPLUS response codes are structured command completion
+                    // data for this path, so they are not forwarded as generic
+                    // unsolicited OK responses.
+                    let Some(res) = self.stream.try_next().await? else {
+                        return Err(Error::ConnectionLost);
+                    };
+                    response = res;
+                    continue;
+                }
+                _ => {}
             }
 
             if let Some(unsolicited) = unsolicited.clone() {
@@ -1517,6 +1701,234 @@ fn validate_sasl_mechanism(value: &str) -> Result<String> {
     Ok(value.to_ascii_uppercase())
 }
 
+fn format_atom_list<I, S>(atoms: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut formatted = String::new();
+    for atom in atoms {
+        let atom = validate_atom(atom.as_ref())?;
+        if !formatted.is_empty() {
+            formatted.push(' ');
+        }
+        formatted.push_str(atom);
+    }
+
+    if formatted.is_empty() {
+        return Err(ValidateAtomError::EmptyList.into());
+    }
+
+    Ok(formatted)
+}
+
+fn format_notify_settings(settings: &NotifySettings<'_>) -> Result<String> {
+    validate_notify_settings(settings)?;
+
+    let mut command = String::from("NOTIFY SET");
+    if settings.requests_status() {
+        command.push_str(" STATUS");
+    }
+
+    for group in settings.groups() {
+        command.push(' ');
+        command.push_str(&format_notify_group(group)?);
+    }
+
+    Ok(command)
+}
+
+fn validate_notify_settings(settings: &NotifySettings<'_>) -> Result<()> {
+    if settings.is_empty() {
+        return Err(ValidateNotifyError::NoGroups.into());
+    }
+
+    let mut selected_count = 0;
+    let mut selected_delayed_count = 0;
+    for group in settings.groups() {
+        match group.filter() {
+            NotifyFilter::Selected => selected_count += 1,
+            NotifyFilter::SelectedDelayed => selected_delayed_count += 1,
+            NotifyFilter::Subtree(mailboxes) | NotifyFilter::Mailboxes(mailboxes)
+                if mailboxes.is_empty() =>
+            {
+                return Err(ValidateNotifyError::EmptyMailboxList.into());
+            }
+            _ => {}
+        }
+
+        validate_notify_events(group.events(), group.filter().is_selected())?;
+    }
+
+    if selected_count > 0 && selected_delayed_count > 0 {
+        return Err(ValidateNotifyError::ConflictingSelectedModes.into());
+    }
+    if selected_count > 1 || selected_delayed_count > 1 {
+        return Err(ValidateNotifyError::DuplicateSelectedFilter.into());
+    }
+
+    Ok(())
+}
+
+fn format_notify_group(group: &NotifyGroup<'_>) -> Result<String> {
+    Ok(format!(
+        "({} {})",
+        format_notify_filter(group.filter())?,
+        format_notify_events(group.events())?
+    ))
+}
+
+fn format_notify_filter(filter: &NotifyFilter<'_>) -> Result<String> {
+    match filter {
+        NotifyFilter::Selected => Ok(String::from("SELECTED")),
+        NotifyFilter::SelectedDelayed => Ok(String::from("SELECTED-DELAYED")),
+        NotifyFilter::Inboxes => Ok(String::from("INBOXES")),
+        NotifyFilter::Personal => Ok(String::from("PERSONAL")),
+        NotifyFilter::Subscribed => Ok(String::from("SUBSCRIBED")),
+        NotifyFilter::Subtree(mailboxes) => Ok(format!("SUBTREE {}", format_mailboxes(mailboxes)?)),
+        NotifyFilter::Mailboxes(mailboxes) => {
+            Ok(format!("MAILBOXES {}", format_mailboxes(mailboxes)?))
+        }
+    }
+}
+
+fn format_mailboxes(mailboxes: &[Cow<'_, str>]) -> Result<String> {
+    if let [mailbox] = mailboxes {
+        return validate_str(mailbox.as_ref());
+    }
+
+    let mut formatted = String::from("(");
+    for mailbox in mailboxes {
+        if formatted.len() > 1 {
+            formatted.push(' ');
+        }
+        formatted.push_str(&validate_str(mailbox.as_ref())?);
+    }
+    formatted.push(')');
+    Ok(formatted)
+}
+
+fn format_notify_events(events: &NotifyEvents<'_>) -> Result<String> {
+    match events {
+        NotifyEvents::None => Ok(String::from("NONE")),
+        NotifyEvents::Events(events) => {
+            let mut formatted = String::from("(");
+            for event in events {
+                if formatted.len() > 1 {
+                    formatted.push(' ');
+                }
+                formatted.push_str(&format_notify_event(event)?);
+            }
+            formatted.push(')');
+            Ok(formatted)
+        }
+    }
+}
+
+fn format_notify_event(event: &NotifyEvent<'_>) -> Result<String> {
+    match event {
+        NotifyEvent::MessageNew { fetch } if fetch.is_empty() => Ok(String::from("MessageNew")),
+        NotifyEvent::MessageNew { fetch } => {
+            let mut formatted = String::from("MessageNew (");
+            for attr in fetch {
+                if !formatted.ends_with('(') {
+                    formatted.push(' ');
+                }
+                formatted.push_str(attr.as_ref());
+            }
+            formatted.push(')');
+            Ok(formatted)
+        }
+        NotifyEvent::MessageExpunge => Ok(String::from("MessageExpunge")),
+        NotifyEvent::FlagChange => Ok(String::from("FlagChange")),
+        NotifyEvent::AnnotationChange => Ok(String::from("AnnotationChange")),
+        NotifyEvent::MailboxName => Ok(String::from("MailboxName")),
+        NotifyEvent::SubscriptionChange => Ok(String::from("SubscriptionChange")),
+        NotifyEvent::MailboxMetadataChange => Ok(String::from("MailboxMetadataChange")),
+        NotifyEvent::ServerMetadataChange => Ok(String::from("ServerMetadataChange")),
+        NotifyEvent::Extension(atom) => Ok(validate_atom(atom.as_ref())?.to_owned()),
+    }
+}
+
+fn validate_notify_events(events: &NotifyEvents<'_>, selected_filter: bool) -> Result<()> {
+    let NotifyEvents::Events(events) = events else {
+        return Ok(());
+    };
+    if events.is_empty() {
+        return Err(ValidateNotifyError::EmptyEventList.into());
+    }
+
+    let mut has_message_new = false;
+    let mut has_message_expunge = false;
+    let mut has_flag_change = false;
+
+    for event in events {
+        if selected_filter && !event.is_message_event() {
+            return Err(ValidateNotifyError::SelectedOnlyMessageEvents.into());
+        }
+        if !selected_filter && event.has_fetch_attributes() {
+            return Err(ValidateNotifyError::FetchAttributesOnlySelected.into());
+        }
+
+        match event {
+            NotifyEvent::MessageNew { fetch } => {
+                has_message_new = true;
+                for attr in fetch {
+                    if attr.is_empty() {
+                        return Err(ValidateNotifyError::EmptyFetchAttribute.into());
+                    }
+                    validate_command_fragment(attr.as_ref())?;
+                }
+            }
+            NotifyEvent::MessageExpunge => has_message_expunge = true,
+            NotifyEvent::FlagChange => has_flag_change = true,
+            NotifyEvent::Extension(atom) => {
+                validate_atom(atom.as_ref())?;
+            }
+            _ => {}
+        }
+    }
+
+    if has_message_new != has_message_expunge {
+        return Err(ValidateNotifyError::MessageNewAndExpungeMustBeTogether.into());
+    }
+    if has_flag_change && !(has_message_new && has_message_expunge) {
+        return Err(ValidateNotifyError::FlagChangeRequiresMessagePair.into());
+    }
+
+    Ok(())
+}
+
+fn validate_atom(value: &str) -> Result<&str> {
+    if value.is_empty() {
+        return Err(ValidateAtomError::Empty.into());
+    }
+    for c in value.chars() {
+        let Ok(byte) = u8::try_from(u32::from(c)) else {
+            return Err(ValidateAtomError::InvalidChar(c).into());
+        };
+        if !is_command_atom_char(byte) {
+            return Err(ValidateAtomError::InvalidChar(c).into());
+        }
+    }
+    Ok(value)
+}
+
+fn validate_command_fragment(value: &str) -> Result<&str> {
+    if let Some(invalid) = value.chars().find(|c| matches!(c, '\r' | '\n')) {
+        return Err(ValidateError(invalid).into());
+    }
+    Ok(value)
+}
+
+fn is_command_atom_char(byte: u8) -> bool {
+    byte.is_ascii_graphic()
+        && !matches!(
+            byte,
+            b'(' | b')' | b'{' | b' ' | b'%' | b'*' | b'"' | b'\\' | b']'
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -1529,7 +1941,7 @@ mod tests {
 
     use async_std::sync::{Arc, Mutex};
     use futures::StreamExt;
-    use imap_proto::Status;
+    use imap_proto::{MailboxDatum, Status};
 
     use crate::{Plain, XOAuth2};
 
@@ -1577,6 +1989,21 @@ mod tests {
                 $c
             )
         };
+    }
+
+    fn expected_append_uid(uid: Uid) -> AppendUid {
+        AppendUid {
+            uid_validity: 1_725_735_035,
+            uids: vec![UidSetMember::Uid(uid)],
+        }
+    }
+
+    fn expected_copy_uid() -> CopyUid {
+        CopyUid {
+            uid_validity: 1_511_554_416,
+            source: vec![UidSetMember::Uid(142), UidSetMember::Uid(399)],
+            destination: vec![UidSetMember::Range(41..=42)],
+        }
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
@@ -2104,6 +2531,249 @@ mod tests {
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
     #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn enable() {
+        let response = b"* ENABLED QRESYNC CONDSTORE\r\n\
+            A0001 OK ENABLE completed\r\n"
+            .to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let enabled = session.enable(["QRESYNC", "CONDSTORE"]).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 ENABLE QRESYNC CONDSTORE\r\n".to_vec(),
+            "Invalid enable command"
+        );
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled.contains("qresync"));
+        assert!(enabled.contains("CONDSTORE"));
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn enable_rejects_empty_capability_list() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session
+            .enable(std::iter::empty::<&str>())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateAtom(ValidateAtomError::EmptyList)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn enable_rejects_invalid_capability_atom() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session.enable(["QRESYNC", "BAD ATOM"]).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateAtom(ValidateAtomError::InvalidChar(' '))
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_set_selected_and_personal_events() {
+        let response = b"A0001 OK NOTIFY completed\r\n".to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        session
+            .notify(
+                NotifySettings::new()
+                    .status()
+                    .selected(NotifyEvents::new([
+                        NotifyEvent::message_new_with_fetch(["UID", "FLAGS"]),
+                        NotifyEvent::MessageExpunge,
+                        NotifyEvent::FlagChange,
+                    ]))
+                    .personal(NotifyEvents::new([
+                        NotifyEvent::message_new(),
+                        NotifyEvent::MessageExpunge,
+                        NotifyEvent::MailboxName,
+                        NotifyEvent::ServerMetadataChange,
+                    ])),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 NOTIFY SET STATUS (SELECTED (MessageNew (UID FLAGS) MessageExpunge FlagChange)) (PERSONAL (MessageNew MessageExpunge MailboxName ServerMetadataChange))\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_set_formats_mailbox_filters() {
+        let response = b"A0001 OK NOTIFY completed\r\n".to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        session
+            .notify(
+                NotifySettings::new()
+                    .mailboxes(["INBOX", "Projects/IMAP"], NotifyEvents::none())
+                    .subtree(["Archive"], NotifyEvents::message_changes()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 NOTIFY SET (MAILBOXES (\"INBOX\" \"Projects/IMAP\") NONE) (SUBTREE \"Archive\" (MessageNew MessageExpunge))\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_none() {
+        let response = b"A0001 OK NOTIFY completed\r\n".to_vec();
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        session.notify_none().await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 NOTIFY NONE\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_rejects_empty_settings() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session.notify(NotifySettings::new()).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateNotify(ValidateNotifyError::NoGroups)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_rejects_selected_mailbox_events() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session
+            .notify(NotifySettings::new().selected(NotifyEvents::new([NotifyEvent::MailboxName])))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateNotify(ValidateNotifyError::SelectedOnlyMessageEvents)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_rejects_duplicate_selected_filter() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session
+            .notify(
+                NotifySettings::new()
+                    .selected(NotifyEvents::none())
+                    .selected(NotifyEvents::message_changes()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateNotify(ValidateNotifyError::DuplicateSelectedFilter)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_rejects_unpaired_message_events() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session
+            .notify(NotifySettings::new().personal(NotifyEvents::new([NotifyEvent::message_new()])))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateNotify(ValidateNotifyError::MessageNewAndExpungeMustBeTogether)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn notify_rejects_fetch_attrs_for_non_selected_mailboxes() {
+        let mock_stream = MockStream::default();
+        let mut session = mock_session!(mock_stream);
+
+        let err = session
+            .notify(NotifySettings::new().personal(NotifyEvents::new([
+                NotifyEvent::message_new_with_fetch(["UID"]),
+                NotifyEvent::MessageExpunge,
+            ])))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::ValidateNotify(ValidateNotifyError::FetchAttributesOnlySelected)
+        ));
+        assert!(session.stream.inner.written_buf.is_empty());
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn idle_once_returns_session_after_data() {
+        let response = b"+ idling\r\n\
+            * 3 EXISTS\r\n\
+            A0001 OK IDLE completed\r\n"
+            .to_vec();
+        let session = mock_session!(MockStream::new(response));
+
+        let (session, idle_response) = session.idle_once(Duration::from_secs(60)).await.unwrap();
+
+        match idle_response {
+            extensions::idle::IdleResponse::NewData(response) => {
+                assert_eq!(
+                    response.parsed(),
+                    &Response::MailboxData(MailboxDatum::Exists(3))
+                );
+            }
+            other => panic!("unexpected idle response: {other:?}"),
+        }
+        assert_eq!(
+            session.stream.inner.written_buf,
+            b"A0001 IDLE\r\nDONE\r\n".to_vec()
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn create() {
         let response = b"A0001 OK CREATE completed\r\n".to_vec();
         let mailbox_name = "INBOX";
@@ -2205,7 +2875,8 @@ mod tests {
     #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn copy() {
         generic_copy(" ", |c, set, query| async move {
-            c.lock().await.copy(set, query).await?;
+            let response = c.lock().await.copy(set, query).await?;
+            assert_eq!(response, CopyResponse::default());
             Ok(())
         })
         .await;
@@ -2215,7 +2886,8 @@ mod tests {
     #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn uid_copy() {
         generic_copy(" UID ", |c, set, query| async move {
-            c.lock().await.uid_copy(set, query).await?;
+            let response = c.lock().await.uid_copy(set, query).await?;
+            assert_eq!(response, CopyResponse::default());
             Ok(())
         })
         .await;
@@ -2243,6 +2915,54 @@ mod tests {
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
     #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn copy_returns_copy_uid() {
+        let response = b"A0001 OK [COPYUID 1511554416 142,399 41:42] COPY completed\r\n".to_vec();
+        let mailbox_name = "MEETING";
+        let command = format!("A0001 COPY 2,4 {}\r\n", quote!(mailbox_name));
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let response = session.copy("2,4", mailbox_name).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            command.as_bytes().to_vec(),
+            "Invalid copy command"
+        );
+        assert_eq!(
+            response,
+            CopyResponse {
+                copy_uid: Some(expected_copy_uid()),
+            }
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
+    async fn uid_copy_returns_copy_uid() {
+        let response = b"A0001 OK [COPYUID 1511554416 142,399 41:42] COPY completed\r\n".to_vec();
+        let mailbox_name = "MEETING";
+        let command = format!("A0001 UID COPY 142,399 {}\r\n", quote!(mailbox_name));
+        let mock_stream = MockStream::new(response);
+        let mut session = mock_session!(mock_stream);
+
+        let response = session.uid_copy("142,399", mailbox_name).await.unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            command.as_bytes().to_vec(),
+            "Invalid uid copy command"
+        );
+        assert_eq!(
+            response,
+            CopyResponse {
+                copy_uid: Some(expected_copy_uid()),
+            }
+        );
+    }
+
+    #[cfg_attr(feature = "tokio1", tokio::test)]
+    #[cfg_attr(feature = "async-std1", async_std::test)]
     async fn mv() {
         let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
             * 2 EXPUNGE\r\n\
@@ -2253,11 +2973,26 @@ mod tests {
         let command = format!("A0001 MOVE 1:2 {}\r\n", quote!(mailbox_name));
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        session.mv("1:2", mailbox_name).await.unwrap();
+        let response = session.mv("1:2", mailbox_name).await.unwrap();
         assert!(
             session.stream.inner.written_buf == command.as_bytes().to_vec(),
             "Invalid move command"
         );
+        assert_eq!(
+            response,
+            MoveResponse {
+                copy_uid: Some(expected_copy_uid()),
+            }
+        );
+        assert_eq!(
+            session.unsolicited_responses.recv().await.unwrap(),
+            UnsolicitedResponse::Expunge(2)
+        );
+        assert_eq!(
+            session.unsolicited_responses.recv().await.unwrap(),
+            UnsolicitedResponse::Expunge(1)
+        );
+        assert!(session.unsolicited_responses.try_recv().is_err());
     }
 
     #[cfg_attr(feature = "tokio1", tokio::test)]
@@ -2272,10 +3007,16 @@ mod tests {
         let command = format!("A0001 UID MOVE 41:42 {}\r\n", quote!(mailbox_name));
         let mock_stream = MockStream::new(response);
         let mut session = mock_session!(mock_stream);
-        session.uid_mv("41:42", mailbox_name).await.unwrap();
+        let response = session.uid_mv("41:42", mailbox_name).await.unwrap();
         assert!(
             session.stream.inner.written_buf == command.as_bytes().to_vec(),
             "Invalid uid move command"
+        );
+        assert_eq!(
+            response,
+            MoveResponse {
+                copy_uid: Some(expected_copy_uid()),
+            }
         );
     }
 
@@ -2571,10 +3312,16 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            session
+            let response = session
                 .append("INBOX", Some(r"(\Seen)"), None, "foobarbaz")
                 .await
                 .unwrap();
+            assert_eq!(
+                response,
+                AppendResponse {
+                    append_uid: Some(expected_append_uid(2)),
+                }
+            );
             assert_eq!(
                 session.stream.inner.written_buf,
                 b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec()
@@ -2589,10 +3336,16 @@ mod tests {
 
             let mock_stream = MockStream::new(response);
             let mut session = mock_session!(mock_stream);
-            session
+            let response = session
                 .append("INBOX", Some(r"(\Seen)"), None, "foobarbaz")
                 .await
                 .unwrap();
+            assert_eq!(
+                response,
+                AppendResponse {
+                    append_uid: Some(expected_append_uid(2)),
+                }
+            );
             assert_eq!(
                 session.stream.inner.written_buf,
                 b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec()
@@ -2601,6 +3354,23 @@ mod tests {
             assert_eq!(exists_response, UnsolicitedResponse::Exists(3));
             let recent_response = session.unsolicited_responses.recv().await.unwrap();
             assert_eq!(recent_response, UnsolicitedResponse::Recent(2));
+        }
+
+        {
+            // Server without UIDPLUS APPENDUID.
+            let response = b"+ OK\r\nA0001 OK Append completed\r\n".to_vec();
+
+            let mock_stream = MockStream::new(response);
+            let mut session = mock_session!(mock_stream);
+            let response = session
+                .append("INBOX", Some(r"(\Seen)"), None, "foobarbaz")
+                .await
+                .unwrap();
+            assert_eq!(response, AppendResponse::default());
+            assert_eq!(
+                session.stream.inner.written_buf,
+                b"A0001 APPEND \"INBOX\" (\\Seen) {9}\r\nfoobarbaz\r\n".to_vec()
+            );
         }
 
         {

@@ -34,6 +34,12 @@ pub enum Error {
     /// The requested SASL mechanism name was invalid.
     #[error("invalid SASL mechanism: {0}")]
     ValidateSaslMechanism(#[from] ValidateSaslMechanismError),
+    /// A command atom was invalid.
+    #[error("invalid atom: {0}")]
+    ValidateAtom(#[from] ValidateAtomError),
+    /// A `NOTIFY` command input was invalid.
+    #[error("invalid notify settings: {0}")]
+    ValidateNotify(#[from] ValidateNotifyError),
     /// Error appending an e-mail.
     #[error("could not append mail to mailbox")]
     Append,
@@ -78,6 +84,57 @@ pub enum ValidateSaslMechanismError {
     /// SASL mechanism names can only contain ASCII letters, digits, hyphen, and underscore.
     #[error("invalid character '{0}'")]
     InvalidChar(char),
+}
+
+/// An invalid IMAP atom was passed to a command.
+#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ValidateAtomError {
+    /// IMAP atoms cannot be empty.
+    #[error("atom must not be empty")]
+    Empty,
+    /// Command atom lists cannot be empty.
+    #[error("atom list must not be empty")]
+    EmptyList,
+    /// IMAP atoms cannot contain this character.
+    #[error("invalid character '{0}'")]
+    InvalidChar(char),
+}
+
+/// Invalid settings were passed to the RFC 5465 `NOTIFY` command.
+#[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ValidateNotifyError {
+    /// `NOTIFY SET` needs at least one mailbox event group.
+    #[error("notify settings must include at least one event group")]
+    NoGroups,
+    /// An event list was empty. Use `NotifyEvents::none()` to send `NONE`.
+    #[error("notify event list must not be empty")]
+    EmptyEventList,
+    /// A `SUBTREE` or `MAILBOXES` filter had no mailbox names.
+    #[error("notify mailbox list must not be empty")]
+    EmptyMailboxList,
+    /// `SELECTED` and `SELECTED-DELAYED` cannot both appear in one command.
+    #[error("selected and selected-delayed cannot both be specified")]
+    ConflictingSelectedModes,
+    /// A selected mailbox filter appeared more than once.
+    #[error("selected mailbox filter can only be specified once")]
+    DuplicateSelectedFilter,
+    /// `SELECTED` and `SELECTED-DELAYED` filters only allow message events.
+    #[error("selected mailbox filters only allow message events")]
+    SelectedOnlyMessageEvents,
+    /// `MessageNew` and `MessageExpunge` must be requested together.
+    #[error("MessageNew and MessageExpunge must be specified together")]
+    MessageNewAndExpungeMustBeTogether,
+    /// `FlagChange` requires `MessageNew` and `MessageExpunge`.
+    #[error("FlagChange requires MessageNew and MessageExpunge")]
+    FlagChangeRequiresMessagePair,
+    /// `MessageNew` fetch attributes are only valid for selected mailbox filters.
+    #[error("MessageNew fetch attributes are only valid for selected mailbox filters")]
+    FetchAttributesOnlySelected,
+    /// A `MessageNew` fetch attribute was empty.
+    #[error("MessageNew fetch attributes must not be empty")]
+    EmptyFetchAttribute,
 }
 
 #[cfg(test)]

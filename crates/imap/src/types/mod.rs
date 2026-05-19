@@ -1,6 +1,7 @@
 //! This module contains types used throughout the IMAP protocol.
 
 use std::borrow::Cow;
+use std::ops::RangeInclusive;
 
 /// From section [2.3.1.1 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-2.3.1.1).
 ///
@@ -78,6 +79,73 @@ use std::borrow::Cow;
 /// >      include message numbers, nor does it include attributes
 /// >      that can be set by a `STORE` command (e.g., `FLAGS`).
 pub type Uid = u32;
+
+/// A member of an IMAP UID set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum UidSetMember {
+    /// A range of UIDs, inclusive at both ends.
+    Range(RangeInclusive<Uid>),
+    /// A single UID.
+    Uid(Uid),
+}
+
+impl From<&imap_proto::UidSetMember> for UidSetMember {
+    fn from(member: &imap_proto::UidSetMember) -> Self {
+        match member {
+            imap_proto::UidSetMember::UidRange(range) => UidSetMember::Range(range.clone()),
+            imap_proto::UidSetMember::Uid(uid) => UidSetMember::Uid(*uid),
+        }
+    }
+}
+
+/// UIDPLUS `APPENDUID` response data for an appended message or message set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AppendUid {
+    /// The UIDVALIDITY value for the destination mailbox.
+    pub uid_validity: Uid,
+    /// The UID or UID set assigned to the appended message data.
+    pub uids: Vec<UidSetMember>,
+}
+
+/// Result data returned by [`Session::append`](crate::Session::append).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AppendResponse {
+    /// UIDPLUS `APPENDUID` data when the server returned it.
+    pub append_uid: Option<AppendUid>,
+}
+
+/// UIDPLUS `COPYUID` response data for copied or moved messages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CopyUid {
+    /// The UIDVALIDITY value for the destination mailbox.
+    pub uid_validity: Uid,
+    /// The source UID set.
+    pub source: Vec<UidSetMember>,
+    /// The destination UID set.
+    pub destination: Vec<UidSetMember>,
+}
+
+/// Result data returned by [`Session::copy`](crate::Session::copy) and
+/// [`Session::uid_copy`](crate::Session::uid_copy).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CopyResponse {
+    /// UIDPLUS `COPYUID` data when the server returned it.
+    pub copy_uid: Option<CopyUid>,
+}
+
+/// Result data returned by [`Session::mv`](crate::Session::mv) and
+/// [`Session::uid_mv`](crate::Session::uid_mv).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct MoveResponse {
+    /// UIDPLUS `COPYUID` data when the server returned it.
+    pub copy_uid: Option<CopyUid>,
+}
 
 /// From section [2.3.1.2 of RFC 3501](https://tools.ietf.org/html/rfc3501#section-2.3.1.2).
 ///
@@ -202,6 +270,9 @@ pub use self::name::{Name, NameAttribute};
 
 mod capabilities;
 pub use self::capabilities::{Capabilities, Capability};
+
+mod notify;
+pub use self::notify::{NotifyEvent, NotifyEvents, NotifyFilter, NotifyGroup, NotifySettings};
 
 /// re-exported from imap_proto;
 pub use imap_proto::StatusAttribute;
