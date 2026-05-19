@@ -16,6 +16,7 @@ use crate::message::{
 
 /// Describe Dkim Canonicalization to apply to either body or headers
 #[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
 pub enum DkimCanonicalizationType {
     Simple,
     Relaxed,
@@ -40,7 +41,7 @@ pub struct DkimCanonicalization {
 impl Default for DkimCanonicalization {
     fn default() -> Self {
         DkimCanonicalization {
-            header: DkimCanonicalizationType::Simple,
+            header: DkimCanonicalizationType::Relaxed,
             body: DkimCanonicalizationType::Relaxed,
         }
     }
@@ -55,6 +56,7 @@ impl Display for DkimCanonicalization {
 
 /// Describe the algorithm used for signing the message
 #[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
 pub enum DkimSigningAlgorithm {
     Rsa,
     Ed25519,
@@ -159,7 +161,7 @@ pub struct DkimConfig {
 }
 
 impl DkimConfig {
-    /// Create a default signature configuration with a set of headers and "simple/relaxed"
+    /// Create a default signature configuration with a set of headers and "relaxed/relaxed"
     /// canonicalization
     pub fn default_config(
         selector: String,
@@ -176,10 +178,7 @@ impl DkimConfig {
                 HeaderName::new_from_ascii_str("To"),
                 HeaderName::new_from_ascii_str("Date"),
             ],
-            canonicalization: DkimCanonicalization {
-                header: DkimCanonicalizationType::Simple,
-                body: DkimCanonicalizationType::Relaxed,
-            },
+            canonicalization: DkimCanonicalization::default(),
         }
     }
 
@@ -485,28 +484,26 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
     #[test]
     fn test_headers_simple_canonicalize() {
         let message = test_message();
-        dbg!(message.headers.to_string());
         assert_eq!(
             dkim_canonicalize_headers(
                 ["From", "Test"],
                 &message.headers,
                 DkimCanonicalizationType::Simple
             ),
-            "From: =?utf-8?b?VGVzdCBPJ0xlYXJ5?= <test+ezrz@example.net>\r\nTest: test  test very very long with spaces and extra spaces   \twill be\r\n folded to several lines \r\n"
+            "From: Test O'Leary <test+ezrz@example.net>\r\nTest: test  test very very long with spaces and extra spaces   \twill be\r\n folded to several lines \r\n"
         );
     }
 
     #[test]
     fn test_headers_relaxed_canonicalize() {
         let message = test_message();
-        dbg!(message.headers.to_string());
         assert_eq!(
             dkim_canonicalize_headers(
                 ["From", "Test"],
                 &message.headers,
                 DkimCanonicalizationType::Relaxed
             ),
-            "from:=?utf-8?b?VGVzdCBPJ0xlYXJ5?= <test+ezrz@example.net>\r\ntest:test test very very long with spaces and extra spaces will be folded to several lines\r\n"
+            "from:Test O'Leary <test+ezrz@example.net>\r\ntest:test test very very long with spaces and extra spaces will be folded to several lines\r\n"
         );
     }
 
@@ -526,6 +523,18 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
             dkim_canonicalize_body(body, DkimCanonicalizationType::Relaxed).into_owned(),
             b" C\r\nD E\r\n F\r\n"
         );
+    }
+
+    #[test]
+    fn default_config_uses_relaxed_relaxed() {
+        let signing_key = DkimSigningKey::new(KEY_RSA, DkimSigningAlgorithm::Rsa).unwrap();
+        let config = DkimConfig::default_config(
+            "dkimtest".to_owned(),
+            "example.org".to_owned(),
+            signing_key,
+        );
+
+        assert_eq!(config.canonicalization.to_string(), "relaxed/relaxed");
     }
 
     #[test]
@@ -553,28 +562,13 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         );
         let signed = message.formatted();
         let signed = std::str::from_utf8(&signed).unwrap();
-        assert_eq!(
+        assert!(signed.starts_with(TEST_MESSAGE_HEADERS), "{signed}");
+        assert!(signed.ends_with(TEST_MESSAGE_BODY), "{signed}");
+        assert_dkim_signature(
             signed,
-            std::concat!(
-                "From: =?utf-8?b?VGVzdCBPJ0xlYXJ5?= <test+ezrz@example.net>\r\n",
-                "To: Test2 <test2@example.org>\r\n",
-                "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
-                "Test: test  test very very long with spaces and extra spaces   \twill be\r\n",
-                " folded to several lines \r\n",
-                "Subject: Test with utf-8 =?utf-8?b?w6s=?=\r\n",
-                "Content-Type: text/plain; charset=utf-8\r\n",
-                "Content-Transfer-Encoding: 7bit\r\n",
-                "DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=dkimtest;\r\n",
-                " c=simple/simple; q=dns/txt; t=0; h=Date:From:Subject:To;\r\n",
-                " bh=f3Zksdcjqa/xRBwdyFzIXWCcgP7XTgxjCgYsXOMKQl4=;\r\n",
-                " b=NhoIMMAALoSgu5lKAR0+MUQunOWnU7wpF9ORUFtpxq9sGZDo9AX43AMhFemyM5W204jpFwMU6pm7AMR1nOYBdSYye4yUALtvT2nqbJBwSh7JeYu+z22t1RFKp7qQR1il8aSrkbZuNMFHYuSEwW76QtKwcNqP4bQOzS9CzgQp0ABu8qwYPBr/EypykPTfqjtyN+ywrfdqjjGOzTpRGolH0hc3CrAETNjjHbNBgKgucXmXTN7hMRdzqWjeFPxizXwouwNAavFClPG0l33gXVArFWn+CkgA84G/s4zuJiF7QPZR87Pu4pw/vIlSXxH4a42W3tT19v9iBTH7X7ldYegtmQ==\r\n",
-                "\r\n",
-                "test\r\n",
-                "\r\n",
-                "test   \ttest\r\n",
-                "\r\n",
-                "\r\n",
-            )
+            "simple/simple",
+            "Date:From:Subject:To",
+            "f3Zksdcjqa/xRBwdyFzIXWCcgP7XTgxjCgYsXOMKQl4=",
         );
     }
 
@@ -603,29 +597,61 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         );
         let signed = message.formatted();
         let signed = std::str::from_utf8(&signed).unwrap();
-        println!("{signed}");
-        assert_eq!(
+        assert!(signed.starts_with(TEST_MESSAGE_HEADERS), "{signed}");
+        assert!(signed.ends_with(TEST_MESSAGE_BODY), "{signed}");
+        assert_dkim_signature(
             signed,
-            std::concat!(
-                "From: =?utf-8?b?VGVzdCBPJ0xlYXJ5?= <test+ezrz@example.net>\r\n",
-                "To: Test2 <test2@example.org>\r\n",
-                "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
-                "Test: test  test very very long with spaces and extra spaces   \twill be\r\n",
-                " folded to several lines \r\n",
-                "Subject: Test with utf-8 =?utf-8?b?w6s=?=\r\n",
-                "Content-Type: text/plain; charset=utf-8\r\n",
-                "Content-Transfer-Encoding: 7bit\r\n",
-                "DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=dkimtest;\r\n",
-                " c=relaxed/relaxed; q=dns/txt; t=0; h=date:from:subject:to;\r\n",
-                " bh=qN8je6qJgWFGSnN2MycC/XKPbN6BOrMJyAX2h4m19Ss=;\r\n",
-                " b=YaVfmH8dbGEywoLJ4uhbvYqDyQG1UGKFH3PE7zXGgk+YFxUgkwWjoA3aQupDNQtfTjfUsNe0dnrjyZP+ylnESpZBpbCIf5/n3FEh6j3RQthqNbQblcfH/U8mazTuRbVjYBbTZQDaQCMPTz+8D+ZQfXo2oq6dGzTuGvmuYft0CVsq/BIp/EkhZHqiphDeVJSHD4iKW8+L2XwEWThoY92xOYc1G0TtBwz2UJgtiHX2YulH/kRBHeK3dKn9RTNVL3VZ+9ZrnFwIhET9TPGtU2I+q0EMSWF9H9bTrASMgW/U+E0VM2btqJlrTU6rQ7wlQeHdwecLnzXcyhCUInF1+veMNw==\r\n",
-                "\r\n",
-                "test\r\n",
-                "\r\n",
-                "test   \ttest\r\n",
-                "\r\n",
-                "\r\n",
-            )
+            "relaxed/relaxed",
+            "date:from:subject:to",
+            "qN8je6qJgWFGSnN2MycC/XKPbN6BOrMJyAX2h4m19Ss=",
         );
+    }
+
+    const TEST_MESSAGE_HEADERS: &str = std::concat!(
+        "From: Test O'Leary <test+ezrz@example.net>\r\n",
+        "To: Test2 <test2@example.org>\r\n",
+        "Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n",
+        "Test: test  test very very long with spaces and extra spaces   \twill be\r\n",
+        " folded to several lines \r\n",
+        "Subject: Test with utf-8 =?utf-8?b?w6s=?=\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: 7bit\r\n",
+    );
+
+    const TEST_MESSAGE_BODY: &str = std::concat!(
+        "\r\n",
+        "test\r\n",
+        "\r\n",
+        "test   \ttest\r\n",
+        "\r\n",
+        "\r\n",
+    );
+
+    fn assert_dkim_signature(
+        signed: &str,
+        canonicalization: &str,
+        headers_list: &str,
+        body_hash: &str,
+    ) {
+        assert!(
+            signed.contains("DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=dkimtest;\r\n"),
+            "{signed}"
+        );
+        assert!(
+            signed.contains(&format!(
+                " c={canonicalization}; q=dns/txt; t=0; h={headers_list};\r\n"
+            )),
+            "{signed}"
+        );
+        assert!(
+            signed.contains(&format!(" bh={body_hash};\r\n")),
+            "{signed}"
+        );
+
+        let signature_line = signed
+            .lines()
+            .find(|line| line.starts_with(" b="))
+            .expect("signed message should contain a DKIM signature value");
+        assert!(signature_line.trim_end().len() > " b=".len());
     }
 }

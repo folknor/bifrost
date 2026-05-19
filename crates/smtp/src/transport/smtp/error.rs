@@ -32,24 +32,50 @@ impl Error {
         }
     }
 
-    /// Returns true if the error is from response
+    /// Returns the public kind of this SMTP error.
+    pub fn kind(&self) -> ErrorKind {
+        self.inner.kind.as_public()
+    }
+
+    /// Returns true if the client failed while parsing an SMTP response.
+    ///
+    /// This does not include SMTP 4xx or 5xx replies. For those, use
+    /// [`Error::is_transient`], [`Error::is_permanent`], or [`Error::status`].
     pub fn is_response(&self) -> bool {
         matches!(self.inner.kind, Kind::Response)
     }
 
-    /// Returns true if the error is from client
+    /// Returns true if the error is from client-side validation or protocol state.
     pub fn is_client(&self) -> bool {
         matches!(self.inner.kind, Kind::Client)
     }
 
-    /// Returns true if the error is a transient SMTP error
+    /// Returns true if the error is a transient SMTP 4xx reply.
+    ///
+    /// This is not the inverse of [`Error::is_permanent`]: parse, client,
+    /// connection, network, TLS, and shutdown errors are neither transient nor
+    /// permanent SMTP replies.
     pub fn is_transient(&self) -> bool {
         matches!(self.inner.kind, Kind::Transient(_))
     }
 
-    /// Returns true if the error is a permanent SMTP error
+    /// Returns true if the error is a permanent SMTP 5xx reply.
+    ///
+    /// This is not the inverse of [`Error::is_transient`]: parse, client,
+    /// connection, network, TLS, and shutdown errors are neither transient nor
+    /// permanent SMTP replies.
     pub fn is_permanent(&self) -> bool {
         matches!(self.inner.kind, Kind::Permanent(_))
+    }
+
+    /// Returns true if the error happened while opening or maintaining the SMTP connection.
+    pub fn is_connection(&self) -> bool {
+        matches!(self.inner.kind, Kind::Connection)
+    }
+
+    /// Returns true if the error came from the underlying network I/O layer.
+    pub fn is_network(&self) -> bool {
+        matches!(self.inner.kind, Kind::Network)
     }
 
     /// Returns true if the error is caused by a timeout
@@ -88,6 +114,30 @@ impl Error {
     }
 }
 
+/// Public classification for [`Error`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// Transient SMTP error, 4xx reply code.
+    Transient(Code),
+    /// Permanent SMTP error, 5xx reply code.
+    Permanent(Code),
+    /// Error parsing an SMTP response.
+    Response,
+    /// Internal client error.
+    Client,
+    /// Connection error.
+    Connection,
+    /// Underlying network I/O error.
+    Network,
+    /// TLS error.
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    #[cfg(feature = "native-tls")]
+    Tls,
+    /// Transport shutdown error.
+    TransportShutdown,
+}
+
 #[derive(Debug)]
 pub(crate) enum Kind {
     /// Transient SMTP error, 4xx reply code
@@ -112,6 +162,22 @@ pub(crate) enum Kind {
     Tls,
     /// Transport shutdown error
     TransportShutdown,
+}
+
+impl Kind {
+    fn as_public(&self) -> ErrorKind {
+        match *self {
+            Kind::Transient(code) => ErrorKind::Transient(code),
+            Kind::Permanent(code) => ErrorKind::Permanent(code),
+            Kind::Response => ErrorKind::Response,
+            Kind::Client => ErrorKind::Client,
+            Kind::Connection => ErrorKind::Connection,
+            Kind::Network => ErrorKind::Network,
+            #[cfg(feature = "native-tls")]
+            Kind::Tls => ErrorKind::Tls,
+            Kind::TransportShutdown => ErrorKind::TransportShutdown,
+        }
+    }
 }
 
 impl fmt::Debug for Error {
@@ -199,4 +265,45 @@ pub(crate) fn tls<E: Into<BoxError>>(e: E) -> Error {
 
 pub(crate) fn transport_shutdown() -> Error {
     Error::new::<BoxError>(Kind::TransportShutdown, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorKind, code, connection, network};
+    use crate::transport::smtp::response::{Category, Code, Detail, Severity};
+
+    #[test]
+    fn exposes_connection_kind() {
+        let error = connection("server closed the connection");
+
+        assert_eq!(error.kind(), ErrorKind::Connection);
+        assert!(error.is_connection());
+        assert!(!error.is_network());
+        assert!(!error.is_transient());
+        assert!(!error.is_permanent());
+    }
+
+    #[test]
+    fn exposes_network_kind() {
+        let error = network("socket write failed");
+
+        assert_eq!(error.kind(), ErrorKind::Network);
+        assert!(error.is_network());
+        assert!(!error.is_connection());
+    }
+
+    #[test]
+    fn exposes_smtp_reply_kind_and_status() {
+        let status = Code::new(
+            Severity::TransientNegativeCompletion,
+            Category::Connections,
+            Detail::Zero,
+        );
+        let error = code(status, None);
+
+        assert_eq!(error.kind(), ErrorKind::Transient(status));
+        assert_eq!(error.status(), Some(status));
+        assert!(error.is_transient());
+        assert!(!error.is_permanent());
+    }
 }

@@ -192,7 +192,7 @@ pub use self::async_transport::{AsyncSmtpTransport, AsyncSmtpTransportBuilder};
 #[cfg(feature = "pool")]
 pub use self::pool::PoolConfig;
 pub use self::{
-    error::Error,
+    error::{Error, ErrorKind},
     transport::{SmtpTransport, SmtpTransportBuilder},
 };
 #[cfg(feature = "native-tls")]

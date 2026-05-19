@@ -69,15 +69,21 @@ impl Mailbox {
     }
 
     pub(crate) fn encode(&self, w: &mut EmailWriter<'_>) -> FmtResult {
+        let mut has_display_name = false;
+
         if let Some(name) = &self.name {
-            email_encoding::headers::quoted_string::encode(name, w)?;
-            w.space();
-            w.write_char('<')?;
+            let name = name.trim();
+            if !name.is_empty() {
+                encode_display_name(name, w)?;
+                w.space();
+                w.write_char('<')?;
+                has_display_name = true;
+            }
         }
 
         w.write_str(self.email.as_ref())?;
 
-        if self.name.is_some() {
+        if has_display_name {
             w.write_char('>')?;
         }
 
@@ -357,6 +363,22 @@ impl FromStr for Mailboxes {
     }
 }
 
+fn encode_display_name(name: &str, w: &mut EmailWriter<'_>) -> FmtResult {
+    if is_valid_phrase(name) {
+        w.write_str(name)
+    } else {
+        email_encoding::headers::quoted_string::encode(name, w)
+    }
+}
+
+fn is_valid_phrase(name: &str) -> bool {
+    name.as_bytes()
+        .iter()
+        .copied()
+        .all(|c| is_valid_atext_char(c) || matches!(c, b'\t' | b' '))
+        && name.as_bytes().iter().copied().any(is_valid_atext_char)
+}
+
 // https://datatracker.ietf.org/doc/html/rfc2822#section-3.2.6
 fn write_word(f: &mut Formatter<'_>, s: &str) -> FmtResult {
     if s.as_bytes().iter().copied().all(is_valid_atom_char) {
@@ -375,11 +397,19 @@ fn write_word(f: &mut Formatter<'_>, s: &str) -> FmtResult {
 
 // https://datatracker.ietf.org/doc/html/rfc2822#section-3.2.4
 fn is_valid_atom_char(c: u8) -> bool {
-    matches!(c,
-		// Not really allowed but can be inserted between atoms.
-		b'\t' |
+    matches!(
+        c,
+        // Not really allowed but can be inserted between atoms.
+        b'\t' |
 		b' ' |
 
+		// Not technically allowed but will be escaped into allowed characters.
+		128..=255
+    ) || is_valid_atext_char(c)
+}
+
+fn is_valid_atext_char(c: u8) -> bool {
+    matches!(c,
 		b'!' |
 		b'#' |
 		b'$' |
@@ -390,7 +420,7 @@ fn is_valid_atom_char(c: u8) -> bool {
 		b'+' |
 		b'-' |
 		b'/' |
-		b'0'..=b'8' |
+		b'0'..=b'9' |
 		b'=' |
 		b'?' |
 		b'A'..=b'Z' |
@@ -401,10 +431,7 @@ fn is_valid_atom_char(c: u8) -> bool {
 		b'{' |
 		b'|' |
 		b'}' |
-		b'~' |
-
-		// Not technically allowed but will be escaped into allowed characters.
-		128..=255)
+		b'~')
 }
 
 // https://datatracker.ietf.org/doc/html/rfc2822#section-3.2.5

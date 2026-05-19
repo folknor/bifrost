@@ -178,7 +178,7 @@ mailboxes_header! {
 mod test {
     use pretty_assertions::assert_eq;
 
-    use super::{From, Mailbox, Mailboxes};
+    use super::{From, Mailbox, Mailboxes, ReplyTo};
     use crate::message::header::{HeaderName, HeaderValue, Headers};
 
     #[test]
@@ -199,6 +199,42 @@ mod test {
         headers.set(From(from));
 
         assert_eq!(headers.to_string(), "From: Kayo <kayo@example.com>\r\n");
+    }
+
+    #[test]
+    fn format_single_with_phrase_name() {
+        let from = Mailboxes::new().with("John Smith <john@example.com>".parse().unwrap());
+
+        let mut headers = Headers::new();
+        headers.set(From(from));
+
+        assert_eq!(
+            headers.to_string(),
+            "From: John Smith <john@example.com>\r\n"
+        );
+    }
+
+    #[test]
+    fn format_single_with_digit_name() {
+        let from = Mailboxes::new().with("User9 <user9@example.com>".parse().unwrap());
+
+        let mut headers = Headers::new();
+        headers.set(From(from));
+
+        assert_eq!(headers.to_string(), "From: User9 <user9@example.com>\r\n");
+    }
+
+    #[test]
+    fn format_reply_to_with_phrase_name() {
+        let reply_to = Mailboxes::new().with("John Smith <john@example.com>".parse().unwrap());
+
+        let mut headers = Headers::new();
+        headers.set(ReplyTo(reply_to));
+
+        assert_eq!(
+            headers.to_string(),
+            "Reply-To: John Smith <john@example.com>\r\n"
+        );
     }
 
     #[test]

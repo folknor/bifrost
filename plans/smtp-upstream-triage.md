@@ -199,9 +199,9 @@ Implemented:
 
 Deferred:
 
-- Full timeout semantics for async SMTP command reads/writes, STARTTLS command
-  exchange, `test_connection`, and shared-deadline budgeting
-  (#917/#1027/#978) need a dedicated pass.
+- Shared-deadline budgeting (#917/#1027/#978) needs a dedicated pass if we
+  decide configured timeout should cap the whole connection lifecycle instead
+  of each phase or operation.
 - Focused tests for async DNS and TLS-handshake timeout paths are still needed.
 - Dropping `async-trait` is a larger trait/API rewrite and belongs with the
   async transport redesign.
@@ -247,3 +247,147 @@ Verification:
 
 - `brokkr fmt` passed with only the known brokkr history warning.
 - `brokkr check` passed across default and minimal sweeps.
+
+## Async SMTP command timeout pass
+
+Issues covered:
+
+- #917: async send and connection tests can wait indefinitely when a connected
+  peer stops responding.
+- #1027: async STARTTLS does not carry the configured timeout through the
+  STARTTLS exchange and TLS upgrade.
+- #978: async `test_connection` can block waiting for the `NOOP` response.
+
+Implemented:
+
+- `AsyncSmtpConnection` now records the configured timeout and the runtime used
+  to create it.
+- Async SMTP writes, flushes, and response reads are wrapped in the configured
+  per-operation timeout for both tokio and async-std.
+- Initial banner reads and EHLO during async connection setup now use the same
+  timeout path.
+- STARTTLS now passes the configured timeout into the native-tls upgrade rather
+  than using an unbounded handshake.
+- Added tokio regression tests for timing out while waiting for the initial
+  banner and while waiting for a command response.
+
+Verification:
+
+- `brokkr fmt` passed with only the known brokkr history warning.
+- `brokkr check --package bifrost-smtp --features tokio1-native-tls -- -- times_out`
+  passed.
+
+## Upstream issue 1125: display-name quoting and DKIM
+
+Upstream issue: https://github.com/lettre/lettre/issues/1125
+
+Problem:
+
+- The header encoder used quoted-string formatting for every display name with
+  whitespace, producing `"John Smith" <john@example.com>`.
+- Gmail may later render or reserialize that as `John Smith <john@example.com>`.
+  When the original message was DKIM-signed over `From` or `Reply-To`, that
+  harmless-looking syntactic rewrite can invalidate the signature.
+
+Decision:
+
+- Encode plain RFC 5322 phrase names as phrase text instead of quoted strings.
+- Keep the existing encoded-word/quoted-string path for names containing
+  punctuation that is not valid `atext`, names needing escaping, and non-ASCII
+  names.
+
+Implemented:
+
+- `Mailbox::encode` now trims display names like `Display` already did and
+  skips empty display names. This intentionally drops the old header-only
+  behavior where a whitespace-only name could still force angle brackets.
+- Display names made of atom characters separated by spaces or tabs are written
+  directly, so `John Smith` remains unquoted in `From` and `Reply-To`.
+- Fixed the inherited atom-range typo that treated `9` as invalid in display
+  names, which made names such as `User9` quote unnecessarily.
+- Names such as `Pony P.`, names containing commas, and non-ASCII names still
+  use the previous encoder path.
+- Added regression coverage for `From` and `Reply-To` phrase display names,
+  including a display name ending in `9`.
+
+Verification:
+
+- `brokkr fmt` passed with only the known brokkr history warning.
+- `brokkr check --package bifrost-smtp --features builder` passed.
+- `brokkr check --package bifrost-smtp --features builder -- -- format_single_with_phrase_name`
+  passed.
+- `brokkr check --package bifrost-smtp --features builder -- -- format_reply_to_with_phrase_name`
+  passed.
+
+## Upstream issues 927 and 1104: DKIM default canonicalization
+
+Upstream issues:
+
+- https://github.com/lettre/lettre/issues/927
+- https://github.com/lettre/lettre/issues/1104
+
+Problem:
+
+- `DkimConfig::default_config` used `simple/relaxed`, which is brittle when
+  MTAs rewrap, refold, or normalize signed headers.
+- `relaxed/relaxed` is the practical default users expect, and upstream agreed
+  there was no strong reason to keep the original `simple` header default.
+
+Implemented:
+
+- `DkimCanonicalization::default()` is now `relaxed/relaxed`.
+- `DkimConfig::default_config(...)` now uses that default instead of
+  duplicating a hard-coded canonicalization pair.
+- `bifrost-smtp` now uses `sha2` 0.10 for DKIM so RSA signing builds against
+  the digest traits expected by `rsa` 0.9.
+- Removed stale debug macros from DKIM tests that were only caught once the
+  `dkim` feature was checked.
+- Added regression coverage for the default config canonicalization.
+- Marked the public DKIM enum types as non-exhaustive while this fork is still
+  free to break API.
+
+Verification:
+
+- `brokkr fmt` passed with only the known brokkr history warning.
+- `brokkr check --package bifrost-smtp --features dkim` passed.
+
+## Upstream issues 940 and 965: SMTP error classification
+
+Upstream issues:
+
+- https://github.com/lettre/lettre/issues/940
+- https://github.com/lettre/lettre/issues/965
+
+Problem:
+
+- Users could not match on SMTP error kind without relying on debug strings or
+  incomplete boolean helpers.
+- `is_transient` and `is_permanent` read like opposites, but both are false for
+  parse, client, connection, network, TLS, and shutdown errors.
+
+Implemented:
+
+- Added public `transport::smtp::ErrorKind` and `Error::kind()` for structured
+  classification.
+- Added `Error::is_connection()` and `Error::is_network()` helpers.
+- Clarified docs for `is_response`, `is_transient`, and `is_permanent`.
+- Re-exported `ErrorKind` next to `Error` from `transport::smtp`.
+- Added unit coverage for connection, network, and SMTP reply classifications.
+
+Verification:
+
+- `brokkr fmt` passed with only the known brokkr history warning.
+- `brokkr check --package bifrost-smtp --features builder -- -- exposes_connection_kind`
+  passed.
+- `brokkr check --package bifrost-smtp --features builder` passed.
+
+Final SMTP-only verification after concurrent IMAP edits:
+
+- From `crates/smtp`: `brokkr check --features builder` passed.
+- From `crates/smtp`: `brokkr check --features dkim` passed.
+- From `crates/smtp`: `brokkr check --features tokio1-native-tls -- -- times_out`
+  passed.
+
+Root-level `brokkr check` is currently blocked by gremlin findings in concurrent
+IMAP proto files, so these verification runs were scoped to the SMTP crate
+without rewriting IMAP files.
