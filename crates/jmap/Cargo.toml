@@ -10,7 +10,6 @@ authors.workspace = true
 homepage = "https://github.com/folknor/bifrost"
 keywords = ["jmap", "email", "mail", "e-mail"]
 categories = ["email"]
-readme = "README.md"
 
 [lib]
 doctest = false

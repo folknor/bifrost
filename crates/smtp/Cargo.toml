@@ -10,7 +10,6 @@ authors.workspace = true
 homepage = "https://github.com/folknor/bifrost"
 keywords = ["email", "smtp", "mailer", "message", "sendmail"]
 categories = ["email", "network-programming"]
-readme = "README.md"
 
 [lib]
 doctest = false
