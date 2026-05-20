@@ -7,6 +7,95 @@ impl ImapConnection {
     // Authentication
     // -----------------------------------------------------------------------
 
+    /// Authenticate using a policy-selected mechanism.
+    ///
+    /// Password credentials prefer SCRAM-SHA-256, SCRAM-SHA-1, then PLAIN on
+    /// encrypted connections, then CRAM-MD5 only when explicitly allowed by
+    /// policy and TLS is active. LOGIN is never used unless explicitly
+    /// allowed in [`AuthPolicy`].
+    ///
+    /// OAuth credentials currently use XOAUTH2.
+    pub async fn authenticate_best(
+        &self,
+        credentials: &crate::types::Credentials,
+        policy: &crate::types::AuthPolicy,
+        timeout: Duration,
+    ) -> Result<crate::types::AuthOutcome, Error> {
+        use crate::types::{AuthMechanism, AuthOutcome, Credentials};
+
+        let profile = self.server_profile();
+        match credentials {
+            Credentials::OAuth2 {
+                identity,
+                access_token,
+            } => {
+                if !profile.supports_auth(AuthMechanism::XOAuth2) {
+                    return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
+                }
+                self.authenticate_xoauth2(identity, access_token.as_str(), timeout)
+                    .await?;
+                Ok(AuthOutcome {
+                    mechanism: AuthMechanism::XOAuth2,
+                })
+            }
+            Credentials::Password { username, password } => {
+                for mechanism in [
+                    AuthMechanism::ScramSha256,
+                    AuthMechanism::ScramSha1,
+                    AuthMechanism::Plain,
+                    AuthMechanism::CramMd5,
+                    AuthMechanism::Login,
+                ] {
+                    if !profile.supports_auth(mechanism) {
+                        continue;
+                    }
+                    match mechanism {
+                        AuthMechanism::ScramSha256 => {
+                            self.authenticate_scram_sha256(username, password.as_str(), timeout)
+                                .await?;
+                        }
+                        AuthMechanism::ScramSha1 => {
+                            self.authenticate_scram_sha1(username, password.as_str(), timeout)
+                                .await?;
+                        }
+                        AuthMechanism::Plain => {
+                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                continue;
+                            }
+                            self.authenticate_plain(username, password.as_str(), timeout)
+                                .await?;
+                        }
+                        AuthMechanism::CramMd5 => {
+                            if !policy.allow_cram_md5 {
+                                continue;
+                            }
+                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                continue;
+                            }
+                            self.authenticate_cram_md5(username, password.as_str(), timeout)
+                                .await?;
+                        }
+                        AuthMechanism::Login => {
+                            if !policy.allow_login {
+                                continue;
+                            }
+                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                continue;
+                            }
+                            self.login(username, password.as_str(), timeout).await?;
+                        }
+                        AuthMechanism::XOAuth2 => unreachable!("password path skips XOAUTH2"),
+                    }
+                    return Ok(AuthOutcome { mechanism });
+                }
+                Err(Error::AuthPolicy(
+                    "no permitted server authentication mechanism matched the supplied credentials"
+                        .into(),
+                ))
+            }
+        }
+    }
+
     /// Authenticate with LOGIN command (RFC 3501 Section 6.2.3).
     ///
     /// **Note:** LOGIN is deprecated in `IMAP4rev2` (RFC 9051 Section 2.2).

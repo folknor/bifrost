@@ -5,59 +5,10 @@
 //!
 //! Client commands are defined in RFC 3501 Section 6 / RFC 9051 Section 6.
 
-use std::fmt;
-use std::ops::Deref;
-
 use super::flag::Flag;
 use super::mailbox::MailboxAttribute;
+use super::secret::SecretString;
 use super::validated::{MailboxName, SequenceSet};
-use zeroize::Zeroizing;
-
-/// Internal zeroizing string for credentials and SASL payloads.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub(crate) struct SecretString(Zeroizing<String>);
-
-impl SecretString {
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl From<String> for SecretString {
-    fn from(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-}
-
-impl From<&str> for SecretString {
-    fn from(value: &str) -> Self {
-        Self(Zeroizing::new(value.to_owned()))
-    }
-}
-
-impl Deref for SecretString {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
-
-impl AsRef<str> for SecretString {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
 
 /// An IMAP command to be encoded and sent to the server.
 #[derive(Debug, Clone)]

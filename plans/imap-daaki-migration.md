@@ -49,9 +49,12 @@ Completed:
   and redact under `Debug`.
 - Gmail `X-GM-MSGID`, `X-GM-THRID`, and `X-GM-EXT-1` support is restored on
   top of daaki's fetch model.
-- `brokkr fmt` passes. Full `brokkr check` passed after the IMAP code changes;
-  the latest rerun after this plan edit is blocked by an unrelated dirty SMTP
-  clippy error in `crates/smtp/src/transport/smtp/client/connection.rs`.
+- The first API ergonomics stretch is complete: typed IDs and sequence sets,
+  secret-aware credentials, auth policy selection, connection config, server
+  profiles, sync helpers, limited and callback-based fetch helpers, event
+  impact mapping, and structured error classification.
+- `brokkr fmt -p bifrost-imap` passes.
+- `brokkr check` passes.
 
 Deliberate choices:
 
@@ -291,6 +294,85 @@ Before a commit, ensure:
 - `Cargo.lock` is updated if dependencies changed
 - the plan contains only current gaps and decisions
 
+### Phase 8: API ergonomics stretch - done
+
+The first post-cutover API pass is intentionally breaking and consumer-first.
+The goal is to make common correct behavior obvious, not to preserve daaki or
+async-imap surface area.
+
+Completed:
+
+- Added typed numeric identities:
+  - `Uid`
+  - `Seq`
+  - `UidValidity`
+  - `ModSeq`
+  - `GmailMessageId`
+  - `GmailThreadId`
+- Added typed sequence-set wrappers:
+  - `UidSet`
+  - `SeqSet`
+  These prevent accidental UID/sequence-number mixing at API boundaries while
+  still reusing the validated IMAP sequence-set encoder.
+- Added public secret handling:
+  - `SecretString`
+  - `IntoSecretString`
+  Secrets redact under `Debug` and zeroize owned storage on drop.
+- Added credential and auth policy types:
+  - `Credentials`
+  - `AuthMechanism`
+  - `AuthPolicy`
+  - `AuthOutcome`
+  `authenticate_best()` chooses a permitted mechanism from advertised server
+  capabilities and refuses cleartext password mechanisms without TLS unless the
+  caller explicitly opts in.
+- Added `ImapConfig` as the low-ceremony connection entry point for implicit
+  TLS, STARTTLS, and plaintext. It also centralizes connect timeout, command
+  timeout, keepalive, and custom native-tls connector configuration.
+- Added `ServerProfile` so callers can ask capability questions without
+  re-learning CAPABILITY, ENABLE, IMAP4rev2 implications, AUTH tokens,
+  APPENDLIMIT, or THREAD algorithm parsing.
+- Added sync-oriented request and result types:
+  - `SyncSelectOptions`
+  - `SyncSelectResult`
+  - `SyncFetchRequest`
+  - `SyncFetchResult`
+  These wrap SELECT/EXAMINE, CONDSTORE, QRESYNC, CHANGEDSINCE, VANISHED, and
+  common full-message fetches behind explicit typed choices.
+- Added fetch helpers that hide channel ceremony:
+  - `uid_fetch_each()`
+  - `uid_fetch_limited()`
+  - `uid_fetch_full_messages()`
+  The limited variant enforces a hard client-side budget in the driver
+  consumer and returns structured `Error::FetchLimit` when crossed.
+- Removed a fetch-loss footgun from the daaki-derived streaming path:
+  `fetch_streaming()` and `uid_fetch_streaming()` now use an unbounded sender
+  instead of a bounded channel plus `try_send`, and buffered `uid_fetch()` no
+  longer depends on that streaming path. A slow consumer can still create
+  memory pressure, but responses are no longer silently dropped.
+- Added event impact mapping:
+  - `TypedEvent::impact()`
+  - `EventImpact`
+  Consumers can classify unsolicited events by mailbox-cache impact without a
+  large ad hoc match in every application.
+- Added error classification:
+  - `Error::category()`
+  - `Error::recovery()`
+  - `Error::response_code()`
+  - `ErrorCategory`
+  - `Recovery`
+  This gives consumers stable policy hooks without string matching server text.
+
+Design constraints for follow-up API work:
+
+- Prefer typed wrappers over raw strings and raw integers at public boundaries.
+- Prefer a single high-level method for the common safe flow, while keeping the
+  protocol-shaped primitive available underneath.
+- Refuse footguns by default. Cleartext auth, LOGIN, and lossy UID/sequence
+  conversions should be explicit.
+- Keep connection I/O driver-owned. Do not reintroduce public stream ownership
+  or boxed transport escape hatches unless a concrete consumer requires them.
+
 ## Risk Register
 
 - Size: even without integration tests, this is a large source import. Keep the
@@ -313,8 +395,10 @@ Before a commit, ensure:
 
 ## Next Work
 
-- Ratatoskr integration should drive ergonomic polish on names and return
-  shapes.
+- Keep replacing raw-string and raw-integer protocol boundaries with typed
+  request/response objects where the safety win is obvious.
+- Consider typed mailbox names, mailbox paths, and flag sets next. These are
+  still common footgun points.
 - Clean imported clippy style warnings when touching nearby code.
 - Continue structured error cleanup.
 - Add more deterministic unit coverage for new IMAP auth edge cases if an

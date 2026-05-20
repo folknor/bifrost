@@ -9,41 +9,31 @@ impl ImapConnection {
 
     /// UID FETCH (RFC 3501 Section 6.4.5).
     ///
-    /// Thin wrapper around [`uid_fetch_streaming`](Self::uid_fetch_streaming)
-    /// that collects all responses into a `Vec`. Logs a warning when the
-    /// buffered data exceeds 10 MB to nudge callers toward the streaming
-    /// variant for large result sets.
+    /// Collects all responses into a `Vec`. Logs a warning when the buffered
+    /// data exceeds 10 MB to nudge callers toward the streaming variant for
+    /// large result sets.
     pub async fn uid_fetch(
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
         timeout: Duration,
     ) -> Result<Vec<FetchResponse>, Error> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        let fetch_fut = self.uid_fetch_streaming(sequence_set, items, tx, timeout);
-        let collect_fut = async {
-            let mut out = Vec::new();
-            let mut total_bytes: usize = 0;
-            let mut warned = false;
-            while let Some(resp) = rx.recv().await {
-                let resp = resp?;
-                total_bytes += dispatch::estimate_fetch_response_bytes(&resp);
-                if !warned && total_bytes > dispatch::DEFAULT_FETCH_WARN_BYTES {
-                    tracing::warn!(
-                        estimated_bytes = total_bytes,
-                        threshold = dispatch::DEFAULT_FETCH_WARN_BYTES,
-                        "uid_fetch buffered >{} MB  -  consider uid_fetch_streaming",
-                        dispatch::DEFAULT_FETCH_WARN_BYTES / (1024 * 1024),
-                    );
-                    warned = true;
-                }
-                out.push(resp);
-            }
-            Ok::<_, Error>(out)
-        };
-        let (fetch_result, collect_result) = tokio::join!(fetch_fut, collect_fut);
-        fetch_result?;
-        collect_result
+        self.validate_requested_fetch_items(items)?;
+        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        self.fetch_impl(
+            Command::UidFetch {
+                sequence_set: sequence_set.clone(),
+                items: format_fetch_attrs(items),
+                changed_since: None,
+                vanished: false,
+            },
+            None,
+            timeout,
+        )
+        .await
     }
 
     /// UID FETCH with CHANGEDSINCE modifier (RFC 7162 Section 3.1.4).
@@ -154,14 +144,12 @@ impl ImapConnection {
 
     /// UID FETCH streaming (RFC 3501 Section 6.4.5).
     ///
-    /// Pushes each [`FetchResponse`] through the provided `tx` channel as it
-    /// arrives from the server, rather than buffering the entire result set
-    /// in memory. The channel is closed when the tagged OK is received
-    /// (the consumer drops `tx` in [`finalize`]).
+    /// Pushes each [`FetchResponse`] through the provided unbounded channel as
+    /// it arrives from the server, rather than buffering the entire result set
+    /// in memory. The channel is closed when the tagged OK is received.
     ///
-    /// Callers should read from the corresponding `rx` concurrently or drain
-    /// it after this method returns  -  responses are sent via `try_send`, so
-    /// the channel buffer must be large enough to hold in-flight data.
+    /// If the receiver is dropped, the driver still drains the command to the
+    /// tagged completion so the IMAP stream remains synchronized.
     ///
     /// Prefer this over [`uid_fetch`](Self::uid_fetch) when the result set
     /// may be large enough to cause memory pressure.
@@ -169,7 +157,7 @@ impl ImapConnection {
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
-        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
         self.validate_requested_fetch_items(items)?;
@@ -199,7 +187,7 @@ impl ImapConnection {
     pub(super) async fn fetch_streaming_impl(
         &self,
         cmd: Command,
-        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
         self.require_state(&[SessionState::Selected])?;

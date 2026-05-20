@@ -125,6 +125,7 @@ impl DetachedPipeline {
             events_rx: tokio::sync::Mutex::new(events_rx),
             driver_handle: tokio::sync::Mutex::new(None),
             prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
+            tls_active: std::sync::atomic::AtomicBool::new(false),
             host: String::new(),
         };
         // Leak the connection so the reference lives 'a.

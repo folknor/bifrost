@@ -183,6 +183,9 @@ impl ImapConnection {
             driver_handle: tokio::sync::Mutex::new(Some(handle)),
             prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
             host: host.to_owned(),
+            tls_active: std::sync::atomic::AtomicBool::new(
+                tls_mode.uses_implicit_tls() || tls_mode.uses_starttls(),
+            ),
         })
     }
 
@@ -303,6 +306,9 @@ impl ImapConnection {
             }),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Timeout)??;
+        self.tls_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 }

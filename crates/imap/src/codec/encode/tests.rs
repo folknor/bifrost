@@ -34,12 +34,28 @@ fn opts(literal_mode: LiteralMode, utf8_mode: bool) -> EncodeOptions {
             Capability::LiteralMinus,
             Capability::Sort,
         ],
+        enabled: Vec::new(),
     }
 }
 
 /// Shorthand: synchronizing literals, no UTF-8.
 fn default_opts() -> EncodeOptions {
     opts(LiteralMode::Synchronizing, false)
+}
+
+#[test]
+fn encode_enable_uses_imap4rev2_base_capability() {
+    let opts = EncodeOptions {
+        utf8_mode: false,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![Capability::Imap4Rev2],
+        enabled: Vec::new(),
+    };
+    let cmd = Command::Enable {
+        capabilities: vec!["QRESYNC".to_owned()],
+    };
+    let encoded = encode_command("A001", &cmd, &opts).unwrap();
+    assert_eq!(&encoded.into_buf()[..], b"A001 ENABLE QRESYNC\r\n");
 }
 
 #[test]

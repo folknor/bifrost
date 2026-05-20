@@ -1745,6 +1745,7 @@ fn build_encode_options(state: &super::state::ProtocolState) -> EncodeOptions {
         utf8_mode: utf8_mode(state),
         literal_mode: literal_mode(state),
         capabilities: state.capabilities().to_vec(),
+        enabled: state.enabled().to_vec(),
     }
 }
 

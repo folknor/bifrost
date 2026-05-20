@@ -1476,6 +1476,10 @@ fn capability_from_str_known_variants() {
     assert_eq!(Capability::from("QRESYNC"), Capability::QResync);
     assert_eq!(Capability::from("MOVE"), Capability::Move);
     assert_eq!(Capability::from("NAMESPACE"), Capability::Namespace);
+    assert_eq!(
+        Capability::from("STATUS=DELETED"),
+        Capability::StatusDeleted
+    );
     assert_eq!(Capability::from("X-GM-EXT-1"), Capability::XGmExt1);
 }
 

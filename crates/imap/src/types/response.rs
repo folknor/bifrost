@@ -499,6 +499,8 @@ pub enum Capability {
     Thread(String),
     /// `STATUS=SIZE` (RFC 8438).
     StatusSize,
+    /// `STATUS=DELETED` (RFC 9051 Section 6.3.11).
+    StatusDeleted,
     /// `UIDPLUS` (RFC 4315).
     UidPlus,
     /// `UNAUTHENTICATE` (RFC 8437 Section 2).
@@ -568,6 +570,7 @@ impl Capability {
             Self::SpecialUse => "SPECIAL-USE".into(),
             Self::Thread(s) => format!("THREAD={s}"),
             Self::StatusSize => "STATUS=SIZE".into(),
+            Self::StatusDeleted => "STATUS=DELETED".into(),
             Self::Unauthenticate => "UNAUTHENTICATE".into(),
             Self::UidPlus => "UIDPLUS".into(),
             Self::Unselect => "UNSELECT".into(),
@@ -624,6 +627,7 @@ impl Capability {
             "SPECIAL-USE" => Self::SpecialUse,
             "STARTTLS" => Self::StartTls,
             "STATUS=SIZE" => Self::StatusSize,
+            "STATUS=DELETED" => Self::StatusDeleted,
             // RFC 8437 Section 2: UNAUTHENTICATE command support.
             "UNAUTHENTICATE" => Self::Unauthenticate,
             "UIDPLUS" => Self::UidPlus,
@@ -768,6 +772,7 @@ impl PartialEq for Capability {
             | (Self::StartTls, Self::StartTls)
             | (Self::SpecialUse, Self::SpecialUse)
             | (Self::StatusSize, Self::StatusSize)
+            | (Self::StatusDeleted, Self::StatusDeleted)
             | (Self::Unauthenticate, Self::Unauthenticate)
             | (Self::UidPlus, Self::UidPlus)
             | (Self::Unselect, Self::Unselect)

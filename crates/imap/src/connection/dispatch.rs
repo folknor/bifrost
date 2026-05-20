@@ -1167,13 +1167,12 @@ fn is_select_solicited_response(
             if *consumed_select_list {
                 return false;
             }
-            if let Some(target) = ctx.command_target() {
-                if inbox_eq(target.as_str(), info.name.as_str())
-                    && !super::is_notify_list_event(info, true)
-                {
-                    *consumed_select_list = true;
-                    return true;
-                }
+            if let Some(target) = ctx.command_target()
+                && inbox_eq(target.as_str(), info.name.as_str())
+                && !super::is_notify_list_event(info, true)
+            {
+                *consumed_select_list = true;
+                return true;
             }
             false
         }
@@ -1227,12 +1226,11 @@ fn validate_select_responses(
             // \NonExistent, \NoAccess)  -  those are NOTIFY events, not
             // the mandatory solicited response.
             UntaggedResponse::List(info) => {
-                if let Some(target) = ctx.command_target() {
-                    if inbox_eq(target.as_str(), info.name.as_str())
-                        && !super::is_notify_list_event(info, true)
-                    {
-                        saw_list = true;
-                    }
+                if let Some(target) = ctx.command_target()
+                    && inbox_eq(target.as_str(), info.name.as_str())
+                    && !super::is_notify_list_event(info, true)
+                {
+                    saw_list = true;
                 }
             }
             _ => {}
@@ -1443,6 +1441,10 @@ pub(crate) struct FetchConsumer {
     estimated_bytes: usize,
     /// Threshold at which to emit a warn-on-large log.
     warn_threshold: usize,
+    /// Hard caller-supplied memory budget.
+    hard_limit: Option<usize>,
+    /// Estimated size observed when the hard limit was first crossed.
+    limit_exceeded_at: Option<usize>,
     /// Whether the warning has already been emitted (log once).
     warned: bool,
 }
@@ -1454,7 +1456,16 @@ impl FetchConsumer {
             buffered: Vec::new(),
             estimated_bytes: 0,
             warn_threshold: DEFAULT_FETCH_WARN_BYTES,
+            hard_limit: None,
+            limit_exceeded_at: None,
             warned: false,
+        }
+    }
+
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self {
+            hard_limit: Some(limit),
+            ..Self::new()
         }
     }
 }
@@ -1471,7 +1482,15 @@ impl Consumer for FetchConsumer {
         // RFC 3501 Section7.4.2: FETCH responses are the solicited data
         // for FETCH/UID FETCH commands.
         if let UntaggedResponse::Fetch(fr) = resp {
-            self.estimated_bytes += estimate_fetch_response_bytes(&fr);
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_add(estimate_fetch_response_bytes(&fr));
+            if let Some(limit) = self.hard_limit
+                && self.estimated_bytes > limit
+            {
+                self.limit_exceeded_at.get_or_insert(self.estimated_bytes);
+                return;
+            }
             if !self.warned && self.estimated_bytes > self.warn_threshold {
                 tracing::warn!(
                     estimated_bytes = self.estimated_bytes,
@@ -1496,6 +1515,12 @@ impl Consumer for FetchConsumer {
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<Vec<FetchResponse>>, Error> {
         tagged.require_ok()?;
+        if let Some(estimated) = self.limit_exceeded_at {
+            return Err(Error::FetchLimit {
+                estimated,
+                limit: self.hard_limit.expect("limit exceeded requires hard limit"),
+            });
+        }
         Ok(Finalized {
             output: self.fetches,
             reclassified_as_events: self.buffered,
@@ -1506,21 +1531,23 @@ impl Consumer for FetchConsumer {
 /// Streaming consumer for FETCH / UID FETCH (RFC 3501 Section6.4.5).
 ///
 /// Instead of buffering all `FETCH` responses into a `Vec`, pushes each
-/// one through an `mpsc::Sender` as it arrives. The dispatcher keeps
+/// one through an `mpsc::UnboundedSender` as it arrives. The dispatcher keeps
 /// reading until the tagged OK regardless of whether the receiver is
 /// still alive  -  this keeps the IMAP stream consistent.
 ///
 /// Non-FETCH responses classified as `Either` are buffered and returned
 /// in `finalize` for the dispatcher to re-emit as events.
 pub(crate) struct StreamingFetchConsumer {
-    tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+    tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
     /// Buffer for ambiguous responses the dispatcher routed here but
     /// that finalize will re-emit as events.
     ambiguous_buffer: Vec<UntaggedResponse>,
 }
 
 impl StreamingFetchConsumer {
-    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>) -> Self {
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
+    ) -> Self {
         Self {
             tx,
             ambiguous_buffer: Vec::new(),
@@ -1540,11 +1567,9 @@ impl Consumer for StreamingFetchConsumer {
         // RFC 3501 Section7.4.2: FETCH responses are the solicited data
         // for FETCH/UID FETCH commands.
         if let UntaggedResponse::Fetch(fr) = resp {
-            // Best-effort push. If the receiver is dropped or the
-            // channel is full, the response is silently dropped  -  the
-            // dispatcher keeps reading until the tagged OK to keep the
-            // stream consistent.
-            let _ = self.tx.try_send(Ok(*fr));
+            // If the receiver is dropped, discard the response but keep
+            // reading until the tagged OK to preserve stream consistency.
+            let _ = self.tx.send(Ok(*fr));
         } else {
             // Non-FETCH response routed to us  -  ambiguous.
             self.ambiguous_buffer.push(resp);

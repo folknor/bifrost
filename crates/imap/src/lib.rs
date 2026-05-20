@@ -72,20 +72,23 @@ mod connection;
 /// Re-export the small address type used by IMAP envelope conversion helpers.
 pub use crate::types::Address;
 pub use connection::{
-    IdleEvent, ImapConnection, SearchResult, SessionState, TcpKeepalive, TlsMode,
+    IdleEvent, ImapConfig, ImapConnection, SearchResult, SessionState, TcpKeepalive, TlsMode,
     typed_event::TypedEvent,
 };
-pub use error::Error;
+pub use error::{Error, ErrorCategory, Recovery};
 pub use types::{
-    AclEntry, AppendMessage, BinarySection, BodySection, BodyStructure, Capability,
-    ContentDisposition, ContinuationRequest, CopyResult, Envelope, EnvelopeAddress,
-    EsearchResponse, ExpungeResult, FetchAttr, FetchResponse, Flag, GreetingResponse,
-    GreetingStatus, ImapAtom, ListRightsResponse, MailboxAttribute, MailboxFilter, MailboxInfo,
-    MailboxName, MetadataEntry, MetadataResult, MoveResult, NamespaceDescriptor, NamespaceResponse,
-    NotifyEvent, NotifyEventGroup, NotifySetParams, ObjectId, QresyncParams, QuotaResource,
-    QuotaRootResponse, Response, ResponseCode, SearchCriteria, SelectOptions, SelectedMailbox,
-    SequenceSet, SpecialUse, StatusItem, StatusKind, StatusResult, StoreOperation, StoreResult,
-    TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus, ValidationError,
+    AclEntry, AppendMessage, AuthMechanism, AuthOutcome, AuthPolicy, BinarySection, BodySection,
+    BodyStructure, Capability, ContentDisposition, ContinuationRequest, CopyResult, Credentials,
+    Envelope, EnvelopeAddress, EsearchResponse, EventImpact, ExpungeResult, FetchAttr,
+    FetchResponse, Flag, GmailMessageId, GmailThreadId, GreetingResponse, GreetingStatus, ImapAtom,
+    IntoSecretString, ListRightsResponse, MailboxAttribute, MailboxFilter, MailboxInfo,
+    MailboxName, MetadataEntry, MetadataResult, ModSeq, MoveResult, NamespaceDescriptor,
+    NamespaceResponse, NotifyEvent, NotifyEventGroup, NotifySetParams, ObjectId, QresyncParams,
+    QuotaResource, QuotaRootResponse, Response, ResponseCode, SearchCriteria, SecretString,
+    SelectOptions, SelectedMailbox, Seq, SeqSet, SequenceSet, ServerProfile, SpecialUse,
+    StatusItem, StatusKind, StatusResult, StoreOperation, StoreResult, SyncFetchRequest,
+    SyncFetchResult, SyncSelectOptions, SyncSelectResult, TaggedResponse, ThreadNode, Uid,
+    UidRange, UidSet, UidValidity, UntaggedResponse, UntaggedStatus, ValidationError,
 };
 
 /// Result type alias for IMAP operations.

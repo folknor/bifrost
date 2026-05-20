@@ -34,8 +34,10 @@ use crate::types::{
 
 mod append;
 mod auth;
+mod config;
 pub(super) mod dispatch;
 pub(super) mod driver;
+mod ergonomics;
 mod extensions;
 mod helpers;
 mod idle;
@@ -54,6 +56,8 @@ mod tag;
 pub mod typed_event;
 mod uid_ops;
 pub(super) mod wire;
+
+pub use config::ImapConfig;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -580,15 +584,12 @@ impl ImapStream {
             Self::Tls(tls) => {
                 SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
             }
-            Self::Compressed(c) => {
-                let inner_result = match &c.inner {
-                    InnerStream::Plain(tcp) => SockRef::from(tcp).set_tcp_keepalive(&sock_ka),
-                    InnerStream::Tls(tls) => {
-                        SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
-                    }
-                };
-                inner_result
-            }
+            Self::Compressed(c) => match &c.inner {
+                InnerStream::Plain(tcp) => SockRef::from(tcp).set_tcp_keepalive(&sock_ka),
+                InnerStream::Tls(tls) => {
+                    SockRef::from(tls.get_ref().get_ref().get_ref()).set_tcp_keepalive(&sock_ka)
+                }
+            },
             Self::Poisoned => {
                 return Err(Error::Io(std::sync::Arc::new(std::io::Error::other(
                     "cannot set keepalive: stream is in upgrade transition",
@@ -658,6 +659,8 @@ pub struct ImapConnection {
     /// Needed to construct the `ServerName` for TLS SNI and certificate
     /// verification when the caller invokes `starttls()`.
     host: String,
+    /// Whether the current transport is encrypted.
+    tls_active: std::sync::atomic::AtomicBool,
 }
 
 /// Per-type NOTIFY flags (RFC 5465 Sections 5.1-5.8).
@@ -767,6 +770,7 @@ impl std::fmt::Debug for ImapConnection {
         f.debug_struct("ImapConnection")
             .field("state", &snapshot.session_state)
             .field("capabilities_count", &snapshot.capabilities.len())
+            .field("encrypted", &self.is_encrypted())
             .field("cmd_tx_closed", &self.cmd_tx.is_closed())
             .finish_non_exhaustive()
     }

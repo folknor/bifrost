@@ -76,6 +76,7 @@ async fn make_driver_test_pair() -> (ImapConnection, tokio::io::DuplexStream) {
         events_rx: tokio::sync::Mutex::new(events_rx),
         driver_handle: tokio::sync::Mutex::new(Some(handle)),
         prebuilt_tag_counter: std::sync::atomic::AtomicU32::new(0),
+        tls_active: std::sync::atomic::AtomicBool::new(false),
         host: "test".into(),
     };
 

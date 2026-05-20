@@ -58,6 +58,14 @@ Planned (not yet present in this workspace): `bifrost-imap`, `bifrost-graph`, `b
 - Has `Cargo.lock` changed? Commit it.
 - Never `git push` unless the user explicitly asks. Stop after the commit.
 
+### Testing rules
+
+- Bifrost tests are small and technical. Parser tests, encoder tests, type-level checks, validation rules, error classification, serde round-trips. That is the entire scope.
+- Do not add end-to-end, integration, or live-server tests in this repo. Do not spawn mock servers from bifrost tests. Do not add Docker-driven, fixed-port, or external-account harnesses.
+- Public APIs are exercised end-to-end downstream, not here. Bifrost does not prove its own protocol round-trips at the integration level.
+- When in doubt, write the smallest deterministic unit test that pins the behavior. If the test needs a real server, the test belongs elsewhere.
+- Do not propose growing the suite to "match coverage of similar crates." The size of the suite is a deliberate choice, not an oversight.
+
 ## Commands
 
 Use `brokkr` (not `cargo`) for check/test. By default output is filtered to changed files and capped at 20 diagnostics per phase.

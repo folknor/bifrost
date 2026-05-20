@@ -1,0 +1,167 @@
+#![allow(clippy::wildcard_imports)]
+use super::*;
+
+impl ImapConnection {
+    /// SELECT or EXAMINE a mailbox using sync-oriented options.
+    ///
+    /// If a complete QRESYNC cursor is provided and the server advertises
+    /// QRESYNC, this method enables QRESYNC before selecting the mailbox.
+    /// Otherwise it falls back to CONDSTORE when requested and available.
+    pub async fn select_for_sync(
+        &self,
+        mailbox: &str,
+        options: &crate::types::SyncSelectOptions,
+        timeout: Duration,
+    ) -> Result<crate::types::SyncSelectResult, Error> {
+        let profile = self.server_profile();
+        let qresync = options.qresync_params();
+        let qresync_used = qresync.is_some() && profile.supports_qresync();
+        let condstore_used = !qresync_used && options.condstore && profile.supports_condstore();
+
+        if qresync_used && !profile.enabled("QRESYNC") {
+            self.enable(&["QRESYNC"], timeout).await?;
+        }
+
+        let select_options = if qresync_used {
+            SelectOptions::qresync(qresync.expect("checked qresync"))
+        } else if condstore_used {
+            SelectOptions::condstore()
+        } else {
+            SelectOptions::default()
+        };
+
+        let mailbox = if options.read_only {
+            self.examine_with(mailbox, &select_options, timeout).await?
+        } else {
+            self.select_with(mailbox, &select_options, timeout).await?
+        };
+
+        Ok(crate::types::SyncSelectResult {
+            mailbox,
+            qresync_used,
+            condstore_used,
+        })
+    }
+
+    /// Execute a sync-oriented UID FETCH.
+    pub async fn sync_fetch(
+        &self,
+        request: &crate::types::SyncFetchRequest,
+        timeout: Duration,
+    ) -> Result<crate::types::SyncFetchResult, Error> {
+        let sequence_set = request.uids.as_sequence_set();
+        if request.include_vanished {
+            let Some(mod_seq) = request.changed_since else {
+                return Err(Error::Protocol(
+                    "include_vanished requires changed_since for UID FETCH".into(),
+                ));
+            };
+            let (fetches, vanished) = self
+                .uid_fetch_vanished(sequence_set, &request.attrs, mod_seq.get(), timeout)
+                .await?;
+            Ok(crate::types::SyncFetchResult { fetches, vanished })
+        } else if let Some(mod_seq) = request.changed_since {
+            let fetches = self
+                .uid_fetch_changed_since(sequence_set, &request.attrs, mod_seq.get(), timeout)
+                .await?;
+            Ok(crate::types::SyncFetchResult {
+                fetches,
+                vanished: Vec::new(),
+            })
+        } else {
+            let fetches = self
+                .uid_fetch(sequence_set, &request.attrs, timeout)
+                .await?;
+            Ok(crate::types::SyncFetchResult {
+                fetches,
+                vanished: Vec::new(),
+            })
+        }
+    }
+
+    /// Stream a UID FETCH into a callback without exposing channel ceremony.
+    pub async fn uid_fetch_each<F>(
+        &self,
+        uids: &crate::types::UidSet,
+        attrs: &[FetchAttr],
+        timeout: Duration,
+        mut on_fetch: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(FetchResponse) -> Result<(), Error>,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fetch_fut = self.uid_fetch_streaming(uids.as_sequence_set(), attrs, tx, timeout);
+        let drain_fut = async {
+            while let Some(fetch) = rx.recv().await {
+                on_fetch(fetch?)?;
+            }
+            Ok::<(), Error>(())
+        };
+        let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
+        fetch_result?;
+        drain_result
+    }
+
+    /// Collect a UID FETCH with a caller-supplied memory budget.
+    pub async fn uid_fetch_limited(
+        &self,
+        uids: &crate::types::UidSet,
+        attrs: &[FetchAttr],
+        max_estimated_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Vec<FetchResponse>, Error> {
+        self.require_state(&[SessionState::Selected])?;
+        self.validate_requested_fetch_items(attrs)?;
+        if uids.as_sequence_set().as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        tokio::time::timeout(
+            timeout,
+            self.submit_regular(
+                Command::UidFetch {
+                    sequence_set: uids.as_sequence_set().clone(),
+                    items: format_fetch_attrs(attrs),
+                    changed_since: None,
+                    vanished: false,
+                },
+                dispatch::FetchConsumer::with_limit(max_estimated_bytes),
+            ),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Fetch full messages by UID without setting `\Seen`.
+    ///
+    /// `max_estimated_bytes` caps the buffered response size. Use
+    /// [`uid_fetch_each`](Self::uid_fetch_each) for unbounded or large
+    /// result sets.
+    pub async fn uid_fetch_full_messages(
+        &self,
+        uids: &crate::types::UidSet,
+        max_estimated_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Vec<FetchResponse>, Error> {
+        let request = crate::types::SyncFetchRequest::full_messages(uids.clone());
+        self.uid_fetch_limited(uids, &request.attrs, max_estimated_bytes, timeout)
+            .await
+    }
+
+    /// Drain pending typed events and return their sync impacts.
+    pub async fn drain_event_impacts(&self) -> Vec<crate::types::EventImpact> {
+        self.drain_events()
+            .await
+            .into_iter()
+            .map(|event| event.impact())
+            .collect()
+    }
+
+    /// Wait for the next event and return its sync impact.
+    pub async fn next_event_impact(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<crate::types::EventImpact>, Error> {
+        Ok(self.next_event(timeout).await?.map(|event| event.impact()))
+    }
+}

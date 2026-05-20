@@ -32,6 +32,21 @@ impl ImapConnection {
         self.state_rx.borrow().capabilities.clone()
     }
 
+    /// Caller-friendly server capability profile snapshot.
+    ///
+    /// This clones the driver's current capability and ENABLE state. The
+    /// result is stale after STARTTLS, authentication, or ENABLE; call this
+    /// method again after those transitions before making feature decisions.
+    pub fn server_profile(&self) -> crate::types::ServerProfile {
+        let snap = self.state_rx.borrow();
+        crate::types::ServerProfile::new(snap.capabilities.clone(), snap.enabled.clone())
+    }
+
+    /// Whether the current transport is encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.tls_active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Check if `IMAP4rev2` behavior is active (RFC 9051).
     ///
     /// Many extension capabilities (`ESEARCH`, `IDLE`, `MOVE`, etc.) are part of the
@@ -174,10 +189,13 @@ impl ImapConnection {
             return Err(Error::MissingCapability("WITHIN".into()));
         }
 
+        let is_rev2 = super::auth::is_rev2_from_snapshot(&snap);
+
         if ["SAVEDBEFORE", "SAVEDON", "SAVEDSINCE", "SAVEDATESUPPORTED"]
             .into_iter()
             .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
             && !snap.capabilities.contains(&Capability::SaveDate)
+            && !is_rev2
         {
             return Err(Error::MissingCapability("SAVEDATE".into()));
         }
@@ -186,6 +204,7 @@ impl ImapConnection {
             .into_iter()
             .any(|atom| Self::search_criteria_contains_atom(criteria, atom))
             && !snap.capabilities.contains(&Capability::ObjectId)
+            && !is_rev2
         {
             return Err(Error::MissingCapability("OBJECTID".into()));
         }
@@ -223,11 +242,10 @@ impl ImapConnection {
         let mut lookahead = i;
         if let Some(SearchCriteriaItem::Bare(token)) =
             Self::search_criteria_consume_item(criteria, bytes, &mut lookahead)
+            && token.eq_ignore_ascii_case("CHARSET")
         {
-            if token.eq_ignore_ascii_case("CHARSET") {
-                i = lookahead;
-                let _ = Self::search_criteria_consume_item(criteria, bytes, &mut i);
-            }
+            i = lookahead;
+            let _ = Self::search_criteria_consume_item(criteria, bytes, &mut i);
         }
 
         while i < bytes.len() {
@@ -490,9 +508,12 @@ impl ImapConnection {
         {
             let snap = self.state_rx.borrow();
 
-            // RFC 9051 Appendix C keeps RFC 5258's parenthesized multiple-pattern
-            // syntax behind the LIST-EXTENDED capability, even for IMAP4rev2.
-            if patterns.len() > 1 && !snap.capabilities.contains(&Capability::ListExtended) {
+            let is_rev2 = super::auth::is_rev2_from_snapshot(&snap);
+
+            if patterns.len() > 1
+                && !snap.capabilities.contains(&Capability::ListExtended)
+                && !is_rev2
+            {
                 return Err(Error::MissingCapability("LIST-EXTENDED".into()));
             }
 
@@ -504,7 +525,7 @@ impl ImapConnection {
 
             if needs_list_extended
                 && !snap.capabilities.contains(&Capability::ListExtended)
-                && !super::auth::is_rev2_from_snapshot(&snap)
+                && !is_rev2
             {
                 return Err(Error::MissingCapability("LIST-EXTENDED".into()));
             }
@@ -520,6 +541,7 @@ impl ImapConnection {
                 }
                 if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
                     && !snap.capabilities.contains(&Capability::SpecialUse)
+                    && !is_rev2
                 {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
@@ -541,8 +563,10 @@ impl ImapConnection {
 
             {
                 let snap = self.state_rx.borrow();
+                let is_rev2 = super::auth::is_rev2_from_snapshot(&snap);
                 if trimmed.eq_ignore_ascii_case("SPECIAL-USE")
                     && !snap.capabilities.contains(&Capability::SpecialUse)
+                    && !is_rev2
                 {
                     return Err(Error::MissingCapability("SPECIAL-USE".into()));
                 }
@@ -685,7 +709,9 @@ impl ImapConnection {
                 }
                 "MAILBOXID" => {
                     let snap = self.state_rx.borrow();
-                    if !snap.capabilities.contains(&Capability::ObjectId) {
+                    if !snap.capabilities.contains(&Capability::ObjectId)
+                        && !super::auth::is_rev2_from_snapshot(&snap)
+                    {
                         return Err(Error::MissingCapability("OBJECTID".into()));
                     }
                 }
@@ -730,13 +756,13 @@ impl ImapConnection {
                 }
                 // RFC 8514 Section 3: SAVEDATE requires SAVEDATE capability.
                 FetchAttr::SaveDate => {
-                    if !snap.capabilities.contains(&Capability::SaveDate) {
+                    if !snap.capabilities.contains(&Capability::SaveDate) && !is_rev2 {
                         return Err(Error::MissingCapability("SAVEDATE".into()));
                     }
                 }
                 // RFC 8474 Sections 4 and 7: EMAILID/THREADID require OBJECTID.
                 FetchAttr::EmailId | FetchAttr::ThreadId => {
-                    if !snap.capabilities.contains(&Capability::ObjectId) {
+                    if !snap.capabilities.contains(&Capability::ObjectId) && !is_rev2 {
                         return Err(Error::MissingCapability("OBJECTID".into()));
                     }
                 }

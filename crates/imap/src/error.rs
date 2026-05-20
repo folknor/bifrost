@@ -101,6 +101,10 @@ pub enum Error {
     #[error("STARTTLS not supported by server")]
     StartTlsUnavailable,
 
+    /// Authentication policy rejected every mechanism the server offered.
+    #[error("authentication policy rejected authentication: {0}")]
+    AuthPolicy(String),
+
     /// A capability required for the requested operation is not advertised
     /// (RFC 3501 Section 6.1.1).
     #[error("missing required capability: {0}")]
@@ -113,6 +117,15 @@ pub enum Error {
         size: u64,
         /// Server-advertised maximum in octets (RFC 7889 Section 5).
         limit: u64,
+    },
+
+    /// A buffered FETCH exceeded the caller's configured memory budget.
+    #[error("estimated FETCH response size {estimated} exceeds caller limit of {limit}")]
+    FetchLimit {
+        /// Estimated bytes observed while parsing the FETCH responses.
+        estimated: usize,
+        /// Caller-supplied maximum estimated bytes.
+        limit: usize,
     },
 
     /// The date-time string supplied to APPEND does not conform to the
@@ -187,6 +200,7 @@ impl PartialEq for Error {
             }
             (Self::Protocol(a), Self::Protocol(b))
             | (Self::Parse(a), Self::Parse(b))
+            | (Self::AuthPolicy(a), Self::AuthPolicy(b))
             | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
             | (Self::Internal(a), Self::Internal(b))
@@ -205,6 +219,16 @@ impl PartialEq for Error {
                     limit: l2,
                 },
             ) => s1 == s2 && l1 == l2,
+            (
+                Self::FetchLimit {
+                    estimated: e1,
+                    limit: l1,
+                },
+                Self::FetchLimit {
+                    estimated: e2,
+                    limit: l2,
+                },
+            ) => e1 == e2 && l1 == l2,
             _ => false,
         }
     }
@@ -233,6 +257,149 @@ impl Error {
     pub(crate) fn bye_with_code(text: String, code: Option<ResponseCode>) -> Self {
         Self::Bye { text, code }
     }
+
+    /// Return the broad policy category for this error.
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            Self::Io(_) | Self::Closed | Self::DriverGone | Self::DriverPanicked(_) => {
+                ErrorCategory::Transport
+            }
+            Self::Auth { .. } | Self::AuthPolicy(_) => ErrorCategory::Authentication,
+            Self::No { code, .. } | Self::Bad { code, .. } | Self::Bye { code, .. } => {
+                ErrorCategory::from_response_code(code.as_ref())
+            }
+            Self::Protocol(_) => ErrorCategory::Protocol,
+            Self::Parse(_) => ErrorCategory::Parse,
+            Self::Timeout => ErrorCategory::Timeout,
+            Self::StartTlsUnavailable | Self::MissingCapability(_) => ErrorCategory::Capability,
+            Self::AppendLimit { .. } | Self::FetchLimit { .. } => ErrorCategory::Limit,
+            Self::InvalidAppendDate(_) => ErrorCategory::InvalidInput,
+            Self::Internal(_) => ErrorCategory::Internal,
+        }
+    }
+
+    /// Suggested high-level recovery action.
+    pub fn recovery(&self) -> Recovery {
+        match self.category() {
+            ErrorCategory::Transport => Recovery::Reconnect,
+            ErrorCategory::Timeout => Recovery::RetryOrReconnect,
+            ErrorCategory::Authentication => Recovery::Reauthenticate,
+            ErrorCategory::Capability | ErrorCategory::InvalidInput | ErrorCategory::Internal => {
+                Recovery::DoNotRetry
+            }
+            ErrorCategory::Protocol | ErrorCategory::Parse => Recovery::Reconnect,
+            ErrorCategory::Transient => Recovery::RetryAfter,
+            ErrorCategory::Referral => Recovery::FollowReferral,
+            ErrorCategory::NotificationOverflow => Recovery::RebuildNotificationRegistration,
+            ErrorCategory::Authorization | ErrorCategory::Limit | ErrorCategory::ServerRejected => {
+                Recovery::DoNotRetry
+            }
+            ErrorCategory::MailboxState => Recovery::ResyncMailbox,
+        }
+    }
+
+    /// Response code carried by a server status error, if any.
+    pub fn response_code(&self) -> Option<&ResponseCode> {
+        match self {
+            Self::Auth { code, .. }
+            | Self::No { code, .. }
+            | Self::Bad { code, .. }
+            | Self::Bye { code, .. } => code.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+/// Broad error category for consumer policy decisions.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ErrorCategory {
+    Transport,
+    Timeout,
+    Authentication,
+    Authorization,
+    Capability,
+    Limit,
+    MailboxState,
+    Transient,
+    Referral,
+    NotificationOverflow,
+    ServerRejected,
+    Protocol,
+    Parse,
+    InvalidInput,
+    Internal,
+}
+
+impl ErrorCategory {
+    fn from_response_code(code: Option<&ResponseCode>) -> Self {
+        match code {
+            Some(
+                ResponseCode::AuthenticationFailed
+                | ResponseCode::Expired
+                | ResponseCode::PrivacyRequired,
+            ) => Self::Authentication,
+            Some(ResponseCode::AuthorizationFailed | ResponseCode::NoPerm) => Self::Authorization,
+            Some(ResponseCode::ContactAdmin) => Self::Authorization,
+            Some(
+                ResponseCode::OverQuota
+                | ResponseCode::TooBig
+                | ResponseCode::Limit
+                | ResponseCode::MetadataMaxSize(_),
+            ) => Self::Limit,
+            Some(
+                ResponseCode::ExpungeIssued
+                | ResponseCode::UidNotSticky
+                | ResponseCode::Closed
+                | ResponseCode::NoModSeq,
+            ) => Self::MailboxState,
+            Some(ResponseCode::AlreadyExists | ResponseCode::NonExistent) => Self::MailboxState,
+            Some(
+                ResponseCode::Unavailable
+                | ResponseCode::InUse
+                | ResponseCode::Corruption
+                | ResponseCode::TempFail(_),
+            ) => Self::Transient,
+            Some(ResponseCode::Referral(_)) => Self::Referral,
+            Some(ResponseCode::NotificationOverflow(_)) => Self::NotificationOverflow,
+            Some(ResponseCode::Parse) => Self::Parse,
+            Some(ResponseCode::BadCharset(_)) => Self::Capability,
+            Some(
+                ResponseCode::TryCreate
+                | ResponseCode::NotSaved
+                | ResponseCode::MetadataTooMany
+                | ResponseCode::MetadataNoPrivate,
+            ) => Self::MailboxState,
+            Some(ResponseCode::Cannot | ResponseCode::ClientBug | ResponseCode::ServerBug) => {
+                Self::Protocol
+            }
+            _ => Self::ServerRejected,
+        }
+    }
+}
+
+/// Suggested high-level recovery action for an IMAP error.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Recovery {
+    /// The same request may be retried, but reconnecting may also be needed.
+    RetryOrReconnect,
+    /// Drop the connection and establish a new one.
+    Reconnect,
+    /// Re-authenticate before retrying account operations.
+    Reauthenticate,
+    /// Resynchronize the selected mailbox.
+    ResyncMailbox,
+    /// Retry later, optionally honoring backoff information from the server text.
+    RetryAfter,
+    /// Follow the referral target carried by the response code before retrying.
+    FollowReferral,
+    /// Rebuild NOTIFY registration state before relying on asynchronous events.
+    RebuildNotificationRegistration,
+    /// Do not retry automatically.
+    DoNotRetry,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +505,19 @@ mod serde_support {
         Timeout,
         Closed,
         StartTlsUnavailable,
+        AuthPolicy {
+            message: String,
+        },
         MissingCapability {
             capability: String,
         },
         AppendLimit {
             size: u64,
             limit: u64,
+        },
+        FetchLimit {
+            estimated: usize,
+            limit: usize,
         },
         InvalidAppendDate {
             date: String,
@@ -389,11 +563,18 @@ mod serde_support {
                 Error::Timeout => Self::Timeout,
                 Error::Closed => Self::Closed,
                 Error::StartTlsUnavailable => Self::StartTlsUnavailable,
+                Error::AuthPolicy(msg) => Self::AuthPolicy {
+                    message: msg.clone(),
+                },
                 Error::MissingCapability(cap) => Self::MissingCapability {
                     capability: cap.clone(),
                 },
                 Error::AppendLimit { size, limit } => Self::AppendLimit {
                     size: *size,
+                    limit: *limit,
+                },
+                Error::FetchLimit { estimated, limit } => Self::FetchLimit {
+                    estimated: *estimated,
                     limit: *limit,
                 },
                 Error::InvalidAppendDate(msg) => Self::InvalidAppendDate { date: msg.clone() },
@@ -424,8 +605,10 @@ mod serde_support {
                 ErrorRepr::Timeout => Self::Timeout,
                 ErrorRepr::Closed => Self::Closed,
                 ErrorRepr::StartTlsUnavailable => Self::StartTlsUnavailable,
+                ErrorRepr::AuthPolicy { message } => Self::AuthPolicy(message),
                 ErrorRepr::MissingCapability { capability } => Self::MissingCapability(capability),
                 ErrorRepr::AppendLimit { size, limit } => Self::AppendLimit { size, limit },
+                ErrorRepr::FetchLimit { estimated, limit } => Self::FetchLimit { estimated, limit },
                 ErrorRepr::InvalidAppendDate { date } => Self::InvalidAppendDate(date),
                 ErrorRepr::Internal { message } => Self::Internal(message),
                 ErrorRepr::DriverPanicked { message } => Self::DriverPanicked(message),

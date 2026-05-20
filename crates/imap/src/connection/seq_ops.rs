@@ -64,9 +64,12 @@ impl ImapConnection {
 
     /// FETCH streaming by sequence number (RFC 3501 Section 6.4.5).
     ///
-    /// Pushes each [`FetchResponse`] through the provided `tx` channel as it
-    /// arrives from the server, rather than buffering the entire result set
+    /// Pushes each [`FetchResponse`] through the provided unbounded channel as
+    /// it arrives from the server, rather than buffering the entire result set
     /// in memory. The channel is closed when the tagged OK is received.
+    ///
+    /// If the receiver is dropped, the driver still drains the command to the
+    /// tagged completion so the IMAP stream remains synchronized.
     ///
     /// Prefer [`uid_fetch_streaming`](Self::uid_fetch_streaming) for stable
     /// message references.
@@ -74,7 +77,7 @@ impl ImapConnection {
         &self,
         sequence_set: &SequenceSet,
         items: &[FetchAttr],
-        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
+        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
         self.validate_requested_fetch_items(items)?;

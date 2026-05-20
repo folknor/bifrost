@@ -570,6 +570,83 @@ fn auth_with_code_display_shows_text_only() {
 }
 
 #[test]
+fn response_code_categories_cover_policy_hooks() {
+    let cases = vec![
+        (
+            ResponseCode::Unavailable,
+            ErrorCategory::Transient,
+            Recovery::RetryAfter,
+        ),
+        (
+            ResponseCode::InUse,
+            ErrorCategory::Transient,
+            Recovery::RetryAfter,
+        ),
+        (
+            ResponseCode::TempFail(None),
+            ErrorCategory::Transient,
+            Recovery::RetryAfter,
+        ),
+        (
+            ResponseCode::Corruption,
+            ErrorCategory::Transient,
+            Recovery::RetryAfter,
+        ),
+        (
+            ResponseCode::ExpungeIssued,
+            ErrorCategory::MailboxState,
+            Recovery::ResyncMailbox,
+        ),
+        (
+            ResponseCode::Closed,
+            ErrorCategory::MailboxState,
+            Recovery::ResyncMailbox,
+        ),
+        (
+            ResponseCode::ContactAdmin,
+            ErrorCategory::Authorization,
+            Recovery::DoNotRetry,
+        ),
+        (
+            ResponseCode::AlreadyExists,
+            ErrorCategory::MailboxState,
+            Recovery::ResyncMailbox,
+        ),
+        (
+            ResponseCode::NonExistent,
+            ErrorCategory::MailboxState,
+            Recovery::ResyncMailbox,
+        ),
+        (
+            ResponseCode::TooBig,
+            ErrorCategory::Limit,
+            Recovery::DoNotRetry,
+        ),
+        (
+            ResponseCode::MetadataMaxSize(1024),
+            ErrorCategory::Limit,
+            Recovery::DoNotRetry,
+        ),
+        (
+            ResponseCode::Referral(Some("imap://example.test/".to_owned())),
+            ErrorCategory::Referral,
+            Recovery::FollowReferral,
+        ),
+        (
+            ResponseCode::NotificationOverflow(None),
+            ErrorCategory::NotificationOverflow,
+            Recovery::RebuildNotificationRegistration,
+        ),
+    ];
+
+    for (code, category, recovery) in cases {
+        let err = Error::no_with_code("status".into(), Some(code));
+        assert_eq!(err.category(), category);
+        assert_eq!(err.recovery(), recovery);
+    }
+}
+
+#[test]
 fn pattern_match_no_extracts_response_code() {
     let err = Error::no_with_code("over quota".into(), Some(ResponseCode::OverQuota));
     match &err {
@@ -734,9 +811,14 @@ fn all_variants_are_distinguishable() {
         Error::Parse("r".into()),
         Error::Timeout,
         Error::Closed,
+        Error::AuthPolicy("policy".into()),
         Error::StartTlsUnavailable,
         Error::MissingCapability("c".into()),
         Error::AppendLimit { size: 1, limit: 0 },
+        Error::FetchLimit {
+            estimated: 2,
+            limit: 1,
+        },
         Error::InvalidAppendDate("bad date".into()),
         Error::Internal("internal err".into()),
         Error::DriverPanicked("test panic".into()),
@@ -755,9 +837,11 @@ fn all_variants_are_distinguishable() {
             Error::Parse(_) => "parse",
             Error::Timeout => "timeout",
             Error::Closed => "closed",
+            Error::AuthPolicy(_) => "authpolicy",
             Error::StartTlsUnavailable => "starttls",
             Error::MissingCapability(_) => "capability",
             Error::AppendLimit { .. } => "appendlimit",
+            Error::FetchLimit { .. } => "fetchlimit",
             Error::InvalidAppendDate(_) => "invalidappenddate",
             Error::Internal(_) => "internal",
             Error::DriverPanicked(_) => "driverpanicked",

@@ -80,12 +80,14 @@ pub(crate) struct EncodeOptions {
     pub(crate) literal_mode: LiteralMode,
     /// Server-advertised capabilities (RFC 3501 Section 7.2.1).
     pub(crate) capabilities: Vec<Capability>,
+    /// Extensions successfully enabled with ENABLE.
+    pub(crate) enabled: Vec<String>,
 }
 
 impl EncodeOptions {
     /// Check whether the server advertises a specific capability.
     fn has_capability(&self, cap: &Capability) -> bool {
-        self.capabilities.contains(cap)
+        self.capabilities.contains(cap) || self.rev2_implies(cap)
     }
 
     /// Check whether CONDSTORE is available (explicitly or via QRESYNC).
@@ -95,6 +97,43 @@ impl EncodeOptions {
     /// modifier (CHANGEDSINCE, UNCHANGEDSINCE, VANISHED) is present.
     fn has_condstore(&self) -> bool {
         self.has_capability(&Capability::Condstore) || self.has_capability(&Capability::QResync)
+    }
+
+    fn imap4rev2_active(&self) -> bool {
+        let has_rev2 = self.capabilities.contains(&Capability::Imap4Rev2);
+        let has_rev1 = self.capabilities.contains(&Capability::Imap4Rev1);
+        if has_rev2 && has_rev1 {
+            self.enabled
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case("IMAP4rev2"))
+        } else {
+            has_rev2
+        }
+    }
+
+    fn rev2_implies(&self, capability: &Capability) -> bool {
+        self.imap4rev2_active()
+            && matches!(
+                capability,
+                Capability::Binary
+                    | Capability::Enable
+                    | Capability::Esearch
+                    | Capability::Idle
+                    | Capability::ListExtended
+                    | Capability::LiteralMinus
+                    | Capability::LiteralPlus
+                    | Capability::Move
+                    | Capability::Namespace
+                    | Capability::ObjectId
+                    | Capability::SaslIr
+                    | Capability::SaveDate
+                    | Capability::SearchRes
+                    | Capability::SpecialUse
+                    | Capability::StatusDeleted
+                    | Capability::StatusSize
+                    | Capability::UidPlus
+                    | Capability::Unselect
+            )
     }
 }
 
