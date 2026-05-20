@@ -16,6 +16,24 @@ fn tagged_ok() -> TaggedResponse {
     }
 }
 
+fn tagged_no() -> TaggedResponse {
+    TaggedResponse {
+        tag: "A001".into(),
+        status: StatusKind::No,
+        code: None,
+        text: "Rejected".into(),
+    }
+}
+
+fn tagged_bad() -> TaggedResponse {
+    TaggedResponse {
+        tag: "A001".into(),
+        status: StatusKind::Bad,
+        code: None,
+        text: "Bad command".into(),
+    }
+}
+
 fn default_ctx() -> ConsumerContext<'static> {
     ConsumerContext {
         capabilities: &[],
@@ -98,6 +116,69 @@ async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
     assert_eq!(received.len(), 300);
     assert_eq!(received.first().map(|fetch| fetch.seq), Some(1));
     assert_eq!(received.last().map(|fetch| fetch.seq), Some(300));
+}
+
+#[test]
+fn fetch_consumer_propagates_terminal_no_after_data() {
+    let mut consumer = FetchConsumer::new();
+    let ctx = default_ctx();
+
+    consumer.on_response(
+        UntaggedResponse::Fetch(Box::new(FetchResponse {
+            seq: 1,
+            uid: Some(1001),
+            ..Default::default()
+        })),
+        NotifyFlags::default(),
+        &ctx,
+    );
+
+    let err = match Box::new(consumer).finalize(tagged_no(), &ctx) {
+        Err(err) => err,
+        Ok(_) => panic!("terminal NO must fail FETCH"),
+    };
+    assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+}
+
+#[tokio::test]
+async fn streaming_fetch_consumer_propagates_terminal_no_and_closes_channel() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut consumer = StreamingFetchConsumer::new(tx);
+    let ctx = default_ctx();
+
+    consumer.on_response(
+        UntaggedResponse::Fetch(Box::new(FetchResponse {
+            seq: 1,
+            uid: Some(1001),
+            ..Default::default()
+        })),
+        NotifyFlags::default(),
+        &ctx,
+    );
+
+    let err = match Box::new(consumer).finalize(tagged_no(), &ctx) {
+        Err(err) => err,
+        Ok(_) => panic!("terminal NO must fail streaming FETCH"),
+    };
+    assert!(matches!(err, Error::No { text, .. } if text == "Rejected"));
+
+    let first = rx.recv().await.expect("first FETCH should be delivered");
+    assert_eq!(first.unwrap().seq, 1);
+    assert!(rx.recv().await.is_none());
+}
+
+#[test]
+fn expunge_consumer_propagates_terminal_bad_after_data() {
+    let mut consumer = ExpungeConsumer::new();
+    let ctx = default_ctx();
+
+    consumer.on_response(UntaggedResponse::Expunge(3), NotifyFlags::default(), &ctx);
+
+    let err = match Box::new(consumer).finalize(tagged_bad(), &ctx) {
+        Err(err) => err,
+        Ok(_) => panic!("terminal BAD must fail EXPUNGE"),
+    };
+    assert!(matches!(err, Error::Bad { text, .. } if text == "Bad command"));
 }
 
 // ---------------------------------------------------------------------------

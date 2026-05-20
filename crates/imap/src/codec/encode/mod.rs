@@ -120,6 +120,7 @@ impl EncodeOptions {
                     | Capability::Esearch
                     | Capability::Idle
                     | Capability::ListExtended
+                    | Capability::ListStatus
                     | Capability::LiteralMinus
                     | Capability::LiteralPlus
                     | Capability::Move

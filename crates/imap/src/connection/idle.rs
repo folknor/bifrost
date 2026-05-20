@@ -170,8 +170,8 @@ impl ImapConnection {
 /// observable via `state_rx`).
 ///
 /// Handles all `TypedEvent` variants, extracting IDLE-relevant data
-/// from `Extension` variants where needed (e.g., `MailboxStatus`,
-/// `Metadata`, `Search`/`Esearch`).
+/// from `Extension` variants where needed (e.g., `Metadata`,
+/// `Search`/`Esearch`).
 fn typed_event_to_idle_event(ev: TypedEvent) -> Option<IdleEvent> {
     match ev {
         TypedEvent::Exists(n) => Some(IdleEvent::Exists(n)),
@@ -180,6 +180,9 @@ fn typed_event_to_idle_event(ev: TypedEvent) -> Option<IdleEvent> {
         TypedEvent::FetchUpdate(f) => Some(IdleEvent::Fetch(f)),
         TypedEvent::Alert(text) => Some(IdleEvent::Alert(text)),
         TypedEvent::MailboxEvent(info) => Some(IdleEvent::MailboxEvent(info)),
+        TypedEvent::MailboxStatus { mailbox, items } => {
+            Some(IdleEvent::MailboxStatus { mailbox, items })
+        }
         TypedEvent::Vanished { earlier, uids } => Some(IdleEvent::Vanished { earlier, uids }),
         TypedEvent::NotificationOverflow { code, text } => Some(IdleEvent::NotificationOverflow {
             code_text: code,
@@ -223,8 +226,9 @@ fn typed_event_to_idle_event(ev: TypedEvent) -> Option<IdleEvent> {
 /// IDLE (RFC 3501 Section 7.1).
 ///
 /// Handles response types that `TypedEvent::From<UntaggedResponse>`
-/// routes to `Extension`  -  notably `MailboxStatus`, `Metadata`,
-/// `Search`, and `Esearch`.
+/// routes to `Extension`  -  notably `Metadata`, `Search`, and
+/// `Esearch`. The `MailboxStatus` arm remains for callers that
+/// construct raw extension events directly.
 fn untagged_to_idle_event(resp: UntaggedResponse) -> Option<IdleEvent> {
     match resp {
         UntaggedResponse::MailboxStatus { mailbox, items } => {

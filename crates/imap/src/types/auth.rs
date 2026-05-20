@@ -64,6 +64,12 @@ impl fmt::Debug for Credentials {
 }
 
 /// SASL or legacy authentication mechanism selected by the client.
+///
+/// SCRAM channel-binding mechanisms such as `SCRAM-SHA-256-PLUS` are
+/// intentionally not represented here yet. They need TLS channel-binding
+/// material from the transport, and this crate's transport abstraction does
+/// not expose that material. `authenticate_best` will therefore not silently
+/// treat a `*-PLUS` advertisement as the non-PLUS SCRAM mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AuthMechanism {

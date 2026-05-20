@@ -88,8 +88,10 @@ P0: streamed command final status
 - Why it matters: this is a correctness issue, not docs or polish. A failed
   command can look like an empty successful result stream.
 - Status: initial fix landed locally through a shared command-response adapter.
-  Keep an eye out for any remaining command parser still hand-rolling final
-  tagged status handling.
+  The current dispatcher audit found no remaining `take_while`-style final
+  status path. Regression tests now cover terminal `NO`/`BAD` propagation for
+  buffered FETCH, streaming FETCH, and EXPUNGE consumers after data has already
+  arrived.
 
 P1: FETCH flags presence ambiguity
 
@@ -105,10 +107,11 @@ P0: SASL capability API
 - Problem: CAPABILITY is valid in any state, and authentication selection needs
   direct access to advertised `AUTH=<mechanism>` SASL mechanisms.
 - Status: capability discovery, typed mechanism checks, and common PLAIN/XOAUTH2
-  authenticators are in place. Continue to review whether SCRAM and TLS channel
-  binding belong here or in a shared SASL crate. Future hardening: decide how
-  owned IMAP authenticator secrets should zeroize on drop without pretending
-  borrowed strings can be cleared.
+  authenticators are in place. SCRAM is implemented for `SCRAM-SHA-1` and
+  `SCRAM-SHA-256`. SCRAM channel-binding mechanisms such as
+  `SCRAM-SHA-256-PLUS` are intentionally not selected until the transport layer
+  exposes TLS channel-binding material; a profile test locks in that `*-PLUS`
+  advertisements are not silently treated as non-PLUS SCRAM.
 
 P2: parser hardening for recursion
 
@@ -129,9 +132,10 @@ P2: IDLE ergonomics and NOTIFY
 
 - Sources: `chatmail/async-imap` #55, #89, `djc/tokio-imap` #18.
 - Status: local crate has IDLE, `idle_once`, and typed RFC 5465 NOTIFY command
-  helpers. Later follow-up: decide whether unsolicited STATUS/LIST/FETCH
-  responses from NOTIFY should get higher-level event wrappers or remain on the
-  existing unsolicited response channel.
+  helpers. LIST and FETCH notifications already had typed wrappers. STATUS
+  notifications now surface as `TypedEvent::MailboxStatus` and
+  `EventImpact::MailboxStatus` instead of falling through to the raw extension
+  path.
 
 P2: generic boxed transport type
 
@@ -150,11 +154,13 @@ P3 or skip for now
 - `chatmail/async-imap` #99 and #100: SCRAM and TLS channel binding. Important
   protocol work, but broader than IMAP consolidation and probably belongs in a
   SASL/TLS authentication design pass.
-- `chatmail/async-imap` #126 and `djc/tokio-imap` #186: IMAP4rev2. Track as a
-  larger protocol feature after rev1 behavior is stable. Current local
-  groundwork covers typed `IMAP4rev2` capabilities and RFC 9051 `STATUS`
-  `DELETED`/`SIZE` response data, but not the full rev2 command/response
-  surface.
+- `chatmail/async-imap` #126 and `djc/tokio-imap` #186: IMAP4rev2. Current local
+  surface covers active rev2 detection, rev2-implied capability/profile helpers,
+  LIST-EXTENDED/LIST-STATUS gates, STATUS `DELETED`/`SIZE`, BINARY/SAVEDATE/
+  OBJECTID fetch/search gates, SASL-IR, ENABLE, IDLE, MOVE, UIDPLUS,
+  NAMESPACE, SEARCHRES, UNSELECT, SPECIAL-USE, and LITERAL+/LITERAL- handling.
+  The last helper mismatch found in this pass was LIST-STATUS, now treated as
+  rev2-implied by both `ServerProfile` and the encoder capability context.
 - `chatmail/async-imap` #11: UIDPLUS. Parser and several client pieces already
   exist locally; `APPENDUID` and `COPYUID` are now surfaced by the relevant
   commands, and `expunge_deleted_uids` covers the common UID EXPUNGE fallback

@@ -22,6 +22,7 @@ fn imap4rev2_profile_implies_base_extensions() {
         Capability::Esearch,
         Capability::Idle,
         Capability::ListExtended,
+        Capability::ListStatus,
         Capability::LiteralMinus,
         Capability::LiteralPlus,
         Capability::Move,
@@ -48,6 +49,16 @@ fn auth_mechanisms_are_case_insensitive() {
     assert!(profile.supports_auth(AuthMechanism::Plain));
     assert!(profile.supports_sasl_auth(AuthMechanism::Plain));
     assert!(!profile.supports_auth(AuthMechanism::ScramSha256));
+}
+
+#[test]
+fn scram_plus_does_not_satisfy_non_plus_scram() {
+    let profile = ServerProfile::new(
+        vec![Capability::Auth("SCRAM-SHA-256-PLUS".to_owned())],
+        vec![],
+    );
+
+    assert!(!profile.supports_sasl_auth(AuthMechanism::ScramSha256));
 }
 
 #[test]

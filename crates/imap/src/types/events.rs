@@ -1,6 +1,8 @@
 //! Application-facing event impact helpers.
 
-use super::{FetchResponse, MailboxInfo, ResponseCode, UidRange, UntaggedResponse};
+use super::{
+    FetchResponse, MailboxInfo, MailboxName, ResponseCode, StatusItem, UidRange, UntaggedResponse,
+};
 use crate::TypedEvent;
 
 /// What a consumer should generally do after receiving an asynchronous event.
@@ -23,6 +25,13 @@ pub enum EventImpact {
     SelectedMailboxResync,
     /// A non-selected mailbox changed.
     MailboxChanged(MailboxInfo),
+    /// STATUS data changed for a non-selected mailbox.
+    MailboxStatus {
+        /// The mailbox whose STATUS data changed.
+        mailbox: MailboxName,
+        /// STATUS items delivered by the server.
+        items: Vec<StatusItem>,
+    },
     /// Messages vanished by UID.
     UidsVanished {
         /// `true` for `VANISHED (EARLIER)`.
@@ -72,6 +81,10 @@ impl TypedEvent {
             },
             Self::FetchUpdate(fetch) => EventImpact::FetchUpdate(fetch.clone()),
             Self::MailboxEvent(info) => EventImpact::MailboxChanged(info.clone()),
+            Self::MailboxStatus { mailbox, items } => EventImpact::MailboxStatus {
+                mailbox: mailbox.clone(),
+                items: items.clone(),
+            },
             Self::MetadataChange { .. } => EventImpact::SelectedMailboxChanged,
             Self::ServerMetadataChange { .. } => EventImpact::ServerMetadataChanged,
             Self::Extension(response) => EventImpact::Extension(response.clone()),
@@ -146,6 +159,16 @@ mod tests {
             (
                 TypedEvent::MailboxEvent(mailbox.clone()),
                 EventImpact::MailboxChanged(mailbox),
+            ),
+            (
+                TypedEvent::MailboxStatus {
+                    mailbox: crate::types::MailboxName::new("Archive").unwrap(),
+                    items: vec![StatusItem::Messages(42)],
+                },
+                EventImpact::MailboxStatus {
+                    mailbox: crate::types::MailboxName::new("Archive").unwrap(),
+                    items: vec![StatusItem::Messages(42)],
+                },
             ),
             (
                 TypedEvent::MetadataChange {},

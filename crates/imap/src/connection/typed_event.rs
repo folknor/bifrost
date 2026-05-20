@@ -9,8 +9,9 @@
 //! asynchronously. RFC 5465 adds NOTIFY-specific events.
 
 use crate::types::fetch::FetchResponse;
-use crate::types::mailbox::MailboxInfo;
+use crate::types::mailbox::{MailboxInfo, StatusItem};
 use crate::types::response::{Capability, ResponseCode, UidRange, UntaggedResponse};
+use crate::types::validated::MailboxName;
 
 /// Asynchronously delivered server data.
 ///
@@ -47,6 +48,13 @@ pub enum TypedEvent {
     FetchUpdate(Box<FetchResponse>),
     /// RFC 5465 Section5 `MailboxName` event.
     MailboxEvent(MailboxInfo),
+    /// RFC 5465 Section4 STATUS indicator event for a non-selected mailbox.
+    MailboxStatus {
+        /// The mailbox whose STATUS data changed.
+        mailbox: MailboxName,
+        /// STATUS items delivered by the server.
+        items: Vec<StatusItem>,
+    },
     /// RFC 5465 Section5 `MailboxMetadataChange`.
     MetadataChange {},
     /// RFC 5465 Section5 `ServerMetadataChange`.
@@ -105,6 +113,9 @@ impl From<UntaggedResponse> for TypedEvent {
             UntaggedResponse::Expunge(n) => Self::Expunge(n),
             UntaggedResponse::Fetch(f) => Self::FetchUpdate(f),
             UntaggedResponse::List(info) | UntaggedResponse::Lsub(info) => Self::MailboxEvent(info),
+            UntaggedResponse::MailboxStatus { mailbox, items } => {
+                Self::MailboxStatus { mailbox, items }
+            }
             UntaggedResponse::Vanished { earlier, uids } => Self::Vanished { earlier, uids },
             // Everything else  -  plain `* OK/NO/BAD` with no special response
             // code, SEARCH, ESEARCH, ACL, QUOTA, METADATA, THREAD, SORT, etc.
@@ -131,9 +142,41 @@ impl TypedEvent {
             | Self::Vanished { .. }
             | Self::FetchUpdate(_)
             | Self::MailboxEvent(_)
+            | Self::MailboxStatus { .. }
             | Self::MetadataChange { .. }
             | Self::ServerMetadataChange { .. }
             | Self::Extension(_) => Priority::Resyncable,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mailbox_status_response_becomes_typed_notify_event() {
+        let event = TypedEvent::from(UntaggedResponse::MailboxStatus {
+            mailbox: MailboxName::new("Archive").unwrap(),
+            items: vec![StatusItem::Messages(42)],
+        });
+
+        match event {
+            TypedEvent::MailboxStatus { mailbox, items } => {
+                assert_eq!(mailbox.as_str(), "Archive");
+                assert_eq!(items, vec![StatusItem::Messages(42)]);
+            }
+            other => panic!("expected MailboxStatus event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mailbox_status_event_is_resyncable() {
+        let event = TypedEvent::MailboxStatus {
+            mailbox: MailboxName::new("Archive").unwrap(),
+            items: vec![StatusItem::Messages(42)],
+        };
+
+        assert_eq!(event.priority(), Priority::Resyncable);
     }
 }

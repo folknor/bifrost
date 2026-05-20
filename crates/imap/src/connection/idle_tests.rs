@@ -69,6 +69,16 @@ fn mailbox_event_returns_some() {
 }
 
 #[test]
+fn mailbox_status_event_returns_some() {
+    let ev = TypedEvent::MailboxStatus {
+        mailbox: MailboxName::default(),
+        items: vec![StatusItem::Messages(42)],
+    };
+    let result = typed_event_to_idle_event(ev);
+    assert!(matches!(result, Some(IdleEvent::MailboxStatus { .. })));
+}
+
+#[test]
 fn bye_returns_some() {
     let ev = TypedEvent::Bye {
         code: None,

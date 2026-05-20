@@ -59,6 +59,18 @@ fn encode_enable_uses_imap4rev2_base_capability() {
 }
 
 #[test]
+fn encode_options_treats_list_status_as_imap4rev2_base_capability() {
+    let opts = EncodeOptions {
+        utf8_mode: false,
+        literal_mode: LiteralMode::Synchronizing,
+        capabilities: vec![Capability::Imap4Rev2],
+        enabled: Vec::new(),
+    };
+
+    assert!(opts.has_capability(&Capability::ListStatus));
+}
+
+#[test]
 fn encode_simple_command() {
     let mut buf = BytesMut::new();
     encode_simple(&mut buf, "A001", "NOOP");
