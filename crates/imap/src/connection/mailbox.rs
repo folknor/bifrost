@@ -29,10 +29,9 @@ impl ImapConnection {
         // NOTIFICATIONOVERFLOW (RFC 5465 Section5.8) is handled automatically:
         // apply_side_effects clears the notify flags, so subsequent
         // snapshots have list=false.
-        let inner = tokio::time::timeout(timeout, self.submit_regular(cmd, ListConsumer::new()))
+        tokio::time::timeout(timeout, self.submit_regular(cmd, ListConsumer::new()))
             .await
-            .map_err(|_| Error::Timeout)??;
-        inner
+            .map_err(|_| Error::Timeout)??
     }
 
     /// LIST mailboxes with RFC 5258 selection options, multiple patterns, and
@@ -96,10 +95,9 @@ impl ImapConnection {
             filter_extended,
             selection_options.iter().map(|o| (*o).to_owned()).collect(),
         );
-        let inner = tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
+        tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)??;
-        inner
+            .map_err(|_| Error::Timeout)??
     }
 
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -139,11 +137,9 @@ impl ImapConnection {
             pattern: pattern.to_owned(),
             status_items: status_items.to_owned(),
         };
-        let inner =
-            tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
-                .await
-                .map_err(|_| Error::Timeout)??;
-        inner
+        tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
+            .await
+            .map_err(|_| Error::Timeout)??
     }
 
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).

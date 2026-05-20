@@ -117,20 +117,20 @@ pub(super) fn skip_balanced_parens(mut input: &[u8]) -> IResult<&[u8], ()> {
                             // Parse the byte count and skip that many bytes.
                             // Use checked_add to prevent wrapping on crafted counts
                             // near usize::MAX (RFC 3501 Section 9 / RFC 9051 Section 9).
-                            if let Ok(s) = std::str::from_utf8(&input[start..count_end]) {
-                                if let Ok(count) = s.parse::<usize>() {
-                                    match end.checked_add(count) {
-                                        Some(new_end) if new_end <= input.len() => {
-                                            input = &input[new_end..];
-                                        }
-                                        _ => {
-                                            // Literal body exceeds available data or
-                                            // overflows usize  -  stop scanning to avoid
-                                            // misinterpreting literal body bytes as
-                                            // parenthesized structure
-                                            // (RFC 3501 Section 9 / RFC 9051 Section 9).
-                                            return Ok((input, ()));
-                                        }
+                            if let Ok(s) = std::str::from_utf8(&input[start..count_end])
+                                && let Ok(count) = s.parse::<usize>()
+                            {
+                                match end.checked_add(count) {
+                                    Some(new_end) if new_end <= input.len() => {
+                                        input = &input[new_end..];
+                                    }
+                                    _ => {
+                                        // Literal body exceeds available data or
+                                        // overflows usize  -  stop scanning to avoid
+                                        // misinterpreting literal body bytes as
+                                        // parenthesized structure
+                                        // (RFC 3501 Section 9 / RFC 9051 Section 9).
+                                        return Ok((input, ()));
                                     }
                                 }
                             }

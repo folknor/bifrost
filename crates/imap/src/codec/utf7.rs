@@ -188,7 +188,7 @@ pub(crate) fn decode_utf7(input: &[u8]) -> String {
 /// (RFC 3501 Section 5.1.3).
 fn decode_utf16be(bytes: &[u8], out: &mut String) {
     // Track whether there's a trailing odd byte.
-    let has_trailing = bytes.len() % 2 != 0;
+    let has_trailing = !bytes.len().is_multiple_of(2);
 
     // Each code unit is 2 bytes big-endian.
     for result in char::decode_utf16(bytes.chunks(2).filter_map(|chunk| {

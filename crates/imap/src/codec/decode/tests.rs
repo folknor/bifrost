@@ -843,8 +843,8 @@ fn search_trailing_space_empty() {
 
 /// Regression test: UID 0 in SEARCH results must be filtered out.
 ///
-/// RFC 3501 Section 7.2.5 / Section 9: SEARCH results are `nz-number`
-///  -  UIDs and sequence numbers are never zero.  Some non-conformant
+/// RFC 3501 Section 7.2.5 / Section 9: SEARCH results are `nz-number`.
+/// UIDs and sequence numbers are never zero. Some non-conformant
 /// servers include 0 in results; the parser accepts it during parsing
 /// (to avoid `many0` silently dropping subsequent numbers) but must
 /// discard it before returning results to the caller.
@@ -3831,12 +3831,12 @@ fn skip_paren_group_valid() {
 fn fetch_savedate_quoted() {
     let (_, resp) =
         parse_response(b"* 1 FETCH (UID 42 SAVEDATE \"28-Dec-2023 10:30:00 +0000\")\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.save_date.as_deref(), Some("28-Dec-2023 10:30:00 +0000"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.save_date.as_deref(), Some("28-Dec-2023 10:30:00 +0000"));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -3844,12 +3844,12 @@ fn fetch_savedate_quoted() {
 #[test]
 fn fetch_savedate_nil() {
     let (_, resp) = parse_response(b"* 5 FETCH (UID 100 SAVEDATE NIL)\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(100));
-            assert!(fr.save_date.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(100));
+        assert!(fr.save_date.is_none());
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -3860,16 +3860,16 @@ fn fetch_savedate_with_internaldate() {
             b"* 3 FETCH (UID 7 INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" SAVEDATE \"15-Feb-2024 12:00:00 +0000\")\r\n",
         )
         .unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(7));
-            assert_eq!(
-                fr.internal_date.as_deref(),
-                Some("01-Jan-2024 00:00:00 +0000")
-            );
-            assert_eq!(fr.save_date.as_deref(), Some("15-Feb-2024 12:00:00 +0000"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(7));
+        assert_eq!(
+            fr.internal_date.as_deref(),
+            Some("01-Jan-2024 00:00:00 +0000")
+        );
+        assert_eq!(fr.save_date.as_deref(), Some("15-Feb-2024 12:00:00 +0000"));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -3878,11 +3878,11 @@ fn fetch_savedate_with_internaldate() {
 fn fetch_savedate_case_insensitive() {
     let (_, resp) =
         parse_response(b"* 1 FETCH (savedate \"01-Jan-2025 00:00:00 +0000\")\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.save_date.as_deref(), Some("01-Jan-2025 00:00:00 +0000"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.save_date.as_deref(), Some("01-Jan-2025 00:00:00 +0000"));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -3893,12 +3893,12 @@ fn fetch_savedate_case_insensitive() {
 fn fetch_emailid() {
     let input = b"* 1 FETCH (UID 42 EMAILID (M6d99ac3275826486))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.email_id.as_deref(), Some("M6d99ac3275826486"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.email_id.as_deref(), Some("M6d99ac3275826486"));
+        return;
     }
     panic!("expected Fetch response with EMAILID");
 }
@@ -3907,12 +3907,12 @@ fn fetch_emailid() {
 fn fetch_threadid() {
     let input = b"* 1 FETCH (UID 42 THREADID (T64b478a75b7ea9fd))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.thread_id.as_deref(), Some("T64b478a75b7ea9fd"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.thread_id.as_deref(), Some("T64b478a75b7ea9fd"));
+        return;
     }
     panic!("expected Fetch response with THREADID");
 }
@@ -3921,12 +3921,12 @@ fn fetch_threadid() {
 fn fetch_threadid_nil() {
     let input = b"* 1 FETCH (UID 42 THREADID NIL)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert!(fr.thread_id.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert!(fr.thread_id.is_none());
+        return;
     }
     panic!("expected Fetch response with THREADID NIL");
 }
@@ -3935,15 +3935,15 @@ fn fetch_threadid_nil() {
 fn fetch_emailid_and_threadid_combined() {
     let input = b"* 5 FETCH (UID 100 FLAGS (\\Seen) EMAILID (Mabcdef1234567890) THREADID (T0987654321fedcba))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.seq, 5);
-            assert_eq!(fr.uid, Some(100));
-            assert_eq!(fr.email_id.as_deref(), Some("Mabcdef1234567890"));
-            assert_eq!(fr.thread_id.as_deref(), Some("T0987654321fedcba"));
-            assert_eq!(fr.flags, Some(vec![Flag::Seen]));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.seq, 5);
+        assert_eq!(fr.uid, Some(100));
+        assert_eq!(fr.email_id.as_deref(), Some("Mabcdef1234567890"));
+        assert_eq!(fr.thread_id.as_deref(), Some("T0987654321fedcba"));
+        assert_eq!(fr.flags, Some(vec![Flag::Seen]));
+        return;
     }
     panic!("expected Fetch response with EMAILID and THREADID");
 }
@@ -3953,14 +3953,14 @@ fn fetch_gmail_msgid_and_thrid() {
     let input =
         b"* 5 FETCH (UID 100 X-GM-MSGID 1278455344230334864 X-GM-THRID 1278455344230334865)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.seq, 5);
-            assert_eq!(fr.uid, Some(100));
-            assert_eq!(fr.gmail_msg_id, Some(1_278_455_344_230_334_864));
-            assert_eq!(fr.gmail_thread_id, Some(1_278_455_344_230_334_865));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.seq, 5);
+        assert_eq!(fr.uid, Some(100));
+        assert_eq!(fr.gmail_msg_id, Some(1_278_455_344_230_334_864));
+        assert_eq!(fr.gmail_thread_id, Some(1_278_455_344_230_334_865));
+        return;
     }
     panic!("expected Fetch response with Gmail message and thread ids");
 }
@@ -3969,11 +3969,11 @@ fn fetch_gmail_msgid_and_thrid() {
 fn fetch_emailid_case_insensitive() {
     let input = b"* 1 FETCH (emailid (Mabc123))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.email_id.as_deref(), Some("Mabc123"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.email_id.as_deref(), Some("Mabc123"));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -3982,11 +3982,11 @@ fn fetch_emailid_case_insensitive() {
 fn fetch_threadid_nil_case_insensitive() {
     let input = b"* 1 FETCH (threadid nil)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert!(fr.thread_id.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert!(fr.thread_id.is_none());
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -4024,11 +4024,11 @@ fn fetch_emailid_nil_rejected() {
 fn fetch_emailid_valid_objectid() {
     let input = b"* 1 FETCH (EMAILID (V001))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.email_id.as_deref(), Some("V001"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.email_id.as_deref(), Some("V001"));
+        return;
     }
     panic!("expected Fetch response with EMAILID (V001)");
 }
@@ -4078,7 +4078,7 @@ fn objectid_empty_fails() {
 /// Exactly 255 characters must be accepted.
 #[test]
 fn objectid_exactly_255_chars() {
-    let mut input: Vec<u8> = std::iter::repeat(b'A').take(255).collect();
+    let mut input: Vec<u8> = std::iter::repeat_n(b'A', 255).collect();
     input.push(b')'); // delimiter after objectid
     let (rest, val) = objectid(&input).unwrap();
     assert_eq!(val.len(), 255);
@@ -4090,7 +4090,7 @@ fn objectid_exactly_255_chars() {
 /// leftover bytes in the input stream, poisoning downstream parsers.
 #[test]
 fn objectid_256_chars_accepted_in_full() {
-    let mut input: Vec<u8> = std::iter::repeat(b'A').take(256).collect();
+    let mut input: Vec<u8> = std::iter::repeat_n(b'A', 256).collect();
     input.push(b')');
     let (rest, val) = objectid(&input).unwrap();
     // Must accept the full 256-char atom, not truncate to 255
@@ -4104,7 +4104,7 @@ fn objectid_256_chars_accepted_in_full() {
 /// parsers (e.g., the closing `)` in EMAILID) to fail.
 #[test]
 fn objectid_oversized_accepted_via_postel() {
-    let mut input: Vec<u8> = std::iter::repeat(b'A').take(300).collect();
+    let mut input: Vec<u8> = std::iter::repeat_n(b'A', 300).collect();
     input.push(b')');
     let (rest, val) = objectid(&input).unwrap();
     // Must accept the full 300-char value, not truncate to 255
@@ -4128,11 +4128,11 @@ fn fetch_emailid_oversized_objectid_parses() {
     let long_id: String = "A".repeat(300);
     let input = format!("* 1 FETCH (EMAILID ({long_id}))\r\n");
     let (_, resp) = parse_response(input.as_bytes()).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.email_id.as_deref(), Some(long_id.as_str()));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.email_id.as_deref(), Some(long_id.as_str()));
+        return;
     }
     panic!("expected Fetch response with EMAILID");
 }
@@ -4152,11 +4152,11 @@ fn objectid_non_compliant_falls_back_to_atom() {
 fn fetch_emailid_rfc8474_valid_objectid() {
     let input = b"* 1 FETCH (EMAILID (M_abc-XYZ_123))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.email_id.as_deref(), Some("M_abc-XYZ_123"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.email_id.as_deref(), Some("M_abc-XYZ_123"));
+        return;
     }
     panic!("expected Fetch response with EMAILID");
 }
@@ -4166,11 +4166,11 @@ fn fetch_emailid_rfc8474_valid_objectid() {
 fn fetch_threadid_rfc8474_valid_objectid() {
     let input = b"* 1 FETCH (THREADID (T_thread-99))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.thread_id.as_deref(), Some("T_thread-99"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.thread_id.as_deref(), Some("T_thread-99"));
+        return;
     }
     panic!("expected Fetch response with THREADID");
 }
@@ -4195,14 +4195,14 @@ fn response_code_mailboxid_rfc8474_valid_objectid() {
 fn parse_metadata_response() {
     let input = b"* METADATA \"INBOX\" (\"/private/comment\" \"My comment\")\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].name, "/private/comment");
-            assert_eq!(entries[0].value.as_deref(), Some(b"My comment".as_slice()));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/private/comment");
+        assert_eq!(entries[0].value.as_deref(), Some(b"My comment".as_slice()));
+        return;
     }
     panic!("expected Metadata response");
 }
@@ -4212,16 +4212,16 @@ fn parse_metadata_multiple_entries() {
     let input =
         b"* METADATA \"INBOX\" (\"/private/comment\" \"hello\" \"/shared/vendor/x\" \"world\")\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].name, "/private/comment");
-            assert_eq!(entries[0].value.as_deref(), Some(b"hello".as_slice()));
-            assert_eq!(entries[1].name, "/shared/vendor/x");
-            assert_eq!(entries[1].value.as_deref(), Some(b"world".as_slice()));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "/private/comment");
+        assert_eq!(entries[0].value.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(entries[1].name, "/shared/vendor/x");
+        assert_eq!(entries[1].value.as_deref(), Some(b"world".as_slice()));
+        return;
     }
     panic!("expected Metadata response");
 }
@@ -4230,14 +4230,14 @@ fn parse_metadata_multiple_entries() {
 fn parse_metadata_nil_value() {
     let input = b"* METADATA \"INBOX\" (\"/private/comment\" NIL)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].name, "/private/comment");
-            assert!(entries[0].value.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/private/comment");
+        assert!(entries[0].value.is_none());
+        return;
     }
     panic!("expected Metadata response");
 }
@@ -4246,14 +4246,14 @@ fn parse_metadata_nil_value() {
 fn parse_metadata_literal_value() {
     let input = b"* METADATA \"INBOX\" (\"/private/comment\" {5}\r\nhello)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].name, "/private/comment");
-            assert_eq!(entries[0].value.as_deref(), Some(b"hello".as_slice()));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/private/comment");
+        assert_eq!(entries[0].value.as_deref(), Some(b"hello".as_slice()));
+        return;
     }
     panic!("expected Metadata response");
 }
@@ -4262,12 +4262,12 @@ fn parse_metadata_literal_value() {
 fn parse_metadata_empty_entries() {
     let input = b"* METADATA \"INBOX\" ()\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert!(entries.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert!(entries.is_empty());
+        return;
     }
     panic!("expected Metadata response");
 }
@@ -4279,17 +4279,17 @@ fn parse_metadata_empty_entries() {
 fn parse_metadata_binary_literal8_value() {
     let input = b"* METADATA \"INBOX\" (\"/private/vendor/bin\" ~{4}\r\n\x80\x81\x82\x83)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].name, "/private/vendor/bin");
-            assert_eq!(
-                entries[0].value.as_deref(),
-                Some(b"\x80\x81\x82\x83".as_slice())
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/private/vendor/bin");
+        assert_eq!(
+            entries[0].value.as_deref(),
+            Some(b"\x80\x81\x82\x83".as_slice())
+        );
+        return;
     }
     panic!("expected Metadata response with binary value");
 }
@@ -4319,16 +4319,16 @@ fn parse_thread_simple() {
     // Simple linear thread: (1 2 3)
     let input = b"* THREAD (1 2 3)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            assert_eq!(threads[0].id, Some(1));
-            assert_eq!(threads[0].children.len(), 1);
-            assert_eq!(threads[0].children[0].id, Some(2));
-            assert_eq!(threads[0].children[0].children.len(), 1);
-            assert_eq!(threads[0].children[0].children[0].id, Some(3));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, Some(1));
+        assert_eq!(threads[0].children.len(), 1);
+        assert_eq!(threads[0].children[0].id, Some(2));
+        assert_eq!(threads[0].children[0].children.len(), 1);
+        assert_eq!(threads[0].children[0].children[0].id, Some(3));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4338,15 +4338,15 @@ fn parse_thread_multiple_roots() {
     // Two separate threads: (1)(2)
     let input = b"* THREAD (1)(2)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 2);
-            assert_eq!(threads[0].id, Some(1));
-            assert!(threads[0].children.is_empty());
-            assert_eq!(threads[1].id, Some(2));
-            assert!(threads[1].children.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, Some(1));
+        assert!(threads[0].children.is_empty());
+        assert_eq!(threads[1].id, Some(2));
+        assert!(threads[1].children.is_empty());
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4356,15 +4356,15 @@ fn parse_thread_nested() {
     // Thread with branching: (1 (2)(3))
     let input = b"* THREAD (1 (2)(3))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            assert_eq!(threads[0].id, Some(1));
-            assert_eq!(threads[0].children.len(), 2);
-            assert_eq!(threads[0].children[0].id, Some(2));
-            assert_eq!(threads[0].children[1].id, Some(3));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, Some(1));
+        assert_eq!(threads[0].children.len(), 2);
+        assert_eq!(threads[0].children[0].id, Some(2));
+        assert_eq!(threads[0].children[1].id, Some(3));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4374,16 +4374,16 @@ fn parse_thread_dummy_parent() {
     // Dummy parent (no UID): ((1)(2))
     let input = b"* THREAD ((1)(2))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            // Dummy parent has id=None (RFC 5256 Section 4)
-            assert_eq!(threads[0].id, None);
-            assert_eq!(threads[0].children.len(), 2);
-            assert_eq!(threads[0].children[0].id, Some(1));
-            assert_eq!(threads[0].children[1].id, Some(2));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        // Dummy parent has id=None (RFC 5256 Section 4)
+        assert_eq!(threads[0].id, None);
+        assert_eq!(threads[0].children.len(), 2);
+        assert_eq!(threads[0].children[0].id, Some(1));
+        assert_eq!(threads[0].children[1].id, Some(2));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4393,11 +4393,11 @@ fn parse_thread_empty() {
     // Empty thread response
     let input = b"* THREAD\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert!(threads.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert!(threads.is_empty());
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4407,23 +4407,23 @@ fn parse_thread_complex() {
     // Complex: (1 (2 3)(4 5 6))
     let input = b"* THREAD (1 (2 3)(4 5 6))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            assert_eq!(threads[0].id, Some(1));
-            assert_eq!(threads[0].children.len(), 2);
-            // First child: (2 3)  -  2 with child 3
-            assert_eq!(threads[0].children[0].id, Some(2));
-            assert_eq!(threads[0].children[0].children.len(), 1);
-            assert_eq!(threads[0].children[0].children[0].id, Some(3));
-            // Second child: (4 5 6)  -  4 with child 5 with child 6
-            assert_eq!(threads[0].children[1].id, Some(4));
-            assert_eq!(threads[0].children[1].children.len(), 1);
-            assert_eq!(threads[0].children[1].children[0].id, Some(5));
-            assert_eq!(threads[0].children[1].children[0].children.len(), 1);
-            assert_eq!(threads[0].children[1].children[0].children[0].id, Some(6));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, Some(1));
+        assert_eq!(threads[0].children.len(), 2);
+        // First child: (2 3)  -  2 with child 3
+        assert_eq!(threads[0].children[0].id, Some(2));
+        assert_eq!(threads[0].children[0].children.len(), 1);
+        assert_eq!(threads[0].children[0].children[0].id, Some(3));
+        // Second child: (4 5 6)  -  4 with child 5 with child 6
+        assert_eq!(threads[0].children[1].id, Some(4));
+        assert_eq!(threads[0].children[1].children.len(), 1);
+        assert_eq!(threads[0].children[1].children[0].id, Some(5));
+        assert_eq!(threads[0].children[1].children[0].children.len(), 1);
+        assert_eq!(threads[0].children[1].children[0].children[0].id, Some(6));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4433,37 +4433,37 @@ fn parse_thread_rfc_example() {
     // Example from RFC 5256 Section 4: (2)(3 6 (4 23)(44 7 96))
     let input = b"* THREAD (2)(3 6 (4 23)(44 7 96))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 2);
-            // First thread: just message 2
-            assert_eq!(threads[0].id, Some(2));
-            assert!(threads[0].children.is_empty());
-            // Second thread: 3 -> 6 -> [(4 -> 23), (44 -> 7 -> 96)]
-            assert_eq!(threads[1].id, Some(3));
-            assert_eq!(threads[1].children.len(), 1);
-            assert_eq!(threads[1].children[0].id, Some(6));
-            assert_eq!(threads[1].children[0].children.len(), 2);
-            // Branch 1: (4 23)
-            assert_eq!(threads[1].children[0].children[0].id, Some(4));
-            assert_eq!(threads[1].children[0].children[0].children.len(), 1);
-            assert_eq!(threads[1].children[0].children[0].children[0].id, Some(23));
-            // Branch 2: (44 7 96)
-            assert_eq!(threads[1].children[0].children[1].id, Some(44));
-            assert_eq!(threads[1].children[0].children[1].children.len(), 1);
-            assert_eq!(threads[1].children[0].children[1].children[0].id, Some(7));
-            assert_eq!(
-                threads[1].children[0].children[1].children[0]
-                    .children
-                    .len(),
-                1
-            );
-            assert_eq!(
-                threads[1].children[0].children[1].children[0].children[0].id,
-                Some(96)
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 2);
+        // First thread: just message 2
+        assert_eq!(threads[0].id, Some(2));
+        assert!(threads[0].children.is_empty());
+        // Second thread: 3 -> 6 -> [(4 -> 23), (44 -> 7 -> 96)]
+        assert_eq!(threads[1].id, Some(3));
+        assert_eq!(threads[1].children.len(), 1);
+        assert_eq!(threads[1].children[0].id, Some(6));
+        assert_eq!(threads[1].children[0].children.len(), 2);
+        // Branch 1: (4 23)
+        assert_eq!(threads[1].children[0].children[0].id, Some(4));
+        assert_eq!(threads[1].children[0].children[0].children.len(), 1);
+        assert_eq!(threads[1].children[0].children[0].children[0].id, Some(23));
+        // Branch 2: (44 7 96)
+        assert_eq!(threads[1].children[0].children[1].id, Some(44));
+        assert_eq!(threads[1].children[0].children[1].children.len(), 1);
+        assert_eq!(threads[1].children[0].children[1].children[0].id, Some(7));
+        assert_eq!(
+            threads[1].children[0].children[1].children[0]
+                .children
+                .len(),
+            1
+        );
+        assert_eq!(
+            threads[1].children[0].children[1].children[0].children[0].id,
+            Some(96)
+        );
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4476,20 +4476,20 @@ fn spec_audit_thread_dummy_parent_uses_option() {
     // Thread with dummy parent: ((1)(2))
     let input = b"* THREAD ((1)(2))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            // Dummy parent must have id == None per RFC 5256 Section 4
-            assert_eq!(
-                threads[0].id, None,
-                "RFC 5256 Section 4: dummy parent has no UID, expected None, got {:?}",
-                threads[0].id
-            );
-            assert_eq!(threads[0].children.len(), 2);
-            assert_eq!(threads[0].children[0].id, Some(1));
-            assert_eq!(threads[0].children[1].id, Some(2));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        // Dummy parent must have id == None per RFC 5256 Section 4
+        assert_eq!(
+            threads[0].id, None,
+            "RFC 5256 Section 4: dummy parent has no UID, expected None, got {:?}",
+            threads[0].id
+        );
+        assert_eq!(threads[0].children.len(), 2);
+        assert_eq!(threads[0].children[0].id, Some(1));
+        assert_eq!(threads[0].children[1].id, Some(2));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4503,24 +4503,24 @@ fn spec_audit_thread_dummy_parent_uses_option() {
 fn spec_audit_thread_single_child_dummy_collapsed() {
     let input = b"* THREAD ((1))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1, "should have one top-level thread");
-            // After collapsing, the thread should be a direct message
-            // (id=Some(1)), NOT a dummy parent wrapping one child.
-            assert_eq!(
-                threads[0].id,
-                Some(1),
-                "RFC 5256 Section 5: single-child dummy parent must be \
-                     collapsed  -  expected id=Some(1), got id={:?}",
-                threads[0].id
-            );
-            assert!(
-                threads[0].children.is_empty(),
-                "collapsed thread should have no children"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1, "should have one top-level thread");
+        // After collapsing, the thread should be a direct message
+        // (id=Some(1)), NOT a dummy parent wrapping one child.
+        assert_eq!(
+            threads[0].id,
+            Some(1),
+            "RFC 5256 Section 5: single-child dummy parent must be \
+                 collapsed  -  expected id=Some(1), got id={:?}",
+            threads[0].id
+        );
+        assert!(
+            threads[0].children.is_empty(),
+            "collapsed thread should have no children"
+        );
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4531,20 +4531,20 @@ fn spec_audit_thread_single_child_dummy_collapsed() {
 fn spec_audit_thread_single_child_dummy_collapsed_chain() {
     let input = b"* THREAD ((1 2))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            assert_eq!(
-                threads[0].id,
-                Some(1),
-                "RFC 5256 Section 5: single-child dummy parent must be \
-                     collapsed  -  expected id=Some(1), got id={:?}",
-                threads[0].id
-            );
-            assert_eq!(threads[0].children.len(), 1);
-            assert_eq!(threads[0].children[0].id, Some(2));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].id,
+            Some(1),
+            "RFC 5256 Section 5: single-child dummy parent must be \
+                 collapsed  -  expected id=Some(1), got id={:?}",
+            threads[0].id
+        );
+        assert_eq!(threads[0].children.len(), 1);
+        assert_eq!(threads[0].children[0].id, Some(2));
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4555,16 +4555,16 @@ fn spec_audit_thread_single_child_dummy_collapsed_chain() {
 fn spec_audit_thread_multi_child_dummy_not_collapsed() {
     let input = b"* THREAD ((1)(2))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Thread(threads) = *boxed {
-            assert_eq!(threads.len(), 1);
-            assert_eq!(
-                threads[0].id, None,
-                "valid dummy parent (2+ children) must keep id=None"
-            );
-            assert_eq!(threads[0].children.len(), 2);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Thread(threads) = *boxed
+    {
+        assert_eq!(threads.len(), 1);
+        assert_eq!(
+            threads[0].id, None,
+            "valid dummy parent (2+ children) must keep id=None"
+        );
+        assert_eq!(threads[0].children.len(), 2);
+        return;
     }
     panic!("expected Thread response");
 }
@@ -4575,15 +4575,15 @@ fn spec_audit_thread_multi_child_dummy_not_collapsed() {
 fn parse_quota_single_resource() {
     let input = b"* QUOTA \"\" (STORAGE 10 512)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Quota { root, resources } = *boxed {
-            assert_eq!(root, "");
-            assert_eq!(resources.len(), 1);
-            assert_eq!(resources[0].name, "STORAGE");
-            assert_eq!(resources[0].usage, 10);
-            assert_eq!(resources[0].limit, 512);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Quota { root, resources } = *boxed
+    {
+        assert_eq!(root, "");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "STORAGE");
+        assert_eq!(resources[0].usage, 10);
+        assert_eq!(resources[0].limit, 512);
+        return;
     }
     panic!("expected Quota response");
 }
@@ -4592,18 +4592,18 @@ fn parse_quota_single_resource() {
 fn parse_quota_multiple_resources() {
     let input = b"* QUOTA \"user.alice\" (STORAGE 100 1024 MESSAGE 50 500)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Quota { root, resources } = *boxed {
-            assert_eq!(root, "user.alice");
-            assert_eq!(resources.len(), 2);
-            assert_eq!(resources[0].name, "STORAGE");
-            assert_eq!(resources[0].usage, 100);
-            assert_eq!(resources[0].limit, 1024);
-            assert_eq!(resources[1].name, "MESSAGE");
-            assert_eq!(resources[1].usage, 50);
-            assert_eq!(resources[1].limit, 500);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Quota { root, resources } = *boxed
+    {
+        assert_eq!(root, "user.alice");
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].name, "STORAGE");
+        assert_eq!(resources[0].usage, 100);
+        assert_eq!(resources[0].limit, 1024);
+        assert_eq!(resources[1].name, "MESSAGE");
+        assert_eq!(resources[1].usage, 50);
+        assert_eq!(resources[1].limit, 500);
+        return;
     }
     panic!("expected Quota response with multiple resources");
 }
@@ -4612,12 +4612,12 @@ fn parse_quota_multiple_resources() {
 fn parse_quota_empty_resource_list() {
     let input = b"* QUOTA \"\" ()\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Quota { root, resources } = *boxed {
-            assert_eq!(root, "");
-            assert!(resources.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Quota { root, resources } = *boxed
+    {
+        assert_eq!(root, "");
+        assert!(resources.is_empty());
+        return;
     }
     panic!("expected Quota response with empty resources");
 }
@@ -4626,12 +4626,12 @@ fn parse_quota_empty_resource_list() {
 fn parse_quotaroot_single_root() {
     let input = b"* QUOTAROOT INBOX \"\"\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(roots, vec![""]);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(roots, vec![""]);
+        return;
     }
     panic!("expected QuotaRoot response");
 }
@@ -4640,12 +4640,12 @@ fn parse_quotaroot_single_root() {
 fn parse_quotaroot_multiple_roots() {
     let input = b"* QUOTAROOT INBOX \"\" \"user.bob\"\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(roots, vec!["", "user.bob"]);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(roots, vec!["", "user.bob"]);
+        return;
     }
     panic!("expected QuotaRoot response with multiple roots");
 }
@@ -4654,12 +4654,12 @@ fn parse_quotaroot_multiple_roots() {
 fn parse_quotaroot_no_roots() {
     let input = b"* QUOTAROOT INBOX\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert!(roots.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert!(roots.is_empty());
+        return;
     }
     panic!("expected QuotaRoot response with no roots");
 }
@@ -4668,13 +4668,13 @@ fn parse_quotaroot_no_roots() {
 fn parse_quota_case_insensitive() {
     let input = b"* quota \"\" (STORAGE 5 100)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Quota { root, resources } = *boxed {
-            assert_eq!(root, "");
-            assert_eq!(resources.len(), 1);
-            assert_eq!(resources[0].name, "STORAGE");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Quota { root, resources } = *boxed
+    {
+        assert_eq!(root, "");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "STORAGE");
+        return;
     }
     panic!("expected case-insensitive Quota response");
 }
@@ -4683,11 +4683,11 @@ fn parse_quota_case_insensitive() {
 fn capability_quota() {
     let input = b"* CAPABILITY IMAP4rev1 QUOTA\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(caps.contains(&Capability::Quota));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(caps.contains(&Capability::Quota));
+        return;
     }
     panic!("expected QUOTA capability");
 }
@@ -4696,11 +4696,11 @@ fn capability_quota() {
 fn capability_quotaset() {
     let input = b"* CAPABILITY IMAP4rev1 QUOTASET\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(caps.contains(&Capability::QuotaSet));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(caps.contains(&Capability::QuotaSet));
+        return;
     }
     panic!("expected QUOTASET capability");
 }
@@ -4709,11 +4709,11 @@ fn capability_quotaset() {
 fn capability_quota_resource() {
     let input = b"* CAPABILITY IMAP4rev1 QUOTA=RES-STORAGE\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(caps.contains(&Capability::QuotaResource("STORAGE".into())));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(caps.contains(&Capability::QuotaResource("STORAGE".into())));
+        return;
     }
     panic!("expected QUOTA=RES-STORAGE capability");
 }
@@ -4724,14 +4724,14 @@ fn capability_quota_resource() {
 fn parse_acl_single_entry() {
     let input = b"* ACL INBOX fred lrswipcda\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Acl { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].identifier, "fred");
-            assert_eq!(entries[0].rights, "lrswipcda");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Acl { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].identifier, "fred");
+        assert_eq!(entries[0].rights, "lrswipcda");
+        return;
     }
     panic!("expected ACL response");
 }
@@ -4740,16 +4740,16 @@ fn parse_acl_single_entry() {
 fn parse_acl_multiple_entries() {
     let input = b"* ACL INBOX fred lrswipcda chris lrs\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Acl { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].identifier, "fred");
-            assert_eq!(entries[0].rights, "lrswipcda");
-            assert_eq!(entries[1].identifier, "chris");
-            assert_eq!(entries[1].rights, "lrs");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Acl { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].identifier, "fred");
+        assert_eq!(entries[0].rights, "lrswipcda");
+        assert_eq!(entries[1].identifier, "chris");
+        assert_eq!(entries[1].rights, "lrs");
+        return;
     }
     panic!("expected ACL response with multiple entries");
 }
@@ -4758,12 +4758,12 @@ fn parse_acl_multiple_entries() {
 fn parse_acl_no_entries() {
     let input = b"* ACL INBOX\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Acl { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert!(entries.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Acl { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert!(entries.is_empty());
+        return;
     }
     panic!("expected ACL response with no entries");
 }
@@ -4772,12 +4772,12 @@ fn parse_acl_no_entries() {
 fn parse_myrights() {
     let input = b"* MYRIGHTS INBOX lrswipcda\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::MyRights { mailbox, rights } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(rights, "lrswipcda");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::MyRights { mailbox, rights } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(rights, "lrswipcda");
+        return;
     }
     panic!("expected MYRIGHTS response");
 }
@@ -4786,12 +4786,12 @@ fn parse_myrights() {
 fn parse_myrights_quoted_mailbox() {
     let input = b"* MYRIGHTS \"Sent Items\" lrs\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::MyRights { mailbox, rights } = *boxed {
-            assert_eq!(mailbox.as_str(), "Sent Items");
-            assert_eq!(rights, "lrs");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::MyRights { mailbox, rights } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "Sent Items");
+        assert_eq!(rights, "lrs");
+        return;
     }
     panic!("expected MYRIGHTS response with quoted mailbox");
 }
@@ -4800,20 +4800,19 @@ fn parse_myrights_quoted_mailbox() {
 fn parse_listrights_with_optional() {
     let input = b"* LISTRIGHTS INBOX fred lr s w i p c d a\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::ListRights {
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::ListRights {
             mailbox,
             identifier,
             required,
             optional,
         } = *boxed
-        {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(identifier, "fred");
-            assert_eq!(required, "lr");
-            assert_eq!(optional, vec!["s", "w", "i", "p", "c", "d", "a"]);
-            return;
-        }
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(identifier, "fred");
+        assert_eq!(required, "lr");
+        assert_eq!(optional, vec!["s", "w", "i", "p", "c", "d", "a"]);
+        return;
     }
     panic!("expected LISTRIGHTS response");
 }
@@ -4822,20 +4821,19 @@ fn parse_listrights_with_optional() {
 fn parse_listrights_no_optional() {
     let input = b"* LISTRIGHTS INBOX fred lrswipcda\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::ListRights {
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::ListRights {
             mailbox,
             identifier,
             required,
             optional,
         } = *boxed
-        {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(identifier, "fred");
-            assert_eq!(required, "lrswipcda");
-            assert!(optional.is_empty());
-            return;
-        }
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(identifier, "fred");
+        assert_eq!(required, "lrswipcda");
+        assert!(optional.is_empty());
+        return;
     }
     panic!("expected LISTRIGHTS response with no optional");
 }
@@ -4844,13 +4842,13 @@ fn parse_listrights_no_optional() {
 fn parse_acl_case_insensitive() {
     let input = b"* acl INBOX alice lrs\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Acl { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].identifier, "alice");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Acl { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].identifier, "alice");
+        return;
     }
     panic!("expected case-insensitive ACL response");
 }
@@ -4859,11 +4857,11 @@ fn parse_acl_case_insensitive() {
 fn capability_acl() {
     let input = b"* CAPABILITY IMAP4rev1 ACL\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(caps.contains(&Capability::Acl));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(caps.contains(&Capability::Acl));
+        return;
     }
     panic!("expected ACL capability");
 }
@@ -4893,15 +4891,15 @@ fn capability_rights_case_insensitive() {
 fn capability_response_includes_rights() {
     let input = b"* CAPABILITY IMAP4rev1 ACL RIGHTS=texk\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(
-                caps.iter()
-                    .any(|c| matches!(c, Capability::Rights(r) if r == "texk")),
-                "RIGHTS=texk not found in capabilities: {caps:?}"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(
+            caps.iter()
+                .any(|c| matches!(c, Capability::Rights(r) if r == "texk")),
+            "RIGHTS=texk not found in capabilities: {caps:?}"
+        );
+        return;
     }
     panic!("expected capability response");
 }
@@ -4919,43 +4917,43 @@ fn body_structure_deeply_nested_multipart() {
             (\"application\" \"pdf\" (\"name\" \"doc.pdf\") NIL NIL \"base64\" 5000 NIL NIL NIL NIL) \
             \"mixed\" NIL NIL NIL NIL))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fetch) = *boxed {
-            let body = fetch.body_structure.expect("missing BODYSTRUCTURE");
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fetch) = *boxed
+    {
+        let body = fetch.body_structure.expect("missing BODYSTRUCTURE");
+        if let BodyStructure::Multipart {
+            media_subtype,
+            bodies,
+            ..
+        } = &body
+        {
+            assert!(media_subtype.eq_ignore_ascii_case("mixed"));
+            assert_eq!(bodies.len(), 2);
+            // First part is multipart/alternative
             if let BodyStructure::Multipart {
-                media_subtype,
-                bodies,
+                media_subtype: inner_sub,
+                bodies: inner_parts,
                 ..
-            } = &body
+            } = &bodies[0]
             {
-                assert!(media_subtype.eq_ignore_ascii_case("mixed"));
-                assert_eq!(bodies.len(), 2);
-                // First part is multipart/alternative
-                if let BodyStructure::Multipart {
-                    media_subtype: inner_sub,
-                    bodies: inner_parts,
-                    ..
-                } = &bodies[0]
-                {
-                    assert!(inner_sub.eq_ignore_ascii_case("alternative"));
-                    assert_eq!(inner_parts.len(), 2);
-                } else {
-                    panic!("expected inner multipart/alternative");
-                }
-                // Second part is application/pdf
-                if let BodyStructure::Basic {
-                    media_type,
-                    media_subtype,
-                    ..
-                } = &bodies[1]
-                {
-                    assert!(media_type.eq_ignore_ascii_case("application"));
-                    assert!(media_subtype.eq_ignore_ascii_case("pdf"));
-                } else {
-                    panic!("expected application/pdf");
-                }
-                return;
+                assert!(inner_sub.eq_ignore_ascii_case("alternative"));
+                assert_eq!(inner_parts.len(), 2);
+            } else {
+                panic!("expected inner multipart/alternative");
             }
+            // Second part is application/pdf
+            if let BodyStructure::Basic {
+                media_type,
+                media_subtype,
+                ..
+            } = &bodies[1]
+            {
+                assert!(media_type.eq_ignore_ascii_case("application"));
+                assert!(media_subtype.eq_ignore_ascii_case("pdf"));
+            } else {
+                panic!("expected application/pdf");
+            }
+            return;
         }
     }
     panic!("expected nested multipart BODYSTRUCTURE");
@@ -4974,20 +4972,20 @@ fn body_structure_message_rfc822_nested() {
             (\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 50 3 NIL NIL NIL NIL) \
             20 NIL NIL NIL NIL))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fetch) = *boxed {
-            let body = fetch.body_structure.expect("missing BODYSTRUCTURE");
-            if let BodyStructure::Message { envelope, body, .. } = &body {
-                assert_eq!(envelope.subject, Some("Inner Subject".into()));
-                assert_eq!(envelope.message_id, Some("<inner@example.com>".into()));
-                // Nested body is text/plain
-                if let BodyStructure::Text { media_subtype, .. } = body.as_ref() {
-                    assert!(media_subtype.eq_ignore_ascii_case("plain"));
-                } else {
-                    panic!("expected text/plain in nested body");
-                }
-                return;
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fetch) = *boxed
+    {
+        let body = fetch.body_structure.expect("missing BODYSTRUCTURE");
+        if let BodyStructure::Message { envelope, body, .. } = &body {
+            assert_eq!(envelope.subject, Some("Inner Subject".into()));
+            assert_eq!(envelope.message_id, Some("<inner@example.com>".into()));
+            // Nested body is text/plain
+            if let BodyStructure::Text { media_subtype, .. } = body.as_ref() {
+                assert!(media_subtype.eq_ignore_ascii_case("plain"));
+            } else {
+                panic!("expected text/plain in nested body");
             }
+            return;
         }
     }
     panic!("expected message/rfc822 BODYSTRUCTURE");
@@ -4998,14 +4996,14 @@ fn body_structure_message_rfc822_nested() {
 fn fetch_body_partial_with_origin() {
     let input = b"* 1 FETCH (BODY[]<0> {10}\r\n0123456789)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fetch) = *boxed {
-            assert_eq!(fetch.body_sections.len(), 1);
-            let sec = &fetch.body_sections[0];
-            assert_eq!(sec.origin, Some(0));
-            assert_eq!(sec.data.as_deref(), Some(b"0123456789".as_slice()));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fetch) = *boxed
+    {
+        assert_eq!(fetch.body_sections.len(), 1);
+        let sec = &fetch.body_sections[0];
+        assert_eq!(sec.origin, Some(0));
+        assert_eq!(sec.data.as_deref(), Some(b"0123456789".as_slice()));
+        return;
     }
     panic!("expected FETCH with partial origin");
 }
@@ -5015,11 +5013,11 @@ fn fetch_body_partial_with_origin() {
 fn search_empty_result() {
     let input = b"* SEARCH\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Search { uids, .. } = *boxed {
-            assert!(uids.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Search { uids, .. } = *boxed
+    {
+        assert!(uids.is_empty());
+        return;
     }
     panic!("expected empty SEARCH");
 }
@@ -5029,11 +5027,11 @@ fn search_empty_result() {
 fn search_multiple_uids() {
     let input = b"* SEARCH 1 5 10 42\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Search { uids, .. } = *boxed {
-            assert_eq!(uids, vec![1, 5, 10, 42]);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Search { uids, .. } = *boxed
+    {
+        assert_eq!(uids, vec![1, 5, 10, 42]);
+        return;
     }
     panic!("expected SEARCH with UIDs");
 }
@@ -5043,20 +5041,20 @@ fn search_multiple_uids() {
 fn esearch_all_preserves_ranges() {
     let input = b"* ESEARCH (TAG \"A001\") ALL 1:3,5,10:12\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Esearch(esearch) = *boxed {
-            assert_eq!(esearch.tag.as_deref(), Some("A001"));
-            assert!(!esearch.uid);
-            assert_eq!(
-                esearch.all,
-                vec![
-                    UidRange::range(1, 3),
-                    UidRange::single(5),
-                    UidRange::range(10, 12),
-                ]
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Esearch(esearch) = *boxed
+    {
+        assert_eq!(esearch.tag.as_deref(), Some("A001"));
+        assert!(!esearch.uid);
+        assert_eq!(
+            esearch.all,
+            vec![
+                UidRange::range(1, 3),
+                UidRange::single(5),
+                UidRange::range(10, 12),
+            ]
+        );
+        return;
     }
     panic!("expected ESEARCH with ALL ranges");
 }
@@ -5168,12 +5166,12 @@ fn tagged_bad_response() {
 fn untagged_bye_with_text() {
     let input = b"* BYE Server shutting down\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Status { status, text, .. } = &*boxed {
-            assert_eq!(*status, UntaggedStatus::Bye);
-            assert_eq!(text, "Server shutting down");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Status { status, text, .. } = &*boxed
+    {
+        assert_eq!(*status, UntaggedStatus::Bye);
+        assert_eq!(text, "Server shutting down");
+        return;
     }
     panic!("expected BYE");
 }
@@ -5959,13 +5957,13 @@ fn metadata_garbage_data() {
 fn metadata_via_parse_response() {
     let input = b"* METADATA \"INBOX\" (\"/private/comment\" \"test\")\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Metadata { mailbox, entries } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].name, "/private/comment");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Metadata { mailbox, entries } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "/private/comment");
+        return;
     }
     panic!("expected Metadata via parse_response");
 }
@@ -6443,12 +6441,12 @@ fn binary_section_with_origin_empty_section() {
 fn fetch_binary_size_via_parse_response() {
     let input = b"* 1 FETCH (BINARY.SIZE[1] 4096)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.binary_sizes.len(), 1);
-            assert_eq!(fr.binary_sizes[0], (vec![1], 4096));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.binary_sizes.len(), 1);
+        assert_eq!(fr.binary_sizes[0], (vec![1], 4096));
+        return;
     }
     panic!("expected BINARY.SIZE via FETCH");
 }
@@ -6627,12 +6625,12 @@ fn spec_audit_q_encoding_soft_line_break_is_postel_leniency() {
 fn fetch_savedate_via_parse_response() {
     let input = b"* 3 FETCH (UID 10 SAVEDATE \"15-Mar-2026 12:00:00 +0000\")\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(10));
-            assert_eq!(fr.save_date.as_deref(), Some("15-Mar-2026 12:00:00 +0000"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(10));
+        assert_eq!(fr.save_date.as_deref(), Some("15-Mar-2026 12:00:00 +0000"));
+        return;
     }
     panic!("expected Fetch with SAVEDATE");
 }
@@ -6642,14 +6640,14 @@ fn fetch_savedate_via_parse_response() {
 fn fetch_savedate_with_flags_and_uid() {
     let input = b"* 1 FETCH (UID 42 FLAGS (\\Seen) SAVEDATE \"01-Jan-2025 00:00:00 +0000\" RFC822.SIZE 1234)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.flags, Some(vec![Flag::Seen]));
-            assert_eq!(fr.save_date.as_deref(), Some("01-Jan-2025 00:00:00 +0000"));
-            assert_eq!(fr.rfc822_size, Some(1234));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.flags, Some(vec![Flag::Seen]));
+        assert_eq!(fr.save_date.as_deref(), Some("01-Jan-2025 00:00:00 +0000"));
+        assert_eq!(fr.rfc822_size, Some(1234));
+        return;
     }
     panic!("expected Fetch with SAVEDATE and other attrs");
 }
@@ -6659,11 +6657,11 @@ fn fetch_savedate_with_flags_and_uid() {
 fn fetch_savedate_unusual_timezone() {
     let input = b"* 1 FETCH (SAVEDATE \"31-Dec-2099 23:59:59 -1200\")\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.save_date.as_deref(), Some("31-Dec-2099 23:59:59 -1200"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.save_date.as_deref(), Some("31-Dec-2099 23:59:59 -1200"));
+        return;
     }
     panic!("expected Fetch with SAVEDATE");
 }
@@ -6700,11 +6698,11 @@ fn bodystructure_deeply_nested() {
 fn fetch_uid_u32_max() {
     let input = b"* 1 FETCH (UID 4294967295)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(u32::MAX));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(u32::MAX));
+        return;
     }
     panic!("expected Fetch with max UID");
 }
@@ -6739,12 +6737,12 @@ fn exists_large_count() {
 fn fetch_unknown_attribute_skipped_stress() {
     let input = b"* 1 FETCH (UID 42 X-CUSTOM-ATTR \"some value\" FLAGS (\\Seen))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.flags, Some(vec![Flag::Seen]));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.flags, Some(vec![Flag::Seen]));
+        return;
     }
     panic!("expected Fetch with unknown attr skipped");
 }
@@ -6784,12 +6782,12 @@ fn response_code_very_long_atom() {
 fn esearch_unknown_key_skipped_stress() {
     let input = b"* ESEARCH (TAG \"A001\") UID XFUTURE somevalue\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Esearch(esearch) = *boxed {
-            assert!(esearch.all.is_empty(), "unknown key should be skipped");
-            assert!(esearch.uid);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Esearch(esearch) = *boxed
+    {
+        assert!(esearch.all.is_empty(), "unknown key should be skipped");
+        assert!(esearch.uid);
+        return;
     }
     panic!("expected Esearch response");
 }
@@ -6799,15 +6797,15 @@ fn esearch_unknown_key_skipped_stress() {
 fn vanished_overlapping_ranges() {
     let input = b"* VANISHED (EARLIER) 1:5,3:8,10\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Vanished { earlier, uids } = *boxed {
-            assert!(earlier);
-            assert_eq!(uids.len(), 3);
-            assert_eq!(uids[0], UidRange::range(1, 5));
-            assert_eq!(uids[1], UidRange::range(3, 8));
-            assert_eq!(uids[2], UidRange::single(10));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Vanished { earlier, uids } = *boxed
+    {
+        assert!(earlier);
+        assert_eq!(uids.len(), 3);
+        assert_eq!(uids[0], UidRange::range(1, 5));
+        assert_eq!(uids[1], UidRange::range(3, 8));
+        assert_eq!(uids[2], UidRange::single(10));
+        return;
     }
     panic!("expected Vanished response");
 }
@@ -6904,14 +6902,14 @@ fn quoted_string_non_ascii_bytes() {
     let input =
         b"* 1 FETCH (UID 1 ENVELOPE (NIL \"caf\xc3\xa9\" NIL NIL NIL NIL NIL NIL NIL NIL))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(
-                fr.envelope.as_ref().and_then(|e| e.subject.as_deref()),
-                Some("café")
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(
+            fr.envelope.as_ref().and_then(|e| e.subject.as_deref()),
+            Some("café")
+        );
+        return;
     }
     panic!("expected Fetch with non-ASCII envelope subject");
 }
@@ -6921,13 +6919,13 @@ fn quoted_string_non_ascii_bytes() {
 fn fetch_binary_large_origin() {
     let input = b"* 1 FETCH (BINARY[1]<4294967295> NIL)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.binary_sections.len(), 1);
-            assert_eq!(fr.binary_sections[0].origin, Some(u64::from(u32::MAX)));
-            assert!(fr.binary_sections[0].data.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.binary_sections.len(), 1);
+        assert_eq!(fr.binary_sections[0].origin, Some(u64::from(u32::MAX)));
+        assert!(fr.binary_sections[0].data.is_none());
+        return;
     }
     panic!("expected Fetch with large binary origin");
 }
@@ -6937,11 +6935,11 @@ fn fetch_binary_large_origin() {
 fn fetch_modseq_i64_max() {
     let input = b"* 1 FETCH (MODSEQ (9223372036854775807))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.mod_seq, Some(i64::MAX as u64));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.mod_seq, Some(i64::MAX as u64));
+        return;
     }
     panic!("expected Fetch with max MODSEQ");
 }
@@ -7755,11 +7753,11 @@ fn search_empty_results_still_works() {
     let input = b"* SEARCH\r\n";
     let (_, resp) = parse_response(input).unwrap();
     // empty SEARCH is fine (many0 accepts zero results)
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Search { uids, .. } = *boxed {
-            assert!(uids.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Search { uids, .. } = *boxed
+    {
+        assert!(uids.is_empty());
+        return;
     }
     panic!("expected Search");
 }
@@ -9404,7 +9402,7 @@ fn audit_l14_body_language_rejects_empty_parens() {
     if let Ok((_, val)) = result {
         // If it parses, the result should be empty/None (graceful fallback)
         assert!(
-            val.as_ref().map_or(true, std::vec::Vec::is_empty),
+            val.as_ref().is_none_or(std::vec::Vec::is_empty),
             "empty () should not produce non-empty language list"
         );
     }
@@ -9553,15 +9551,15 @@ fn appendlimit_large_value_parsed_as_u64() {
     let input = b"* CAPABILITY IMAP4rev1 APPENDLIMIT=99999999999\r\n";
     let (rem, resp) = parse_response(input).unwrap();
     assert!(rem.is_empty());
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = &*boxed {
-            // Now that the type is u64, this should parse as AppendLimit(Some(99999999999)).
-            assert!(
-                caps.contains(&Capability::AppendLimit(Some(99_999_999_999))),
-                "large value must be parsed as AppendLimit(Some(99999999999)), got: {caps:?}"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = &*boxed
+    {
+        // Now that the type is u64, this should parse as AppendLimit(Some(99999999999)).
+        assert!(
+            caps.contains(&Capability::AppendLimit(Some(99_999_999_999))),
+            "large value must be parsed as AppendLimit(Some(99999999999)), got: {caps:?}"
+        );
+        return;
     }
     panic!("expected Capabilities untagged response");
 }
@@ -9574,15 +9572,15 @@ fn regression_appendlimit_large_value_parsed_as_u64() {
     let input = b"* CAPABILITY IMAP4rev1 APPENDLIMIT=5000000000\r\n";
     let (rem, resp) = parse_response(input).unwrap();
     assert!(rem.is_empty());
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = &*boxed {
-            assert!(
-                caps.contains(&Capability::AppendLimit(Some(5_000_000_000))),
-                "APPENDLIMIT=5000000000 must be parsed as AppendLimit(Some(5000000000)), \
-                     got: {caps:?}"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = &*boxed
+    {
+        assert!(
+            caps.contains(&Capability::AppendLimit(Some(5_000_000_000))),
+            "APPENDLIMIT=5000000000 must be parsed as AppendLimit(Some(5000000000)), \
+                 got: {caps:?}"
+        );
+        return;
     }
     panic!("expected Capabilities untagged response");
 }
@@ -10320,17 +10318,17 @@ fn body_section_mime() {
 fn spec_audit_flags_response_retains_recent() {
     let input = b"* FLAGS (\\Seen \\Answered \\Recent \\Flagged)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Flags(flags) = *boxed {
-            assert!(
-                flags.contains(&Flag::Recent),
-                "\\Recent must be retained in FLAGS for Postel's law compatibility: {flags:?}"
-            );
-            assert!(flags.contains(&Flag::Seen));
-            assert!(flags.contains(&Flag::Answered));
-            assert!(flags.contains(&Flag::Flagged));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Flags(flags) = *boxed
+    {
+        assert!(
+            flags.contains(&Flag::Recent),
+            "\\Recent must be retained in FLAGS for Postel's law compatibility: {flags:?}"
+        );
+        assert!(flags.contains(&Flag::Seen));
+        assert!(flags.contains(&Flag::Answered));
+        assert!(flags.contains(&Flag::Flagged));
+        return;
     }
     panic!("expected FLAGS response");
 }
@@ -10342,17 +10340,17 @@ fn spec_audit_flags_response_retains_recent() {
 fn spec_audit_fetch_flags_includes_recent() {
     let input = b"* 1 FETCH (FLAGS (\\Seen \\Recent))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fetch) = *boxed {
-            let flags = fetch.flags.as_ref().expect("FLAGS should be present");
-            assert!(
-                flags.contains(&Flag::Recent),
-                "RFC 3501 Section 9: flag-fetch includes \\Recent, \
-                     but parser excluded it: {flags:?}"
-            );
-            assert!(flags.contains(&Flag::Seen));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fetch) = *boxed
+    {
+        let flags = fetch.flags.as_ref().expect("FLAGS should be present");
+        assert!(
+            flags.contains(&Flag::Recent),
+            "RFC 3501 Section 9: flag-fetch includes \\Recent, \
+                 but parser excluded it: {flags:?}"
+        );
+        assert!(flags.contains(&Flag::Seen));
+        return;
     }
     panic!("expected FETCH response");
 }
@@ -11268,12 +11266,12 @@ fn fetch_preview_quoted() {
     // RFC 8970 Section 3: PREVIEW data item is an nstring.
     let (_, resp) =
         parse_response(b"* 1 FETCH (UID 42 PREVIEW \"Meeting tomorrow at 3pm\")\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(42));
-            assert_eq!(fr.preview.as_deref(), Some("Meeting tomorrow at 3pm"));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(42));
+        assert_eq!(fr.preview.as_deref(), Some("Meeting tomorrow at 3pm"));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -11282,12 +11280,12 @@ fn fetch_preview_quoted() {
 fn fetch_preview_nil() {
     // RFC 8970 Section 3: PREVIEW NIL (e.g., LAZY mode not yet computed).
     let (_, resp) = parse_response(b"* 5 FETCH (UID 100 PREVIEW NIL)\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(100));
-            assert!(fr.preview.is_none());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(100));
+        assert!(fr.preview.is_none());
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -11296,11 +11294,11 @@ fn fetch_preview_nil() {
 fn fetch_preview_empty_string() {
     // RFC 8970 Section 3: PREVIEW with empty quoted string.
     let (_, resp) = parse_response(b"* 1 FETCH (PREVIEW \"\")\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.preview.as_deref(), Some(""));
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.preview.as_deref(), Some(""));
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -11310,13 +11308,13 @@ fn fetch_preview_with_other_items() {
     // PREVIEW alongside UID, FLAGS, and ENVELOPE.
     let (_, resp) =
         parse_response(b"* 3 FETCH (UID 7 FLAGS (\\Seen) PREVIEW \"Hello world\")\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.uid, Some(7));
-            assert_eq!(fr.preview.as_deref(), Some("Hello world"));
-            assert!(fr.flags.is_some());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.uid, Some(7));
+        assert_eq!(fr.preview.as_deref(), Some("Hello world"));
+        assert!(fr.flags.is_some());
+        return;
     }
     panic!("expected Fetch response");
 }
@@ -11326,18 +11324,17 @@ fn fetch_preview_with_other_items() {
 #[test]
 fn capability_preview_parsed() {
     let (_, resp) = parse_response(b"* OK [CAPABILITY IMAP4rev1 PREVIEW] Ready\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Status {
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Status {
             code: Some(ResponseCode::Capability(caps)),
             ..
         } = *boxed
-        {
-            assert!(
-                caps.contains(&Capability::Preview),
-                "PREVIEW capability must be parsed"
-            );
-            return;
-        }
+    {
+        assert!(
+            caps.contains(&Capability::Preview),
+            "PREVIEW capability must be parsed"
+        );
+        return;
     }
     panic!("expected OK with CAPABILITY");
 }
@@ -11348,18 +11345,17 @@ fn capability_preview_parsed() {
 fn capability_within_parsed() {
     // RFC 5032 Section 3: WITHIN capability enables OLDER/YOUNGER search keys.
     let (_, resp) = parse_response(b"* OK [CAPABILITY IMAP4rev1 WITHIN] Ready\r\n").unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Status {
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Status {
             code: Some(ResponseCode::Capability(caps)),
             ..
         } = *boxed
-        {
-            assert!(
-                caps.contains(&Capability::Within),
-                "WITHIN capability must be parsed"
-            );
-            return;
-        }
+    {
+        assert!(
+            caps.contains(&Capability::Within),
+            "WITHIN capability must be parsed"
+        );
+        return;
     }
     panic!("expected OK with CAPABILITY");
 }
@@ -11655,16 +11651,16 @@ fn list_extended_unknown_item_parenthesized_value_skipped() {
     // parenthesized value  -  the parser should skip it gracefully.
     let input = b"* LIST (\\HasNoChildren) \"/\" \"INBOX\" (\"XFUTURE\" (\"some\" \"data\"))\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::List(info) = *boxed {
-            assert_eq!(info.name.as_str(), "INBOX");
-            assert_eq!(info.delimiter, Some('/'));
-            assert!(info.attributes.contains(&MailboxAttribute::HasNoChildren));
-            // The unknown extended item should be silently skipped
-            assert!(info.old_name.is_none());
-            assert!(info.child_info.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::List(info) = *boxed
+    {
+        assert_eq!(info.name.as_str(), "INBOX");
+        assert_eq!(info.delimiter, Some('/'));
+        assert!(info.attributes.contains(&MailboxAttribute::HasNoChildren));
+        // The unknown extended item should be silently skipped
+        assert!(info.old_name.is_none());
+        assert!(info.child_info.is_empty());
+        return;
     }
     panic!("expected List response");
 }
@@ -11676,11 +11672,11 @@ fn list_extended_unknown_item_simple_value_skipped() {
     // Unknown item with a simple token value (not parenthesized)
     let input = b"* LIST () \"/\" \"INBOX\" (\"XTOKEN\" 12345)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::List(info) = *boxed {
-            assert_eq!(info.name.as_str(), "INBOX");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::List(info) = *boxed
+    {
+        assert_eq!(info.name.as_str(), "INBOX");
+        return;
     }
     panic!("expected List response");
 }
@@ -11691,11 +11687,11 @@ fn list_extended_unknown_item_simple_value_skipped() {
 fn list_extended_multiple_unknown_items_skipped() {
     let input = b"* LIST () \"/\" \"INBOX\" (\"XFOO\" (\"nested\") \"XBAR\" 42)\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::List(info) = *boxed {
-            assert_eq!(info.name.as_str(), "INBOX");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::List(info) = *boxed
+    {
+        assert_eq!(info.name.as_str(), "INBOX");
+        return;
     }
     panic!("expected List response");
 }
@@ -11833,15 +11829,15 @@ fn esearch_trailing_space_tolerated() {
 fn esearch_no_result_data_immediate_crlf() {
     let input = b"* ESEARCH (TAG \"A001\") UID\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Esearch(esearch) = *boxed {
-            assert!(esearch.uid);
-            assert!(esearch.all.is_empty());
-            assert_eq!(esearch.min, None);
-            assert_eq!(esearch.max, None);
-            assert_eq!(esearch.count, None);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Esearch(esearch) = *boxed
+    {
+        assert!(esearch.uid);
+        assert!(esearch.all.is_empty());
+        assert_eq!(esearch.min, None);
+        assert_eq!(esearch.max, None);
+        assert_eq!(esearch.count, None);
+        return;
     }
     panic!("expected Esearch response");
 }
@@ -11870,12 +11866,12 @@ fn quotaroot_trailing_space_tolerated_per_postels_law() {
 fn quotaroot_no_roots_loop_break() {
     let input = b"* QUOTAROOT INBOX\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            assert!(roots.is_empty());
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::QuotaRoot { mailbox, roots } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        assert!(roots.is_empty());
+        return;
     }
     panic!("expected QuotaRoot response");
 }
@@ -11887,14 +11883,14 @@ fn quotaroot_no_roots_loop_break() {
 fn capability_appendlimit_in_full_response() {
     let input = b"* CAPABILITY IMAP4rev1 APPENDLIMIT\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(
-                caps.contains(&Capability::AppendLimit(None)),
-                "Bare APPENDLIMIT must parse as AppendLimit(None): {caps:?}"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(
+            caps.contains(&Capability::AppendLimit(None)),
+            "Bare APPENDLIMIT must parse as AppendLimit(None): {caps:?}"
+        );
+        return;
     }
     panic!("expected Capability response");
 }
@@ -11904,14 +11900,14 @@ fn capability_appendlimit_in_full_response() {
 fn capability_appendlimit_with_value_in_full_response() {
     let input = b"* CAPABILITY IMAP4rev1 APPENDLIMIT=1048576\r\n";
     let (_, resp) = parse_response(input).unwrap();
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Capability(caps) = *boxed {
-            assert!(
-                caps.contains(&Capability::AppendLimit(Some(1_048_576))),
-                "APPENDLIMIT=1048576 must parse as AppendLimit(Some(1048576)): {caps:?}"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Capability(caps) = *boxed
+    {
+        assert!(
+            caps.contains(&Capability::AppendLimit(Some(1_048_576))),
+            "APPENDLIMIT=1048576 must parse as AppendLimit(Some(1048576)): {caps:?}"
+        );
+        return;
     }
     panic!("expected Capability response");
 }
@@ -12287,7 +12283,7 @@ fn envelope_explicit_sender_reply_to_not_overridden() {
 fn literal8_tolerates_non_synchronizing_modifier() {
     // ~{100+}\r\n followed by 100 bytes of data.
     let mut input = b"~{100+}\r\n".to_vec();
-    input.extend(std::iter::repeat(b'x').take(100));
+    input.extend(std::iter::repeat_n(b'x', 100));
     let result = literal(&input);
     assert!(
         result.is_ok(),
@@ -12427,17 +12423,17 @@ fn regression_esearch_unknown_key_no_value() {
         "ESEARCH with trailing unknown key (no value) must parse \
              per Postel's law (RFC 1122 Section 1.2.2)",
     );
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Esearch(esearch) = *boxed {
-            assert_eq!(
-                esearch.count,
-                Some(5),
-                "COUNT must be preserved when trailing unknown key has no value"
-            );
-            assert!(esearch.uid, "UID indicator must be preserved");
-            assert_eq!(esearch.tag.as_deref(), Some("t1"), "TAG must be preserved");
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Esearch(esearch) = *boxed
+    {
+        assert_eq!(
+            esearch.count,
+            Some(5),
+            "COUNT must be preserved when trailing unknown key has no value"
+        );
+        assert!(esearch.uid, "UID indicator must be preserved");
+        assert_eq!(esearch.tag.as_deref(), Some("t1"), "TAG must be preserved");
+        return;
     }
     panic!("expected ESEARCH response");
 }
@@ -12561,53 +12557,53 @@ fn edge_envelope_all_nil_full_response() {
     let input = b"* 1 FETCH (ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL))\r\n";
     let (_, resp) = parse_response(input)
         .expect("ENVELOPE with all-NIL fields must parse (RFC 3501 Section 7.4.2)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            let env = fr
-                .envelope
-                .expect("FETCH response should contain an envelope");
-            assert!(
-                env.date.is_none(),
-                "date must be None for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.subject.is_none(),
-                "subject must be None for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.from.is_empty(),
-                "from must be empty for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.sender.is_empty(),
-                "sender must be empty when from is also NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.reply_to.is_empty(),
-                "reply_to must be empty when from is also NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.to.is_empty(),
-                "to must be empty for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.cc.is_empty(),
-                "cc must be empty for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.bcc.is_empty(),
-                "bcc must be empty for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.in_reply_to.is_none(),
-                "in_reply_to must be None for NIL (RFC 3501 Section 7.4.2)"
-            );
-            assert!(
-                env.message_id.is_none(),
-                "message_id must be None for NIL (RFC 3501 Section 7.4.2)"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        let env = fr
+            .envelope
+            .expect("FETCH response should contain an envelope");
+        assert!(
+            env.date.is_none(),
+            "date must be None for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.subject.is_none(),
+            "subject must be None for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.from.is_empty(),
+            "from must be empty for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.sender.is_empty(),
+            "sender must be empty when from is also NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.reply_to.is_empty(),
+            "reply_to must be empty when from is also NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.to.is_empty(),
+            "to must be empty for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.cc.is_empty(),
+            "cc must be empty for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.bcc.is_empty(),
+            "bcc must be empty for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.in_reply_to.is_none(),
+            "in_reply_to must be None for NIL (RFC 3501 Section 7.4.2)"
+        );
+        assert!(
+            env.message_id.is_none(),
+            "message_id must be None for NIL (RFC 3501 Section 7.4.2)"
+        );
+        return;
     }
     panic!("expected Untagged Fetch with Envelope");
 }
@@ -12624,18 +12620,18 @@ fn edge_fetch_unknown_data_items_skipped() {
     let input = b"* 1 FETCH (UID 42 XFUTURE somevalue FLAGS (\\Seen) XBLOB (nested stuff))\r\n";
     let (_, resp) =
         parse_response(input).expect("FETCH with unknown data items must parse (Postel's law)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(
-                fr.uid,
-                Some(42),
-                "UID must be preserved when unknown items are present"
-            );
-            let flags = fr.flags.expect("FLAGS must be preserved");
-            assert_eq!(flags.len(), 1);
-            assert_eq!(flags[0], Flag::Seen);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(
+            fr.uid,
+            Some(42),
+            "UID must be preserved when unknown items are present"
+        );
+        let flags = fr.flags.expect("FLAGS must be preserved");
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0], Flag::Seen);
+        return;
     }
     panic!("expected Untagged Fetch response");
 }
@@ -12650,28 +12646,28 @@ fn edge_list_contradictory_attributes_preserved() {
     let input = b"* LIST (\\HasChildren \\HasNoChildren) \"/\" \"INBOX\"\r\n";
     let (_, resp) = parse_response(input)
         .expect("LIST with contradictory attributes must parse (Postel's law)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::List(info) = *boxed {
-            assert_eq!(info.name.as_str(), "INBOX");
-            assert_eq!(info.delimiter, Some('/'));
-            assert_eq!(
-                info.attributes.len(),
-                2,
-                "both contradictory attributes must be preserved; got {:?}",
-                info.attributes
-            );
-            assert_eq!(
-                info.attributes[0],
-                MailboxAttribute::HasChildren,
-                "first attribute must be \\HasChildren"
-            );
-            assert_eq!(
-                info.attributes[1],
-                MailboxAttribute::HasNoChildren,
-                "second attribute must be \\HasNoChildren"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::List(info) = *boxed
+    {
+        assert_eq!(info.name.as_str(), "INBOX");
+        assert_eq!(info.delimiter, Some('/'));
+        assert_eq!(
+            info.attributes.len(),
+            2,
+            "both contradictory attributes must be preserved; got {:?}",
+            info.attributes
+        );
+        assert_eq!(
+            info.attributes[0],
+            MailboxAttribute::HasChildren,
+            "first attribute must be \\HasChildren"
+        );
+        assert_eq!(
+            info.attributes[1],
+            MailboxAttribute::HasNoChildren,
+            "second attribute must be \\HasNoChildren"
+        );
+        return;
     }
     panic!("expected Untagged List response");
 }
@@ -12685,36 +12681,36 @@ fn edge_esearch_empty_uid_list() {
     let input = b"* ESEARCH (TAG \"A001\") UID\r\n";
     let (_, resp) = parse_response(input)
         .expect("ESEARCH with empty UID result must parse (RFC 4731 Section 3.1)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Esearch(esearch) = *boxed {
-            assert_eq!(
-                esearch.tag.as_deref(),
-                Some("A001"),
-                "TAG must be preserved"
-            );
-            assert!(esearch.uid, "UID indicator must be true");
-            assert!(
-                esearch.all.is_empty(),
-                "ALL must be empty for an empty ESEARCH result"
-            );
-            assert_eq!(
-                esearch.min, None,
-                "MIN must be None for an empty ESEARCH result"
-            );
-            assert_eq!(
-                esearch.max, None,
-                "MAX must be None for an empty ESEARCH result"
-            );
-            assert_eq!(
-                esearch.count, None,
-                "COUNT must be None for an empty ESEARCH result"
-            );
-            assert_eq!(
-                esearch.mod_seq, None,
-                "MODSEQ must be None for an empty ESEARCH result"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Esearch(esearch) = *boxed
+    {
+        assert_eq!(
+            esearch.tag.as_deref(),
+            Some("A001"),
+            "TAG must be preserved"
+        );
+        assert!(esearch.uid, "UID indicator must be true");
+        assert!(
+            esearch.all.is_empty(),
+            "ALL must be empty for an empty ESEARCH result"
+        );
+        assert_eq!(
+            esearch.min, None,
+            "MIN must be None for an empty ESEARCH result"
+        );
+        assert_eq!(
+            esearch.max, None,
+            "MAX must be None for an empty ESEARCH result"
+        );
+        assert_eq!(
+            esearch.count, None,
+            "COUNT must be None for an empty ESEARCH result"
+        );
+        assert_eq!(
+            esearch.mod_seq, None,
+            "MODSEQ must be None for an empty ESEARCH result"
+        );
+        return;
     }
     panic!("expected Untagged Esearch response");
 }
@@ -12757,22 +12753,22 @@ fn edge_status_unknown_items_skipped() {
     let input = b"* STATUS INBOX (MESSAGES 5 UNKNOWN 3)\r\n";
     let (_, resp) =
         parse_response(input).expect("STATUS with unknown items must parse (Postel's law)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::MailboxStatus { mailbox, items } = *boxed {
-            assert_eq!(mailbox.as_str(), "INBOX");
-            // Only MESSAGES should be recognized; UNKNOWN should be skipped.
-            assert_eq!(
-                items.len(),
-                1,
-                "only recognized status items should be present; got {items:?}"
-            );
-            assert_eq!(
-                items[0],
-                StatusItem::Messages(5),
-                "MESSAGES value must be preserved"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::MailboxStatus { mailbox, items } = *boxed
+    {
+        assert_eq!(mailbox.as_str(), "INBOX");
+        // Only MESSAGES should be recognized; UNKNOWN should be skipped.
+        assert_eq!(
+            items.len(),
+            1,
+            "only recognized status items should be present; got {items:?}"
+        );
+        assert_eq!(
+            items[0],
+            StatusItem::Messages(5),
+            "MESSAGES value must be preserved"
+        );
+        return;
     }
     panic!("expected Untagged MailboxStatus response");
 }
@@ -12790,31 +12786,31 @@ fn edge_bodystructure_rfc2231_continuation_reassembly() {
     let input = b"* 1 FETCH (BODYSTRUCTURE (\"APPLICATION\" \"PDF\" (\"FILENAME*0\" \"very_long_\" \"FILENAME*1\" \"document.pdf\") NIL NIL \"BASE64\" 99999))\r\n";
     let (_, resp) =
         parse_response(input).expect("BODYSTRUCTURE with RFC 2231 continuation params must parse");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            let bs = fr
-                .body_structure
-                .expect("FETCH response should contain a body_structure");
-            if let BodyStructure::Basic { params, .. } = &bs {
-                assert_eq!(
-                    params.len(),
-                    1,
-                    "RFC 2231 continuation segments must be reassembled into one param; \
-                         got {params:?}"
-                );
-                assert_eq!(
-                    params[0].0, "filename",
-                    "reassembled param key must be the base name"
-                );
-                assert_eq!(
-                    params[0].1, "very_long_document.pdf",
-                    "reassembled param value must concatenate all segments \
-                         (RFC 2231 Section 3)"
-                );
-                return;
-            }
-            panic!("expected Basic body structure, got {bs:?}");
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        let bs = fr
+            .body_structure
+            .expect("FETCH response should contain a body_structure");
+        if let BodyStructure::Basic { params, .. } = &bs {
+            assert_eq!(
+                params.len(),
+                1,
+                "RFC 2231 continuation segments must be reassembled into one param; \
+                     got {params:?}"
+            );
+            assert_eq!(
+                params[0].0, "filename",
+                "reassembled param key must be the base name"
+            );
+            assert_eq!(
+                params[0].1, "very_long_document.pdf",
+                "reassembled param value must concatenate all segments \
+                     (RFC 2231 Section 3)"
+            );
+            return;
         }
+        panic!("expected Basic body structure, got {bs:?}");
     }
     panic!("expected Untagged Fetch response");
 }
@@ -12829,17 +12825,17 @@ fn edge_fetch_literal_with_crlf() {
     let input = b"* 1 FETCH (BODY[] {12}\r\nline1\r\nline2)\r\n";
     let (_, resp) = parse_response(input)
         .expect("FETCH with literal containing CRLF must parse (RFC 3501 Section 9)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::Fetch(fr) = *boxed {
-            assert_eq!(fr.body_sections.len(), 1, "should have one body section");
-            let section = &fr.body_sections[0];
-            assert_eq!(
-                section.data.as_deref(),
-                Some(b"line1\r\nline2".as_slice()),
-                "literal must preserve embedded CRLF bytes (RFC 3501 Section 9)"
-            );
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::Fetch(fr) = *boxed
+    {
+        assert_eq!(fr.body_sections.len(), 1, "should have one body section");
+        let section = &fr.body_sections[0];
+        assert_eq!(
+            section.data.as_deref(),
+            Some(b"line1\r\nline2".as_slice()),
+            "literal must preserve embedded CRLF bytes (RFC 3501 Section 9)"
+        );
+        return;
     }
     panic!("expected Untagged Fetch response");
 }
@@ -12867,22 +12863,22 @@ fn flag_list_tolerates_multiple_spaces() {
 #[test]
 fn capability_list_tolerates_multiple_spaces() {
     let (_, resp) = parse_response(b"* CAPABILITY IMAP4rev1  IDLE  LITERAL+\r\n").unwrap();
-    if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Capability(caps) = &*u {
-            assert!(
-                caps.contains(&Capability::Imap4Rev1),
-                "IMAP4rev1 missing after double spaces"
-            );
-            assert!(
-                caps.contains(&Capability::Idle),
-                "IDLE missing after double spaces"
-            );
-            assert!(
-                caps.contains(&Capability::LiteralPlus),
-                "LITERAL+ missing after double spaces"
-            );
-            return;
-        }
+    if let Response::Untagged(u) = resp
+        && let UntaggedResponse::Capability(caps) = &*u
+    {
+        assert!(
+            caps.contains(&Capability::Imap4Rev1),
+            "IMAP4rev1 missing after double spaces"
+        );
+        assert!(
+            caps.contains(&Capability::Idle),
+            "IDLE missing after double spaces"
+        );
+        assert!(
+            caps.contains(&Capability::LiteralPlus),
+            "LITERAL+ missing after double spaces"
+        );
+        return;
     }
     panic!("expected Untagged Capability response");
 }
@@ -12892,13 +12888,13 @@ fn capability_list_tolerates_multiple_spaces() {
 #[test]
 fn capability_list_tolerates_tabs() {
     let (_, resp) = parse_response(b"* CAPABILITY IMAP4rev1\tIDLE\tLITERAL+\r\n").unwrap();
-    if let Response::Untagged(u) = resp {
-        if let UntaggedResponse::Capability(caps) = &*u {
-            assert!(caps.contains(&Capability::Imap4Rev1));
-            assert!(caps.contains(&Capability::Idle));
-            assert!(caps.contains(&Capability::LiteralPlus));
-            return;
-        }
+    if let Response::Untagged(u) = resp
+        && let UntaggedResponse::Capability(caps) = &*u
+    {
+        assert!(caps.contains(&Capability::Imap4Rev1));
+        assert!(caps.contains(&Capability::Idle));
+        assert!(caps.contains(&Capability::LiteralPlus));
+        return;
     }
     panic!("expected Untagged Capability response");
 }
@@ -12910,19 +12906,19 @@ fn list_attributes_tolerate_multiple_spaces() {
     let input = b"* LIST (\\NoSelect  \\HasChildren) \"/\" \"Archive\"\r\n";
     let (_, resp) = parse_response(input)
         .expect("LIST with double-spaced attributes must parse (Postel's law)");
-    if let Response::Untagged(boxed) = resp {
-        if let UntaggedResponse::List(info) = *boxed {
-            assert_eq!(info.name.as_str(), "Archive");
-            assert_eq!(
-                info.attributes.len(),
-                2,
-                "both attributes must be parsed despite double spaces; got {:?}",
-                info.attributes
-            );
-            assert_eq!(info.attributes[0], MailboxAttribute::NoSelect);
-            assert_eq!(info.attributes[1], MailboxAttribute::HasChildren);
-            return;
-        }
+    if let Response::Untagged(boxed) = resp
+        && let UntaggedResponse::List(info) = *boxed
+    {
+        assert_eq!(info.name.as_str(), "Archive");
+        assert_eq!(
+            info.attributes.len(),
+            2,
+            "both attributes must be parsed despite double spaces; got {:?}",
+            info.attributes
+        );
+        assert_eq!(info.attributes[0], MailboxAttribute::NoSelect);
+        assert_eq!(info.attributes[1], MailboxAttribute::HasChildren);
+        return;
     }
     panic!("expected Untagged List response");
 }
@@ -13372,11 +13368,11 @@ mod prop_invariants {
         /// response, all UIDs must be >= 1.
         #[test]
         fn search_uids_nonzero(data in prop::collection::vec(any::<u8>(), 0..500)) {
-            if let Ok((_, Response::Untagged(boxed))) = parse_response_utf8(&data, false).as_ref() {
-                if let UntaggedResponse::Search { uids, .. } = boxed.as_ref() {
-                    for uid in uids {
-                        prop_assert!(*uid >= 1, "UID must be >= 1 (RFC 3501 Section 9), got {}", uid);
-                    }
+            if let Ok((_, Response::Untagged(boxed))) = parse_response_utf8(&data, false).as_ref()
+                && let UntaggedResponse::Search { uids, .. } = boxed.as_ref()
+            {
+                for uid in uids {
+                    prop_assert!(*uid >= 1, "UID must be >= 1 (RFC 3501 Section 9), got {}", uid);
                 }
             }
         }
@@ -13608,26 +13604,23 @@ mod prop_invariants {
             );
             if let Ok((_, Response::Untagged(u))) =
                 parse_response(input.as_bytes()).as_ref()
+                && let UntaggedResponse::Fetch(f) = u.as_ref()
+                && let Some(BodyStructure::Text {
+                    media_subtype,
+                    encoding: enc,
+                    ..
+                }) = &f.body_structure
             {
-                if let UntaggedResponse::Fetch(f) = u.as_ref() {
-                    if let Some(BodyStructure::Text {
-                        media_subtype,
-                        encoding: enc,
-                        ..
-                    }) = &f.body_structure
-                    {
-                        prop_assert_eq!(
-                            media_subtype,
-                            &subtype.to_ascii_lowercase(),
-                            "subtype must be lowercase"
-                        );
-                        prop_assert_eq!(
-                            enc,
-                            &encoding.to_ascii_lowercase(),
-                            "encoding must be lowercase"
-                        );
-                    }
-                }
+                prop_assert_eq!(
+                    media_subtype,
+                    &subtype.to_ascii_lowercase(),
+                    "subtype must be lowercase"
+                );
+                prop_assert_eq!(
+                    enc,
+                    &encoding.to_ascii_lowercase(),
+                    "encoding must be lowercase"
+                );
             }
         }
     }

@@ -299,29 +299,30 @@ pub(super) fn buffer_may_contain_complete_response(buf: &[u8]) -> bool {
         }
     };
 
-    if first_crlf >= 2 && may_contain_literal {
-        if let Some(literal_len) = try_parse_literal_marker(buf, first_crlf) {
-            // Skip past the first literal body and iteratively check
-            // for additional literals (e.g., multi-body FETCH).
-            let mut pos = first_crlf + 2 + literal_len;
-            loop {
-                if pos > buf.len() {
-                    return false;
-                }
-                // Find the next \r\n after the current literal body.
-                let remaining = &buf[pos..];
-                let Some(next_crlf) = remaining.windows(2).position(|w| w == b"\r\n") else {
-                    return false;
-                };
-                // Check if there's another literal marker at this CRLF.
-                if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf) {
-                    // Another literal  -  skip past it and continue.
-                    pos += next_crlf + 2 + next_literal_len;
-                    continue;
-                }
-                // No more literals  -  this CRLF terminates the response.
-                return true;
+    if first_crlf >= 2
+        && may_contain_literal
+        && let Some(literal_len) = try_parse_literal_marker(buf, first_crlf)
+    {
+        // Skip past the first literal body and iteratively check
+        // for additional literals (e.g., multi-body FETCH).
+        let mut pos = first_crlf + 2 + literal_len;
+        loop {
+            if pos > buf.len() {
+                return false;
             }
+            // Find the next \r\n after the current literal body.
+            let remaining = &buf[pos..];
+            let Some(next_crlf) = remaining.windows(2).position(|w| w == b"\r\n") else {
+                return false;
+            };
+            // Check if there's another literal marker at this CRLF.
+            if let Some(next_literal_len) = try_parse_literal_marker(remaining, next_crlf) {
+                // Another literal  -  skip past it and continue.
+                pos += next_crlf + 2 + next_literal_len;
+                continue;
+            }
+            // No more literals  -  this CRLF terminates the response.
+            return true;
         }
     }
 

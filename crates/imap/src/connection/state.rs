@@ -444,11 +444,10 @@ impl ProtocolState {
         // code was already handled above (clears self.notify AND
         // self.in_notify_set), so the take() below returns None in that
         // case  -  no double-write.
-        if let Some(pending_flags) = self.in_notify_set.take() {
-            if t.status == crate::types::response::StatusKind::Ok {
-                self.notify = pending_flags;
-            }
-            // NO/BAD: flags unchanged  -  command was rejected.
+        if let Some(pending_flags) = self.in_notify_set.take()
+            && t.status == crate::types::response::StatusKind::Ok
+        {
+            self.notify = pending_flags;
         }
     }
 }

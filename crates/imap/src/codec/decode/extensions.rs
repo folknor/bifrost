@@ -77,11 +77,7 @@ pub(super) fn parse_untagged_quotaroot(
     // Remaining tokens before CRLF are quota root names (space-separated astrings).
     let mut roots = Vec::new();
     let mut input = input;
-    loop {
-        // Try to consume SP + astring
-        let Ok((rest, _)) = sp(input) else {
-            break;
-        };
+    while let Ok((rest, _)) = sp(input) {
         // Check if we hit CRLF
         if rest.starts_with(b"\r\n") {
             break;
@@ -116,11 +112,7 @@ pub(super) fn parse_untagged_acl(
     let mailbox = decode_mailbox_from_wire(&mailbox_bytes, utf8_mode);
     let mut entries = Vec::new();
     let mut input = input;
-    loop {
-        // Try to consume SP + identifier SP rights pair
-        let Ok((rest, _)) = sp(input) else {
-            break;
-        };
+    while let Ok((rest, _)) = sp(input) {
         if rest.starts_with(b"\r\n") {
             break;
         }
@@ -181,10 +173,7 @@ pub(super) fn parse_untagged_listrights(
     // Remaining tokens are optional rights groups
     let mut optional = Vec::new();
     let mut input = input;
-    loop {
-        let Ok((rest, _)) = sp(input) else {
-            break;
-        };
+    while let Ok((rest, _)) = sp(input) {
         if rest.starts_with(b"\r\n") {
             break;
         }
@@ -417,20 +406,22 @@ pub(super) fn scan_unknown_response(input: &[u8]) -> IResult<&[u8], &[u8]> {
 
         // Literal8: `~{N}\r\n<N bytes>` (RFC 3516 / RFC 6855 Section 4).
         // Check for `~` followed by `{`.
-        if b == b'~' && pos + 1 < input.len() && input[pos + 1] == b'{' {
-            if let Some(advance) = try_skip_literal(&input[pos + 1..]) {
-                pos += 1 + advance; // 1 for `~`, plus the literal bytes
-                continue;
-            }
+        if b == b'~'
+            && pos + 1 < input.len()
+            && input[pos + 1] == b'{'
+            && let Some(advance) = try_skip_literal(&input[pos + 1..])
+        {
+            pos += 1 + advance; // 1 for `~`, plus the literal bytes
+            continue;
         }
 
         // Literal `{N}\r\n<data>` or LITERAL+ `{N+}\r\n<data>`
         // (RFC 3501 Section 9 / RFC 7888).
-        if b == b'{' {
-            if let Some(advance) = try_skip_literal(&input[pos..]) {
-                pos += advance;
-                continue;
-            }
+        if b == b'{'
+            && let Some(advance) = try_skip_literal(&input[pos..])
+        {
+            pos += advance;
+            continue;
         }
 
         pos += 1;
@@ -529,7 +520,7 @@ fn parse_thread_node(input: &[u8], depth: u32) -> IResult<&[u8], ThreadNode> {
 
     // The first element is either a bare UID or another '(' (dummy parent).
     // UIDs are nz-number per RFC 3501 Section 9 (uniqueid = nz-number).
-    let root_id: Option<u32> = if input.first().map_or(true, |b| *b == b'(' || *b == b')') {
+    let root_id: Option<u32> = if input.first().is_none_or(|b| *b == b'(' || *b == b')') {
         // Dummy parent (RFC 5256 Section 4)  -  no UID.
         None
     } else {

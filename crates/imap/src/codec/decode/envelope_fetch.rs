@@ -496,14 +496,12 @@ pub(super) fn scan_section_spec(input: &[u8]) -> IResult<&[u8], &[u8]> {
                             // (RFC 3501 Section 9: literal = "{" number "}" CRLF *CHAR8).
                             // Use checked_add to prevent overflow, and bounds-check
                             // to avoid reading past the end of input.
-                            if let Ok(s) = std::str::from_utf8(&input[digit_start..count_end]) {
-                                if let Ok(count) = s.parse::<usize>() {
-                                    if let Some(new_pos) = pos.checked_add(count) {
-                                        if new_pos <= input.len() {
-                                            pos = new_pos;
-                                        }
-                                    }
-                                }
+                            if let Ok(s) = std::str::from_utf8(&input[digit_start..count_end])
+                                && let Ok(count) = s.parse::<usize>()
+                                && let Some(new_pos) = pos.checked_add(count)
+                                && new_pos <= input.len()
+                            {
+                                pos = new_pos;
                             }
                         }
                     }
@@ -682,24 +680,24 @@ pub(super) fn skip_paren_group(input: &[u8]) -> IResult<&[u8], &[u8]> {
                             // Parse the byte count and skip that many bytes.
                             // Use checked_add to prevent wrapping on crafted counts
                             // near usize::MAX (RFC 3501 Section 9 / RFC 9051 Section 9).
-                            if let Ok(s) = std::str::from_utf8(&input[start..count_end]) {
-                                if let Ok(count) = s.parse::<usize>() {
-                                    match end.checked_add(count) {
-                                        Some(new_end) if new_end <= input.len() => {
-                                            i = new_end;
-                                            continue;
-                                        }
-                                        _ => {
-                                            // Literal body exceeds available data or
-                                            // overflows usize  -  stop scanning to avoid
-                                            // misinterpreting literal body bytes as
-                                            // parenthesized structure
-                                            // (RFC 3501 Section 9 / RFC 9051 Section 9).
-                                            return Err(nom::Err::Error(nom::error::Error::new(
-                                                input,
-                                                nom::error::ErrorKind::Eof,
-                                            )));
-                                        }
+                            if let Ok(s) = std::str::from_utf8(&input[start..count_end])
+                                && let Ok(count) = s.parse::<usize>()
+                            {
+                                match end.checked_add(count) {
+                                    Some(new_end) if new_end <= input.len() => {
+                                        i = new_end;
+                                        continue;
+                                    }
+                                    _ => {
+                                        // Literal body exceeds available data or
+                                        // overflows usize  -  stop scanning to avoid
+                                        // misinterpreting literal body bytes as
+                                        // parenthesized structure
+                                        // (RFC 3501 Section 9 / RFC 9051 Section 9).
+                                        return Err(nom::Err::Error(nom::error::Error::new(
+                                            input,
+                                            nom::error::ErrorKind::Eof,
+                                        )));
                                     }
                                 }
                             }

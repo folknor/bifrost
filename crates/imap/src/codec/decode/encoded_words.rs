@@ -34,22 +34,20 @@ fn decode_rfc2047_str(input: &str) -> String {
         remaining = saved_after_prefix;
 
         // Parse: charset?encoding?text?=
-        if candidate_has_valid_prefix {
-            if let Some(decoded) = parse_encoded_word(&mut remaining) {
-                let candidate_has_valid_suffix = match remaining.chars().next() {
-                    None => true,
-                    Some(c) => c == ' ' || c == '\t',
-                };
+        if candidate_has_valid_prefix && let Some(decoded) = parse_encoded_word(&mut remaining) {
+            let candidate_has_valid_suffix = match remaining.chars().next() {
+                None => true,
+                Some(c) => c == ' ' || c == '\t',
+            };
 
-                if candidate_has_valid_suffix {
-                    // RFC 2047 Section 5: decode only when the token is
-                    // separated from adjacent text by linear whitespace.
-                    // RFC 2047 Section 6.2: both adjacent words are valid,
-                    // so drop the inter-word whitespace.
-                    result.push_str(&decoded);
-                    last_was_encoded = true;
-                    continue;
-                }
+            if candidate_has_valid_suffix {
+                // RFC 2047 Section 5: decode only when the token is
+                // separated from adjacent text by linear whitespace.
+                // RFC 2047 Section 6.2: both adjacent words are valid,
+                // so drop the inter-word whitespace.
+                result.push_str(&decoded);
+                last_was_encoded = true;
+                continue;
             }
         }
         remaining = saved_after_prefix;
