@@ -26,8 +26,8 @@
 //! Uses schannel on Windows, Security-Framework on macOS, and OpenSSL
 //! on all other platforms.
 //!
-//! * **native-tls** (default): TLS support for the synchronous version of the API
-//! * **tokio**: TLS support for the `tokio` async version of the API
+//! TLS support is always available for the synchronous API.
+//! Enable **tokio** for TLS support in the async API.
 //!
 //! ##### Building Bifrost SMTP with OpenSSL
 //!

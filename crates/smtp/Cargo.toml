@@ -39,7 +39,7 @@ url = "2.4"
 percent-encoding = "2.3"
 zeroize = { version = "1", features = ["serde"] }
 
-native-tls = { version = "0.2.9", optional = true }
+native-tls = "0.2.9"
 
 tokio = { version = "1", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
@@ -55,7 +55,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 
 [features]
-default = ["pool", "native-tls"]
+default = ["pool"]
 
 pool = ["tokio?/sync"]
 
@@ -65,7 +65,6 @@ tokio = [
     "tokio/time",
     "tokio/net",
     "tokio/io-util",
-    "native-tls",
     "dep:tokio-native-tls",
 ]
 
@@ -77,7 +76,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
 name = "autoconfigure"
-required-features = ["native-tls"]
 
 [[example]]
 name = "smtp"
@@ -87,15 +85,12 @@ name = "lmtp"
 
 [[example]]
 name = "smtp_tls"
-required-features = ["native-tls"]
 
 [[example]]
 name = "smtp_starttls"
-required-features = ["native-tls"]
 
 [[example]]
 name = "smtp_selfsigned"
-required-features = ["native-tls"]
 
 [[example]]
 name = "tokio_smtp_tls"

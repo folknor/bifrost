@@ -30,9 +30,6 @@ use crate::transport::smtp::{Error, error};
 pub(crate) use self::async_connection::AsyncSmtpConnection;
 pub(crate) use self::connection::SmtpConnection;
 use self::net::NetworkStream;
-#[cfg(feature = "native-tls")]
-pub(super) use self::tls::InnerTlsParameters;
-#[cfg(feature = "native-tls")]
 pub use self::tls::{Certificate, Identity};
 pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 

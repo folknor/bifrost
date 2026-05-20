@@ -141,7 +141,7 @@ crates/smtp/src/
 ## SMTP-specific code style
 
 - `client::` is private; low-level connection/network stream types are crate-internal.
-- TLS variants are gated on `native-tls`; rustls/boring features have been removed.
+- TLS uses native-tls unconditionally; rustls/boring features have been removed.
 - `#[non_exhaustive]` on `Error`, `ErrorKind`, DKIM enums, `CertificateStore`.
 - `AsyncTransport` requires `Sync` so borrowed methods return `Send` futures.
 - Async traits use native `impl Future + Send` return types; no `async-trait`.

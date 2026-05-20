@@ -1,14 +1,8 @@
 use std::fmt::{self, Debug};
 
-#[cfg(feature = "native-tls")]
 use native_tls::{Protocol, TlsConnector};
 
-#[cfg(feature = "native-tls")]
 use crate::transport::smtp::{Error, error};
-
-#[cfg(not(feature = "native-tls"))]
-#[derive(Clone)]
-struct NoTlsParameters;
 
 /// TLS protocol versions.
 #[derive(Debug, Copy, Clone)]
@@ -54,17 +48,11 @@ pub enum Tls {
     /// This is kept for compatibility with servers that advertise STARTTLS
     /// opportunistically. Prefer [`Tls::Required`] or [`Tls::Wrapper`] for
     /// authenticated remote SMTP.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     Opportunistic(TlsParameters),
     /// Begin with a plaintext connection and require `STARTTLS` before
     /// transmitting credentials or messages.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     Required(TlsParameters),
     /// Establish a TLS connection immediately.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     Wrapper(TlsParameters),
 }
 
@@ -72,11 +60,8 @@ impl Debug for Tls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self {
             Self::None => f.pad("None"),
-            #[cfg(feature = "native-tls")]
             Self::Opportunistic(_) => f.pad("Opportunistic"),
-            #[cfg(feature = "native-tls")]
             Self::Required(_) => f.pad("Required"),
-            #[cfg(feature = "native-tls")]
             Self::Wrapper(_) => f.pad("Wrapper"),
         }
     }
@@ -104,25 +89,17 @@ pub enum CertificateStore {
 /// Parameters to use for secure clients.
 #[derive(Clone)]
 pub struct TlsParameters {
-    #[cfg(feature = "native-tls")]
-    pub(crate) connector: InnerTlsParameters,
+    pub(crate) connector: TlsConnector,
     /// The domain name expected in the server TLS certificate.
-    #[cfg(feature = "native-tls")]
     pub(super) domain: String,
-    /// Placeholder for builds where TLS cannot be constructed.
-    #[cfg(not(feature = "native-tls"))]
-    _private: NoTlsParameters,
 }
 
 /// Builder for [`TlsParameters`].
 #[derive(Debug, Clone)]
-#[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
 pub struct TlsParametersBuilder {
     domain: String,
     cert_store: CertificateStore,
-    #[cfg(feature = "native-tls")]
     root_certs: Vec<Certificate>,
-    #[cfg(feature = "native-tls")]
     identity: Option<Identity>,
     accept_invalid_hostnames: bool,
     accept_invalid_certs: bool,
@@ -135,9 +112,7 @@ impl TlsParametersBuilder {
         Self {
             domain,
             cert_store: CertificateStore::Default,
-            #[cfg(feature = "native-tls")]
             root_certs: Vec::new(),
-            #[cfg(feature = "native-tls")]
             identity: None,
             accept_invalid_hostnames: false,
             accept_invalid_certs: false,
@@ -155,16 +130,12 @@ impl TlsParametersBuilder {
     ///
     /// Can be used to safely connect to a server using a self-signed
     /// certificate, for example.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn add_root_certificate(mut self, cert: Certificate) -> Self {
         self.root_certs.push(cert);
         self
     }
 
     /// Add a client certificate.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn identify_with(mut self, identity: Identity) -> Self {
         self.identity = Some(identity);
         self
@@ -202,16 +173,7 @@ impl TlsParametersBuilder {
     }
 
     /// Creates a new [`TlsParameters`] using native-tls.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn build(self) -> Result<TlsParameters, Error> {
-        self.build_native()
-    }
-
-    /// Creates a new [`TlsParameters`] using native-tls.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn build_native(self) -> Result<TlsParameters, Error> {
         let mut tls_builder = TlsConnector::builder();
 
         match self.cert_store {
@@ -246,23 +208,14 @@ impl TlsParametersBuilder {
 
         let connector = tls_builder.build().map_err(error::tls)?;
         Ok(TlsParameters {
-            connector: InnerTlsParameters::NativeTls { connector },
+            connector,
             domain: self.domain,
         })
     }
 }
 
-#[cfg(feature = "native-tls")]
-#[derive(Clone)]
-#[allow(clippy::enum_variant_names)]
-pub(crate) enum InnerTlsParameters {
-    NativeTls { connector: TlsConnector },
-}
-
 impl TlsParameters {
     /// Creates a new [`TlsParameters`] using native-tls.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn new(domain: String) -> Result<Self, Error> {
         TlsParametersBuilder::new(domain).build()
     }
@@ -272,33 +225,19 @@ impl TlsParameters {
         TlsParametersBuilder::new(domain)
     }
 
-    /// Creates a new [`TlsParameters`] using native-tls.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn new_native(domain: String) -> Result<Self, Error> {
-        TlsParametersBuilder::new(domain).build_native()
-    }
-
     /// Creates new [`TlsParameters`] from an existing native-tls connector.
     ///
-    /// This is useful when callers need native-tls features that are not
+    /// This is useful when callers need native-tls settings that are not
     /// mirrored directly by [`TlsParametersBuilder`].
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn from_inner(domain: String, connector: TlsConnector) -> Self {
-        Self {
-            connector: InnerTlsParameters::NativeTls { connector },
-            domain,
-        }
+        Self { connector, domain }
     }
 
-    #[cfg(feature = "native-tls")]
     pub fn domain(&self) -> &str {
         &self.domain
     }
 }
 
-#[cfg(feature = "native-tls")]
 impl From<(String, TlsConnector)> for TlsParameters {
     fn from((domain, connector): (String, TlsConnector)) -> Self {
         Self::from_inner(domain, connector)
@@ -309,13 +248,10 @@ impl From<(String, TlsConnector)> for TlsParameters {
 /// [`TlsParametersBuilder::add_root_certificate`].
 #[derive(Clone)]
 #[allow(missing_copy_implementations)]
-#[cfg(feature = "native-tls")]
-#[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
 pub struct Certificate {
     native_tls: native_tls::Certificate,
 }
 
-#[cfg(feature = "native-tls")]
 impl Certificate {
     /// Create a [`Certificate`] from a DER encoded certificate.
     pub fn from_der(der: Vec<u8>) -> Result<Self, Error> {
@@ -337,14 +273,12 @@ impl Certificate {
     }
 }
 
-#[cfg(feature = "native-tls")]
 impl From<native_tls::Certificate> for Certificate {
     fn from(native_tls: native_tls::Certificate) -> Self {
         Self::from_inner(native_tls)
     }
 }
 
-#[cfg(feature = "native-tls")]
 impl Debug for Certificate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Certificate").finish()
@@ -354,20 +288,16 @@ impl Debug for Certificate {
 /// An identity that can be used with [`TlsParametersBuilder::identify_with`].
 #[derive(Clone)]
 #[allow(missing_copy_implementations)]
-#[cfg(feature = "native-tls")]
-#[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
 pub struct Identity {
     native_tls: native_tls::Identity,
 }
 
-#[cfg(feature = "native-tls")]
 impl Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Identity").finish()
     }
 }
 
-#[cfg(feature = "native-tls")]
 impl Identity {
     pub fn from_pem(pem: &[u8], key: &[u8]) -> Result<Self, Error> {
         Ok(Self {
@@ -381,7 +311,6 @@ impl Identity {
     }
 }
 
-#[cfg(feature = "native-tls")]
 impl From<native_tls::Identity> for Identity {
     fn from(native_tls: native_tls::Identity) -> Self {
         Self::from_inner(native_tls)
@@ -389,7 +318,6 @@ impl From<native_tls::Identity> for Identity {
 }
 
 #[cfg(test)]
-#[cfg(feature = "native-tls")]
 mod tests {
     use super::*;
 

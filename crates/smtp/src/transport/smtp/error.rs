@@ -102,8 +102,6 @@ impl Error {
     }
 
     /// Returns true if the error is from TLS
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn is_tls(&self) -> bool {
         matches!(self.inner.kind, Kind::Tls)
     }
@@ -141,8 +139,6 @@ pub enum ErrorKind {
     /// Underlying network I/O error.
     Network,
     /// TLS error.
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    #[cfg(feature = "native-tls")]
     Tls,
     /// Transport shutdown error.
     TransportShutdown,
@@ -169,8 +165,6 @@ pub(crate) enum Kind {
     /// Underlying network i/o error
     Network,
     /// TLS error
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    #[cfg(feature = "native-tls")]
     Tls,
     /// Transport shutdown error
     #[cfg_attr(not(feature = "pool"), allow(dead_code))]
@@ -187,7 +181,6 @@ impl Kind {
             Kind::Policy => ErrorKind::Policy,
             Kind::Connection => ErrorKind::Connection,
             Kind::Network => ErrorKind::Network,
-            #[cfg(feature = "native-tls")]
             Kind::Tls => ErrorKind::Tls,
             Kind::TransportShutdown => ErrorKind::TransportShutdown,
         }
@@ -216,7 +209,6 @@ impl fmt::Display for Error {
             Kind::Policy => f.write_str("policy error")?,
             Kind::Network => f.write_str("network error")?,
             Kind::Connection => f.write_str("Connection error")?,
-            #[cfg(feature = "native-tls")]
             Kind::Tls => f.write_str("tls error")?,
             Kind::TransportShutdown => f.write_str("transport has been shut down")?,
             Kind::Transient(code) => {
@@ -277,7 +269,6 @@ pub(crate) fn timeout(message: &'static str) -> Error {
     connection(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
 }
 
-#[cfg(feature = "native-tls")]
 pub(crate) fn tls<E: Into<BoxError>>(e: E) -> Error {
     Error::new(Kind::Tls, Some(e))
 }

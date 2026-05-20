@@ -44,7 +44,6 @@
 //! do the following:
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -82,7 +81,6 @@
 //! For more information take a look at [`SmtpTransport::from_url`] or [`AsyncSmtpTransport::from_url`].
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -110,7 +108,6 @@
 //! #### Advanced configuration with custom TLS settings
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::fs;
 //!
@@ -155,7 +152,6 @@
 //! In a webserver context it may go about this:
 //!
 //! ```rust,no_run
-//! # #[cfg(feature = "native-tls")]
 //! # fn test() {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -204,7 +200,6 @@ pub use self::async_transport::{
 #[cfg(feature = "tokio")]
 pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
-#[cfg(feature = "native-tls")]
 pub use self::client::{Certificate, Identity};
 pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 #[cfg(feature = "pool")]

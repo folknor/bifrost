@@ -13,14 +13,14 @@ use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
     TlsParameters,
 };
-#[cfg(feature = "native-tls")]
-use crate::transport::smtp::commands::Starttls;
 use crate::{
     address::Envelope,
     transport::smtp::{
         Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Rset, Vrfy},
+        commands::{
+            Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Rset, Starttls, Vrfy,
+        },
         error,
         error::Error,
         extension::{
@@ -657,36 +657,24 @@ impl SmtpConnection {
         self.stream.get_ref().state() != ConnectionState::Ok
     }
 
-    // Without sync native-tls, no public transport path can perform STARTTLS.
-    #[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
     pub(crate) fn can_starttls(&self) -> bool {
         !self.is_encrypted() && self.server_info.supports_feature(Extension::StartTls)
     }
 
-    // Without sync native-tls, no public transport path can perform STARTTLS.
-    #[allow(unused_variables)]
-    #[cfg_attr(not(feature = "native-tls"), allow(dead_code))]
     pub(crate) fn starttls(
         &mut self,
         tls_parameters: &TlsParameters,
         hello_name: &ClientId,
     ) -> Result<(), Error> {
         if self.server_info.supports_feature(Extension::StartTls) {
-            #[cfg(feature = "native-tls")]
-            {
-                try_smtp!(self.command(Starttls), self);
-                self.stream.get_mut().upgrade_tls(tls_parameters)?;
-                #[cfg(feature = "tracing")]
-                tracing::debug!("connection encrypted");
-                // Send EHLO/LHLO again
-                try_smtp!(self.hello(hello_name), self);
-                self.hello_name = hello_name.clone();
-                Ok(())
-            }
-            #[cfg(not(feature = "native-tls"))]
-            // This should never happen as `Tls` can only be created
-            // when a TLS library is enabled
-            unreachable!("TLS support required but not supported");
+            try_smtp!(self.command(Starttls), self);
+            self.stream.get_mut().upgrade_tls(tls_parameters)?;
+            #[cfg(feature = "tracing")]
+            tracing::debug!("connection encrypted");
+            // Send EHLO/LHLO again
+            try_smtp!(self.hello(hello_name), self);
+            self.hello_name = hello_name.clone();
+            Ok(())
         } else {
             Err(error::client("STARTTLS is not supported on this server"))
         }

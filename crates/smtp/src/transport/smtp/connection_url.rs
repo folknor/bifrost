@@ -7,14 +7,11 @@ use super::AsyncSmtpTransportBuilder;
 use super::{
     Error, SMTP_PORT, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId,
 };
-#[cfg(feature = "native-tls")]
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT};
-#[cfg(feature = "native-tls")]
 use super::{Tls, TlsParameters};
 
 pub(crate) trait TransportBuilder {
     fn new<T: Into<String>>(server: T) -> Self;
-    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self;
     fn port(self, port: u16) -> Self;
     fn credentials(self, credentials: Credentials) -> Self;
@@ -26,7 +23,6 @@ impl TransportBuilder for SmtpTransportBuilder {
         Self::new(server)
     }
 
-    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self {
         self.tls(tls)
     }
@@ -50,7 +46,6 @@ impl TransportBuilder for AsyncSmtpTransportBuilder {
         Self::new(server)
     }
 
-    #[cfg(feature = "native-tls")]
     fn tls(self, tls: super::Tls) -> Self {
         self.tls(tls)
     }
@@ -86,19 +81,16 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         ("smtp", None) => {
             builder = builder.port(connection_url.port().unwrap_or(SMTP_PORT));
         }
-        #[cfg(feature = "native-tls")]
         ("smtp", Some("required")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
                 .tls(Tls::Required(TlsParameters::new(host.into())?));
         }
-        #[cfg(feature = "native-tls")]
         ("smtp", Some("opportunistic")) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSION_PORT))
                 .tls(Tls::Opportunistic(TlsParameters::new(host.into())?));
         }
-        #[cfg(feature = "native-tls")]
         ("smtps", _) => {
             builder = builder
                 .port(connection_url.port().unwrap_or(SUBMISSIONS_PORT))
@@ -106,7 +98,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
         }
         (scheme, tls) => {
             return Err(error::connection(format!(
-                "Unknown scheme '{scheme}' or tls parameter '{tls:?}', note that a transport with TLS requires one of the TLS features"
+                "Unknown scheme '{scheme}' or tls parameter '{tls:?}'"
             )));
         }
     }

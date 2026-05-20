@@ -774,7 +774,7 @@ impl AsyncSmtpConnection {
         self.stream.get_ref().state() != ConnectionState::Ok
     }
 
-    // Async STARTTLS is only wired for the tokio native-tls feature path.
+    // Async STARTTLS is only wired when the tokio backend is enabled.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn can_starttls(&self) -> bool {
         !self.is_encrypted() && self.server_info.supports_feature(Extension::StartTls)
@@ -786,8 +786,7 @@ impl AsyncSmtpConnection {
     ///
     /// [rfc3207]: https://www.rfc-editor.org/rfc/rfc3207
     /// [rfc8314]: https://www.rfc-editor.org/rfc/rfc8314
-    // Async STARTTLS is only wired for the tokio native-tls feature path.
-    #[allow(unused_variables)]
+    // Async STARTTLS is only wired when the tokio backend is enabled.
     #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) async fn starttls(
         &mut self,

@@ -17,7 +17,6 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::net::{TcpSocket, TcpStream, ToSocketAddrs};
 use tokio_native_tls::TlsStream as TokioTlsStream;
 
-use super::InnerTlsParameters;
 use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
@@ -255,20 +254,16 @@ impl AsyncNetworkStream {
     ) -> Result<InnerAsyncNetworkStream, Error> {
         let domain = tls_parameters.domain().to_owned();
 
-        match tls_parameters.connector {
-            InnerTlsParameters::NativeTls { connector } => {
-                use tokio_native_tls::TlsConnector;
+        use tokio_native_tls::TlsConnector;
 
-                let connector = TlsConnector::from(connector);
-                let handshake = connector.connect(&domain, tcp_stream);
-                let stream = deadline
-                    .timeout("TLS handshake timed out", handshake)
-                    .await?;
-                Ok(InnerAsyncNetworkStream::TokioNativeTls(
-                    stream.map_err(error::connection)?,
-                ))
-            }
-        }
+        let connector = TlsConnector::from(tls_parameters.connector);
+        let handshake = connector.connect(&domain, tcp_stream);
+        let stream = deadline
+            .timeout("TLS handshake timed out", handshake)
+            .await?;
+        Ok(InnerAsyncNetworkStream::TokioNativeTls(
+            stream.map_err(error::connection)?,
+        ))
     }
 
     pub(crate) fn is_encrypted(&self) -> bool {

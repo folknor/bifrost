@@ -12,7 +12,6 @@ use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
     SmtpInfo, error,
 };
-#[cfg(feature = "native-tls")]
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Transport, address::Envelope};
@@ -131,8 +130,6 @@ impl SmtpTransport {
     ///
     /// Creates an encrypted transport over submissions port, using the provided domain
     /// to validate TLS certificates.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn relay(relay: &str) -> Result<SmtpTransportBuilder, Error> {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
@@ -152,8 +149,6 @@ impl SmtpTransport {
     ///
     /// An error is returned if the connection can't be upgraded. No credentials
     /// or emails will be sent to the server, protecting from downgrade attacks.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn starttls_relay(relay: &str) -> Result<SmtpTransportBuilder, Error> {
         let tls_parameters = TlsParameters::new(relay.into())?;
 
@@ -253,10 +248,8 @@ impl SmtpTransport {
     /// ```
     ///
     /// The connection URL can then be used in the following way:
-    /// TLS URL forms such as `smtps://` and `?tls=required` require the
-    /// `native-tls` feature. Without it, only plaintext `smtp://` URLs are
-    /// accepted. If a plaintext URL contains credentials, authentication is
-    /// refused at connection time unless
+    /// If a plaintext URL contains credentials, authentication is refused at
+    /// connection time unless
     /// [`SmtpTransportBuilder::dangerous_allow_insecure_auth`] is enabled.
     ///
     /// ```rust,no_run
@@ -615,8 +608,6 @@ impl SmtpTransportBuilder {
     ///
     /// Using the wrong [`Tls`] and [`Self::port`] combination may
     /// lead to hard to debug IO errors coming from the TLS library.
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -732,8 +723,6 @@ impl LmtpTransportBuilder {
     }
 
     /// Set the TLS settings to use
-    #[cfg(feature = "native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -805,14 +794,11 @@ impl SmtpClient {
             }
         }
 
-        #[allow(clippy::match_single_binding)]
         let tls_parameters = match &self.info.tls {
-            #[cfg(feature = "native-tls")]
             Tls::Wrapper(tls_parameters) => Some(tls_parameters),
             _ => None,
         };
 
-        #[allow(unused_mut)]
         let mut conn = SmtpConnection::connect_with_protocol::<(&str, u16)>(
             (self.info.server.as_ref(), self.info.port),
             self.info.timeout,
@@ -822,7 +808,6 @@ impl SmtpClient {
             self.info.protocol,
         )?;
 
-        #[cfg(feature = "native-tls")]
         match &self.info.tls {
             Tls::Opportunistic(tls_parameters) if conn.can_starttls() => {
                 conn.starttls(tls_parameters, &self.info.hello_name)?;
@@ -851,7 +836,6 @@ mod tests {
         time::Duration,
     };
 
-    #[cfg(feature = "native-tls")]
     use crate::transport::smtp::Tls;
     #[cfg(unix)]
     use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
@@ -944,7 +928,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "native-tls")]
     fn transport_from_tls_url() {
         let builder = SmtpTransport::from_url("smtp://127.0.0.1:2525").unwrap();
 

@@ -4,8 +4,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "native-tls")]
-use std::mem;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
@@ -13,20 +11,17 @@ use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
 
-#[cfg(feature = "native-tls")]
 use native_tls::TlsStream;
 #[cfg(unix)]
 use socket2::SockAddr;
 use socket2::{Domain, Protocol, Type};
 
-#[cfg(feature = "native-tls")]
-use super::InnerTlsParameters;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
 
 /// A network stream
 pub(crate) struct NetworkStream {
-    inner: InnerNetworkStream,
+    inner: Option<InnerNetworkStream>,
     state: ConnectionState,
 }
 
@@ -41,22 +36,13 @@ enum InnerNetworkStream {
     #[cfg(unix)]
     Unix(UnixStream),
     /// Encrypted TCP stream
-    #[cfg(feature = "native-tls")]
     NativeTls(TlsStream<TcpStream>),
-    /// Can't be built
-    #[cfg(feature = "native-tls")]
-    None,
 }
 
 impl NetworkStream {
     fn new(inner: InnerNetworkStream) -> Self {
-        #[cfg(feature = "native-tls")]
-        if let InnerNetworkStream::None = inner {
-            debug_assert!(false, "InnerNetworkStream::None must never be built");
-        }
-
         NetworkStream {
-            inner,
+            inner: Some(inner),
             state: ConnectionState::Ok,
         }
     }
@@ -73,17 +59,12 @@ impl NetworkStream {
     pub(crate) fn shutdown(&mut self, how: Shutdown) -> io::Result<()> {
         self.state = ConnectionState::Closed;
 
-        match &self.inner {
-            InnerNetworkStream::Tcp(s) => s.shutdown(how),
+        match self.inner.as_ref() {
+            Some(InnerNetworkStream::Tcp(s)) => s.shutdown(how),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(s) => s.shutdown(how),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(s) => s.get_ref().shutdown(how),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(())
-            }
+            Some(InnerNetworkStream::Unix(s)) => s.shutdown(how),
+            Some(InnerNetworkStream::NativeTls(s)) => s.get_ref().shutdown(how),
+            None => Ok(()),
         }
     }
 
@@ -160,28 +141,18 @@ impl NetworkStream {
         Ok(NetworkStream::new(InnerNetworkStream::Unix(stream)))
     }
 
-    #[cfg(not(feature = "native-tls"))]
-    pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
-        let _ = self;
-        let _ = tls_parameters;
-        unreachable!("Trying to upgrade a NetworkStream without having enabled native-tls");
-    }
-
-    #[cfg(feature = "native-tls")]
     pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
         self.state.verify()?;
 
-        match &self.inner {
-            InnerNetworkStream::Tcp(_) => {
+        match self.inner.as_ref() {
+            Some(InnerNetworkStream::Tcp(_)) => {
                 self.state = ConnectionState::Broken;
 
-                // get owned TcpStream
-                let tcp_stream = mem::replace(&mut self.inner, InnerNetworkStream::None);
-                let InnerNetworkStream::Tcp(tcp_stream) = tcp_stream else {
+                let Some(InnerNetworkStream::Tcp(tcp_stream)) = self.inner.take() else {
                     unreachable!()
                 };
 
-                self.inner = Self::upgrade_tls_impl(tcp_stream, tls_parameters)?;
+                self.inner = Some(Self::upgrade_tls_impl(tcp_stream, tls_parameters)?);
                 self.state = ConnectionState::Ok;
                 Ok(())
             }
@@ -191,116 +162,93 @@ impl NetworkStream {
         }
     }
 
-    #[cfg(feature = "native-tls")]
     fn upgrade_tls_impl(
         tcp_stream: TcpStream,
         tls_parameters: &TlsParameters,
     ) -> Result<InnerNetworkStream, Error> {
-        Ok(match &tls_parameters.connector {
-            InnerTlsParameters::NativeTls { connector } => {
-                let stream = connector
-                    .connect(tls_parameters.domain(), tcp_stream)
-                    .map_err(error::connection)?;
-                InnerNetworkStream::NativeTls(stream)
-            }
-        })
+        let stream = tls_parameters
+            .connector
+            .connect(tls_parameters.domain(), tcp_stream)
+            .map_err(error::connection)?;
+        Ok(InnerNetworkStream::NativeTls(stream))
     }
 
     pub(crate) fn is_encrypted(&self) -> bool {
-        match &self.inner {
-            InnerNetworkStream::Tcp(_) => false,
+        match self.inner.as_ref() {
+            Some(InnerNetworkStream::Tcp(_)) => false,
             #[cfg(unix)]
-            InnerNetworkStream::Unix(_) => false,
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(_) => true,
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                false
-            }
+            Some(InnerNetworkStream::Unix(_)) => false,
+            Some(InnerNetworkStream::NativeTls(_)) => true,
+            None => false,
         }
     }
 
     pub(crate) fn set_read_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
-        match &mut self.inner {
-            InnerNetworkStream::Tcp(stream) => stream.set_read_timeout(duration),
+        match self.inner.as_mut() {
+            Some(InnerNetworkStream::Tcp(stream)) => stream.set_read_timeout(duration),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(stream) => stream.set_read_timeout(duration),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_read_timeout(duration),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(())
+            Some(InnerNetworkStream::Unix(stream)) => stream.set_read_timeout(duration),
+            Some(InnerNetworkStream::NativeTls(stream)) => {
+                stream.get_ref().set_read_timeout(duration)
             }
+            None => Err(not_connected()),
         }
     }
 
     /// Set write timeout for IO calls
     pub(crate) fn set_write_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
-        match &mut self.inner {
-            InnerNetworkStream::Tcp(stream) => stream.set_write_timeout(duration),
+        match self.inner.as_mut() {
+            Some(InnerNetworkStream::Tcp(stream)) => stream.set_write_timeout(duration),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(stream) => stream.set_write_timeout(duration),
+            Some(InnerNetworkStream::Unix(stream)) => stream.set_write_timeout(duration),
 
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_write_timeout(duration),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(())
+            Some(InnerNetworkStream::NativeTls(stream)) => {
+                stream.get_ref().set_write_timeout(duration)
             }
+            None => Err(not_connected()),
         }
     }
 }
 
 impl Read for NetworkStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.inner {
-            InnerNetworkStream::Tcp(s) => s.read(buf),
+        match self.inner.as_mut() {
+            Some(InnerNetworkStream::Tcp(s)) => s.read(buf),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(s) => s.read(buf),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(s) => s.read(buf),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(0)
-            }
+            Some(InnerNetworkStream::Unix(s)) => s.read(buf),
+            Some(InnerNetworkStream::NativeTls(s)) => s.read(buf),
+            None => Err(not_connected()),
         }
     }
 }
 
 impl Write for NetworkStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match &mut self.inner {
-            InnerNetworkStream::Tcp(s) => s.write(buf),
+        match self.inner.as_mut() {
+            Some(InnerNetworkStream::Tcp(s)) => s.write(buf),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(s) => s.write(buf),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(s) => s.write(buf),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(0)
-            }
+            Some(InnerNetworkStream::Unix(s)) => s.write(buf),
+            Some(InnerNetworkStream::NativeTls(s)) => s.write(buf),
+            None => Err(not_connected()),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match &mut self.inner {
-            InnerNetworkStream::Tcp(s) => s.flush(),
+        match self.inner.as_mut() {
+            Some(InnerNetworkStream::Tcp(s)) => s.flush(),
             #[cfg(unix)]
-            InnerNetworkStream::Unix(s) => s.flush(),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::NativeTls(s) => s.flush(),
-            #[cfg(feature = "native-tls")]
-            InnerNetworkStream::None => {
-                debug_assert!(false, "InnerNetworkStream::None must never be built");
-                Ok(())
-            }
+            Some(InnerNetworkStream::Unix(s)) => s.flush(),
+            Some(InnerNetworkStream::NativeTls(s)) => s.flush(),
+            None => Err(not_connected()),
         }
     }
+}
+
+fn not_connected() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "network stream is not connected",
+    )
 }
 
 /// If the local address is set, binds the socket to this address.
