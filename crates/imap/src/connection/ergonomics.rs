@@ -99,11 +99,20 @@ impl ImapConnection {
             Ok::<(), Error>(())
         };
         let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
-        fetch_result?;
-        drain_result
+        match (drain_result, fetch_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     /// Collect a UID FETCH with a caller-supplied memory budget.
+    ///
+    /// The budget is enforced in the FETCH consumer: responses beyond the
+    /// budget are not retained, and the method returns [`Error::FetchLimit`]
+    /// after the tagged completion. The driver still drains the command to
+    /// keep the IMAP stream synchronized, so callers that need strict
+    /// back-pressure should use [`uid_fetch_each`](Self::uid_fetch_each).
     pub async fn uid_fetch_limited(
         &self,
         uids: &crate::types::UidSet,

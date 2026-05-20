@@ -308,7 +308,7 @@ impl ImapConnection {
         .await
         .map_err(|_| Error::Timeout)??;
         self.tls_active
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }

@@ -14,13 +14,17 @@ impl ImapConnection {
     /// policy and TLS is active. LOGIN is never used unless explicitly
     /// allowed in [`AuthPolicy`].
     ///
-    /// OAuth credentials currently use XOAUTH2.
+    /// OAuth credentials currently use XOAUTH2 and require TLS unless the
+    /// policy explicitly permits cleartext credential mechanisms.
     pub async fn authenticate_best(
         &self,
         credentials: &crate::types::Credentials,
         policy: &crate::types::AuthPolicy,
         timeout: Duration,
     ) -> Result<crate::types::AuthOutcome, Error> {
+        use crate::error::{
+            AuthMechanismRejection, AuthMechanismRejectionReason, AuthPolicyFailure,
+        };
         use crate::types::{AuthMechanism, AuthOutcome, Credentials};
 
         let profile = self.server_profile();
@@ -29,8 +33,17 @@ impl ImapConnection {
                 identity,
                 access_token,
             } => {
-                if !profile.supports_auth(AuthMechanism::XOAuth2) {
+                if !profile.supports_sasl_auth(AuthMechanism::XOAuth2) {
                     return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
+                }
+                if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                    return Err(Error::AuthPolicy(AuthPolicyFailure::new(
+                        offered_authentication(&profile, false),
+                        vec![AuthMechanismRejection::new(
+                            AuthMechanism::XOAuth2,
+                            AuthMechanismRejectionReason::CleartextWithoutTls,
+                        )],
+                    )));
                 }
                 self.authenticate_xoauth2(identity, access_token.as_str(), timeout)
                     .await?;
@@ -39,6 +52,7 @@ impl ImapConnection {
                 })
             }
             Credentials::Password { username, password } => {
+                let mut rejected = Vec::new();
                 for mechanism in [
                     AuthMechanism::ScramSha256,
                     AuthMechanism::ScramSha1,
@@ -46,9 +60,15 @@ impl ImapConnection {
                     AuthMechanism::CramMd5,
                     AuthMechanism::Login,
                 ] {
-                    if !profile.supports_auth(mechanism) {
+                    let supported = if mechanism == AuthMechanism::Login {
+                        profile.supports_login_command()
+                    } else {
+                        profile.supports_sasl_auth(mechanism)
+                    };
+                    if !supported {
                         continue;
                     }
+                    let mut rejection = None;
                     match mechanism {
                         AuthMechanism::ScramSha256 => {
                             self.authenticate_scram_sha256(username, password.as_str(), timeout)
@@ -60,6 +80,10 @@ impl ImapConnection {
                         }
                         AuthMechanism::Plain => {
                             if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
+                            }
+                            if let Some(reason) = rejection {
+                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
                                 continue;
                             }
                             self.authenticate_plain(username, password.as_str(), timeout)
@@ -67,9 +91,13 @@ impl ImapConnection {
                         }
                         AuthMechanism::CramMd5 => {
                             if !policy.allow_cram_md5 {
-                                continue;
+                                rejection = Some(AuthMechanismRejectionReason::DisabledByPolicy);
                             }
                             if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
+                            }
+                            if let Some(reason) = rejection {
+                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
                                 continue;
                             }
                             self.authenticate_cram_md5(username, password.as_str(), timeout)
@@ -77,9 +105,13 @@ impl ImapConnection {
                         }
                         AuthMechanism::Login => {
                             if !policy.allow_login {
-                                continue;
+                                rejection = Some(AuthMechanismRejectionReason::DisabledByPolicy);
                             }
                             if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
+                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
+                            }
+                            if let Some(reason) = rejection {
+                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
                                 continue;
                             }
                             self.login(username, password.as_str(), timeout).await?;
@@ -88,10 +120,10 @@ impl ImapConnection {
                     }
                     return Ok(AuthOutcome { mechanism });
                 }
-                Err(Error::AuthPolicy(
-                    "no permitted server authentication mechanism matched the supplied credentials"
-                        .into(),
-                ))
+                Err(Error::AuthPolicy(AuthPolicyFailure::new(
+                    offered_authentication(&profile, true),
+                    rejected,
+                )))
             }
         }
     }
@@ -698,6 +730,21 @@ impl ImapConnection {
             Err(_) => Err(self.observe_driver_panic().await),
         }
     }
+}
+
+fn offered_authentication(
+    profile: &crate::types::ServerProfile,
+    include_login: bool,
+) -> Vec<String> {
+    let mut offered = profile
+        .auth_mechanisms
+        .iter()
+        .map(|mechanism| format!("AUTH={mechanism}"))
+        .collect::<Vec<_>>();
+    if include_login && profile.supports_login_command() {
+        offered.push("LOGIN".to_owned());
+    }
+    offered
 }
 
 /// Check if `IMAP4rev2` behavior is active from a

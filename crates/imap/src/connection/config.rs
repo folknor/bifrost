@@ -2,7 +2,6 @@
 use super::*;
 
 /// Connection configuration for [`ImapConnection`].
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct ImapConfig {
     /// Server hostname.
@@ -13,7 +12,8 @@ pub struct ImapConfig {
     pub tls_mode: TlsMode,
     /// Timeout for connect and initial greeting/capability negotiation.
     pub connect_timeout: Duration,
-    /// Default timeout for higher-level helper operations.
+    /// Timeout used by [`connect_authenticated`](Self::connect_authenticated)
+    /// for the automatic authentication exchange.
     pub command_timeout: Duration,
     /// Optional TCP keepalive configuration.
     pub keepalive: Option<TcpKeepalive>,
@@ -80,9 +80,15 @@ impl ImapConfig {
         self
     }
 
-    /// Override TCP keepalive.
-    pub fn with_keepalive(mut self, keepalive: Option<TcpKeepalive>) -> Self {
-        self.keepalive = keepalive;
+    /// Enable TCP keepalive with the supplied settings.
+    pub fn with_keepalive(mut self, keepalive: TcpKeepalive) -> Self {
+        self.keepalive = Some(keepalive);
+        self
+    }
+
+    /// Disable TCP keepalive.
+    pub fn without_keepalive(mut self) -> Self {
+        self.keepalive = None;
         self
     }
 

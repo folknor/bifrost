@@ -1,6 +1,6 @@
 //! Application-facing event impact helpers.
 
-use super::{FetchResponse, MailboxInfo, ResponseCode, UidRange};
+use super::{FetchResponse, MailboxInfo, ResponseCode, UidRange, UntaggedResponse};
 use crate::TypedEvent;
 
 /// What a consumer should generally do after receiving an asynchronous event.
@@ -45,9 +45,8 @@ pub enum EventImpact {
         /// Human-readable server text.
         text: String,
     },
-    /// Extension-defined event. Consumers that care about the extension should
-    /// inspect the raw typed event.
-    Extension,
+    /// Extension-defined event with the raw untagged response preserved.
+    Extension(Box<UntaggedResponse>),
 }
 
 impl TypedEvent {
@@ -75,7 +74,7 @@ impl TypedEvent {
             Self::MailboxEvent(info) => EventImpact::MailboxChanged(info.clone()),
             Self::MetadataChange { .. } => EventImpact::SelectedMailboxChanged,
             Self::ServerMetadataChange { .. } => EventImpact::ServerMetadataChanged,
-            Self::Extension(_) => EventImpact::Extension,
+            Self::Extension(response) => EventImpact::Extension(response.clone()),
         }
     }
 }
@@ -156,13 +155,16 @@ mod tests {
                 TypedEvent::ServerMetadataChange {},
                 EventImpact::ServerMetadataChanged,
             ),
-            (
-                TypedEvent::Extension(Box::new(UntaggedResponse::Search {
+            {
+                let response = Box::new(UntaggedResponse::Search {
                     uids: Vec::new(),
                     mod_seq: None,
-                })),
-                EventImpact::Extension,
-            ),
+                });
+                (
+                    TypedEvent::Extension(response.clone()),
+                    EventImpact::Extension(response),
+                )
+            },
         ];
 
         for (event, impact) in cases {

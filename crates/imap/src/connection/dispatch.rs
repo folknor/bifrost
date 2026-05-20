@@ -1443,8 +1443,8 @@ pub(crate) struct FetchConsumer {
     warn_threshold: usize,
     /// Hard caller-supplied memory budget.
     hard_limit: Option<usize>,
-    /// Estimated size observed when the hard limit was first crossed.
-    limit_exceeded_at: Option<usize>,
+    /// Fetch-limit error captured when the hard limit was first crossed.
+    limit_exceeded: Option<Error>,
     /// Whether the warning has already been emitted (log once).
     warned: bool,
 }
@@ -1457,7 +1457,7 @@ impl FetchConsumer {
             estimated_bytes: 0,
             warn_threshold: DEFAULT_FETCH_WARN_BYTES,
             hard_limit: None,
-            limit_exceeded_at: None,
+            limit_exceeded: None,
             warned: false,
         }
     }
@@ -1488,7 +1488,12 @@ impl Consumer for FetchConsumer {
             if let Some(limit) = self.hard_limit
                 && self.estimated_bytes > limit
             {
-                self.limit_exceeded_at.get_or_insert(self.estimated_bytes);
+                self.limit_exceeded.get_or_insert(Error::FetchLimit {
+                    estimated: self.estimated_bytes,
+                    limit,
+                    seq: fr.seq,
+                    uid: fr.uid,
+                });
                 return;
             }
             if !self.warned && self.estimated_bytes > self.warn_threshold {
@@ -1515,11 +1520,8 @@ impl Consumer for FetchConsumer {
         _ctx: &ConsumerContext,
     ) -> Result<Finalized<Vec<FetchResponse>>, Error> {
         tagged.require_ok()?;
-        if let Some(estimated) = self.limit_exceeded_at {
-            return Err(Error::FetchLimit {
-                estimated,
-                limit: self.hard_limit.expect("limit exceeded requires hard limit"),
-            });
+        if let Some(error) = self.limit_exceeded {
+            return Err(error);
         }
         Ok(Finalized {
             output: self.fetches,

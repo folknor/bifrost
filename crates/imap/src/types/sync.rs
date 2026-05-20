@@ -1,7 +1,7 @@
 //! Higher-level mailbox sync request and result types.
 
 use super::{
-    FetchAttr, FetchResponse, ModSeq, QresyncParams, SelectedMailbox, UidSet, UidValidity,
+    FetchAttr, FetchResponse, ModSeq, QresyncParams, SelectedMailbox, SeqSet, UidSet, UidValidity,
 };
 
 /// Options for selecting a mailbox for synchronization.
@@ -19,6 +19,8 @@ pub struct SyncSelectOptions {
     pub mod_seq: Option<ModSeq>,
     /// Optional known UID set for QRESYNC.
     pub known_uids: Option<UidSet>,
+    /// Optional sequence-number to UID correspondence for QRESYNC.
+    pub seq_match_data: Option<(SeqSet, UidSet)>,
 }
 
 impl SyncSelectOptions {
@@ -52,12 +54,26 @@ impl SyncSelectOptions {
         self
     }
 
+    /// Attach QRESYNC sequence-match data.
+    ///
+    /// RFC 7162 Section 3.2.5.2 allows clients to send
+    /// `(known-sequence-set known-uid-set)` in addition to `known-uids` so
+    /// the server can detect expunges and renumbering more efficiently.
+    pub fn with_qresync_seq_match(mut self, known_seqs: SeqSet, known_uids: UidSet) -> Self {
+        self.seq_match_data = Some((known_seqs, known_uids));
+        self
+    }
+
     /// Convert to low-level QRESYNC parameters when a complete cursor exists.
     pub fn qresync_params(&self) -> Option<QresyncParams> {
         let uid_validity = self.uid_validity?;
         let mod_seq = self.mod_seq?;
         let mut params = QresyncParams::new(uid_validity.get(), mod_seq.get());
         params.known_uids = self.known_uids.as_ref().map(ToString::to_string);
+        params.seq_match_data = self
+            .seq_match_data
+            .as_ref()
+            .map(|(known_seqs, known_uids)| (known_seqs.to_string(), known_uids.to_string()));
         Some(params)
     }
 }
@@ -160,4 +176,42 @@ pub struct SyncFetchResult {
     pub fetches: Vec<FetchResponse>,
     /// Vanished UID ranges returned by QRESYNC.
     pub vanished: Vec<super::UidRange>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Seq, Uid};
+
+    #[test]
+    fn qresync_params_preserve_seq_match_data() {
+        let options = SyncSelectOptions::read_write()
+            .with_qresync(
+                UidValidity::new(77).expect("valid uidvalidity"),
+                ModSeq::new(9000),
+                Some(UidSet::range(
+                    Uid::new(10).expect("valid uid"),
+                    Uid::new(20).expect("valid uid"),
+                )),
+            )
+            .with_qresync_seq_match(
+                SeqSet::range(
+                    Seq::new(1).expect("valid sequence"),
+                    Seq::new(5).expect("valid sequence"),
+                ),
+                UidSet::range(
+                    Uid::new(10).expect("valid uid"),
+                    Uid::new(14).expect("valid uid"),
+                ),
+            );
+
+        let params = options.qresync_params().expect("complete qresync cursor");
+        assert_eq!(params.uid_validity, 77);
+        assert_eq!(params.mod_seq, 9000);
+        assert_eq!(params.known_uids.as_deref(), Some("10:20"));
+        assert_eq!(
+            params.seq_match_data,
+            Some(("1:5".to_owned(), "10:14".to_owned()))
+        );
+    }
 }

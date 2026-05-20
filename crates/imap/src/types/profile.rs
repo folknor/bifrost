@@ -2,6 +2,21 @@
 
 use super::{AuthMechanism, Capability};
 
+/// Server-wide APPENDLIMIT policy advertised in CAPABILITY.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AppendLimitPolicy {
+    /// The server did not advertise APPENDLIMIT.
+    #[default]
+    NotAdvertised,
+    /// Bare `APPENDLIMIT` was advertised; check selected-mailbox status for
+    /// a mailbox-specific limit.
+    PerMailbox,
+    /// `APPENDLIMIT=<n>` advertised a server-wide limit in octets.
+    Limit(u64),
+}
+
 /// Caller-friendly snapshot of server capabilities and enabled extensions.
 ///
 /// This is not a live view. Capabilities and enabled extensions can change
@@ -20,8 +35,8 @@ pub struct ServerProfile {
     pub imap4rev2: bool,
     /// AUTH mechanisms advertised by the server.
     pub auth_mechanisms: Vec<String>,
-    /// Server APPENDLIMIT, when advertised. `Some(None)` means no limit.
-    pub append_limit: Option<Option<u64>>,
+    /// Server APPENDLIMIT policy advertised in CAPABILITY.
+    pub append_limit: AppendLimitPolicy,
     /// Advertised THREAD algorithms.
     pub thread_algorithms: Vec<String>,
 }
@@ -37,10 +52,14 @@ impl ServerProfile {
                 _ => None,
             })
             .collect();
-        let append_limit = capabilities.iter().find_map(|cap| match cap {
-            Capability::AppendLimit(limit) => Some(*limit),
-            _ => None,
-        });
+        let append_limit = capabilities
+            .iter()
+            .find_map(|cap| match cap {
+                Capability::AppendLimit(None) => Some(AppendLimitPolicy::PerMailbox),
+                Capability::AppendLimit(Some(limit)) => Some(AppendLimitPolicy::Limit(*limit)),
+                _ => None,
+            })
+            .unwrap_or_default();
         let thread_algorithms = capabilities
             .iter()
             .filter_map(|cap| match cap {
@@ -65,13 +84,32 @@ impl ServerProfile {
     }
 
     /// Return `true` if the server advertises the SASL mechanism.
+    ///
+    /// [`AuthMechanism::Login`] represents the legacy IMAP LOGIN command in
+    /// this crate, not the non-standard `AUTH=LOGIN` SASL mechanism. For
+    /// clearer call sites, prefer [`supports_sasl_auth`](Self::supports_sasl_auth)
+    /// for SASL and [`supports_login_command`](Self::supports_login_command)
+    /// for the legacy command.
     pub fn supports_auth(&self, mechanism: AuthMechanism) -> bool {
         if mechanism == AuthMechanism::Login {
-            return !self.supports(Capability::LoginDisabled);
+            return self.supports_login_command();
+        }
+        self.supports_sasl_auth(mechanism)
+    }
+
+    /// Return `true` if the server advertises a SASL AUTH mechanism.
+    pub fn supports_sasl_auth(&self, mechanism: AuthMechanism) -> bool {
+        if mechanism == AuthMechanism::Login {
+            return false;
         }
         self.auth_mechanisms
             .iter()
             .any(|m| m.eq_ignore_ascii_case(mechanism.name()))
+    }
+
+    /// Return `true` if the legacy IMAP LOGIN command is available.
+    pub fn supports_login_command(&self) -> bool {
+        !self.supports(Capability::LoginDisabled)
     }
 
     /// Return `true` if the extension has been enabled.

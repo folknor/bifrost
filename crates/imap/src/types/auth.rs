@@ -5,6 +5,11 @@ use std::fmt;
 use super::{IntoSecretString, SecretString};
 
 /// Credentials accepted by [`ImapConnection::authenticate_best`](crate::ImapConnection::authenticate_best).
+///
+/// These variants model the common single-identity flows. Delegated access
+/// with a distinct SASL authorization identity is not represented here yet;
+/// use explicit mechanism methods if a server-specific flow needs different
+/// authentication and authorization identities.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// Username and password credentials.
@@ -99,7 +104,11 @@ pub struct AuthPolicy {
     ///
     /// Default: `false`. LOGIN is not SASL and is deprecated for IMAP4rev2.
     pub allow_login: bool,
-    /// Allow PLAIN or LOGIN on a connection that is not encrypted.
+    /// Allow credential-bearing mechanisms on a connection that is not encrypted.
+    ///
+    /// This includes PLAIN, XOAUTH2, CRAM-MD5, and LOGIN. SCRAM mechanisms
+    /// remain allowed because they do not send reusable credentials or bearer
+    /// tokens directly.
     ///
     /// Default: `false`.
     pub allow_cleartext_without_tls: bool,

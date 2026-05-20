@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::types::ResponseCode;
+use crate::types::{AuthMechanism, ResponseCode};
 
 /// Error type for IMAP client operations.
 ///
@@ -103,7 +103,7 @@ pub enum Error {
 
     /// Authentication policy rejected every mechanism the server offered.
     #[error("authentication policy rejected authentication: {0}")]
-    AuthPolicy(String),
+    AuthPolicy(AuthPolicyFailure),
 
     /// A capability required for the requested operation is not advertised
     /// (RFC 3501 Section 6.1.1).
@@ -120,12 +120,21 @@ pub enum Error {
     },
 
     /// A buffered FETCH exceeded the caller's configured memory budget.
+    ///
+    /// The driver drains the command to tagged completion before returning
+    /// this error so the IMAP stream remains usable. `seq` and `uid` identify
+    /// the response that first crossed the budget when the server supplied
+    /// those values.
     #[error("estimated FETCH response size {estimated} exceeds caller limit of {limit}")]
     FetchLimit {
         /// Estimated bytes observed while parsing the FETCH responses.
         estimated: usize,
         /// Caller-supplied maximum estimated bytes.
         limit: usize,
+        /// Message sequence number of the response that crossed the limit.
+        seq: u32,
+        /// UID of the response that crossed the limit, if present.
+        uid: Option<u32>,
     },
 
     /// The date-time string supplied to APPEND does not conform to the
@@ -200,11 +209,11 @@ impl PartialEq for Error {
             }
             (Self::Protocol(a), Self::Protocol(b))
             | (Self::Parse(a), Self::Parse(b))
-            | (Self::AuthPolicy(a), Self::AuthPolicy(b))
             | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
             | (Self::Internal(a), Self::Internal(b))
             | (Self::DriverPanicked(a), Self::DriverPanicked(b)) => a == b,
+            (Self::AuthPolicy(a), Self::AuthPolicy(b)) => a == b,
             (Self::Timeout, Self::Timeout)
             | (Self::Closed, Self::Closed)
             | (Self::StartTlsUnavailable, Self::StartTlsUnavailable)
@@ -223,12 +232,16 @@ impl PartialEq for Error {
                 Self::FetchLimit {
                     estimated: e1,
                     limit: l1,
+                    seq: s1,
+                    uid: u1,
                 },
                 Self::FetchLimit {
                     estimated: e2,
                     limit: l2,
+                    seq: s2,
+                    uid: u2,
                 },
-            ) => e1 == e2 && l1 == l2,
+            ) => e1 == e2 && l1 == l2 && s1 == s2 && u1 == u2,
             _ => false,
         }
     }
@@ -261,17 +274,21 @@ impl Error {
     /// Return the broad policy category for this error.
     pub fn category(&self) -> ErrorCategory {
         match self {
-            Self::Io(_) | Self::Closed | Self::DriverGone | Self::DriverPanicked(_) => {
-                ErrorCategory::Transport
-            }
+            Self::Io(_) => ErrorCategory::Transport,
+            Self::Closed | Self::DriverGone | Self::DriverPanicked(_) => ErrorCategory::Connection,
             Self::Auth { .. } | Self::AuthPolicy(_) => ErrorCategory::Authentication,
-            Self::No { code, .. } | Self::Bad { code, .. } | Self::Bye { code, .. } => {
+            Self::No { code, .. } | Self::Bad { code, .. } => {
                 ErrorCategory::from_response_code(code.as_ref())
             }
+            Self::Bye { code: None, .. } => ErrorCategory::Connection,
+            Self::Bye {
+                code: Some(code), ..
+            } => ErrorCategory::from_response_code(Some(code)),
             Self::Protocol(_) => ErrorCategory::Protocol,
             Self::Parse(_) => ErrorCategory::Parse,
             Self::Timeout => ErrorCategory::Timeout,
-            Self::StartTlsUnavailable | Self::MissingCapability(_) => ErrorCategory::Capability,
+            Self::StartTlsUnavailable => ErrorCategory::SecurityPolicy,
+            Self::MissingCapability(_) => ErrorCategory::Capability,
             Self::AppendLimit { .. } | Self::FetchLimit { .. } => ErrorCategory::Limit,
             Self::InvalidAppendDate(_) => ErrorCategory::InvalidInput,
             Self::Internal(_) => ErrorCategory::Internal,
@@ -281,12 +298,14 @@ impl Error {
     /// Suggested high-level recovery action.
     pub fn recovery(&self) -> Recovery {
         match self.category() {
+            ErrorCategory::Connection => Recovery::Reconnect,
             ErrorCategory::Transport => Recovery::Reconnect,
             ErrorCategory::Timeout => Recovery::RetryOrReconnect,
             ErrorCategory::Authentication => Recovery::Reauthenticate,
-            ErrorCategory::Capability | ErrorCategory::InvalidInput | ErrorCategory::Internal => {
-                Recovery::DoNotRetry
-            }
+            ErrorCategory::Capability
+            | ErrorCategory::SecurityPolicy
+            | ErrorCategory::InvalidInput
+            | ErrorCategory::Internal => Recovery::DoNotRetry,
             ErrorCategory::Protocol | ErrorCategory::Parse => Recovery::Reconnect,
             ErrorCategory::Transient => Recovery::RetryAfter,
             ErrorCategory::Referral => Recovery::FollowReferral,
@@ -299,6 +318,10 @@ impl Error {
     }
 
     /// Response code carried by a server status error, if any.
+    ///
+    /// The current parser stores the single response code attached to a
+    /// status response. If a future parser preserves multiple codes, this
+    /// accessor should grow alongside the stored representation.
     pub fn response_code(&self) -> Option<&ResponseCode> {
         match self {
             Self::Auth { code, .. }
@@ -315,11 +338,13 @@ impl Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ErrorCategory {
+    Connection,
     Transport,
     Timeout,
     Authentication,
     Authorization,
     Capability,
+    SecurityPolicy,
     Limit,
     MailboxState,
     Transient,
@@ -330,6 +355,87 @@ pub enum ErrorCategory {
     Parse,
     InvalidInput,
     Internal,
+}
+
+/// Structured reason automatic authentication could not select a mechanism.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AuthPolicyFailure {
+    /// Mechanisms or commands the server offered for the supplied credential type.
+    pub offered: Vec<String>,
+    /// Offered mechanisms rejected by local policy.
+    pub rejected: Vec<AuthMechanismRejection>,
+}
+
+impl AuthPolicyFailure {
+    pub fn new(offered: Vec<String>, rejected: Vec<AuthMechanismRejection>) -> Self {
+        Self { offered, rejected }
+    }
+}
+
+impl std::fmt::Display for AuthPolicyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.offered.is_empty() {
+            f.write_str("server offered no compatible authentication mechanisms")
+        } else if self.rejected.is_empty() {
+            write!(
+                f,
+                "no permitted authentication mechanism among offered mechanisms: {}",
+                self.offered.join(", ")
+            )
+        } else {
+            write!(
+                f,
+                "no permitted authentication mechanism among offered mechanisms: {}; rejected: ",
+                self.offered.join(", ")
+            )?;
+            for (idx, rejection) in self.rejected.iter().enumerate() {
+                if idx > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{} ({})", rejection.mechanism.name(), rejection.reason)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Offered authentication mechanism rejected by local policy.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AuthMechanismRejection {
+    /// Mechanism or legacy command rejected by policy.
+    pub mechanism: AuthMechanism,
+    /// Why the mechanism was rejected.
+    pub reason: AuthMechanismRejectionReason,
+}
+
+impl AuthMechanismRejection {
+    pub const fn new(mechanism: AuthMechanism, reason: AuthMechanismRejectionReason) -> Self {
+        Self { mechanism, reason }
+    }
+}
+
+/// Local policy reason for rejecting an offered authentication mechanism.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AuthMechanismRejectionReason {
+    /// Mechanism is disabled by local policy.
+    DisabledByPolicy,
+    /// Mechanism would expose credentials or bearer tokens without TLS.
+    CleartextWithoutTls,
+}
+
+impl std::fmt::Display for AuthMechanismRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DisabledByPolicy => f.write_str("disabled by policy"),
+            Self::CleartextWithoutTls => f.write_str("requires TLS by policy"),
+        }
+    }
 }
 
 impl ErrorCategory {
@@ -408,7 +514,7 @@ pub enum Recovery {
 
 #[cfg(feature = "serde")]
 mod serde_support {
-    use super::{Arc, Error, ResponseCode};
+    use super::{Arc, AuthPolicyFailure, Error, ResponseCode};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     /// Convert an [`std::io::ErrorKind`] to its stable `Debug` name
@@ -506,7 +612,7 @@ mod serde_support {
         Closed,
         StartTlsUnavailable,
         AuthPolicy {
-            message: String,
+            failure: AuthPolicyFailure,
         },
         MissingCapability {
             capability: String,
@@ -518,6 +624,8 @@ mod serde_support {
         FetchLimit {
             estimated: usize,
             limit: usize,
+            seq: u32,
+            uid: Option<u32>,
         },
         InvalidAppendDate {
             date: String,
@@ -563,8 +671,8 @@ mod serde_support {
                 Error::Timeout => Self::Timeout,
                 Error::Closed => Self::Closed,
                 Error::StartTlsUnavailable => Self::StartTlsUnavailable,
-                Error::AuthPolicy(msg) => Self::AuthPolicy {
-                    message: msg.clone(),
+                Error::AuthPolicy(failure) => Self::AuthPolicy {
+                    failure: failure.clone(),
                 },
                 Error::MissingCapability(cap) => Self::MissingCapability {
                     capability: cap.clone(),
@@ -573,9 +681,16 @@ mod serde_support {
                     size: *size,
                     limit: *limit,
                 },
-                Error::FetchLimit { estimated, limit } => Self::FetchLimit {
+                Error::FetchLimit {
+                    estimated,
+                    limit,
+                    seq,
+                    uid,
+                } => Self::FetchLimit {
                     estimated: *estimated,
                     limit: *limit,
+                    seq: *seq,
+                    uid: *uid,
                 },
                 Error::InvalidAppendDate(msg) => Self::InvalidAppendDate { date: msg.clone() },
                 Error::Internal(msg) => Self::Internal {
@@ -605,10 +720,20 @@ mod serde_support {
                 ErrorRepr::Timeout => Self::Timeout,
                 ErrorRepr::Closed => Self::Closed,
                 ErrorRepr::StartTlsUnavailable => Self::StartTlsUnavailable,
-                ErrorRepr::AuthPolicy { message } => Self::AuthPolicy(message),
+                ErrorRepr::AuthPolicy { failure } => Self::AuthPolicy(failure),
                 ErrorRepr::MissingCapability { capability } => Self::MissingCapability(capability),
                 ErrorRepr::AppendLimit { size, limit } => Self::AppendLimit { size, limit },
-                ErrorRepr::FetchLimit { estimated, limit } => Self::FetchLimit { estimated, limit },
+                ErrorRepr::FetchLimit {
+                    estimated,
+                    limit,
+                    seq,
+                    uid,
+                } => Self::FetchLimit {
+                    estimated,
+                    limit,
+                    seq,
+                    uid,
+                },
                 ErrorRepr::InvalidAppendDate { date } => Self::InvalidAppendDate(date),
                 ErrorRepr::Internal { message } => Self::Internal(message),
                 ErrorRepr::DriverPanicked { message } => Self::DriverPanicked(message),

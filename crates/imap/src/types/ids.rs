@@ -8,6 +8,7 @@ use super::{SequenceSet, ValidationError};
 macro_rules! nonzero_u32_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
+        #[repr(transparent)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(NonZeroU32);
@@ -61,6 +62,7 @@ nonzero_u32_id!(UidValidity, "A UIDVALIDITY value for a mailbox.");
 macro_rules! u64_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
+        #[repr(transparent)]
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(u64);
@@ -124,6 +126,9 @@ impl UidSet {
 
     /// Build a compact UID set from individual UIDs.
     ///
+    /// Values are sorted and deduplicated because IMAP sequence sets are
+    /// unordered set operands, not ordered result lists.
+    ///
     /// Empty input returns `None` so callers cannot accidentally send an empty
     /// command operand.
     pub fn from_uids(uids: impl IntoIterator<Item = Uid>) -> Option<Self> {
@@ -139,6 +144,12 @@ impl UidSet {
     }
 
     /// Parse a raw IMAP sequence-set string as a UID set.
+    ///
+    /// Prefer typed constructors such as [`one`](Self::one),
+    /// [`range`](Self::range), and [`from_uids`](Self::from_uids). This
+    /// raw parser exists for protocol features such as saved-search `$` and
+    /// already-validated strings from higher-level code.
+    #[doc(hidden)]
     pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
         SequenceSet::new(value).map(Self)
     }
@@ -195,6 +206,9 @@ impl SeqSet {
 
     /// Build a compact sequence set from individual sequence numbers.
     ///
+    /// Values are sorted and deduplicated because IMAP sequence sets are
+    /// unordered set operands, not ordered result lists.
+    ///
     /// Empty input returns `None` so callers cannot accidentally send an empty
     /// command operand.
     pub fn from_seqs(seqs: impl IntoIterator<Item = Seq>) -> Option<Self> {
@@ -210,6 +224,12 @@ impl SeqSet {
     }
 
     /// Parse a raw IMAP sequence-set string as a sequence-number set.
+    ///
+    /// Prefer typed constructors such as [`one`](Self::one),
+    /// [`range`](Self::range), and [`from_seqs`](Self::from_seqs). This
+    /// raw parser exists for protocol features such as saved-search `$` and
+    /// already-validated strings from higher-level code.
+    #[doc(hidden)]
     pub fn parse(value: impl Into<String>) -> Result<Self, ValidationError> {
         SequenceSet::new(value).map(Self)
     }

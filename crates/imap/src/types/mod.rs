@@ -42,7 +42,7 @@ pub use mailbox::{
     MailboxAttribute, MailboxInfo, SelectedMailbox, SpecialUse, StatusItem, StatusResult,
 };
 pub use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
-pub use profile::ServerProfile;
+pub use profile::{AppendLimitPolicy, ServerProfile};
 pub use response::{
     AclEntry, Capability, ContinuationRequest, CopyResult, EsearchResponse, ExpungeResult,
     GreetingResponse, GreetingStatus, ListRightsResponse, MetadataEntry, MetadataResult,

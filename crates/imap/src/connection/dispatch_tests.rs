@@ -68,6 +68,38 @@ fn scram_sha1_client_final_matches_rfc_5802_vector() {
     );
 }
 
+#[tokio::test]
+async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut consumer = StreamingFetchConsumer::new(tx);
+    let ctx = default_ctx();
+    let notify = NotifyFlags::default();
+
+    for seq in 1..=300 {
+        consumer.on_response(
+            UntaggedResponse::Fetch(Box::new(FetchResponse {
+                seq,
+                uid: Some(seq + 10_000),
+                ..Default::default()
+            })),
+            notify,
+            &ctx,
+        );
+    }
+
+    let finalized = Box::new(consumer).finalize(tagged_ok(), &ctx).unwrap();
+    assert!(finalized.reclassified_as_events.is_empty());
+
+    let mut received = Vec::new();
+    while let Some(fetch) = rx.recv().await {
+        received.push(fetch.unwrap());
+    }
+
+    assert_eq!(received.len(), 300);
+    assert_eq!(received.first().map(|fetch| fetch.seq), Some(1));
+    assert_eq!(received.last().map(|fetch| fetch.seq), Some(300));
+}
+
 // ---------------------------------------------------------------------------
 // SortConsumer  -  empty result tolerance (RFC 5256 Section 4)
 // ---------------------------------------------------------------------------

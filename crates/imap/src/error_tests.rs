@@ -4,6 +4,16 @@ use std::sync::Arc;
 
 use super::*;
 
+fn auth_policy_failure() -> AuthPolicyFailure {
+    AuthPolicyFailure::new(
+        vec!["AUTH=PLAIN".to_owned()],
+        vec![AuthMechanismRejection::new(
+            crate::types::AuthMechanism::Plain,
+            AuthMechanismRejectionReason::CleartextWithoutTls,
+        )],
+    )
+}
+
 // --- Construction and Debug ---
 
 #[test]
@@ -647,6 +657,47 @@ fn response_code_categories_cover_policy_hooks() {
 }
 
 #[test]
+fn local_error_categories_cover_connection_and_security_policy() {
+    let cases = vec![
+        (
+            Error::Closed,
+            ErrorCategory::Connection,
+            Recovery::Reconnect,
+        ),
+        (
+            Error::DriverGone,
+            ErrorCategory::Connection,
+            Recovery::Reconnect,
+        ),
+        (
+            Error::StartTlsUnavailable,
+            ErrorCategory::SecurityPolicy,
+            Recovery::DoNotRetry,
+        ),
+        (
+            Error::Bye {
+                text: "server closed".to_owned(),
+                code: None,
+            },
+            ErrorCategory::Connection,
+            Recovery::Reconnect,
+        ),
+    ];
+
+    for (err, category, recovery) in cases {
+        assert_eq!(err.category(), category);
+        assert_eq!(err.recovery(), recovery);
+    }
+}
+
+#[test]
+fn response_code_accessor_returns_status_code() {
+    let err = Error::no_with_code("try later".to_owned(), Some(ResponseCode::Unavailable));
+    assert_eq!(err.response_code(), Some(&ResponseCode::Unavailable));
+    assert_eq!(Error::Timeout.response_code(), None);
+}
+
+#[test]
 fn pattern_match_no_extracts_response_code() {
     let err = Error::no_with_code("over quota".into(), Some(ResponseCode::OverQuota));
     match &err {
@@ -811,13 +862,15 @@ fn all_variants_are_distinguishable() {
         Error::Parse("r".into()),
         Error::Timeout,
         Error::Closed,
-        Error::AuthPolicy("policy".into()),
+        Error::AuthPolicy(auth_policy_failure()),
         Error::StartTlsUnavailable,
         Error::MissingCapability("c".into()),
         Error::AppendLimit { size: 1, limit: 0 },
         Error::FetchLimit {
             estimated: 2,
             limit: 1,
+            seq: 3,
+            uid: Some(4),
         },
         Error::InvalidAppendDate("bad date".into()),
         Error::Internal("internal err".into()),
@@ -966,6 +1019,11 @@ mod serde_tests {
     }
 
     #[test]
+    fn serde_auth_policy_round_trip() {
+        round_trip(&Error::AuthPolicy(auth_policy_failure()));
+    }
+
+    #[test]
     fn serde_missing_capability_round_trip() {
         round_trip(&Error::MissingCapability("IDLE".into()));
     }
@@ -975,6 +1033,16 @@ mod serde_tests {
         round_trip(&Error::AppendLimit {
             size: 50_000_000,
             limit: 25_000_000,
+        });
+    }
+
+    #[test]
+    fn serde_fetch_limit_round_trip() {
+        round_trip(&Error::FetchLimit {
+            estimated: 4096,
+            limit: 1024,
+            seq: 9,
+            uid: Some(99),
         });
     }
 

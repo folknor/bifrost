@@ -44,7 +44,7 @@ impl ImapConnection {
 
     /// Whether the current transport is encrypted.
     pub fn is_encrypted(&self) -> bool {
-        self.tls_active.load(std::sync::atomic::Ordering::Relaxed)
+        self.tls_active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Check if `IMAP4rev2` behavior is active (RFC 9051).

@@ -6,16 +6,21 @@ use std::ops::Deref;
 use zeroize::Zeroizing;
 
 /// A string that zeroizes its allocation on drop and redacts under `Debug`.
-#[derive(Clone, Default, PartialEq, Eq)]
+///
+/// `as_str`, `as_bytes`, and `Deref<Target = str>` intentionally expose the
+/// raw secret to authentication code. Callers should treat those borrows like
+/// any other credential material and avoid formatting or logging them.
+#[repr(transparent)]
+#[derive(Clone, Default, Eq)]
 pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {
-    /// Borrow the secret as a string slice.
+    /// Borrow the unredacted secret as a string slice.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
-    /// Borrow the secret as bytes.
+    /// Borrow the unredacted secret as bytes.
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
@@ -55,6 +60,21 @@ impl Deref for SecretString {
 impl AsRef<str> for SecretString {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl PartialEq for SecretString {
+    fn eq(&self, other: &Self) -> bool {
+        let a = self.as_bytes();
+        let b = other.as_bytes();
+        let mut diff = a.len() ^ b.len();
+        let max_len = a.len().max(b.len());
+        for index in 0..max_len {
+            let lhs = a.get(index).copied().unwrap_or(0);
+            let rhs = b.get(index).copied().unwrap_or(0);
+            diff |= usize::from(lhs ^ rhs);
+        }
+        diff == 0
     }
 }
 
