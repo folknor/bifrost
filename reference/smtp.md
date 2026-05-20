@@ -80,6 +80,9 @@ Plaintext AUTH is refused by default for both passwords and OAuth bearer tokens.
 
 AUTH continuation formatting treats challenge responses as continuation lines even for mechanisms supporting initial response. Required for OAUTHBEARER failed-auth dummy-cancel exchange (`AQ==` on the wire).
 
+Builder helpers: `.password(user, password)` for password auth and
+`.oauth2(identity, access_token)` for OAuth2 bearer-token auth.
+
 ## LMTP
 
 `LHLO` instead of EHLO. Default TCP port 24 (Postfix/Dovecot convention, not RFC-assigned).
@@ -121,6 +124,12 @@ Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPriva
 ## Error model
 
 `Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Local buckets are `Parse`, `InvalidInput`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal.
+
+## Example validation
+
+Examples live under `crates/smtp/examples`. Sync examples require no crate
+features. Tokio examples are gated by `tokio`. Validate examples with the SMTP
+crate checks under both the default feature set and `tokio`.
 
 ## Module layout
 

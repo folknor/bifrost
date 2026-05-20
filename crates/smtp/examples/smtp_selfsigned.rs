@@ -18,7 +18,7 @@ fn main() {
         .body(String::from("Be happy!"))
         .unwrap();
 
-    // Use a custom certificate stored on disk to securely verify the server's certificate
+    // Use a custom certificate stored on disk to verify the server certificate.
     let pem_cert = fs::read("certificate.pem").unwrap();
     let cert = Certificate::from_pem(&pem_cert).unwrap();
     let tls = TlsParameters::builder("smtp.server.com".to_owned())
@@ -26,11 +26,11 @@ fn main() {
         .build()
         .unwrap();
 
-    // Open a remote connection to the smtp server
+    // Open a TLS-wrapped connection to the SMTP server.
     let mailer = SmtpTransport::builder_dangerous("smtp.server.com")
         .port(465)
         .tls(Tls::Wrapper(tls))
-        .password("smtp_username", "smtp_password")
+        .password("user@example.com", "smtp_password")
         .build();
 
     // Send the email

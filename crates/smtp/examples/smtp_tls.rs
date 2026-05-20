@@ -12,10 +12,10 @@ fn main() {
         .body(String::from("Be happy!"))
         .unwrap();
 
-    // Open a remote connection to gmail
-    let mailer = SmtpTransport::relay("smtp.gmail.com")
+    // Open a TLS-wrapped connection to a remote SMTP submission server.
+    let mailer = SmtpTransport::relay("smtp.example.com")
         .unwrap()
-        .password("smtp_username", "smtp_password")
+        .password("user@example.com", "smtp_password")
         .build();
 
     // Send the email

@@ -12,7 +12,7 @@ fn main() {
         .body(String::from("Be happy!"))
         .unwrap();
 
-    // Open a local LMTP connection on port 24.
+    // Open a local LMTP TCP connection on port 24.
     let mailer = LmtpTransport::builder_dangerous("localhost").build();
 
     match mailer.send(&email) {

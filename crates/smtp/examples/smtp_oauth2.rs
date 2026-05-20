@@ -7,20 +7,20 @@ fn main() {
         .from("NoBody <nobody@domain.tld>".parse().unwrap())
         .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
         .to("Hei <hei@domain.tld>".parse().unwrap())
-        .subject("Happy new year")
+        .subject("OAuth2 SMTP example")
         .header(ContentType::TEXT_PLAIN)
-        .body(String::from("Be happy!"))
+        .body(String::from(
+            "This message authenticates with an OAuth2 access token.",
+        ))
         .unwrap();
 
-    // Open a plaintext connection and require STARTTLS before authentication.
     let mailer = SmtpTransport::starttls_relay("smtp.example.com")
         .unwrap()
-        .password("user@example.com", "smtp_password")
+        .oauth2("user@example.com", "oauth2_access_token")
         .build();
 
-    // Send the email
     match mailer.send(&email) {
         Ok(_) => println!("Email sent successfully!"),
-        Err(e) => panic!("Could not send email: {e:?}"),
+        Err(error) => panic!("Could not send email: {error:?}"),
     }
 }

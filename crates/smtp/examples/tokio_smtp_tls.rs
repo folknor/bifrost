@@ -15,11 +15,11 @@ async fn main() {
         .body(String::from("Be happy with async!"))
         .unwrap();
 
-    // Open a remote connection to gmail
+    // Open a TLS-wrapped connection to a remote SMTP submission server.
     let mailer: AsyncSmtpTransport<TokioExecutor> =
-        AsyncSmtpTransport::<TokioExecutor>::relay("smtp.gmail.com")
+        AsyncSmtpTransport::<TokioExecutor>::relay("smtp.example.com")
             .unwrap()
-            .password("smtp_username", "smtp_password")
+            .password("user@example.com", "smtp_password")
             .build();
 
     // Send the email

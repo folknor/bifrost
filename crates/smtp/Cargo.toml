@@ -89,6 +89,9 @@ name = "smtp_tls"
 name = "smtp_starttls"
 
 [[example]]
+name = "smtp_oauth2"
+
+[[example]]
 name = "smtp_selfsigned"
 
 [[example]]

@@ -15,11 +15,11 @@ async fn main() {
         .body(String::from("Be happy with async!"))
         .unwrap();
 
-    // Open a remote connection to gmail using STARTTLS
+    // Open a plaintext connection and require STARTTLS before authentication.
     let mailer: AsyncSmtpTransport<TokioExecutor> =
-        AsyncSmtpTransport::<TokioExecutor>::starttls_relay("smtp.gmail.com")
+        AsyncSmtpTransport::<TokioExecutor>::starttls_relay("smtp.example.com")
             .unwrap()
-            .password("smtp_username", "smtp_password")
+            .password("user@example.com", "smtp_password")
             .build();
 
     // Send the email
