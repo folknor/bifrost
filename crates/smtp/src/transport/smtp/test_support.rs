@@ -30,7 +30,7 @@ pub(super) struct LmtpServer {
 pub(super) struct UnixLmtpServer {
     pub(super) path: PathBuf,
     commands_rx: mpsc::Receiver<Vec<String>>,
-    handle: thread::JoinHandle<()>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl LmtpServer {
@@ -46,14 +46,20 @@ impl LmtpServer {
 
 #[cfg(unix)]
 impl UnixLmtpServer {
-    pub(super) fn commands(self) -> Vec<String> {
+    pub(super) fn commands(mut self) -> Vec<String> {
         let commands = self
             .commands_rx
             .recv_timeout(Duration::from_secs(3))
             .unwrap();
-        self.handle.join().unwrap();
-        let _ = fs::remove_file(&self.path);
+        self.handle.take().unwrap().join().unwrap();
         commands
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixLmtpServer {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -121,7 +127,9 @@ pub(super) fn spawn_lmtp_delivery_server() -> LmtpServer {
 #[cfg(unix)]
 pub(super) fn spawn_unix_lmtp_delivery_server() -> UnixLmtpServer {
     let socket_id = NEXT_UNIX_SOCKET.fetch_add(1, Ordering::Relaxed);
-    let socket_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/t");
+    let socket_dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/t"));
     fs::create_dir_all(&socket_dir).unwrap();
     let path = socket_dir.join(format!("lmtp-{}-{socket_id}.sock", process::id()));
     let _ = fs::remove_file(&path);
@@ -181,7 +189,7 @@ pub(super) fn spawn_unix_lmtp_delivery_server() -> UnixLmtpServer {
     UnixLmtpServer {
         path,
         commands_rx,
-        handle,
+        handle: Some(handle),
     }
 }
 

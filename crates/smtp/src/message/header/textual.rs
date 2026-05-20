@@ -39,6 +39,93 @@ macro_rules! text_header {
     };
 }
 
+macro_rules! list_url_header {
+    ($(#[$attr:meta])* Header($type_name: ident, $header_name: expr, $allow_no: expr )) => {
+        $(#[$attr])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $type_name(String);
+
+        impl $type_name {
+            pub fn new(value: impl Into<String>) -> Result<Self, BoxError> {
+                let value = value.into();
+                validate_list_url_header_value(&value, $allow_no)?;
+                Ok(Self(value))
+            }
+        }
+
+        impl Header for $type_name {
+            fn name() -> HeaderName {
+                HeaderName::new_from_ascii_str($header_name)
+            }
+
+            fn parse(s: &str) -> Result<Self, BoxError> {
+                Self::new(s)
+            }
+
+            fn display(&self) -> HeaderValue {
+                HeaderValue::new(Self::name(), self.0.clone())
+            }
+        }
+
+        impl TryFrom<String> for $type_name {
+            type Error = BoxError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $type_name {
+            type Error = BoxError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl AsRef<str> for $type_name {
+            #[inline]
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+fn validate_list_url_header_value(value: &str, allow_no: bool) -> Result<(), BoxError> {
+    if allow_no && value.eq_ignore_ascii_case("NO") {
+        return Ok(());
+    }
+
+    if value.is_empty() {
+        return Err(invalid_list_header("List header value must not be empty"));
+    }
+
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.len() < 3 || !item.starts_with('<') || !item.ends_with('>') {
+            return Err(invalid_list_header(
+                "List header URLs must be enclosed in angle brackets",
+            ));
+        }
+
+        let url = &item[1..item.len() - 1];
+        if url.is_empty()
+            || !url
+                .bytes()
+                .all(|byte| byte > b' ' && byte < 0x7f && !b"<>,()".contains(&byte))
+        {
+            return Err(invalid_list_header("List header URL is invalid"));
+        }
+    }
+
+    Ok(())
+}
+
+fn invalid_list_header(message: &'static str) -> BoxError {
+    Box::new(io::Error::new(ErrorKind::InvalidData, message))
+}
+
 text_header!(
     /// `Subject` of the message, defined in [RFC5322](https://tools.ietf.org/html/rfc5322#section-3.6.5)
     Header(Subject, "Subject")
@@ -78,13 +165,13 @@ text_header!(
     /// `List-Id` header, defined in [RFC2919](https://www.rfc-editor.org/rfc/rfc2919)
     Header(ListId, "List-ID")
 );
-text_header!(
+list_url_header!(
     /// `List-Help` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListHelp, "List-Help")
+    Header(ListHelp, "List-Help", false)
 );
-text_header!(
+list_url_header!(
     /// `List-Unsubscribe` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListUnsubscribe, "List-Unsubscribe")
+    Header(ListUnsubscribe, "List-Unsubscribe", false)
 );
 /// `List-Unsubscribe-Post` header, defined in [RFC8058](https://www.rfc-editor.org/rfc/rfc8058)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,21 +209,21 @@ impl AsRef<str> for ListUnsubscribePost {
         Self::VALUE
     }
 }
-text_header!(
+list_url_header!(
     /// `List-Subscribe` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListSubscribe, "List-Subscribe")
+    Header(ListSubscribe, "List-Subscribe", false)
 );
-text_header!(
+list_url_header!(
     /// `List-Post` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListPost, "List-Post")
+    Header(ListPost, "List-Post", true)
 );
-text_header!(
+list_url_header!(
     /// `List-Owner` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListOwner, "List-Owner")
+    Header(ListOwner, "List-Owner", false)
 );
-text_header!(
+list_url_header!(
     /// `List-Archive` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
-    Header(ListArchive, "List-Archive")
+    Header(ListArchive, "List-Archive", false)
 );
 text_header! {
     /// `Content-Id` header,
@@ -153,7 +240,7 @@ text_header! {
 mod test {
     use pretty_assertions::assert_eq;
 
-    use super::{ListId, ListUnsubscribe, ListUnsubscribePost, Subject};
+    use super::{ListId, ListPost, ListUnsubscribe, ListUnsubscribePost, Subject};
     use crate::message::header::{Header, HeaderName, HeaderValue, Headers};
 
     #[test]
@@ -190,7 +277,7 @@ mod test {
     fn format_list_headers() {
         let mut headers = Headers::new();
         headers.set(ListId("Users <users.example.com>".into()));
-        headers.set(ListUnsubscribe("<mailto:unsubscribe@example.com>".into()));
+        headers.set(ListUnsubscribe::new("<mailto:unsubscribe@example.com>").unwrap());
         headers.set(ListUnsubscribePost);
 
         assert_eq!(
@@ -207,6 +294,22 @@ mod test {
     fn rejects_invalid_list_unsubscribe_post() {
         assert!(ListUnsubscribePost::parse("List-Unsubscribe=One-Click").is_ok());
         assert!(ListUnsubscribePost::parse("List-Unsubscribe=Maybe").is_err());
+    }
+
+    #[test]
+    fn validates_list_url_headers() {
+        assert!(ListUnsubscribe::parse("<mailto:unsubscribe@example.com>").is_ok());
+        assert!(
+            ListUnsubscribe::parse(
+                "<mailto:unsubscribe@example.com>, <https://example.com/unsubscribe>"
+            )
+            .is_ok()
+        );
+        assert!(ListPost::parse("NO").is_ok());
+        assert!(ListUnsubscribe::parse("mailto:unsubscribe@example.com").is_err());
+        assert!(ListUnsubscribe::parse("<mailto:un,subscribe@example.com>").is_err());
+        assert!(ListUnsubscribe::parse("<mailto:unsubscribe@example.com> (unsubscribe)").is_err());
+        assert!(ListUnsubscribe::parse("<mailto:\u{00fc}mlaut@example.com>").is_err());
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub enum Error {
     Io(std::io::Error),
     /// Non-ASCII chars
     NonAsciiChars,
+    /// Invalid user-supplied message input
+    InvalidInput(String),
 }
 
 impl Display for Error {
@@ -40,6 +42,7 @@ impl Display for Error {
             Error::EmailMissingDomain => f.write_str("missing domain in email address"),
             Error::CannotParseFilename => f.write_str("could not parse attachment filename"),
             Error::NonAsciiChars => f.write_str("contains non-ASCII chars"),
+            Error::InvalidInput(message) => f.write_str(message),
             Error::Io(e) => e.fmt(f),
         }
     }

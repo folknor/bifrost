@@ -474,6 +474,13 @@ pub enum MailParameter {
         /// Parameter value
         value: Option<String>,
     },
+    /// Custom parameter whose value is emitted without xtext encoding.
+    OtherRaw {
+        /// Parameter keyword
+        keyword: String,
+        /// Parameter value
+        value: Option<String>,
+    },
 }
 
 impl Display for MailParameter {
@@ -493,6 +500,14 @@ impl Display for MailParameter {
                 value: Some(value),
             } => write!(f, "{}={}", keyword, XText(value)),
             MailParameter::Other {
+                keyword,
+                value: None,
+            } => f.write_str(keyword),
+            MailParameter::OtherRaw {
+                keyword,
+                value: Some(value),
+            } => write!(f, "{keyword}={value}"),
+            MailParameter::OtherRaw {
                 keyword,
                 value: None,
             } => f.write_str(keyword),
@@ -521,6 +536,17 @@ impl MailParameter {
         match self {
             MailParameter::EnvelopeId(value) => validate_envelope_id(value),
             MailParameter::Other { keyword, .. } => validate_esmtp_keyword(keyword),
+            MailParameter::OtherRaw {
+                keyword,
+                value: Some(value),
+            } => {
+                validate_esmtp_keyword(keyword)?;
+                validate_esmtp_raw_value(value)
+            }
+            MailParameter::OtherRaw {
+                keyword,
+                value: None,
+            } => validate_esmtp_keyword(keyword),
             _ => Ok(()),
         }
     }
@@ -738,7 +764,7 @@ impl SendOptions {
         }
 
         for (configured_recipient, configured_parameters) in &self.recipient_parameters {
-            if configured_recipient == recipient {
+            if addresses_match_for_recipient_options(configured_recipient, recipient) {
                 for parameter in configured_parameters {
                     upsert_rcpt_parameter(&mut parameters, parameter.clone());
                 }
@@ -746,6 +772,14 @@ impl SendOptions {
         }
         parameters
     }
+}
+
+pub(crate) fn addresses_match_for_recipient_options(
+    configured: &Address,
+    recipient: &Address,
+) -> bool {
+    configured.user() == recipient.user()
+        && configured.domain().eq_ignore_ascii_case(recipient.domain())
 }
 
 fn upsert_rcpt_parameter(parameters: &mut Vec<RcptParameter>, parameter: RcptParameter) {
@@ -1107,6 +1141,16 @@ fn validate_esmtp_keyword(keyword: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_esmtp_raw_value(value: &str) -> Result<(), Error> {
+    if value.is_empty() || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
+        return Err(error::client(
+            "raw ESMTP parameter value must contain printable ASCII without spaces",
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_atom(value: &str, name: &str) -> Result<(), Error> {
     const SPECIALS: &[u8] = b"()<>@,;:\\\".[]";
 
@@ -1397,6 +1441,26 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
+                MailParameter::Other {
+                    keyword: "XTEST".to_owned(),
+                    value: Some("raw=value".to_owned()),
+                }
+            ),
+            "XTEST=raw+3Dvalue"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                MailParameter::OtherRaw {
+                    keyword: "XTEST".to_owned(),
+                    value: Some("raw=value".to_owned()),
+                }
+            ),
+            "XTEST=raw=value"
+        );
+        assert_eq!(
+            format!(
+                "{}",
                 RcptParameter::Notify(
                     DsnNotifyParameter::new([DsnNotify::Success, DsnNotify::Failure]).unwrap()
                 )
@@ -1460,6 +1524,19 @@ mod test {
     }
 
     #[test]
+    fn test_recipient_parameters_match_domain_case_insensitively() {
+        let configured: Address = "first@EXAMPLE.COM".parse().unwrap();
+        let envelope_recipient: Address = "first@example.com".parse().unwrap();
+        let different_local: Address = "FIRST@example.com".parse().unwrap();
+        let options = SendOptions::new()
+            .recipient_notify(configured, [DsnNotify::Success])
+            .unwrap();
+
+        assert_eq!(options.rcpt_parameters_for(&envelope_recipient).len(), 1);
+        assert_eq!(options.rcpt_parameters_for(&different_local).len(), 0);
+    }
+
+    #[test]
     fn test_dsn_parameter_validation() {
         assert!(validate_envelope_id("env=1").is_ok());
         assert!(validate_envelope_id("env 1").is_err());
@@ -1468,5 +1545,22 @@ mod test {
         assert!(validate_original_recipient("rfc822", "alias@example.com").is_ok());
         assert!(validate_original_recipient("rfc822 name", "alias@example.com").is_err());
         assert!(validate_original_recipient("rfc822", "alias\r\n@example.com").is_err());
+
+        assert!(
+            MailParameter::OtherRaw {
+                keyword: "XTEST".to_owned(),
+                value: Some("raw=value".to_owned()),
+            }
+            .validate_syntax()
+            .is_ok()
+        );
+        assert!(
+            MailParameter::OtherRaw {
+                keyword: "XTEST".to_owned(),
+                value: Some("raw value".to_owned()),
+            }
+            .validate_syntax()
+            .is_err()
+        );
     }
 }

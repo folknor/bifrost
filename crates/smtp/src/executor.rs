@@ -178,6 +178,7 @@ impl SmtpExecutor for Tokio1Executor {
             }
             #[cfg(not(unix))]
             {
+                // Keep the binding used when Unix socket support is cfg-gated out.
                 let _ = path;
                 return Err(crate::transport::smtp::error::client(
                     "Unix-domain LMTP sockets are only supported on Unix platforms",
@@ -303,6 +304,7 @@ impl SmtpExecutor for AsyncStd1Executor {
             }
             #[cfg(not(unix))]
             {
+                // Keep the binding used when Unix socket support is cfg-gated out.
                 let _ = path;
                 return Err(crate::transport::smtp::error::client(
                     "Unix-domain LMTP sockets are only supported on Unix platforms",

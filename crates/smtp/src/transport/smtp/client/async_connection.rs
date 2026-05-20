@@ -19,12 +19,15 @@ use crate::{
     transport::smtp::{
         Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Starttls, Vrfy},
+        commands::{
+            Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Rset, Starttls, Vrfy,
+        },
         error,
         error::Error,
         extension::{
             ClientId, DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter,
             MailParameter, RcptParameter, SendOptions, ServerInfo,
+            addresses_match_for_recipient_options,
         },
         response::{Response, parse_response},
     },
@@ -415,29 +418,58 @@ impl AsyncSmtpConnection {
         let data_response = self
             .read_response_with_budget_inner(self.per_operation_budget(), true, false)
             .await?;
+        let accepted_recipients = recipient_responses
+            .iter()
+            .filter(|response| response.is_positive())
+            .count();
 
         self.stream.get_mut().set_state(ConnectionState::Ok);
 
         if !mail_response.is_positive() {
-            self.abort().await;
+            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
+                .await;
             return Err(Self::error_from_status(mail_response));
         }
 
         if let Some(response) = recipient_responses
-            .into_iter()
+            .iter()
             .find(|response| !response.is_positive())
         {
-            self.abort().await;
-            return Err(Self::error_from_status(response));
+            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
+                .await;
+            return Err(Self::error_from_status(response.clone()));
         }
 
         if !data_response.is_positive() {
-            self.abort().await;
+            self.reset_or_abort_pipelined_transaction(&data_response, accepted_recipients)
+                .await;
             return Err(Self::error_from_status(data_response));
         }
 
         let result = try_smtp!(self.message(email).await, self);
         Ok(result)
+    }
+
+    async fn reset_or_abort_pipelined_transaction(
+        &mut self,
+        data_response: &Response,
+        accepted_recipients: usize,
+    ) {
+        if data_response.is_positive() {
+            if accepted_recipients == 0 {
+                if self.write(b".\r\n").await.is_err() {
+                    self.abort().await;
+                    return;
+                }
+                if self.read_response_accepting_status().await.is_err() {
+                    self.abort().await;
+                }
+            } else {
+                self.abort().await;
+            }
+        } else if self.command_accepting_status(Rset).await.is_err() {
+            self.abort().await;
+        }
     }
 
     pub(crate) async fn send_lmtp(
@@ -659,7 +691,9 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<Vec<Vec<RcptParameter>>, Error> {
         for (recipient, _) in options.recipient_parameters() {
-            if !envelope.to().contains(recipient) {
+            if !envelope.to().iter().any(|envelope_recipient| {
+                addresses_match_for_recipient_options(recipient, envelope_recipient)
+            }) {
                 return Err(error::client(
                     "recipient-specific RCPT parameters do not match an envelope recipient",
                 ));
@@ -808,7 +842,7 @@ impl AsyncSmtpConnection {
                     ))
                 }
             }
-            MailParameter::Other { .. } => Ok(()),
+            MailParameter::Other { .. } | MailParameter::OtherRaw { .. } => Ok(()),
         }
     }
 
@@ -994,7 +1028,7 @@ impl AsyncSmtpConnection {
     }
 
     pub(crate) async fn message_bdat(&mut self, message: &[u8]) -> Result<Response, Error> {
-        self.write(Bdat::new(message.len(), true).to_string().as_bytes())
+        self.write(Bdat::last(message.len()).to_string().as_bytes())
             .await?;
         self.write(message).await?;
         self.read_response().await
@@ -1005,7 +1039,7 @@ impl AsyncSmtpConnection {
         message: &[u8],
         recipients: usize,
     ) -> Result<Vec<Response>, Error> {
-        self.write(Bdat::new(message.len(), true).to_string().as_bytes())
+        self.write(Bdat::last(message.len()).to_string().as_bytes())
             .await?;
         self.write(message).await?;
 
@@ -1231,7 +1265,7 @@ impl AsyncSmtpConnection {
 #[cfg(feature = "tokio1")]
 mod test {
     use std::{
-        io::{BufRead, BufReader, Write},
+        io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
         sync::mpsc,
         thread,
@@ -1342,20 +1376,20 @@ mod test {
                 .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
                 .unwrap();
 
-            for _ in 0..3 {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                commands.push(command);
-            }
-
+            let expected_batch = concat!(
+                "MAIL FROM:<sender@example.com> SIZE=22\r\n",
+                "RCPT TO:<first@example.com>\r\n",
+                "RCPT TO:<second@example.com>\r\n",
+                "DATA\r\n",
+            );
+            let mut batch = vec![0; expected_batch.len()];
+            reader.read_exact(&mut batch).unwrap();
+            assert_eq!(batch, expected_batch.as_bytes());
+            let batch = String::from_utf8(batch).unwrap();
+            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
             stream
-                .write_all(b"250 sender ok\r\n250 first ok\r\n250 second ok\r\n")
+                .write_all(b"250 sender ok\r\n250 first ok\r\n250 second ok\r\n354 send body\r\n")
                 .unwrap();
-
-            let mut data = String::new();
-            reader.read_line(&mut data).unwrap();
-            commands.push(data);
-            stream.write_all(b"354 send body\r\n").unwrap();
 
             let mut line = String::new();
             loop {
@@ -1395,6 +1429,84 @@ mod test {
         assert_eq!(commands[2], "RCPT TO:<first@example.com>\r\n");
         assert_eq!(commands[3], "RCPT TO:<second@example.com>\r\n");
         assert_eq!(commands[4], "DATA\r\n");
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn pipelined_send_rsets_when_data_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            commands.push(ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
+                .unwrap();
+
+            let expected_batch = concat!(
+                "MAIL FROM:<sender@example.com> SIZE=22\r\n",
+                "RCPT TO:<recipient@example.com>\r\n",
+                "DATA\r\n",
+            );
+            let mut batch = vec![0; expected_batch.len()];
+            reader.read_exact(&mut batch).unwrap();
+            assert_eq!(batch, expected_batch.as_bytes());
+            let batch = String::from_utf8(batch).unwrap();
+            commands.extend(batch.split_inclusive('\n').map(str::to_owned));
+
+            stream
+                .write_all(b"250 sender ok\r\n550 recipient rejected\r\n554 no recipients\r\n")
+                .unwrap();
+
+            let mut rset = String::new();
+            reader.read_line(&mut rset).unwrap();
+            commands.push(rset);
+            stream.write_all(b"250 reset ok\r\n").unwrap();
+
+            let mut noop = String::new();
+            reader.read_line(&mut noop).unwrap();
+            commands.push(noop);
+            stream.write_all(b"250 noop ok\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec!["recipient@example.com".parse().unwrap()],
+        )
+        .unwrap();
+
+        let result = connection
+            .send(&envelope, b"Subject: test\r\n\r\nHello")
+            .await;
+        assert!(result.is_err());
+        assert!(!connection.has_broken());
+        assert!(connection.test_connected().await);
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=22\r\n");
+        assert_eq!(commands[2], "RCPT TO:<recipient@example.com>\r\n");
+        assert_eq!(commands[3], "DATA\r\n");
+        assert_eq!(commands[4], "RSET\r\n");
+        assert_eq!(commands[5], "NOOP\r\n");
         handle.join().unwrap();
     }
 
@@ -1890,7 +2002,7 @@ mod test {
 #[cfg(feature = "async-std1")]
 mod asyncstd_test {
     use std::{
-        io::{BufRead, BufReader, Write},
+        io::{BufRead, BufReader, Read, Write},
         net::TcpListener,
         sync::mpsc,
         thread,
@@ -1976,6 +2088,74 @@ mod asyncstd_test {
             async_std::future::timeout(Duration::from_millis(50), connection.command(Noop)).await;
 
         assert!(result.is_err(), "command future must be cancelled");
+        assert!(connection.has_broken());
+
+        let error = connection.command(Noop).await.unwrap_err();
+        assert!(
+            error.is_connection(),
+            "expected connection error: {error:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[async_std::test]
+    async fn asyncstd_cancelled_pipelined_send_marks_connection_broken() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream
+                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
+                .unwrap();
+
+            let expected_batch = concat!(
+                "MAIL FROM:<sender@example.com> SIZE=22\r\n",
+                "RCPT TO:<first@example.com>\r\n",
+                "RCPT TO:<second@example.com>\r\n",
+                "DATA\r\n",
+            );
+            let mut batch = vec![0; expected_batch.len()];
+            reader.read_exact(&mut batch).unwrap();
+            assert_eq!(batch, expected_batch.as_bytes());
+
+            stream.write_all(b"250 sender ok\r\n").unwrap();
+            thread::sleep(Duration::from_millis(250));
+            let _ = stream.write_all(b"250 first ok\r\n250 second ok\r\n354 send body\r\n");
+        });
+
+        let mut connection = AsyncSmtpConnection::connect_asyncstd1(
+            address,
+            Some(Duration::from_secs(2)),
+            &ClientId::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let result = async_std::future::timeout(
+            Duration::from_millis(50),
+            connection.send(&envelope, b"Subject: test\r\n\r\nHello"),
+        )
+        .await;
+
+        assert!(result.is_err(), "pipelined send future must be cancelled");
         assert!(connection.has_broken());
 
         let error = connection.command(Noop).await.unwrap_err();

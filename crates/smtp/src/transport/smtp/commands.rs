@@ -164,6 +164,16 @@ impl Bdat {
     pub fn new(size: usize, last: bool) -> Bdat {
         Bdat { size, last }
     }
+
+    /// Creates a BDAT command for a non-final chunk.
+    pub fn chunk(size: usize) -> Bdat {
+        Bdat { size, last: false }
+    }
+
+    /// Creates a BDAT command for the final chunk.
+    pub fn last(size: usize) -> Bdat {
+        Bdat { size, last: true }
+    }
 }
 
 /// QUIT command
@@ -403,6 +413,8 @@ mod test {
         );
         assert_eq!(format!("{}", Bdat::new(42, false)), "BDAT 42\r\n");
         assert_eq!(format!("{}", Bdat::new(42, true)), "BDAT 42 LAST\r\n");
+        assert_eq!(format!("{}", Bdat::chunk(42)), "BDAT 42\r\n");
+        assert_eq!(format!("{}", Bdat::last(42)), "BDAT 42 LAST\r\n");
         assert_eq!(format!("{Quit}"), "QUIT\r\n");
         assert_eq!(format!("{Data}"), "DATA\r\n");
         assert_eq!(format!("{Noop}"), "NOOP\r\n");

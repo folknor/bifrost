@@ -201,6 +201,12 @@ fn make_boundary() -> String {
 impl MultiPartKind {
     pub(crate) fn to_mime<S: Into<String>>(&self, boundary: Option<S>) -> Mime {
         let boundary = boundary.map_or_else(make_boundary, Into::into);
+        if let Self::Report { report_type } = self {
+            assert!(
+                is_mime_token(report_type),
+                "multipart/report report-type must be a MIME token"
+            );
+        }
 
         format!(
             "multipart/{}; boundary=\"{}\"{}",
@@ -214,7 +220,7 @@ impl MultiPartKind {
             },
             boundary,
             match self {
-                Self::Report { report_type } => format!("; report-type=\"{report_type}\""),
+                Self::Report { report_type } => format!("; report-type={report_type}"),
                 Self::Encrypted { protocol } => format!("; protocol=\"{protocol}\""),
                 Self::Signed { protocol, micalg } =>
                     format!("; protocol=\"{protocol}\"; micalg=\"{micalg}\""),
@@ -245,6 +251,15 @@ impl MultiPartKind {
             _ => None,
         }
     }
+}
+
+fn is_mime_token(value: &str) -> bool {
+    const TSPECIALS: &[u8] = b"()<>@,;:\\\"/[]?=";
+
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte > b' ' && byte < 0x7f && !TSPECIALS.contains(&byte))
 }
 
 /// Multipart builder
@@ -369,7 +384,21 @@ impl MultiPart {
     ///
     /// Shortcut for `MultiPart::builder().kind(MultiPartKind::Report { report_type })`
     pub fn report(report_type: String) -> MultiPartBuilder {
-        MultiPart::builder().kind(MultiPartKind::Report { report_type })
+        Self::try_report(report_type).expect("multipart/report report-type must be a MIME token")
+    }
+
+    /// Creates a report multipart builder after validating `report_type` as a MIME token.
+    pub fn try_report(
+        report_type: impl Into<String>,
+    ) -> Result<MultiPartBuilder, crate::error::Error> {
+        let report_type = report_type.into();
+        if !is_mime_token(&report_type) {
+            return Err(crate::error::Error::InvalidInput(
+                "multipart/report report-type must be a MIME token".to_owned(),
+            ));
+        }
+
+        Ok(MultiPart::builder().kind(MultiPartKind::Report { report_type }))
     }
 
     /// Creates encrypted multipart builder
@@ -470,6 +499,18 @@ impl MultiPart {
 
 impl EmailFormat for MultiPart {
     fn format(&self, out: &mut Vec<u8>) {
+        if self
+            .headers
+            .get::<ContentType>()
+            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
+            .is_some_and(|kind| matches!(kind, MultiPartKind::Report { .. }))
+        {
+            assert!(
+                (2..=3).contains(&self.parts.len()),
+                "multipart/report requires two or three body parts"
+            );
+        }
+
         write!(out, "{}", self.headers)
             .expect("A Write implementation panicked while formatting headers");
         out.extend_from_slice(b"\r\n");
@@ -653,7 +694,7 @@ mod test {
             concat!(
                 "Content-Type: multipart/report;\r\n",
                 " boundary=\"0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\";\r\n",
-                " report-type=\"delivery-status\"\r\n",
+                " report-type=delivery-status\r\n",
                 "\r\n",
                 "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
                 "Content-Type: text/plain; charset=utf-8\r\n",
@@ -668,6 +709,23 @@ mod test {
                 "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n"
             )
         );
+    }
+
+    #[test]
+    fn multi_part_report_rejects_invalid_report_type() {
+        assert!(MultiPart::try_report("delivery-status").is_ok());
+        assert!(MultiPart::try_report("message/delivery-status").is_err());
+        assert!(MultiPart::try_report("delivery\r\nstatus").is_err());
+        assert!(MultiPart::try_report("delivery\"status").is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "multipart/report requires two or three body parts")]
+    fn multi_part_report_rejects_wrong_part_count() {
+        let part = MultiPart::report("delivery-status".to_owned())
+            .singlepart(SinglePart::plain("Delivery failed".to_owned()));
+
+        let _ = part.formatted();
     }
 
     #[test]

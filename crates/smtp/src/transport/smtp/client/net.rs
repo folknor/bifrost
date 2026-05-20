@@ -13,6 +13,8 @@ use std::path::Path;
 
 #[cfg(feature = "native-tls")]
 use native_tls::TlsStream;
+#[cfg(unix)]
+use socket2::SockAddr;
 use socket2::{Domain, Protocol, Type};
 
 #[cfg(feature = "native-tls")]
@@ -138,8 +140,21 @@ impl NetworkStream {
     }
 
     #[cfg(unix)]
-    pub(crate) fn connect_unix(path: &Path) -> Result<NetworkStream, Error> {
-        let stream = UnixStream::connect(path).map_err(error::connection)?;
+    pub(crate) fn connect_unix(
+        path: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<NetworkStream, Error> {
+        let addr = SockAddr::unix(path).map_err(error::connection)?;
+        let socket =
+            socket2::Socket::new(Domain::UNIX, Type::STREAM, None).map_err(error::connection)?;
+        if let Some(timeout) = timeout {
+            socket
+                .connect_timeout(&addr, timeout)
+                .map_err(error::connection)?;
+        } else {
+            socket.connect(&addr).map_err(error::connection)?;
+        }
+        let stream: UnixStream = socket.into();
         Ok(NetworkStream::new(InnerNetworkStream::Unix(stream)))
     }
 

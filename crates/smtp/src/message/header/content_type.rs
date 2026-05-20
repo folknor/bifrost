@@ -38,12 +38,14 @@ impl ContentType {
 
     /// A `ContentType` of type `text/plain; charset=utf-8; format=flowed`.
     pub fn text_plain_flowed() -> ContentType {
+        // The mime crate does not expose consts for parameterized flowed forms.
         Self::parse("text/plain; charset=utf-8; format=flowed")
             .expect("static text/plain flowed MIME type must parse")
     }
 
     /// A `ContentType` of type `text/plain; charset=utf-8; format=flowed; delsp=yes`.
     pub fn text_plain_flowed_delsp() -> ContentType {
+        // The mime crate does not expose consts for parameterized flowed forms.
         Self::parse("text/plain; charset=utf-8; format=flowed; delsp=yes")
             .expect("static text/plain flowed MIME type must parse")
     }

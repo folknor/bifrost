@@ -230,8 +230,16 @@ impl Response {
     /// Bifrost accepts the first well-formed code whose class matches the
     /// normal SMTP reply class.
     pub fn enhanced_status_code(&self) -> Option<EnhancedStatusCode> {
+        self.enhanced_status_codes().next()
+    }
+
+    /// Returns all enhanced status codes from response text lines.
+    ///
+    /// Only well-formed codes whose class matches the normal SMTP reply class
+    /// are returned.
+    pub fn enhanced_status_codes(&self) -> impl Iterator<Item = EnhancedStatusCode> + '_ {
         let expected_class = self.code.severity as u8;
-        self.message.iter().find_map(|line| {
+        self.message.iter().filter_map(move |line| {
             line.split_whitespace()
                 .next()
                 .and_then(parse_enhanced_status_code)
@@ -521,6 +529,40 @@ mod test {
                 subject: 1,
                 detail: 5,
             })
+        );
+        assert_eq!(
+            multiline
+                .enhanced_status_codes()
+                .collect::<Vec<EnhancedStatusCode>>(),
+            vec![EnhancedStatusCode {
+                class: 2,
+                subject: 1,
+                detail: 5,
+            }]
+        );
+
+        let varied: Response = concat!(
+            "550-5.1.1 first user unknown\r\n",
+            "550 5.2.0 second mailbox disabled\r\n"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(
+            varied
+                .enhanced_status_codes()
+                .collect::<Vec<EnhancedStatusCode>>(),
+            vec![
+                EnhancedStatusCode {
+                    class: 5,
+                    subject: 1,
+                    detail: 1,
+                },
+                EnhancedStatusCode {
+                    class: 5,
+                    subject: 2,
+                    detail: 0,
+                },
+            ]
         );
 
         for invalid in ["5.01.1", "5.1.001", "5.1000.1", "5.1.1000"] {
