@@ -1,5 +1,4 @@
 #[cfg(test)]
-#[cfg(feature = "builder")]
 mod sync {
     use std::sync::Arc;
 
@@ -72,7 +71,7 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "builder", feature = "tokio"))]
+#[cfg(feature = "tokio")]
 mod tokio {
     use std::sync::Arc;
 

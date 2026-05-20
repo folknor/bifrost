@@ -41,15 +41,10 @@ impl Default for ClientId {
         // client's address is dynamically assigned and the client does not have
         // an obvious name), an address literal SHOULD be substituted for the
         // domain name.
-        #[cfg(feature = "hostname")]
-        {
-            hostname::get()
-                .ok()
-                .and_then(|s| s.into_string().map(Self::Domain).ok())
-                .unwrap_or(LOCALHOST_CLIENT)
-        }
-        #[cfg(not(feature = "hostname"))]
-        LOCALHOST_CLIENT
+        hostname::get()
+            .ok()
+            .and_then(|s| s.into_string().map(Self::Domain).ok())
+            .unwrap_or(LOCALHOST_CLIENT)
     }
 }
 

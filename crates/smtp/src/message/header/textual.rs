@@ -238,7 +238,6 @@ text_header! {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::{ListId, ListPost, ListUnsubscribe, ListUnsubscribePost, Subject};
     use crate::message::header::{Header, HeaderName, HeaderValue, Headers};

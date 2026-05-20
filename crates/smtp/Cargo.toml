@@ -8,7 +8,7 @@ license = "MIT"
 repository.workspace = true
 authors.workspace = true
 homepage = "https://github.com/folknor/bifrost"
-keywords = ["email", "smtp", "mailer", "message", "sendmail"]
+keywords = ["email", "smtp", "mailer", "message"]
 categories = ["email", "network-programming"]
 
 [lib]
@@ -24,22 +24,20 @@ idna = "1"
 
 tracing = { version = "0.1.16", default-features = false, features = ["std"], optional = true }
 
-httpdate = { version = "1", optional = true }
-mime = { version = "0.3.4", optional = true }
-fastrand = { version = "2.0", optional = true }
-quoted_printable = { version = "0.5", optional = true }
-base64 = { version = "0.22", optional = true }
-email-encoding = { version = "0.4", optional = true }
+httpdate = "1"
+mime = "0.3.4"
+fastrand = "2.0"
+quoted_printable = "0.5"
+base64 = "0.22"
+email-encoding = "0.4"
 
-uuid = { version = "1", features = ["v4"], optional = true }
 serde = { version = "1.0.110", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
 
-hostname = { version = "0.4", optional = true }
-socket2 = { version = "0.6", optional = true }
-url = { version = "2.4", optional = true }
-percent-encoding = { version = "2.3", optional = true }
-zeroize = { version = "1", features = ["serde"], optional = true }
+hostname = "0.4"
+socket2 = "0.6"
+url = "2.4"
+percent-encoding = "2.3"
+zeroize = { version = "1", features = ["serde"] }
 
 native-tls = { version = "0.2.9", optional = true }
 
@@ -51,31 +49,27 @@ rsa = { version = "0.10.0-rc.18", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 
 [dev-dependencies]
-pretty_assertions = "1"
 tracing = { version = "0.1.16", default-features = false, features = ["std"] }
 tracing-subscriber = "0.3"
-glob = "0.3"
-walkdir = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
-maud = "0.27"
 
 [features]
-default = ["smtp-transport", "pool", "native-tls", "hostname", "builder"]
-builder = ["dep:httpdate", "dep:mime", "dep:fastrand", "dep:quoted_printable", "dep:email-encoding"]
-
-file-transport = ["dep:uuid", "tokio?/fs", "tokio?/io-util"]
-file-transport-envelope = ["serde", "dep:serde_json", "file-transport"]
-sendmail-transport = ["tokio?/process", "tokio?/io-util"]
-smtp-transport = ["dep:base64", "dep:socket2", "dep:url", "dep:percent-encoding", "dep:zeroize", "tokio?/rt", "tokio?/time", "tokio?/net", "tokio?/io-util"]
+default = ["pool", "native-tls"]
 
 pool = ["tokio?/sync"]
 
-tls-native = ["native-tls"]
+tokio = [
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/time",
+    "tokio/net",
+    "tokio/io-util",
+    "native-tls",
+    "dep:tokio-native-tls",
+]
 
-tokio = ["dep:tokio", "native-tls", "dep:tokio-native-tls"]
-
-dkim = ["dep:base64", "dep:sha2", "dep:rsa", "dep:ed25519-dalek"]
+dkim = ["dep:sha2", "dep:rsa", "dep:ed25519-dalek"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -83,40 +77,30 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
 name = "autoconfigure"
-required-features = ["smtp-transport", "native-tls"]
-
-[[example]]
-name = "basic_html"
-required-features = ["file-transport", "builder"]
-
-[[example]]
-name = "maud_html"
-required-features = ["file-transport", "builder"]
+required-features = ["native-tls"]
 
 [[example]]
 name = "smtp"
-required-features = ["smtp-transport", "builder"]
 
 [[example]]
 name = "lmtp"
-required-features = ["smtp-transport", "builder"]
 
 [[example]]
 name = "smtp_tls"
-required-features = ["smtp-transport", "native-tls", "builder"]
+required-features = ["native-tls"]
 
 [[example]]
 name = "smtp_starttls"
-required-features = ["smtp-transport", "native-tls", "builder"]
+required-features = ["native-tls"]
 
 [[example]]
 name = "smtp_selfsigned"
-required-features = ["smtp-transport", "native-tls", "builder"]
+required-features = ["native-tls"]
 
 [[example]]
 name = "tokio_smtp_tls"
-required-features = ["smtp-transport", "tokio", "builder"]
+required-features = ["tokio"]
 
 [[example]]
 name = "tokio_smtp_starttls"
-required-features = ["smtp-transport", "tokio", "builder"]
+required-features = ["tokio"]

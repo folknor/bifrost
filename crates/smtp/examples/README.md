@@ -5,7 +5,6 @@ This folder contains examples showing how to use Bifrost SMTP in your own projec
 ## Message builder examples
 
 - [basic_html.rs] - Create an HTML email.
-- [maud_html.rs] - Create an HTML email using a [maud](https://github.com/lambda-fairy/maud) template.
 
 ## SMTP Examples
 
@@ -17,7 +16,6 @@ This folder contains examples showing how to use Bifrost SMTP in your own projec
   These files are prefixed with `tokio_`.
 
 [basic_html.rs]: ./basic_html.rs
-[maud_html.rs]: ./maud_html.rs
 [smtp.rs]: ./smtp.rs
 [smtp_tls.rs]: ./smtp_tls.rs
 [smtp_starttls.rs]: ./smtp_starttls.rs

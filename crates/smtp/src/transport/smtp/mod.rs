@@ -44,7 +44,7 @@
 //! do the following:
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
+//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -82,7 +82,7 @@
 //! For more information take a look at [`SmtpTransport::from_url`] or [`AsyncSmtpTransport::from_url`].
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
+//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,
@@ -110,7 +110,7 @@
 //! #### Advanced configuration with custom TLS settings
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
+//! # #[cfg(feature = "native-tls")]
 //! # fn test() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::fs;
 //!
@@ -155,7 +155,7 @@
 //! In a webserver context it may go about this:
 //!
 //! ```rust,no_run
-//! # #[cfg(all(feature = "builder", feature = "native-tls"))]
+//! # #[cfg(feature = "native-tls")]
 //! # fn test() {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport,

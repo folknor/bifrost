@@ -9,8 +9,7 @@
 //! # Examples
 //!
 //! ```rust
-//! # #[cfg(feature = "builder")]
-//! # {
+//! # //! # {
 //! use bifrost_smtp::{
 //!     Message, Transport, message::header::ContentType, transport::stub::StubTransport,
 //! };

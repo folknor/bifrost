@@ -79,7 +79,6 @@ impl Header for ContentDisposition {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::ContentDisposition;
     use crate::message::header::{HeaderName, HeaderValue, Headers};

@@ -1,5 +1,5 @@
 use bifrost_smtp::{
-    FileTransport, Message, Transport,
+    Message,
     message::{MultiPart, SinglePart, header},
 };
 
@@ -42,10 +42,6 @@ fn main() {
         )
         .expect("failed to build email");
 
-    // Create our mailer. Please see the other examples for creating SMTP mailers.
-    // The path given here must exist on the filesystem.
-    let mailer = FileTransport::new("./");
-
-    // Store the message when you're ready.
-    mailer.send(&email).expect("failed to deliver message");
+    let raw_message = email.formatted();
+    println!("{}", String::from_utf8_lossy(&raw_message));
 }

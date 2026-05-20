@@ -769,6 +769,7 @@ impl AsyncSmtpConnection {
         }
     }
 
+    #[cfg_attr(not(feature = "pool"), allow(dead_code))]
     pub(crate) fn has_broken(&self) -> bool {
         self.stream.get_ref().state() != ConnectionState::Ok
     }

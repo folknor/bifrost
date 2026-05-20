@@ -319,7 +319,6 @@ fn find_all_lf_char_indices(s: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::{Body, ContentTransferEncoding, in_place_crlf_line_endings};
 

@@ -426,7 +426,6 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
     use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey};
 
     use super::{

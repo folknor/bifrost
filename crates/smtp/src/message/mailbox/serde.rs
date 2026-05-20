@@ -154,7 +154,6 @@ impl<'de> Deserialize<'de> for Mailboxes {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
     use serde_json::from_str;
 
     use super::*;

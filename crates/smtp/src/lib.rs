@@ -13,22 +13,11 @@
 //! This section lists each crate feature and briefly explains it.
 //! More info about each module can be found in the corresponding module page.
 //!
-//! Features marked `(default)` are enabled by default.
-//!
-//! ### Typed message builder
-//!
-//! _Strongly typed [`message`] builder_
-//!
-//! * **builder** (default): Enable the [`Message`] builder
-//! * **hostname** (default): Try to use the actual system hostname in the `Message-ID` header
-//!
 //! ### SMTP transport
 //!
 //! _Send emails using [`SMTP`]_
 //!
-//! * **smtp-transport** (default): Enable the SMTP transport
 //! * **pool** (default): Connection pool for SMTP transport
-//! * **hostname** (default): Try to use the actual system hostname for the SMTP `CLIENTID`
 //!
 //! #### SMTP over TLS via the native-tls crate
 //!
@@ -51,19 +40,6 @@
 //! | Debian       | `pkg-config`, `libssl-dev` | `libssl3`, `ca-certificates` |
 //! | Alpine Linux | `pkgconf`, `openssl-dev`   | `libssl3`, `ca-certificates` |
 //!
-//! ### Sendmail transport
-//!
-//! _Send emails using the [`sendmail`] command_
-//!
-//! * **sendmail-transport**: Enable the `sendmail` transport
-//!
-//! ### File transport
-//!
-//! _Save emails as an `.eml` [`file`]_
-//!
-//! * **file-transport**: Enable the file transport (saves emails into an `.eml` file)
-//! * **file-transport-envelope**: Allow writing the envelope into a JSON file (additionally saves envelopes into a `.json` file)
-//!
 //! ### Async execution runtime
 //!
 //! _Use [tokio] as the async execution runtime for sending emails_
@@ -79,9 +55,6 @@
 //! * **dkim**: Add support for signing email with DKIM
 //!
 //! [`SMTP`]: crate::transport::smtp
-//! [`sendmail`]: crate::transport::sendmail
-//! [`file`]: crate::transport::file
-//! [`ContentType`]: crate::message::header::ContentType
 //! [tokio]: https://docs.rs/tokio/1
 //! [Tokio 1.x]: https://docs.rs/tokio/1
 //! [DKIM]: https://datatracker.ietf.org/doc/html/rfc6376
@@ -125,13 +98,10 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod address;
-#[cfg(any(feature = "smtp-transport", feature = "dkim"))]
 mod base64;
 pub mod error;
 #[cfg(feature = "tokio")]
 mod executor;
-#[cfg(feature = "builder")]
-#[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
 pub mod message;
 mod time;
 pub mod transport;
@@ -146,24 +116,10 @@ pub use self::executor::TokioExecutor;
 #[doc(inline)]
 pub use self::transport::{AsyncTransport, BoxedAsyncTransport};
 pub use crate::address::Address;
-#[cfg(feature = "builder")]
 #[doc(inline)]
 pub use crate::message::Message;
-#[cfg(all(feature = "file-transport", feature = "tokio"))]
-#[doc(inline)]
-pub use crate::transport::file::AsyncFileTransport;
-#[cfg(feature = "file-transport")]
-#[doc(inline)]
-pub use crate::transport::file::FileTransport;
-#[cfg(all(feature = "sendmail-transport", feature = "tokio"))]
-#[doc(inline)]
-pub use crate::transport::sendmail::AsyncSendmailTransport;
-#[cfg(feature = "sendmail-transport")]
-#[doc(inline)]
-pub use crate::transport::sendmail::SendmailTransport;
-#[cfg(all(feature = "smtp-transport", feature = "tokio"))]
+#[cfg(feature = "tokio")]
 pub use crate::transport::smtp::{AsyncLmtpTransport, AsyncSmtpTransport};
-#[cfg(feature = "smtp-transport")]
 pub use crate::transport::smtp::{LmtpTransport, SmtpTransport};
 #[doc(inline)]
 pub use crate::transport::{BoxedTransport, Transport};
@@ -173,7 +129,6 @@ use crate::{address::Envelope, error::Error};
 pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;
 
 #[cfg(test)]
-#[cfg(feature = "builder")]
 mod test {
     use super::*;
     use crate::message::{Mailbox, Mailboxes, header, header::Headers};

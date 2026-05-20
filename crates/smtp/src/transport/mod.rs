@@ -27,12 +27,10 @@
 //!
 //! The following transports are available:
 //!
-//! | Module       | Protocol | Sync API              | Async API                  | Description                                             |
-//! | ------------ | -------- | --------------------- | -------------------------- | ------------------------------------------------------- |
-//! | [`smtp`]     | SMTP     | [`SmtpTransport`]     | [`AsyncSmtpTransport`]     | Uses the SMTP protocol to send emails to a relay server |
-//! | [`sendmail`] | Sendmail | [`SendmailTransport`] | [`AsyncSendmailTransport`] | Uses the `sendmail` command to send emails              |
-//! | [`file`]     | File     | [`FileTransport`]     | [`AsyncFileTransport`]     | Saves the email as an `.eml` file                       |
-//! | [`stub`]     | Debug    | [`StubTransport`]     | [`AsyncStubTransport`]     | Drops the email - Useful for debugging                  |
+//! | Module   | Protocol | Sync API              | Async API              | Description                                             |
+//! | -------- | -------- | --------------------- | ---------------------- | ------------------------------------------------------- |
+//! | [`smtp`] | SMTP     | [`SmtpTransport`]     | [`AsyncSmtpTransport`] | Uses the SMTP protocol to send emails to a relay server |
+//! | [`stub`] | Debug    | [`StubTransport`]     | [`AsyncStubTransport`] | Drops the email - Useful for debugging                  |
 //!
 //! ## Building an email
 //!
@@ -54,7 +52,6 @@
 //! ```rust,no_run
 //! # use std::error::Error;
 //! #
-//! # #[cfg(all(feature = "builder", feature = "smtp-transport"))]
 //! # fn main() -> Result<(), Box<dyn Error>> {
 //! use bifrost_smtp::{
 //!     Message, SmtpTransport, Transport, message::header::ContentType,
@@ -80,8 +77,6 @@
 //! }
 //! # Ok(())
 //! # }
-//! # #[cfg(not(all(feature = "builder", feature = "smtp-transport")))]
-//! # fn main() {}
 //! ```
 //!
 //! [MTA]: https://en.wikipedia.org/wiki/Message_transfer_agent
@@ -90,28 +85,14 @@
 //! [`starttls_relay`]: crate::SmtpTransport::starttls_relay
 //! [`credentials`]: crate::transport::smtp::SmtpTransportBuilder::credentials
 //! [`Message`]: crate::Message
-//! [`file`]: self::file
 //! [`SmtpTransport`]: crate::SmtpTransport
 //! [`AsyncSmtpTransport`]: crate::AsyncSmtpTransport
-//! [`SendmailTransport`]: crate::SendmailTransport
-//! [`AsyncSendmailTransport`]: crate::AsyncSendmailTransport
-//! [`FileTransport`]: crate::FileTransport
-//! [`AsyncFileTransport`]: crate::AsyncFileTransport
 //! [`StubTransport`]: crate::transport::stub::StubTransport
 //! [`AsyncStubTransport`]: crate::transport::stub::AsyncStubTransport
 
 use crate::Envelope;
-#[cfg(feature = "builder")]
 use crate::Message;
 
-#[cfg(feature = "file-transport")]
-#[cfg_attr(docsrs, doc(cfg(feature = "file-transport")))]
-pub mod file;
-#[cfg(feature = "sendmail-transport")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sendmail-transport")))]
-pub mod sendmail;
-#[cfg(feature = "smtp-transport")]
-#[cfg_attr(docsrs, doc(cfg(feature = "smtp-transport")))]
 pub mod smtp;
 pub mod stub;
 
@@ -123,8 +104,6 @@ pub trait Transport {
     type Error;
 
     /// Sends the email
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
         #[cfg(feature = "tracing")]
         tracing::trace!("starting to send an email");
@@ -150,8 +129,6 @@ where
     type Ok = T::Ok;
     type Error = T::Error;
 
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
         (**self).send(message)
     }
@@ -172,8 +149,6 @@ where
     type Ok = T::Ok;
     type Error = T::Error;
 
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send(&self, message: &Message) -> Result<Self::Ok, Self::Error> {
         (**self).send(message)
     }
@@ -200,8 +175,6 @@ pub trait AsyncTransport: Sync {
     type Error;
 
     /// Sends the email
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send<'a>(
         &'a self,
         message: &'a Message,
@@ -236,8 +209,6 @@ where
     type Ok = T::Ok;
     type Error = T::Error;
 
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send<'a>(
         &'a self,
         message: &'a Message,
@@ -266,8 +237,6 @@ where
     type Ok = T::Ok;
     type Error = T::Error;
 
-    #[cfg(feature = "builder")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
     fn send<'a>(
         &'a self,
         message: &'a Message,

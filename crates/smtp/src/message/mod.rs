@@ -348,13 +348,10 @@ impl MessageBuilder {
         match id {
             Some(i) => self.header(header::MessageId::from(i)),
             None => {
-                #[cfg(feature = "hostname")]
                 let hostname = hostname::get()
                     .map_err(|_| ())
                     .and_then(|s| s.into_string().map_err(|_| ()))
                     .unwrap_or_else(|()| DEFAULT_MESSAGE_ID_DOMAIN.to_owned());
-                #[cfg(not(feature = "hostname"))]
-                let hostname = DEFAULT_MESSAGE_ID_DOMAIN.to_owned();
 
                 self.header(header::MessageId::from(
                     // https://tools.ietf.org/html/rfc5322#section-3.6.4
@@ -495,7 +492,6 @@ impl MessageBuilder {
 }
 
 /// Email message which can be formatted
-#[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
 #[derive(Clone, Debug)]
 pub struct Message {
     headers: Headers,
@@ -643,8 +639,6 @@ fn make_message_id() -> String {
 #[cfg(test)]
 mod test {
     use std::time::{Duration, SystemTime};
-
-    use pretty_assertions::assert_eq;
 
     use super::{
         Message, MultiPart, SinglePart, header,

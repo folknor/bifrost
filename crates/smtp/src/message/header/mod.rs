@@ -382,7 +382,6 @@ const fn allowed_char(c: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
 
     use super::{HeaderName, HeaderValue, Headers, To};
     use crate::message::Mailboxes;

@@ -7,6 +7,8 @@ use std::{
 #[cfg(feature = "native-tls")]
 use std::mem;
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
@@ -154,7 +156,7 @@ impl NetworkStream {
         } else {
             socket.connect(&addr).map_err(error::connection)?;
         }
-        let stream: UnixStream = socket.into();
+        let stream = UnixStream::from(OwnedFd::from(socket));
         Ok(NetworkStream::new(InnerNetworkStream::Unix(stream)))
     }
 

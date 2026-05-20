@@ -1,5 +1,4 @@
 #[cfg(test)]
-#[cfg(all(feature = "smtp-transport", feature = "builder"))]
 mod sync {
     use bifrost_smtp::{Message, SmtpTransport, Transport};
 
@@ -22,7 +21,7 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "smtp-transport", feature = "builder", feature = "tokio"))]
+#[cfg(feature = "tokio")]
 mod tokio {
     use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor};
 
@@ -46,7 +45,7 @@ mod tokio {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "smtp-transport", feature = "tokio"))]
+#[cfg(feature = "tokio")]
 mod read_response_caps {
     use std::{io::Write, net::TcpListener, thread, time::Duration};
 

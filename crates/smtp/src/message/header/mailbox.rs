@@ -176,7 +176,6 @@ mailboxes_header! {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::{From, Mailbox, Mailboxes, ReplyTo};
     use crate::message::header::{HeaderName, HeaderValue, Headers};

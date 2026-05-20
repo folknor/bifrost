@@ -160,7 +160,6 @@ mod serde {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::ContentType;
     use crate::message::header::{HeaderName, HeaderValue, Headers};

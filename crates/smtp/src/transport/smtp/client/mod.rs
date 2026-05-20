@@ -5,8 +5,7 @@
 //! ```rust,no_run
 //! # use std::error::Error;
 //!
-//! # #[cfg(feature = "smtp-transport")]
-//! # fn main() -> Result<(), Box<dyn Error>> {
+//! # //! # fn main() -> Result<(), Box<dyn Error>> {
 //! use bifrost_smtp::transport::smtp::{
 //!     SMTP_PORT, client::SmtpConnection, commands::*, extension::ClientId,
 //! };

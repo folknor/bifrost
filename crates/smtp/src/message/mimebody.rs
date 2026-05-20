@@ -520,7 +520,6 @@ impl EmailFormat for MultiPart {
 
 #[cfg(test)]
 mod test {
-    use pretty_assertions::assert_eq;
 
     use super::*;
 

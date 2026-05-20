@@ -42,7 +42,6 @@ use crate::{Transport, address::Envelope};
 /// of this struct for the connection pool to be of any use.
 ///
 /// To customize connection pool settings, use [`SmtpTransportBuilder::pool_config`].
-#[cfg_attr(docsrs, doc(cfg(feature = "smtp-transport")))]
 #[derive(Clone)]
 pub struct SmtpTransport {
     #[cfg(feature = "pool")]
@@ -57,7 +56,6 @@ pub struct SmtpTransport {
 /// LMTP uses `LHLO` for capability discovery and returns one status per
 /// envelope recipient. Rejected recipients carry their `RCPT` response;
 /// accepted recipients carry their post-DATA delivery response.
-#[cfg_attr(docsrs, doc(cfg(feature = "smtp-transport")))]
 #[derive(Clone)]
 pub struct LmtpTransport {
     #[cfg(feature = "pool")]

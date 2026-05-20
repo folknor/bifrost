@@ -114,10 +114,6 @@ Batch builders: `MultiPart::multiparts(...)` and `.singleparts(...)`.
 
 Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPrivateKey>` and `From<ed25519_dalek::SigningKey>` on `DkimSigningKey`. SHA-2 via `sha2` 0.10 to match `rsa` 0.9 digest traits.
 
-## Sendmail transport
-
-`SendmailTransport::new_with_command(...)` takes the command path. Tests use a fake-command directory under `target/sendmail-tests` keyed by label + pid; no real sendmail required.
-
 ## Pool
 
 `PoolConfig` configures min idle, max size, and idle timeout. `min_idle` defaults to 0 (no background DNS / reconnect). `test_connected()` runs before reuse and aborts on failure.
@@ -132,7 +128,6 @@ Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPriva
 crates/smtp/src/
 ├── message/             - builder, headers, MIME parts, address parsers
 ├── transport/
-│   ├── sendmail/        - sendmail invocation
 │   └── smtp/
 │       ├── client/      - connection, async_connection, net, async_net
 │       ├── transport.rs / async_transport.rs - public sync + async transports

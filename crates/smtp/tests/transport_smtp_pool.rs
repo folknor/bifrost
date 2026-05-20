@@ -1,4 +1,4 @@
-#[cfg(all(test, feature = "smtp-transport", feature = "pool"))]
+#[cfg(all(test, feature = "pool"))]
 mod sync {
     use std::{sync::mpsc, thread};
 
