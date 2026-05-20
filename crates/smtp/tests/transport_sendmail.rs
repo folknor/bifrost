@@ -174,21 +174,16 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(
-    feature = "sendmail-transport",
-    feature = "builder",
-    feature = "tokio1"
-))]
-mod tokio_1 {
-    use bifrost_smtp::{AsyncSendmailTransport, AsyncTransport, Tokio1Executor};
-    use tokio1_crate as tokio;
+#[cfg(all(feature = "sendmail-transport", feature = "builder", feature = "tokio"))]
+mod tokio {
+    use bifrost_smtp::{AsyncSendmailTransport, AsyncTransport, TokioExecutor};
 
     use crate::support::{FakeSendmail, assert_delivered, email};
 
     #[tokio::test]
-    async fn sendmail_transport_tokio1() {
+    async fn sendmail_transport_tokio() {
         let fake = FakeSendmail::success("tokio-success");
-        let sender = AsyncSendmailTransport::<Tokio1Executor>::new_with_command(fake.command());
+        let sender = AsyncSendmailTransport::<TokioExecutor>::new_with_command(fake.command());
         let email = email();
 
         let result = sender.send(&email).await;
@@ -198,9 +193,9 @@ mod tokio_1 {
     }
 
     #[tokio::test]
-    async fn sendmail_transport_tokio1_reports_stderr_on_failure() {
+    async fn sendmail_transport_tokio_reports_stderr_on_failure() {
         let fake = FakeSendmail::failure("tokio-failure", "synthetic tokio sendmail failure");
-        let sender = AsyncSendmailTransport::<Tokio1Executor>::new_with_command(fake.command());
+        let sender = AsyncSendmailTransport::<TokioExecutor>::new_with_command(fake.command());
         let email = email();
 
         let error = sender.send(&email).await.unwrap_err();
@@ -209,46 +204,6 @@ mod tokio_1 {
             error
                 .to_string()
                 .contains("synthetic tokio sendmail failure"),
-            "{error:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-#[cfg(all(
-    feature = "sendmail-transport",
-    feature = "builder",
-    feature = "async-std1"
-))]
-mod asyncstd_1 {
-    use bifrost_smtp::{AsyncSendmailTransport, AsyncStd1Executor, AsyncTransport};
-
-    use crate::support::{FakeSendmail, assert_delivered, email};
-
-    #[async_std::test]
-    async fn sendmail_transport_asyncstd1() {
-        let fake = FakeSendmail::success("asyncstd-success");
-        let sender = AsyncSendmailTransport::<AsyncStd1Executor>::new_with_command(fake.command());
-        let email = email();
-
-        let result = sender.send(&email).await;
-        println!("{result:?}");
-        assert!(result.is_ok());
-        assert_delivered(&fake, &email);
-    }
-
-    #[async_std::test]
-    async fn sendmail_transport_asyncstd1_reports_stderr_on_failure() {
-        let fake = FakeSendmail::failure("asyncstd-failure", "synthetic asyncstd sendmail failure");
-        let sender = AsyncSendmailTransport::<AsyncStd1Executor>::new_with_command(fake.command());
-        let email = email();
-
-        let error = sender.send(&email).await.unwrap_err();
-        assert!(error.is_client());
-        assert!(
-            error
-                .to_string()
-                .contains("synthetic asyncstd sendmail failure"),
             "{error:?}"
         );
     }

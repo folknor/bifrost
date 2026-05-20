@@ -10,7 +10,7 @@ use std::{
 
 #[cfg(feature = "pool")]
 use super::PoolConfig;
-#[cfg(feature = "tokio1-native-tls")]
+#[cfg(feature = "tokio")]
 use super::Tls;
 #[cfg(feature = "pool")]
 use super::pool::async_impl::Pool;
@@ -18,12 +18,8 @@ use super::{
     AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
     SmtpInfo,
 };
-#[cfg(feature = "async-std1")]
-use crate::AsyncStd1Executor;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
 use crate::AsyncTransport;
-#[cfg(feature = "tokio1")]
-use crate::Tokio1Executor;
+use crate::TokioExecutor;
 use crate::executor::SmtpExecutor;
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Envelope, Executor};
@@ -53,7 +49,7 @@ use crate::{Envelope, Executor};
 /// of this struct for the connection pool to be of any use.
 ///
 /// To customize connection pool settings, use [`AsyncSmtpTransportBuilder::pool_config`].
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransport<E: Executor> {
     #[cfg(feature = "pool")]
     inner: Arc<Pool<E>>,
@@ -67,7 +63,7 @@ pub struct AsyncSmtpTransport<E: Executor> {
 /// [`AsyncSmtpTransport`]. LMTP uses `LHLO` for capability discovery and
 /// returns one status per envelope recipient. Rejected recipients carry their
 /// `RCPT` response; accepted recipients carry their post-DATA delivery response.
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransport<E: Executor> {
     #[cfg(feature = "pool")]
     inner: Arc<Pool<E>>,
@@ -75,8 +71,7 @@ pub struct AsyncLmtpTransport<E: Executor> {
     inner: AsyncSmtpClient<E>,
 }
 
-#[cfg(feature = "tokio1")]
-impl AsyncTransport for AsyncSmtpTransport<Tokio1Executor> {
+impl AsyncTransport for AsyncSmtpTransport<TokioExecutor> {
     type Ok = Response;
     type Error = Error;
 
@@ -98,54 +93,7 @@ impl AsyncTransport for AsyncSmtpTransport<Tokio1Executor> {
     }
 }
 
-#[cfg(feature = "tokio1")]
-impl AsyncTransport for AsyncLmtpTransport<Tokio1Executor> {
-    type Ok = Vec<Response>;
-    type Error = Error;
-
-    /// Sends an email and returns one LMTP status per recipient.
-    async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        let mut conn = self.inner.connection().await?;
-
-        let result = conn.send_lmtp(envelope, email).await?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        Ok(result)
-    }
-
-    async fn shutdown(&self) {
-        #[cfg(feature = "pool")]
-        self.inner.shutdown().await;
-    }
-}
-
-#[cfg(feature = "async-std1")]
-impl AsyncTransport for AsyncSmtpTransport<AsyncStd1Executor> {
-    type Ok = Response;
-    type Error = Error;
-
-    /// Sends an email
-    async fn send_raw(&self, envelope: &Envelope, email: &[u8]) -> Result<Self::Ok, Self::Error> {
-        let mut conn = self.inner.connection().await?;
-
-        let result = conn.send(envelope, email).await?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        Ok(result)
-    }
-
-    async fn shutdown(&self) {
-        #[cfg(feature = "pool")]
-        self.inner.shutdown().await;
-    }
-}
-
-#[cfg(feature = "async-std1")]
-impl AsyncTransport for AsyncLmtpTransport<AsyncStd1Executor> {
+impl AsyncTransport for AsyncLmtpTransport<TokioExecutor> {
     type Ok = Vec<Response>;
     type Error = Error;
 
@@ -177,8 +125,7 @@ where
     ///
     /// Creates an encrypted transport over submissions port, using the provided domain
     /// to validate TLS certificates.
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSIONS_PORT, Tls, TlsParameters};
 
@@ -200,8 +147,7 @@ where
     ///
     /// An error is returned if the connection can't be upgraded. No credentials
     /// or emails will be sent to the server, protecting from downgrade attacks.
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn starttls_relay(relay: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         use super::{SUBMISSION_PORT, Tls, TlsParameters};
 
@@ -310,9 +256,8 @@ where
     ///
     /// ```rust,no_run
     /// use bifrost_smtp::{
-    ///     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::header::ContentType,
+    ///     AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor, message::header::ContentType,
     /// };
-    /// # use tokio1_crate as tokio;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -326,8 +271,8 @@ where
     ///     .unwrap();
     ///
     /// // Open a remote connection to gmail
-    /// let mailer: AsyncSmtpTransport<Tokio1Executor> =
-    ///     AsyncSmtpTransport::<Tokio1Executor>::from_url(
+    /// let mailer: AsyncSmtpTransport<TokioExecutor> =
+    ///     AsyncSmtpTransport::<TokioExecutor>::from_url(
     ///         "smtps://username:password@smtp.example.com:465",
     ///     )?
     ///     .build();
@@ -338,29 +283,10 @@ where
     /// # }
     /// ```
     ///
-    /// TLS URL forms such as `smtps://` and `?tls=required` require the
-    /// `tokio1-native-tls` feature. Without `native-tls`, plaintext
-    /// `smtp://` URLs are accepted for both async runtimes. If a plaintext URL
-    /// contains credentials, authentication is refused at connection time
-    /// unless [`AsyncSmtpTransportBuilder::dangerous_allow_insecure_auth`] is
+    /// If a plaintext URL contains credentials, authentication is refused at
+    /// connection time unless
+    /// [`AsyncSmtpTransportBuilder::dangerous_allow_insecure_auth`] is
     /// enabled.
-    #[cfg(any(
-        feature = "tokio1-native-tls",
-        all(
-            any(feature = "tokio1", feature = "async-std1"),
-            not(feature = "native-tls")
-        )
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(any(
-            feature = "tokio1-native-tls",
-            all(
-                any(feature = "tokio1", feature = "async-std1"),
-                not(feature = "native-tls")
-            )
-        )))
-    )]
     pub fn from_url(connection_url: &str) -> Result<AsyncSmtpTransportBuilder, Error> {
         super::connection_url::from_connection_url(connection_url)
     }
@@ -685,7 +611,7 @@ where
 /// Contains client configuration.
 /// Instances of this struct can be created using functions of [`AsyncSmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransportBuilder {
     info: SmtpInfo,
     #[cfg(feature = "pool")]
@@ -695,7 +621,7 @@ pub struct AsyncSmtpTransportBuilder {
 /// Contains LMTP client configuration.
 /// Instances of this struct can be created using functions of [`AsyncLmtpTransport`].
 #[derive(Debug, Clone)]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransportBuilder {
     info: SmtpInfo,
     #[cfg(feature = "pool")]
@@ -807,8 +733,8 @@ impl AsyncSmtpTransportBuilder {
     ///
     /// Using the incorrect [`Tls`] and [`Self::port`] combination may
     /// lead to hard to debug IO errors coming from the TLS library.
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -928,8 +854,8 @@ impl AsyncLmtpTransportBuilder {
     }
 
     /// Set the TLS settings to use
-    #[cfg(feature = "tokio1-native-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
+    #[cfg(feature = "tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
         self.info.unix_socket = None;
@@ -1020,7 +946,7 @@ where
 }
 
 #[cfg(test)]
-#[cfg(feature = "tokio1")]
+#[cfg(feature = "tokio")]
 mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
@@ -1034,7 +960,7 @@ mod tests {
     #[cfg(unix)]
     use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
-        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+        AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, TokioExecutor,
         address::Envelope,
         transport::smtp::test_support::{
             assert_lmtp_delivery_commands, spawn_lmtp_delivery_server,
@@ -1046,7 +972,7 @@ mod tests {
     #[test]
     fn tokio_transport_from_plaintext_url() {
         let builder =
-            AsyncSmtpTransport::<Tokio1Executor>::from_url("smtp://127.0.0.1:2525").unwrap();
+            AsyncSmtpTransport::<TokioExecutor>::from_url("smtp://127.0.0.1:2525").unwrap();
 
         assert_eq!(builder.info.port, 2525);
         assert_eq!(builder.info.server, "127.0.0.1");
@@ -1054,13 +980,13 @@ mod tests {
 
     #[test]
     fn tokio_lmtp_builder_uses_lmtp_defaults() {
-        let builder = AsyncLmtpTransport::<Tokio1Executor>::builder_dangerous("localhost");
+        let builder = AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("localhost");
 
         assert_eq!(builder.info.port, super::super::LMTP_PORT);
         assert_eq!(builder.info.protocol, Protocol::Lmtp);
     }
 
-    #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[tokio::test(crate = "tokio")]
     async fn tokio_lmtp_transport_returns_per_recipient_statuses() {
         let server = spawn_lmtp_delivery_server();
 
@@ -1073,8 +999,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let mailer: AsyncLmtpTransport<Tokio1Executor> =
-            AsyncLmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+        let mailer: AsyncLmtpTransport<TokioExecutor> =
+            AsyncLmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
                 .port(server.address.port())
                 .build();
 
@@ -1094,7 +1020,7 @@ mod tests {
         assert_lmtp_delivery_commands(&commands);
     }
 
-    #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[tokio::test(crate = "tokio")]
     #[cfg(unix)]
     async fn tokio_lmtp_transport_sends_over_unix_socket() {
         let server = spawn_unix_lmtp_delivery_server();
@@ -1108,8 +1034,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let mailer: AsyncLmtpTransport<Tokio1Executor> =
-            AsyncLmtpTransport::<Tokio1Executor>::unix_socket(server.path.clone()).build();
+        let mailer: AsyncLmtpTransport<TokioExecutor> =
+            AsyncLmtpTransport::<TokioExecutor>::unix_socket(server.path.clone()).build();
 
         let responses = mailer
             .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
@@ -1125,7 +1051,7 @@ mod tests {
         assert_lmtp_delivery_commands(&commands);
     }
 
-    #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[tokio::test(crate = "tokio")]
     async fn tokio_plaintext_auth_is_refused_before_auth_command() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1150,10 +1076,10 @@ mod tests {
             observed_tx.send((read, after_ehlo)).unwrap();
         });
 
-        let builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+        let builder = AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
             .port(address.port())
             .password("user", "pass");
-        let client = AsyncSmtpClient::<Tokio1Executor> {
+        let client = AsyncSmtpClient::<TokioExecutor> {
             info: builder.info,
             marker_: PhantomData,
         };
@@ -1166,94 +1092,5 @@ mod tests {
         assert_eq!(read, 0, "client must close instead of sending AUTH");
         assert_eq!(after_ehlo, "");
         handle.join().unwrap();
-    }
-}
-
-#[cfg(test)]
-#[cfg(feature = "async-std1")]
-mod asyncstd_tests {
-    #[cfg(unix)]
-    use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
-    use crate::{
-        AsyncLmtpTransport, AsyncStd1Executor, AsyncTransport,
-        address::Envelope,
-        transport::smtp::test_support::{
-            assert_lmtp_delivery_commands, spawn_lmtp_delivery_server,
-        },
-    };
-
-    use super::Protocol;
-
-    #[test]
-    fn asyncstd_lmtp_builder_uses_lmtp_defaults() {
-        let builder = AsyncLmtpTransport::<AsyncStd1Executor>::builder_dangerous("localhost");
-
-        assert_eq!(builder.info.port, super::super::LMTP_PORT);
-        assert_eq!(builder.info.protocol, Protocol::Lmtp);
-    }
-
-    #[async_std::test]
-    async fn asyncstd_lmtp_transport_returns_per_recipient_statuses() {
-        let server = spawn_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<AsyncStd1Executor> =
-            AsyncLmtpTransport::<AsyncStd1Executor>::builder_dangerous("127.0.0.1")
-                .port(server.address.port())
-                .build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(!responses[1].is_positive());
-        assert!(responses[2].has_code(451));
-        assert!(!responses[2].is_positive());
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
-    }
-
-    #[async_std::test]
-    #[cfg(unix)]
-    async fn asyncstd_lmtp_transport_sends_over_unix_socket() {
-        let server = spawn_unix_lmtp_delivery_server();
-
-        let envelope = Envelope::new(
-            Some("sender@example.com".parse().unwrap()),
-            vec![
-                "first@example.com".parse().unwrap(),
-                "second@example.com".parse().unwrap(),
-                "third@example.com".parse().unwrap(),
-            ],
-        )
-        .unwrap();
-        let mailer: AsyncLmtpTransport<AsyncStd1Executor> =
-            AsyncLmtpTransport::<AsyncStd1Executor>::unix_socket(server.path.clone()).build();
-
-        let responses = mailer
-            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
-            .await
-            .unwrap();
-
-        assert_eq!(responses.len(), 3);
-        assert!(responses[0].has_code(250));
-        assert!(responses[1].has_code(550));
-        assert!(responses[2].has_code(451));
-
-        let commands = server.commands();
-        assert_lmtp_delivery_commands(&commands);
     }
 }

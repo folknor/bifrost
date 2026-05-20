@@ -191,8 +191,8 @@ where
 ///
 /// Implementations must be [`Sync`] so borrowed async methods can return
 /// [`Send`] futures.
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub trait AsyncTransport: Sync {
     /// Response produced by the Transport
     type Ok;
@@ -228,7 +228,7 @@ pub trait AsyncTransport: Sync {
     }
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl<T> AsyncTransport for Box<T>
 where
     T: AsyncTransport + ?Sized,
@@ -258,7 +258,7 @@ where
     }
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl<T> AsyncTransport for std::sync::Arc<T>
 where
     T: AsyncTransport + Send + Sync + ?Sized,
@@ -288,7 +288,7 @@ where
     }
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 trait ErasedAsyncTransport<Ok, Error>: Send + Sync {
     fn send_raw_boxed<'a>(
         &'a self,
@@ -299,7 +299,7 @@ trait ErasedAsyncTransport<Ok, Error>: Send + Sync {
     fn shutdown_boxed(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl<Ok, Error, T> ErasedAsyncTransport<Ok, Error> for T
 where
     T: AsyncTransport<Ok = Ok, Error = Error> + Send + Sync,
@@ -324,13 +324,13 @@ where
 /// reintroducing `async-trait`. The wrapped transport must be `Send + Sync +
 /// 'static` because the heap-erased transport can outlive the construction
 /// frame and may be shared between runtime tasks.
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct BoxedAsyncTransport<Ok, Error> {
     inner: Box<dyn ErasedAsyncTransport<Ok, Error>>,
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl<Ok, Error> BoxedAsyncTransport<Ok, Error> {
     /// Boxes an async transport.
     pub fn new<T>(transport: T) -> Self
@@ -343,7 +343,7 @@ impl<Ok, Error> BoxedAsyncTransport<Ok, Error> {
     }
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl<Ok, Error> AsyncTransport for BoxedAsyncTransport<Ok, Error> {
     type Ok = Ok;
     type Error = Error;

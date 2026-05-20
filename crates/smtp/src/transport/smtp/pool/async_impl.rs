@@ -5,10 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{
-    lock::Mutex,
-    stream::{self, StreamExt},
-};
+use tokio::sync::Mutex;
 
 use super::{
     super::{AsyncSmtpConnection, Error},
@@ -237,7 +234,7 @@ impl<E: Executor> Debug for Pool<E> {
             .field(
                 "connections",
                 &match self.connections.try_lock() {
-                    Some(connections) => {
+                    Ok(connections) => {
                         if let Some(connections) = connections.as_ref() {
                             format!("{} connections", connections.len())
                         } else {
@@ -245,7 +242,7 @@ impl<E: Executor> Debug for Pool<E> {
                         }
                     }
 
-                    None => "LOCKED".to_owned(),
+                    Err(_) => "LOCKED".to_owned(),
                 },
             )
             .field("client", &self.client)
@@ -337,9 +334,7 @@ async fn abort_concurrent<I>(iter: I)
 where
     I: Iterator<Item = AsyncSmtpConnection>,
 {
-    stream::iter(iter)
-        .for_each_concurrent(8, |mut conn| async move {
-            conn.abort().await;
-        })
-        .await;
+    for mut conn in iter {
+        conn.abort().await;
+    }
 }

@@ -22,14 +22,13 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "smtp-transport", feature = "builder", feature = "tokio1"))]
-mod tokio_1 {
-    use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-    use tokio1_crate as tokio;
+#[cfg(all(feature = "smtp-transport", feature = "builder", feature = "tokio"))]
+mod tokio {
+    use bifrost_smtp::{AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor};
 
     #[tokio::test]
     #[ignore = "requires a local SMTP server on 127.0.0.1:2525"]
-    async fn smtp_transport_simple_tokio1() {
+    async fn smtp_transport_simple_tokio() {
         let email = Message::builder()
             .from("NoBody <nobody@domain.tld>".parse().unwrap())
             .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
@@ -38,8 +37,8 @@ mod tokio_1 {
             .body(String::from("Be happy!"))
             .unwrap();
 
-        let sender: AsyncSmtpTransport<Tokio1Executor> =
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+        let sender: AsyncSmtpTransport<TokioExecutor> =
+            AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
                 .port(2525)
                 .build();
         sender.send(&email).await.unwrap();
@@ -47,40 +46,11 @@ mod tokio_1 {
 }
 
 #[cfg(test)]
-#[cfg(all(
-    feature = "smtp-transport",
-    feature = "builder",
-    feature = "async-std1"
-))]
-mod asyncstd_1 {
-    use bifrost_smtp::{AsyncSmtpTransport, AsyncStd1Executor, AsyncTransport, Message};
-
-    #[async_std::test]
-    #[ignore = "requires a local SMTP server on 127.0.0.1:2525"]
-    async fn smtp_transport_simple_asyncstd1() {
-        let email = Message::builder()
-            .from("NoBody <nobody@domain.tld>".parse().unwrap())
-            .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
-            .to("Hei <hei@domain.tld>".parse().unwrap())
-            .subject("Happy new year")
-            .body(String::from("Be happy!"))
-            .unwrap();
-
-        let sender: AsyncSmtpTransport<AsyncStd1Executor> =
-            AsyncSmtpTransport::<AsyncStd1Executor>::builder_dangerous("127.0.0.1")
-                .port(2525)
-                .build();
-        sender.send(&email).await.unwrap();
-    }
-}
-
-#[cfg(test)]
-#[cfg(all(feature = "smtp-transport", feature = "tokio1"))]
+#[cfg(all(feature = "smtp-transport", feature = "tokio"))]
 mod read_response_caps {
     use std::{io::Write, net::TcpListener, thread, time::Duration};
 
-    use bifrost_smtp::{AsyncSmtpTransport, Tokio1Executor};
-    use tokio1_crate as tokio;
+    use bifrost_smtp::{AsyncSmtpTransport, TokioExecutor};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_connection_returns_on_oversized_banner_line() {
@@ -96,9 +66,9 @@ mod read_response_caps {
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+            AsyncSmtpTransport::<TokioExecutor>::builder_dangerous("127.0.0.1")
                 .port(addr.port())
-                .build::<Tokio1Executor>()
+                .build::<TokioExecutor>()
                 .test_connection(),
         )
         .await

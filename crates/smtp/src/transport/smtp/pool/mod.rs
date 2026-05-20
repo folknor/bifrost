@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub(super) mod async_impl;
 pub(super) mod sync_impl;
 

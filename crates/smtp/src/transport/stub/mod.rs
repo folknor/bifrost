@@ -46,7 +46,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 use crate::AsyncTransport;
 use crate::{Transport, address::Envelope};
 
@@ -72,8 +72,8 @@ pub struct StubTransport {
 
 /// This transport logs messages and always returns the given response
 #[derive(Debug, Clone)]
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncStubTransport {
     response: Result<(), Error>,
     message_log: Arc<Mutex<Vec<(Envelope, String)>>>,
@@ -113,7 +113,7 @@ impl StubTransport {
     }
 }
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 impl AsyncStubTransport {
     /// Creates a new transport that always returns the given Result
     pub fn new(response: Result<(), Error>) -> Self {
@@ -140,7 +140,7 @@ impl AsyncStubTransport {
     }
 
     /// Return all logged messages sent using [`AsyncTransport::send_raw`]
-    #[cfg(any(feature = "tokio1", feature = "async-std1"))]
+    #[cfg(feature = "tokio")]
     pub async fn messages(&self) -> Vec<(Envelope, String)> {
         self.message_log.lock().unwrap().clone()
     }
@@ -157,7 +157,7 @@ impl Transport for StubTransport {
     }
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 impl AsyncTransport for AsyncStubTransport {
     type Ok = ();
     type Error = Error;

@@ -1,40 +1,23 @@
-#[cfg(feature = "tokio1-native-tls")]
-use std::mem;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
-use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(feature = "tokio1")]
-use std::{fmt, net::IpAddr};
 use std::{
     future::Future,
+    io::Result as IoResult,
+    mem,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-#[cfg(feature = "async-std1")]
-use async_std::net::{TcpStream as AsyncStd1TcpStream, ToSocketAddrs as AsyncStd1ToSocketAddrs};
-#[cfg(all(feature = "async-std1", unix))]
-use async_std::os::unix::net::UnixStream as AsyncStd1UnixStream;
-use futures_io::{
-    AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, Result as IoResult,
-};
-#[cfg(feature = "tokio1")]
-use tokio1_crate::io::{AsyncRead, AsyncWrite, ReadBuf as Tokio1ReadBuf};
-#[cfg(all(feature = "tokio1", unix))]
-use tokio1_crate::net::UnixStream as Tokio1UnixStream;
-#[cfg(feature = "tokio1")]
-use tokio1_crate::net::{
-    TcpSocket as Tokio1TcpSocket, TcpStream as Tokio1TcpStream,
-    ToSocketAddrs as Tokio1ToSocketAddrs,
-};
-#[cfg(feature = "tokio1-native-tls")]
-use tokio1_native_tls_crate::TlsStream as Tokio1TlsStream;
+use std::fmt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(unix)]
+use tokio::net::UnixStream as TokioUnixStream;
+use tokio::net::{TcpSocket, TcpStream, ToSocketAddrs};
+use tokio_native_tls::TlsStream as TokioTlsStream;
 
-#[cfg(feature = "tokio1-native-tls")]
 use super::InnerTlsParameters;
-#[cfg(feature = "tokio1")]
 use super::net::resolved_address_filter;
 use super::{ConnectionState, TlsParameters};
 use crate::transport::smtp::{Error, error};
@@ -64,35 +47,20 @@ impl AsyncDeadline {
             .map(Some)
     }
 
-    #[cfg(feature = "tokio1")]
-    async fn timeout_tokio1<T, F>(self, message: &'static str, future: F) -> Result<T, Error>
+    async fn timeout<T, F>(self, message: &'static str, future: F) -> Result<T, Error>
     where
         F: Future<Output = T>,
     {
         match self.remaining(message)? {
             None => Ok(future.await),
-            Some(timeout) => tokio1_crate::time::timeout(timeout, future)
-                .await
-                .map_err(|_| error::timeout(message)),
-        }
-    }
-
-    #[cfg(feature = "async-std1")]
-    async fn timeout_asyncstd1<T, F>(self, message: &'static str, future: F) -> Result<T, Error>
-    where
-        F: Future<Output = T>,
-    {
-        match self.remaining(message)? {
-            None => Ok(future.await),
-            Some(timeout) => async_std::future::timeout(timeout, future)
+            Some(timeout) => tokio::time::timeout(timeout, future)
                 .await
                 .map_err(|_| error::timeout(message)),
         }
     }
 }
 
-#[cfg(feature = "tokio1")]
-async fn resolve_tokio1_lookup_until<I, F>(
+async fn resolve_lookup_until<I, F>(
     deadline: AsyncDeadline,
     local_addr: Option<IpAddr>,
     lookup: F,
@@ -102,7 +70,7 @@ where
     I: IntoIterator<Item = SocketAddr>,
 {
     let addrs = deadline
-        .timeout_tokio1("DNS lookup timed out", lookup)
+        .timeout("DNS lookup timed out", lookup)
         .await?
         .map_err(error::connection)?;
 
@@ -110,23 +78,6 @@ where
         .into_iter()
         .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr))
         .collect())
-}
-
-#[cfg(feature = "async-std1")]
-async fn resolve_asyncstd1_lookup_until<I, F>(
-    deadline: AsyncDeadline,
-    lookup: F,
-) -> Result<Vec<SocketAddr>, Error>
-where
-    F: Future<Output = std::io::Result<I>>,
-    I: IntoIterator<Item = SocketAddr>,
-{
-    let addrs = deadline
-        .timeout_asyncstd1("DNS lookup timed out", lookup)
-        .await?
-        .map_err(error::connection)?;
-
-    Ok(addrs.into_iter().collect())
 }
 
 /// A network stream
@@ -140,16 +91,14 @@ pub(crate) struct AsyncNetworkStream {
     state: ConnectionState,
 }
 
-#[cfg(feature = "tokio1")]
 pub(crate) trait AsyncTokioStream:
     AsyncRead + AsyncWrite + Send + Sync + Unpin + fmt::Debug
 {
 }
 
-#[cfg(feature = "tokio1")]
-impl AsyncTokioStream for Tokio1TcpStream {}
-#[cfg(all(feature = "tokio1", unix))]
-impl AsyncTokioStream for Tokio1UnixStream {}
+impl AsyncTokioStream for TcpStream {}
+#[cfg(unix)]
+impl AsyncTokioStream for TokioUnixStream {}
 
 /// Represents the different types of underlying network streams
 // usually only one TLS backend at a time is going to be enabled,
@@ -159,20 +108,12 @@ impl AsyncTokioStream for Tokio1UnixStream {}
 #[derive(Debug)]
 enum InnerAsyncNetworkStream {
     /// Plain Tokio 1.x TCP stream
-    #[cfg(feature = "tokio1")]
-    Tokio1Tcp(Box<dyn AsyncTokioStream>),
+    TokioTcp(Box<dyn AsyncTokioStream>),
     /// Plain Tokio 1.x Unix-domain stream
-    #[cfg(all(feature = "tokio1", unix))]
-    Tokio1Unix(Box<dyn AsyncTokioStream>),
+    #[cfg(unix)]
+    TokioUnix(Box<dyn AsyncTokioStream>),
     /// Encrypted Tokio 1.x TCP stream
-    #[cfg(feature = "tokio1-native-tls")]
-    Tokio1NativeTls(Tokio1TlsStream<Box<dyn AsyncTokioStream>>),
-    /// Plain Tokio 1.x TCP stream
-    #[cfg(feature = "async-std1")]
-    AsyncStd1Tcp(AsyncStd1TcpStream),
-    /// Plain async-std Unix-domain stream
-    #[cfg(all(feature = "async-std1", unix))]
-    AsyncStd1Unix(AsyncStd1UnixStream),
+    TokioNativeTls(TokioTlsStream<Box<dyn AsyncTokioStream>>),
     /// Can't be built
     None,
 }
@@ -198,31 +139,26 @@ impl AsyncNetworkStream {
         self.state = state;
     }
 
-    #[cfg(feature = "tokio1")]
-    pub(super) async fn connect_tokio1_until<T: Tokio1ToSocketAddrs>(
+    pub(super) async fn connect_until<T: ToSocketAddrs>(
         server: T,
         deadline: AsyncDeadline,
         tls_parameters: Option<TlsParameters>,
         local_addr: Option<IpAddr>,
     ) -> Result<AsyncNetworkStream, Error> {
-        async fn try_connect<T: Tokio1ToSocketAddrs>(
+        async fn try_connect<T: ToSocketAddrs>(
             server: T,
             deadline: AsyncDeadline,
             local_addr: Option<IpAddr>,
-        ) -> Result<Tokio1TcpStream, Error> {
-            let addrs = resolve_tokio1_lookup_until(
-                deadline,
-                local_addr,
-                tokio1_crate::net::lookup_host(server),
-            )
-            .await?;
+        ) -> Result<TcpStream, Error> {
+            let addrs =
+                resolve_lookup_until(deadline, local_addr, tokio::net::lookup_host(server)).await?;
 
             let mut last_err = None;
 
             for addr in addrs {
                 let socket = match addr.ip() {
-                    IpAddr::V4(_) => Tokio1TcpSocket::new_v4(),
-                    IpAddr::V6(_) => Tokio1TcpSocket::new_v6(),
+                    IpAddr::V4(_) => TcpSocket::new_v4(),
+                    IpAddr::V6(_) => TcpSocket::new_v6(),
                 }
                 .map_err(error::connection)?;
                 if let Some(local_addr) = local_addr {
@@ -233,7 +169,7 @@ impl AsyncNetworkStream {
 
                 let connect_future = socket.connect(addr);
                 match deadline
-                    .timeout_tokio1("connection timed out", connect_future)
+                    .timeout("connection timed out", connect_future)
                     .await?
                 {
                     Ok(stream) => return Ok(stream),
@@ -249,91 +185,30 @@ impl AsyncNetworkStream {
 
         let tcp_stream = try_connect(server, deadline, local_addr).await?;
         let mut stream =
-            AsyncNetworkStream::new(InnerAsyncNetworkStream::Tokio1Tcp(Box::new(tcp_stream)));
+            AsyncNetworkStream::new(InnerAsyncNetworkStream::TokioTcp(Box::new(tcp_stream)));
         if let Some(tls_parameters) = tls_parameters {
             stream.upgrade_tls_until(tls_parameters, deadline).await?;
         }
         Ok(stream)
     }
 
-    #[cfg(all(feature = "tokio1", unix))]
-    pub(super) async fn connect_tokio1_unix_until(
+    #[cfg(unix)]
+    pub(super) async fn connect_unix_until(
         path: &Path,
         deadline: AsyncDeadline,
     ) -> Result<AsyncNetworkStream, Error> {
         let stream = deadline
-            .timeout_tokio1(
+            .timeout(
                 "Unix socket connection timed out",
-                Tokio1UnixStream::connect(path),
+                TokioUnixStream::connect(path),
             )
             .await?
             .map_err(error::connection)?;
-        Ok(AsyncNetworkStream::new(
-            InnerAsyncNetworkStream::Tokio1Unix(Box::new(stream)),
-        ))
+        Ok(AsyncNetworkStream::new(InnerAsyncNetworkStream::TokioUnix(
+            Box::new(stream),
+        )))
     }
 
-    #[cfg(feature = "async-std1")]
-    pub(super) async fn connect_asyncstd1_until<T: AsyncStd1ToSocketAddrs>(
-        server: T,
-        deadline: AsyncDeadline,
-        tls_parameters: Option<TlsParameters>,
-    ) -> Result<AsyncNetworkStream, Error> {
-        // Unfortunately, there doesn't currently seem to be a way to set the local address.
-        // Whilst we can create a AsyncStd1TcpStream from an existing socket, it needs to first have
-        // been connected, which is a blocking operation.
-        async fn try_connect<T: AsyncStd1ToSocketAddrs>(
-            server: T,
-            deadline: AsyncDeadline,
-        ) -> Result<AsyncStd1TcpStream, Error> {
-            let addrs = resolve_asyncstd1_lookup_until(deadline, server.to_socket_addrs()).await?;
-
-            let mut last_err = None;
-
-            for addr in addrs {
-                let connect_future = AsyncStd1TcpStream::connect(&addr);
-                match deadline
-                    .timeout_asyncstd1("connection timed out", connect_future)
-                    .await?
-                {
-                    Ok(stream) => return Ok(stream),
-                    Err(err) => last_err = Some(err),
-                }
-            }
-
-            Err(match last_err {
-                Some(last_err) => error::connection(last_err),
-                None => error::connection("could not resolve to any address"),
-            })
-        }
-
-        let tcp_stream = try_connect(server, deadline).await?;
-
-        let mut stream = AsyncNetworkStream::new(InnerAsyncNetworkStream::AsyncStd1Tcp(tcp_stream));
-        if let Some(tls_parameters) = tls_parameters {
-            stream.upgrade_tls_until(tls_parameters, deadline).await?;
-        }
-        Ok(stream)
-    }
-
-    #[cfg(all(feature = "async-std1", unix))]
-    pub(super) async fn connect_asyncstd1_unix_until(
-        path: &Path,
-        deadline: AsyncDeadline,
-    ) -> Result<AsyncNetworkStream, Error> {
-        let stream = deadline
-            .timeout_asyncstd1(
-                "Unix socket connection timed out",
-                AsyncStd1UnixStream::connect(path),
-            )
-            .await?
-            .map_err(error::connection)?;
-        Ok(AsyncNetworkStream::new(
-            InnerAsyncNetworkStream::AsyncStd1Unix(stream),
-        ))
-    }
-
-    #[cfg_attr(not(feature = "tokio1-native-tls"), allow(dead_code))]
     pub(crate) async fn upgrade_tls(
         &mut self,
         tls_parameters: TlsParameters,
@@ -351,38 +226,20 @@ impl AsyncNetworkStream {
         self.state.verify()?;
 
         match &self.inner {
-            #[cfg(all(feature = "tokio1", not(feature = "tokio1-native-tls")))]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => {
-                let _ = tls_parameters;
-                let _ = deadline;
-                unreachable!(
-                    "Trying to upgrade an AsyncNetworkStream without having enabled the tokio1-native-tls feature"
-                );
-            }
-
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => {
+            InnerAsyncNetworkStream::TokioTcp(_) => {
                 self.state = ConnectionState::Broken;
 
                 // get owned TcpStream
                 let tcp_stream = mem::replace(&mut self.inner, InnerAsyncNetworkStream::None);
-                let InnerAsyncNetworkStream::Tokio1Tcp(tcp_stream) = tcp_stream else {
+                let InnerAsyncNetworkStream::TokioTcp(tcp_stream) = tcp_stream else {
                     unreachable!()
                 };
 
-                self.inner = Self::upgrade_tokio1_tls(tcp_stream, tls_parameters, deadline)
+                self.inner = Self::upgrade_tls_stream(tcp_stream, tls_parameters, deadline)
                     .await
                     .map_err(error::connection)?;
                 self.state = ConnectionState::Ok;
                 Ok(())
-            }
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => {
-                let _ = tls_parameters;
-                let _ = deadline;
-                unreachable!(
-                    "Trying to upgrade an AsyncNetworkStream with async-std, which does not support native-tls"
-                );
             }
             _ => Err(error::client(
                 "STARTTLS is only supported on TCP connections",
@@ -391,8 +248,7 @@ impl AsyncNetworkStream {
     }
 
     #[allow(unused_variables)]
-    #[cfg(feature = "tokio1-native-tls")]
-    async fn upgrade_tokio1_tls(
+    async fn upgrade_tls_stream(
         tcp_stream: Box<dyn AsyncTokioStream>,
         tls_parameters: TlsParameters,
         deadline: AsyncDeadline,
@@ -401,14 +257,14 @@ impl AsyncNetworkStream {
 
         match tls_parameters.connector {
             InnerTlsParameters::NativeTls { connector } => {
-                use tokio1_native_tls_crate::TlsConnector;
+                use tokio_native_tls::TlsConnector;
 
                 let connector = TlsConnector::from(connector);
                 let handshake = connector.connect(&domain, tcp_stream);
                 let stream = deadline
-                    .timeout_tokio1("TLS handshake timed out", handshake)
+                    .timeout("TLS handshake timed out", handshake)
                     .await?;
-                Ok(InnerAsyncNetworkStream::Tokio1NativeTls(
+                Ok(InnerAsyncNetworkStream::TokioNativeTls(
                     stream.map_err(error::connection)?,
                 ))
             }
@@ -417,86 +273,47 @@ impl AsyncNetworkStream {
 
     pub(crate) fn is_encrypted(&self) -> bool {
         match &self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(_) => false,
-            #[cfg(all(feature = "tokio1", unix))]
-            InnerAsyncNetworkStream::Tokio1Unix(_) => false,
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(_) => true,
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(_) => false,
-            #[cfg(all(feature = "async-std1", unix))]
-            InnerAsyncNetworkStream::AsyncStd1Unix(_) => false,
+            InnerAsyncNetworkStream::TokioTcp(_) => false,
+            #[cfg(unix)]
+            InnerAsyncNetworkStream::TokioUnix(_) => false,
+            InnerAsyncNetworkStream::TokioNativeTls(_) => true,
             InnerAsyncNetworkStream::None => false,
         }
     }
 }
 
 #[allow(deprecated)]
-impl FuturesAsyncRead for AsyncNetworkStream {
+impl AsyncRead for AsyncNetworkStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<IoResult<usize>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<IoResult<()>> {
         match &mut self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(s) => {
-                let mut b = Tokio1ReadBuf::new(buf);
-                match Pin::new(s).poll_read(cx, &mut b) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            #[cfg(all(feature = "tokio1", unix))]
-            InnerAsyncNetworkStream::Tokio1Unix(s) => {
-                let mut b = Tokio1ReadBuf::new(buf);
-                match Pin::new(s).poll_read(cx, &mut b) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(s) => {
-                let mut b = Tokio1ReadBuf::new(buf);
-                match Pin::new(s).poll_read(cx, &mut b) {
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            #[cfg(all(feature = "async-std1", unix))]
-            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_read(cx, buf),
+            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(unix)]
+            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_read(cx, buf),
+            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_read(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
-                Poll::Ready(Ok(0))
+                Poll::Ready(Ok(()))
             }
         }
     }
 }
 
 #[allow(deprecated)]
-impl FuturesAsyncWrite for AsyncNetworkStream {
+impl AsyncWrite for AsyncNetworkStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<IoResult<usize>> {
         match &mut self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(all(feature = "tokio1", unix))]
-            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            #[cfg(all(feature = "async-std1", unix))]
-            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_write(cx, buf),
+            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(unix)]
+            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_write(cx, buf),
+            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_write(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
@@ -506,16 +323,10 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         match &mut self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(all(feature = "tokio1", unix))]
-            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_flush(cx),
-            #[cfg(all(feature = "async-std1", unix))]
-            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_flush(cx),
+            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(unix)]
+            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_flush(cx),
+            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_flush(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
@@ -523,20 +334,14 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
         }
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         self.state = ConnectionState::Closed;
 
         match &mut self.inner {
-            #[cfg(feature = "tokio1")]
-            InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(all(feature = "tokio1", unix))]
-            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "tokio1-native-tls")]
-            InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "async-std1")]
-            InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_close(cx),
-            #[cfg(all(feature = "async-std1", unix))]
-            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_close(cx),
+            InnerAsyncNetworkStream::TokioTcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(unix)]
+            InnerAsyncNetworkStream::TokioUnix(s) => Pin::new(s).poll_shutdown(cx),
+            InnerAsyncNetworkStream::TokioNativeTls(s) => Pin::new(s).poll_shutdown(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
@@ -546,15 +351,14 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
 }
 
 #[cfg(test)]
-#[cfg(feature = "tokio1")]
-mod tokio1_test {
+mod tokio_test {
     use std::{future::pending, net::TcpListener, thread, time::Duration};
 
     use super::*;
 
-    #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[tokio::test(crate = "tokio")]
     async fn tokio_dns_lookup_uses_deadline() {
-        let result = resolve_tokio1_lookup_until(
+        let result = resolve_lookup_until(
             AsyncDeadline::new(Some(Duration::from_millis(25))),
             None,
             pending::<std::io::Result<Vec<SocketAddr>>>(),
@@ -565,9 +369,8 @@ mod tokio1_test {
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
     }
 
-    #[cfg(feature = "tokio1-native-tls")]
     #[allow(deprecated)]
-    #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[tokio::test(crate = "tokio")]
     async fn tokio_tls_handshake_uses_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -578,7 +381,7 @@ mod tokio1_test {
         });
 
         let tls_parameters = TlsParameters::new("localhost".to_owned()).unwrap();
-        let result = AsyncNetworkStream::connect_tokio1_until(
+        let result = AsyncNetworkStream::connect_until(
             address,
             AsyncDeadline::new(Some(Duration::from_millis(50))),
             Some(tls_parameters),
@@ -589,25 +392,5 @@ mod tokio1_test {
         let error = result.unwrap_err();
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
         handle.join().unwrap();
-    }
-}
-
-#[cfg(test)]
-#[cfg(feature = "async-std1")]
-mod asyncstd_test {
-    use std::{future::pending, time::Duration};
-
-    use super::*;
-
-    #[async_std::test]
-    async fn asyncstd_dns_lookup_uses_deadline() {
-        let result = resolve_asyncstd1_lookup_until(
-            AsyncDeadline::new(Some(Duration::from_millis(25))),
-            pending::<std::io::Result<Vec<SocketAddr>>>(),
-        )
-        .await;
-
-        let error = result.unwrap_err();
-        assert!(error.is_timeout(), "expected timeout, got {error:?}");
     }
 }

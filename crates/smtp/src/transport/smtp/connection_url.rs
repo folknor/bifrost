@@ -2,15 +2,7 @@ use std::borrow::Cow;
 
 use url::Url;
 
-// Async URL parsing can configure TLS only through the tokio native-tls path.
-// Plain async builders are still available when no TLS support is compiled in.
-#[cfg(any(
-    feature = "tokio1-native-tls",
-    all(
-        any(feature = "tokio1", feature = "async-std1"),
-        not(feature = "native-tls")
-    )
-))]
+#[cfg(feature = "tokio")]
 use super::AsyncSmtpTransportBuilder;
 use super::{
     Error, SMTP_PORT, SmtpTransportBuilder, authentication::Credentials, error, extension::ClientId,
@@ -52,15 +44,7 @@ impl TransportBuilder for SmtpTransportBuilder {
     }
 }
 
-// Async URL parsing can configure TLS only through the tokio native-tls path.
-// Plain async builders are still available when no TLS support is compiled in.
-#[cfg(any(
-    feature = "tokio1-native-tls",
-    all(
-        any(feature = "tokio1", feature = "async-std1"),
-        not(feature = "native-tls")
-    )
-))]
+#[cfg(feature = "tokio")]
 impl TransportBuilder for AsyncSmtpTransportBuilder {
     fn new<T: Into<String>>(server: T) -> Self {
         Self::new(server)

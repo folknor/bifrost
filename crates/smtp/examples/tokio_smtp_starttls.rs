@@ -1,10 +1,6 @@
-// This line is only to make it compile from bifrost_smtp's examples folder,
-// since it uses Rust 2018 crate renaming to import tokio.
-// Won't be needed in user's code.
 use bifrost_smtp::{
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::header::ContentType,
+    AsyncSmtpTransport, AsyncTransport, Message, TokioExecutor, message::header::ContentType,
 };
-use tokio1_crate as tokio;
 
 #[tokio::main]
 async fn main() {
@@ -19,9 +15,9 @@ async fn main() {
         .body(String::from("Be happy with async!"))
         .unwrap();
 
-    // Open a remote connection to gmail
-    let mailer: AsyncSmtpTransport<Tokio1Executor> =
-        AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.gmail.com")
+    // Open a remote connection to gmail using STARTTLS
+    let mailer: AsyncSmtpTransport<TokioExecutor> =
+        AsyncSmtpTransport::<TokioExecutor>::starttls_relay("smtp.gmail.com")
             .unwrap()
             .password("smtp_username", "smtp_password")
             .build();

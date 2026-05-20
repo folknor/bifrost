@@ -72,18 +72,17 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "builder", feature = "tokio1"))]
-mod tokio_1 {
+#[cfg(all(feature = "builder", feature = "tokio"))]
+mod tokio {
     use std::sync::Arc;
 
     use bifrost_smtp::{
         AsyncTransport, BoxedAsyncTransport, Message,
         transport::stub::{AsyncStubTransport, Error as StubError},
     };
-    use tokio1_crate as tokio;
 
     #[tokio::test]
-    async fn stub_transport_tokio1() {
+    async fn stub_transport_tokio() {
         let sender_ok = AsyncStubTransport::new_ok();
         let sender_ko = AsyncStubTransport::new_error();
         let email = Message::builder()
@@ -105,7 +104,7 @@ mod tokio_1 {
     }
 
     #[tokio::test]
-    async fn boxed_stub_transport_tokio1() {
+    async fn boxed_stub_transport_tokio() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<BoxedAsyncTransport<(), StubError>>();
 
@@ -129,83 +128,7 @@ mod tokio_1 {
     }
 
     #[tokio::test]
-    async fn arc_stub_transport_tokio1() {
-        let sender = Arc::new(AsyncStubTransport::new_ok());
-        let email = Message::builder()
-            .from("NoBody <nobody@domain.tld>".parse().unwrap())
-            .to("Hei <hei@domain.tld>".parse().unwrap())
-            .subject("Arc")
-            .body(String::from("arc body"))
-            .unwrap();
-
-        sender.send(&email).await.unwrap();
-
-        let expected_messages = [(
-            email.envelope().clone(),
-            String::from_utf8(email.formatted()).unwrap(),
-        )];
-        assert_eq!(sender.messages().await, expected_messages);
-    }
-}
-
-#[cfg(test)]
-#[cfg(all(feature = "builder", feature = "async-std1"))]
-mod asyncstd_1 {
-    use std::sync::Arc;
-
-    use bifrost_smtp::{
-        AsyncTransport, BoxedAsyncTransport, Message,
-        transport::stub::{AsyncStubTransport, Error as StubError},
-    };
-
-    #[async_std::test]
-    async fn stub_transport_asyncstd1() {
-        let sender_ok = AsyncStubTransport::new_ok();
-        let sender_ko = AsyncStubTransport::new_error();
-        let email = Message::builder()
-            .from("NoBody <nobody@domain.tld>".parse().unwrap())
-            .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
-            .to("Hei <hei@domain.tld>".parse().unwrap())
-            .subject("Happy new year")
-            .body(String::from("Be happy!"))
-            .unwrap();
-
-        sender_ok.send(&email).await.unwrap();
-        sender_ko.send(&email).await.unwrap_err();
-
-        let expected_messages = [(
-            email.envelope().clone(),
-            String::from_utf8(email.formatted()).unwrap(),
-        )];
-        assert_eq!(sender_ok.messages().await, expected_messages);
-    }
-
-    #[async_std::test]
-    async fn boxed_stub_transport_asyncstd1() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<BoxedAsyncTransport<(), StubError>>();
-
-        let sender = AsyncStubTransport::new_ok();
-        let observer = sender.clone();
-        let boxed: BoxedAsyncTransport<(), StubError> = BoxedAsyncTransport::new(sender);
-        let email = Message::builder()
-            .from("NoBody <nobody@domain.tld>".parse().unwrap())
-            .to("Hei <hei@domain.tld>".parse().unwrap())
-            .subject("Boxed")
-            .body(String::from("boxed body"))
-            .unwrap();
-
-        boxed.send(&email).await.unwrap();
-
-        let expected_messages = [(
-            email.envelope().clone(),
-            String::from_utf8(email.formatted()).unwrap(),
-        )];
-        assert_eq!(observer.messages().await, expected_messages);
-    }
-
-    #[async_std::test]
-    async fn arc_stub_transport_asyncstd1() {
+    async fn arc_stub_transport_tokio() {
         let sender = Arc::new(AsyncStubTransport::new_ok());
         let email = Message::builder()
             .from("NoBody <nobody@domain.tld>".parse().unwrap())

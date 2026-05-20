@@ -197,11 +197,11 @@
 
 use std::{path::PathBuf, time::Duration};
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub use self::async_transport::{
     AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
 };
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
 #[cfg(feature = "native-tls")]
@@ -220,7 +220,7 @@ use crate::transport::smtp::{
     response::Response,
 };
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 mod async_transport;
 pub mod authentication;
 mod client;

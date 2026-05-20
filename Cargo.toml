@@ -45,8 +45,5 @@ cast_possible_wrap = "deny"
 dbg_macro = "deny"
 todo = "deny"
 
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bifrost_smtp_ignore_tls_mismatch)'] }
-
 [profile.bench]
 debug = true

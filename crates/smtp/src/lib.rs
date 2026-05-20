@@ -38,10 +38,7 @@
 //! on all other platforms.
 //!
 //! * **native-tls** (default): TLS support for the synchronous version of the API
-//! * **tokio1-native-tls**: TLS support for the `tokio1` async version of the API
-//!
-//! NOTE: native-tls for SMTP is only supported with `tokio1`; async-std SMTP
-//! remains plaintext-only.
+//! * **tokio**: TLS support for the `tokio` async version of the API
 //!
 //! ##### Building Bifrost SMTP with OpenSSL
 //!
@@ -67,20 +64,11 @@
 //! * **file-transport**: Enable the file transport (saves emails into an `.eml` file)
 //! * **file-transport-envelope**: Allow writing the envelope into a JSON file (additionally saves envelopes into a `.json` file)
 //!
-//! ### Async execution runtimes
+//! ### Async execution runtime
 //!
-//! _Use [tokio] or [async-std] as an async execution runtime for sending emails_
+//! _Use [tokio] as the async execution runtime for sending emails_
 //!
-//! The correct runtime version must be chosen in order for Bifrost SMTP to work correctly.
-//! For example, when sending emails from a Tokio 1.x context, the Tokio 1.x executor
-//! ([`Tokio1Executor`]) must be used. Using a different version (for example Tokio 0.2.x),
-//! or async-std, would result in a runtime panic.
-//!
-//! * **tokio1**: Allow to asynchronously send emails using [Tokio 1.x]
-//! * **async-std1**: Allow to asynchronously send emails using [async-std 1.x]
-//!
-//! NOTE: native-tls for SMTP is only supported with `tokio1`; async-std SMTP
-//! remains plaintext-only.
+//! * **tokio**: Allow asynchronously sending emails using [Tokio 1.x]
 //!
 //! ### Misc features
 //!
@@ -88,19 +76,14 @@
 //!
 //! * **serde**: Serialization/Deserialization of entities
 //! * **tracing**: Logging using the `tracing` crate
-//! * **mime03**: Allow creating a [`ContentType`] from an existing [mime 0.3] `Mime` struct
 //! * **dkim**: Add support for signing email with DKIM
-//! * **web**: WebAssembly support using the `web-time` crate for time operations
 //!
 //! [`SMTP`]: crate::transport::smtp
 //! [`sendmail`]: crate::transport::sendmail
 //! [`file`]: crate::transport::file
 //! [`ContentType`]: crate::message::header::ContentType
 //! [tokio]: https://docs.rs/tokio/1
-//! [async-std]: https://docs.rs/async-std/1
 //! [Tokio 1.x]: https://docs.rs/tokio/1
-//! [async-std 1.x]: https://docs.rs/async-std/1
-//! [mime 0.3]: https://docs.rs/mime/0.3
 //! [DKIM]: https://datatracker.ietf.org/doc/html/rfc6376
 
 #![doc(html_root_url = "https://docs.rs/bifrost-smtp/0.1.0")]
@@ -141,22 +124,11 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(not(bifrost_smtp_ignore_tls_mismatch))]
-mod compiletime_checks {
-    #[cfg(all(
-        feature = "tokio1",
-        feature = "native-tls",
-        not(feature = "tokio1-native-tls")
-    ))]
-    compile_error!("Bifrost SMTP is being built with the `tokio1` and the `native-tls` features, but the `tokio1-native-tls` feature hasn't been turned on.
-    Make sure to apply the same to any of your crate dependencies that use the `bifrost_smtp` crate.");
-}
-
 pub mod address;
 #[cfg(any(feature = "smtp-transport", feature = "dkim"))]
 mod base64;
 pub mod error;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 mod executor;
 #[cfg(feature = "builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "builder")))]
@@ -166,41 +138,30 @@ pub mod transport;
 
 use std::error::Error as StdError;
 
-#[cfg(feature = "async-std1")]
-pub use self::executor::AsyncStd1Executor;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub use self::executor::Executor;
-#[cfg(feature = "tokio1")]
-pub use self::executor::Tokio1Executor;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
+pub use self::executor::TokioExecutor;
+#[cfg(feature = "tokio")]
 #[doc(inline)]
 pub use self::transport::{AsyncTransport, BoxedAsyncTransport};
 pub use crate::address::Address;
 #[cfg(feature = "builder")]
 #[doc(inline)]
 pub use crate::message::Message;
-#[cfg(all(
-    feature = "file-transport",
-    any(feature = "tokio1", feature = "async-std1")
-))]
+#[cfg(all(feature = "file-transport", feature = "tokio"))]
 #[doc(inline)]
 pub use crate::transport::file::AsyncFileTransport;
 #[cfg(feature = "file-transport")]
 #[doc(inline)]
 pub use crate::transport::file::FileTransport;
-#[cfg(all(
-    feature = "sendmail-transport",
-    any(feature = "tokio1", feature = "async-std1")
-))]
+#[cfg(all(feature = "sendmail-transport", feature = "tokio"))]
 #[doc(inline)]
 pub use crate::transport::sendmail::AsyncSendmailTransport;
 #[cfg(feature = "sendmail-transport")]
 #[doc(inline)]
 pub use crate::transport::sendmail::SendmailTransport;
-#[cfg(all(
-    feature = "smtp-transport",
-    any(feature = "tokio1", feature = "async-std1")
-))]
+#[cfg(all(feature = "smtp-transport", feature = "tokio"))]
 pub use crate::transport::smtp::{AsyncLmtpTransport, AsyncSmtpTransport};
 #[cfg(feature = "smtp-transport")]
 pub use crate::transport::smtp::{LmtpTransport, SmtpTransport};

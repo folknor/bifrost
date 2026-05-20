@@ -271,7 +271,7 @@ pub(crate) fn connection<E: Into<BoxError>>(e: E) -> Error {
     Error::new(Kind::Connection, Some(e))
 }
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub(crate) fn timeout(message: &'static str) -> Error {
     connection(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
 }

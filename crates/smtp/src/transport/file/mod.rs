@@ -69,45 +69,16 @@
 //! ```rust,no_run
 //! # use std::error::Error;
 //! #
-//! # #[cfg(all(feature = "tokio1", feature = "file-transport", feature = "builder"))]
+//! # #[cfg(all(feature = "tokio", feature = "file-transport", feature = "builder"))]
 //! # async fn run() -> Result<(), Box<dyn Error>> {
 //! use std::env::temp_dir;
 //!
 //! use bifrost_smtp::{
-//!     AsyncFileTransport, AsyncTransport, Message, Tokio1Executor, message::header::ContentType,
+//!     AsyncFileTransport, AsyncTransport, Message, TokioExecutor, message::header::ContentType,
 //! };
 //!
 //! // Write to the local temp directory
-//! let sender = AsyncFileTransport::<Tokio1Executor>::new(temp_dir());
-//! let email = Message::builder()
-//!     .from("NoBody <nobody@domain.tld>".parse()?)
-//!     .reply_to("Yuin <yuin@domain.tld>".parse()?)
-//!     .to("Hei <hei@domain.tld>".parse()?)
-//!     .subject("Happy new year")
-//!     .header(ContentType::TEXT_PLAIN)
-//!     .body(String::from("Be happy!"))?;
-//!
-//! sender.send(&email).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Async async-std 1.x
-//!
-//! ```rust,no_run
-//! # use std::error::Error;
-//! #
-//! # #[cfg(all(feature = "async-std1", feature = "file-transport", feature = "builder"))]
-//! # async fn run() -> Result<(), Box<dyn Error>> {
-//! use std::env::temp_dir;
-//!
-//! use bifrost_smtp::{
-//!     AsyncFileTransport, AsyncStd1Executor, AsyncTransport, Message,
-//!     message::header::ContentType,
-//! };
-//!
-//! // Write to the local temp directory
-//! let sender = AsyncFileTransport::<AsyncStd1Executor>::new(temp_dir());
+//! let sender = AsyncFileTransport::<TokioExecutor>::new(temp_dir());
 //! let email = Message::builder()
 //!     .from("NoBody <nobody@domain.tld>".parse()?)
 //!     .reply_to("Yuin <yuin@domain.tld>".parse()?)
@@ -142,7 +113,7 @@
 //! {"forward_path":["hei@domain.tld"],"reverse_path":"nobody@domain.tld"}
 //! ```
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 use std::marker::PhantomData;
 use std::{
     path::{Path, PathBuf},
@@ -152,7 +123,7 @@ use std::{
 use uuid::Uuid;
 
 pub use self::error::Error;
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 use crate::{AsyncTransport, Executor};
 use crate::{Transport, address::Envelope};
 
@@ -173,8 +144,8 @@ pub struct FileTransport {
 /// Asynchronously writes the content and the envelope information to a file
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "tokio1", feature = "async-std1"))))]
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "tokio")]
 pub struct AsyncFileTransport<E: Executor> {
     inner: FileTransport,
     marker_: PhantomData<E>,
@@ -229,7 +200,7 @@ impl FileTransport {
     }
 }
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 impl<E> AsyncFileTransport<E>
 where
     E: Executor,
@@ -274,7 +245,7 @@ where
     }
 }
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 impl<E: Executor> Clone for AsyncFileTransport<E> {
     fn clone(&self) -> Self {
         Self {
@@ -313,7 +284,7 @@ impl Transport for FileTransport {
     }
 }
 
-#[cfg(any(feature = "async-std1", feature = "tokio1"))]
+#[cfg(feature = "tokio")]
 impl<E> AsyncTransport for AsyncFileTransport<E>
 where
     E: Executor,

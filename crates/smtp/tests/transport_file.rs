@@ -106,73 +106,20 @@ mod sync {
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "file-transport", feature = "builder", feature = "tokio1"))]
-mod tokio_1 {
+#[cfg(all(feature = "file-transport", feature = "builder", feature = "tokio"))]
+mod tokio {
     use std::{
         env::temp_dir,
         fs::{read_to_string, remove_file},
     };
 
-    use bifrost_smtp::{AsyncFileTransport, AsyncTransport, Message, Tokio1Executor};
-    use tokio1_crate as tokio;
+    use bifrost_smtp::{AsyncFileTransport, AsyncTransport, Message, TokioExecutor};
 
     use crate::default_date;
 
     #[tokio::test]
-    async fn file_transport_tokio1() {
-        let sender = AsyncFileTransport::<Tokio1Executor>::new(temp_dir());
-        let email = Message::builder()
-            .from("NoBody <nobody@domain.tld>".parse().unwrap())
-            .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())
-            .to("Hei <hei@domain.tld>".parse().unwrap())
-            .subject("Happy new year")
-            .date(default_date())
-            .body(String::from("Be happy!"))
-            .unwrap();
-
-        let result = sender.send(&email).await;
-        let id = result.unwrap();
-
-        let eml_file = temp_dir().join(format!("{id}.eml"));
-        let eml = read_to_string(&eml_file).unwrap();
-
-        assert_eq!(
-            eml,
-            concat!(
-                "From: NoBody <nobody@domain.tld>\r\n",
-                "Reply-To: Yuin <yuin@domain.tld>\r\n",
-                "To: Hei <hei@domain.tld>\r\n",
-                "Subject: Happy new year\r\n",
-                "Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n",
-                "Content-Type: text/plain; charset=utf-8\r\n",
-                "Content-Transfer-Encoding: 7bit\r\n",
-                "\r\n",
-                "Be happy!"
-            )
-        );
-        remove_file(eml_file).unwrap();
-    }
-}
-
-#[cfg(test)]
-#[cfg(all(
-    feature = "file-transport",
-    feature = "builder",
-    feature = "async-std1"
-))]
-mod asyncstd_1 {
-    use std::{
-        env::temp_dir,
-        fs::{read_to_string, remove_file},
-    };
-
-    use bifrost_smtp::{AsyncFileTransport, AsyncStd1Executor, AsyncTransport, Message};
-
-    use crate::default_date;
-
-    #[async_std::test]
-    async fn file_transport_asyncstd1() {
-        let sender = AsyncFileTransport::<AsyncStd1Executor>::new(temp_dir());
+    async fn file_transport_tokio() {
+        let sender = AsyncFileTransport::<TokioExecutor>::new(temp_dir());
         let email = Message::builder()
             .from("NoBody <nobody@domain.tld>".parse().unwrap())
             .reply_to("Yuin <yuin@domain.tld>".parse().unwrap())

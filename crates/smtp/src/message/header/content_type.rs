@@ -81,8 +81,6 @@ impl FromStr for ContentType {
     }
 }
 
-#[cfg(feature = "mime03")]
-#[cfg_attr(docsrs, doc(cfg(feature = "mime03")))]
 impl From<Mime> for ContentType {
     fn from(mime: Mime) -> Self {
         Self::from_mime(mime)

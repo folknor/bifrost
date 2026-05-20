@@ -11,7 +11,7 @@ Sync and async, SMTP and LMTP:
 
 `Transport::Ok` is `Response` for SMTP, `Vec<Response>` for LMTP (one per envelope recipient, original order preserved).
 
-Async transports support tokio and async-std. TLS URL parsing via `from_url` is tokio-only; plaintext URLs work on both.
+Async transports support Tokio. TLS and plaintext URL parsing via `from_url` use the Tokio backend.
 
 `BoxedTransport<Ok, Error>` and `BoxedAsyncTransport<Ok, Error>` erase the concrete type. `Box<T>` and `Arc<T>` get blanket `Transport` / `AsyncTransport` forwarding.
 
@@ -86,7 +86,7 @@ AUTH continuation formatting treats challenge responses as continuation lines ev
 
 Per-recipient response model: vector length equals envelope recipient count. RCPT-time rejection responses are preserved at the original recipient index; accepted recipients receive the post-DATA delivery response in original order.
 
-Unix-domain LMTP constructors are `#[cfg(unix)]` on sync, tokio, and async-std. Unix sockets refuse STARTTLS explicitly.
+Unix-domain LMTP constructors are `#[cfg(unix)]` on sync and Tokio. Unix sockets refuse STARTTLS explicitly.
 
 ## Native-tls only
 

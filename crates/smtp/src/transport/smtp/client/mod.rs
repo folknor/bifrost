@@ -27,7 +27,7 @@ use std::fmt::Debug;
 
 use crate::transport::smtp::{Error, error};
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 pub(crate) use self::async_connection::AsyncSmtpConnection;
 pub(crate) use self::connection::SmtpConnection;
 use self::net::NetworkStream;
@@ -37,9 +37,9 @@ pub(super) use self::tls::InnerTlsParameters;
 pub use self::tls::{Certificate, Identity};
 pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 mod async_connection;
-#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+#[cfg(feature = "tokio")]
 mod async_net;
 mod connection;
 mod net;
