@@ -30,16 +30,12 @@ impl Attachment {
     ///
     /// ```rust
     /// # use std::error::Error;
-    /// use std::fs;
     ///
     /// use bifrost_smtp::message::{Attachment, header::ContentType};
     ///
     /// # fn main() -> Result<(), Box<dyn Error>> {
     /// let filename = String::from("invoice.pdf");
-    /// # if false {
-    /// let filebody = fs::read("invoice.pdf")?;
-    /// # }
-    /// # let filebody = fs::read("docs/bifrost-smtp.png")?;
+    /// let filebody = b"%PDF-1.7\n".to_vec();
     /// let content_type = ContentType::parse("application/pdf").unwrap();
     /// let attachment = Attachment::new(filename).body(filebody, content_type);
     ///
@@ -65,16 +61,12 @@ impl Attachment {
     ///
     /// ```rust
     /// # use std::error::Error;
-    /// use std::fs;
     ///
     /// use bifrost_smtp::message::{Attachment, header::ContentType};
     ///
     /// # fn main() -> Result<(), Box<dyn Error>> {
     /// let content_id = String::from("123");
-    /// # if false {
-    /// let filebody = fs::read("image.jpg")?;
-    /// # }
-    /// # let filebody = fs::read("docs/bifrost-smtp.png")?;
+    /// let filebody = vec![0xff, 0xd8, 0xff, 0xe0];
     /// let content_type = ContentType::parse("image/jpeg").unwrap();
     /// let attachment = Attachment::new_inline(content_id).body(filebody, content_type);
     ///
@@ -103,17 +95,13 @@ impl Attachment {
     ///
     /// ```rust
     /// # use std::error::Error;
-    /// use std::fs;
     ///
     /// use bifrost_smtp::message::{Attachment, header::ContentType};
     ///
     /// # fn main() -> Result<(), Box<dyn Error>> {
     /// let content_id = String::from("123");
     /// let file_name = String::from("image.jpg");
-    /// # if false {
-    /// let filebody = fs::read(&file_name)?;
-    /// # }
-    /// # let filebody = fs::read("docs/bifrost-smtp.png")?;
+    /// let filebody = vec![0xff, 0xd8, 0xff, 0xe0];
     /// let content_type = ContentType::parse("image/jpeg").unwrap();
     /// let attachment =
     ///     Attachment::new_inline_with_name(content_id, file_name).body(filebody, content_type);

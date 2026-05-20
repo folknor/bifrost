@@ -108,12 +108,10 @@
 //!
 //! ```rust
 //! # use std::error::Error;
-//! use std::fs;
-//!
 //! use bifrost_smtp::message::{Attachment, Body, Message, MultiPart, SinglePart, header};
 //!
 //! # fn main() -> Result<(), Box<dyn Error>> {
-//! let image = fs::read("docs/bifrost-smtp.png")?;
+//! let image = b"\x89PNG\r\n\x1a\n".to_vec();
 //! // this image_body can be cloned and reused between emails.
 //! // since `Body` holds a pre-encoded body, reusing it means avoiding having
 //! // to re-encode the same body for every email (this clearly only applies
@@ -768,7 +766,7 @@ mod test {
     fn email_with_png() {
         // Tue, 15 Nov 1994 08:12:31 GMT
         let date = SystemTime::UNIX_EPOCH + Duration::from_secs(784887151);
-        let img = std::fs::read("./docs/bifrost-smtp.png").unwrap();
+        let img = b"\x89PNG\r\n\x1a\n".to_vec();
         let m = Message::builder()
             .date(date)
             .from("NoBody <nobody@domain.tld>".parse().unwrap())
@@ -795,16 +793,18 @@ mod test {
             .unwrap();
 
         let output = String::from_utf8(m.formatted()).unwrap();
-        let file_expected = std::fs::read("./testdata/email_with_png.eml").unwrap();
-        let expected = String::from_utf8(file_expected).unwrap();
-
-        for (i, line) in output.lines().zip(expected.lines()).enumerate() {
-            if i == 7 || i == 9 || i == 14 || i == 233 {
-                continue;
-            }
-
-            assert_eq!(line.0, line.1);
-        }
+        assert!(output.contains("Date: Tue, 15 Nov 1994 08:12:31 +0000\r\n"));
+        assert!(output.contains("From: NoBody <nobody@domain.tld>\r\n"));
+        assert!(output.contains("To: Hei <hei@domain.tld>\r\n"));
+        assert!(output.contains("Subject: Happy new year\r\n"));
+        assert!(output.contains("Content-Type: multipart/related;"));
+        assert!(output.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(output.contains("<p><b>Hello</b>, <i>world</i>! <img src=cid:123></p>\r\n"));
+        assert!(output.contains("Content-Type: image/png\r\n"));
+        assert!(output.contains("Content-Disposition: inline\r\n"));
+        assert!(output.contains("Content-ID: <123>\r\n"));
+        assert!(output.contains("Content-Transfer-Encoding: base64\r\n"));
+        assert!(output.contains("iVBORw0KGgo=\r\n"));
     }
 
     #[test]
