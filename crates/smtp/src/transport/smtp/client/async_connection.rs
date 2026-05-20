@@ -1,5 +1,7 @@
 #[cfg(feature = "tokio1")]
 use std::net::IpAddr;
+#[cfg(unix)]
+use std::path::Path;
 use std::{fmt::Display, future::Future, time::Duration};
 
 use futures_util::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,10 +19,13 @@ use crate::{
     transport::smtp::{
         Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{Auth, Data, Ehlo, Lhlo, Mail, Noop, Quit, Rcpt, Starttls},
+        commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Starttls, Vrfy},
         error,
         error::Error,
-        extension::{ClientId, Extension, MailBodyParameter, MailParameter, ServerInfo},
+        extension::{
+            ClientId, DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter,
+            MailParameter, RcptParameter, SendOptions, ServerInfo,
+        },
         response::{Response, parse_response},
     },
 };
@@ -187,6 +192,27 @@ impl AsyncSmtpConnection {
         .await
     }
 
+    #[cfg(all(feature = "tokio1", unix))]
+    pub(crate) async fn connect_tokio1_unix_with_protocol(
+        path: &Path,
+        timeout: Option<Duration>,
+        hello_name: &ClientId,
+        protocol: Protocol,
+    ) -> Result<AsyncSmtpConnection, Error> {
+        let deadline = AsyncDeadline::new(timeout);
+        #[allow(deprecated)]
+        let stream = AsyncNetworkStream::connect_tokio1_unix_until(path, deadline).await?;
+        Self::connect_impl(
+            stream,
+            hello_name,
+            timeout,
+            TimeoutRuntime::Tokio1,
+            TimeoutBudget::SetupDeadline(deadline),
+            protocol,
+        )
+        .await
+    }
+
     /// Connects to the configured server
     ///
     /// Sends EHLO and parses server information
@@ -232,6 +258,27 @@ impl AsyncSmtpConnection {
         .await
     }
 
+    #[cfg(all(feature = "async-std1", unix))]
+    pub(crate) async fn connect_asyncstd1_unix_with_protocol(
+        path: &Path,
+        timeout: Option<Duration>,
+        hello_name: &ClientId,
+        protocol: Protocol,
+    ) -> Result<AsyncSmtpConnection, Error> {
+        let deadline = AsyncDeadline::new(timeout);
+        #[allow(deprecated)]
+        let stream = AsyncNetworkStream::connect_asyncstd1_unix_until(path, deadline).await?;
+        Self::connect_impl(
+            stream,
+            hello_name,
+            timeout,
+            TimeoutRuntime::AsyncStd1,
+            TimeoutBudget::SetupDeadline(deadline),
+            protocol,
+        )
+        .await
+    }
+
     #[allow(deprecated)]
     async fn connect_impl(
         stream: AsyncNetworkStream,
@@ -265,7 +312,24 @@ impl AsyncSmtpConnection {
         envelope: &Envelope,
         email: &[u8],
     ) -> Result<Response, Error> {
-        let mail_options = self.mail_options(envelope, email)?;
+        self.send_with_options(envelope, email, &SendOptions::default())
+            .await
+    }
+
+    pub(crate) async fn send_with_options(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        let mail_options = self.mail_options(envelope, email, options, false)?;
+        let rcpt_options = self.rcpt_options(envelope, options)?;
+
+        if self.server_info().supports_pipelining() {
+            return self
+                .send_pipelined(envelope, email, mail_options, rcpt_options)
+                .await;
+        }
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
@@ -273,9 +337,10 @@ impl AsyncSmtpConnection {
             self
         );
 
-        for to_address in envelope.to() {
+        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             try_smtp!(
-                self.command(Rcpt::new(to_address.clone(), vec![])).await,
+                self.command(Rcpt::new(to_address.clone(), rcpt_options.clone()))
+                    .await,
                 self
             );
         }
@@ -285,12 +350,113 @@ impl AsyncSmtpConnection {
         Ok(result)
     }
 
+    pub(crate) async fn send_bdat_with_options(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        if !self.server_info().supports_chunking() {
+            return Err(error::client("BDAT requires server CHUNKING support"));
+        }
+
+        let mail_options = self.mail_options(envelope, email, options, true)?;
+        let rcpt_options = self.rcpt_options(envelope, options)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options))
+                .await,
+            self
+        );
+
+        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
+            try_smtp!(
+                self.command(Rcpt::new(to_address.clone(), rcpt_options.clone()))
+                    .await,
+                self
+            );
+        }
+
+        let result = try_smtp!(self.message_bdat(email).await, self);
+        Ok(result)
+    }
+
+    async fn send_pipelined(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+        mail_options: Vec<MailParameter>,
+        rcpt_options: Vec<Vec<RcptParameter>>,
+    ) -> Result<Response, Error> {
+        let mut commands = Mail::new(envelope.from().cloned(), mail_options).to_string();
+        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
+            commands.push_str(&Rcpt::new(to_address.clone(), rcpt_options.clone()).to_string());
+        }
+        commands.push_str(&Data.to_string());
+
+        self.write(commands.as_bytes()).await?;
+
+        // A dropped pipelined send cannot safely reuse the stream until every
+        // queued MAIL/RCPT/DATA response has been consumed.
+        // Keep verification and marking broken synchronous with no await gap.
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
+        let mail_response = self
+            .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+            .await?;
+        let mut recipient_responses = Vec::with_capacity(envelope.to().len());
+        for _ in envelope.to() {
+            recipient_responses.push(
+                self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await?,
+            );
+        }
+        let data_response = self
+            .read_response_with_budget_inner(self.per_operation_budget(), true, false)
+            .await?;
+
+        self.stream.get_mut().set_state(ConnectionState::Ok);
+
+        if !mail_response.is_positive() {
+            self.abort().await;
+            return Err(Self::error_from_status(mail_response));
+        }
+
+        if let Some(response) = recipient_responses
+            .into_iter()
+            .find(|response| !response.is_positive())
+        {
+            self.abort().await;
+            return Err(Self::error_from_status(response));
+        }
+
+        if !data_response.is_positive() {
+            self.abort().await;
+            return Err(Self::error_from_status(data_response));
+        }
+
+        let result = try_smtp!(self.message(email).await, self);
+        Ok(result)
+    }
+
     pub(crate) async fn send_lmtp(
         &mut self,
         envelope: &Envelope,
         email: &[u8],
     ) -> Result<Vec<Response>, Error> {
-        let mail_options = self.mail_options(envelope, email)?;
+        self.send_lmtp_with_options(envelope, email, &SendOptions::default())
+            .await
+    }
+
+    pub(crate) async fn send_lmtp_with_options(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error> {
+        let mail_options = self.mail_options(envelope, email, options, false)?;
+        let rcpt_options = self.rcpt_options(envelope, options)?;
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
@@ -301,9 +467,9 @@ impl AsyncSmtpConnection {
         let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
         let mut accepted_recipients = 0;
 
-        for to_address in envelope.to() {
+        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             let response = try_smtp!(
-                self.command_accepting_status(Rcpt::new(to_address.clone(), vec![]))
+                self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone()))
                     .await,
                 self
             );
@@ -316,10 +482,16 @@ impl AsyncSmtpConnection {
         }
 
         if accepted_recipients == 0 {
-            return Ok(recipient_statuses
-                .into_iter()
-                .map(|response| response.expect("all recipients were rejected"))
-                .collect());
+            let mut rejected = Vec::with_capacity(recipient_statuses.len());
+            for response in recipient_statuses {
+                let Some(response) = response else {
+                    return Err(error::client(
+                        "recipient status invariant failed after all recipients were rejected",
+                    ));
+                };
+                rejected.push(response);
+            }
+            return Ok(rejected);
         }
 
         try_smtp!(self.command(Data).await, self);
@@ -338,7 +510,80 @@ impl AsyncSmtpConnection {
             .collect())
     }
 
-    fn mail_options(&self, envelope: &Envelope, email: &[u8]) -> Result<Vec<MailParameter>, Error> {
+    pub(crate) async fn send_lmtp_bdat_with_options(
+        &mut self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error> {
+        if !self.server_info().supports_chunking() {
+            return Err(error::client("BDAT requires server CHUNKING support"));
+        }
+
+        let mail_options = self.mail_options(envelope, email, options, true)?;
+        let rcpt_options = self.rcpt_options(envelope, options)?;
+
+        try_smtp!(
+            self.command(Mail::new(envelope.from().cloned(), mail_options))
+                .await,
+            self
+        );
+
+        let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
+        let mut accepted_recipients = 0;
+
+        for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
+            let response = try_smtp!(
+                self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone()))
+                    .await,
+                self
+            );
+            if response.is_positive() {
+                accepted_recipients += 1;
+                recipient_statuses.push(None);
+            } else {
+                recipient_statuses.push(Some(response));
+            }
+        }
+
+        if accepted_recipients == 0 {
+            let mut rejected = Vec::with_capacity(recipient_statuses.len());
+            for response in recipient_statuses {
+                let Some(response) = response else {
+                    return Err(error::client(
+                        "recipient status invariant failed after all recipients were rejected",
+                    ));
+                };
+                rejected.push(response);
+            }
+            return Ok(rejected);
+        }
+
+        let mut delivery_statuses = try_smtp!(
+            self.message_lmtp_bdat(email, accepted_recipients).await,
+            self
+        )
+        .into_iter();
+
+        Ok(recipient_statuses
+            .into_iter()
+            .map(|response| {
+                response.unwrap_or_else(|| {
+                    delivery_statuses
+                        .next()
+                        .expect("server returned one status per accepted recipient")
+                })
+            })
+            .collect())
+    }
+
+    fn mail_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+        allow_binary_mime: bool,
+    ) -> Result<Vec<MailParameter>, Error> {
         // Mail
         let mut mail_options = vec![];
 
@@ -348,7 +593,16 @@ impl AsyncSmtpConnection {
         // * SMTPUTF8: https://tools.ietf.org/html/rfc653
 
         // Check for non-ascii addresses and use the SMTPUTF8 option if any.
-        if envelope.has_non_ascii_addresses() {
+        let has_smtputf8 = options
+            .mail_parameters()
+            .iter()
+            .any(|parameter| matches!(parameter, MailParameter::SmtpUtfEight));
+        let has_body_parameter = options
+            .mail_parameters()
+            .iter()
+            .any(|parameter| matches!(parameter, MailParameter::Body(_)));
+
+        if envelope.has_non_ascii_addresses() && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 // don't try to send non-ascii addresses (per RFC)
                 return Err(error::client(
@@ -359,7 +613,7 @@ impl AsyncSmtpConnection {
         }
 
         // Check for non-ascii content in the message
-        if !email.is_ascii() {
+        if !email.is_ascii() && !has_body_parameter {
             if !self.server_info().supports_feature(Extension::EightBitMime) {
                 return Err(error::client(
                     "Message contains non-ascii chars but server does not support 8BITMIME",
@@ -368,7 +622,211 @@ impl AsyncSmtpConnection {
             mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
         }
 
+        if self.server_info().supports_size()
+            && !options
+                .mail_parameters()
+                .iter()
+                .any(|parameter| matches!(parameter, MailParameter::Size(_)))
+        {
+            if self
+                .server_info()
+                .size_limit()
+                .is_some_and(|limit| email.len() > limit)
+            {
+                return Err(error::client(
+                    "Message is larger than the server-advertised SIZE limit",
+                ));
+            }
+            mail_options.push(MailParameter::Size(email.len()));
+        }
+
+        for parameter in options.mail_parameters() {
+            self.validate_mail_parameter(
+                parameter,
+                email.len(),
+                email.is_ascii(),
+                allow_binary_mime,
+            )?;
+            mail_options.push(parameter.clone());
+        }
+
         Ok(mail_options)
+    }
+
+    fn rcpt_options(
+        &self,
+        envelope: &Envelope,
+        options: &SendOptions,
+    ) -> Result<Vec<Vec<RcptParameter>>, Error> {
+        for (recipient, _) in options.recipient_parameters() {
+            if !envelope.to().contains(recipient) {
+                return Err(error::client(
+                    "recipient-specific RCPT parameters do not match an envelope recipient",
+                ));
+            }
+        }
+
+        envelope
+            .to()
+            .iter()
+            .map(|recipient| {
+                let parameters = options.rcpt_parameters_for(recipient);
+                for parameter in &parameters {
+                    self.validate_rcpt_parameter(parameter)?;
+                }
+                Ok(parameters)
+            })
+            .collect()
+    }
+
+    fn validate_mail_parameter(
+        &self,
+        parameter: &MailParameter,
+        message_size: usize,
+        message_is_ascii: bool,
+        allow_binary_mime: bool,
+    ) -> Result<(), Error> {
+        parameter.validate_syntax()?;
+
+        match parameter {
+            MailParameter::Body(MailBodyParameter::SevenBit) => {
+                if message_is_ascii {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "BODY=7BIT cannot be used with non-ASCII message content",
+                    ))
+                }
+            }
+            MailParameter::Body(MailBodyParameter::EightBitMime) => {
+                if self.server_info().supports_feature(Extension::EightBitMime) {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "BODY=8BITMIME requires server 8BITMIME support",
+                    ))
+                }
+            }
+            MailParameter::Body(MailBodyParameter::BinaryMime) => {
+                if !allow_binary_mime {
+                    return Err(error::client("BODY=BINARYMIME requires a BDAT send path"));
+                }
+                if self.server_info().supports_binary_mime() {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "BODY=BINARYMIME requires server BINARYMIME support",
+                    ))
+                }
+            }
+            MailParameter::Size(size) => {
+                if self
+                    .server_info()
+                    .size_limit()
+                    .is_some_and(|limit| *size > limit || message_size > limit)
+                {
+                    Err(error::client(
+                        "Message is larger than the server-advertised SIZE limit",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            MailParameter::SmtpUtfEight => {
+                if self.server_info().supports_feature(Extension::SmtpUtfEight) {
+                    Ok(())
+                } else {
+                    Err(error::client("SMTPUTF8 requires server SMTPUTF8 support"))
+                }
+            }
+            MailParameter::RequireTls => {
+                if !self.server_info().supports_require_tls() {
+                    return Err(error::client(
+                        "REQUIRETLS requires server REQUIRETLS support",
+                    ));
+                }
+                if !self.is_encrypted() {
+                    return Err(error::policy(
+                        "REQUIRETLS requires an encrypted SMTP connection",
+                    ));
+                }
+                Ok(())
+            }
+            MailParameter::FutureRelease(value) => {
+                if !self.server_info().supports_future_release() {
+                    return Err(error::client(
+                        "FUTURERELEASE requires server FUTURERELEASE support",
+                    ));
+                }
+                match value {
+                    FutureReleaseParameter::HoldFor(seconds)
+                        if self
+                            .server_info()
+                            .future_release_max_interval()
+                            .is_some_and(|limit| *seconds > limit) =>
+                    {
+                        return Err(error::client(
+                            "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
+                        ));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            MailParameter::DeliverBy(value) => {
+                if !self.server_info().supports_deliver_by() {
+                    return Err(error::client("BY requires server DELIVERBY support"));
+                }
+                if value.mode() == DeliverByMode::Return
+                    && value.seconds() > 0
+                    && self
+                        .server_info()
+                        .deliver_by_minimum()
+                        .is_some_and(|minimum| value.seconds() < minimum)
+                {
+                    return Err(error::client(
+                        "BY return deadline is below the server-advertised DELIVERBY minimum",
+                    ));
+                }
+                Ok(())
+            }
+            MailParameter::MtPriority(_) => {
+                if self.server_info().supports_mt_priority() {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "MT-PRIORITY requires server MT-PRIORITY support",
+                    ))
+                }
+            }
+            MailParameter::DsnReturn(_) | MailParameter::EnvelopeId(_) => {
+                if self.server_info().supports_dsn() {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "DSN MAIL parameters require server DSN support",
+                    ))
+                }
+            }
+            MailParameter::Other { .. } => Ok(()),
+        }
+    }
+
+    fn validate_rcpt_parameter(&self, parameter: &RcptParameter) -> Result<(), Error> {
+        parameter.validate_syntax()?;
+
+        match parameter {
+            RcptParameter::Notify(_) | RcptParameter::OriginalRecipient { .. } => {
+                if self.server_info().supports_dsn() {
+                    Ok(())
+                } else {
+                    Err(error::client(
+                        "DSN RCPT parameters require server DSN support",
+                    ))
+                }
+            }
+            RcptParameter::Other { .. } => Ok(()),
+        }
     }
 
     pub(crate) fn has_broken(&self) -> bool {
@@ -471,6 +929,18 @@ impl AsyncSmtpConnection {
         }
     }
 
+    /// Sends a VRFY command and returns the server response.
+    pub(crate) async fn verify(&mut self, argument: impl Into<String>) -> Result<Response, Error> {
+        self.command_accepting_status(Vrfy::new(argument.into())?)
+            .await
+    }
+
+    /// Sends an EXPN command and returns the server response.
+    pub(crate) async fn expand(&mut self, argument: impl Into<String>) -> Result<Response, Error> {
+        self.command_accepting_status(Expn::new(argument.into())?)
+            .await
+    }
+
     /// Sends an AUTH command with the given mechanism, and handles the challenge if needed
     pub(crate) async fn auth(
         &mut self,
@@ -521,6 +991,39 @@ impl AsyncSmtpConnection {
     ) -> Result<Vec<Response>, Error> {
         self.message_lmtp_iter(std::iter::once(message), recipients)
             .await
+    }
+
+    pub(crate) async fn message_bdat(&mut self, message: &[u8]) -> Result<Response, Error> {
+        self.write(Bdat::new(message.len(), true).to_string().as_bytes())
+            .await?;
+        self.write(message).await?;
+        self.read_response().await
+    }
+
+    pub(crate) async fn message_lmtp_bdat(
+        &mut self,
+        message: &[u8],
+        recipients: usize,
+    ) -> Result<Vec<Response>, Error> {
+        self.write(Bdat::new(message.len(), true).to_string().as_bytes())
+            .await?;
+        self.write(message).await?;
+
+        // A dropped LMTP BDAT send cannot safely reuse the stream until every
+        // accepted recipient status has been consumed.
+        self.stream.get_ref().state().verify()?;
+        self.stream.get_mut().set_state(ConnectionState::Broken);
+
+        let mut responses = Vec::with_capacity(recipients);
+        for _ in 0..recipients {
+            responses.push(
+                self.read_response_with_budget_inner(self.per_operation_budget(), true, false)
+                    .await?,
+            );
+        }
+
+        self.stream.get_mut().set_state(ConnectionState::Ok);
+        Ok(responses)
     }
 
     /// Sends the message content by consuming an iterator that in its whole represents a message.
@@ -599,6 +1102,10 @@ impl AsyncSmtpConnection {
     ) -> Result<Response, Error> {
         self.write(command.to_string().as_bytes()).await?;
         self.read_response_accepting_status().await
+    }
+
+    fn error_from_status(response: Response) -> Error {
+        error::code(response.code(), Some(response.message().collect()))
     }
 
     /// Writes a string to the server
@@ -731,11 +1238,14 @@ mod test {
         time::Duration,
     };
 
-    use crate::transport::smtp::{
-        AsyncSmtpConnection,
-        authentication::{Credentials, Mechanism},
-        commands::Noop,
-        extension::{ClientId, Extension},
+    use crate::{
+        address::Envelope,
+        transport::smtp::{
+            AsyncSmtpConnection,
+            authentication::{Credentials, Mechanism},
+            commands::Noop,
+            extension::{ClientId, Extension, MailBodyParameter, MailParameter, SendOptions},
+        },
     };
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
@@ -806,6 +1316,163 @@ mod test {
 
         assert!(!connection.test_connected().await);
         assert!(connection.has_broken());
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn send_uses_pipelining_for_mail_and_recipients() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            commands.push(ehlo);
+            stream
+                .write_all(b"250-localhost\r\n250-PIPELINING\r\n250 SIZE 1024\r\n")
+                .unwrap();
+
+            for _ in 0..3 {
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                commands.push(command);
+            }
+
+            stream
+                .write_all(b"250 sender ok\r\n250 first ok\r\n250 second ok\r\n")
+                .unwrap();
+
+            let mut data = String::new();
+            reader.read_line(&mut data).unwrap();
+            commands.push(data);
+            stream.write_all(b"354 send body\r\n").unwrap();
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(b"250 queued\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let response = connection
+            .send(&envelope, b"Subject: test\r\n\r\nHello")
+            .await
+            .unwrap();
+        assert!(response.has_code(250));
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(commands[0].starts_with("EHLO "));
+        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=22\r\n");
+        assert_eq!(commands[2], "RCPT TO:<first@example.com>\r\n");
+        assert_eq!(commands[3], "RCPT TO:<second@example.com>\r\n");
+        assert_eq!(commands[4], "DATA\r\n");
+        handle.join().unwrap();
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn explicit_mail_parameters_are_not_duplicated() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut commands = Vec::new();
+
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            commands.push(ehlo);
+            stream
+                .write_all(
+                    b"250-localhost\r\n250-PIPELINING\r\n250-SIZE 1024\r\n250-SMTPUTF8\r\n250 8BITMIME\r\n",
+                )
+                .unwrap();
+
+            for _ in 0..3 {
+                let mut command = String::new();
+                reader.read_line(&mut command).unwrap();
+                commands.push(command);
+            }
+
+            stream
+                .write_all(b"250 sender ok\r\n250 recipient ok\r\n354 send body\r\n")
+                .unwrap();
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == ".\r\n" {
+                    break;
+                }
+            }
+            stream.write_all(b"250 queued\r\n").unwrap();
+
+            commands_tx.send(commands).unwrap();
+        });
+
+        let mut connection =
+            AsyncSmtpConnection::connect_tokio1(address, None, &ClientId::default(), None, None)
+                .await
+                .unwrap();
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![crate::address::Address::new_dangerous(
+                "recipient",
+                "exämple.com",
+            )],
+        )
+        .unwrap();
+        let options = SendOptions::new()
+            .mail_parameter(MailParameter::SmtpUtfEight)
+            .mail_parameter(MailParameter::Body(MailBodyParameter::EightBitMime));
+
+        let response = connection
+            .send_with_options(&envelope, "Subject: test\r\n\r\nHéllo".as_bytes(), &options)
+            .await
+            .unwrap();
+        assert!(response.has_code(250));
+
+        let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            commands[1],
+            "MAIL FROM:<sender@example.com> SIZE=23 SMTPUTF8 BODY=8BITMIME\r\n"
+        );
         handle.join().unwrap();
     }
 

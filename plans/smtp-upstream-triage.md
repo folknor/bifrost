@@ -832,3 +832,150 @@ Verification:
   passed.
 - From `crates/smtp`: `brokkr check` passed.
 - From workspace root: `git diff --check` passed.
+
+## Current TODO queue
+
+Next useful SMTP batches, after the post-LMTP cleanup commit:
+
+- Decide whether and how to migrate the authentication internals to `rsasl`.
+  Keep bifrost-owned wrapper types at the public API boundary; do not expose
+  rsasl directly unless there is a concrete reason.
+- Add focused async DNS and TLS-handshake timeout edge coverage. The shared
+  setup-deadline machinery exists, but DNS and native-tls handshake failures
+  are not pinned with dedicated tests yet.
+- Continue upstream PR/issue triage now that connection state and LMTP support
+  are in place. Prefer small behavior fixes and API simplifications that fit
+  bifrost's native-tls-only, OIDC-first direction.
+
+## Daaki SMTP comparison notes
+
+Reference tree: `research/daaki/crates/smtp`
+
+LMTP:
+
+- Both bifrost-smtp and daaki-smtp support LMTP with `LHLO` and
+  per-recipient response collection.
+- Bifrost exposes separate `LmtpTransport` and `AsyncLmtpTransport` types with
+  `Transport::Ok = Vec<Response>`.
+- Bifrost preserves recipient position: RCPT-time rejection responses and
+  post-DATA delivery responses are returned in one vector in the same order as
+  the input envelope recipients. A caller can pair
+  `envelope.to().zip(responses)` and render a clean per-recipient delivery
+  view.
+- Daaki uses a shared `SmtpConnection` plus `Protocol::Lmtp`, returning
+  `LmtpSendResult { results: Vec<RecipientResult>, rejected_recipients:
+  Vec<RejectedRecipient> }`.
+- Daaki's split accepted/rejected lists are reasonable, but they force callers
+  to reconstruct original recipient position. Bifrost's current API is the
+  better base for a mail client UI that needs per-address delivery state.
+- Daaki does not support Unix-socket LMTP. Bifrost now does, which closes the
+  biggest practical LMTP deployment gap for Dovecot-style local delivery over
+  paths such as `/var/run/lmtp.sock`.
+
+Daaki areas worth mining:
+
+- REQUIRETLS (RFC 8689).
+- DELIVERBY (RFC 2852), including validation.
+- FUTURERELEASE (RFC 4865), including `HOLDFOR` and `HOLDUNTIL`.
+- MT-PRIORITY (RFC 6710).
+- Structured enhanced status code parsing from SMTP response text.
+- First-class `VRFY` and `EXPN` commands.
+- BDAT / CHUNKING and BINARYMIME, including LMTP BDAT.
+- PIPELINING. This is local to the send path: write `MAIL FROM`, all
+  `RCPT TO`, and `DATA` in one batch, then read responses in order with
+  correct draining and cleanup. BDAT pipelining is intentionally still held
+  back because it includes the message body before recipient replies.
+- A large protocol test corpus, including Mailpit and GreenMail compose tests,
+  plus fuzz targets for response parsing, EHLO parsing, and enhanced-status
+  parsing.
+
+Design judgment:
+
+- Do not replace bifrost's LMTP API with daaki's split-result API.
+- Do not import daaki's connection architecture wholesale. Its
+  `&self` plus internal `tokio::sync::Mutex` model is useful as a reference,
+  but bifrost-smtp still needs to preserve sync transport, async transport, and
+  pooling behavior.
+- Most daaki features are additive and can be layered onto the existing
+  bifrost connection/send path.
+- PIPELINING is the main feature that touches connection flow, but it should
+  still be implementable as a focused send-path change, not a rewrite.
+
+## Daaki mining batch: SMTP extensions and pipelining
+
+Implemented:
+
+- Added structured enhanced status code parsing on `Response` with
+  `Response::enhanced_status_code()`.
+- Expanded EHLO parsing and `ServerInfo` accessors for `SIZE`, `PIPELINING`,
+  `CHUNKING`, `BINARYMIME`, `ENHANCEDSTATUSCODES`, `DSN`, `REQUIRETLS`,
+  `FUTURERELEASE`, `DELIVERBY`, `MT-PRIORITY`, `VRFY`, and `EXPN`.
+- Added typed `MAIL FROM` parameter support for `REQUIRETLS`,
+  `FUTURERELEASE` (`HOLDFOR` / `HOLDUNTIL`), `DELIVERBY`, and
+  `MT-PRIORITY`, with validation for the DELIVERBY and MT-PRIORITY value
+  ranges.
+- Added DSN send options for `RET`, `ENVID`, `NOTIFY`, and `ORCPT`. Bifrost
+  validates the server-advertised `DSN` extension before writing DSN mail or
+  recipient parameters.
+- Fixed SMTP xtext encoding to escape UTF-8 bytes and always emit two-digit
+  hex escapes. This matters for DSN `ENVID`, DSN `ORCPT`, and custom ESMTP
+  parameter values.
+- Added `SendOptions` as the per-message public API for advanced ESMTP
+  parameters on `MAIL FROM`, uniform parameters on `RCPT TO`, and
+  recipient-specific `RCPT TO` parameters for cases such as per-recipient
+  `ORCPT`. This keeps the core `Transport` trait unchanged.
+- Added `SmtpTransport::send_raw_with_options`,
+  `LmtpTransport::send_raw_with_options`, and async equivalents.
+- Added explicit SMTP and LMTP BDAT send methods. Defaults still use DATA;
+  callers must opt into BDAT so dot-stuffing and BINARYMIME behavior are not
+  changed silently.
+- Added Unix-domain socket LMTP constructors for sync, tokio, and async-std
+  transports on Unix platforms. This keeps TCP LMTP as the existing default
+  while supporting the deployment mode local LMTP servers commonly use.
+- SMTP DATA send now uses PIPELINING when the server advertises it for
+  `MAIL FROM`, all `RCPT TO`, and `DATA`. The client drains every queued reply
+  before sending the message body, preserving the existing "do not deliver if
+  any recipient was rejected" behavior.
+- SMTP send now advertises `SIZE=<bytes>` when the server supports `SIZE`, and
+  rejects messages larger than the advertised limit before sending `MAIL FROM`.
+- Added first-class `VRFY` and `EXPN` helpers on sync and async SMTP/LMTP
+  transports. Negative replies are returned as `Response` values because they
+  are normal outcomes for these privacy-sensitive commands.
+- Added `MultiPartKind::Report { report_type }` and `MultiPart::report(...)`
+  for upstream #1023, covering `multipart/report` messages such as delivery
+  status notifications.
+- Added typed wrappers for common list-management headers from upstream #823:
+  `List-ID`, `List-Help`, `List-Unsubscribe`, `List-Unsubscribe-Post`,
+  `List-Subscribe`, `List-Post`, `List-Owner`, and `List-Archive`.
+- Added explicit `ContentType::text_plain_flowed()` and
+  `ContentType::text_plain_flowed_delsp()` helpers for upstream #998 without
+  changing the default `text/plain; charset=utf-8` behavior.
+- Added `singleparts(...)` and `multiparts(...)` batch helpers on
+  `MultiPartBuilder` and `MultiPart` for upstream #930, so callers can attach
+  a `Vec<SinglePart>` directly.
+
+Deferred:
+
+- BDAT command pipelining. That path needs careful response draining and
+  RSET/abort semantics because a failed pipelined `BDAT` leaves the
+  transaction state indeterminate after the body was already sent.
+
+Verification:
+
+- From `crates/smtp`: `brokkr check` passed after each sub-batch.
+- From `crates/smtp`: `brokkr check` passed after DSN support was added.
+- From `crates/smtp`: `brokkr check` passed after Unix-domain LMTP support was
+  added.
+- From `crates/smtp`: `brokkr check` passed after DATA was added to the SMTP
+  PIPELINING batch.
+- From `crates/smtp`: `brokkr check` passed after recipient-specific DSN
+  options were added.
+- From `crates/smtp`: `brokkr check` passed after xtext encoding was corrected.
+- From `crates/smtp`: `brokkr check` passed after `multipart/report` support
+  was added.
+- From `crates/smtp`: `brokkr check` passed after typed `List-*` headers were
+  added.
+- From `crates/smtp`: `brokkr check` passed after `format=flowed` content type
+  helpers were added.
+- From `crates/smtp`: `brokkr check` passed after multipart batch helpers were
+  added.

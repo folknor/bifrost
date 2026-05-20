@@ -5,9 +5,9 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-// FIXME message-specific errors
 /// Error type for email content
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Missing from in envelope
     MissingFrom,

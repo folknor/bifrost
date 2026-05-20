@@ -1,3 +1,5 @@
+use std::{io, io::ErrorKind};
+
 use super::{Header, HeaderName, HeaderValue};
 use crate::BoxError;
 
@@ -72,6 +74,70 @@ text_header!(
     /// defined in [draft-melnikov-email-user-agent-00](https://tools.ietf.org/html/draft-melnikov-email-user-agent-00#section-3)
     Header(UserAgent, "User-Agent")
 );
+text_header!(
+    /// `List-Id` header, defined in [RFC2919](https://www.rfc-editor.org/rfc/rfc2919)
+    Header(ListId, "List-ID")
+);
+text_header!(
+    /// `List-Help` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListHelp, "List-Help")
+);
+text_header!(
+    /// `List-Unsubscribe` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListUnsubscribe, "List-Unsubscribe")
+);
+/// `List-Unsubscribe-Post` header, defined in [RFC8058](https://www.rfc-editor.org/rfc/rfc8058)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListUnsubscribePost;
+
+impl ListUnsubscribePost {
+    /// The only value allowed by RFC 8058.
+    pub const VALUE: &'static str = "List-Unsubscribe=One-Click";
+}
+
+impl Header for ListUnsubscribePost {
+    fn name() -> HeaderName {
+        HeaderName::new_from_ascii_str("List-Unsubscribe-Post")
+    }
+
+    fn parse(s: &str) -> Result<Self, BoxError> {
+        if s.trim() == Self::VALUE {
+            Ok(Self)
+        } else {
+            Err(Box::new(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid List-Unsubscribe-Post header",
+            )))
+        }
+    }
+
+    fn display(&self) -> HeaderValue {
+        HeaderValue::new(Self::name(), Self::VALUE.to_owned())
+    }
+}
+
+impl AsRef<str> for ListUnsubscribePost {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        Self::VALUE
+    }
+}
+text_header!(
+    /// `List-Subscribe` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListSubscribe, "List-Subscribe")
+);
+text_header!(
+    /// `List-Post` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListPost, "List-Post")
+);
+text_header!(
+    /// `List-Owner` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListOwner, "List-Owner")
+);
+text_header!(
+    /// `List-Archive` header, defined in [RFC2369](https://www.rfc-editor.org/rfc/rfc2369)
+    Header(ListArchive, "List-Archive")
+);
 text_header! {
     /// `Content-Id` header,
     /// defined in [RFC2045](https://tools.ietf.org/html/rfc2045#section-7)
@@ -87,8 +153,8 @@ text_header! {
 mod test {
     use pretty_assertions::assert_eq;
 
-    use super::Subject;
-    use crate::message::header::{HeaderName, HeaderValue, Headers};
+    use super::{ListId, ListUnsubscribe, ListUnsubscribePost, Subject};
+    use crate::message::header::{Header, HeaderName, HeaderValue, Headers};
 
     #[test]
     fn format_ascii() {
@@ -118,6 +184,29 @@ mod test {
             headers.to_string(),
             "Subject: =?utf-8?b?QWRtaW5pc3RyYXTDtnI=?=\r\n"
         );
+    }
+
+    #[test]
+    fn format_list_headers() {
+        let mut headers = Headers::new();
+        headers.set(ListId("Users <users.example.com>".into()));
+        headers.set(ListUnsubscribe("<mailto:unsubscribe@example.com>".into()));
+        headers.set(ListUnsubscribePost);
+
+        assert_eq!(
+            headers.to_string(),
+            concat!(
+                "List-ID: Users <users.example.com>\r\n",
+                "List-Unsubscribe: <mailto:unsubscribe@example.com>\r\n",
+                "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_list_unsubscribe_post() {
+        assert!(ListUnsubscribePost::parse("List-Unsubscribe=One-Click").is_ok());
+        assert!(ListUnsubscribePost::parse("List-Unsubscribe=Maybe").is_err());
     }
 
     #[test]

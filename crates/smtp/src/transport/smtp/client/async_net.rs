@@ -1,5 +1,7 @@
 #[cfg(feature = "tokio1-native-tls")]
 use std::mem;
+#[cfg(unix)]
+use std::path::Path;
 #[cfg(feature = "tokio1")]
 use std::{
     fmt,
@@ -14,11 +16,15 @@ use std::{
 
 #[cfg(feature = "async-std1")]
 use async_std::net::{TcpStream as AsyncStd1TcpStream, ToSocketAddrs as AsyncStd1ToSocketAddrs};
+#[cfg(all(feature = "async-std1", unix))]
+use async_std::os::unix::net::UnixStream as AsyncStd1UnixStream;
 use futures_io::{
     AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite, Result as IoResult,
 };
 #[cfg(feature = "tokio1")]
 use tokio1_crate::io::{AsyncRead, AsyncWrite, ReadBuf as Tokio1ReadBuf};
+#[cfg(all(feature = "tokio1", unix))]
+use tokio1_crate::net::UnixStream as Tokio1UnixStream;
 #[cfg(feature = "tokio1")]
 use tokio1_crate::net::{
     TcpSocket as Tokio1TcpSocket, TcpStream as Tokio1TcpStream,
@@ -105,6 +111,8 @@ pub(crate) trait AsyncTokioStream:
 
 #[cfg(feature = "tokio1")]
 impl AsyncTokioStream for Tokio1TcpStream {}
+#[cfg(all(feature = "tokio1", unix))]
+impl AsyncTokioStream for Tokio1UnixStream {}
 
 /// Represents the different types of underlying network streams
 // usually only one TLS backend at a time is going to be enabled,
@@ -116,12 +124,18 @@ enum InnerAsyncNetworkStream {
     /// Plain Tokio 1.x TCP stream
     #[cfg(feature = "tokio1")]
     Tokio1Tcp(Box<dyn AsyncTokioStream>),
+    /// Plain Tokio 1.x Unix-domain stream
+    #[cfg(all(feature = "tokio1", unix))]
+    Tokio1Unix(Box<dyn AsyncTokioStream>),
     /// Encrypted Tokio 1.x TCP stream
     #[cfg(feature = "tokio1-native-tls")]
     Tokio1NativeTls(Tokio1TlsStream<Box<dyn AsyncTokioStream>>),
     /// Plain Tokio 1.x TCP stream
     #[cfg(feature = "async-std1")]
     AsyncStd1Tcp(AsyncStd1TcpStream),
+    /// Plain async-std Unix-domain stream
+    #[cfg(all(feature = "async-std1", unix))]
+    AsyncStd1Unix(AsyncStd1UnixStream),
     /// Can't be built
     None,
 }
@@ -205,6 +219,23 @@ impl AsyncNetworkStream {
         Ok(stream)
     }
 
+    #[cfg(all(feature = "tokio1", unix))]
+    pub(super) async fn connect_tokio1_unix_until(
+        path: &Path,
+        deadline: AsyncDeadline,
+    ) -> Result<AsyncNetworkStream, Error> {
+        let stream = deadline
+            .timeout_tokio1(
+                "Unix socket connection timed out",
+                Tokio1UnixStream::connect(path),
+            )
+            .await?
+            .map_err(error::connection)?;
+        Ok(AsyncNetworkStream::new(
+            InnerAsyncNetworkStream::Tokio1Unix(Box::new(stream)),
+        ))
+    }
+
     #[cfg(feature = "async-std1")]
     pub(super) async fn connect_asyncstd1_until<T: AsyncStd1ToSocketAddrs>(
         server: T,
@@ -249,6 +280,23 @@ impl AsyncNetworkStream {
             stream.upgrade_tls_until(tls_parameters, deadline).await?;
         }
         Ok(stream)
+    }
+
+    #[cfg(all(feature = "async-std1", unix))]
+    pub(super) async fn connect_asyncstd1_unix_until(
+        path: &Path,
+        deadline: AsyncDeadline,
+    ) -> Result<AsyncNetworkStream, Error> {
+        let stream = deadline
+            .timeout_asyncstd1(
+                "Unix socket connection timed out",
+                AsyncStd1UnixStream::connect(path),
+            )
+            .await?
+            .map_err(error::connection)?;
+        Ok(AsyncNetworkStream::new(
+            InnerAsyncNetworkStream::AsyncStd1Unix(stream),
+        ))
     }
 
     #[cfg_attr(not(feature = "tokio1-native-tls"), allow(dead_code))]
@@ -302,7 +350,9 @@ impl AsyncNetworkStream {
                     "Trying to upgrade an AsyncNetworkStream with async-std, which does not support native-tls"
                 );
             }
-            _ => Ok(()),
+            _ => Err(error::client(
+                "STARTTLS is only supported on TCP connections",
+            )),
         }
     }
 
@@ -335,10 +385,14 @@ impl AsyncNetworkStream {
         match &self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(_) => false,
+            #[cfg(all(feature = "tokio1", unix))]
+            InnerAsyncNetworkStream::Tokio1Unix(_) => false,
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(_) => true,
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(_) => false,
+            #[cfg(all(feature = "async-std1", unix))]
+            InnerAsyncNetworkStream::AsyncStd1Unix(_) => false,
             InnerAsyncNetworkStream::None => false,
         }
     }
@@ -361,6 +415,15 @@ impl FuturesAsyncRead for AsyncNetworkStream {
                     Poll::Pending => Poll::Pending,
                 }
             }
+            #[cfg(all(feature = "tokio1", unix))]
+            InnerAsyncNetworkStream::Tokio1Unix(s) => {
+                let mut b = Tokio1ReadBuf::new(buf);
+                match Pin::new(s).poll_read(cx, &mut b) {
+                    Poll::Ready(Ok(())) => Poll::Ready(Ok(b.filled().len())),
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => {
                 let mut b = Tokio1ReadBuf::new(buf);
@@ -372,6 +435,8 @@ impl FuturesAsyncRead for AsyncNetworkStream {
             }
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(all(feature = "async-std1", unix))]
+            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_read(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
@@ -390,10 +455,14 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
         match &mut self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(all(feature = "tokio1", unix))]
+            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(all(feature = "async-std1", unix))]
+            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_write(cx, buf),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(0))
@@ -405,10 +474,14 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
         match &mut self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(all(feature = "tokio1", unix))]
+            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(all(feature = "async-std1", unix))]
+            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_flush(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))
@@ -422,10 +495,14 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
         match &mut self.inner {
             #[cfg(feature = "tokio1")]
             InnerAsyncNetworkStream::Tokio1Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(all(feature = "tokio1", unix))]
+            InnerAsyncNetworkStream::Tokio1Unix(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "tokio1-native-tls")]
             InnerAsyncNetworkStream::Tokio1NativeTls(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "async-std1")]
             InnerAsyncNetworkStream::AsyncStd1Tcp(s) => Pin::new(s).poll_close(cx),
+            #[cfg(all(feature = "async-std1", unix))]
+            InnerAsyncNetworkStream::AsyncStd1Unix(s) => Pin::new(s).poll_close(cx),
             InnerAsyncNetworkStream::None => {
                 debug_assert!(false, "InnerAsyncNetworkStream::None must never be built");
                 Poll::Ready(Ok(()))

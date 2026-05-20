@@ -119,10 +119,8 @@ impl FromStr for Mailbox {
     type Err = AddressError;
 
     fn from_str(src: &str) -> Result<Mailbox, Self::Err> {
-        let (_rest, (name, (user, domain))) = parsers::mailbox(src).map_err(|_errs| {
-            // TODO: improve error management
-            AddressError::InvalidInput
-        })?;
+        let (_rest, (name, (user, domain))) =
+            parsers::mailbox(src).map_err(|_errs| AddressError::InvalidInput)?;
 
         let mailbox = Mailbox::new(name, Address::new(user, domain)?);
 
@@ -350,10 +348,8 @@ impl FromStr for Mailboxes {
     fn from_str(src: &str) -> Result<Self, Self::Err> {
         let mut mailboxes = Vec::new();
 
-        let (_rest, parsed_mailboxes) = parsers::mailbox_list(src).map_err(|_errs| {
-            // TODO: improve error management
-            AddressError::InvalidInput
-        })?;
+        let (_rest, parsed_mailboxes) =
+            parsers::mailbox_list(src).map_err(|_errs| AddressError::InvalidInput)?;
 
         for (name, (user, domain)) in parsed_mailboxes {
             mailboxes.push(Mailbox::new(name, Address::new(user, domain)?));

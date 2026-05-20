@@ -137,6 +137,37 @@ impl From<Code> for u16 {
     }
 }
 
+/// Represents an enhanced SMTP status code.
+///
+/// Enhanced status codes are defined by RFC 2034 and appear in response text as
+/// `class.subject.detail`, for example `5.1.1`.
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub struct EnhancedStatusCode {
+    /// Status class: 2 for success, 4 for transient failure, 5 for permanent
+    /// failure.
+    pub class: u8,
+    /// Subject component.
+    pub subject: u16,
+    /// Detail component.
+    pub detail: u16,
+}
+
+impl Display for EnhancedStatusCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}.{}.{}", self.class, self.subject, self.detail)
+    }
+}
+
+impl FromStr for EnhancedStatusCode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        parse_enhanced_status_code(s).ok_or_else(|| error::response("invalid enhanced status code"))
+    }
+}
+
 /// Contains an SMTP reply, with separated code and message
 ///
 /// The text message is optional, only the code is mandatory
@@ -191,6 +222,21 @@ impl Response {
     /// Response code
     pub fn code(&self) -> Code {
         self.code
+    }
+
+    /// Returns the first enhanced status code from the response text.
+    ///
+    /// RFC 2034 puts enhanced status codes at the start of response text lines.
+    /// Bifrost accepts the first well-formed code whose class matches the
+    /// normal SMTP reply class.
+    pub fn enhanced_status_code(&self) -> Option<EnhancedStatusCode> {
+        let expected_class = self.code.severity as u8;
+        self.message.iter().find_map(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(parse_enhanced_status_code)
+                .filter(|code| code.class == expected_class)
+        })
     }
 
     /// Server response string (array of lines)
@@ -251,6 +297,40 @@ fn parse_detail(i: &str) -> IResult<&str, Detail> {
         map(tag("9"), |_| Detail::Nine),
     ))
     .parse(i)
+}
+
+fn parse_enhanced_status_code(value: &str) -> Option<EnhancedStatusCode> {
+    let mut parts = value.split('.');
+    let class = match parts.next()? {
+        "2" => 2,
+        "4" => 4,
+        "5" => 5,
+        _ => return None,
+    };
+    let subject = parse_enhanced_status_component(parts.next()?)?;
+    let detail = parse_enhanced_status_component(parts.next()?)?;
+
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some(EnhancedStatusCode {
+        class,
+        subject,
+        detail,
+    })
+}
+
+fn parse_enhanced_status_component(value: &str) -> Option<u16> {
+    if value.is_empty()
+        || value.len() > 3
+        || value.starts_with('0') && value.len() > 1
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    value.parse().ok()
 }
 
 pub(crate) fn parse_response(i: &str) -> IResult<&str, Response> {
@@ -414,6 +494,38 @@ mod test {
             )
             .has_code(251)
         );
+    }
+
+    #[test]
+    fn test_enhanced_status_code() {
+        let response: Response = "550 5.1.1 user unknown\r\n".parse().unwrap();
+        assert_eq!(
+            response.enhanced_status_code(),
+            Some(EnhancedStatusCode {
+                class: 5,
+                subject: 1,
+                detail: 1,
+            })
+        );
+
+        let mismatched: Response = "550 4.2.0 mailbox full\r\n".parse().unwrap();
+        assert_eq!(mismatched.enhanced_status_code(), None);
+
+        let multiline: Response = "250-mail.example\r\n250 2.1.5 recipient ok\r\n"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            multiline.enhanced_status_code(),
+            Some(EnhancedStatusCode {
+                class: 2,
+                subject: 1,
+                detail: 5,
+            })
+        );
+
+        for invalid in ["5.01.1", "5.1.001", "5.1000.1", "5.1.1000"] {
+            assert!(invalid.parse::<EnhancedStatusCode>().is_err());
+        }
     }
 
     #[test]

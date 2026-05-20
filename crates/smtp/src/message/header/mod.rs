@@ -361,7 +361,7 @@ impl<'a> HeaderValueEncoder<'a> {
         let prefix = self.encode_buf.trim_end_matches(' ');
         email_encoding::headers::rfc2047::encode(prefix, &mut self.writer)?;
 
-        // TODO: add a better API for doing this in email-encoding
+        // Preserve trailing spaces outside the encoded-word.
         let spaces = self.encode_buf.len() - prefix.len();
         for _ in 0..spaces {
             self.writer.space();

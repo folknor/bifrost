@@ -6,6 +6,10 @@ use std::{
 
 #[cfg(feature = "native-tls")]
 use std::mem;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::path::Path;
 
 #[cfg(feature = "native-tls")]
 use native_tls::TlsStream;
@@ -29,6 +33,9 @@ pub(crate) struct NetworkStream {
 enum InnerNetworkStream {
     /// Plain TCP stream
     Tcp(TcpStream),
+    /// Plain Unix-domain stream
+    #[cfg(unix)]
+    Unix(UnixStream),
     /// Encrypted TCP stream
     #[cfg(feature = "native-tls")]
     NativeTls(TlsStream<TcpStream>),
@@ -64,6 +71,8 @@ impl NetworkStream {
 
         match &self.inner {
             InnerNetworkStream::Tcp(s) => s.shutdown(how),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(s) => s.shutdown(how),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.get_ref().shutdown(how),
             #[cfg(feature = "native-tls")]
@@ -128,6 +137,12 @@ impl NetworkStream {
         Ok(stream)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn connect_unix(path: &Path) -> Result<NetworkStream, Error> {
+        let stream = UnixStream::connect(path).map_err(error::connection)?;
+        Ok(NetworkStream::new(InnerNetworkStream::Unix(stream)))
+    }
+
     #[cfg(not(feature = "native-tls"))]
     pub(crate) fn upgrade_tls(&mut self, tls_parameters: &TlsParameters) -> Result<(), Error> {
         let _ = self;
@@ -153,7 +168,9 @@ impl NetworkStream {
                 self.state = ConnectionState::Ok;
                 Ok(())
             }
-            _ => Ok(()),
+            _ => Err(error::client(
+                "STARTTLS is only supported on TCP connections",
+            )),
         }
     }
 
@@ -175,6 +192,8 @@ impl NetworkStream {
     pub(crate) fn is_encrypted(&self) -> bool {
         match &self.inner {
             InnerNetworkStream::Tcp(_) => false,
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(_) => false,
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(_) => true,
             #[cfg(feature = "native-tls")]
@@ -188,6 +207,8 @@ impl NetworkStream {
     pub(crate) fn set_read_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(stream) => stream.set_read_timeout(duration),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(stream) => stream.set_read_timeout(duration),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_read_timeout(duration),
             #[cfg(feature = "native-tls")]
@@ -202,6 +223,8 @@ impl NetworkStream {
     pub(crate) fn set_write_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(stream) => stream.set_write_timeout(duration),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(stream) => stream.set_write_timeout(duration),
 
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(stream) => stream.get_ref().set_write_timeout(duration),
@@ -218,6 +241,8 @@ impl Read for NetworkStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(s) => s.read(buf),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.read(buf),
             #[cfg(feature = "native-tls")]
@@ -233,6 +258,8 @@ impl Write for NetworkStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(s) => s.write(buf),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.write(buf),
             #[cfg(feature = "native-tls")]
@@ -246,6 +273,8 @@ impl Write for NetworkStream {
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.inner {
             InnerNetworkStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            InnerNetworkStream::Unix(s) => s.flush(),
             #[cfg(feature = "native-tls")]
             InnerNetworkStream::NativeTls(s) => s.flush(),
             #[cfg(feature = "native-tls")]

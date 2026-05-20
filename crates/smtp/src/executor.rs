@@ -1,7 +1,13 @@
 use std::fmt::Debug;
 #[cfg(feature = "file-transport")]
 use std::io::Result as IoResult;
-#[cfg(feature = "file-transport")]
+#[cfg(any(
+    feature = "file-transport",
+    all(
+        feature = "smtp-transport",
+        any(feature = "tokio1", feature = "async-std1")
+    )
+))]
 use std::path::Path;
 #[cfg(feature = "smtp-transport")]
 use std::time::Duration;
@@ -88,6 +94,7 @@ pub(crate) trait SmtpExecutor: Executor {
     fn connect<'a>(
         hostname: &'a str,
         port: u16,
+        unix_socket: Option<&'a Path>,
         timeout: Option<Duration>,
         hello_name: &'a ClientId,
         tls: &'a Tls,
@@ -150,11 +157,34 @@ impl SmtpExecutor for Tokio1Executor {
     async fn connect(
         hostname: &str,
         port: u16,
+        unix_socket: Option<&Path>,
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls: &Tls,
         protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
+        if let Some(path) = unix_socket {
+            #[cfg(unix)]
+            {
+                if !matches!(tls, Tls::None) {
+                    return Err(crate::transport::smtp::error::client(
+                        "TLS is not supported over Unix-domain LMTP sockets",
+                    ));
+                }
+                return AsyncSmtpConnection::connect_tokio1_unix_with_protocol(
+                    path, timeout, hello_name, protocol,
+                )
+                .await;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(crate::transport::smtp::error::client(
+                    "Unix-domain LMTP sockets are only supported on Unix platforms",
+                ));
+            }
+        }
+
         #[allow(clippy::match_single_binding)]
         let tls_parameters = match tls {
             #[cfg(feature = "tokio1-native-tls")]
@@ -252,11 +282,34 @@ impl SmtpExecutor for AsyncStd1Executor {
     async fn connect(
         hostname: &str,
         port: u16,
+        unix_socket: Option<&Path>,
         timeout: Option<Duration>,
         hello_name: &ClientId,
         tls: &Tls,
         protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
+        if let Some(path) = unix_socket {
+            #[cfg(unix)]
+            {
+                if !matches!(tls, Tls::None) {
+                    return Err(crate::transport::smtp::error::client(
+                        "TLS is not supported over Unix-domain LMTP sockets",
+                    ));
+                }
+                return AsyncSmtpConnection::connect_asyncstd1_unix_with_protocol(
+                    path, timeout, hello_name, protocol,
+                )
+                .await;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(crate::transport::smtp::error::client(
+                    "Unix-domain LMTP sockets are only supported on Unix platforms",
+                ));
+            }
+        }
+
         #[cfg(feature = "native-tls")]
         if !matches!(tls, Tls::None) {
             return Err(crate::transport::smtp::error::client(

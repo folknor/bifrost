@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::path::Path;
 #[cfg(feature = "pool")]
 use std::sync::Arc;
 use std::{fmt::Debug, time::Duration};
@@ -7,7 +9,8 @@ use super::PoolConfig;
 #[cfg(feature = "pool")]
 use super::pool::sync_impl::Pool;
 use super::{
-    ClientId, Credentials, Error, Mechanism, Protocol, Response, SmtpConnection, SmtpInfo,
+    ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
+    SmtpInfo, error,
 };
 #[cfg(feature = "native-tls")]
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
@@ -299,16 +302,98 @@ impl SmtpTransport {
 
         Ok(is_connected)
     }
+
+    /// Sends `VRFY` and returns the server response.
+    ///
+    /// Many servers disable `VRFY` for privacy. Negative SMTP replies are
+    /// returned as [`Response`] values so callers can inspect the exact status.
+    pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        let response = conn.verify(argument);
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        response
+    }
+
+    /// Sends `EXPN` and returns the server response.
+    ///
+    /// Many servers disable `EXPN` for privacy. Negative SMTP replies are
+    /// returned as [`Response`] values so callers can inspect the exact status.
+    pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        let response = conn.expand(argument);
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        response
+    }
+
+    /// Sends an email with per-message SMTP options.
+    ///
+    /// This is the advanced counterpart to [`Transport::send_raw`]. It keeps
+    /// the core transport trait simple while still allowing message-specific
+    /// ESMTP parameters such as `REQUIRETLS`, `DELIVERBY`, `FUTURERELEASE`,
+    /// `MT-PRIORITY`, and DSN options.
+    pub fn send_raw_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+
+        let result = conn.send_with_options(envelope, email, options)?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        Ok(result)
+    }
+
+    /// Sends an email with `BDAT ... LAST`.
+    ///
+    /// The server must advertise `CHUNKING`. This path avoids DATA
+    /// dot-stuffing and is the required path for `BODY=BINARYMIME`.
+    pub fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error> {
+        self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
+    }
+
+    /// Sends an email with `BDAT ... LAST` and per-message SMTP options.
+    pub fn send_raw_bdat_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+
+        let result = conn.send_bdat_with_options(envelope, email, options)?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        Ok(result)
+    }
 }
 
 impl LmtpTransport {
     /// Creates a new local LMTP client to port 24.
     ///
     /// RFC 2033 does not assign an LMTP TCP port. Port 24 is the common TCP
-    /// convention; Unix sockets are also common but are not supported by this
-    /// transport.
+    /// convention. Use [`Self::unix_socket`] for the more common local socket
+    /// deployment shape.
     pub fn unencrypted_localhost() -> LmtpTransport {
         Self::builder_dangerous("localhost").build()
+    }
+
+    /// Creates a new local LMTP client over a Unix-domain socket.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn unix_socket(path: impl AsRef<Path>) -> LmtpTransportBuilder {
+        Self::builder_dangerous("localhost").unix_socket(path)
     }
 
     /// Creates a new LMTP client.
@@ -336,6 +421,76 @@ impl LmtpTransport {
         conn.quit()?;
 
         Ok(is_connected)
+    }
+
+    /// Sends `VRFY` over LMTP and returns the server response.
+    ///
+    /// Negative replies are returned as [`Response`] values so callers can
+    /// inspect the exact status.
+    pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        let response = conn.verify(argument);
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        response
+    }
+
+    /// Sends `EXPN` over LMTP and returns the server response.
+    ///
+    /// Negative replies are returned as [`Response`] values so callers can
+    /// inspect the exact status.
+    pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
+        let mut conn = self.inner.connection()?;
+        let response = conn.expand(argument);
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        response
+    }
+
+    /// Sends an email over LMTP with per-message SMTP options.
+    pub fn send_raw_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error> {
+        let mut conn = self.inner.connection()?;
+
+        let result = conn.send_lmtp_with_options(envelope, email, options)?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        Ok(result)
+    }
+
+    /// Sends an email over LMTP with `BDAT ... LAST`.
+    ///
+    /// The server must advertise `CHUNKING`. Returned responses still preserve
+    /// one status per input recipient.
+    pub fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Vec<Response>, Error> {
+        self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
+    }
+
+    /// Sends an email over LMTP with `BDAT ... LAST` and per-message options.
+    pub fn send_raw_bdat_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error> {
+        let mut conn = self.inner.connection()?;
+
+        let result = conn.send_lmtp_bdat_with_options(envelope, email, options)?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort();
+
+        Ok(result)
     }
 }
 
@@ -466,6 +621,7 @@ impl SmtpTransportBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
+        self.info.unix_socket = None;
         self
     }
 
@@ -564,6 +720,16 @@ impl LmtpTransportBuilder {
     /// Set the port to use
     pub fn port(mut self, port: u16) -> Self {
         self.info.port = port;
+        self.info.unix_socket = None;
+        self
+    }
+
+    /// Connect over a Unix-domain socket instead of TCP.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn unix_socket(mut self, path: impl AsRef<Path>) -> Self {
+        self.info.unix_socket = Some(path.as_ref().to_path_buf());
+        self.info.tls = super::Tls::None;
         self
     }
 
@@ -572,6 +738,7 @@ impl LmtpTransportBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
+        self.info.unix_socket = None;
         self
     }
 
@@ -610,6 +777,36 @@ impl SmtpClient {
     ///
     /// Handles encryption and authentication
     pub(super) fn connection(&self) -> Result<SmtpConnection, Error> {
+        if let Some(path) = &self.info.unix_socket {
+            #[cfg(unix)]
+            {
+                if self.info.uses_tls() {
+                    return Err(error::client(
+                        "TLS is not supported over Unix-domain LMTP sockets",
+                    ));
+                }
+                let mut conn = SmtpConnection::connect_unix_with_protocol(
+                    path,
+                    self.info.timeout,
+                    &self.info.hello_name,
+                    self.info.protocol,
+                )?;
+
+                if let Some(credentials) = &self.info.credentials {
+                    self.info.ensure_can_authenticate(conn.is_encrypted())?;
+                    conn.auth(&self.info.authentication, credentials)?;
+                }
+                return Ok(conn);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                return Err(error::client(
+                    "Unix-domain LMTP sockets are only supported on Unix platforms",
+                ));
+            }
+        }
+
         #[allow(clippy::match_single_binding)]
         let tls_parameters = match &self.info.tls {
             #[cfg(feature = "native-tls")]
@@ -658,6 +855,8 @@ mod tests {
 
     #[cfg(feature = "native-tls")]
     use crate::transport::smtp::Tls;
+    #[cfg(unix)]
+    use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
         LmtpTransport, SmtpTransport, Transport,
         address::Envelope,
@@ -712,6 +911,35 @@ mod tests {
         assert!(!responses[1].is_positive());
         assert!(responses[2].has_code(451));
         assert!(!responses[2].is_positive());
+
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lmtp_transport_sends_over_unix_socket() {
+        let server = spawn_unix_lmtp_delivery_server();
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer = LmtpTransport::unix_socket(server.path.clone()).build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(responses[2].has_code(451));
 
         let commands = server.commands();
         assert_lmtp_delivery_commands(&commands);

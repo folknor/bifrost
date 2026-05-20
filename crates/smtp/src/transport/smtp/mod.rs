@@ -9,6 +9,14 @@
 //!
 //! * 8BITMIME ([RFC 6152](https://tools.ietf.org/html/rfc6152))
 //! * AUTH ([RFC 4954](https://tools.ietf.org/html/rfc4954)) with PLAIN, LOGIN, OAUTHBEARER and XOAUTH2 mechanisms
+//! * BDAT/CHUNKING ([RFC 3030](https://www.rfc-editor.org/rfc/rfc3030)) through explicit BDAT send methods
+//! * DELIVERBY ([RFC 2852](https://www.rfc-editor.org/rfc/rfc2852)) through per-message send options
+//! * DSN ([RFC 3461](https://www.rfc-editor.org/rfc/rfc3461)) through per-message send options
+//! * ENHANCEDSTATUSCODES ([RFC 2034](https://www.rfc-editor.org/rfc/rfc2034)) response parsing
+//! * FUTURERELEASE ([RFC 4865](https://www.rfc-editor.org/rfc/rfc4865)) through per-message send options
+//! * MT-PRIORITY ([RFC 6710](https://www.rfc-editor.org/rfc/rfc6710)) through per-message send options
+//! * PIPELINING ([RFC 2920](https://www.rfc-editor.org/rfc/rfc2920)) for MAIL and RCPT commands
+//! * REQUIRETLS ([RFC 8689](https://www.rfc-editor.org/rfc/rfc8689)) through per-message send options
 //! * STARTTLS ([RFC 2487](https://tools.ietf.org/html/rfc2487))
 //!
 //! #### SMTP Transport
@@ -23,6 +31,7 @@
 //!
 //! [`LmtpTransport`] and [`AsyncLmtpTransport`] provide the same transport
 //! shape for local delivery over LMTP, returning one status per recipient.
+//! They support both TCP LMTP and Unix-domain LMTP sockets on Unix platforms.
 //!
 //! This client is designed to send emails to a relay server, and should *not* be used to send
 //! emails directly to the destination server.
@@ -186,7 +195,7 @@
 //! # }
 //! ```
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 #[cfg(any(feature = "tokio1", feature = "async-std1"))]
 pub use self::async_transport::{
@@ -202,6 +211,7 @@ pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilde
 pub use self::pool::PoolConfig;
 pub use self::{
     error::{Error, ErrorKind},
+    extension::SendOptions,
     transport::{LmtpTransport, LmtpTransportBuilder, SmtpTransport, SmtpTransportBuilder},
 };
 use crate::transport::smtp::{
@@ -272,6 +282,8 @@ struct SmtpInfo {
     server: String,
     /// Port to connect to
     port: u16,
+    /// Unix-domain socket path for local LMTP delivery.
+    unix_socket: Option<PathBuf>,
     /// TLS security configuration
     tls: Tls,
     /// Optional enforced authentication mechanism
@@ -293,6 +305,7 @@ impl Default for SmtpInfo {
             protocol: Protocol::Smtp,
             server: "localhost".to_owned(),
             port: SMTP_PORT,
+            unix_socket: None,
             hello_name: ClientId::default(),
             credentials: None,
             allow_insecure_auth: false,
@@ -324,6 +337,10 @@ impl SmtpInfo {
     fn set_authentication(&mut self, mechanisms: Vec<Mechanism>) {
         self.authentication = mechanisms;
         self.authentication_configured = true;
+    }
+
+    fn uses_tls(&self) -> bool {
+        !matches!(self.tls, Tls::None)
     }
 
     fn ensure_can_authenticate(&self, encrypted: bool) -> Result<(), Error> {

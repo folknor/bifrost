@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::path::Path;
 #[cfg(feature = "pool")]
 use std::sync::Arc;
 use std::{
@@ -13,7 +15,8 @@ use super::Tls;
 #[cfg(feature = "pool")]
 use super::pool::async_impl::Pool;
 use super::{
-    AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SmtpInfo,
+    AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
+    SmtpInfo,
 };
 #[cfg(feature = "async-std1")]
 use crate::AsyncStd1Executor;
@@ -380,6 +383,104 @@ where
 
         Ok(is_connected)
     }
+
+    /// Sends `VRFY` and returns the server response.
+    ///
+    /// Many servers disable `VRFY` for privacy. Negative SMTP replies are
+    /// returned as [`Response`] values so callers can inspect the exact status.
+    #[allow(private_bounds)]
+    pub async fn verify(&self, argument: impl Into<String>) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+        let response = conn.verify(argument).await;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        response
+    }
+
+    /// Sends `EXPN` and returns the server response.
+    ///
+    /// Many servers disable `EXPN` for privacy. Negative SMTP replies are
+    /// returned as [`Response`] values so callers can inspect the exact status.
+    #[allow(private_bounds)]
+    pub async fn expand(&self, argument: impl Into<String>) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+        let response = conn.expand(argument).await;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        response
+    }
+
+    /// Sends an email with per-message SMTP options.
+    ///
+    /// This is the advanced counterpart to [`AsyncTransport::send_raw`]. It
+    /// keeps the core transport trait simple while still allowing
+    /// message-specific ESMTP parameters such as `REQUIRETLS`, `DELIVERBY`,
+    /// `FUTURERELEASE`, `MT-PRIORITY`, and DSN options.
+    #[allow(private_bounds)]
+    pub async fn send_raw_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+
+        let result = conn.send_with_options(envelope, email, options).await?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        Ok(result)
+    }
+
+    /// Sends an email with `BDAT ... LAST`.
+    ///
+    /// The server must advertise `CHUNKING`. This path avoids DATA
+    /// dot-stuffing and is the required path for `BODY=BINARYMIME`.
+    #[allow(private_bounds)]
+    pub async fn send_raw_bdat(&self, envelope: &Envelope, email: &[u8]) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
+            .await
+    }
+
+    /// Sends an email with `BDAT ... LAST` and per-message SMTP options.
+    #[allow(private_bounds)]
+    pub async fn send_raw_bdat_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+
+        let result = conn
+            .send_bdat_with_options(envelope, email, options)
+            .await?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        Ok(result)
+    }
 }
 
 impl<E> AsyncLmtpTransport<E>
@@ -389,14 +490,21 @@ where
     /// Creates a new local LMTP client to port 24.
     ///
     /// RFC 2033 does not assign an LMTP TCP port. Port 24 is the common TCP
-    /// convention; Unix sockets are also common but are not supported by this
-    /// transport.
+    /// convention. Use [`Self::unix_socket`] for the more common local socket
+    /// deployment shape.
     #[allow(private_bounds)]
     pub fn unencrypted_localhost() -> AsyncLmtpTransport<E>
     where
         E: SmtpExecutor,
     {
         Self::builder_dangerous("localhost").build()
+    }
+
+    /// Creates a new local LMTP client over a Unix-domain socket.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn unix_socket(path: impl AsRef<Path>) -> AsyncLmtpTransportBuilder {
+        Self::builder_dangerous("localhost").unix_socket(path)
     }
 
     /// Creates a new LMTP client.
@@ -428,6 +536,105 @@ where
         conn.quit().await?;
 
         Ok(is_connected)
+    }
+
+    /// Sends `VRFY` over LMTP and returns the server response.
+    ///
+    /// Negative replies are returned as [`Response`] values so callers can
+    /// inspect the exact status.
+    #[allow(private_bounds)]
+    pub async fn verify(&self, argument: impl Into<String>) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+        let response = conn.verify(argument).await;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        response
+    }
+
+    /// Sends `EXPN` over LMTP and returns the server response.
+    ///
+    /// Negative replies are returned as [`Response`] values so callers can
+    /// inspect the exact status.
+    #[allow(private_bounds)]
+    pub async fn expand(&self, argument: impl Into<String>) -> Result<Response, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+        let response = conn.expand(argument).await;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        response
+    }
+
+    /// Sends an email over LMTP with per-message SMTP options.
+    #[allow(private_bounds)]
+    pub async fn send_raw_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+
+        let result = conn
+            .send_lmtp_with_options(envelope, email, options)
+            .await?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        Ok(result)
+    }
+
+    /// Sends an email over LMTP with `BDAT ... LAST`.
+    ///
+    /// The server must advertise `CHUNKING`. Returned responses still preserve
+    /// one status per input recipient.
+    #[allow(private_bounds)]
+    pub async fn send_raw_bdat(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+    ) -> Result<Vec<Response>, Error>
+    where
+        E: SmtpExecutor,
+    {
+        self.send_raw_bdat_with_options(envelope, email, &SendOptions::default())
+            .await
+    }
+
+    /// Sends an email over LMTP with `BDAT ... LAST` and per-message options.
+    #[allow(private_bounds)]
+    pub async fn send_raw_bdat_with_options(
+        &self,
+        envelope: &Envelope,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<Vec<Response>, Error>
+    where
+        E: SmtpExecutor,
+    {
+        let mut conn = self.inner.connection().await?;
+
+        let result = conn
+            .send_lmtp_bdat_with_options(envelope, email, options)
+            .await?;
+
+        #[cfg(not(feature = "pool"))]
+        conn.abort().await;
+
+        Ok(result)
     }
 }
 
@@ -604,6 +811,7 @@ impl AsyncSmtpTransportBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
+        self.info.unix_socket = None;
         self
     }
 
@@ -700,6 +908,16 @@ impl AsyncLmtpTransportBuilder {
     /// Set the port to use
     pub fn port(mut self, port: u16) -> Self {
         self.info.port = port;
+        self.info.unix_socket = None;
+        self
+    }
+
+    /// Connect over a Unix-domain socket instead of TCP.
+    #[cfg(unix)]
+    #[cfg_attr(docsrs, doc(cfg(unix)))]
+    pub fn unix_socket(mut self, path: impl AsRef<Path>) -> Self {
+        self.info.unix_socket = Some(path.as_ref().to_path_buf());
+        self.info.tls = super::Tls::None;
         self
     }
 
@@ -714,6 +932,7 @@ impl AsyncLmtpTransportBuilder {
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio1-native-tls")))]
     pub fn tls(mut self, tls: Tls) -> Self {
         self.info.tls = tls;
+        self.info.unix_socket = None;
         self
     }
 
@@ -762,6 +981,7 @@ where
         let mut conn = E::connect(
             &self.info.server,
             self.info.port,
+            self.info.unix_socket.as_deref(),
             self.info.timeout,
             &self.info.hello_name,
             &self.info.tls,
@@ -811,6 +1031,8 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(unix)]
+    use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
         AsyncLmtpTransport, AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
         address::Envelope,
@@ -873,6 +1095,37 @@ mod tests {
     }
 
     #[tokio1_crate::test(crate = "tokio1_crate")]
+    #[cfg(unix)]
+    async fn tokio_lmtp_transport_sends_over_unix_socket() {
+        let server = spawn_unix_lmtp_delivery_server();
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer: AsyncLmtpTransport<Tokio1Executor> =
+            AsyncLmtpTransport::<Tokio1Executor>::unix_socket(server.path.clone()).build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .await
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(responses[2].has_code(451));
+
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
+    }
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
     async fn tokio_plaintext_auth_is_refused_before_auth_command() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -919,6 +1172,8 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "async-std1")]
 mod asyncstd_tests {
+    #[cfg(unix)]
+    use crate::transport::smtp::test_support::spawn_unix_lmtp_delivery_server;
     use crate::{
         AsyncLmtpTransport, AsyncStd1Executor, AsyncTransport,
         address::Envelope,
@@ -966,6 +1221,37 @@ mod asyncstd_tests {
         assert!(!responses[1].is_positive());
         assert!(responses[2].has_code(451));
         assert!(!responses[2].is_positive());
+
+        let commands = server.commands();
+        assert_lmtp_delivery_commands(&commands);
+    }
+
+    #[async_std::test]
+    #[cfg(unix)]
+    async fn asyncstd_lmtp_transport_sends_over_unix_socket() {
+        let server = spawn_unix_lmtp_delivery_server();
+
+        let envelope = Envelope::new(
+            Some("sender@example.com".parse().unwrap()),
+            vec![
+                "first@example.com".parse().unwrap(),
+                "second@example.com".parse().unwrap(),
+                "third@example.com".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mailer: AsyncLmtpTransport<AsyncStd1Executor> =
+            AsyncLmtpTransport::<AsyncStd1Executor>::unix_socket(server.path.clone()).build();
+
+        let responses = mailer
+            .send_raw(&envelope, b"Subject: test\r\n\r\nHello")
+            .await
+            .unwrap();
+
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].has_code(250));
+        assert!(responses[1].has_code(550));
+        assert!(responses[2].has_code(451));
 
         let commands = server.commands();
         assert_lmtp_delivery_commands(&commands);

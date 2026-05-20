@@ -55,8 +55,7 @@ pub(super) fn fws(input: &str) -> IResult<&str, Option<char>> {
 
 // CFWS            =       *([FWS] comment) (([FWS] comment) / FWS)
 pub(super) fn cfws(input: &str) -> IResult<&str, Option<char>> {
-    // TODO: comment are not currently supported, so for now a cfws is
-    // the same as a fws.
+    // Comments are not currently supported, so CFWS is parsed as FWS.
     fws(input)
 }
 

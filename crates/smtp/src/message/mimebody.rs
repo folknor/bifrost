@@ -182,6 +182,9 @@ pub enum MultiPartKind {
     /// For example, you can include images in HTML content using that.
     Related,
 
+    /// Report kind for delivery-status, disposition-notification, and other reports.
+    Report { report_type: String },
+
     /// Encrypted kind for encrypted messages
     Encrypted { protocol: String },
 
@@ -205,11 +208,13 @@ impl MultiPartKind {
                 Self::Mixed => "mixed",
                 Self::Alternative => "alternative",
                 Self::Related => "related",
+                Self::Report { .. } => "report",
                 Self::Encrypted { .. } => "encrypted",
                 Self::Signed { .. } => "signed",
             },
             boundary,
             match self {
+                Self::Report { report_type } => format!("; report-type=\"{report_type}\""),
                 Self::Encrypted { protocol } => format!("; protocol=\"{protocol}\""),
                 Self::Signed { protocol, micalg } =>
                     format!("; protocol=\"{protocol}\"; micalg=\"{micalg}\""),
@@ -225,6 +230,9 @@ impl MultiPartKind {
             "mixed" => Some(Self::Mixed),
             "alternative" => Some(Self::Alternative),
             "related" => Some(Self::Related),
+            "report" => m.get_param("report-type").map(|report_type| Self::Report {
+                report_type: report_type.as_str().to_owned(),
+            }),
             "signed" => m.get_param("protocol").and_then(|p| {
                 m.get_param("micalg").map(|micalg| Self::Signed {
                     protocol: p.as_str().to_owned(),
@@ -295,9 +303,25 @@ impl MultiPartBuilder {
         self.build().singlepart(part)
     }
 
+    /// Creates multipart using multiple singleparts
+    pub fn singleparts<I>(self, parts: I) -> MultiPart
+    where
+        I: IntoIterator<Item = SinglePart>,
+    {
+        self.build().singleparts(parts)
+    }
+
     /// Creates multipart using multipart
     pub fn multipart(self, part: MultiPart) -> MultiPart {
         self.build().multipart(part)
+    }
+
+    /// Creates multipart using multiple multiparts
+    pub fn multiparts<I>(self, parts: I) -> MultiPart
+    where
+        I: IntoIterator<Item = MultiPart>,
+    {
+        self.build().multiparts(parts)
     }
 }
 
@@ -341,6 +365,13 @@ impl MultiPart {
         MultiPart::builder().kind(MultiPartKind::Related)
     }
 
+    /// Creates report multipart builder.
+    ///
+    /// Shortcut for `MultiPart::builder().kind(MultiPartKind::Report { report_type })`
+    pub fn report(report_type: String) -> MultiPartBuilder {
+        MultiPart::builder().kind(MultiPartKind::Report { report_type })
+    }
+
     /// Creates encrypted multipart builder
     ///
     /// Shortcut for `MultiPart::builder().kind(MultiPartKind::Encrypted{ protocol })`
@@ -368,9 +399,27 @@ impl MultiPart {
         self
     }
 
+    /// Add multiple single parts to multipart
+    pub fn singleparts<I>(mut self, parts: I) -> Self
+    where
+        I: IntoIterator<Item = SinglePart>,
+    {
+        self.parts.extend(parts.into_iter().map(Part::Single));
+        self
+    }
+
     /// Add multi part to multipart
     pub fn multipart(mut self, part: MultiPart) -> Self {
         self.parts.push(Part::Multi(part));
+        self
+    }
+
+    /// Add multiple multipart parts to multipart
+    pub fn multiparts<I>(mut self, parts: I) -> Self
+    where
+        I: IntoIterator<Item = MultiPart>,
+    {
+        self.parts.extend(parts.into_iter().map(Part::Multi));
         self
     }
 
@@ -546,6 +595,76 @@ mod test {
                 "Content-Transfer-Encoding: 7bit\r\n",
                 "\r\n",
                 "hello\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn multi_part_accepts_multiple_singleparts() {
+        let attachments = vec![
+            SinglePart::builder()
+                .header(header::ContentDisposition::attachment("a.txt"))
+                .body(String::from("alpha")),
+            SinglePart::builder()
+                .header(header::ContentDisposition::attachment("b.txt"))
+                .body(String::from("beta")),
+        ];
+        let part = MultiPart::mixed()
+            .boundary("0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
+            .singleparts(attachments);
+
+        assert_eq!(
+            String::from_utf8(part.formatted()).unwrap(),
+            concat!(
+                "Content-Type: multipart/mixed;\r\n",
+                " boundary=\"0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\"\r\n",
+                "\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "Content-Disposition: attachment; filename=\"a.txt\"\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 7bit\r\n",
+                "\r\n",
+                "alpha\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "Content-Disposition: attachment; filename=\"b.txt\"\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 7bit\r\n",
+                "\r\n",
+                "beta\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn multi_part_report() {
+        let part = MultiPart::report("delivery-status".to_owned())
+            .boundary("0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
+            .singlepart(SinglePart::plain("Delivery failed".to_owned()))
+            .singlepart(
+                SinglePart::builder()
+                    .header(header::ContentType::parse("message/delivery-status").unwrap())
+                    .body(String::from("Final-Recipient: rfc822; user@example.com")),
+            );
+
+        assert_eq!(
+            String::from_utf8(part.formatted()).unwrap(),
+            concat!(
+                "Content-Type: multipart/report;\r\n",
+                " boundary=\"0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\";\r\n",
+                " report-type=\"delivery-status\"\r\n",
+                "\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "Content-Transfer-Encoding: 7bit\r\n",
+                "\r\n",
+                "Delivery failed\r\n",
+                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "Content-Type: message/delivery-status\r\n",
+                "Content-Transfer-Encoding: 7bit\r\n",
+                "\r\n",
+                "Final-Recipient: rfc822; user@example.com\r\n",
                 "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n"
             )
         );

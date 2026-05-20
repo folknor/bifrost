@@ -193,8 +193,6 @@ where
         use async_std::process::Command;
 
         let mut c = Command::new(&self.inner.command);
-        // TODO: figure out why enabling this kills it earlier
-        // c.kill_on_drop(true);
         c.arg("-i");
         if let Some(from) = envelope.from() {
             c.arg("-f").arg(from);

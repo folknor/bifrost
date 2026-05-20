@@ -415,8 +415,6 @@ impl MessageBuilder {
         self
     }
 
-    // TODO: High-level methods for attachments and embedded files
-
     /// Create message from body
     fn build(self, body: MessageBody) -> Result<Message, EmailError> {
         // Check for missing required headers

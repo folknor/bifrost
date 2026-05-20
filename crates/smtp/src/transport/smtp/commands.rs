@@ -12,6 +12,16 @@ use crate::{
     },
 };
 
+fn validate_single_line_argument(command: &str, argument: &str) -> Result<(), Error> {
+    if argument.chars().any(char::is_control) {
+        return Err(error::client(format!(
+            "{command} argument must not contain control characters"
+        )));
+    }
+
+    Ok(())
+}
+
 /// EHLO command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -131,6 +141,31 @@ impl Display for Data {
     }
 }
 
+/// BDAT command
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Bdat {
+    size: usize,
+    last: bool,
+}
+
+impl Display for Bdat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "BDAT {}", self.size)?;
+        if self.last {
+            f.write_str(" LAST")?;
+        }
+        f.write_str("\r\n")
+    }
+}
+
+impl Bdat {
+    /// Creates a BDAT command.
+    pub fn new(size: usize, last: bool) -> Bdat {
+        Bdat { size, last }
+    }
+}
+
 /// QUIT command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -192,8 +227,9 @@ impl Display for Vrfy {
 
 impl Vrfy {
     /// Creates a VRFY command
-    pub fn new(argument: String) -> Vrfy {
-        Vrfy { argument }
+    pub fn new(argument: String) -> Result<Vrfy, Error> {
+        validate_single_line_argument("VRFY", &argument)?;
+        Ok(Vrfy { argument })
     }
 }
 
@@ -212,8 +248,9 @@ impl Display for Expn {
 
 impl Expn {
     /// Creates an EXPN command
-    pub fn new(argument: String) -> Expn {
-        Expn { argument }
+    pub fn new(argument: String) -> Result<Expn, Error> {
+        validate_single_line_argument("EXPN", &argument)?;
+        Ok(Expn { argument })
     }
 }
 
@@ -364,6 +401,8 @@ mod test {
             format!("{}", Rcpt::new(email, vec![rcpt_parameter])),
             "RCPT TO:<test@example.com> TEST=value\r\n"
         );
+        assert_eq!(format!("{}", Bdat::new(42, false)), "BDAT 42\r\n");
+        assert_eq!(format!("{}", Bdat::new(42, true)), "BDAT 42 LAST\r\n");
         assert_eq!(format!("{Quit}"), "QUIT\r\n");
         assert_eq!(format!("{Data}"), "DATA\r\n");
         assert_eq!(format!("{Noop}"), "NOOP\r\n");
@@ -372,8 +411,16 @@ mod test {
             format!("{}", Help::new(Some("test".to_owned()))),
             "HELP test\r\n"
         );
-        assert_eq!(format!("{}", Vrfy::new("test".to_owned())), "VRFY test\r\n");
-        assert_eq!(format!("{}", Expn::new("test".to_owned())), "EXPN test\r\n");
+        assert_eq!(
+            format!("{}", Vrfy::new("test".to_owned()).unwrap()),
+            "VRFY test\r\n"
+        );
+        assert_eq!(
+            format!("{}", Expn::new("test".to_owned()).unwrap()),
+            "EXPN test\r\n"
+        );
+        assert!(Vrfy::new("safe\r\nNOOP".to_owned()).is_err());
+        assert!(Expn::new("safe\u{85}NOOP".to_owned()).is_err());
         assert_eq!(format!("{Rset}"), "RSET\r\n");
         let credentials = Credentials::password("user".to_owned(), "password".to_owned());
         assert_eq!(

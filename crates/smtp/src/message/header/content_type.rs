@@ -36,6 +36,18 @@ impl ContentType {
         Ok(Self::from_mime(s.parse().map_err(ContentTypeErr)?))
     }
 
+    /// A `ContentType` of type `text/plain; charset=utf-8; format=flowed`.
+    pub fn text_plain_flowed() -> ContentType {
+        Self::parse("text/plain; charset=utf-8; format=flowed")
+            .expect("static text/plain flowed MIME type must parse")
+    }
+
+    /// A `ContentType` of type `text/plain; charset=utf-8; format=flowed; delsp=yes`.
+    pub fn text_plain_flowed_delsp() -> ContentType {
+        Self::parse("text/plain; charset=utf-8; format=flowed; delsp=yes")
+            .expect("static text/plain flowed MIME type must parse")
+    }
+
     pub(crate) const fn from_mime(mime: Mime) -> Self {
         Self(mime)
     }
@@ -169,6 +181,20 @@ mod test {
         assert_eq!(
             headers.to_string(),
             "Content-Type: text/html; charset=utf-8\r\n"
+        );
+
+        headers.set(ContentType::text_plain_flowed());
+
+        assert_eq!(
+            headers.to_string(),
+            "Content-Type: text/plain; charset=utf-8; format=flowed\r\n"
+        );
+
+        headers.set(ContentType::text_plain_flowed_delsp());
+
+        assert_eq!(
+            headers.to_string(),
+            "Content-Type: text/plain; charset=utf-8; format=flowed; delsp=yes\r\n"
         );
     }
 
