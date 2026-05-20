@@ -1,12 +1,11 @@
 #[cfg(feature = "tokio1-native-tls")]
 use std::mem;
+#[cfg(any(feature = "tokio1", feature = "async-std1"))]
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(feature = "tokio1")]
-use std::{
-    fmt,
-    net::{IpAddr, SocketAddr},
-};
+use std::{fmt, net::IpAddr};
 use std::{
     future::Future,
     pin::Pin,
@@ -92,6 +91,44 @@ impl AsyncDeadline {
     }
 }
 
+#[cfg(feature = "tokio1")]
+async fn resolve_tokio1_lookup_until<I, F>(
+    deadline: AsyncDeadline,
+    local_addr: Option<IpAddr>,
+    lookup: F,
+) -> Result<Vec<SocketAddr>, Error>
+where
+    F: Future<Output = std::io::Result<I>>,
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let addrs = deadline
+        .timeout_tokio1("DNS lookup timed out", lookup)
+        .await?
+        .map_err(error::connection)?;
+
+    Ok(addrs
+        .into_iter()
+        .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr))
+        .collect())
+}
+
+#[cfg(feature = "async-std1")]
+async fn resolve_asyncstd1_lookup_until<I, F>(
+    deadline: AsyncDeadline,
+    lookup: F,
+) -> Result<Vec<SocketAddr>, Error>
+where
+    F: Future<Output = std::io::Result<I>>,
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let addrs = deadline
+        .timeout_asyncstd1("DNS lookup timed out", lookup)
+        .await?
+        .map_err(error::connection)?;
+
+    Ok(addrs.into_iter().collect())
+}
+
 /// A network stream
 #[derive(Debug)]
 #[deprecated(
@@ -173,12 +210,12 @@ impl AsyncNetworkStream {
             deadline: AsyncDeadline,
             local_addr: Option<IpAddr>,
         ) -> Result<Tokio1TcpStream, Error> {
-            let lookup = tokio1_crate::net::lookup_host(server);
-            let addrs = deadline
-                .timeout_tokio1("DNS lookup timed out", lookup)
-                .await?
-                .map_err(error::connection)?
-                .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
+            let addrs = resolve_tokio1_lookup_until(
+                deadline,
+                local_addr,
+                tokio1_crate::net::lookup_host(server),
+            )
+            .await?;
 
             let mut last_err = None;
 
@@ -249,10 +286,7 @@ impl AsyncNetworkStream {
             server: T,
             deadline: AsyncDeadline,
         ) -> Result<AsyncStd1TcpStream, Error> {
-            let addrs = deadline
-                .timeout_asyncstd1("DNS lookup timed out", server.to_socket_addrs())
-                .await?
-                .map_err(error::connection)?;
+            let addrs = resolve_asyncstd1_lookup_until(deadline, server.to_socket_addrs()).await?;
 
             let mut last_err = None;
 
@@ -508,5 +542,72 @@ impl FuturesAsyncWrite for AsyncNetworkStream {
                 Poll::Ready(Ok(()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "tokio1")]
+mod tokio1_test {
+    use std::{future::pending, net::TcpListener, thread, time::Duration};
+
+    use super::*;
+
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn tokio_dns_lookup_uses_deadline() {
+        let result = resolve_tokio1_lookup_until(
+            AsyncDeadline::new(Some(Duration::from_millis(25))),
+            None,
+            pending::<std::io::Result<Vec<SocketAddr>>>(),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+    }
+
+    #[cfg(feature = "tokio1-native-tls")]
+    #[allow(deprecated)]
+    #[tokio1_crate::test(crate = "tokio1_crate")]
+    async fn tokio_tls_handshake_uses_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let tls_parameters = TlsParameters::new("localhost".to_owned()).unwrap();
+        let result = AsyncNetworkStream::connect_tokio1_until(
+            address,
+            AsyncDeadline::new(Some(Duration::from_millis(50))),
+            Some(tls_parameters),
+            None,
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
+        handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "async-std1")]
+mod asyncstd_test {
+    use std::{future::pending, time::Duration};
+
+    use super::*;
+
+    #[async_std::test]
+    async fn asyncstd_dns_lookup_uses_deadline() {
+        let result = resolve_asyncstd1_lookup_until(
+            AsyncDeadline::new(Some(Duration::from_millis(25))),
+            pending::<std::io::Result<Vec<SocketAddr>>>(),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert!(error.is_timeout(), "expected timeout, got {error:?}");
     }
 }

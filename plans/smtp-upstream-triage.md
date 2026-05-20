@@ -833,19 +833,101 @@ Verification:
 - From `crates/smtp`: `brokkr check` passed.
 - From workspace root: `git diff --check` passed.
 
+## Async DNS and TLS timeout edge coverage
+
+Implemented:
+
+- Extracted private async DNS resolution helpers so the timeout wrapper can be
+  tested with deterministic pending lookup futures instead of relying on host
+  resolver behavior.
+- Added tokio coverage proving a pending DNS lookup trips the shared setup
+  deadline with a timeout error.
+- Added async-std coverage for the same pending DNS lookup path.
+- Added tokio native-tls coverage where TCP connect succeeds but the peer
+  stalls before TLS handshake bytes are exchanged, proving the handshake also
+  uses the setup deadline.
+
+Verification:
+
+- From workspace root: `brokkr fmt` passed.
+- From workspace root: `brokkr check --package bifrost-smtp --features tokio1-native-tls -- -- tokio_tls_handshake_uses_deadline`
+  passed.
+- From workspace root: `brokkr check --package bifrost-smtp --features async-std1 -- -- asyncstd_dns_lookup_uses_deadline`
+  passed.
+
+## rsasl migration decision
+
+Decision: do not migrate the SMTP auth internals to `rsasl` in this pass.
+
+Rationale:
+
+- `rsasl` supports the mechanisms bifrost-smtp currently needs, including
+  `plain`, `login`, `oauthbearer`, and `xoauth2`, and a future migration could
+  use `default-features = false` with only those mechanism features enabled.
+- The current bifrost implementation is intentionally narrow: it formats
+  PLAIN, LOGIN, XOAUTH2, and OAUTHBEARER client responses behind bifrost-owned
+  `Credentials` and `Mechanism` types, with explicit OAuth2 credential
+  handling and protocol tests.
+- Moving to `rsasl` now would add a dependency, SASL session/config plumbing,
+  and property callbacks without adding a mechanism or fixing a known auth
+  behavior gap.
+- Revisit `rsasl` when bifrost-smtp needs mechanisms with real state machines
+  or security layers, such as SCRAM, GSSAPI, channel binding, or custom
+  provider integration. Keep the public API boundary bifrost-owned if that
+  migration happens.
+
+## Current upstream triage refresh
+
+Checked on 2026-05-20 against the current `lettre/lettre` open issue and PR
+lists.
+
+Implemented:
+
+- #1106 / #1107: added the conventional `Address::new_unchecked(user, domain)`
+  constructor while keeping `Address::new_dangerous(...)` as a compatibility
+  alias. Bifrost already allowed unchecked mailbox construction by composing
+  `Mailbox::new(name, Address::new_unchecked(...))`, so a separate
+  `Mailbox::new_unchecked` would duplicate the existing typed constructor.
+- #1120: added native-tls wrapper escape hatches for callers who need TLS
+  features that bifrost does not mirror directly:
+  `TlsParameters::from_inner(domain, native_tls::TlsConnector)`,
+  `From<(String, native_tls::TlsConnector)> for TlsParameters`,
+  `Certificate::from_inner(native_tls::Certificate)`,
+  `From<native_tls::Certificate> for Certificate`,
+  `Identity::from_inner(native_tls::Identity)`, and
+  `From<native_tls::Identity> for Identity`.
+
+Verification:
+
+- From workspace root: `brokkr fmt` passed.
+- From workspace root: `brokkr check --package bifrost-smtp --features builder -- -- test_unchecked`
+  passed.
+- From workspace root: `brokkr check --package bifrost-smtp --features native-tls -- -- tls_parameters_can_wrap_native_tls_connector`
+  passed.
+- From workspace root: `brokkr check --package bifrost-smtp --features tokio1-native-tls,async-std1`
+  passed.
+
+Decisions:
+
+- The current dependency PRs for OpenSSL, rustls-webpki, and rand do not apply
+  directly to bifrost-smtp's already-simplified native-tls-only surface.
+- #1126 wasm32-wasip2 sockets is not a fit for this fork's current SMTP
+  transport direction.
+- #962 GPGME, #963 PGP, #1117 S/MIME/PGP encryption, #341 S/MIME signing,
+  #1020 signing existing signatures, and #1025 S/MIME signing output are
+  message signing/encryption work. They should stay out of the SMTP transport
+  triage batch.
+
 ## Current TODO queue
 
-Next useful SMTP batches, after the post-LMTP cleanup commit:
+Next useful SMTP batches from this triage:
 
-- Decide whether and how to migrate the authentication internals to `rsasl`.
-  Keep bifrost-owned wrapper types at the public API boundary; do not expose
-  rsasl directly unless there is a concrete reason.
-- Add focused async DNS and TLS-handshake timeout edge coverage. The shared
-  setup-deadline machinery exists, but DNS and native-tls handshake failures
-  are not pinned with dedicated tests yet.
-- Continue upstream PR/issue triage now that connection state and LMTP support
-  are in place. Prefer small behavior fixes and API simplifications that fit
-  bifrost's native-tls-only, OIDC-first direction.
+- BDAT command pipelining remains deferred below because it changes response
+  draining and transaction recovery semantics after message body bytes have
+  already been sent.
+- The remaining current upstream issues are larger design areas rather than
+  small follow-up fixes: SCRAM/NTLM auth, MX delivery, SOCKS proxying,
+  message streaming, docs/examples, and broader builder API redesign.
 
 ## Daaki SMTP comparison notes
 

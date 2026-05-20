@@ -279,9 +279,29 @@ impl TlsParameters {
         TlsParametersBuilder::new(domain).build_native()
     }
 
+    /// Creates new [`TlsParameters`] from an existing native-tls connector.
+    ///
+    /// This is useful when callers need native-tls features that are not
+    /// mirrored directly by [`TlsParametersBuilder`].
+    #[cfg(feature = "native-tls")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+    pub fn from_inner(domain: String, connector: TlsConnector) -> Self {
+        Self {
+            connector: InnerTlsParameters::NativeTls { connector },
+            domain,
+        }
+    }
+
     #[cfg(feature = "native-tls")]
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+}
+
+#[cfg(feature = "native-tls")]
+impl From<(String, TlsConnector)> for TlsParameters {
+    fn from((domain, connector): (String, TlsConnector)) -> Self {
+        Self::from_inner(domain, connector)
     }
 }
 
@@ -309,6 +329,18 @@ impl Certificate {
         Ok(Self {
             native_tls: native_tls::Certificate::from_pem(pem).map_err(error::tls)?,
         })
+    }
+
+    /// Create a [`Certificate`] from an existing native-tls certificate.
+    pub fn from_inner(native_tls: native_tls::Certificate) -> Self {
+        Self { native_tls }
+    }
+}
+
+#[cfg(feature = "native-tls")]
+impl From<native_tls::Certificate> for Certificate {
+    fn from(native_tls: native_tls::Certificate) -> Self {
+        Self::from_inner(native_tls)
     }
 }
 
@@ -341,5 +373,31 @@ impl Identity {
         Ok(Self {
             native_tls: native_tls::Identity::from_pkcs8(pem, key).map_err(error::tls)?,
         })
+    }
+
+    /// Create an [`Identity`] from an existing native-tls identity.
+    pub fn from_inner(native_tls: native_tls::Identity) -> Self {
+        Self { native_tls }
+    }
+}
+
+#[cfg(feature = "native-tls")]
+impl From<native_tls::Identity> for Identity {
+    fn from(native_tls: native_tls::Identity) -> Self {
+        Self::from_inner(native_tls)
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "native-tls")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_parameters_can_wrap_native_tls_connector() {
+        let connector = native_tls::TlsConnector::builder().build().unwrap();
+        let parameters = TlsParameters::from(("smtp.example.com".to_owned(), connector));
+
+        assert_eq!(parameters.domain(), "smtp.example.com");
     }
 }
