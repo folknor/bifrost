@@ -9,7 +9,6 @@
 /// Every field can be `None` because servers may return NIL for any of them.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Envelope {
     /// Date from the Date header (RFC 5322 Section 3.3, RFC 3501 Section 7.4.2).
     pub date: Option<String>,
@@ -163,7 +162,6 @@ fn find_structural_angle(raw: &str, start: usize, target: u8) -> Option<usize> {
 /// Use [`EnvelopeAddress::is_group_start`] and [`EnvelopeAddress::is_group_end`] to detect these markers.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EnvelopeAddress {
     /// Display name, RFC 2047 decoded (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
     /// When UTF8=ACCEPT (RFC 6855 Section 3) is active, contains raw UTF-8

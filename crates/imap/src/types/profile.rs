@@ -5,7 +5,6 @@ use super::{AuthMechanism, Capability};
 /// Server-wide APPENDLIMIT policy advertised in CAPABILITY.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AppendLimitPolicy {
     /// The server did not advertise APPENDLIMIT.
     #[default]
@@ -25,7 +24,6 @@ pub enum AppendLimitPolicy {
 /// profile.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ServerProfile {
     /// Raw advertised capabilities.
     pub capabilities: Vec<Capability>,

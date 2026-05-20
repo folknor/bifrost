@@ -7,7 +7,6 @@ use super::{
 /// Options for selecting a mailbox for synchronization.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncSelectOptions {
     /// Open the mailbox read-only via EXAMINE.
     pub read_only: bool,
@@ -81,7 +80,6 @@ impl SyncSelectOptions {
 /// Result of selecting a mailbox for synchronization.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncSelectResult {
     /// Raw selected-mailbox data.
     pub mailbox: SelectedMailbox,
@@ -94,7 +92,6 @@ pub struct SyncSelectResult {
 /// Common fetch shape for mailbox synchronization.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncFetchRequest {
     /// UID set to fetch.
     pub uids: UidSet,
@@ -170,7 +167,6 @@ impl SyncFetchRequest {
 /// Result of a sync fetch.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncFetchResult {
     /// Fetched messages.
     pub fetches: Vec<FetchResponse>,

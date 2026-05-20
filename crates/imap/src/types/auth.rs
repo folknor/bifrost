@@ -71,7 +71,6 @@ impl fmt::Debug for Credentials {
 /// not expose that material. `authenticate_best` will therefore not silently
 /// treat a `*-PLUS` advertisement as the non-PLUS SCRAM mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AuthMechanism {
     /// SASL XOAUTH2 bearer-token authentication.
     XOAuth2,
@@ -104,7 +103,6 @@ impl AuthMechanism {
 /// Policy for automatic authentication mechanism selection.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AuthPolicy {
     /// Allow the legacy LOGIN command.
     ///
@@ -155,7 +153,6 @@ impl AuthPolicy {
 /// Result of automatic authentication.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AuthOutcome {
     /// Mechanism used for the successful authentication exchange.
     pub mechanism: AuthMechanism,

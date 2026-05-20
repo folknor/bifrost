@@ -6,7 +6,6 @@
 /// Parsed IMAP BODYSTRUCTURE (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BodyStructure {
     /// A single non-text, non-message part (e.g. image/png, application/pdf)
     /// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
@@ -129,7 +128,6 @@ pub enum BodyStructure {
 /// Content-Disposition from BODYSTRUCTURE extension data (RFC 2183).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ContentDisposition {
     /// Disposition type (e.g. `"inline"`, `"attachment"`) (RFC 2183 Section 2).
     pub disposition_type: String,

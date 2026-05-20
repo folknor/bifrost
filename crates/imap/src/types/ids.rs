@@ -10,7 +10,6 @@ macro_rules! nonzero_u32_id {
         #[doc = $doc]
         #[repr(transparent)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(NonZeroU32);
 
         impl $name {
@@ -64,7 +63,6 @@ macro_rules! u64_id {
         #[doc = $doc]
         #[repr(transparent)]
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
         pub struct $name(u64);
 
         impl $name {
@@ -99,7 +97,6 @@ u64_id!(GmailThreadId, "A Gmail X-GM-THRID value.");
 
 /// A typed UID set for UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UidSet(SequenceSet);
 
 impl UidSet {
@@ -179,7 +176,6 @@ impl fmt::Display for UidSet {
 
 /// A typed message sequence-number set for non-UID commands.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SeqSet(SequenceSet);
 
 impl SeqSet {

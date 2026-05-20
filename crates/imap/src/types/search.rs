@@ -44,7 +44,6 @@ use search_helpers::{push_parenthesized_if_compound, quote_imap_string, validate
 /// - RFC 9051 Section 6.4.4 (`IMAP4rev2` SEARCH)
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SearchCriteria {
     /// The accumulated criteria string.
     buf: String,

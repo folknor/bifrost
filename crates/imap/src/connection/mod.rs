@@ -67,7 +67,6 @@ mod tests;
 
 /// TLS policy for an IMAP connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TlsMode {
     /// Connect directly over TLS.
     Implicit,
@@ -90,7 +89,6 @@ impl TlsMode {
 /// TCP keepalive configuration for the underlying socket.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TcpKeepalive {
     /// Time before the first keepalive probe.
     pub time: Duration,
@@ -111,7 +109,6 @@ impl TcpKeepalive {
 /// are managed automatically by `ImapConnection` methods.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SessionState {
     /// Not Authenticated  -  client must authenticate (RFC 3501 Section 3.1).
     NotAuthenticated,
@@ -126,7 +123,6 @@ pub enum SessionState {
 /// Event received during an IDLE session (RFC 2177).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IdleEvent {
     /// New message(s) arrived  -  `* <n> EXISTS` (RFC 3501 Section 7.3.1).
     Exists(u32),
@@ -280,7 +276,6 @@ pub enum IdleEvent {
 /// highest mod-sequence value (RFC 7162 Section 3.1.5).
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SearchResult {
     /// Matching message sequence numbers (SEARCH) or UIDs (UID SEARCH).
     pub ids: Vec<u32>,

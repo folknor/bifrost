@@ -2,7 +2,6 @@
 /// (RFC 3501 Section 9 / RFC 4315 Section 2.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UidRange {
     /// First UID in this range (RFC 3501 Section 9 / RFC 4315 Section 2.1).
     pub start: u32,

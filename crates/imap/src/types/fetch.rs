@@ -11,7 +11,6 @@ use super::{BodyStructure, Envelope, Flag};
 /// (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FetchResponse {
     /// Message sequence number (RFC 3501 Section 7.4.2 / RFC 9051 Section 7.5.2).
     pub seq: u32,
@@ -80,7 +79,6 @@ pub struct FetchResponse {
 /// (RFC 3516 Section 4.2).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BinarySection {
     /// The numeric section path (e.g. `[1, 2, 3]` for `BINARY[1.2.3]`).
     pub section: Vec<u32>,
@@ -96,7 +94,6 @@ pub struct BinarySection {
 /// A single fetched body section (RFC 3501 Section 6.4.5).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BodySection {
     /// The section specification (e.g. `"HEADER"`, `"1.2"`, `"TEXT"`).
     pub section: String,
@@ -113,7 +110,6 @@ pub struct BodySection {
 /// (RFC 3501 Section 6.4.5 / RFC 9051 Section 6.4.5).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FetchAttr {
     /// UID (RFC 3501 Section 2.3.1.1).
     Uid,
@@ -298,7 +294,6 @@ pub(crate) fn format_fetch_attrs(attrs: &[FetchAttr]) -> String {
 /// `store-att-flags = (["+" / "-"] "FLAGS" [".SILENT"]) SP (flag-list / NIL)`
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StoreOperation {
     /// `+FLAGS`  -  add flags.
     Add,
@@ -326,7 +321,6 @@ pub enum StoreOperation {
 /// information so callers can detect partial failures.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StoreResult {
     /// Implicit FETCH responses with updated flags (RFC 3501 Section 6.4.6).
     ///
@@ -347,7 +341,6 @@ pub struct StoreResult {
 /// RFC 3502 Section 3.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AppendMessage {
     /// Flags to set on the appended message (RFC 3501 Section 6.3.11).
     pub flags: Vec<Flag>,

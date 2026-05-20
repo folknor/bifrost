@@ -8,7 +8,6 @@ use crate::TypedEvent;
 /// What a consumer should generally do after receiving an asynchronous event.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EventImpact {
     /// No immediate sync action is required.
     None,

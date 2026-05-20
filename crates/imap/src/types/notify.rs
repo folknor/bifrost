@@ -19,7 +19,6 @@
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MailboxFilter {
     /// `selected`  -  the currently selected mailbox; notifications delivered
     /// immediately, including expunges (RFC 5465 Section 6.1).
@@ -82,7 +81,6 @@ pub enum MailboxFilter {
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NotifyEvent {
     // --- Message events (RFC 5465 Sections 5.1-5.3, RFC 5423 Section 4.1-4.2) ---
     /// `MessageNew`  -  new message delivered or appended
@@ -168,7 +166,6 @@ pub enum NotifyEvent {
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NotifyEventGroup {
     /// Which mailboxes this event group applies to (RFC 5465 Section 6).
     pub filter: MailboxFilter,
@@ -195,7 +192,6 @@ impl NotifyEventGroup {
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NotifySetParams {
     /// When `true`, the server sends an initial STATUS response for each
     /// non-selected mailbox with message events before the tagged OK

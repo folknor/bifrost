@@ -8,7 +8,6 @@
 /// Comparison and hashing are case-insensitive per RFC 3501 Section 2.3.2.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Flag {
     /// `\Seen`  -  Message has been read (RFC 3501 Section 2.3.2 / RFC 9051 Section 2.3.2).
     Seen,

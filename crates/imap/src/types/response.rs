@@ -13,7 +13,6 @@ pub use super::uid_range::UidRange;
 /// (RFC 3501 Section 2.2.2 / RFC 9051 Section 2.2.2).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Response {
     /// Initial server greeting on connection (RFC 3501 Section 7.1).
     Greeting(GreetingResponse),
@@ -29,7 +28,6 @@ pub enum Response {
 /// (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GreetingResponse {
     /// Greeting status (`OK`, `PREAUTH`, or `BYE`) (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
     pub status: GreetingStatus,
@@ -42,7 +40,6 @@ pub struct GreetingResponse {
 /// Status of the server greeting (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GreetingStatus {
     /// `* OK`  -  server ready, client should authenticate.
     #[default]
@@ -57,7 +54,6 @@ pub enum GreetingStatus {
 /// (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TaggedResponse {
     /// Command tag that this response corresponds to (RFC 3501 Section 2.2.1 / RFC 9051 Section 2.2.1).
     pub tag: String,
@@ -88,7 +84,6 @@ impl TaggedResponse {
 /// Status of a tagged response (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StatusKind {
     #[default]
     Ok,
@@ -99,7 +94,6 @@ pub enum StatusKind {
 /// Status of an untagged status response (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UntaggedStatus {
     #[default]
     Ok,
@@ -111,7 +105,6 @@ pub enum UntaggedStatus {
 /// Untagged server response (RFC 3501 Section 7 / RFC 9051 Section 7).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UntaggedResponse {
     /// `* OK/NO/BAD/BYE [code] text` (RFC 3501 Section 7.1).
     Status {
@@ -230,7 +223,6 @@ pub enum UntaggedResponse {
 /// where `resp-text = ["[" resp-text-code "]" SP] text`.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ContinuationRequest {
     /// Optional response code in square brackets (RFC 3501 Section 7.5 / RFC 9051 Section 7.5).
     ///
@@ -246,7 +238,6 @@ pub struct ContinuationRequest {
 /// (RFC 3501 Section 7.1 / RFC 9051 Section 7.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResponseCode {
     /// `[ALERT]`  -  must be presented to the user (RFC 3501 Section 7.1).
     Alert,
@@ -419,7 +410,6 @@ pub enum ResponseCode {
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NamespaceDescriptor {
     /// Namespace prefix (e.g. `""`, `"INBOX."`, `"#shared."`) (RFC 2342 Section 5).
     pub prefix: String,
@@ -439,7 +429,6 @@ pub struct NamespaceDescriptor {
 /// positional tuple, making it safe to extend in the future.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NamespaceResponse {
     /// Personal namespaces (RFC 2342 Section 5).
     pub personal: Vec<NamespaceDescriptor>,
@@ -455,7 +444,6 @@ pub struct NamespaceResponse {
 /// each root.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QuotaRootResponse {
     /// Quota root names returned by the server (RFC 2087 Section 4.3).
     pub roots: Vec<String>,
@@ -472,7 +460,6 @@ pub struct QuotaRootResponse {
 /// rights that can be independently granted.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ListRightsResponse {
     /// Rights that are always granted to the identifier (RFC 4314 Section 3.4).
     pub required: String,
@@ -504,7 +491,6 @@ pub struct ListRightsResponse {
 ///   option MUST always be included in the ESEARCH response."
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EsearchResponse {
     /// Correlating tag from `(TAG "tagstring")`, if present
     /// (RFC 4466 Section 2.6.2 `search-correlator`).
@@ -532,7 +518,6 @@ pub struct EsearchResponse {
 /// to handle both cases.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExpungeResult {
     /// Classic EXPUNGE  -  sequence numbers of removed messages (RFC 3501 Section 7.4.1).
     ///
@@ -559,7 +544,6 @@ impl Default for ExpungeResult {
 /// (RFC 6851 Section 4.3). This struct captures both pieces of information.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MoveResult {
     /// The response code from the tagged OK, typically `COPYUID`
     /// (RFC 6851 Section 4.3).
@@ -576,7 +560,6 @@ pub struct MoveResult {
 /// tagged OK. This struct captures that response code.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CopyResult {
     /// The response code from the tagged OK, typically `COPYUID`
     /// (RFC 4315 Section 3). `None` when the server omits the response code.
@@ -589,7 +572,6 @@ pub struct CopyResult {
 /// only the changes since the last synchronization point.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QresyncParams {
     /// The UIDVALIDITY value from the last session (RFC 7162 Section 3.2.5.2).
     pub uid_validity: u32,
@@ -627,7 +609,6 @@ impl QresyncParams {
 /// variants for each combination.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectOptions {
     /// Enable CONDSTORE per-message mod-sequence tracking
     /// (RFC 7162 Section 3.1.1).
@@ -671,7 +652,6 @@ impl SelectOptions {
 /// the current usage, and the limit.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QuotaResource {
     /// Resource name (e.g. `"STORAGE"`, `"MESSAGE"`) (RFC 2087 Section 5.1).
     pub name: String,
@@ -686,7 +666,6 @@ pub struct QuotaResource {
 /// Each entry pairs an identifier (user or group name) with a rights string.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AclEntry {
     /// The identifier (user or group) this entry applies to (RFC 4314 Section 3.6).
     pub identifier: String,
@@ -704,7 +683,6 @@ pub struct AclEntry {
 /// so the value is stored as raw bytes rather than a UTF-8 string.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetadataEntry {
     /// Entry name (e.g. `/private/comment`, `/shared/vendor/foo`) (RFC 5464 Section 3.2).
     pub name: String,
@@ -732,7 +710,6 @@ pub struct MetadataEntry {
 /// pipeline).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetadataResult {
     /// All metadata entries from matching `METADATA` responses, merged.
     pub entries: Vec<MetadataEntry>,
@@ -754,7 +731,6 @@ pub struct MetadataResult {
 /// correspond to an existing message.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ThreadNode {
     /// UID (or sequence number) of this message, or `None` if this is a
     /// dummy parent (RFC 5256 Section 4).

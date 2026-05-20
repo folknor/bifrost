@@ -9,11 +9,6 @@ use std::sync::Arc;
 use crate::types::{AuthMechanism, ResponseCode};
 
 /// Error type for IMAP client operations.
-///
-/// Implements `Serialize`/`Deserialize` behind the `serde` feature flag.
-/// The [`Io`](Error::Io) variant is serialized as its
-/// [`ErrorKind`](std::io::ErrorKind) name and message string; on
-/// deserialization an `std::io::Error` is reconstructed from these fields.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -336,7 +331,6 @@ impl Error {
 /// Broad error category for consumer policy decisions.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ErrorCategory {
     Connection,
     Transport,
@@ -360,7 +354,6 @@ pub enum ErrorCategory {
 /// Structured reason automatic authentication could not select a mechanism.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AuthPolicyFailure {
     /// Mechanisms or commands the server offered for the supplied credential type.
     pub offered: Vec<String>,
@@ -404,7 +397,6 @@ impl std::fmt::Display for AuthPolicyFailure {
 /// Offered authentication mechanism rejected by local policy.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AuthMechanismRejection {
     /// Mechanism or legacy command rejected by policy.
     pub mechanism: AuthMechanism,
@@ -421,7 +413,6 @@ impl AuthMechanismRejection {
 /// Local policy reason for rejecting an offered authentication mechanism.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AuthMechanismRejectionReason {
     /// Mechanism is disabled by local policy.
     DisabledByPolicy,
@@ -488,7 +479,6 @@ impl ErrorCategory {
 /// Suggested high-level recovery action for an IMAP error.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Recovery {
     /// The same request may be retried, but reconnecting may also be needed.
     RetryOrReconnect,
@@ -506,253 +496,6 @@ pub enum Recovery {
     RebuildNotificationRegistration,
     /// Do not retry automatically.
     DoNotRetry,
-}
-
-// ---------------------------------------------------------------------------
-// Serde support  -  custom Serialize/Deserialize behind the `serde` feature
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "serde")]
-mod serde_support {
-    use super::{Arc, AuthPolicyFailure, Error, ResponseCode};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    /// Convert an [`std::io::ErrorKind`] to its stable `Debug` name
-    /// (e.g., `"ConnectionReset"`) for serialization.
-    fn error_kind_to_str(kind: std::io::ErrorKind) -> &'static str {
-        match kind {
-            std::io::ErrorKind::NotFound => "NotFound",
-            std::io::ErrorKind::PermissionDenied => "PermissionDenied",
-            std::io::ErrorKind::ConnectionRefused => "ConnectionRefused",
-            std::io::ErrorKind::ConnectionReset => "ConnectionReset",
-            std::io::ErrorKind::ConnectionAborted => "ConnectionAborted",
-            std::io::ErrorKind::NotConnected => "NotConnected",
-            std::io::ErrorKind::AddrInUse => "AddrInUse",
-            std::io::ErrorKind::AddrNotAvailable => "AddrNotAvailable",
-            std::io::ErrorKind::BrokenPipe => "BrokenPipe",
-            std::io::ErrorKind::AlreadyExists => "AlreadyExists",
-            std::io::ErrorKind::WouldBlock => "WouldBlock",
-            std::io::ErrorKind::InvalidInput => "InvalidInput",
-            std::io::ErrorKind::InvalidData => "InvalidData",
-            std::io::ErrorKind::TimedOut => "TimedOut",
-            std::io::ErrorKind::WriteZero => "WriteZero",
-            std::io::ErrorKind::Interrupted => "Interrupted",
-            std::io::ErrorKind::Unsupported => "Unsupported",
-            std::io::ErrorKind::UnexpectedEof => "UnexpectedEof",
-            std::io::ErrorKind::OutOfMemory => "OutOfMemory",
-            _ => "Other",
-        }
-    }
-
-    /// Reconstruct an [`std::io::ErrorKind`] from its `Debug` name.
-    /// Unrecognised names map to [`std::io::ErrorKind::Other`].
-    fn error_kind_from_str(s: &str) -> std::io::ErrorKind {
-        match s {
-            "NotFound" => std::io::ErrorKind::NotFound,
-            "PermissionDenied" => std::io::ErrorKind::PermissionDenied,
-            "ConnectionRefused" => std::io::ErrorKind::ConnectionRefused,
-            "ConnectionReset" => std::io::ErrorKind::ConnectionReset,
-            "ConnectionAborted" => std::io::ErrorKind::ConnectionAborted,
-            "NotConnected" => std::io::ErrorKind::NotConnected,
-            "AddrInUse" => std::io::ErrorKind::AddrInUse,
-            "AddrNotAvailable" => std::io::ErrorKind::AddrNotAvailable,
-            "BrokenPipe" => std::io::ErrorKind::BrokenPipe,
-            "AlreadyExists" => std::io::ErrorKind::AlreadyExists,
-            "WouldBlock" => std::io::ErrorKind::WouldBlock,
-            "InvalidInput" => std::io::ErrorKind::InvalidInput,
-            "InvalidData" => std::io::ErrorKind::InvalidData,
-            "TimedOut" => std::io::ErrorKind::TimedOut,
-            "WriteZero" => std::io::ErrorKind::WriteZero,
-            "Interrupted" => std::io::ErrorKind::Interrupted,
-            "Unsupported" => std::io::ErrorKind::Unsupported,
-            "UnexpectedEof" => std::io::ErrorKind::UnexpectedEof,
-            "OutOfMemory" => std::io::ErrorKind::OutOfMemory,
-            _ => std::io::ErrorKind::Other,
-        }
-    }
-
-    /// Serializable representation of an [`std::io::Error`].
-    #[derive(Serialize, Deserialize)]
-    struct IoFields {
-        kind: String,
-        message: String,
-    }
-
-    /// Serde-compatible mirror of [`Error`].
-    ///
-    /// Uses adjacently-tagged representation (`"type"` + `"data"`) so that
-    /// unit variants serialize cleanly and struct variants keep their field names.
-    #[derive(Serialize, Deserialize)]
-    #[serde(tag = "type", content = "data")]
-    enum ErrorRepr {
-        Io(IoFields),
-        Auth {
-            text: String,
-            code: Option<ResponseCode>,
-        },
-        No {
-            text: String,
-            code: Option<ResponseCode>,
-        },
-        Bad {
-            text: String,
-            code: Option<ResponseCode>,
-        },
-        Bye {
-            text: String,
-            code: Option<ResponseCode>,
-        },
-        Protocol {
-            message: String,
-        },
-        Parse {
-            message: String,
-        },
-        Timeout,
-        Closed,
-        StartTlsUnavailable,
-        AuthPolicy {
-            failure: AuthPolicyFailure,
-        },
-        MissingCapability {
-            capability: String,
-        },
-        AppendLimit {
-            size: u64,
-            limit: u64,
-        },
-        FetchLimit {
-            estimated: usize,
-            limit: usize,
-            seq: u32,
-            uid: Option<u32>,
-        },
-        InvalidAppendDate {
-            date: String,
-        },
-        Internal {
-            message: String,
-        },
-        DriverPanicked {
-            message: String,
-        },
-        DriverGone,
-    }
-
-    impl From<&Error> for ErrorRepr {
-        fn from(err: &Error) -> Self {
-            match err {
-                Error::Io(e) => Self::Io(IoFields {
-                    kind: error_kind_to_str(e.kind()).to_owned(),
-                    message: e.to_string(),
-                }),
-                Error::Auth { text, code } => Self::Auth {
-                    text: text.clone(),
-                    code: code.clone(),
-                },
-                Error::No { text, code } => Self::No {
-                    text: text.clone(),
-                    code: code.clone(),
-                },
-                Error::Bad { text, code } => Self::Bad {
-                    text: text.clone(),
-                    code: code.clone(),
-                },
-                Error::Bye { text, code } => Self::Bye {
-                    text: text.clone(),
-                    code: code.clone(),
-                },
-                Error::Protocol(msg) => Self::Protocol {
-                    message: msg.clone(),
-                },
-                Error::Parse(msg) => Self::Parse {
-                    message: msg.clone(),
-                },
-                Error::Timeout => Self::Timeout,
-                Error::Closed => Self::Closed,
-                Error::StartTlsUnavailable => Self::StartTlsUnavailable,
-                Error::AuthPolicy(failure) => Self::AuthPolicy {
-                    failure: failure.clone(),
-                },
-                Error::MissingCapability(cap) => Self::MissingCapability {
-                    capability: cap.clone(),
-                },
-                Error::AppendLimit { size, limit } => Self::AppendLimit {
-                    size: *size,
-                    limit: *limit,
-                },
-                Error::FetchLimit {
-                    estimated,
-                    limit,
-                    seq,
-                    uid,
-                } => Self::FetchLimit {
-                    estimated: *estimated,
-                    limit: *limit,
-                    seq: *seq,
-                    uid: *uid,
-                },
-                Error::InvalidAppendDate(msg) => Self::InvalidAppendDate { date: msg.clone() },
-                Error::Internal(msg) => Self::Internal {
-                    message: msg.clone(),
-                },
-                Error::DriverPanicked(msg) => Self::DriverPanicked {
-                    message: msg.clone(),
-                },
-                Error::DriverGone => Self::DriverGone,
-            }
-        }
-    }
-
-    impl From<ErrorRepr> for Error {
-        fn from(repr: ErrorRepr) -> Self {
-            match repr {
-                ErrorRepr::Io(fields) => {
-                    let kind = error_kind_from_str(&fields.kind);
-                    Self::Io(Arc::new(std::io::Error::new(kind, fields.message)))
-                }
-                ErrorRepr::Auth { text, code } => Self::Auth { text, code },
-                ErrorRepr::No { text, code } => Self::No { text, code },
-                ErrorRepr::Bad { text, code } => Self::Bad { text, code },
-                ErrorRepr::Bye { text, code } => Self::Bye { text, code },
-                ErrorRepr::Protocol { message } => Self::Protocol(message),
-                ErrorRepr::Parse { message } => Self::Parse(message),
-                ErrorRepr::Timeout => Self::Timeout,
-                ErrorRepr::Closed => Self::Closed,
-                ErrorRepr::StartTlsUnavailable => Self::StartTlsUnavailable,
-                ErrorRepr::AuthPolicy { failure } => Self::AuthPolicy(failure),
-                ErrorRepr::MissingCapability { capability } => Self::MissingCapability(capability),
-                ErrorRepr::AppendLimit { size, limit } => Self::AppendLimit { size, limit },
-                ErrorRepr::FetchLimit {
-                    estimated,
-                    limit,
-                    seq,
-                    uid,
-                } => Self::FetchLimit {
-                    estimated,
-                    limit,
-                    seq,
-                    uid,
-                },
-                ErrorRepr::InvalidAppendDate { date } => Self::InvalidAppendDate(date),
-                ErrorRepr::Internal { message } => Self::Internal(message),
-                ErrorRepr::DriverPanicked { message } => Self::DriverPanicked(message),
-                ErrorRepr::DriverGone => Self::DriverGone,
-            }
-        }
-    }
-
-    impl Serialize for Error {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            ErrorRepr::from(self).serialize(serializer)
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Error {
-        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            ErrorRepr::deserialize(deserializer).map(Self::from)
-        }
-    }
 }
 
 #[cfg(test)]

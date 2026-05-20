@@ -3,7 +3,6 @@
 /// Comparison and hashing are case-insensitive per RFC 3501 Section 7.2.1.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Capability {
     /// `IMAP4rev1` (RFC 3501).
     Imap4Rev1,

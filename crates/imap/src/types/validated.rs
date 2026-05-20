@@ -14,7 +14,6 @@ use std::fmt;
 /// Error returned when constructing a validated IMAP protocol type from an
 /// invalid string.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[error("{0}")]
 pub struct ValidationError(String);
 
@@ -50,8 +49,6 @@ impl ValidationError {
 /// Construction validates the full ABNF and rejects empty, malformed,
 /// or overflowing values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 pub struct SequenceSet(String);
 
 impl SequenceSet {
@@ -207,8 +204,6 @@ pub(crate) fn is_valid_sequence_set(s: &str) -> bool {
 /// Used for flag keywords (`flag-keyword = atom`, RFC 3501 Section 9)
 /// and other protocol atoms.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 pub struct ImapAtom(String);
 
 impl ImapAtom {
@@ -341,8 +336,6 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// let _: MailboxName = "Inbox".into();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 pub struct MailboxName(String);
 
 impl MailboxName {
@@ -441,8 +434,6 @@ impl From<MailboxName> for String {
 ///
 /// Used for `MAILBOXID`, `EMAILID`, and `THREADID` values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 pub struct ObjectId(String);
 
 impl ObjectId {

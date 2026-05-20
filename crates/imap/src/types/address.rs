@@ -7,7 +7,6 @@
 /// that tuple at the protocol boundary.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Address {
     /// Display name, if one was provided by the server.
     pub name: Option<String>,

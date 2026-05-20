@@ -11,7 +11,6 @@ use super::validated::MailboxName;
 /// (RFC 3501 Section 7.2.2 / RFC 9051 Section 7.2.2).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MailboxInfo {
     /// Mailbox name (UTF-8; MUTF-7 decoded if necessary)
     /// (RFC 3501 Section 7.2.2 / RFC 9051 Section 7.2.2).
@@ -41,7 +40,6 @@ pub struct MailboxInfo {
 /// Comparison and hashing are case-insensitive per RFC 5258 Section 4.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MailboxAttribute {
     // --- RFC 3501 Section 7.2.2 / RFC 9051 Section 7.2.2 base attributes ---
     /// `\Noinferiors`  -  no child mailboxes possible (RFC 3501 Section 7.2.2).
@@ -348,7 +346,6 @@ impl std::fmt::Display for MailboxAttribute {
 /// with name-based fallback (case-insensitive match on well-known names).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SpecialUse {
     /// The primary mailbox (implicit, not defined in RFC 6154).
     Inbox,
@@ -422,7 +419,6 @@ impl MailboxInfo {
 /// (RFC 3501 Section 6.3.1 / RFC 9051 Section 6.3.1).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectedMailbox {
     /// Number of messages in the mailbox (RFC 3501 Section 7.3.1).
     pub exists: u32,
@@ -480,7 +476,6 @@ pub struct SelectedMailbox {
 /// A STATUS response item (RFC 3501 Section 6.3.10 / RFC 9051 Section 6.3.11).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StatusItem {
     /// `MESSAGES`  -  number of messages in the mailbox (RFC 3501 Section 6.3.10).
     Messages(u32),
@@ -518,7 +513,6 @@ pub enum StatusItem {
 /// When NOTIFY is not active, [`ambiguous`](Self::ambiguous) is always empty.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StatusResult {
     /// Status items from the primary (solicited) response.
     ///
