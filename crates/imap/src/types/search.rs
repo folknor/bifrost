@@ -29,10 +29,9 @@ use super::validated::{is_valid_sequence_set, validate_atom_bytes};
 #[path = "search_helpers.rs"]
 mod search_helpers;
 
-use search_helpers::{
-    count_top_level_tokens, is_compound, push_parenthesized_if_compound, quote_imap_string,
-    validate_imap_date,
-};
+#[cfg(test)]
+use search_helpers::{count_top_level_tokens, is_compound};
+use search_helpers::{push_parenthesized_if_compound, quote_imap_string, validate_imap_date};
 
 /// A builder for type-safe IMAP SEARCH criteria (RFC 3501 Section 6.4.4).
 ///

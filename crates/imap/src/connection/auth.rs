@@ -770,7 +770,7 @@ fn generate_scram_nonce() -> Result<String, Error> {
     use base64::Engine;
 
     let mut bytes = [0u8; 18];
-    getrandom::getrandom(&mut bytes)
+    getrandom::fill(&mut bytes)
         .map_err(|e| Error::Protocol(format!("failed to generate SCRAM nonce: {e}")))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }

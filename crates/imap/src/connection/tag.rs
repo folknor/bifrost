@@ -28,7 +28,7 @@ impl TagGenerator {
     #[allow(clippy::expect_used)] // getrandom failure = no OS entropy source; unrecoverable.
     pub(crate) fn new() -> Self {
         let mut bytes = [0u8; 4];
-        getrandom::getrandom(&mut bytes).expect("getrandom failed  -  no OS entropy source");
+        getrandom::fill(&mut bytes).expect("getrandom failed  -  no OS entropy source");
         let prefix = u32::from_le_bytes(bytes);
         Self { prefix, counter: 0 }
     }
@@ -42,7 +42,7 @@ impl TagGenerator {
     pub(crate) fn next(&mut self) -> String {
         if self.counter == u32::MAX {
             let mut bytes = [0u8; 4];
-            getrandom::getrandom(&mut bytes).expect("getrandom failed  -  no OS entropy source");
+            getrandom::fill(&mut bytes).expect("getrandom failed  -  no OS entropy source");
             self.prefix = u32::from_le_bytes(bytes);
             self.counter = 0;
         } else {
