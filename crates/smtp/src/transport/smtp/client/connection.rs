@@ -18,9 +18,7 @@ use crate::{
     transport::smtp::{
         Protocol,
         authentication::{Credentials, Mechanism},
-        commands::{
-            Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Quit, Rcpt, Rset, Starttls, Vrfy,
-        },
+        commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
         error,
         error::Error,
         extension::{
@@ -652,7 +650,6 @@ impl SmtpConnection {
         }
     }
 
-    #[cfg_attr(not(feature = "pool"), allow(dead_code))]
     pub(crate) fn has_broken(&self) -> bool {
         self.stream.get_ref().state() != ConnectionState::Ok
     }
@@ -688,11 +685,6 @@ impl SmtpConnection {
         };
         self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())
-    }
-
-    #[cfg_attr(feature = "pool", allow(dead_code))]
-    pub(crate) fn quit(&mut self) -> Result<Response, Error> {
-        Ok(try_smtp!(self.command(Quit), self))
     }
 
     pub(crate) fn abort(&mut self) {

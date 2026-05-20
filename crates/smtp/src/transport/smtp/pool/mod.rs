@@ -7,7 +7,6 @@ pub(super) mod sync_impl;
 /// Configuration for a connection pool
 #[derive(Debug, Clone)]
 #[allow(missing_copy_implementations)]
-#[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
 pub struct PoolConfig {
     min_idle: u32,
     max_size: u32,

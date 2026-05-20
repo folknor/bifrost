@@ -17,7 +17,7 @@
 //!
 //! _Send emails using [`SMTP`]_
 //!
-//! * **pool** (default): Connection pool for SMTP transport
+//! SMTP and LMTP transports use connection pooling by default.
 //!
 //! #### SMTP over TLS via the native-tls crate
 //!

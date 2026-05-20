@@ -167,7 +167,6 @@ pub(crate) enum Kind {
     /// TLS error
     Tls,
     /// Transport shutdown error
-    #[cfg_attr(not(feature = "pool"), allow(dead_code))]
     TransportShutdown,
 }
 
@@ -273,7 +272,6 @@ pub(crate) fn tls<E: Into<BoxError>>(e: E) -> Error {
     Error::new(Kind::Tls, Some(e))
 }
 
-#[cfg_attr(not(feature = "pool"), allow(dead_code))]
 pub(crate) fn transport_shutdown() -> Error {
     Error::new::<BoxError>(Kind::TransportShutdown, None)
 }

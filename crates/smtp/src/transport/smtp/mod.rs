@@ -202,7 +202,6 @@ pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
 pub use self::client::{Certificate, Identity};
 pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
-#[cfg(feature = "pool")]
 pub use self::pool::PoolConfig;
 pub use self::{
     error::{Error, ErrorKind},
@@ -223,7 +222,6 @@ pub mod commands;
 mod connection_url;
 pub(crate) mod error;
 pub mod extension;
-#[cfg(feature = "pool")]
 mod pool;
 pub mod response;
 #[cfg(test)]

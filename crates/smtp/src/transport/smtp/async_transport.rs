@@ -1,6 +1,5 @@
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(feature = "pool")]
 use std::sync::Arc;
 use std::{
     fmt::{self, Debug},
@@ -8,11 +7,9 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "pool")]
 use super::PoolConfig;
 #[cfg(feature = "tokio")]
 use super::Tls;
-#[cfg(feature = "pool")]
 use super::pool::async_impl::Pool;
 use super::{
     AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
@@ -33,8 +30,8 @@ use crate::{Envelope, Executor};
 ///
 /// # Connection pool
 ///
-/// When the `pool` feature is enabled (default), `AsyncSmtpTransport` maintains a
-/// connection pool to manage SMTP connections. The pool:
+/// `AsyncSmtpTransport` maintains a connection pool to manage SMTP
+/// connections. The pool:
 ///
 /// - Establishes a new connection when sending a message.
 /// - Recycles connections internally after a message is sent.
@@ -51,10 +48,7 @@ use crate::{Envelope, Executor};
 /// To customize connection pool settings, use [`AsyncSmtpTransportBuilder::pool_config`].
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransport<E: Executor> {
-    #[cfg(feature = "pool")]
     inner: Arc<Pool<E>>,
-    #[cfg(not(feature = "pool"))]
-    inner: AsyncSmtpClient<E>,
 }
 
 /// Asynchronously sends emails using the LMTP protocol
@@ -65,10 +59,7 @@ pub struct AsyncSmtpTransport<E: Executor> {
 /// `RCPT` response; accepted recipients carry their post-DATA delivery response.
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransport<E: Executor> {
-    #[cfg(feature = "pool")]
     inner: Arc<Pool<E>>,
-    #[cfg(not(feature = "pool"))]
-    inner: AsyncSmtpClient<E>,
 }
 
 impl AsyncTransport for AsyncSmtpTransport<TokioExecutor> {
@@ -81,14 +72,10 @@ impl AsyncTransport for AsyncSmtpTransport<TokioExecutor> {
 
         let result = conn.send(envelope, email).await?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
         Ok(result)
     }
 
     async fn shutdown(&self) {
-        #[cfg(feature = "pool")]
         self.inner.shutdown().await;
     }
 }
@@ -103,14 +90,10 @@ impl AsyncTransport for AsyncLmtpTransport<TokioExecutor> {
 
         let result = conn.send_lmtp(envelope, email).await?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
         Ok(result)
     }
 
     async fn shutdown(&self) {
-        #[cfg(feature = "pool")]
         self.inner.shutdown().await;
     }
 }
@@ -294,7 +277,6 @@ where
     /// Tests the SMTP connection
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    /// The connection is closed afterward if a connection pool is not used.
     #[allow(private_bounds)]
     pub async fn test_connection(&self) -> Result<bool, Error>
     where
@@ -303,9 +285,6 @@ where
         let mut conn = self.inner.connection().await?;
 
         let is_connected = conn.test_connected().await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.quit().await?;
 
         Ok(is_connected)
     }
@@ -320,12 +299,7 @@ where
         E: SmtpExecutor,
     {
         let mut conn = self.inner.connection().await?;
-        let response = conn.verify(argument).await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        response
+        conn.verify(argument).await
     }
 
     /// Sends `EXPN` and returns the server response.
@@ -338,12 +312,7 @@ where
         E: SmtpExecutor,
     {
         let mut conn = self.inner.connection().await?;
-        let response = conn.expand(argument).await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        response
+        conn.expand(argument).await
     }
 
     /// Sends an email with per-message SMTP options.
@@ -365,9 +334,6 @@ where
         let mut conn = self.inner.connection().await?;
 
         let result = conn.send_with_options(envelope, email, options).await?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
 
         Ok(result)
     }
@@ -401,9 +367,6 @@ where
         let result = conn
             .send_bdat_with_options(envelope, email, options)
             .await?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
 
         Ok(result)
     }
@@ -448,7 +411,6 @@ where
     /// Tests the LMTP connection.
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    /// The connection is closed afterward if a connection pool is not used.
     #[allow(private_bounds)]
     pub async fn test_connection(&self) -> Result<bool, Error>
     where
@@ -457,9 +419,6 @@ where
         let mut conn = self.inner.connection().await?;
 
         let is_connected = conn.test_connected().await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.quit().await?;
 
         Ok(is_connected)
     }
@@ -474,12 +433,7 @@ where
         E: SmtpExecutor,
     {
         let mut conn = self.inner.connection().await?;
-        let response = conn.verify(argument).await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        response
+        conn.verify(argument).await
     }
 
     /// Sends `EXPN` over LMTP and returns the server response.
@@ -492,12 +446,7 @@ where
         E: SmtpExecutor,
     {
         let mut conn = self.inner.connection().await?;
-        let response = conn.expand(argument).await;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
-        response
+        conn.expand(argument).await
     }
 
     /// Sends an email over LMTP with per-message SMTP options.
@@ -516,9 +465,6 @@ where
         let result = conn
             .send_lmtp_with_options(envelope, email, options)
             .await?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
 
         Ok(result)
     }
@@ -557,9 +503,6 @@ where
             .send_lmtp_bdat_with_options(envelope, email, options)
             .await?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort().await;
-
         Ok(result)
     }
 }
@@ -586,10 +529,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(feature = "pool")]
             inner: Arc::clone(&self.inner),
-            #[cfg(not(feature = "pool"))]
-            inner: self.inner.clone(),
         }
     }
 }
@@ -600,10 +540,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(feature = "pool")]
             inner: Arc::clone(&self.inner),
-            #[cfg(not(feature = "pool"))]
-            inner: self.inner.clone(),
         }
     }
 }
@@ -614,7 +551,6 @@ where
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncSmtpTransportBuilder {
     info: SmtpInfo,
-    #[cfg(feature = "pool")]
     pool_config: PoolConfig,
 }
 
@@ -624,7 +560,6 @@ pub struct AsyncSmtpTransportBuilder {
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub struct AsyncLmtpTransportBuilder {
     info: SmtpInfo,
-    #[cfg(feature = "pool")]
     pool_config: PoolConfig,
 }
 
@@ -634,7 +569,6 @@ impl AsyncSmtpTransportBuilder {
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         AsyncSmtpTransportBuilder {
             info: SmtpInfo::new(server, Protocol::Smtp),
-            #[cfg(feature = "pool")]
             pool_config: PoolConfig::default(),
         }
     }
@@ -744,8 +678,6 @@ impl AsyncSmtpTransportBuilder {
     /// Use a custom configuration for the connection pool
     ///
     /// Defaults can be found at [`PoolConfig`]
-    #[cfg(feature = "pool")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
     pub fn pool_config(mut self, pool_config: PoolConfig) -> Self {
         self.pool_config = pool_config;
         self
@@ -762,7 +694,6 @@ impl AsyncSmtpTransportBuilder {
             marker_: PhantomData,
         };
 
-        #[cfg(feature = "pool")]
         let client = Pool::new(self.pool_config, client);
 
         AsyncSmtpTransport { inner: client }
@@ -775,7 +706,6 @@ impl AsyncLmtpTransportBuilder {
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         AsyncLmtpTransportBuilder {
             info: SmtpInfo::new(server, Protocol::Lmtp),
-            #[cfg(feature = "pool")]
             pool_config: PoolConfig::default(),
         }
     }
@@ -865,8 +795,6 @@ impl AsyncLmtpTransportBuilder {
     /// Use a custom configuration for the connection pool
     ///
     /// Defaults can be found at [`PoolConfig`]
-    #[cfg(feature = "pool")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
     pub fn pool_config(mut self, pool_config: PoolConfig) -> Self {
         self.pool_config = pool_config;
         self
@@ -883,7 +811,6 @@ impl AsyncLmtpTransportBuilder {
             marker_: PhantomData,
         };
 
-        #[cfg(feature = "pool")]
         let client = Pool::new(self.pool_config, client);
 
         AsyncLmtpTransport { inner: client }
@@ -928,20 +855,6 @@ impl<E> Debug for AsyncSmtpClient<E> {
         let mut builder = f.debug_struct("AsyncSmtpClient");
         builder.field("info", &self.info);
         builder.finish()
-    }
-}
-
-// `clone` is unused when the `pool` feature is on
-#[allow(dead_code)]
-impl<E> AsyncSmtpClient<E>
-where
-    E: Executor,
-{
-    fn clone(&self) -> Self {
-        Self {
-            info: self.info.clone(),
-            marker_: PhantomData,
-        }
     }
 }
 

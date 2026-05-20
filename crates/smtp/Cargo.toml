@@ -55,9 +55,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 
 [features]
-default = ["pool"]
-
-pool = ["tokio?/sync"]
+default = []
 
 tokio = [
     "dep:tokio",
@@ -65,6 +63,7 @@ tokio = [
     "tokio/time",
     "tokio/net",
     "tokio/io-util",
+    "tokio/sync",
     "dep:tokio-native-tls",
 ]
 

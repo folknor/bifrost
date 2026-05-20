@@ -1,12 +1,9 @@
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(feature = "pool")]
 use std::sync::Arc;
 use std::{fmt::Debug, time::Duration};
 
-#[cfg(feature = "pool")]
 use super::PoolConfig;
-#[cfg(feature = "pool")]
 use super::pool::sync_impl::Pool;
 use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
@@ -25,8 +22,8 @@ use crate::{Transport, address::Envelope};
 ///
 /// # Connection pool
 ///
-/// When the `pool` feature is enabled (default), `SmtpTransport` maintains a
-/// connection pool to manage SMTP connections. The pool:
+/// `SmtpTransport` maintains a connection pool to manage SMTP connections. The
+/// pool:
 ///
 /// - Establishes a new connection when sending a message.
 /// - Recycles connections internally after a message is sent.
@@ -43,10 +40,7 @@ use crate::{Transport, address::Envelope};
 /// To customize connection pool settings, use [`SmtpTransportBuilder::pool_config`].
 #[derive(Clone)]
 pub struct SmtpTransport {
-    #[cfg(feature = "pool")]
     inner: Arc<Pool>,
-    #[cfg(not(feature = "pool"))]
-    inner: SmtpClient,
 }
 
 /// Synchronously send emails using the LMTP protocol
@@ -57,10 +51,7 @@ pub struct SmtpTransport {
 /// accepted recipients carry their post-DATA delivery response.
 #[derive(Clone)]
 pub struct LmtpTransport {
-    #[cfg(feature = "pool")]
     inner: Arc<Pool>,
-    #[cfg(not(feature = "pool"))]
-    inner: SmtpClient,
 }
 
 impl Transport for SmtpTransport {
@@ -73,14 +64,10 @@ impl Transport for SmtpTransport {
 
         let result = conn.send(envelope, email)?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
         Ok(result)
     }
 
     fn shutdown(&self) {
-        #[cfg(feature = "pool")]
         self.inner.shutdown();
     }
 }
@@ -95,14 +82,10 @@ impl Transport for LmtpTransport {
 
         let result = conn.send_lmtp(envelope, email)?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
         Ok(result)
     }
 
     fn shutdown(&self) {
-        #[cfg(feature = "pool")]
         self.inner.shutdown();
     }
 }
@@ -282,14 +265,10 @@ impl SmtpTransport {
     /// Tests the SMTP connection
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    /// The connection is closed afterward if a connection pool is not used.
     pub fn test_connection(&self) -> Result<bool, Error> {
         let mut conn = self.inner.connection()?;
 
         let is_connected = conn.test_connected();
-
-        #[cfg(not(feature = "pool"))]
-        conn.quit()?;
 
         Ok(is_connected)
     }
@@ -300,12 +279,7 @@ impl SmtpTransport {
     /// returned as [`Response`] values so callers can inspect the exact status.
     pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
         let mut conn = self.inner.connection()?;
-        let response = conn.verify(argument);
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
-        response
+        conn.verify(argument)
     }
 
     /// Sends `EXPN` and returns the server response.
@@ -314,12 +288,7 @@ impl SmtpTransport {
     /// returned as [`Response`] values so callers can inspect the exact status.
     pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
         let mut conn = self.inner.connection()?;
-        let response = conn.expand(argument);
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
-        response
+        conn.expand(argument)
     }
 
     /// Sends an email with per-message SMTP options.
@@ -337,9 +306,6 @@ impl SmtpTransport {
         let mut conn = self.inner.connection()?;
 
         let result = conn.send_with_options(envelope, email, options)?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
 
         Ok(result)
     }
@@ -362,9 +328,6 @@ impl SmtpTransport {
         let mut conn = self.inner.connection()?;
 
         let result = conn.send_bdat_with_options(envelope, email, options)?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
 
         Ok(result)
     }
@@ -402,14 +365,10 @@ impl LmtpTransport {
     /// Tests the LMTP connection.
     ///
     /// `test_connection()` tests the connection by using the SMTP NOOP command.
-    /// The connection is closed afterward if a connection pool is not used.
     pub fn test_connection(&self) -> Result<bool, Error> {
         let mut conn = self.inner.connection()?;
 
         let is_connected = conn.test_connected();
-
-        #[cfg(not(feature = "pool"))]
-        conn.quit()?;
 
         Ok(is_connected)
     }
@@ -420,12 +379,7 @@ impl LmtpTransport {
     /// inspect the exact status.
     pub fn verify(&self, argument: impl Into<String>) -> Result<Response, Error> {
         let mut conn = self.inner.connection()?;
-        let response = conn.verify(argument);
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
-        response
+        conn.verify(argument)
     }
 
     /// Sends `EXPN` over LMTP and returns the server response.
@@ -434,12 +388,7 @@ impl LmtpTransport {
     /// inspect the exact status.
     pub fn expand(&self, argument: impl Into<String>) -> Result<Response, Error> {
         let mut conn = self.inner.connection()?;
-        let response = conn.expand(argument);
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
-        response
+        conn.expand(argument)
     }
 
     /// Sends an email over LMTP with per-message SMTP options.
@@ -452,9 +401,6 @@ impl LmtpTransport {
         let mut conn = self.inner.connection()?;
 
         let result = conn.send_lmtp_with_options(envelope, email, options)?;
-
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
 
         Ok(result)
     }
@@ -478,9 +424,6 @@ impl LmtpTransport {
 
         let result = conn.send_lmtp_bdat_with_options(envelope, email, options)?;
 
-        #[cfg(not(feature = "pool"))]
-        conn.abort();
-
         Ok(result)
     }
 }
@@ -490,7 +433,6 @@ impl LmtpTransport {
 #[derive(Debug, Clone)]
 pub struct SmtpTransportBuilder {
     info: SmtpInfo,
-    #[cfg(feature = "pool")]
     pool_config: PoolConfig,
 }
 
@@ -499,7 +441,6 @@ pub struct SmtpTransportBuilder {
 #[derive(Debug, Clone)]
 pub struct LmtpTransportBuilder {
     info: SmtpInfo,
-    #[cfg(feature = "pool")]
     pool_config: PoolConfig,
 }
 
@@ -509,7 +450,6 @@ impl SmtpTransportBuilder {
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
             info: SmtpInfo::new(server, Protocol::Smtp),
-            #[cfg(feature = "pool")]
             pool_config: PoolConfig::default(),
         }
     }
@@ -617,8 +557,6 @@ impl SmtpTransportBuilder {
     /// Use a custom configuration for the connection pool
     ///
     /// Defaults can be found at [`PoolConfig`]
-    #[cfg(feature = "pool")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
     pub fn pool_config(mut self, pool_config: PoolConfig) -> Self {
         self.pool_config = pool_config;
         self
@@ -626,12 +564,10 @@ impl SmtpTransportBuilder {
 
     /// Build the transport
     ///
-    /// If the `pool` feature is enabled, an `Arc` wrapped pool is created.
     /// Defaults can be found at [`PoolConfig`]
     pub fn build(self) -> SmtpTransport {
         let client = SmtpClient { info: self.info };
 
-        #[cfg(feature = "pool")]
         let client = Pool::new(self.pool_config, client);
 
         SmtpTransport { inner: client }
@@ -644,7 +580,6 @@ impl LmtpTransportBuilder {
     pub(crate) fn new<T: Into<String>>(server: T) -> Self {
         Self {
             info: SmtpInfo::new(server, Protocol::Lmtp),
-            #[cfg(feature = "pool")]
             pool_config: PoolConfig::default(),
         }
     }
@@ -732,8 +667,6 @@ impl LmtpTransportBuilder {
     /// Use a custom configuration for the connection pool
     ///
     /// Defaults can be found at [`PoolConfig`]
-    #[cfg(feature = "pool")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "pool")))]
     pub fn pool_config(mut self, pool_config: PoolConfig) -> Self {
         self.pool_config = pool_config;
         self
@@ -741,12 +674,10 @@ impl LmtpTransportBuilder {
 
     /// Build the transport
     ///
-    /// If the `pool` feature is enabled, an `Arc` wrapped pool is created.
     /// Defaults can be found at [`PoolConfig`]
     pub fn build(self) -> LmtpTransport {
         let client = SmtpClient { info: self.info };
 
-        #[cfg(feature = "pool")]
         let client = Pool::new(self.pool_config, client);
 
         LmtpTransport { inner: client }
