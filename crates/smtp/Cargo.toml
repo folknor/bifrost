@@ -19,40 +19,40 @@ workspace = true
 
 [dependencies]
 email_address = { version = "0.2.1", default-features = false }
-nom = "8"
+nom = { workspace = true }
 idna = "1"
 
-tracing = { version = "0.1.16", default-features = false, features = ["std"], optional = true }
+tracing = { workspace = true, features = ["std"], optional = true }
 
 httpdate = "1"
 mime = "0.3.4"
 fastrand = "2.0"
 quoted_printable = "0.5"
-base64 = "0.22"
+base64 = { workspace = true }
 email-encoding = "0.4"
 
-serde = { version = "1.0.110", features = ["derive"], optional = true }
+serde = { workspace = true, optional = true }
 
 hostname = "0.4"
-socket2 = "0.6"
+socket2 = { workspace = true }
 url = "2.4"
-percent-encoding = "2.3"
-zeroize = { version = "1", features = ["serde"] }
+percent-encoding = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 
-native-tls = "0.2.9"
+native-tls = { workspace = true }
 
-tokio = { version = "1", optional = true }
-tokio-native-tls = { version = "0.3", optional = true }
+tokio = { workspace = true, optional = true }
+tokio-native-tls = { workspace = true, optional = true }
 
-sha2 = { version = "0.11.0", features = ["oid"], optional = true }
+sha2 = { workspace = true, features = ["oid"], optional = true }
 rsa = { version = "0.10.0-rc.18", optional = true }
 ed25519-dalek = { version = "2", optional = true }
 
 [dev-dependencies]
-tracing = { version = "0.1.16", default-features = false, features = ["std"] }
-tracing-subscriber = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serde_json = "1"
+tracing = { workspace = true, features = ["std"] }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
 
 [features]
 default = []

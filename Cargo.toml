@@ -16,6 +16,46 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/folknor/bifrost"
 authors = ["folk@folk.wtf"]
 
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.47", default-features = false }
+tokio-util = "0.7"
+tokio-native-tls = "0.3"
+
+# Networking and TLS
+reqwest = { version = "0.13.2", default-features = false }
+native-tls = "0.2"
+socket2 = "0.6"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Encoding
+base64 = "0.22"
+percent-encoding = "2.3"
+urlencoding = "2"
+
+# Parsing
+nom = "8"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Bytes
+bytes = "1"
+
+# Cryptography
+sha2 = "0.11.0"
+getrandom = "0.4.2"
+zeroize = "1"
+blake3 = "1.5"
+
+# Diagnostics
+log = "0.4"
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = "0.3"
+
 [workspace.lints.clippy]
 # Style: modern idiomatic Rust
 uninlined_format_args = "deny"
