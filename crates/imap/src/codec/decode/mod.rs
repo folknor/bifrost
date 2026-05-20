@@ -46,8 +46,10 @@ mod envelope_fetch;
 mod extensions;
 mod flags_caps;
 mod mailbox;
+mod namespace_response;
 mod primitives;
 mod response;
+mod search_response;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -71,9 +73,13 @@ pub(super) use flags_caps::*;
 #[allow(unused_imports)]
 pub(super) use mailbox::*;
 #[allow(unused_imports)]
+pub(super) use namespace_response::*;
+#[allow(unused_imports)]
 pub(super) use primitives::*;
 #[allow(unused_imports)]
 pub(super) use response::*;
+#[allow(unused_imports)]
+pub(super) use search_response::*;
 
 // ---------------------------------------------------------------------------
 // Public entry points

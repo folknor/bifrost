@@ -10,6 +10,7 @@
 mod address;
 mod auth;
 pub(crate) mod body;
+mod capability;
 mod command;
 pub(crate) mod envelope;
 mod events;
@@ -24,6 +25,7 @@ pub(crate) mod rfc2231;
 pub mod search;
 mod secret;
 mod sync;
+mod uid_range;
 pub(crate) mod validated;
 
 pub use address::Address;

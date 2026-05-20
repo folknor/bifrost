@@ -1,4 +1,6 @@
 #![allow(clippy::wildcard_imports)]
+use tokio::net::TcpStream;
+
 use super::*;
 
 impl ImapConnection {

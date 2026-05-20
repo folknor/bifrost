@@ -1,4 +1,6 @@
 #![allow(clippy::wildcard_imports)]
+use bytes::BytesMut;
+
 use super::*;
 
 impl ImapConnection {
