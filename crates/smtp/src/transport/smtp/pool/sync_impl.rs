@@ -155,7 +155,7 @@ impl Pool {
                 let mut connections = self
                     .connections
                     .lock()
-                    .map_err(|_| error::client("connection pool lock poisoned"))?;
+                    .map_err(|_| error::internal("connection pool lock poisoned"))?;
                 let Some(connections) = connections.as_mut() else {
                     // The transport was shut down
                     return Err(error::transport_shutdown());

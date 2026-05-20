@@ -98,7 +98,7 @@ impl Credentials {
     fn password_parts(&self) -> Result<(&str, &str), Error> {
         match self {
             Credentials::Password { username, password } => Ok((username, password.as_str())),
-            Credentials::OAuth2 { .. } => Err(error::client(
+            Credentials::OAuth2 { .. } => Err(error::invalid_input(
                 "OAuth2 credentials cannot be used with password authentication mechanisms",
             )),
         }
@@ -110,7 +110,7 @@ impl Credentials {
                 identity,
                 access_token,
             } => Ok((identity, access_token.as_str())),
-            Credentials::Password { .. } => Err(error::client(
+            Credentials::Password { .. } => Err(error::invalid_input(
                 "password credentials cannot be used with OAuth2 authentication mechanisms",
             )),
         }
@@ -175,7 +175,9 @@ impl Mechanism {
     ) -> Result<String, Error> {
         match self {
             Mechanism::Plain => match challenge {
-                Some(_) => Err(error::client("This mechanism does not expect a challenge")),
+                Some(_) => Err(error::invalid_input(
+                    "This mechanism does not expect a challenge",
+                )),
                 None => {
                     let (username, password) = credentials.password_parts()?;
                     Ok(format!("\u{0}{username}\u{0}{password}"))
@@ -183,8 +185,9 @@ impl Mechanism {
             },
             Mechanism::Login => {
                 let (username, password) = credentials.password_parts()?;
-                let decoded_challenge = challenge
-                    .ok_or_else(|| error::client("This mechanism does expect a challenge"))?;
+                let decoded_challenge = challenge.ok_or_else(|| {
+                    error::invalid_input("This mechanism does expect a challenge")
+                })?;
 
                 if contains_ignore_ascii_case(
                     decoded_challenge,
@@ -200,10 +203,12 @@ impl Mechanism {
                     return Ok(password.to_owned());
                 }
 
-                Err(error::client("Unrecognized challenge"))
+                Err(error::invalid_input("Unrecognized challenge"))
             }
             Mechanism::Xoauth2 => match challenge {
-                Some(_) => Err(error::client("This mechanism does not expect a challenge")),
+                Some(_) => Err(error::invalid_input(
+                    "This mechanism does not expect a challenge",
+                )),
                 None => {
                     let (identity, access_token) = credentials.oauth2_parts()?;
                     Ok(format!(

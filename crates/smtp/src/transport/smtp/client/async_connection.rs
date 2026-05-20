@@ -264,7 +264,9 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<Response, Error> {
         if !self.server_info().supports_chunking() {
-            return Err(error::client("BDAT requires server CHUNKING support"));
+            return Err(error::invalid_input(
+                "BDAT requires server CHUNKING support",
+            ));
         }
 
         let mail_options = self.mail_options(envelope, email, options, true)?;
@@ -421,7 +423,7 @@ impl AsyncSmtpConnection {
             let mut rejected = Vec::with_capacity(recipient_statuses.len());
             for response in recipient_statuses {
                 let Some(response) = response else {
-                    return Err(error::client(
+                    return Err(error::internal(
                         "recipient status invariant failed after all recipients were rejected",
                     ));
                 };
@@ -453,7 +455,9 @@ impl AsyncSmtpConnection {
         options: &SendOptions,
     ) -> Result<Vec<Response>, Error> {
         if !self.server_info().supports_chunking() {
-            return Err(error::client("BDAT requires server CHUNKING support"));
+            return Err(error::invalid_input(
+                "BDAT requires server CHUNKING support",
+            ));
         }
 
         let mail_options = self.mail_options(envelope, email, options, true)?;
@@ -486,7 +490,7 @@ impl AsyncSmtpConnection {
             let mut rejected = Vec::with_capacity(recipient_statuses.len());
             for response in recipient_statuses {
                 let Some(response) = response else {
-                    return Err(error::client(
+                    return Err(error::internal(
                         "recipient status invariant failed after all recipients were rejected",
                     ));
                 };
@@ -541,7 +545,7 @@ impl AsyncSmtpConnection {
         if envelope.has_non_ascii_addresses() && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 // don't try to send non-ascii addresses (per RFC)
-                return Err(error::client(
+                return Err(error::invalid_input(
                     "Envelope contains non-ascii chars but server does not support SMTPUTF8",
                 ));
             }
@@ -551,7 +555,7 @@ impl AsyncSmtpConnection {
         // Check for non-ascii content in the message
         if !email.is_ascii() && !has_body_parameter {
             if !self.server_info().supports_feature(Extension::EightBitMime) {
-                return Err(error::client(
+                return Err(error::invalid_input(
                     "Message contains non-ascii chars but server does not support 8BITMIME",
                 ));
             }
@@ -569,7 +573,7 @@ impl AsyncSmtpConnection {
                 .size_limit()
                 .is_some_and(|limit| email.len() > limit)
             {
-                return Err(error::client(
+                return Err(error::invalid_input(
                     "Message is larger than the server-advertised SIZE limit",
                 ));
             }
@@ -598,7 +602,7 @@ impl AsyncSmtpConnection {
             if !envelope.to().iter().any(|envelope_recipient| {
                 addresses_match_for_recipient_options(recipient, envelope_recipient)
             }) {
-                return Err(error::client(
+                return Err(error::invalid_input(
                     "recipient-specific RCPT parameters do not match an envelope recipient",
                 ));
             }
@@ -631,7 +635,7 @@ impl AsyncSmtpConnection {
                 if message_is_ascii {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "BODY=7BIT cannot be used with non-ASCII message content",
                     ))
                 }
@@ -640,19 +644,21 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_feature(Extension::EightBitMime) {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "BODY=8BITMIME requires server 8BITMIME support",
                     ))
                 }
             }
             MailParameter::Body(MailBodyParameter::BinaryMime) => {
                 if !allow_binary_mime {
-                    return Err(error::client("BODY=BINARYMIME requires a BDAT send path"));
+                    return Err(error::invalid_input(
+                        "BODY=BINARYMIME requires a BDAT send path",
+                    ));
                 }
                 if self.server_info().supports_binary_mime() {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "BODY=BINARYMIME requires server BINARYMIME support",
                     ))
                 }
@@ -663,7 +669,7 @@ impl AsyncSmtpConnection {
                     .size_limit()
                     .is_some_and(|limit| *size > limit || message_size > limit)
                 {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "Message is larger than the server-advertised SIZE limit",
                     ))
                 } else {
@@ -674,12 +680,14 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_feature(Extension::SmtpUtfEight) {
                     Ok(())
                 } else {
-                    Err(error::client("SMTPUTF8 requires server SMTPUTF8 support"))
+                    Err(error::invalid_input(
+                        "SMTPUTF8 requires server SMTPUTF8 support",
+                    ))
                 }
             }
             MailParameter::RequireTls => {
                 if !self.server_info().supports_require_tls() {
-                    return Err(error::client(
+                    return Err(error::invalid_input(
                         "REQUIRETLS requires server REQUIRETLS support",
                     ));
                 }
@@ -692,7 +700,7 @@ impl AsyncSmtpConnection {
             }
             MailParameter::FutureRelease(value) => {
                 if !self.server_info().supports_future_release() {
-                    return Err(error::client(
+                    return Err(error::invalid_input(
                         "FUTURERELEASE requires server FUTURERELEASE support",
                     ));
                 }
@@ -703,7 +711,7 @@ impl AsyncSmtpConnection {
                             .future_release_max_interval()
                             .is_some_and(|limit| *seconds > limit) =>
                     {
-                        return Err(error::client(
+                        return Err(error::invalid_input(
                             "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
                         ));
                     }
@@ -713,7 +721,7 @@ impl AsyncSmtpConnection {
             }
             MailParameter::DeliverBy(value) => {
                 if !self.server_info().supports_deliver_by() {
-                    return Err(error::client("BY requires server DELIVERBY support"));
+                    return Err(error::invalid_input("BY requires server DELIVERBY support"));
                 }
                 if value.mode() == DeliverByMode::Return
                     && value.seconds() > 0
@@ -722,7 +730,7 @@ impl AsyncSmtpConnection {
                         .deliver_by_minimum()
                         .is_some_and(|minimum| value.seconds() < minimum)
                 {
-                    return Err(error::client(
+                    return Err(error::invalid_input(
                         "BY return deadline is below the server-advertised DELIVERBY minimum",
                     ));
                 }
@@ -732,7 +740,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_mt_priority() {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "MT-PRIORITY requires server MT-PRIORITY support",
                     ))
                 }
@@ -741,7 +749,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_dsn() {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "DSN MAIL parameters require server DSN support",
                     ))
                 }
@@ -758,7 +766,7 @@ impl AsyncSmtpConnection {
                 if self.server_info().supports_dsn() {
                     Ok(())
                 } else {
-                    Err(error::client(
+                    Err(error::invalid_input(
                         "DSN RCPT parameters require server DSN support",
                     ))
                 }
@@ -803,7 +811,9 @@ impl AsyncSmtpConnection {
             self.hello_name = hello_name.clone();
             Ok(())
         } else {
-            Err(error::client("STARTTLS is not supported on this server"))
+            Err(error::invalid_input(
+                "STARTTLS is not supported on this server",
+            ))
         }
     }
 
@@ -882,7 +892,9 @@ impl AsyncSmtpConnection {
         let mechanism = self
             .server_info
             .get_auth_mechanism(mechanisms)
-            .ok_or_else(|| error::client("No compatible authentication mechanism was found"))?;
+            .ok_or_else(|| {
+                error::invalid_input("No compatible authentication mechanism was found")
+            })?;
 
         // Limit challenges to avoid blocking
         let mut challenges: u8 = 10;
@@ -903,7 +915,7 @@ impl AsyncSmtpConnection {
         }
 
         if challenges == 0 {
-            Err(error::response("Unexpected number of challenges"))
+            Err(error::parse("Unexpected number of challenges"))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name).await, self);
@@ -1037,7 +1049,7 @@ impl AsyncSmtpConnection {
     }
 
     fn error_from_status(response: Response) -> Error {
-        error::code(response.code(), Some(response.message().collect()))
+        error::status(response)
     }
 
     /// Writes a string to the server
@@ -1118,10 +1130,10 @@ impl AsyncSmtpConnection {
             > 0
         {
             if buffer.len() - pre > MAX_RESPONSE_LINE_BYTES {
-                return Err(error::response("SMTP response line too long"));
+                return Err(error::parse("SMTP response line too long"));
             }
             if buffer.len() > MAX_RESPONSE_BYTES {
-                return Err(error::response("SMTP response too large"));
+                return Err(error::parse("SMTP response too large"));
             }
             pre = buffer.len();
 
@@ -1136,23 +1148,20 @@ impl AsyncSmtpConnection {
                     return if accept_negative || response.is_positive() {
                         Ok(response)
                     } else {
-                        Err(error::code(
-                            response.code(),
-                            Some(response.message().collect()),
-                        ))
+                        Err(error::status(response))
                     };
                 }
                 Err(nom::Err::Failure(e)) => {
-                    return Err(error::response(e.to_string()));
+                    return Err(error::parse(e.to_string()));
                 }
                 Err(nom::Err::Incomplete(_)) => { /* read more */ }
                 Err(nom::Err::Error(e)) => {
-                    return Err(error::response(e.to_string()));
+                    return Err(error::parse(e.to_string()));
                 }
             }
         }
 
-        Err(error::response("incomplete response"))
+        Err(error::parse("incomplete response"))
     }
 }
 

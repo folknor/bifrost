@@ -78,8 +78,8 @@ mod read_response_caps {
             Err(e) => e,
         };
         assert!(
-            err.is_response(),
-            "expected response-kind error, got {err:?}"
+            err.is_parse(),
+            "expected SMTP response parse error, got {err:?}"
         );
     }
 }

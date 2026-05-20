@@ -43,33 +43,27 @@ Current Rust files above 800 lines:
 ```text
 13930  crates/imap/src/codec/decode/tests.rs
  7471  crates/imap/src/codec/encode/tests.rs
- 1834  crates/imap/src/codec/encode/commands.rs
- 1833  crates/imap/src/codec/encode/mod.rs
  1547  crates/imap/src/types/response_tests.rs
- 1451  crates/imap/src/connection/driver/mod.rs
- 1336  crates/imap/src/connection/mod.rs
- 1255  crates/imap/src/types/response.rs
- 1095  crates/imap/src/codec/decode/response.rs
  1093  crates/imap/src/error_tests.rs
- 1049  crates/imap/src/connection/helpers.rs
   855  crates/imap/src/types/command_tests.rs
   851  crates/imap/src/types/search_tests.rs
+  803  crates/imap/src/codec/encode/dispatch.rs
 ```
 
-Natural split candidates:
+Line count is a smell, not a quota. Split only when the new module has a clear
+protocol or responsibility boundary.
 
-- `connection/driver/mod.rs`: split pipeline execution, command execution, and
-  IDLE handling. Stream upgrade and wire-send helpers are already split out.
-- `codec/encode/commands.rs` and `codec/encode/mod.rs`: split command-specific
-  encoders from shared encoding context and literal handling.
-- `connection/mod.rs`: split stream/compression internals from public connection
-  handle types.
-- `types/response.rs`: split capabilities and extension result payloads from
-  core response enums.
-- `codec/decode/response.rs`: split untagged response parsers by response
-  family.
-- Test files: split when there are clear protocol-family boundaries, but giant
-  parser fixture files may be acceptable if splitting would hide fixture flow.
+Remaining treatment:
+
+- `codec/encode/dispatch.rs` is a cohesive `Command` dispatcher and is only
+  barely over the threshold. Leave it together unless new command families make
+  a real dispatch substructure visible.
+- Test files should be split only along obvious protocol-family or fixture-suite
+  boundaries. The large parser/encoder fixture files may remain large if a split
+  would hide fixture flow or make individual cases harder to audit.
+- `types/response_tests.rs`, `error_tests.rs`, `types/command_tests.rs`, and
+  `types/search_tests.rs` are test-only follow-ups. Revisit when modifying those
+  areas, not as a standalone churn task.
 
 ## Not currently tracked
 

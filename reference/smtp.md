@@ -120,7 +120,7 @@ Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPriva
 
 ## Error model
 
-`Error` is `#[non_exhaustive]`. `Error::kind()` returns `ErrorKind`: `Response`, `Network`, `Connection`, `Client`, `Tls`, `Policy`, `Parse`, `Permanent`, `Transient`. Helpers: `is_response`, `is_network`, `is_connection`, `is_permanent`, `is_transient`, `is_policy`. `Policy` covers local refusals such as plaintext-AUTH refusal.
+`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Local buckets are `Parse`, `InvalidInput`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal.
 
 ## Module layout
 

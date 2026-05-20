@@ -198,7 +198,7 @@ impl ServerInfo {
     /// Parses a EHLO response to create a `ServerInfo`
     pub fn from_response(response: &Response) -> Result<ServerInfo, Error> {
         let Some(name) = response.first_word() else {
-            return Err(error::response("Could not read server name"));
+            return Err(error::parse("Could not read server name"));
         };
 
         let mut features: HashSet<Extension> = HashSet::new();
@@ -244,16 +244,17 @@ impl ServerInfo {
                     features.insert(Extension::RequireTls);
                 }
                 "FUTURERELEASE" => {
-                    let max_interval =
-                        match split.next() {
-                            Some(value) => Some(value.parse::<u64>().map_err(|_| {
-                                error::response("invalid FUTURERELEASE max-interval")
-                            })?),
-                            None => None,
-                        };
+                    let max_interval = match split.next() {
+                        Some(value) => Some(
+                            value
+                                .parse::<u64>()
+                                .map_err(|_| error::parse("invalid FUTURERELEASE max-interval"))?,
+                        ),
+                        None => None,
+                    };
                     let max_datetime = split.next().map(str::to_owned);
                     if split.next().is_some() {
-                        return Err(error::response("invalid FUTURERELEASE EHLO response"));
+                        return Err(error::parse("invalid FUTURERELEASE EHLO response"));
                     }
                     features.insert(Extension::FutureRelease {
                         max_interval,
@@ -828,11 +829,13 @@ impl DeliverByParameter {
     /// Creates a DELIVERBY parameter after validating RFC 2852 syntax limits.
     pub fn new(seconds: i64, mode: DeliverByMode, trace: bool) -> Result<Self, Error> {
         if seconds.unsigned_abs() > 999_999_999 {
-            return Err(error::client("DELIVERBY time must not exceed 9 digits"));
+            return Err(error::invalid_input(
+                "DELIVERBY time must not exceed 9 digits",
+            ));
         }
 
         if mode == DeliverByMode::Return && seconds <= 0 {
-            return Err(error::client(
+            return Err(error::invalid_input(
                 "DELIVERBY return mode requires a positive time",
             ));
         }
@@ -902,7 +905,7 @@ impl MtPriorityParameter {
     /// Creates an MT-PRIORITY value after validating RFC 6710 bounds.
     pub fn new(value: i8) -> Result<Self, Error> {
         if !(-9..=9).contains(&value) {
-            return Err(error::client(
+            return Err(error::invalid_input(
                 "MT-PRIORITY value must be in the range -9..=9",
             ));
         }
@@ -1035,10 +1038,12 @@ impl DsnNotifyParameter {
         }
         let values = deduped;
         if values.is_empty() {
-            return Err(error::client("NOTIFY must contain at least one value"));
+            return Err(error::invalid_input(
+                "NOTIFY must contain at least one value",
+            ));
         }
         if values.contains(&DsnNotify::Never) && values.len() > 1 {
-            return Err(error::client(
+            return Err(error::invalid_input(
                 "NOTIFY=NEVER cannot be combined with other NOTIFY values",
             ));
         }
@@ -1098,13 +1103,17 @@ impl Display for DsnNotify {
 
 fn validate_envelope_id(value: &str) -> Result<(), Error> {
     if value.is_empty() {
-        return Err(error::client("ENVID must not be empty"));
+        return Err(error::invalid_input("ENVID must not be empty"));
     }
     if !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
-        return Err(error::client("ENVID must contain printable ASCII only"));
+        return Err(error::invalid_input(
+            "ENVID must contain printable ASCII only",
+        ));
     }
     if xtext_len(value) > 100 {
-        return Err(error::client("ENVID must not exceed 100 xtext bytes"));
+        return Err(error::invalid_input(
+            "ENVID must not exceed 100 xtext bytes",
+        ));
     }
 
     Ok(())
@@ -1113,10 +1122,10 @@ fn validate_envelope_id(value: &str) -> Result<(), Error> {
 fn validate_original_recipient(address_type: &str, address: &str) -> Result<(), Error> {
     validate_atom(address_type, "ORCPT address type")?;
     if address.is_empty() {
-        return Err(error::client("ORCPT address must not be empty"));
+        return Err(error::invalid_input("ORCPT address must not be empty"));
     }
     if address.chars().any(char::is_control) {
-        return Err(error::client(
+        return Err(error::invalid_input(
             "ORCPT address must not contain control characters",
         ));
     }
@@ -1130,7 +1139,7 @@ fn validate_esmtp_keyword(keyword: &str) -> Result<(), Error> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
     {
-        return Err(error::client("ESMTP parameter keyword is invalid"));
+        return Err(error::invalid_input("ESMTP parameter keyword is invalid"));
     }
 
     Ok(())
@@ -1138,7 +1147,7 @@ fn validate_esmtp_keyword(keyword: &str) -> Result<(), Error> {
 
 fn validate_esmtp_raw_value(value: &str) -> Result<(), Error> {
     if value.is_empty() || !value.bytes().all(|byte| (b'!'..=b'~').contains(&byte)) {
-        return Err(error::client(
+        return Err(error::invalid_input(
             "raw ESMTP parameter value must contain printable ASCII without spaces",
         ));
     }
@@ -1155,7 +1164,9 @@ fn validate_atom(value: &str, name: &str) -> Result<(), Error> {
             .bytes()
             .any(|byte| byte <= b' ' || byte >= 0x7f || SPECIALS.contains(&byte))
     {
-        return Err(error::client(format!("{name} must be an RFC 5322 atom")));
+        return Err(error::invalid_input(format!(
+            "{name} must be an RFC 5322 atom"
+        )));
     }
 
     Ok(())

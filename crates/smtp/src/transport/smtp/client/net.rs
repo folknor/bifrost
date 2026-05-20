@@ -81,7 +81,7 @@ impl NetworkStream {
         ) -> Result<TcpStream, Error> {
             let addrs = server
                 .to_socket_addrs()
-                .map_err(error::connection)?
+                .map_err(error::connection_io)?
                 .filter(|resolved_addr| resolved_address_filter(resolved_addr, local_addr));
 
             let mut last_err = None;
@@ -92,7 +92,7 @@ impl NetworkStream {
                     Type::STREAM,
                     Some(Protocol::TCP),
                 )
-                .map_err(error::connection)?;
+                .map_err(error::connection_io)?;
                 bind_local_address(&socket, &addr, local_addr)?;
 
                 if let Some(timeout) = timeout {
@@ -109,7 +109,7 @@ impl NetworkStream {
             }
 
             Err(match last_err {
-                Some(last_err) => error::connection(last_err),
+                Some(last_err) => error::connection_io(last_err),
                 None => error::connection("could not resolve to any address"),
             })
         }
@@ -127,15 +127,15 @@ impl NetworkStream {
         path: &Path,
         timeout: Option<Duration>,
     ) -> Result<NetworkStream, Error> {
-        let addr = SockAddr::unix(path).map_err(error::connection)?;
+        let addr = SockAddr::unix(path).map_err(error::connection_io)?;
         let socket =
-            socket2::Socket::new(Domain::UNIX, Type::STREAM, None).map_err(error::connection)?;
+            socket2::Socket::new(Domain::UNIX, Type::STREAM, None).map_err(error::connection_io)?;
         if let Some(timeout) = timeout {
             socket
                 .connect_timeout(&addr, timeout)
-                .map_err(error::connection)?;
+                .map_err(error::connection_io)?;
         } else {
-            socket.connect(&addr).map_err(error::connection)?;
+            socket.connect(&addr).map_err(error::connection_io)?;
         }
         let stream = UnixStream::from(OwnedFd::from(socket));
         Ok(NetworkStream::new(InnerNetworkStream::Unix(stream)))
@@ -156,7 +156,7 @@ impl NetworkStream {
                 self.state = ConnectionState::Ok;
                 Ok(())
             }
-            _ => Err(error::client(
+            _ => Err(error::invalid_input(
                 "STARTTLS is only supported on TCP connections",
             )),
         }
@@ -169,7 +169,7 @@ impl NetworkStream {
         let stream = tls_parameters
             .connector
             .connect(tls_parameters.domain(), tcp_stream)
-            .map_err(error::connection)?;
+            .map_err(error::tls)?;
         Ok(InnerNetworkStream::NativeTls(stream))
     }
 
@@ -264,7 +264,7 @@ fn bind_local_address(
         Some(local_addr) => {
             socket
                 .bind(&SocketAddr::new(local_addr, 0).into())
-                .map_err(error::connection)?;
+                .map_err(error::connection_io)?;
         }
         _ => {
             if cfg!(windows) {
@@ -273,7 +273,7 @@ fn bind_local_address(
                     SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
                     SocketAddr::V6(_) => ([0, 0, 0, 0, 0, 0, 0, 0], 0).into(),
                 };
-                socket.bind(&any.into()).map_err(error::connection)?;
+                socket.bind(&any.into()).map_err(error::connection_io)?;
             }
         }
     }

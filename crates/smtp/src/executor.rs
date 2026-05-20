@@ -100,7 +100,7 @@ impl SmtpExecutor for TokioExecutor {
             #[cfg(unix)]
             {
                 if !matches!(tls, Tls::None) {
-                    return Err(crate::transport::smtp::error::client(
+                    return Err(crate::transport::smtp::error::invalid_input(
                         "TLS is not supported over Unix-domain LMTP sockets",
                     ));
                 }
@@ -113,7 +113,7 @@ impl SmtpExecutor for TokioExecutor {
             {
                 // Keep the binding used when Unix socket support is cfg-gated out.
                 let _ = path;
-                return Err(crate::transport::smtp::error::client(
+                return Err(crate::transport::smtp::error::invalid_input(
                     "Unix-domain LMTP sockets are only supported on Unix platforms",
                 ));
             }

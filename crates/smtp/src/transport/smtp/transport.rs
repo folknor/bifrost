@@ -699,7 +699,7 @@ impl SmtpClient {
             #[cfg(unix)]
             {
                 if self.info.uses_tls() {
-                    return Err(error::client(
+                    return Err(error::invalid_input(
                         "TLS is not supported over Unix-domain LMTP sockets",
                     ));
                 }
@@ -719,7 +719,7 @@ impl SmtpClient {
             #[cfg(not(unix))]
             {
                 let _ = path;
-                return Err(error::client(
+                return Err(error::invalid_input(
                     "Unix-domain LMTP sockets are only supported on Unix platforms",
                 ));
             }

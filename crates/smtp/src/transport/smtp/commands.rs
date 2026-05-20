@@ -14,7 +14,7 @@ use crate::{
 
 fn validate_single_line_argument(command: &str, argument: &str) -> Result<(), Error> {
     if argument.chars().any(char::is_control) {
-        return Err(error::client(format!(
+        return Err(error::invalid_input(format!(
             "{command} argument must not contain control characters"
         )));
     }
@@ -331,17 +331,17 @@ impl Auth {
         response: &Response,
     ) -> Result<Auth, Error> {
         if !response.has_code(334) {
-            return Err(error::response("Expecting a challenge"));
+            return Err(error::parse("Expecting a challenge"));
         }
 
         let encoded_challenge = response
             .first_word()
-            .ok_or_else(|| error::response("Could not read auth challenge"))?;
+            .ok_or_else(|| error::parse("Could not read auth challenge"))?;
         #[cfg(feature = "tracing")]
         tracing::debug!("auth encoded challenge: {}", encoded_challenge);
 
-        let decoded_base64 = crate::base64::decode(encoded_challenge).map_err(error::response)?;
-        let decoded_challenge = String::from_utf8(decoded_base64).map_err(error::response)?;
+        let decoded_base64 = crate::base64::decode(encoded_challenge).map_err(error::parse)?;
+        let decoded_challenge = String::from_utf8(decoded_base64).map_err(error::parse)?;
         #[cfg(feature = "tracing")]
         tracing::debug!("auth decoded challenge: {}", decoded_challenge);
 

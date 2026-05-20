@@ -164,7 +164,7 @@ impl FromStr for EnhancedStatusCode {
     type Err = Error;
 
     fn from_str(s: &str) -> result::Result<Self, Self::Err> {
-        parse_enhanced_status_code(s).ok_or_else(|| error::response("invalid enhanced status code"))
+        parse_enhanced_status_code(s).ok_or_else(|| error::parse("invalid enhanced status code"))
     }
 }
 
@@ -187,7 +187,7 @@ impl FromStr for Response {
     fn from_str(s: &str) -> result::Result<Response, Error> {
         parse_response(s)
             .map(|(_, r)| r)
-            .map_err(|e| error::response(e.to_owned()))
+            .map_err(|e| error::parse(e.to_owned()))
     }
 }
 

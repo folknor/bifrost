@@ -71,7 +71,7 @@ where
     let addrs = deadline
         .timeout("DNS lookup timed out", lookup)
         .await?
-        .map_err(error::connection)?;
+        .map_err(error::connection_io)?;
 
     Ok(addrs
         .into_iter()
@@ -159,11 +159,11 @@ impl AsyncNetworkStream {
                     IpAddr::V4(_) => TcpSocket::new_v4(),
                     IpAddr::V6(_) => TcpSocket::new_v6(),
                 }
-                .map_err(error::connection)?;
+                .map_err(error::connection_io)?;
                 if let Some(local_addr) = local_addr {
                     socket
                         .bind(SocketAddr::new(local_addr, 0))
-                        .map_err(error::connection)?;
+                        .map_err(error::connection_io)?;
                 }
 
                 let connect_future = socket.connect(addr);
@@ -177,7 +177,7 @@ impl AsyncNetworkStream {
             }
 
             Err(match last_err {
-                Some(last_err) => error::connection(last_err),
+                Some(last_err) => error::connection_io(last_err),
                 None => error::connection("could not resolve to any supported address"),
             })
         }
@@ -202,7 +202,7 @@ impl AsyncNetworkStream {
                 TokioUnixStream::connect(path),
             )
             .await?
-            .map_err(error::connection)?;
+            .map_err(error::connection_io)?;
         Ok(AsyncNetworkStream::new(InnerAsyncNetworkStream::TokioUnix(
             Box::new(stream),
         )))
@@ -234,13 +234,11 @@ impl AsyncNetworkStream {
                     unreachable!()
                 };
 
-                self.inner = Self::upgrade_tls_stream(tcp_stream, tls_parameters, deadline)
-                    .await
-                    .map_err(error::connection)?;
+                self.inner = Self::upgrade_tls_stream(tcp_stream, tls_parameters, deadline).await?;
                 self.state = ConnectionState::Ok;
                 Ok(())
             }
-            _ => Err(error::client(
+            _ => Err(error::invalid_input(
                 "STARTTLS is only supported on TCP connections",
             )),
         }
@@ -262,7 +260,7 @@ impl AsyncNetworkStream {
             .timeout("TLS handshake timed out", handshake)
             .await?;
         Ok(InnerAsyncNetworkStream::TokioNativeTls(
-            stream.map_err(error::connection)?,
+            stream.map_err(error::tls)?,
         ))
     }
 
