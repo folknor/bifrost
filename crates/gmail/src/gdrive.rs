@@ -4,7 +4,10 @@
 //! then creates sharing permissions. Uses `reqwest::Client` directly (not
 //! `GmailClient`) since the Drive API has a different base URL.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::{Error, Result};
 
 /// Default chunk size: 5 MiB (must be a multiple of 256 KiB per Google's spec).
 #[allow(dead_code)]
@@ -73,7 +76,7 @@ pub async fn create_upload_session(
     file_name: &str,
     mime_type: &str,
     file_size: u64,
-) -> Result<GDriveUploadSession, String> {
+) -> Result<GDriveUploadSession> {
     let metadata = FileMetadata {
         name: file_name.to_string(),
         mime_type: mime_type.to_string(),
@@ -88,13 +91,13 @@ pub async fn create_upload_session(
         .json(&metadata)
         .send()
         .await
-        .map_err(|e| format!("Failed to create upload session: {e}"))?;
+        .map_err(Error::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.map_err(Error::from)?;
         log::error!("[GDrive] Failed to create upload session for '{file_name}': {status}");
-        return Err(format!("Failed to create upload session: {status} {body}"));
+        return Err(Error::status("Google Drive", status, body));
     }
 
     log::debug!("[GDrive] Created upload session for '{file_name}' ({file_size} bytes)");
@@ -102,7 +105,9 @@ pub async fn create_upload_session(
         .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "Upload session response missing Location header".to_string())?
+        .ok_or_else(|| {
+            Error::MalformedPayload("upload session response missing Location header".to_string())
+        })?
         .to_string();
 
     Ok(GDriveUploadSession { upload_url })
@@ -120,16 +125,16 @@ pub async fn upload_file_chunked(
     upload_url: &str,
     data: &[u8],
     chunk_size: usize,
-) -> Result<GDriveFileResponse, String> {
+) -> Result<GDriveFileResponse> {
     if chunk_size == 0 || !chunk_size.is_multiple_of(GDRIVE_CHUNK_ALIGN) {
-        return Err(format!(
+        return Err(Error::InvalidInput(format!(
             "chunk_size must be a positive multiple of {GDRIVE_CHUNK_ALIGN}, got {chunk_size}"
-        ));
+        )));
     }
 
     let total = data.len();
     if total == 0 {
-        return Err("Cannot upload empty file".to_string());
+        return Err(Error::InvalidInput("cannot upload empty file".to_string()));
     }
 
     let mut offset = 0;
@@ -145,18 +150,12 @@ pub async fn upload_file_chunked(
             .body(chunk.to_vec())
             .send()
             .await
-            .map_err(|e| format!("Upload chunk failed: {e}"))?;
+            .map_err(Error::from)?;
 
-        let status = response.status().as_u16();
-        match status {
+        let status = response.status();
+        match status.as_u16() {
             // 200 or 201 = final chunk accepted, response contains file metadata
-            200 | 201 => {
-                let file: GDriveFileResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| format!("Failed to parse completed upload response: {e}"))?;
-                return Ok(file);
-            }
+            200 | 201 => return parse_success_json(response).await,
             // 308 Resume Incomplete = more chunks needed
             308 => {
                 // Parse Range header to find how many bytes the server received
@@ -172,13 +171,15 @@ pub async fn upload_file_chunked(
                 offset = end;
             }
             _ => {
-                let body = response.text().await.unwrap_or_default();
-                return Err(format!("Upload chunk failed: {status} {body}"));
+                let body = response.text().await.map_err(Error::from)?;
+                return Err(Error::status("Google Drive resumable upload", status, body));
             }
         }
     }
 
-    Err("Upload completed without receiving a file response".to_string())
+    Err(Error::MalformedPayload(
+        "upload completed without receiving a file response".to_string(),
+    ))
 }
 
 /// Resume an interrupted upload by querying the server for what has been received.
@@ -189,7 +190,7 @@ pub async fn resume_upload(
     http: &reqwest::Client,
     upload_url: &str,
     total_size: u64,
-) -> Result<u64, String> {
+) -> Result<u64> {
     let content_range = format!("bytes */{total_size}");
 
     let response = http
@@ -199,10 +200,10 @@ pub async fn resume_upload(
         .body(Vec::<u8>::new())
         .send()
         .await
-        .map_err(|e| format!("Failed to query upload status: {e}"))?;
+        .map_err(Error::from)?;
 
-    let status = response.status().as_u16();
-    match status {
+    let status = response.status();
+    match status.as_u16() {
         // 308 = upload incomplete, Range header tells us what was received
         308 => {
             let range = response
@@ -210,26 +211,32 @@ pub async fn resume_upload(
                 .get("range")
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| {
-                    "Resume response missing Range header - no bytes received yet".to_string()
+                    Error::MalformedPayload(
+                        "resume response missing Range header, no bytes received yet".to_string(),
+                    )
                 })?;
 
             // Format: "bytes=0-{last_byte_received}"
-            let last_byte_str = range
-                .strip_prefix("bytes=0-")
-                .ok_or_else(|| format!("Unexpected Range header format: {range}"))?;
+            let last_byte_str = range.strip_prefix("bytes=0-").ok_or_else(|| {
+                Error::MalformedPayload(format!("unexpected Range header format: {range}"))
+            })?;
 
-            let last_byte: u64 = last_byte_str
-                .parse()
-                .map_err(|e| format!("Failed to parse Range header value: {e}"))?;
+            let last_byte: u64 = last_byte_str.parse().map_err(|e| {
+                Error::MalformedPayload(format!("failed to parse Range header value: {e}"))
+            })?;
 
             Ok(last_byte + 1)
         }
         // 200 or 201 = upload already completed
         200 | 201 => Ok(total_size),
-        404 => Err("Upload session has expired".to_string()),
+        404 => Err(Error::status(
+            "Google Drive resumable upload",
+            status,
+            "upload session has expired".to_string(),
+        )),
         _ => {
-            let body = response.text().await.unwrap_or_default();
-            Err(format!("Upload status query failed: {status} {body}"))
+            let body = response.text().await.map_err(Error::from)?;
+            Err(Error::status("Google Drive resumable upload", status, body))
         }
     }
 }
@@ -243,7 +250,7 @@ pub async fn create_sharing_permission(
     access_token: &str,
     file_id: &str,
     scope: GDriveSharingScope,
-) -> Result<String, String> {
+) -> Result<String> {
     let body = match &scope {
         GDriveSharingScope::Anyone => serde_json::json!({
             "role": "reader",
@@ -265,22 +272,17 @@ pub async fn create_sharing_permission(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Failed to create sharing permission: {e}"))?;
+        .map_err(Error::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.map_err(Error::from)?;
         log::error!("[GDrive] Failed to create sharing permission for file {file_id}: {status}");
-        return Err(format!(
-            "Failed to create sharing permission: {status} {body}"
-        ));
+        return Err(Error::status("Google Drive", status, body));
     }
     log::info!("[GDrive] Created sharing permission for file {file_id}");
 
-    let _perm: PermissionResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse permission response: {e}"))?;
+    let _perm: PermissionResponse = parse_success_json(response).await?;
 
     // Fetch the web view link for the shared file
     get_file_web_link(http, access_token, file_id).await
@@ -293,7 +295,7 @@ pub async fn get_file_web_link(
     http: &reqwest::Client,
     access_token: &str,
     file_id: &str,
-) -> Result<String, String> {
+) -> Result<String> {
     let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink");
 
     let response = http
@@ -301,20 +303,22 @@ pub async fn get_file_web_link(
         .header("Authorization", format!("Bearer {access_token}"))
         .send()
         .await
-        .map_err(|e| format!("Failed to get file web link: {e}"))?;
+        .map_err(Error::from)?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("Failed to get file web link: {status} {body}"));
+        let body = response.text().await.map_err(Error::from)?;
+        return Err(Error::status("Google Drive", status, body));
     }
 
-    let file: FileWebLinkResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse file web link response: {e}"))?;
+    let file: FileWebLinkResponse = parse_success_json(response).await?;
 
     Ok(file.web_view_link)
+}
+
+async fn parse_success_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    let body = response.text().await.map_err(Error::from)?;
+    serde_json::from_str(&body).map_err(Error::from)
 }
 
 #[cfg(test)]

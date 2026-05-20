@@ -1,5 +1,6 @@
 use serde_json::json;
 
+use crate::Result;
 use crate::client::GmailClient;
 use crate::types::{
     GmailAttachmentData, GmailDraft, GmailDraftStub, GmailHistoryResponse, GmailLabel,
@@ -8,11 +9,11 @@ use crate::types::{
 };
 
 impl GmailClient {
-    pub async fn get_profile(&self) -> Result<GmailProfile, String> {
+    pub async fn get_profile(&self) -> Result<GmailProfile> {
         self.get("/profile").await
     }
 
-    pub async fn list_labels(&self) -> Result<Vec<GmailLabel>, String> {
+    pub async fn list_labels(&self) -> Result<Vec<GmailLabel>> {
         let resp: ListLabelsResponse = self.get("/labels").await?;
         Ok(resp.labels)
     }
@@ -21,7 +22,7 @@ impl GmailClient {
         &self,
         name: &str,
         color: Option<(&str, &str)>,
-    ) -> Result<GmailLabel, String> {
+    ) -> Result<GmailLabel> {
         let mut body = json!({
             "name": name,
             "labelListVisibility": "labelShow",
@@ -41,7 +42,7 @@ impl GmailClient {
         label_id: &str,
         name: Option<&str>,
         color: Option<Option<(&str, &str)>>,
-    ) -> Result<GmailLabel, String> {
+    ) -> Result<GmailLabel> {
         let mut body = json!({});
         if let Some(n) = name {
             body["name"] = json!(n);
@@ -55,7 +56,7 @@ impl GmailClient {
         self.patch(&format!("/labels/{label_id}"), &body).await
     }
 
-    pub async fn delete_label(&self, label_id: &str) -> Result<(), String> {
+    pub async fn delete_label(&self, label_id: &str) -> Result<()> {
         self.delete(&format!("/labels/{label_id}")).await
     }
 
@@ -64,7 +65,7 @@ impl GmailClient {
         query: Option<&str>,
         max_results: Option<u32>,
         page_token: Option<&str>,
-    ) -> Result<(Vec<GmailThreadStub>, Option<String>), String> {
+    ) -> Result<(Vec<GmailThreadStub>, Option<String>)> {
         let mut params = Vec::new();
         if let Some(q) = query {
             params.push(format!("q={}", urlencoding::encode(q)));
@@ -85,7 +86,7 @@ impl GmailClient {
         Ok((resp.threads, resp.next_page_token))
     }
 
-    pub async fn get_thread(&self, thread_id: &str, format: &str) -> Result<GmailThread, String> {
+    pub async fn get_thread(&self, thread_id: &str, format: &str) -> Result<GmailThread> {
         self.get(&format!("/threads/{thread_id}?format={format}"))
             .await
     }
@@ -95,7 +96,7 @@ impl GmailClient {
         thread_id: &str,
         add_labels: &[String],
         remove_labels: &[String],
-    ) -> Result<GmailThread, String> {
+    ) -> Result<GmailThread> {
         self.post(
             &format!("/threads/{thread_id}/modify"),
             &json!({
@@ -106,24 +107,16 @@ impl GmailClient {
         .await
     }
 
-    pub async fn delete_thread(&self, thread_id: &str) -> Result<(), String> {
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<()> {
         self.delete(&format!("/threads/{thread_id}")).await
     }
 
-    pub async fn get_message(
-        &self,
-        message_id: &str,
-        format: &str,
-    ) -> Result<GmailMessage, String> {
+    pub async fn get_message(&self, message_id: &str, format: &str) -> Result<GmailMessage> {
         self.get(&format!("/messages/{message_id}?format={format}"))
             .await
     }
 
-    pub async fn send_message(
-        &self,
-        raw: &str,
-        thread_id: Option<&str>,
-    ) -> Result<GmailMessage, String> {
+    pub async fn send_message(&self, raw: &str, thread_id: Option<&str>) -> Result<GmailMessage> {
         let mut body = json!({ "raw": raw });
         if let Some(tid) = thread_id {
             body["threadId"] = json!(tid);
@@ -136,7 +129,7 @@ impl GmailClient {
         message_id: &str,
         add_labels: &[String],
         remove_labels: &[String],
-    ) -> Result<GmailMessage, String> {
+    ) -> Result<GmailMessage> {
         self.post(
             &format!("/messages/{message_id}/modify"),
             &json!({
@@ -151,7 +144,7 @@ impl GmailClient {
         &self,
         message_id: &str,
         attachment_id: &str,
-    ) -> Result<GmailAttachmentData, String> {
+    ) -> Result<GmailAttachmentData> {
         self.get(&format!(
             "/messages/{message_id}/attachments/{attachment_id}"
         ))
@@ -162,7 +155,7 @@ impl GmailClient {
         &self,
         start_history_id: &str,
         page_token: Option<&str>,
-    ) -> Result<GmailHistoryResponse, String> {
+    ) -> Result<GmailHistoryResponse> {
         let mut params = vec![
             format!("startHistoryId={start_history_id}"),
             "maxResults=500".to_string(),
@@ -178,11 +171,7 @@ impl GmailClient {
         self.get(&format!("/history?{qs}")).await
     }
 
-    pub async fn create_draft(
-        &self,
-        raw: &str,
-        thread_id: Option<&str>,
-    ) -> Result<GmailDraft, String> {
+    pub async fn create_draft(&self, raw: &str, thread_id: Option<&str>) -> Result<GmailDraft> {
         let mut message = json!({ "raw": raw });
         if let Some(tid) = thread_id {
             message["threadId"] = json!(tid);
@@ -195,7 +184,7 @@ impl GmailClient {
         draft_id: &str,
         raw: &str,
         thread_id: Option<&str>,
-    ) -> Result<GmailDraft, String> {
+    ) -> Result<GmailDraft> {
         let mut message = json!({ "raw": raw });
         if let Some(tid) = thread_id {
             message["threadId"] = json!(tid);
@@ -207,11 +196,11 @@ impl GmailClient {
         .await
     }
 
-    pub async fn delete_draft(&self, draft_id: &str) -> Result<(), String> {
+    pub async fn delete_draft(&self, draft_id: &str) -> Result<()> {
         self.delete(&format!("/drafts/{draft_id}")).await
     }
 
-    pub async fn list_drafts(&self) -> Result<Vec<GmailDraftStub>, String> {
+    pub async fn list_drafts(&self) -> Result<Vec<GmailDraftStub>> {
         let mut all_drafts = Vec::new();
         let mut page_token: Option<String> = None;
 
@@ -232,7 +221,7 @@ impl GmailClient {
         Ok(all_drafts)
     }
 
-    pub async fn list_send_as(&self) -> Result<Vec<GmailSendAs>, String> {
+    pub async fn list_send_as(&self) -> Result<Vec<GmailSendAs>> {
         let resp: ListSendAsResponse = self.get("/settings/sendAs").await?;
         Ok(resp.send_as)
     }
@@ -241,7 +230,7 @@ impl GmailClient {
         &self,
         send_as_email: &str,
         signature_html: &str,
-    ) -> Result<GmailSendAs, String> {
+    ) -> Result<GmailSendAs> {
         let encoded = urlencoding::encode(send_as_email);
         self.put(
             &format!("/settings/sendAs/{encoded}"),

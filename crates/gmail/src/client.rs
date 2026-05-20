@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+use crate::{Error, Result};
+
 pub const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -59,20 +61,16 @@ impl GmailClient {
         *self.inner.access_token.write().await = access_token.into();
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.api_url(path);
         self.request::<T, ()>(&url, "GET", None).await
     }
 
-    pub async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
+    pub async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         self.request::<T, ()>(url, "GET", None).await
     }
 
-    pub async fn post<T: DeserializeOwned, B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T, String> {
+    pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = self.api_url(path);
         self.request(&url, "POST", Some(body)).await
     }
@@ -81,15 +79,11 @@ impl GmailClient {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, String> {
+    ) -> Result<T> {
         self.request(url, "POST", Some(body)).await
     }
 
-    pub async fn put<T: DeserializeOwned, B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T, String> {
+    pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = self.api_url(path);
         self.request(&url, "PUT", Some(body)).await
     }
@@ -98,7 +92,7 @@ impl GmailClient {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, String> {
+    ) -> Result<T> {
         self.request(url, "PUT", Some(body)).await
     }
 
@@ -106,7 +100,7 @@ impl GmailClient {
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, String> {
+    ) -> Result<T> {
         let url = self.api_url(path);
         self.request(&url, "PATCH", Some(body)).await
     }
@@ -115,16 +109,16 @@ impl GmailClient {
         &self,
         url: &str,
         body: &B,
-    ) -> Result<T, String> {
+    ) -> Result<T> {
         self.request(url, "PATCH", Some(body)).await
     }
 
-    pub async fn delete(&self, path: &str) -> Result<(), String> {
+    pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.api_url(path);
         self.delete_absolute(&url, "Gmail API").await
     }
 
-    pub async fn delete_absolute(&self, url: &str, service: &str) -> Result<(), String> {
+    pub async fn delete_absolute(&self, url: &str, service: &str) -> Result<()> {
         let access_token = self.access_token().await;
         let response = self
             .execute_with_retry(url, "DELETE", None::<&()>, &access_token)
@@ -147,7 +141,7 @@ impl GmailClient {
         url: &str,
         method: &str,
         body: Option<&B>,
-    ) -> Result<T, String> {
+    ) -> Result<T> {
         let access_token = self.access_token().await;
         let response = self
             .execute_with_retry(url, method, body, &access_token)
@@ -161,7 +155,7 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
         access_token: &str,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<reqwest::Response> {
         let mut last_response = None;
 
         for attempt in 0..MAX_RETRY_ATTEMPTS {
@@ -180,7 +174,7 @@ impl GmailClient {
             tokio::time::sleep(delay).await;
         }
 
-        last_response.ok_or_else(|| "No response received".to_string())
+        last_response.ok_or_else(|| Error::MalformedPayload("no response received".to_string()))
     }
 
     async fn execute_once<B: Serialize>(
@@ -189,14 +183,18 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
         access_token: &str,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<reqwest::Response> {
         let mut builder = match method {
             "GET" => self.inner.http.get(url),
             "POST" => self.inner.http.post(url),
             "PUT" => self.inner.http.put(url),
             "PATCH" => self.inner.http.patch(url),
             "DELETE" => self.inner.http.delete(url),
-            _ => return Err(format!("Unsupported HTTP method: {method}")),
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "unsupported HTTP method: {method}"
+                )));
+            }
         };
 
         builder = builder
@@ -207,37 +205,31 @@ impl GmailClient {
             builder = builder.json(b);
         }
 
-        builder
-            .send()
-            .await
-            .map_err(|e| format!("Gmail API request failed: {e}"))
+        builder.send().await.map_err(Error::from)
     }
 }
 
 async fn parse_json_response<T: DeserializeOwned>(
     response: reqwest::Response,
     service: &str,
-) -> Result<T, String> {
+) -> Result<T> {
     let status = response.status();
+    let body = response.text().await.map_err(Error::from)?;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("{service} error {status}: {body}"));
+        return Err(Error::status(service, status, body));
     }
 
-    response
-        .json()
-        .await
-        .map_err(|e| format!("{service} JSON parse failed: {e}"))
+    serde_json::from_str(&body).map_err(Error::from)
 }
 
-async fn check_response_status(response: reqwest::Response, service: &str) -> Result<(), String> {
+async fn check_response_status(response: reqwest::Response, service: &str) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
 
-    let body = response.text().await.unwrap_or_default();
-    Err(format!("{service} error {status}: {body}"))
+    let body = response.text().await.map_err(Error::from)?;
+    Err(Error::status(service, status, body))
 }
 
 fn retry_delay(response: Option<&reqwest::Response>, attempt: u32) -> Duration {

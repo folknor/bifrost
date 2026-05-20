@@ -3,20 +3,18 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 
-pub fn decode_base64_standard(input: &str) -> Result<Vec<u8>, String> {
-    STANDARD
-        .decode(input)
-        .map_err(|e| format!("base64 decode: {e}"))
+use crate::{Error, Result};
+
+pub fn decode_base64_standard(input: &str) -> Result<Vec<u8>> {
+    STANDARD.decode(input).map_err(Error::base64_standard)
 }
 
 pub fn encode_base64_standard(data: &[u8]) -> String {
     STANDARD.encode(data)
 }
 
-pub fn decode_base64url_nopad(input: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD
-        .decode(input)
-        .map_err(|e| format!("base64url decode: {e}"))
+pub fn decode_base64url_nopad(input: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD.decode(input).map_err(Error::base64url)
 }
 
 pub fn encode_base64url_nopad(data: &[u8]) -> String {

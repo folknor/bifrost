@@ -1,6 +1,9 @@
 use serde::Serialize;
 
+use super::headers::{find_header_values_case_insensitive, unfold_header_value};
 use super::types::GmailHeader;
+
+const DEFAULT_AUTHSERV_IDS: &[&str] = &["mx.google.com", "google.com"];
 
 /// Individual authentication mechanism result.
 #[derive(Debug, Clone, Serialize)]
@@ -27,8 +30,21 @@ pub struct AuthResult {
 ///
 /// Returns `None` if no authentication headers are found.
 pub fn parse_authentication_results(headers: &[GmailHeader]) -> Option<AuthResult> {
-    let auth_header = find_header(headers, "authentication-results");
-    let arc_header = auth_header.or_else(|| find_header(headers, "arc-authentication-results"));
+    parse_authentication_results_for_authserv(headers, None)
+}
+
+/// Parse authentication results, preferring the supplied `authserv-id`.
+///
+/// When no `authserv-id` is supplied this prefers Gmail's own result when
+/// present, then falls back to the first header in top-down order.
+pub fn parse_authentication_results_for_authserv(
+    headers: &[GmailHeader],
+    authserv_id: Option<&str>,
+) -> Option<AuthResult> {
+    let auth_header = select_authentication_header(headers, "authentication-results", authserv_id);
+    let arc_header = auth_header.or_else(|| {
+        select_authentication_header(headers, "arc-authentication-results", authserv_id)
+    });
     let received_spf = find_header(headers, "received-spf");
 
     if arc_header.is_none() && received_spf.is_none() {
@@ -67,6 +83,43 @@ pub fn parse_authentication_results(headers: &[GmailHeader]) -> Option<AuthResul
     })
 }
 
+fn select_authentication_header<'a>(
+    headers: &'a [GmailHeader],
+    name: &str,
+    authserv_id: Option<&str>,
+) -> Option<&'a str> {
+    let values = find_header_values_case_insensitive(
+        headers,
+        name,
+        |h| h.name.as_str(),
+        |h| h.value.as_str(),
+    );
+    if values.is_empty() {
+        return None;
+    }
+
+    if let Some(authserv_id) = authserv_id
+        && let Some(value) = values
+            .iter()
+            .copied()
+            .find(|value| header_authserv_id_matches(value, authserv_id))
+    {
+        return Some(value);
+    }
+
+    for authserv_id in DEFAULT_AUTHSERV_IDS {
+        if let Some(value) = values
+            .iter()
+            .copied()
+            .find(|value| header_authserv_id_matches(value, authserv_id))
+        {
+            return Some(value);
+        }
+    }
+
+    values.first().copied()
+}
+
 fn find_header<'a>(headers: &'a [GmailHeader], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -75,24 +128,34 @@ fn find_header<'a>(headers: &'a [GmailHeader], name: &str) -> Option<&'a str> {
 }
 
 fn normalize_header(value: &str) -> String {
-    // Collapse folded headers (CRLF + whitespace) into a single space
-    let mut result = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\r' || c == '\n' {
-            // Skip whitespace after line breaks
-            while chars
-                .peek()
-                .is_some_and(|&ch| ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n')
-            {
-                chars.next();
-            }
-            result.push(' ');
-        } else {
-            result.push(c);
+    unfold_header_value(value)
+}
+
+fn header_authserv_id_matches(header_value: &str, expected: &str) -> bool {
+    extract_authserv_id(header_value)
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn extract_authserv_id(header_value: &str) -> Option<String> {
+    let normalized = normalize_header(header_value);
+
+    for part in normalized.split(';') {
+        let token = part.trim();
+        if token.is_empty() || token.get(..2).is_some_and(|p| p.eq_ignore_ascii_case("i=")) {
+            continue;
         }
+        if token.contains('=') {
+            return None;
+        }
+        return token
+            .split_whitespace()
+            .next()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
     }
-    result
+
+    None
 }
 
 /// Parse a single `mechanism=result (detail)` pattern from the header.
@@ -235,4 +298,100 @@ fn compute_aggregate(spf: &AuthVerdict, dkim: &AuthVerdict, dmarc: &AuthVerdict)
 
     // Mixed results
     "warning".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_authserv_id, parse_authentication_results,
+        parse_authentication_results_for_authserv,
+    };
+    use crate::types::GmailHeader;
+
+    fn header(name: &str, value: &str) -> GmailHeader {
+        GmailHeader {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn extracts_arc_authserv_id_after_instance_tag() {
+        assert_eq!(
+            extract_authserv_id("i=1; mx.google.com; spf=pass").as_deref(),
+            Some("mx.google.com")
+        );
+    }
+
+    #[test]
+    fn selects_default_gmail_authentication_results_header() {
+        let headers = vec![
+            header(
+                "Authentication-Results",
+                "relay.example; spf=fail dkim=fail dmarc=fail",
+            ),
+            header(
+                "Authentication-Results",
+                "mx.google.com; spf=pass dkim=pass dmarc=pass",
+            ),
+        ];
+
+        let result = parse_authentication_results(&headers).expect("auth result");
+        assert_eq!(result.spf.result, "pass");
+        assert_eq!(result.dkim.result, "pass");
+        assert_eq!(result.dmarc.result, "pass");
+        assert_eq!(result.aggregate, "pass");
+    }
+
+    #[test]
+    fn selects_configured_authserv_id() {
+        let headers = vec![
+            header(
+                "Authentication-Results",
+                "mx.google.com; spf=pass dkim=pass dmarc=pass",
+            ),
+            header(
+                "Authentication-Results",
+                "corp.example; spf=fail dkim=fail dmarc=fail",
+            ),
+        ];
+
+        let result = parse_authentication_results_for_authserv(&headers, Some("corp.example"))
+            .expect("auth result");
+        assert_eq!(result.aggregate, "fail");
+    }
+
+    #[test]
+    fn falls_back_to_first_authentication_results_header() {
+        let headers = vec![
+            header(
+                "Authentication-Results",
+                "relay-a.example; spf=pass dkim=pass dmarc=pass",
+            ),
+            header(
+                "Authentication-Results",
+                "relay-b.example; spf=fail dkim=fail dmarc=fail",
+            ),
+        ];
+
+        let result = parse_authentication_results(&headers).expect("auth result");
+        assert_eq!(result.aggregate, "pass");
+    }
+
+    #[test]
+    fn selects_default_gmail_arc_authentication_results_header() {
+        let headers = vec![
+            header(
+                "ARC-Authentication-Results",
+                "i=1; relay.example; spf=fail dkim=fail dmarc=fail",
+            ),
+            header(
+                "ARC-Authentication-Results",
+                "i=1; mx.google.com; spf=pass dkim=pass dmarc=pass",
+            ),
+        ];
+
+        let result = parse_authentication_results(&headers).expect("auth result");
+        assert_eq!(result.aggregate, "pass");
+    }
 }
