@@ -166,7 +166,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     }
 }
 
-// -- Typed batch results (plans/jmap/API.md §6 stretch) --
+// -- Typed batch results --
 //
 // `Request::send_methods((m1, m2, ...))` adds the methods to the
 // batch in order, sends the request, and returns a tuple of the

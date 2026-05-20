@@ -1,10 +1,10 @@
 //! Workflow facade for the mail capability.
 //!
-//! Per plans/jmap/API.md §2 ("B++"), bifrost-jmap ships the protocol layer
-//! ([`Account::call`], [`Account::build`]) plus a small curated facade
-//! around the workflows ratatoskr actually uses. This module is that
-//! facade for `urn:ietf:params:jmap:mail`. The protocol layer remains
-//! available for anything the facade does not cover.
+//! bifrost-jmap ships the protocol layer ([`Account::call`],
+//! [`Account::build`]) plus a small curated facade around the workflows
+//! ratatoskr actually uses. This module is that facade for
+//! `urn:ietf:params:jmap:mail`. The protocol layer remains available for
+//! anything the facade does not cover.
 //!
 //! ```ignore
 //! let mail = client.primary_account::<capability::Mail>()?.into_mail();

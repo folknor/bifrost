@@ -97,6 +97,7 @@ Workspace-wide conventions. Per-crate conventions live in `reference/<crate>.md`
 - `#[non_exhaustive]` on all public enums.
 - Clippy lints in workspace root `Cargo.toml` `[workspace.lints.clippy]`.
 - Don't commit ad-hoc reference docs outside `plans/` or `reference/`.
+- Code comments must never point to documents in `plans/`. Plans move, get renamed, and get deleted; source comments that name a plan path rot silently and require cross-tree edits when the doc moves. Explain the "why" in the comment itself, or point at a stable doc under `reference/`.
 
 ## Reference
 
