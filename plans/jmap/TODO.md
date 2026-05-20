@@ -113,7 +113,7 @@ These came up in the same feedback but are Rust-isms, not API bugs:
 
 ## Remaining specs
 
-Implementation plans for additional JMAP specifications are in the `plans/` directory:
+Implementation plans for additional JMAP specifications live alongside this file:
 
-- **MDN (RFC 9007)** - `plans/MDN.md` - Read receipts (MDN/send, MDN/parse)
-- **S/MIME (RFC 9219)** - `plans/SMIME.md` - Email signature verification properties and filters
+- **MDN (RFC 9007)** - `MDN.md` - Read receipts (MDN/send, MDN/parse)
+- **S/MIME (RFC 9219)** - `SMIME.md` - Email signature verification properties and filters

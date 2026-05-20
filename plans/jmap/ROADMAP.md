@@ -20,7 +20,7 @@
 
 ### MDN Handling (RFC 9007)
 
-See `plans/MDN.md`.
+See `MDN.md`.
 
 - `MDN/send`, `MDN/parse`
 - Read receipts over JMAP
@@ -28,7 +28,7 @@ See `plans/MDN.md`.
 
 ### S/MIME Verification (RFC 9219)
 
-See `plans/SMIME.md`.
+See `SMIME.md`.
 
 - Additional `Email/get` properties: `smimeStatus`, `smimeErrors`, `smimeVerifiedAt`
 - Additional `Email/query` filters: `hasSmime`, `hasVerifiedSmime`
@@ -48,4 +48,4 @@ The JMAP coverage is feature-complete for ratatoskr's needs; the focus before 1.
 - **Async-only.**
 - **Apache-2.0 / MIT dual license.**
 
-Unimplemented spec plans live in `plans/` (`MDN.md`, `SMIME.md`, `SHARING.md`).
+Unimplemented spec plans live alongside this file (`MDN.md`, `SMIME.md`, `SHARING.md`).

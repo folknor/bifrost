@@ -30,7 +30,7 @@ pub struct QueryArguments {
     filter_as_tree: bool,
 }
 
-// -- Lifted method arguments (plans/API.md §5) --
+// -- Lifted method arguments (plans/jmap/API.md §5) --
 
 impl MailboxSet {
     #[must_use]

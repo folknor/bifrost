@@ -681,7 +681,7 @@ If we accept the recommendations above, the pre-1.0 release contains:
 
 - **Type-state split** (`Email<Get>` → `Email`/`EmailCreate`/`EmailPatch`).
   Deferred to a follow-up breaking release before 1.0 - see §8.
-- MDN (RFC 9007), S/MIME (RFC 9219). See `plans/MDN.md`, `plans/SMIME.md`.
+- MDN (RFC 9007), S/MIME (RFC 9219). See `MDN.md`, `SMIME.md`.
 - Optimization items 1, 3, 4 from `TODO.md` (capability_config round-trip,
   CallHandle.call_id, SSE Bytes copy) - accepted trade-offs.
 - JSON-map vs typed-struct unification for CalendarEvent / ContactCard.
