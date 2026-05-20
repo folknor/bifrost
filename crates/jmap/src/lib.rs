@@ -1,8 +1,5 @@
 #![forbid(unsafe_code)]
-#![doc = include_str!("../README.md")]
-
-#[cfg(not(feature = "tls-native"))]
-compile_error!("The `tls-native` feature must be enabled.");
+#![doc = "JMAP client for Rust."]
 
 pub mod account;
 #[cfg(feature = "contacts")]
