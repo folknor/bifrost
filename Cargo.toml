@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/gmail", "crates/imap", "crates/jmap", "crates/smtp"]
+members = [
+    "crates/gmail",
+    "crates/graph",
+    "crates/imap",
+    "crates/jmap",
+    "crates/smtp",
+]
 resolver = "2"
 
 [workspace.package]

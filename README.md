@@ -11,8 +11,8 @@ Rust clients for email/calendar/contact protocols, built for [ratatoskr](https:/
 | [`bifrost-jmap`](crates/jmap) | Pre-1.0 | JMAP client (RFC 8620 / 8621 / 8887 / 9404 / 9425 / 9610 / 9670, calendars draft-26, sieve draft-14) |
 | [`bifrost-imap`](crates/imap) | Pre-1.0 | IMAP client (daaki-derived, tokio + native-tls) |
 | [`bifrost-smtp`](crates/smtp) | Pre-1.0 | SMTP submission + LMTP (lettre-derived, native-tls) |
-| `bifrost-graph` | Planned | Microsoft Graph + Exchange Web Services |
-| `bifrost-gmail` | Planned | Gmail API |
+| [`bifrost-graph`](crates/graph) | Pre-1.0 | Microsoft Graph + Exchange Web Services |
+| [`bifrost-gmail`](crates/gmail) | Pre-1.0 | Gmail API |
 
 Per-crate architecture references live in [`reference/`](reference/). Working examples live under each crate's `examples/` directory.
 
