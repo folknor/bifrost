@@ -77,14 +77,14 @@ pub async fn drive_changes_stream(
     _account_id: AccountId,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     boundary: BoundaryView,
-    control: Option<SyncControl>,
-    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    _control: Option<SyncControl>,
+    _ack_tx: Option<mpsc::Sender<AckRequest>>,
 ) -> Result<ChangesEvent, Error> {
     let mut stream = account.changes_stream(cursor);
     while let Some(event) = stream.next().await {
         match boundary.peek() {
             BoundaryRequest::Stop => return Ok(ChangesEvent::Stopped),
-            BoundaryRequest::Pause => return Ok(ChangesEvent::Paused),
+            BoundaryRequest::Pause => {}
             BoundaryRequest::CheckpointNow | BoundaryRequest::Run => {}
         }
         let checkpoint = checkpoint_for(&event).cloned();
@@ -110,29 +110,13 @@ pub async fn drive_changes_stream(
             // durable write awaits the consumer ack.
             cursors.put(c.clone());
         }
-        if let Some(cp) = checkpoint.clone()
-            && let Some(ctrl) = &control
-        {
-            // Notify pause / checkpoint_now waiters that a checkpoint
-            // has just been emitted (whether or not it has been
-            // acknowledged yet; the generation counter resolves the
-            // race - see SyncControl).
-            ctrl.record_checkpoint(cp).await;
-        }
-        // If the consumer ack channel is wired and they have not yet
-        // opted into per-batch acks, propagate the checkpoint as a
-        // synthetic "self-ack" so v1 consumers that do not yet call
-        // `ack_checkpoint` still see durable cursors. This keeps the
-        // door open for the strict ack contract while preserving
-        // single-process correctness when consumers ignore the API.
-        if let (Some(tx), Some(cp)) = (&ack_tx, checkpoint.clone()) {
-            let _ = tx
-                .send(AckRequest {
-                    scope: scope.clone(),
-                    checkpoint: cp,
-                    auto: true,
-                })
-                .await;
+        if checkpoint.is_some() {
+            match boundary.peek() {
+                BoundaryRequest::Pause => return Ok(ChangesEvent::Paused),
+                BoundaryRequest::CheckpointNow => return Ok(ChangesEvent::Done),
+                BoundaryRequest::Stop => return Ok(ChangesEvent::Stopped),
+                BoundaryRequest::Run => {}
+            }
         }
         if is_done {
             return Ok(ChangesEvent::Done);
@@ -145,15 +129,16 @@ pub async fn drive_changes_stream(
 }
 
 /// Ack request: scope + checkpoint the engine should durably persist.
-/// `auto` is true for engine-emitted "self-acks" issued so v1
-/// consumers that never call `SyncEngine::ack_checkpoint` still see
-/// durable cursors (single-process correctness).
+/// Consumers send these through `SyncEngine::ack_checkpoint` after
+/// their own item store commits the matching batch.
 #[derive(Debug, Clone)]
 pub struct AckRequest {
     pub scope: CursorScope,
     pub checkpoint: Checkpoint,
-    /// True when the engine issued the ack itself (default v1 mode);
-    /// false when it came from `SyncEngine::ack_checkpoint`.
+    /// True for legacy engine-generated acks. Current production code
+    /// sends only consumer acks (`false`), but the field remains for
+    /// trace readability if old tests or callers construct requests
+    /// directly inside the crate.
     pub auto: bool,
 }
 

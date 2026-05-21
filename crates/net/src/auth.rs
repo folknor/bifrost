@@ -106,9 +106,12 @@ impl fmt::Debug for AccessToken {
 ///
 /// The state machine: `Fresh { token, refreshed_at }` is the steady
 /// state; on either a proactive expiry check or a forced refresh, the
-/// state transitions to `Refreshing { waiters }` and exactly one task
-/// drives the network call. Concurrent callers register a oneshot
-/// receiver in `waiters` and await.
+/// state transitions to `Refreshing { waiters }` and exactly one
+/// spawned task drives the network call. Concurrent callers register a
+/// oneshot receiver in `waiters` and await. The spawned driver is
+/// deliberate: if the first caller is cancelled mid-refresh, the state
+/// still resolves to `Fresh` or `Empty` instead of stranding future
+/// callers behind a stale `Refreshing` entry.
 pub struct OAuthRefresher {
     /// Underlying provider hooked up at construction.
     source: Arc<dyn TokenSource>,
@@ -160,8 +163,9 @@ impl OAuthRefresher {
     ///
     /// Single-flights concurrent refresh attempts. The first caller
     /// to find the state empty or stale transitions the state to
-    /// `Refreshing` and drives the network round-trip itself.
-    /// Concurrent callers register a oneshot receiver and await.
+    /// `Refreshing`, registers itself as a waiter, and spawns the
+    /// refresh driver. Concurrent callers register a oneshot receiver
+    /// and await.
     pub async fn token(&self) -> Result<AccessToken, Error> {
         self.token_inner(false).await
     }
@@ -193,13 +197,14 @@ impl OAuthRefresher {
                     return Ok(token.clone());
                 }
                 RefreshState::Fresh { .. } | RefreshState::Empty => {
-                    // We are the driving task. Mark the state as
-                    // `Refreshing` with an empty waiter list and drop
-                    // the lock.
-                    *state = RefreshState::Refreshing {
-                        waiters: Vec::new(),
-                    };
-                    DriverRole::Driver
+                    // This caller is responsible for spawning the
+                    // refresh driver. Register it as the first waiter
+                    // before dropping the lock so cancellation of this
+                    // future cannot leave the state stuck in
+                    // `Refreshing`.
+                    let (tx, rx) = oneshot::channel();
+                    *state = RefreshState::Refreshing { waiters: vec![tx] };
+                    DriverRole::Driver(rx)
                 }
                 RefreshState::Refreshing { waiters } => {
                     let (tx, rx) = oneshot::channel();
@@ -210,14 +215,14 @@ impl OAuthRefresher {
         };
 
         match role {
-            DriverRole::Driver => self.drive_refresh().await,
-            DriverRole::Waiter(rx) => match rx.await {
-                Ok(Ok(t)) => Ok(t),
-                Ok(Err(e)) => Err(arc_err_to_error(e)),
-                // The driver task dropped without sending. Treat as
-                // a refresh failure; the caller will see AuthLost.
-                Err(_) => Err(Error::AuthLost),
-            },
+            DriverRole::Driver(rx) => {
+                let driver = self.clone_handle();
+                tokio::spawn(async move {
+                    let _ = driver.drive_refresh().await;
+                });
+                wait_for_refresh(rx).await
+            }
+            DriverRole::Waiter(rx) => wait_for_refresh(rx).await,
         }
     }
 
@@ -273,6 +278,14 @@ impl OAuthRefresher {
         &self.source
     }
 
+    fn clone_handle(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            state: Arc::clone(&self.state),
+            max_age: self.max_age,
+        }
+    }
+
     /// Internal state handle. Crate-public so `Net` and `RequestBuilder`
     /// can drive the state machine when Phase 2 wires the refresh
     /// path. Not yet wired - `token()` / `force_refresh()` are the
@@ -283,10 +296,6 @@ impl OAuthRefresher {
     }
 }
 
-// `OAuthRefresher` itself implements `TokenSource` so call sites can
-// freely substitute a refresher for a raw token source. `current()`
-// returns the cached token (refreshing only if stale); `refresh()`
-// forces a network round-trip.
 // `OAuthRefresher` is itself a `TokenSource` so call sites can
 // freely substitute a refresher for a raw token source. `current()`
 // returns the cached token (refreshing only if stale); `refresh()`
@@ -328,11 +337,25 @@ impl TokenSource for OAuthRefresher {
 /// the lock.
 enum DriverRole {
     /// This caller transitioned the state to `Refreshing` and must
-    /// drive the network round-trip.
-    Driver,
+    /// spawn the refresh driver, then await the same waiter path as
+    /// every other caller.
+    Driver(oneshot::Receiver<Result<AccessToken, Arc<Error>>>),
     /// Another task is already driving the refresh; this caller is
     /// parked on a oneshot until the driver finishes.
     Waiter(oneshot::Receiver<Result<AccessToken, Arc<Error>>>),
+}
+
+async fn wait_for_refresh(
+    rx: oneshot::Receiver<Result<AccessToken, Arc<Error>>>,
+) -> Result<AccessToken, Error> {
+    match rx.await {
+        Ok(Ok(t)) => Ok(t),
+        Ok(Err(e)) => Err(arc_err_to_error(e)),
+        // The driver task dropped without sending. Treat as a terminal
+        // refresh failure; the state will already have been reset only
+        // if the driver reached `drive_refresh`.
+        Err(_) => Err(Error::AuthLost),
+    }
 }
 
 /// Has the cached token aged past the proactive-refresh threshold?

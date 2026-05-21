@@ -258,7 +258,7 @@ impl RateLimitGovernor {
                     } else {
                         f64::INFINITY
                     };
-                    let wait_capped = wait_secs.clamp(0.001, 0.25);
+                    let wait_capped = wait_secs.clamp(0.005, 0.25);
                     let dur = Duration::from_secs_f64(wait_capped);
                     (Arc::clone(&bucket.notify), dur)
                 };

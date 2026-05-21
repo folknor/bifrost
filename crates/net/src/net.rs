@@ -15,7 +15,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use reqwest::header::RANGE;
 
-use crate::auth::TokenSource;
+use crate::auth::{OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
 use crate::error::Error;
@@ -146,7 +146,10 @@ impl Net {
             inner: Arc::new(AccountNetInner {
                 net: self.clone(),
                 account: id,
-                token_source: spec.token_source,
+                token_source: Arc::new(
+                    OAuthRefresher::new(spec.token_source)
+                        .with_max_age(self.inner.config.token_max_age),
+                ),
                 default_retry: spec.default_retry,
                 priority: AtomicU8::new(Priority::Foreground as u8),
                 bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
@@ -471,7 +474,10 @@ pub struct AccountSpec {
     /// Per-host rate-limit declarations. Empty means "no governor
     /// enforcement for this account", which is the default for JMAP.
     pub hosts: Vec<RateLimit>,
-    /// OAuth token provider.
+    /// Raw OAuth token provider. `Net::attach_account` wraps this in
+    /// an `OAuthRefresher` using `NetConfig::token_max_age`, so callers
+    /// should pass the provider itself rather than pre-wrapping it in
+    /// another refresher.
     pub token_source: Arc<dyn TokenSource>,
     /// Default retry policy.
     pub default_retry: RetryPolicy,

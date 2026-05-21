@@ -105,24 +105,34 @@ impl InvalidationSink for InvalidationSinkInner {
                 // deadline so a transiently-full channel doesn't
                 // drop the wakeup entirely. Increment the drop counter
                 // for observability either way.
-                let unknown = WatchEvent::Invalidated {
-                    hint: InvalidationHint {
-                        source: PushSource::Coalesced,
-                        payload: HintPayload::Unknown,
-                    },
-                };
-                let _ = rejected;
+                let unknown = coalesced_event(rejected);
                 let sender = tx.clone();
                 self.drop_counter.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
-                    let deadline = tokio::time::Duration::from_millis(100);
-                    let _ = tokio::time::timeout(deadline, sender.send(unknown)).await;
-                });
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let deadline = tokio::time::Duration::from_millis(100);
+                        let _ = tokio::time::timeout(deadline, sender.send(unknown)).await;
+                    });
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Account detached during in-flight push.
             }
         }
+    }
+}
+
+pub(crate) fn coalesced_event(event: WatchEvent) -> WatchEvent {
+    let source = match event {
+        WatchEvent::Invalidated { hint } => hint.source,
+        WatchEvent::Disconnected | WatchEvent::Reconnected => PushSource::Coalesced,
+        _ => PushSource::Coalesced,
+    };
+    WatchEvent::Invalidated {
+        hint: InvalidationHint {
+            source,
+            payload: HintPayload::Unknown,
+        },
     }
 }
 

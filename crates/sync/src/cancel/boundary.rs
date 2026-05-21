@@ -22,8 +22,9 @@ pub enum BoundaryRequest {
     /// Persist the next batch's checkpoint, then park until the
     /// request changes back to `Run` or to `Stop`.
     Pause,
-    /// Persist the next batch's checkpoint, emit `Done`, then flip
-    /// back to `Run` so the worker can pick up subsequent work.
+    /// Persist the next batch's checkpoint, then restore the previous
+    /// boundary state (`Run` or `Pause`) so checkpoint requests compose
+    /// with an already-paused account.
     CheckpointNow,
     /// Persist the most recent checkpoint, emit `Done`, exit the
     /// worker.

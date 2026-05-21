@@ -1,13 +1,13 @@
 //! Engine-internal types: configuration knobs, work-kind tags, and
 //! the `AccountSlot` shape the engine keeps in its `DashMap`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{Account, AccountCapabilities, AccountFactory, Priority};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::backfill::BackfillHandle;
@@ -176,6 +176,10 @@ pub(crate) struct AccountSlot {
     pub checkpoints: Arc<DynCheckpointStore>,
     #[allow(dead_code)]
     pub priority_tx: watch::Sender<Priority>,
+    #[allow(dead_code)]
+    pub priority_rx: watch::Receiver<Priority>,
+    #[allow(dead_code)]
+    pub bandwidth_cap_rx: watch::Receiver<Option<u64>>,
     pub boundary_tx: watch::Sender<BoundaryRequest>,
     pub shutdown: CancellationToken,
     #[allow(dead_code)]
@@ -185,13 +189,17 @@ pub(crate) struct AccountSlot {
     /// error.
     #[allow(dead_code)]
     pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
-    /// Per-worker abort handles, paired with their `JoinHandle`s.
-    /// `detach` aborts each handle on timeout so spawned tasks do not
-    /// leak past the configured deadline.
-    pub workers: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
-    pub abort_handles: tokio::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Spawned workers paired with their abort handles. `detach`
+    /// aborts each worker on timeout so tasks do not leak past the
+    /// configured deadline.
+    pub workers: Mutex<Vec<WorkerTask>>,
     /// Optional bandwidth meter wired through `bifrost-net` so
     /// `Control::bandwidth_observed` returns a real reading.
     #[allow(dead_code)]
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+}
+
+pub(crate) struct WorkerTask {
+    pub join: JoinHandle<()>,
+    pub abort: AbortHandle,
 }

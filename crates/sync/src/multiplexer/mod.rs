@@ -437,6 +437,28 @@ async fn spawn_scope_poll_inner(
         if recovered.exit {
             return;
         }
+        if matches!(
+            boundary.peek(),
+            crate::cancel::BoundaryRequest::CheckpointNow
+        ) {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = scope_cancel.cancelled() => return,
+                    next = boundary.changed() => {
+                        match next {
+                            None | Some(crate::cancel::BoundaryRequest::Stop) => return,
+                            Some(crate::cancel::BoundaryRequest::CheckpointNow) => continue,
+                            Some(crate::cancel::BoundaryRequest::Pause) => break,
+                            Some(crate::cancel::BoundaryRequest::Run) => break,
+                        }
+                    }
+                }
+            }
+            if matches!(boundary.peek(), crate::cancel::BoundaryRequest::Pause) {
+                continue;
+            }
+        }
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = scope_cancel.cancelled() => return,
@@ -486,15 +508,19 @@ async fn handle_drive_outcome(
             }
         }
         Ok(ChangesEvent::Fatal(recovery)) => {
-            // Send the full RecoveryClass to the engine so it can
-            // dispatch the right action: Retry / RestartScope /
-            // RestartAccount / AuthLost / etc.
-            let _ = reopen_tx
-                .send(ReopenRequest::Recovery {
-                    scope: scope.clone(),
-                    recovery,
-                })
-                .await;
+            if let RecoveryClass::Retry { after } = recovery {
+                tokio::time::sleep(after).await;
+            } else {
+                // Send the full RecoveryClass to the engine so it can
+                // dispatch the right action: RestartScope /
+                // RestartAccount / AuthLost / etc.
+                let _ = reopen_tx
+                    .send(ReopenRequest::Recovery {
+                        scope: scope.clone(),
+                        recovery,
+                    })
+                    .await;
+            }
             DriveRecovery {
                 advanced: false,
                 exit: false,

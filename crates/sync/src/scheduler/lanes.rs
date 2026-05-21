@@ -43,17 +43,12 @@ pub enum WorkKind {
 /// (matching the original behavior); `DropNewest` rejects the
 /// incoming submission. Both increment the shed counter for
 /// observability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LaneShedPolicy {
+    #[default]
     DropOldest,
     DropNewest,
-}
-
-impl Default for LaneShedPolicy {
-    fn default() -> Self {
-        Self::DropOldest
-    }
 }
 
 /// Per-lane FIFO queue.
@@ -94,17 +89,27 @@ impl LaneQueue {
     pub fn push(&self, item: WorkItem) {
         let mut g = self.queue.lock().expect("poisoned");
         if g.len() >= self.capacity {
-            // Shed oldest. We log a Warning at the scheduler facade so
-            // a single congested lane is visible without spamming on
-            // every push.
-            let _ = g.pop_front();
             self.shed_count.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                target: "bifrost.sync.scheduler",
-                priority = ?self.priority,
-                capacity = self.capacity,
-                "lane full; shedding oldest work item"
-            );
+            match self.shed_policy {
+                LaneShedPolicy::DropOldest => {
+                    let _ = g.pop_front();
+                    tracing::warn!(
+                        target: "bifrost.sync.scheduler",
+                        priority = ?self.priority,
+                        capacity = self.capacity,
+                        "lane full; shedding oldest work item"
+                    );
+                }
+                LaneShedPolicy::DropNewest => {
+                    tracing::warn!(
+                        target: "bifrost.sync.scheduler",
+                        priority = ?self.priority,
+                        capacity = self.capacity,
+                        "lane full; shedding newest work item"
+                    );
+                    return;
+                }
+            }
         }
         g.push_back(item);
     }

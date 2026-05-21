@@ -37,6 +37,14 @@ pub enum Error {
     /// the account.
     #[error("failed to establish initial cursor: {0}")]
     EstablishCursorFailed(String),
+    /// Cursor-establishing inventory ended in `Fatal`; the recovery
+    /// class is preserved so callers can decide whether to retry,
+    /// restart a scope, or surface to the user.
+    #[error("failed to establish initial cursor: {message}; recovery={recovery:?}")]
+    EstablishCursorFatal {
+        message: String,
+        recovery: RecoveryClass,
+    },
     /// Checkpoint persistence failed.
     #[error("checkpoint store rejected the write: {0}")]
     CheckpointStore(String),

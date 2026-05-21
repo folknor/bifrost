@@ -5,8 +5,10 @@
 //! cursor establishment. The multiplexer consumes the inventory stream
 //! and registers the cursor exactly once, on the inventory's terminal
 //! `Done` event. Mid-stream `Batch` checkpoints (if any) advance the
-//! inventory progress marker only; the change cursor is established
-//! when the inventory's terminal `Done` arrives.
+//! inventory progress marker only; the change cursor is established in
+//! memory when the inventory's terminal `Done` arrives. Durable cursor
+//! persistence still waits for the consumer ack of the terminal
+//! checkpoint.
 //!
 //! Inventory data: every `Batch` is forwarded to the per-account
 //! broadcast as a `ScopeChange::Added` membership signal before the
@@ -17,7 +19,7 @@ use std::sync::Arc;
 
 use bifrost_types::{
     Account, Change, Checkpoint, CursorScope, InventoryEntry, ObjectChange, ObjectChangeKind,
-    PageBoundary, SyncEvent,
+    PageBoundary, RecoveryClass, SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
@@ -29,16 +31,16 @@ use crate::error::Error;
 use super::MultiplexerEvent;
 
 /// Outcome of an inventory fusion pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum FusionOutcome {
-    /// Inventory completed; the engine persisted the cursor.
+    /// Inventory completed and the in-memory cursor was established.
     Established,
     /// Inventory completed without yielding a cursor; the engine emits
     /// a Warning.
     NoCursor,
     /// Inventory ended in `Fatal`.
-    Fatal,
+    Fatal(RecoveryClass),
 }
 
 pub struct InventoryFusion {
@@ -49,7 +51,7 @@ pub struct InventoryFusion {
 
 impl InventoryFusion {
     /// Drive an `inventory_stream(scope)` to completion. On the
-    /// terminal `Done`, register and persist the cursor carried in
+    /// terminal `Done`, register the cursor carried in
     /// its checkpoint. Mid-stream batches are ignored for the purpose
     /// of cursor establishment, but see `run_with_broadcast` for the
     /// path that forwards inventory data to subscribers.
@@ -63,7 +65,7 @@ impl InventoryFusion {
 
     /// Same contract as `run`, but each `Batch` of inventory entries
     /// is fanned out to `changes_tx` as `Change::ObjectChange::Created`
-    /// events BEFORE the terminal cursor is persisted. This is the
+    /// events BEFORE the terminal cursor is acknowledged. This is the
     /// only path inventory data flows to consumers for
     /// `EstablishViaInventory` scopes - dropping it would lose every
     /// Graph object and every IMAP-Basic / CONDSTORE-only folder's
@@ -78,9 +80,28 @@ impl InventoryFusion {
         while let Some(event) = stream.next().await {
             match event {
                 SyncEvent::Done(checkpoint) => {
+                    if let (Some(tx), Some(cp)) = (&changes_tx, checkpoint.clone()) {
+                        let me = MultiplexerEvent {
+                            scope: scope.clone(),
+                            event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
+                            checkpoint: Some(cp),
+                        };
+                        let _ = tx.send(me);
+                    }
                     return self.finalize(scope, checkpoint).await;
                 }
-                SyncEvent::Fatal(_) => return Ok(FusionOutcome::Fatal),
+                SyncEvent::Fatal(f) => {
+                    let recovery = f.recovery.clone();
+                    if let Some(tx) = &changes_tx {
+                        let me = MultiplexerEvent {
+                            scope: scope.clone(),
+                            event: Arc::new(SyncEvent::Fatal(f)),
+                            checkpoint: None,
+                        };
+                        let _ = tx.send(me);
+                    }
+                    return Ok(FusionOutcome::Fatal(recovery));
+                }
                 SyncEvent::Batch(batch) => {
                     if let Some(tx) = &changes_tx {
                         Self::forward_inventory_batch(
@@ -151,9 +172,6 @@ impl InventoryFusion {
                 expected_scope, cursor.scope,
             )));
         }
-        self.store
-            .put_change_cursor(&self.account_id, cursor.clone())
-            .await?;
         self.cursors.put(cursor);
         Ok(FusionOutcome::Established)
     }

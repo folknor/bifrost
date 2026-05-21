@@ -68,18 +68,14 @@ pub trait CheckpointStore: Send + Sync {
 
     /// Drop the change cursor for `(account, scope)`. Used by the
     /// engine's `RecoveryClass::RestartScope` recovery path so the
-    /// next attach / poll re-establishes via inventory. Default
-    /// implementation writes through a no-op via `put_change_cursor`
-    /// is wrong; implementors should remove the entry. The default
-    /// here returns Ok so existing third-party stores compile without
-    /// breaking changes - they should override.
+    /// next attach / poll re-establishes via inventory. This is
+    /// required because a no-op delete silently preserves the stale
+    /// durable cursor and makes restart-scope recovery ineffective.
     fn delete_change_cursor<'a>(
         &'a self,
-        _account: &'a AccountId,
-        _scope: &'a CursorScope,
-    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 }
 
 /// Engine-side erased handle type. The slot holds `Arc<dyn

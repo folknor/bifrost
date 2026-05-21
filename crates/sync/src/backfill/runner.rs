@@ -158,9 +158,7 @@ impl BackfillRunner {
                         progress_marker: None,
                         progress: BackfillProgress {
                             items_done: kept_total,
-                            items_estimated: u64::try_from(batch.items.len())
-                                .ok()
-                                .map(|_| kept_total),
+                            items_estimated: None,
                         },
                         envelope_version,
                     };
@@ -195,7 +193,19 @@ impl BackfillRunner {
                     store.put_backfill(account_id, bf).await?;
                 }
                 SyncEvent::Done(_) => break,
-                SyncEvent::Fatal(_) | SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+                SyncEvent::Fatal(f) => {
+                    let message = f.message.clone();
+                    if let Some(tx) = &changes_tx {
+                        let me = MultiplexerEvent {
+                            scope: scope.clone(),
+                            event: Arc::new(SyncEvent::Fatal(f)),
+                            checkpoint: None,
+                        };
+                        let _ = tx.send(me);
+                    }
+                    return Err(Error::Other(format!("backfill inventory fatal: {message}")));
+                }
+                SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
                 _ => {}
             }
         }

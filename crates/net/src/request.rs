@@ -170,15 +170,13 @@ impl RequestBuilder {
         // Drain the body into a single `Bytes`. The retry loop has
         // already validated status; everything from here is a
         // straight body read. Apply the bandwidth meter to the read
-        // so buffered receives feed the same counters as streaming.
-        let meter = internal.account.meter();
-        let mut body_stream = internal.body;
+        // so buffered receives feed the same counters and cap throttle
+        // as streaming.
+        let mut body_stream = wrap_metered(internal.body, internal.account);
         let mut accum: Vec<u8> = Vec::new();
         use futures::StreamExt;
         while let Some(chunk) = body_stream.next().await {
             let chunk = chunk?;
-            let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-            meter.record_bytes_in(n);
             accum.extend_from_slice(&chunk);
         }
         Ok(Response {
@@ -402,9 +400,7 @@ pub(crate) async fn send_streaming_inner(
             if let Some(ref h) = host {
                 account.net().governor().refund(h, cost_units);
             }
-            if account.token_source().refresh().await.is_err() {
-                return Err(Error::AuthLost);
-            }
+            account.token_source().refresh().await?;
             // Undo the top-of-loop network-budget increment: 401 is
             // its own one-shot recovery path tracked by
             // `auth_retries`. `continue 'outer` re-enters the loop;
@@ -581,25 +577,15 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
     let exp = attempt.saturating_sub(1).min(16);
     let scaled = base.saturating_mul(2u32.saturating_pow(exp));
     let capped = scaled.min(policy.max_backoff);
-    // Cheap deterministic-ish jitter from the current monotonic
-    // clock's nanos. Not a CSPRNG; the goal is decorrelation, not
-    // unguessability. `Instant::elapsed` since process start avoids
-    // clock-jumps and `SystemTime::now` (which can go backwards).
-    let nanos = process_start_elapsed_ns();
+    // Use the workspace's UUID RNG as a cheap per-attempt jitter
+    // source. This is not cryptographic policy; it just avoids
+    // lockstep modulus walks between clients that started together.
+    let nanos = uuid::Uuid::new_v4().as_u128();
     let capped_ns = u128::from(u64::try_from(capped.as_nanos()).unwrap_or(u64::MAX)).max(1);
     let jitter_ns = u64::try_from(nanos % capped_ns).unwrap_or(0);
     let half = capped / 2;
     let jitter = Duration::from_nanos(jitter_ns);
     half.saturating_add(jitter).min(policy.max_backoff)
-}
-
-/// Nanoseconds elapsed since process start. Used by `backoff_for` as
-/// a cheap, monotonic, non-CSPRNG jitter source.
-fn process_start_elapsed_ns() -> u128 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos()
 }
 
 /// Parse a `Retry-After` header. Either delta-seconds (an integer) or

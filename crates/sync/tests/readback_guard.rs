@@ -14,8 +14,9 @@ use bifrost_types::{
     BlobRangeSupport, ByteRange, Change, ChangeCursor, CursorDescriptor, CursorEstablishment,
     CursorFreshness, CursorScope, Error as TypesError, FlagOp, HydratedObject, HydratedObjectKind,
     IdempotencyKey, InventoryEntry, MembershipScope, MutationCapabilities, MutationConcurrency,
-    MutationReplaySafety, MutationResult, ObjectId, PageBoundary, Projection, PushCapability,
-    QuotaSignal, RateLimitClass, ScopeLifecycle, SubscriptionHandle, SyncEvent, WatchEvent,
+    MutationReplaySafety, MutationResult, ObjectId, PageBoundary, Priority, Projection,
+    PushCapability, QuotaSignal, RateLimitClass, ScopeLifecycle, SubscriptionHandle, SyncEvent,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -55,6 +56,10 @@ impl Account for FlagsAccount {
     fn capabilities(&self) -> &AccountCapabilities {
         &self.caps
     }
+
+    fn set_priority(&self, _priority: Priority) {}
+
+    fn set_bandwidth_cap(&self, _bps: Option<u64>) {}
 
     fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
         unreachable!("describe_cursor not exercised by readback guard tests")

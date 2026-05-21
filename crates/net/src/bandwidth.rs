@@ -206,6 +206,14 @@ impl BandwidthMeter {
         let map = self.accounts.lock().expect("meter lock poisoned");
         map.get(account).map(Arc::clone)
     }
+
+    fn lookup_or_register(&self, account: &AccountId) -> Arc<AccountCounters> {
+        let mut map = self.accounts.lock().expect("meter lock poisoned");
+        Arc::clone(
+            map.entry(account.clone())
+                .or_insert_with(|| Arc::new(AccountCounters::new(Instant::now()))),
+        )
+    }
 }
 
 impl Default for BandwidthMeter {
@@ -216,14 +224,10 @@ impl Default for BandwidthMeter {
 
 impl MeterSink for BandwidthMeter {
     fn record_bytes_in(&self, account: &AccountId, n: u64) {
-        if let Some(c) = self.lookup(account) {
-            c.record_in(n);
-        }
+        self.lookup_or_register(account).record_in(n);
     }
     fn record_bytes_out(&self, account: &AccountId, n: u64) {
-        if let Some(c) = self.lookup(account) {
-            c.record_out(n);
-        }
+        self.lookup_or_register(account).record_out(n);
     }
 }
 

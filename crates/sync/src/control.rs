@@ -49,16 +49,18 @@ struct SyncControlInner {
     /// reads the new generation before parking.
     generation: AtomicU64,
     priority: watch::Sender<Priority>,
-    bandwidth_cap: AtomicU64,
+    bandwidth_cap: watch::Sender<Option<u64>>,
     bandwidth_observed: AtomicU64,
 }
 
-/// Sentinel value used for `bandwidth_cap` to mean "no cap".
-const BANDWIDTH_CAP_NONE: u64 = u64::MAX;
-
 impl SyncControl {
     #[must_use]
-    pub fn new(account: AccountId, boundary: Boundary, priority: watch::Sender<Priority>) -> Self {
+    pub fn new(
+        account: AccountId,
+        boundary: Boundary,
+        priority: watch::Sender<Priority>,
+        bandwidth_cap: watch::Sender<Option<u64>>,
+    ) -> Self {
         let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
             generation: 0,
             checkpoint: None,
@@ -70,7 +72,7 @@ impl SyncControl {
                 checkpoint_tx,
                 generation: AtomicU64::new(0),
                 priority,
-                bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
+                bandwidth_cap,
                 bandwidth_observed: AtomicU64::new(0),
             }),
         }
@@ -97,16 +99,16 @@ impl SyncControl {
         self.inner.bandwidth_observed.store(bps, Ordering::Relaxed);
     }
 
-    /// Read the configured cap (used by `bifrost-net` if the engine
-    /// chooses to forward it). `None` when no cap is set.
+    /// Read the configured cap. `None` when no cap is set.
     #[must_use]
     pub fn bandwidth_cap_snapshot(&self) -> Option<u64> {
-        let raw = self.inner.bandwidth_cap.load(Ordering::Relaxed);
-        if raw == BANDWIDTH_CAP_NONE {
-            None
-        } else {
-            Some(raw)
-        }
+        *self.inner.bandwidth_cap.borrow()
+    }
+
+    /// Latest requested priority.
+    #[must_use]
+    pub fn priority_snapshot(&self) -> Priority {
+        *self.inner.priority.borrow()
     }
 
     /// Account id this control governs. Exposed for tracing spans.
@@ -168,12 +170,13 @@ impl Control for SyncControl {
     > {
         Box::pin(async move {
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let previous = self.inner.boundary.snapshot();
             self.inner.boundary.set(BoundaryRequest::CheckpointNow);
             let cp = self.wait_for_checkpoint_at_or_after(gen_id).await?;
-            // `CheckpointNow` returns the boundary to `Run` after the
-            // flush; the worker observes the next batch's boundary
-            // peek and continues without waiting.
-            self.inner.boundary.set(BoundaryRequest::Run);
+            // Restore the caller's prior state. A checkpoint request
+            // made while paused should flush one boundary and remain
+            // paused; a request made while running resumes running.
+            self.inner.boundary.set(previous);
             Ok(cp)
         })
     }
@@ -187,8 +190,7 @@ impl Control for SyncControl {
     }
 
     fn bandwidth_cap(&self, bps: Option<u64>) {
-        let stored = bps.unwrap_or(BANDWIDTH_CAP_NONE);
-        self.inner.bandwidth_cap.store(stored, Ordering::Relaxed);
+        let _ = self.inner.bandwidth_cap.send(bps);
     }
 
     fn bandwidth_observed(&self) -> u64 {

@@ -35,7 +35,7 @@ use crate::multiplexer::{
 use crate::mutation::MutationHandle;
 use crate::push::{InvalidationSinkInner, PushHandle, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
-use crate::types::{AccountSlot, EngineConfig};
+use crate::types::{AccountSlot, EngineConfig, WorkerTask};
 
 /// Top-level engine.
 pub struct SyncEngine {
@@ -114,8 +114,8 @@ impl SyncEngineBuilder {
         self
     }
 
-    #[must_use]
-    pub fn build(self) -> SyncEngine {
+    pub fn build(self) -> Result<SyncEngine, Error> {
+        self.config.budget.validate()?;
         let checkpoints = self
             .checkpoints
             .unwrap_or_else(|| Arc::new(InMemoryCheckpointStore::new()));
@@ -125,7 +125,7 @@ impl SyncEngineBuilder {
             budget_gate,
             self.config.lane_capacity,
         );
-        SyncEngine {
+        Ok(SyncEngine {
             config: self.config,
             checkpoints,
             accounts: DashMap::new(),
@@ -137,7 +137,7 @@ impl SyncEngineBuilder {
             bandwidth_meter: self.bandwidth_meter,
             ack_senders: DashMap::new(),
             attaching: Arc::new(AsyncMutex::new(std::collections::HashSet::new())),
-        }
+        })
     }
 }
 
@@ -230,6 +230,7 @@ impl SyncEngine {
         // Wire boundary + priority watches.
         let (boundary, boundary_view) = Boundary::new();
         let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
+        let (bandwidth_cap_tx, bandwidth_cap_rx) = watch::channel(None);
 
         // Per-account watch-event sender / receiver. The reconciler
         // owns the receiver; the multiplexer (in-process forwarder)
@@ -238,9 +239,10 @@ impl SyncEngine {
             mpsc::channel::<WatchEvent>(self.config.multiplexer.watch_capacity);
         self.sink.register(account_id.clone(), watch_tx.clone());
 
-        // Per-account ack channel: consumers (and the auto-ack path
-        // inside the driver) push (scope, checkpoint) here; a
-        // dedicated writer task persists them to `CheckpointStore`.
+        // Per-account ack channel: consumers push
+        // (scope, checkpoint) here after committing the matching
+        // batch; a dedicated writer task persists them to
+        // `CheckpointStore`.
         let (ack_tx, ack_rx) = mpsc::channel::<AckRequest>(256);
         self.ack_senders.insert(account_id.clone(), ack_tx.clone());
 
@@ -260,21 +262,27 @@ impl SyncEngine {
         // Control handle shared between the SyncControl returned to
         // the consumer and the engine's spawned workers (so workers
         // can call `record_checkpoint`).
-        let control = SyncControl::new(account_id.clone(), boundary.clone(), priority_tx.clone());
+        let control = SyncControl::new(
+            account_id.clone(),
+            boundary.clone(),
+            priority_tx.clone(),
+            bandwidth_cap_tx.clone(),
+        );
 
         // Reopen channel: the multiplexer's per-scope tasks raise
         // requests when a stream ends with a recoverable Fatal,
         // carrying the full `RecoveryClass`.
         let (reopen_tx, mut reopen_rx) = mpsc::channel::<ReopenRequest>(16);
 
-        let mut workers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let mut abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
+        let mut workers: Vec<WorkerTask> = Vec::new();
 
         // Helper to track both the JoinHandle and a clone of its
         // AbortHandle so detach can fire `abort()` on timeout.
         let mut spawn = |fut: tokio::task::JoinHandle<()>| {
-            abort_handles.push(fut.abort_handle());
-            workers.push(fut);
+            workers.push(WorkerTask {
+                abort: fut.abort_handle(),
+                join: fut,
+            });
         };
 
         // Ack writer: durably persists cursors as they are acked. Lives
@@ -290,6 +298,50 @@ impl SyncEngine {
             ack_rx,
             ack_writer_shutdown,
         )));
+
+        // Control applier: forwards priority and bandwidth-cap
+        // changes to the currently-open protocol handle. Reopen also
+        // reapplies the snapshots to the replacement handle.
+        {
+            let control_account = Arc::clone(&current);
+            let control_shutdown = shutdown.clone();
+            let mut priority_view = priority_rx.clone();
+            let mut bandwidth_view = bandwidth_cap_rx.clone();
+            spawn(tokio::spawn(async move {
+                {
+                    let account = control_account.load_full();
+                    account
+                        .as_ref()
+                        .as_ref()
+                        .set_priority(*priority_view.borrow());
+                    account
+                        .as_ref()
+                        .as_ref()
+                        .set_bandwidth_cap(*bandwidth_view.borrow());
+                }
+                loop {
+                    tokio::select! {
+                        () = control_shutdown.cancelled() => return,
+                        changed = priority_view.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            let priority = *priority_view.borrow();
+                            let account = control_account.load_full();
+                            account.as_ref().as_ref().set_priority(priority);
+                        }
+                        changed = bandwidth_view.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            let cap = *bandwidth_view.borrow();
+                            let account = control_account.load_full();
+                            account.as_ref().as_ref().set_bandwidth_cap(cap);
+                        }
+                    }
+                }
+            }));
+        }
 
         // Spawn push reconciler.
         let reconciler = crate::push::Reconciler {
@@ -324,12 +376,24 @@ impl SyncEngine {
                             () = sd.cancelled() => return,
                             next = stream.next() => {
                                 let Some(event) = next else { break; };
-                                if tx.try_send(event).is_err() {
-                                    tracing::trace!(
-                                        target: "bifrost.sync.changes",
-                                        account = ?aid,
-                                        "in-process push: queue full, coalesced"
-                                    );
+                                match tx.try_send(event) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(rejected)) => {
+                                        tracing::trace!(
+                                            target: "bifrost.sync.changes",
+                                            account = ?aid,
+                                            "in-process push: queue full, coalesced"
+                                        );
+                                        let unknown = crate::push::coalesced_event(rejected);
+                                        tokio::select! {
+                                            () = sd.cancelled() => return,
+                                            _ = tokio::time::timeout(
+                                                Duration::from_millis(100),
+                                                tx.send(unknown),
+                                            ) => {}
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
                                 }
                             }
                         }
@@ -398,6 +462,7 @@ impl SyncEngine {
         let reopen_aid = account_id.clone();
         let reopen_shutdown = shutdown.clone();
         let reopen_store = Arc::clone(&self.checkpoints);
+        let reopen_control = control.clone();
         spawn(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -413,6 +478,7 @@ impl SyncEngine {
                                     &reopen_store,
                                     &reopen_changes,
                                     &reopen_aid,
+                                    &reopen_control,
                                     scope,
                                     recovery,
                                 )
@@ -475,20 +541,17 @@ impl SyncEngine {
             cursors: Arc::clone(&cursors),
             checkpoints: Arc::clone(&self.checkpoints),
             priority_tx: priority_tx.clone(),
+            priority_rx,
+            bandwidth_cap_rx,
             boundary_tx: boundary.sender(),
             shutdown: shutdown.clone(),
             control: control.clone(),
             _sentinel_rx: sentinel_rx,
-            workers: tokio::sync::Mutex::new(workers),
-            abort_handles: tokio::sync::Mutex::new(abort_handles),
+            workers: std::sync::Mutex::new(workers),
             bandwidth_meter,
         });
 
         self.accounts.insert(account_id.clone(), slot);
-        drop(boundary_view);
-        // Keep priority_rx alive on the slot so the watch channel
-        // does not collapse and `priority_tx.send` continues to land.
-        drop(priority_rx);
 
         Ok(control)
     }
@@ -504,9 +567,11 @@ impl SyncEngine {
         scope: CursorScope,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        let Some(tx) = self.ack_senders.get(account_id) else {
-            return Err(Error::AccountNotAttached(account_id.clone()));
-        };
+        let tx = self
+            .ack_senders
+            .get(account_id)
+            .map(|r| r.value().clone())
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         tx.send(AckRequest {
             scope,
             checkpoint,
@@ -547,56 +612,38 @@ impl SyncEngine {
         let Some((_, slot)) = self.accounts.remove(account_id) else {
             return Err(Error::AccountNotAttached(account_id.clone()));
         };
-        // Drop the ack sender so the ack writer task exits.
+        // Drop the public ack sender so no new consumer acks enter
+        // during teardown. Worker-held clones remain alive long enough
+        // to flush their final checkpoint to the ack writer.
         self.ack_senders.remove(account_id);
         // Ask running workers to checkpoint cleanly, then stop.
         let _ = slot.boundary_tx.send(BoundaryRequest::Stop);
-        slot.shutdown.cancel();
 
-        // Await spawned workers up to the configured timeout. Clone
-        // the abort handles BEFORE the timeout race so we still own
-        // them when the timeout fires. Otherwise dropping the
-        // `JoinHandle` inside `tokio::time::timeout` would silently
-        // detach the task and let it run forever.
+        // Await spawned workers up to the configured timeout. Each
+        // stored worker owns both its join and abort handles so a
+        // timeout cannot detach a task and let it run forever.
         let timeout = self.config.detach_timeout;
-        let drained: Vec<tokio::task::JoinHandle<()>> = {
-            let mut workers = slot.workers.lock().await;
+        let mut drained: Vec<WorkerTask> = {
+            let mut workers = slot.workers.lock().expect("worker list lock poisoned");
             workers.drain(..).collect()
         };
-        let drained_aborts: Vec<tokio::task::AbortHandle> = {
-            let mut aborts = slot.abort_handles.lock().await;
-            aborts.drain(..).collect()
+        // The ack writer is spawned first. Wait for stream workers
+        // before the writer so final worker-held ack sender clones can
+        // close naturally and the writer can drain everything it
+        // received.
+        let ack_worker = if drained.is_empty() {
+            None
+        } else {
+            Some(drained.remove(0))
         };
         let deadline = tokio::time::Instant::now() + timeout;
-        for (handle, abort) in drained.into_iter().zip(drained_aborts) {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                abort.abort();
-                continue;
-            }
-            match tokio::time::timeout(remaining, handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(join)) => {
-                    if !join.is_cancelled() {
-                        tracing::warn!(
-                            target: "bifrost.sync.changes",
-                            error = ?join,
-                            "worker panic during detach"
-                        );
-                    }
-                }
-                Err(_) => {
-                    // Timed out; abort the task via the retained
-                    // abort handle. Dropping the JoinHandle alone
-                    // would orphan the task, not abort it.
-                    abort.abort();
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        "worker exceeded detach timeout; aborted"
-                    );
-                }
-            }
+        for worker in drained {
+            await_worker_until(deadline, worker).await;
         }
+        if let Some(worker) = ack_worker {
+            await_worker_until(deadline, worker).await;
+        }
+        slot.shutdown.cancel();
 
         let current = slot.current.load_full();
         if let Err(e) = current.close().await {
@@ -617,8 +664,12 @@ impl SyncEngine {
         let slot = self
             .accounts
             .get(account_id)
+            .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let next = slot.factory.open().await.map_err(Error::OpenFailed)?;
+        next.as_ref().set_priority(slot.control.priority_snapshot());
+        next.as_ref()
+            .set_bandwidth_cap(slot.control.bandwidth_cap_snapshot());
         slot.current.store(Arc::new(next));
         Ok(())
     }
@@ -657,6 +708,7 @@ impl SyncEngine {
         let slot = self
             .accounts
             .get(account_id)
+            .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let handles = self.subscriptions.take(account_id);
         let account = slot.current.load_full();
@@ -679,6 +731,7 @@ impl SyncEngine {
         let slot = self
             .accounts
             .get(account_id)
+            .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let account = slot.current.load_full();
         let handle = account.push_subscribe(scopes).await?;
@@ -702,6 +755,7 @@ impl SyncEngine {
         let slot = self
             .accounts
             .get(account_id)
+            .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let max_retries = self.config.mutation_max_retries;
 
@@ -715,7 +769,7 @@ impl SyncEngine {
         // the final aggregate counters are computed once at the end,
         // so a retry that flips a previous-attempt Failed -> Applied
         // does not double-count.
-        let mut totals = crate::mutation::MutationCounters::default();
+        let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
         let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
         let mut remaining: Vec<bifrost_types::ObjectId> = targets;
         let mut attempt: u32 = 0;
@@ -733,22 +787,17 @@ impl SyncEngine {
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = account.bulk_set_flags(target_stream, op.clone(), key.clone());
             let mut fatal_retry: Option<Duration> = None;
-            // Per-attempt outcomes; merged into `totals` at the end of
-            // each attempt so retried items overwrite their prior
-            // outcome rather than accumulating.
-            let mut attempt_counters = crate::mutation::MutationCounters::default();
             retry_ids.clear();
 
             while let Some(event) = stream.next().await {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
                         for result in batch.items {
-                            classify_mutation_outcome(
-                                &result.id,
-                                &result.outcome,
-                                &mut attempt_counters,
-                                &mut retry_ids,
-                            );
+                            let bucket = classify_mutation_outcome(&result.outcome);
+                            if bucket == MutationBucket::PendingRetry {
+                                retry_ids.push(result.id.clone());
+                            }
+                            outcomes.insert(result.id, bucket);
                         }
                     }
                     bifrost_types::SyncEvent::Fatal(f) => {
@@ -770,48 +819,55 @@ impl SyncEngine {
                 && attempt < max_retries
             {
                 retry_after = Some(after);
-                // Replace `remaining` with just the retry candidates so
-                // we do not double-process items the previous attempt
-                // already resolved. Reset per-attempt counters; the
-                // retry's outcomes will be re-tallied into `totals`
-                // when it completes.
-                remaining = retry_ids.clone();
-                retry_ids.clear();
-                attempt_counters = crate::mutation::MutationCounters::default();
+                let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
+                remaining.retain(|id| {
+                    retry_set.contains(id)
+                        || !matches!(
+                            outcomes.get(id),
+                            Some(
+                                MutationBucket::Applied
+                                    | MutationBucket::Skipped
+                                    | MutationBucket::FailedTerminal
+                            )
+                        )
+                });
+                if remaining.is_empty() {
+                    break;
+                }
                 continue;
             }
 
-            // Merge the per-attempt counters into the totals. For
-            // retried ids the read-back guard runs once below and
-            // adjusts the totals based on the final server state.
-            totals.applied = totals.applied.saturating_add(attempt_counters.applied);
-            totals.skipped = totals.skipped.saturating_add(attempt_counters.skipped);
-            totals.failed_terminal = totals
-                .failed_terminal
-                .saturating_add(attempt_counters.failed_terminal);
+            for id in &remaining {
+                outcomes
+                    .entry(id.clone())
+                    .or_insert(MutationBucket::PendingRetry);
+            }
+            break;
+        }
+        let mut totals = counters_from_outcomes(&outcomes);
+        let pending_ids: Vec<_> = outcomes
+            .iter()
+            .filter_map(|(id, bucket)| {
+                if *bucket == MutationBucket::PendingRetry {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !pending_ids.is_empty() {
+            let account = slot.current.load_full();
+            let outcome =
+                crate::mutation::run_readback_guard(account.as_ref().as_ref(), pending_ids, &op)
+                    .await?;
             totals.pending_retry = totals
                 .pending_retry
-                .saturating_add(attempt_counters.pending_retry);
-
-            // Run the read-back guard against retry candidates.
-            if !retry_ids.is_empty() {
-                let account = slot.current.load_full();
-                let outcome = crate::mutation::run_readback_guard(
-                    account.as_ref().as_ref(),
-                    retry_ids.clone(),
-                    &op,
-                )
-                .await?;
-                totals.pending_retry = totals
-                    .pending_retry
-                    .saturating_sub(outcome.skipped)
-                    .saturating_sub(outcome.still_failed);
-                totals.skipped = totals.skipped.saturating_add(outcome.skipped);
-                totals.failed_terminal =
-                    totals.failed_terminal.saturating_add(outcome.still_failed);
-            }
-            return Ok(totals);
+                .saturating_sub(outcome.skipped)
+                .saturating_sub(outcome.still_failed);
+            totals.skipped = totals.skipped.saturating_add(outcome.skipped);
+            totals.failed_terminal = totals.failed_terminal.saturating_add(outcome.still_failed);
         }
+        Ok(totals)
     }
 
     /// Scheduler handle for advanced consumers (tests, instrumentation).
@@ -892,9 +948,12 @@ impl SyncEngine {
                 {
                     crate::multiplexer::FusionOutcome::Established
                     | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
-                    crate::multiplexer::FusionOutcome::Fatal => Err(Error::EstablishCursorFailed(
-                        "inventory fusion fatal".into(),
-                    )),
+                    crate::multiplexer::FusionOutcome::Fatal(recovery) => {
+                        Err(Error::EstablishCursorFatal {
+                            message: "inventory fusion fatal".into(),
+                            recovery,
+                        })
+                    }
                 }
             }
             // `CursorEstablishment` is `#[non_exhaustive]`; treat any
@@ -984,6 +1043,33 @@ fn scope_covers_membership(scope: &CursorScope, membership: &MembershipScope) ->
         // Query cursors cover the same query membership.
         (CursorScope::Query(q), MembershipScope::Query(mq)) => q == mq,
         _ => false,
+    }
+}
+
+async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        worker.abort.abort();
+        return;
+    }
+    match tokio::time::timeout(remaining, worker.join).await {
+        Ok(Ok(())) => {}
+        Ok(Err(join)) => {
+            if !join.is_cancelled() {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    error = ?join,
+                    "worker panic during detach"
+                );
+            }
+        }
+        Err(_) => {
+            worker.abort.abort();
+            tracing::warn!(
+                target: "bifrost.sync.changes",
+                "worker exceeded detach timeout; aborted"
+            );
+        }
     }
 }
 
@@ -1116,6 +1202,7 @@ async fn handle_recovery(
     store: &Arc<DynCheckpointStore>,
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
     account_id: &AccountId,
+    control: &SyncControl,
     scope: CursorScope,
     recovery: bifrost_types::RecoveryClass,
 ) {
@@ -1165,7 +1252,12 @@ async fn handle_recovery(
         }
         RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
             match factory.open().await {
-                Ok(next) => current.store(Arc::new(next)),
+                Ok(next) => {
+                    next.as_ref().set_priority(control.priority_snapshot());
+                    next.as_ref()
+                        .set_bandwidth_cap(control.bandwidth_cap_snapshot());
+                    current.store(Arc::new(next));
+                }
                 Err(err) => tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?account_id,
@@ -1239,9 +1331,12 @@ async fn run_establish(
             {
                 crate::multiplexer::FusionOutcome::Established
                 | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
-                crate::multiplexer::FusionOutcome::Fatal => Err(Error::EstablishCursorFailed(
-                    "inventory fusion fatal during recovery".into(),
-                )),
+                crate::multiplexer::FusionOutcome::Fatal(recovery) => {
+                    Err(Error::EstablishCursorFatal {
+                        message: "inventory fusion fatal during recovery".into(),
+                        recovery,
+                    })
+                }
             }
         }
         _ => Err(Error::EstablishCursorFailed(
@@ -1275,27 +1370,44 @@ impl Drop for SyncEngine {
 /// unsupported, cursor/schema mismatch) bypass the read-back guard
 /// and land in `failed_terminal`. Everything else goes through the
 /// retry/read-back path.
-fn classify_mutation_outcome(
-    id: &bifrost_types::ObjectId,
-    outcome: &bifrost_types::MutationOutcome,
-    counters: &mut crate::mutation::MutationCounters,
-    retry_ids: &mut Vec<bifrost_types::ObjectId>,
-) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationBucket {
+    Applied,
+    Skipped,
+    FailedTerminal,
+    PendingRetry,
+}
+
+fn classify_mutation_outcome(outcome: &bifrost_types::MutationOutcome) -> MutationBucket {
     match outcome {
-        bifrost_types::MutationOutcome::Applied => counters.record_applied(),
-        bifrost_types::MutationOutcome::Skipped => counters.record_skipped(),
+        bifrost_types::MutationOutcome::Applied => MutationBucket::Applied,
+        bifrost_types::MutationOutcome::Skipped => MutationBucket::Skipped,
         bifrost_types::MutationOutcome::Failed(err) => {
             if is_terminal_mutation_error(err) {
-                counters.record_failed();
+                MutationBucket::FailedTerminal
             } else {
-                counters.record_pending();
-                retry_ids.push(id.clone());
+                MutationBucket::PendingRetry
             }
         }
         // `MutationOutcome` is `#[non_exhaustive]`; conservatively
         // surface unknown future variants as terminal failures.
-        _ => counters.record_failed(),
+        _ => MutationBucket::FailedTerminal,
     }
+}
+
+fn counters_from_outcomes(
+    outcomes: &HashMap<bifrost_types::ObjectId, MutationBucket>,
+) -> crate::mutation::MutationCounters {
+    let mut counters = crate::mutation::MutationCounters::default();
+    for bucket in outcomes.values() {
+        match bucket {
+            MutationBucket::Applied => counters.record_applied(),
+            MutationBucket::Skipped => counters.record_skipped(),
+            MutationBucket::FailedTerminal => counters.record_failed(),
+            MutationBucket::PendingRetry => counters.record_pending(),
+        }
+    }
+    counters
 }
 
 fn is_terminal_mutation_error(err: &bifrost_types::Error) -> bool {

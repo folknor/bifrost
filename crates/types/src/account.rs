@@ -21,7 +21,7 @@ use crate::cursor::{
     ScopeLifecycle,
 };
 use crate::error::Error;
-use crate::events::{Change, InventoryEntry, SyncEvent, WatchEvent};
+use crate::events::{Change, InventoryEntry, Priority, SyncEvent, WatchEvent};
 use crate::ids::{ObjectId, SubscriptionHandle};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, MutationResult, Projection};
 
@@ -48,6 +48,21 @@ pub trait Account: Send + Sync {
     /// `RecoveryClass::CapabilityChanged`, never through a live
     /// channel here.
     fn capabilities(&self) -> &AccountCapabilities;
+
+    /// Apply the engine's current priority hint to this account.
+    ///
+    /// Implementations that own a `bifrost_net::AccountNet` should
+    /// forward this to `AccountNet::set_priority`. Non-HTTP or
+    /// priority-agnostic implementations may store it for their own
+    /// scheduler.
+    fn set_priority(&self, priority: Priority);
+
+    /// Apply the engine's current bandwidth cap to this account.
+    ///
+    /// Implementations that own a `bifrost_net::AccountNet` should
+    /// forward this to `AccountNet::set_bandwidth_cap`. `None` means
+    /// unlimited.
+    fn set_bandwidth_cap(&self, bps: Option<u64>);
 
     /// Cursor introspection. Account-aware because cost depends on
     /// capability state, not the cursor in isolation.

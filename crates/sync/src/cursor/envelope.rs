@@ -81,10 +81,10 @@ pub fn encode_envelope(checkpoint: &Checkpoint) -> Vec<u8> {
     match checkpoint {
         Checkpoint::Change(c) => encode_change(c),
         Checkpoint::Backfill(b) => encode_backfill(b),
-        // `Checkpoint` is `#[non_exhaustive]`; an unknown future
-        // variant produces an empty envelope rather than panicking.
-        // Decoding such an envelope round-trips to an Other error.
-        _ => Vec::new(),
+        // `Checkpoint` is `#[non_exhaustive]`; panic rather than
+        // producing an empty on-disk envelope that fails later during
+        // decode.
+        _ => panic!("cursor envelope: unknown checkpoint variant"),
     }
 }
 
@@ -232,10 +232,9 @@ fn encode_scope(scope: &CursorScope) -> Vec<u8> {
             write_string(&mut out, &folder.0);
             out.push(encode_obj_type(*ty));
         }
-        // `CursorScope` is `#[non_exhaustive]`; an unknown future
-        // variant encodes as an empty payload. A round-tripped envelope
-        // will fail to decode with the empty-scope error message.
-        _ => {}
+        // `CursorScope` is `#[non_exhaustive]`; panic rather than
+        // producing an empty on-disk scope payload.
+        _ => panic!("cursor envelope: unknown cursor scope variant"),
     }
     out
 }
