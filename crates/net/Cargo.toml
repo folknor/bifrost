@@ -1,0 +1,28 @@
+[package]
+name = "bifrost-net"
+description = "Shared HTTP transport for the bifrost JMAP, Gmail, and Graph clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { workspace = true, features = ["native-tls", "stream", "json"] }
+native-tls = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+httpdate = { workspace = true }
+serde = { workspace = true }
+zeroize = { workspace = true }

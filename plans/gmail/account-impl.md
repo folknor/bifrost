@@ -52,13 +52,13 @@ pub struct GmailAccount {
                                            // cross-check on cursor decode
     pubsub: PubSubControl,                 // users.watch / users.stop CRUD
     seed_state: OpaqueChangeState,         // historyId from getProfile
-                                           // at open() — engine's
+                                           // at open() - engine's
                                            // initial cursor seed
                                            // (per "Initial cursor seeding"
                                            // section below)
     idempotency: IdempotencyState,         // run_id + sequence + salt
     scope_cache: ArcSwap<ScopeSnapshot>,   // last labels.list result;
-                                           // ArcSwap is intentional —
+                                           // ArcSwap is intentional -
                                            // labels.list is a live poll,
                                            // not a capability transition
     shutdown: CancellationToken,
@@ -89,7 +89,7 @@ runner tasks (see `account-trait-shape.md` Q2).
 `GmailAccountFactory` implements `AccountFactory`. It holds the OAuth
 refresher and the Pub/Sub topic config. It does NOT hold a channel
 to the consumer's Pub/Sub listener: out-of-process push events go
-through the engine's `InvalidationSink`, not through GmailAccount —
+through the engine's `InvalidationSink`, not through GmailAccount -
 the listener calls `sink.push(account_id, WatchEvent::Invalidated{..})`
 directly. `factory.open()` mints a fresh `Arc<GmailAccount>`, calls
 `users.getProfile` to seed `historyId` (the initial cursor anchor),
@@ -104,7 +104,7 @@ behind `Arc`. Field values:
 ```rust
 AccountCapabilities {
     cursor_freshness: CursorFreshness::ServerIssued,
-    // No inventory_is_change_cursor_establish field — see
+    // No inventory_is_change_cursor_establish field - see
     // plans/account-trait.md -> Cursor establishment.
     // Gmail returns CursorEstablishment::Ready(cursor) for the
     // single CursorScope::Account, wrapping the historyId from
@@ -333,11 +333,11 @@ The seed lives on `GmailAccount.seed_state`. Two engine interactions:
 1. **First attach.** Engine calls `discover_cursor_scopes()`,
    gets `[CursorScope::Account]`, then asks GmailAccount for the
    initial cursor (via the future trait extension
-   `establish_initial_cursor(scope)` — reserved here, pinned in
+   `establish_initial_cursor(scope)` - reserved here, pinned in
    `plans/account-trait.md`). GmailAccount returns a
    `ChangeCursor` wrapping `seed_state`. Engine persists
    `(scope, cursor)` BEFORE the first `changes_stream(cursor)`
-   call — any change after the seed is observed.
+   call - any change after the seed is observed.
 2. **Reattach with persisted cursor.** Engine reads the stored
    `ChangeCursor` from `CheckpointStore` and calls
    `changes_stream(cursor)` directly. The seed from this run's
@@ -363,7 +363,7 @@ cross-protocol trait shape is a Phase 1 coordination point.
 4. For each `GmailHistoryItem`, translate. `ObjectChange` carries
    only `{ id, kind }` per `plans/sync-engine.md`; membership
    information rides as separate `ScopeChange` events. There is no
-   `MembershipScope::AllOf` variant — the prior draft invented it.
+   `MembershipScope::AllOf` variant - the prior draft invented it.
    - `messages_added` -> emit `ObjectChange { id, kind: Created }`
      **plus** one `ScopeChange { id, membership:
      MembershipScope::Label(label_id), kind: Added }` per label
@@ -393,10 +393,10 @@ cross-protocol trait shape is a Phase 1 coordination point.
 
 When `client.get_history()` returns HTTP 404 (or the typed
 `Error::HttpStatus { status: 404, .. }` from `error.rs`), the cursor
-is dead — Gmail aged it out. This is **not** a capability change:
+is dead - Gmail aged it out. This is **not** a capability change:
 nothing about the account's surface shifted, the cursor token
 itself just lapsed. The right recovery class is the same one Graph
-uses for `410 Gone` on delta tokens — `RestartScope`:
+uses for `410 Gone` on delta tokens - `RestartScope`:
 
 ```rust
 SyncEvent::Fatal(Fatal::Recovery(
@@ -454,7 +454,7 @@ listener decodes Cloud Pub/Sub messages (`emailAddress`,
 HintPayload::Unknown })` on the engine. GmailAccount is not in this
 data path.
 
-`push_stream()` therefore returns an **empty** stream — no items,
+`push_stream()` therefore returns an **empty** stream - no items,
 just natural termination. It does not carry `Reconnected` /
 `Disconnected` / `Invalidated` for out-of-process push; the engine
 reads those from the sink, not from this stream. There is no
@@ -483,7 +483,7 @@ binary level; bifrost-gmail only CRUDs the watch. See
 1. Parse `handle.id` as `(message_id, attachment_id)`.
 2. Call `users.messages.attachments.get` (existing
    `client::get_attachment`). The current wire implementation
-   parses the response into `GmailAttachmentData` — a struct with
+   parses the response into `GmailAttachmentData` - a struct with
    the full base64url string materialized in memory. Streaming
    decode requires a new wire method that pumps the JSON body as
    it arrives; not in scope for v1.
@@ -688,7 +688,7 @@ Fan-out concurrency is the same 8-in-flight semaphore as
 fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
     let _state = decode_gmail_state(&cursor.server_state)?;
     CursorDescriptor {
-        // Any extant Gmail historyId is cheap to consume — one
+        // Any extant Gmail historyId is cheap to consume - one
         // history.list call delivers the delta in O(changes) cost.
         // The 5-day pre-expiry cliff the prior draft posited was
         // wrong: Gmail docs say historyId is *typically* valid at
@@ -729,7 +729,7 @@ fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
 - **Subscription-health surfacing.** Out-of-process push means
   the engine learns about wake-ups via `InvalidationSink` but has
   no current channel for "the Pub/Sub subscription expired and
-  renewal is failing" — sustained renewal failure today degrades
+  renewal is failing" - sustained renewal failure today degrades
   silently into poll-only behavior. A future trait extension
   (e.g. `push_health_stream` separate from `push_stream`, or a
   health field on `SubscriptionHandle`) would let the engine

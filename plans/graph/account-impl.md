@@ -234,13 +234,13 @@ at `open()`. Field values:
 ```rust
 AccountCapabilities {
     cursor_freshness: CursorFreshness::Hybrid,
-    // No inventory_is_change_cursor_establish field — see
+    // No inventory_is_change_cursor_establish field - see
     // plans/account-trait.md -> Cursor establishment.
     // Graph's delta endpoint, called without a token, paginates a
     // FULL sync of the folder before yielding @odata.deltaLink.
     // Subsequent calls with the deltaLink return incremental
     // changes. Cursor establishment is therefore identical to
-    // inventory — same wire calls, same cost — so
+    // inventory - same wire calls, same cost - so
     // establish_initial_cursor(scope) returns
     // CursorEstablishment::EstablishViaInventory for every Graph
     // scope. The engine runs inventory_stream first and reads
@@ -289,7 +289,7 @@ AccountCapabilities {
     historyid_expires_after: None,
     delta_token_expires_after: None,
     // Microsoft documents Outlook delta token lifetime as not
-    // fixed — depends on server-internal token cache, can age out
+    // fixed - depends on server-internal token cache, can age out
     // in hours under load even though "typically" longer. A wall
     // clock value misleads the engine's scheduler. Expiry is an
     // event (410 Gone -> RestartScope), not a budget.
@@ -306,13 +306,13 @@ and the engine reopens. There is no live capability channel.
 
 Any extant delta token is `CostClass::Cheap`: incremental delta
 calls are O(changes), not O(folder). The prior draft's 24-hour /
-30-day cost cliff was wrong — Graph delta token lifetime is not
+30-day cost cliff was wrong - Graph delta token lifetime is not
 deterministic per Microsoft docs (depends on server-internal cache,
 can age out in hours under load). Expiry is an event (410 Gone →
 `RestartScope`), not a budget the engine can plan against.
 
 Strategy is `SyncStrategy::ServerCursor` for all extant tokens.
-There is no "no cursor yet" case at the `describe_cursor` layer —
+There is no "no cursor yet" case at the `describe_cursor` layer -
 the cursor only exists after `inventory_stream`'s establishment
 pass (see below), and `describe_cursor` is only called by the
 engine on cursors it has persisted.
@@ -325,7 +325,7 @@ folders per Microsoft's user-list-mailfolders docs; nested folders
 (subfolders of Inbox, of Archive, of user-created folders) require
 traversing `/me/mailFolders/{id}/childFolders` on each parent.
 `GraphClient::list_mail_folders` in `crates/graph/src/api.rs:17`
-today calls `/mailFolders` once — that's the root-only primitive,
+today calls `/mailFolders` once - that's the root-only primitive,
 not the recursive walk this method needs. A new helper
 `list_mail_folders_recursive` lands alongside; it walks
 breadth-first using `childFolderCount` to skip empty subtrees.
@@ -411,7 +411,7 @@ full sync.
 
 `InventoryEntry::memberships = vec![MembershipScope::Folder(folder)]`
 (singleton). `fingerprint = Fingerprint { server_version:
-ServerVersion::ETag(change_key), flags_hash }` — **no size
+ServerVersion::ETag(change_key), flags_hash }` - **no size
 field**. The ETag is the `changeKey` on Graph messages/events;
 contacts ship `@odata.etag`. `flags_hash` canonicalizes Graph's
 flag-like fields: `isRead`, `flag.flagStatus`, `categories`
@@ -460,7 +460,7 @@ through `open_blob`). Per-item failures inside the batch surface as
 Preconditions: `changes_stream(cursor)` requires a cursor that was
 established by a prior `inventory_stream` pass (terminal
 `@odata.deltaLink`). The engine never constructs a "fresh" Graph
-cursor out of band — there is no cheap-establishment primitive on
+cursor out of band - there is no cheap-establishment primitive on
 Graph (`establish_initial_cursor(scope)` returns
 `EstablishViaInventory` for every Graph scope).
 
@@ -517,7 +517,7 @@ SubscriptionHandle`. Graph maps as follows.
      per-calendar event subscription path. A single subscription
      covers events across all calendars, and the resulting hint
      must therefore reach all `CursorScope::FolderType { ty:
-     Event, .. }` cursor scopes — the receiver maps the inbound
+     Event, .. }` cursor scopes - the receiver maps the inbound
      notification to `HintPayload::SpecificCursorScope` per
      registered calendar (or `Unknown` if the cursor index is
      uncertain), and the engine's reconciler fans out.
@@ -539,7 +539,7 @@ SubscriptionHandle`. Graph maps as follows.
    expires_at, scopes }` in `PushPath::GraphSubscriptions::active`,
    return the handle. For the event subscription, `scopes`
    contains the full set of `CursorScope::FolderType { ty: Event }`
-   the consumer asked about — the receiver's hint-fanout uses
+   the consumer asked about - the receiver's hint-fanout uses
    this set.
 
 Renewal is a separate background task driven by `push_renewer.rs`
@@ -637,14 +637,14 @@ that is a future enhancement, not v1.
 
 Returns `AccountStream<WatchEvent>` per the trait. On Path A
 (webhook delivery, `push_in_process = false`), the stream is
-empty — it yields no items and simply terminates. Out-of-process
+empty - it yields no items and simply terminates. Out-of-process
 push events reach the engine through `InvalidationSink`, not
 through this stream; the engine reads health and invalidations
 from the sink, never from `push_stream` on this path. On Path B
 (EWS streaming, `push_in_process = true`) the stream yields the
 EWS worker's `WatchEvent`s (Invalidated / Disconnected /
 Reconnected) until the worker exits or `close()` trips. There is
-no `SyncEvent::Done` sentinel — `AccountStream<WatchEvent>` yields
+no `SyncEvent::Done` sentinel - `AccountStream<WatchEvent>` yields
 `WatchEvent` items directly and termination is the natural
 stream-end.
 
@@ -671,7 +671,7 @@ both file AND item attachments. Per-type bytes shape:
   treat them as opaque byte streams; parsing into structured
   items is out of scope for the Account trait. The prior
   draft's "$value returns 400 for item attachments" claim was
-  incorrect — it conflated reference attachments with item
+  incorrect - it conflated reference attachments with item
   attachments.
 - **Reference attachments** (`#microsoft.graph.referenceAttachment`):
   `$value` returns `405 Method Not Allowed` per Microsoft's
@@ -714,7 +714,7 @@ Streaming implementation:
    - `method = "PATCH"` (set_flags) or `"POST"` (move) or
      `"DELETE"` (destroy).
    - `url = "/messages/{id}"` or `/move` suffix.
-   - `headers = { "If-Match": etag_from_inventory }` —
+   - `headers = { "If-Match": etag_from_inventory }` -
      StateBased concurrency. The engine supplies the expected ETag
      out of the cursor's most recent `Fingerprint::ServerVersion::
      ETag` snapshot; bulk_* methods accept an `etag_oracle` closure
@@ -742,7 +742,7 @@ Streaming implementation:
    - Other 4xx/5xx -> `MutationOutcome::Failed(Error)`.
 4. Emit one `Batch<MutationResult>` per `$batch` round-trip with a
    `Checkpoint` boundary (engine persists `(results, checkpoint)`
-   so retried-but-applied mutations are not re-issued post-crash —
+   so retried-but-applied mutations are not re-issued post-crash -
    the read-back guard provides the final ground truth).
 
 `bulk_destroy` is the same shape; soft-delete (move to Deleted Items)

@@ -27,7 +27,7 @@ Resolved decisions:
   See `bifrost-net.md` -> TLS.
 - **Cursor establishment.** Per-scope and dynamic, returned from
   `Account::establish_initial_cursor(scope)`. Two variants:
-  `Ready(cursor)` (cheap mint — JMAP all scopes, Gmail Account,
+  `Ready(cursor)` (cheap mint - JMAP all scopes, Gmail Account,
   IMAP-QRESYNC folders) and `EstablishViaInventory` (Graph all
   scopes, IMAP-Basic / IMAP-CONDSTORE-only folders). Replaces the
   account-level `inventory_is_change_cursor_establish` capability

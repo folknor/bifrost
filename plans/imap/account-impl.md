@@ -94,8 +94,8 @@ pub struct ImapAccount {
 
 `Pool` separates **slot capacity** (max concurrent connections
 allowed) from **idle availability** (currently parked, ready-to-use
-connections). Conflating the two — as the prior draft did with a
-single semaphore over `Vec::pop()` — produces either a pool that
+connections). Conflating the two - as the prior draft did with a
+single semaphore over `Vec::pop()` - produces either a pool that
 cannot grow past its initial size, or a pool whose checkouts
 acquire-then-find-nothing.
 
@@ -211,7 +211,7 @@ re-establishes via inventory.
 Basic-tier expunge detection is a direct diff of `known_uids`
 against a fresh `UID SEARCH ALL` result on the
 `DELETION_CHECK_INTERVAL_SECS` cadence. `known_uids` is the
-persistent state — it lives inside `OpaqueChangeState.bytes` for
+persistent state - it lives inside `OpaqueChangeState.bytes` for
 `FolderCursor::Basic` and is restored on resume. A precomputed
 hash over the UID set saves nothing in practice (the SEARCH
 response is what we're comparing against, so we need the live
@@ -297,10 +297,10 @@ Dispatch by tier:
   those in-memory through `BoundedStreamingFetchVanishedConsumer`,
   emit one `Batch<Change>` per `PageBoundary`, advance the cursor
   to the new HIGHESTMODSEQ from the SELECT response, and end with
-  `Done`. **No follow-up `UID FETCH ... CHANGEDSINCE <modseq>`** —
+  `Done`. **No follow-up `UID FETCH ... CHANGEDSINCE <modseq>`** -
   that would re-fetch the same delta. Ongoing detection past this
   point is the IDLE driver's job, not this `changes_stream` call.
-  `advanced_through` is `None` (one SELECT, one drain — mid-page
+  `advanced_through` is `None` (one SELECT, one drain - mid-page
   resumption not applicable).
 - `Condstore { uidvalidity, modseq, known_uids }`: checkout,
   `SELECT (CONDSTORE)`, `UID FETCH 1:* (FLAGS MODSEQ)
@@ -396,9 +396,14 @@ The implementation groups incoming ids by `MailboxName`, then
 per-folder runs `UID FETCH <set> <fetch_atoms>` where
 `<fetch_atoms>` is derived from `Projection`:
 
+- `Projection::FlagsOnly`: `(UID FLAGS)`. Cheapest fetch;
+  used by the engine's read-back guard after mutation retry.
 - `Projection::Metadata`: `(UID FLAGS RFC822.SIZE INTERNALDATE
   ENVELOPE)`.
-- `Projection::Preview(n)`: metadata plus
+- `Projection::Headers`: metadata plus
+  `BODY.PEEK[HEADER.FIELDS (SUBJECT FROM TO CC DATE MESSAGE-ID
+  REFERENCES IN-REPLY-TO)]`.
+- `Projection::Preview(n)`: Headers plus
   `BODY.PEEK[TEXT]<0.n>` for the text/plain part if
   `BODYSTRUCTURE` indicates one.
 - `Projection::TextOnly`: metadata plus
@@ -483,7 +488,7 @@ the dispatch uses `UID STORE <set> (UNCHANGEDSINCE <cutoff>)
 <op> (<flags>)`.
 
 **Cutoff source.** `<cutoff>` is the folder cursor's
-last-synchronized HIGHESTMODSEQ — the `modseq` field on the
+last-synchronized HIGHESTMODSEQ - the `modseq` field on the
 `FolderCursor` snapshot captured at the **start of this
 mutation campaign**. It is NOT an opportunistically newer value
 sampled at STORE time (sampling later would weaken the test for
@@ -507,7 +512,7 @@ tagged status and treats listed UIDs as
   `ConcurrencyConflict`, the rest `Applied`.
 - `NO` + `MODIFIED <set>` -> UIDs in `<set>` are
   `ConcurrencyConflict`. The UIDs not in `<set>` are
-  **ambiguous** — the server returned NO so we cannot assert
+  **ambiguous** - the server returned NO so we cannot assert
   they were applied. Mark them `pending_retry` and let the
   engine's read-back guard (per
   `plans/bifrost-sync.md` -> Read-back guard) resolve their
@@ -676,7 +681,7 @@ Per-tier values:
 ```text
 AccountCapabilities {
     cursor_freshness: CursorFreshness::Hybrid,
-    // No inventory_is_change_cursor_establish field — see
+    // No inventory_is_change_cursor_establish field - see
     // plans/account-trait.md -> Cursor establishment.
     // Per-folder establishment via establish_initial_cursor(scope):
     // QRESYNC folders return Ready(cursor); CONDSTORE-only and

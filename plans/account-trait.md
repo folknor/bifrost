@@ -124,7 +124,7 @@ trait Account: Send + Sync {
     //     and consume the cursor from its terminal Done event.
     //     inventory_stream IS the cursor establishment.
     // Per-scope (not account-level) because IMAP can have mixed
-    // tiers — one QRESYNC folder Ready, one Basic-downgraded
+    // tiers - one QRESYNC folder Ready, one Basic-downgraded
     // folder EstablishViaInventory.
     fn establish_initial_cursor(&self, scope: CursorScope)
         -> AccountFuture<Result<CursorEstablishment, Error>>;
@@ -159,7 +159,7 @@ trait Account: Send + Sync {
     // Event stream from the protocol crate to the engine.
     // Contents depend on push_in_process:
     //   - In-process (IMAP IDLE, JMAP WebSocket, EWS streaming):
-    //     full WatchEvent traffic — Invalidated + Disconnected +
+    //     full WatchEvent traffic - Invalidated + Disconnected +
     //     Reconnected.
     //   - Out-of-process (Gmail Pub/Sub, Graph webhooks):
     //     Invalidated events go through InvalidationSink (see
@@ -169,7 +169,7 @@ trait Account: Send + Sync {
     //     Reconnected so the engine can downgrade scheduling to
     //     poll-only. The protocol crate decides whether to emit;
     //     a v1 implementation may yield nothing and terminate.
-    // No SyncEvent::Done sentinel — stream-end is the natural
+    // No SyncEvent::Done sentinel - stream-end is the natural
     // termination.
     fn push_stream(&self) -> AccountStream<WatchEvent>;
 
@@ -362,14 +362,14 @@ protocols.
 once-per-(account, scope) call to obtain (or stage) the initial
 `ChangeCursor`. Two paths per the `CursorEstablishment` enum:
 
-- `Ready(cursor)` — cheap-mint path. JMAP (via `*/get { ids: [] }`
+- `Ready(cursor)` - cheap-mint path. JMAP (via `*/get { ids: [] }`
   probe at `factory.open()`), Gmail (via `users.getProfile`
   historyId at `factory.open()`), and IMAP-QRESYNC folders (when
   detected). The cursor is produced from already-fetched session
   state without a wire round-trip at call time. Engine starts
   `changes_stream(cursor)` immediately and `inventory_stream` in
   parallel as backfill.
-- `EstablishViaInventory` — establish-by-walking path. Graph
+- `EstablishViaInventory` - establish-by-walking path. Graph
   (all scopes per Microsoft's delta semantics: the initial delta
   call IS the full folder sync), IMAP-Basic and
   IMAP-CONDSTORE-only folders. Engine must call
@@ -665,7 +665,7 @@ Capabilities: `cursor_freshness = ServerIssued`,
 flush_on_input_close: true }`.
 
 `establish_initial_cursor(scope)` returns `Ready(cursor)` for all
-JMAP top-level scopes — the factory probes via
+JMAP top-level scopes - the factory probes via
 `*/get { ids: [] }` at `open()` time and caches the state.
 
 ### Gmail
@@ -710,7 +710,7 @@ deterministic value misleads scheduling),
 flush_on_input_close: true }`.
 
 `establish_initial_cursor(CursorScope::Account)` returns
-`Ready(cursor)` — `users.getProfile` is called at `factory.open()`
+`Ready(cursor)` - `users.getProfile` is called at `factory.open()`
 and the historyId is cached.
 
 ### IMAP
@@ -805,7 +805,7 @@ accounts return different variants per folder.
 Capabilities: `cursor_freshness = Hybrid` (first inventory is a
 full sync; subsequent deltas are server-issued and cheap),
 `delta_token_expires_after = None` (Microsoft documents delta
-token lifetime as not fixed — depends on server-internal cache;
+token lifetime as not fixed - depends on server-internal cache;
 expiry is an event, not a budget),
 `blob_range = Conditional`,
 `push_in_process` depends on subscription type,

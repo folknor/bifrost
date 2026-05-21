@@ -1,0 +1,21 @@
+[package]
+name = "bifrost-types"
+description = "Shared Account trait, sync events, and capability types for the bifrost workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+futures = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true, features = ["std"] }

@@ -148,7 +148,7 @@ helper lives next to the enum when v2 lands.
 
 `advanced_through` is `None` for the JMAP impl in v1.
 `Email/changes` cannot resume mid-page (the `state` string is the
-page boundary, but each response IS a fresh boundary — see
+page boundary, but each response IS a fresh boundary - see
 "changes_stream" below for the per-response checkpoint rule).
 `Email/queryChanges` has no mid-result resumption primitive in
 RFC 8621 §4.5; resume is from `sinceQueryState` alone, and on
@@ -234,7 +234,7 @@ fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimits), Error> 
 
     let caps = AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
-        // No inventory_is_change_cursor_establish field — see
+        // No inventory_is_change_cursor_establish field - see
         // plans/account-trait.md -> Cursor establishment.
         // JMAP returns CursorEstablishment::Ready(cursor) for all
         // top-level scopes via factory-cached state probes.
@@ -306,7 +306,7 @@ fn inventory_stream(scope) -> AccountStream<SyncEvent<Batch<InventoryEntry>>>:
    `Request` via a result reference (`#ids`) requesting
    properties `[id, mailboxIds, threadId, blobId, size, keywords,
    messageId, references, inReplyTo, receivedAt]`. This is the
-   `Projection::Inventory` shape from the trait.
+   `Projection::Metadata` shape from the trait.
 3. For each `Email`, build an `InventoryEntry`:
    - `id`           = `EmailId` lifted into the engine's `ObjectId`
    - `memberships`  = `mailboxIds.keys().map(MembershipScope::Mailbox)`
@@ -501,7 +501,7 @@ On error:
 ```rust
 fn project(p: Projection) -> Vec<email::Property> {
     match p {
-        Projection::Inventory  => INVENTORY_PROPS,
+        Projection::Metadata   => INVENTORY_PROPS,
         Projection::FlagsOnly  => vec![Property::Id, Property::Keywords,
                                         Property::MailboxIds],
         Projection::Headers    => HEADERS_PROPS,
@@ -520,7 +520,7 @@ batch is one HTTP round-trip; `HydratedObject` carries the typed
 
 WebSocket push (RFC 8887 §5) is the **only** push path JMAP wires
 in v1. `PushSubscription/*` (RFC 8620 §7) is an HTTP-webhook
-mechanism — the `url` field is required, the server delivers via
+mechanism - the `url` field is required, the server delivers via
 HTTP POST, and verification is a multi-step round-trip. Conflating
 the two surfaces was a bug in the prior draft: a URL-less
 `PushSubscription` is not how WebSocket push is enabled, and many
@@ -552,7 +552,7 @@ fn push_subscribe(&self, scopes: Vec<CursorScope>)
     //      self.subscriptions[handle] = collected_types.
     // 3. Recompute union of all values in self.subscriptions.
     // 4. Call client.enable_push_ws(union, push_state = None).
-    //    push_state stays None in v1 — the engine treats every
+    //    push_state stays None in v1 - the engine treats every
     //    WatchEvent::Invalidated as a poke; sequence-number
     //    coalescing is the engine's reconciler concern, not the
     //    protocol crate's.
@@ -582,7 +582,7 @@ v1.
 
 `close()` calls `client.disable_push_ws()` once as part of local
 teardown. It does NOT iterate `self.subscriptions` and call
-`push_unsubscribe` per handle — that is the engine's job on
+`push_unsubscribe` per handle - that is the engine's job on
 explicit detach-with-unsubscribe (per
 `account-trait-shape.md` Q3). Since no server-side
 `PushSubscription/*` row was ever created, there is nothing to
@@ -687,7 +687,7 @@ sees every event from subscription onward. `RecvError::Lagged(n)`
 is translated to a synthetic
 `WatchEvent::Invalidated { hint: HintPayload::Unknown }` so the
 engine reconciles all scopes rather than silently missing lagged
-events — `Invalidated` is a wake-up signal not a delivery
+events - `Invalidated` is a wake-up signal not a delivery
 guarantee, but `Disconnected` and `Reconnected` are state
 transitions and must not be coalesced.
 
@@ -920,7 +920,7 @@ impl AccountFactory for JmapAccountFactory {
             let mail = client.primary_account::<core::capability::Mail>()?;
             // submission, cal, contacts: optional, gated on session.
 
-            // Missing/malformed Core is fatal — see capabilities::build.
+            // Missing/malformed Core is fatal - see capabilities::build.
             let (caps, limits) = capabilities::build(&client.session())?;
 
             // Seed initial change-cursor states for every top-level

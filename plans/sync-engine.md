@@ -332,11 +332,28 @@ Two-stage body handling:
 
 ```rust
 enum Projection {
-    Metadata,         // headers + flags + size, no body
-    Preview(usize),   // metadata + N bytes of decoded text
-    TextOnly,         // metadata + full text/plain part
-    Full,             // all parts decoded, no attachment blobs
-    FullWithBlobs,    // full plus inline attachment bytes
+    // Read-back guard primitive: id + flags only. Cheapest
+    // projection. Used by bifrost-sync's mutation read-back
+    // (see plans/bifrost-sync.md -> Read-back guard).
+    FlagsOnly,
+    // Inventory-cheap projection: id, flags, size, threading
+    // headers (Message-ID, References, In-Reply-To), memberships.
+    // What inventory_stream's InventoryEntry carries.
+    Metadata,
+    // Metadata + the canonical header set
+    // (Subject, From, To, Cc, Date) for list-view rendering.
+    Headers,
+    // Headers + N bytes of decoded text/plain for preview.
+    // IMAP via BODY.PEEK[TEXT]<0.N>; JMAP via Email/get
+    // preview field; others fall back to Headers + first N bytes
+    // of the text part client-side.
+    Preview(usize),
+    // Headers + the full text/plain part, no other parts.
+    TextOnly,
+    // All parts decoded, no attachment blob bytes.
+    Full,
+    // Full plus inline attachment bytes.
+    FullWithBlobs,
 }
 
 struct BlobHandle {
@@ -536,7 +553,7 @@ fingerprints for the diff. Graph delta is similar: the initial
 delta call without a token paginates a full folder sync before
 yielding `@odata.deltaLink`. Both surface as
 `CursorEstablishment::EstablishViaInventory` from
-`Account::establish_initial_cursor(scope)` — the engine schedules
+`Account::establish_initial_cursor(scope)` - the engine schedules
 inventory first and reads the cursor out of its terminal `Done`,
 because the cheap-start step does not exist. Per
 `plans/account-trait.md` -> Cursor establishment, this is a

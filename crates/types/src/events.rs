@@ -1,0 +1,270 @@
+//! Stream event types shared between protocol crates and the engine.
+//!
+//! Every Account-trait stream yields `SyncEvent<Batch<T>>` (or, for
+//! `push_stream`, raw `WatchEvent`s). The checkpoint travels inside
+//! the batch so the consumer persists data and cursor in one
+//! transaction.
+
+use std::time::Duration;
+
+use crate::cursor::{ChangeCursor, CursorScope, MembershipScope};
+use crate::error::{Error, Fatal, Warning};
+use crate::ids::{AccountId, ObjectId};
+use crate::mutation::Fingerprint;
+
+/// Cursor and backfill progress checkpoint persisted by the consumer.
+///
+/// Opaque to the consumer: protocol-owned bytes plus an envelope tag.
+/// Carried inside `Batch` at advance boundaries; never travels as its
+/// own event. Resuming from a checkpoint whose covering batch was not
+/// durably written is unsafe.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Checkpoint {
+    Change(ChangeCursor),
+    Backfill(BackfillCheckpoint),
+}
+
+/// Backfill checkpoint. Partition-aware, finite. The engine's
+/// backfill scheduler partitions newest-first so foreground mail is
+/// hydrated before deep history.
+#[derive(Debug, Clone)]
+pub struct BackfillCheckpoint {
+    pub scope: CursorScope,
+    pub partition: Partition,
+    pub progress_marker: Option<crate::cursor::OpaqueProgressBytes>,
+    pub progress: BackfillProgress,
+    pub envelope_version: u32,
+}
+
+/// Backfill partition descriptor. Engine-side, opaque bytes; the
+/// engine chooses partitioning strategy (newest-first by day, by UID
+/// range, by page count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Partition(pub Vec<u8>);
+
+/// Progress within a single backfill partition.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackfillProgress {
+    pub items_done: u64,
+    pub items_estimated: Option<u64>,
+}
+
+/// Page boundary marker on a batch.
+///
+/// The engine writes `Some(checkpoint)` only when `cursor_delta` is
+/// `Some(CursorDelta::Advanced(_))`. Mid-page or non-advance boundaries
+/// carry `None`.
+#[derive(Debug, Clone)]
+pub struct PageBoundary {
+    pub kind: PageBoundaryKind,
+    pub cursor_delta: Option<CursorDelta>,
+}
+
+/// What kind of page boundary this batch ends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PageBoundaryKind {
+    /// Mid-page partial flush (e.g., max_wait elapsed before page
+    /// filled).
+    Partial,
+    /// Natural page boundary as the protocol crate defines it.
+    Page,
+    /// Stream terminus.
+    Final,
+}
+
+/// Cursor advance carried with a page boundary.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum CursorDelta {
+    /// Cursor advanced to the carried checkpoint.
+    Advanced(Checkpoint),
+    /// Cursor unchanged on this boundary.
+    Unchanged,
+}
+
+/// Streaming batch envelope.
+///
+/// The consumer atomically persists `(items, checkpoint.unwrap())` in
+/// one transaction when `checkpoint` is `Some`.
+#[derive(Debug, Clone)]
+pub struct Batch<T> {
+    pub items: Vec<T>,
+    pub page_boundary: PageBoundary,
+    pub server_latency: Duration,
+    pub bytes_in: u64,
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// Top-level event from every Account-trait stream.
+///
+/// `Done(Option<Checkpoint>)` carries the final checkpoint at stream
+/// completion. `None` for streams that terminate before establishing
+/// or advancing any cursor (a discovery stream, a no-op pass).
+///
+/// The `Batch` variant dominates traffic (one per page, every page);
+/// `Progress` / `Warning` / `Fatal` / `Done` are rare. Boxing the
+/// rare arms would slow the hot path without saving real memory, so
+/// we accept the size asymmetry instead.
+#[derive(Debug)]
+#[non_exhaustive]
+#[allow(clippy::large_enum_variant)]
+pub enum SyncEvent<T> {
+    Batch(Batch<T>),
+    Progress(Progress),
+    Warning(Warning),
+    Fatal(Fatal),
+    Done(Option<Checkpoint>),
+}
+
+/// Coarse, consumer-visible progress for long streams.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Progress {
+    pub items_done: u64,
+    pub bytes_in: u64,
+    pub estimated_total: Option<u64>,
+    pub eta: Option<Duration>,
+}
+
+/// Object change emitted by `changes_stream`.
+///
+/// No `memberships` field: scope changes are a separate variant.
+#[derive(Debug, Clone)]
+pub struct ObjectChange {
+    pub id: ObjectId,
+    pub kind: ObjectChangeKind,
+}
+
+/// Per-object change kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ObjectChangeKind {
+    Created,
+    Updated,
+    Destroyed,
+}
+
+/// Object-to-container membership change.
+#[derive(Debug, Clone)]
+pub struct ScopeChange {
+    pub id: ObjectId,
+    pub membership: MembershipScope,
+    pub kind: ScopeChangeKind,
+}
+
+/// Per-scope change kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeChangeKind {
+    Added,
+    Removed,
+}
+
+/// Sum type yielded by `changes_stream`. Consumers that care only
+/// about object state filter to `ObjectChange`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Change {
+    ObjectChange(ObjectChange),
+    ScopeChange(ScopeChange),
+}
+
+/// Inventory entry yielded by `inventory_stream`.
+///
+/// Projection-only cold-start primitive. `memberships` is a `Vec`
+/// because Gmail messages routinely sit in many labels and JMAP
+/// messages can sit in many mailboxes.
+#[derive(Debug, Clone)]
+pub struct InventoryEntry {
+    pub id: ObjectId,
+    pub memberships: Vec<MembershipScope>,
+    pub size: u64,
+    pub blob_id: Option<crate::ids::BlobId>,
+    pub fingerprint: Fingerprint,
+    pub thread_id: Option<crate::ids::ThreadId>,
+    pub message_id: Option<String>,
+    pub references: Vec<String>,
+    pub in_reply_to: Option<String>,
+}
+
+/// Push wake-up event. Push surfaces are wake-ups, not change feeds.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum WatchEvent {
+    Invalidated { hint: InvalidationHint },
+    Disconnected,
+    Reconnected,
+}
+
+/// Push payload, type-erased to a protocol-agnostic shape.
+#[derive(Debug, Clone)]
+pub struct InvalidationHint {
+    pub source: PushSource,
+    pub payload: HintPayload,
+}
+
+/// Which push transport originated the wake-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PushSource {
+    JmapStateChange,
+    ImapNotify,
+    GmailPubsub,
+    GraphSubscription,
+    EwsStreaming,
+}
+
+/// Hint about which scope was touched. Engine treats `Unknown` and a
+/// specific hint identically in v1.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum HintPayload {
+    SpecificCursorScope(CursorScope),
+    SpecificMembership(MembershipScope),
+    Unknown,
+}
+
+/// Sink for out-of-process push events (Gmail Pub/Sub listeners,
+/// Graph webhook receivers). The consumer wires its receiver to
+/// invoke `push` on every event; the engine merges sink-injected
+/// events with in-process events into one logical push channel per
+/// account.
+pub trait InvalidationSink: Send + Sync + 'static {
+    fn push(&self, account: AccountId, event: WatchEvent);
+}
+
+/// Consumer-to-producer control handle returned alongside every
+/// engine-driven stream.
+///
+/// `pause` and `checkpoint_now` are async because they must wait for
+/// "stream is at a safe boundary, here is the checkpoint, you can
+/// now drop." `resume`, `priority`, `bandwidth_cap`, and
+/// `bandwidth_observed` stay synchronous (fire-and-forget signals or
+/// pure reads).
+pub trait Control: Send + Sync {
+    fn pause(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Checkpoint, Error>> + Send + '_>>;
+    fn checkpoint_now(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Checkpoint, Error>> + Send + '_>>;
+    fn resume(&self);
+    fn priority(&self, p: Priority);
+    fn bandwidth_cap(&self, bps: Option<u64>);
+    fn bandwidth_observed(&self) -> u64;
+}
+
+/// Scheduling priority on the four-lane scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Priority {
+    /// User-visible; preempts background work.
+    Foreground,
+    /// Default.
+    Normal,
+    /// Backfill, archive-folder polling.
+    Background,
+    /// Batch operations the user will not watch.
+    Bulk,
+}
