@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use crate::core::changes::ChangesObject;
 use crate::core::query_changes::QueryChangesResponse;
 use crate::email::{Email, EmailChanges, EmailQueryChanges};
-use crate::mailbox::MailboxChanges;
+use crate::mailbox::{Mailbox, MailboxChanges};
 use crate::thread::{Thread, ThreadChanges};
 use crate::transport_reqwest::ReqwestTransport;
 
@@ -145,21 +145,17 @@ fn mailbox_changes(
             };
 
             let new_state = response.new_state().to_string();
-            let created = response.created().iter().map(|id| {
-                Change::ScopeChange(ScopeChange {
-                    id: ObjectId(id.to_string()),
-                    membership: MembershipScope::Mailbox(bifrost_types::MailboxId(id.to_string())),
-                    kind: ScopeChangeKind::Added,
-                })
-            });
-            let destroyed = response.destroyed().iter().map(|id| {
-                Change::ScopeChange(ScopeChange {
-                    id: ObjectId(id.to_string()),
-                    membership: MembershipScope::Mailbox(bifrost_types::MailboxId(id.to_string())),
-                    kind: ScopeChangeKind::Removed,
-                })
-            });
-            let changes = created.chain(destroyed).collect::<Vec<_>>();
+            let changes = object_changes::<Mailbox>(response.created(), ObjectChangeKind::Created)
+                .into_iter()
+                .chain(object_changes::<Mailbox>(
+                    response.updated(),
+                    ObjectChangeKind::Updated,
+                ))
+                .chain(object_changes::<Mailbox>(
+                    response.destroyed(),
+                    ObjectChangeKind::Destroyed,
+                ))
+                .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
             set_state(&shared_state, new_state.clone()).await;
 

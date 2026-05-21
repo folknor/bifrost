@@ -54,6 +54,15 @@ pub(crate) fn open_blob_range(
     handle: BlobHandle,
     range: ByteRange,
 ) -> AccountStream<SyncEvent<Bytes>> {
+    if !handle.capabilities.supports_range {
+        return Box::pin(stream::iter([SyncEvent::Fatal(
+            recovery::fatal_for_account_error(
+                AccountError::RangeNotSupported,
+                RecoveryClass::Fatal,
+            ),
+        )]));
+    }
+
     Box::pin(
         stream::once(async move {
             let started = Instant::now();
@@ -185,4 +194,48 @@ fn slice_range(bytes: Bytes, range: ByteRange) -> Result<Bytes, OpenBlobError> {
 enum OpenBlobError {
     Account(AccountError),
     Gmail(crate::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bifrost_types::{BlobCapabilities, BlobEncoding, BlobId};
+    use futures::StreamExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn range_request_on_non_range_handle_fails_before_download() {
+        let client = Arc::new(GmailClient::new("token"));
+        let handle = BlobHandle {
+            id: BlobId("{\"message_id\":\"m1\",\"attachment_id\":\"a1\"}".to_string()),
+            size: Some(4),
+            content_type: None,
+            digest: None,
+            capabilities: BlobCapabilities {
+                supports_range: false,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: BlobEncoding::Base64,
+            },
+        };
+
+        let mut stream = open_blob_range(
+            client,
+            handle,
+            ByteRange {
+                start: 0,
+                length: Some(1),
+            },
+        );
+
+        let Some(SyncEvent::Fatal(fatal)) = stream.next().await else {
+            panic!("expected fatal range error");
+        };
+        assert!(matches!(
+            fatal.source,
+            Some(AccountError::RangeNotSupported)
+        ));
+    }
 }

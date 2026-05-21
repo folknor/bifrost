@@ -198,7 +198,7 @@ impl Account for GraphAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
-        sync_event_stream(inventory::inventory_events(self.clone(), scope))
+        inventory::inventory_stream(self.clone(), scope)
     }
 
     fn get_stream(
@@ -206,11 +206,11 @@ impl Account for GraphAccount {
         ids: AccountStream<ObjectId>,
         projection: Projection,
     ) -> AccountStream<SyncEvent<HydratedObject>> {
-        sync_event_stream(get::get_events(self.clone(), ids, projection))
+        get::get_stream(self.clone(), ids, projection)
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
-        sync_event_stream(changes::change_events(self.clone(), cursor))
+        changes::changes_stream(self.clone(), cursor)
     }
 
     fn push_subscribe(
@@ -232,7 +232,7 @@ impl Account for GraphAccount {
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {
-        sync_event_stream(blob::open_blob_events(self.clone(), handle))
+        blob::open_blob_stream(self.clone(), handle)
     }
 
     fn open_blob_range(
@@ -240,7 +240,7 @@ impl Account for GraphAccount {
         handle: BlobHandle,
         range: ByteRange,
     ) -> AccountStream<SyncEvent<Bytes>> {
-        sync_event_stream(blob::open_blob_range_events(self.clone(), handle, range))
+        blob::open_blob_range_stream(self.clone(), handle, range)
     }
 
     fn bulk_set_flags(
@@ -249,12 +249,7 @@ impl Account for GraphAccount {
         op: bifrost_types::FlagOp,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>> {
-        sync_event_stream(mutate::bulk_set_flags_events(
-            self.clone(),
-            targets,
-            op,
-            key,
-        ))
+        mutate::bulk_set_flags_stream(self.clone(), targets, op, key)
     }
 
     fn bulk_move(
@@ -263,12 +258,7 @@ impl Account for GraphAccount {
         destination: MembershipScope,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>> {
-        sync_event_stream(mutate::bulk_move_events(
-            self.clone(),
-            targets,
-            destination,
-            key,
-        ))
+        mutate::bulk_move_stream(self.clone(), targets, destination, key)
     }
 
     fn bulk_destroy(
@@ -276,7 +266,7 @@ impl Account for GraphAccount {
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>> {
-        sync_event_stream(mutate::bulk_destroy_events(self.clone(), targets, key))
+        mutate::bulk_destroy_stream(self.clone(), targets, key)
     }
 
     fn close(&self) -> AccountFuture<Result<(), Error>> {

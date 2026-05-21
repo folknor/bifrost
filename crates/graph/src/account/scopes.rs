@@ -6,8 +6,6 @@ use bifrost_types::{
     ScopeLifecycle, SyncEvent,
 };
 
-use crate::calendar_sync::graph_list_calendars;
-
 use super::GraphAccount;
 use super::error::graph_error_to_fatal;
 
@@ -106,32 +104,11 @@ async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<Curs
             .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
     );
 
-    let calendars = graph_list_calendars(&account.client)
-        .await
-        .map_err(|error| graph_error_to_fatal(error, CursorScope::Account))?;
-    let contact_folders = account
-        .client
-        .list_contact_folders()
-        .await
-        .map_err(|error| graph_error_to_fatal(error, CursorScope::Account))?;
-
     let mut scopes = Vec::new();
     for folder in mail_folders {
         scopes.push(CursorScope::FolderType {
             folder: FolderId(folder.id),
             ty: ObjectType::Email,
-        });
-    }
-    for calendar in calendars {
-        scopes.push(CursorScope::FolderType {
-            folder: FolderId(calendar.remote_id),
-            ty: ObjectType::Event,
-        });
-    }
-    for folder in contact_folders {
-        scopes.push(CursorScope::FolderType {
-            folder: FolderId(folder.id),
-            ty: ObjectType::Contact,
         });
     }
 

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bifrost_types::{
-    Batch, BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange, Checkpoint, Error, Fatal,
-    ObjectId, PageBoundary, RecoveryClass, SyncEvent,
+    AccountStream, Batch, BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange,
+    Checkpoint, Error, ObjectId, PageBoundary, RecoveryClass, SyncEvent,
 };
 
 use super::GraphAccount;
@@ -26,25 +26,19 @@ struct GraphBlobLocator {
     kind: GraphBlobKind,
 }
 
-pub(crate) async fn open_blob_events(
+pub(crate) fn open_blob_stream(
     account: GraphAccount,
     handle: BlobHandle,
-) -> Vec<SyncEvent<Bytes>> {
-    match open_blob_inner(&account, handle, None).await {
-        Ok(events) => events,
-        Err(fatal) => vec![SyncEvent::Fatal(fatal), SyncEvent::Done(None)],
-    }
+) -> AccountStream<SyncEvent<Bytes>> {
+    open_blob_inner_stream(account, handle, None)
 }
 
-pub(crate) async fn open_blob_range_events(
+pub(crate) fn open_blob_range_stream(
     account: GraphAccount,
     handle: BlobHandle,
     range: ByteRange,
-) -> Vec<SyncEvent<Bytes>> {
-    match open_blob_inner(&account, handle, Some(range)).await {
-        Ok(events) => events,
-        Err(fatal) => vec![SyncEvent::Fatal(fatal), SyncEvent::Done(None)],
-    }
+) -> AccountStream<SyncEvent<Bytes>> {
+    open_blob_inner_stream(account, handle, Some(range))
 }
 
 pub(crate) fn blob_handle_from_graph_attachment(
@@ -92,75 +86,94 @@ pub(crate) fn blob_handle_from_graph_attachment(
     })
 }
 
-async fn open_blob_inner(
-    account: &GraphAccount,
+fn open_blob_inner_stream(
+    account: GraphAccount,
     handle: BlobHandle,
     range: Option<ByteRange>,
-) -> Result<Vec<SyncEvent<Bytes>>, Fatal> {
-    let locator = decode_locator(&handle).map_err(|error| Fatal {
-        recovery: RecoveryClass::Fatal,
-        message: error.to_string(),
-        source: Some(error),
-    })?;
-    if locator.kind == GraphBlobKind::Reference {
-        return Ok(vec![
-            SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id))),
-            SyncEvent::Done(None),
-        ]);
-    }
-    if range.is_some() && !handle.capabilities.supports_range {
-        return Err(Fatal {
-            recovery: RecoveryClass::Fatal,
-            message: "Graph blob does not support range fetches".to_string(),
-            source: Some(Error::RangeNotSupported),
-        });
-    }
-
-    let response = fetch_blob_response(account, &locator, range)
-        .await
-        .map_err(|error| graph_error_to_fatal(error, bifrost_types::CursorScope::Account))?;
-    let status = response.status();
-    if range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(fatal_from_recovery(
-            RecoveryClass::Fatal,
-            format!("Graph range request returned HTTP {status} instead of 206"),
-        ));
-    }
-    if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-        return Ok(vec![
-            SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id))),
-            SyncEvent::Done(None),
-        ]);
-    }
-    if !status.is_success() {
-        return Err(graph_error_to_fatal(
-            format!("Graph blob request failed with HTTP {status}"),
-            bifrost_types::CursorScope::Account,
-        ));
-    }
-
-    let mut events = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => events.push(SyncEvent::Batch(Batch {
-                items: vec![bytes],
-                page_boundary: PageBoundary::Page,
-                server_latency: std::time::Duration::default(),
-                bytes_in: 0,
-                checkpoint: None::<Checkpoint>,
-            })),
+) -> AccountStream<SyncEvent<Bytes>> {
+    Box::pin(async_stream::stream! {
+        let locator = match decode_locator(&handle) {
+            Ok(locator) => locator,
             Err(error) => {
-                events.push(SyncEvent::Fatal(graph_error_to_fatal(
-                    format!("Graph blob stream failed: {error}"),
+                yield SyncEvent::Fatal(bifrost_types::Fatal {
+                    recovery: RecoveryClass::Fatal,
+                    message: error.to_string(),
+                    source: Some(error),
+                });
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
+        if locator.kind == GraphBlobKind::Reference {
+            yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
+            yield SyncEvent::Done(None);
+            return;
+        }
+        if range.is_some() && !handle.capabilities.supports_range {
+            yield SyncEvent::Fatal(bifrost_types::Fatal {
+                recovery: RecoveryClass::Fatal,
+                message: "Graph blob does not support range fetches".to_string(),
+                source: Some(Error::RangeNotSupported),
+            });
+            yield SyncEvent::Done(None);
+            return;
+        }
+
+        let response = match fetch_blob_response(&account, &locator, range).await {
+            Ok(response) => response,
+            Err(error) => {
+                yield SyncEvent::Fatal(graph_error_to_fatal(
+                    error,
                     bifrost_types::CursorScope::Account,
-                )));
-                break;
+                ));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
+        let status = response.status();
+        if range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            yield SyncEvent::Fatal(fatal_from_recovery(
+                RecoveryClass::Fatal,
+                format!("Graph range request returned HTTP {status} instead of 206"),
+            ));
+            yield SyncEvent::Done(None);
+            return;
+        }
+        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
+            yield SyncEvent::Done(None);
+            return;
+        }
+        if !status.is_success() {
+            yield SyncEvent::Fatal(graph_error_to_fatal(
+                format!("Graph blob request failed with HTTP {status}"),
+                bifrost_types::CursorScope::Account,
+            ));
+            yield SyncEvent::Done(None);
+            return;
+        }
+
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => yield SyncEvent::Batch(Batch {
+                    items: vec![bytes],
+                    page_boundary: PageBoundary::Page,
+                    server_latency: std::time::Duration::default(),
+                    bytes_in: 0,
+                    checkpoint: None::<Checkpoint>,
+                }),
+                Err(error) => {
+                    yield SyncEvent::Fatal(graph_error_to_fatal(
+                        format!("Graph blob stream failed: {error}"),
+                        bifrost_types::CursorScope::Account,
+                    ));
+                    break;
+                }
             }
         }
-    }
-    events.push(SyncEvent::Done(None));
-    Ok(events)
+        yield SyncEvent::Done(None);
+    })
 }
 
 async fn fetch_blob_response(

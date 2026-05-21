@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    Batch, ChangeCursor, Checkpoint, CursorScope, Fatal, Fingerprint, FolderId, InventoryEntry,
-    MembershipScope, ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent, ThreadId,
+    AccountStream, Batch, ChangeCursor, Checkpoint, CursorScope, Fingerprint, FolderId,
+    InventoryEntry, MembershipScope, ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent,
+    ThreadId,
 };
 use serde_json::Value;
 
@@ -19,76 +20,91 @@ id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
 attendees,webLink,iCalUId,categories,recurrence,showAs,\
 responseStatus,isCancelled,changeKey";
 
-pub(crate) async fn inventory_events(
+pub(crate) fn inventory_stream(
     account: GraphAccount,
     scope: CursorScope,
-) -> Vec<SyncEvent<InventoryEntry>> {
-    match inventory_inner(&account, scope.clone()).await {
-        Ok(events) => events,
-        Err(fatal) => vec![SyncEvent::Fatal(fatal), SyncEvent::Done(None)],
-    }
-}
-
-async fn inventory_inner(
-    account: &GraphAccount,
-    scope: CursorScope,
-) -> Result<Vec<SyncEvent<InventoryEntry>>, Fatal> {
-    let mut current_url = initial_delta_url(account, &scope)
-        .map_err(|error| graph_error_to_fatal(error.to_string(), scope.clone()))?;
-    let kind = kind_for_scope(&scope)
-        .map_err(|error| graph_error_to_fatal(error.to_string(), scope.clone()))?;
-    let mut events = Vec::new();
-    let mut checkpoint = None;
-    let mut etags = Vec::new();
-
-    loop {
-        let page: ODataCollection<Value> = fetch_page(account, &current_url)
-            .await
-            .map_err(|error| graph_error_to_fatal(error, scope.clone()))?;
-        let mut entries = Vec::new();
-        for value in page.value {
-            if is_removed(&value) {
-                continue;
+) -> AccountStream<SyncEvent<InventoryEntry>> {
+    Box::pin(async_stream::stream! {
+        let mut current_url = match initial_delta_url(&account, &scope) {
+            Ok(url) => url,
+            Err(error) => {
+                yield SyncEvent::Fatal(graph_error_to_fatal(error.to_string(), scope.clone()));
+                yield SyncEvent::Done(None);
+                return;
             }
-            if let Some(entry) = inventory_entry_from_value(&scope, &value) {
-                if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
-                    etags.push((entry.id.0.clone(), etag.clone()));
+        };
+        let kind = match kind_for_scope(&scope) {
+            Ok(kind) => kind,
+            Err(error) => {
+                yield SyncEvent::Fatal(graph_error_to_fatal(error.to_string(), scope.clone()));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
+
+        loop {
+            let page: ODataCollection<Value> = match fetch_page(&account, &current_url).await {
+                Ok(page) => page,
+                Err(error) => {
+                    yield SyncEvent::Fatal(graph_error_to_fatal(error, scope.clone()));
+                    yield SyncEvent::Done(None);
+                    return;
                 }
-                entries.push(entry);
+            };
+            let mut entries = Vec::new();
+            let mut etags = Vec::new();
+            for value in page.value {
+                if is_removed(&value) {
+                    continue;
+                }
+                if let Some(entry) = inventory_entry_from_value(&scope, &value) {
+                    if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
+                        etags.push((entry.id.0.clone(), etag.clone()));
+                    }
+                    entries.push(entry);
+                }
+            }
+
+            if !etags.is_empty() {
+                let mut cache = account.etag_index.write().await;
+                for (id, etag) in etags {
+                    cache.insert(id, etag);
+                }
+            }
+
+            if let Some(next_link) = page.next_link {
+                if !entries.is_empty() {
+                    yield batch(entries, PageBoundary::Page, None);
+                }
+                current_url = next_link;
+            } else if let Some(delta_link) = page.delta_link {
+                let cursor = match encode_cursor(
+                    scope.clone(),
+                    GraphCursorPayload::new(kind.clone(), delta_link, None),
+                ) {
+                    Ok(cursor) => cursor,
+                    Err(error) => {
+                        yield SyncEvent::Fatal(graph_error_to_fatal(
+                            error.to_string(),
+                            scope.clone(),
+                        ));
+                        yield SyncEvent::Done(None);
+                        return;
+                    }
+                };
+                let checkpoint = Checkpoint::Change(cursor.clone());
+                yield batch(entries, PageBoundary::Final, Some(cursor));
+                yield SyncEvent::Done(Some(checkpoint));
+                return;
+            } else {
+                if !entries.is_empty() {
+                    yield batch(entries, PageBoundary::Final, None);
+                }
+                yield SyncEvent::Done(None);
+                return;
             }
         }
-
-        if let Some(next_link) = page.next_link {
-            if !entries.is_empty() {
-                events.push(batch(entries, PageBoundary::Page, None));
-            }
-            current_url = next_link;
-        } else if let Some(delta_link) = page.delta_link {
-            let cursor = encode_cursor(
-                scope.clone(),
-                GraphCursorPayload::new(kind, delta_link, None),
-            )
-            .map_err(|error| graph_error_to_fatal(error.to_string(), scope.clone()))?;
-            checkpoint = Some(Checkpoint::Change(cursor.clone()));
-            events.push(batch(entries, PageBoundary::Final, Some(cursor)));
-            break;
-        } else {
-            if !entries.is_empty() {
-                events.push(batch(entries, PageBoundary::Final, None));
-            }
-            break;
-        }
-    }
-
-    if !etags.is_empty() {
-        let mut cache = account.etag_index.write().await;
-        for (id, etag) in etags {
-            cache.insert(id, etag);
-        }
-    }
-
-    events.push(SyncEvent::Done(checkpoint));
-    Ok(events)
+    })
 }
 
 pub(crate) async fn fetch_delta_page(

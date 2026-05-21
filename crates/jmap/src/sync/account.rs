@@ -79,7 +79,6 @@ impl JmapAccount {
         let ordered = [
             CursorScope::Type(bifrost_types::ObjectType::Email),
             CursorScope::Type(bifrost_types::ObjectType::Mailbox),
-            CursorScope::Type(bifrost_types::ObjectType::Thread),
         ];
 
         ordered

@@ -16,32 +16,50 @@ use super::blob::blob_handle_from_graph_attachment;
 use super::error::graph_error_to_fatal;
 use super::inventory::{graph_etag, inventory_entry_from_value};
 
-pub(crate) async fn get_events(
+pub(crate) fn get_stream(
     account: GraphAccount,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
-) -> Vec<SyncEvent<HydratedObject>> {
-    let mut all_ids = Vec::new();
-    while let Some(id) = ids.next().await {
-        all_ids.push(id);
-    }
-
-    let mut events = Vec::new();
-    for chunk in all_ids.chunks(account.capabilities.batching_policy.max_items) {
-        match fetch_batch(&account, chunk, projection).await {
-            Ok(mut batch_events) => events.append(&mut batch_events),
-            Err(error) => {
-                events.push(SyncEvent::Fatal(graph_error_to_fatal(
-                    error,
-                    CursorScope::Account,
-                )));
-                events.push(SyncEvent::Done(None));
-                return events;
+) -> AccountStream<SyncEvent<HydratedObject>> {
+    Box::pin(async_stream::stream! {
+        let max_items = account.capabilities.batching_policy.max_items.max(1);
+        let mut chunk = Vec::with_capacity(max_items);
+        while let Some(id) = ids.next().await {
+            chunk.push(id);
+            if chunk.len() >= max_items {
+                match fetch_batch(&account, &chunk, projection).await {
+                    Ok(batch_events) => {
+                        for event in batch_events {
+                            yield event;
+                        }
+                    }
+                    Err(error) => {
+                        yield SyncEvent::Fatal(graph_error_to_fatal(error, CursorScope::Account));
+                        yield SyncEvent::Done(None);
+                        return;
+                    }
+                }
+                chunk.clear();
             }
         }
-    }
-    events.push(SyncEvent::Done(None));
-    events
+
+        if !chunk.is_empty() {
+            match fetch_batch(&account, &chunk, projection).await {
+                Ok(batch_events) => {
+                    for event in batch_events {
+                        yield event;
+                    }
+                }
+                Err(error) => {
+                    yield SyncEvent::Fatal(graph_error_to_fatal(error, CursorScope::Account));
+                    yield SyncEvent::Done(None);
+                    return;
+                }
+            }
+        }
+
+        yield SyncEvent::Done(None);
+    })
 }
 
 async fn fetch_batch(

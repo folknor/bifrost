@@ -85,9 +85,9 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
     let mut remove = HashSet::new();
 
     if contains_flag(flags, FLAG_SEEN) {
-        remove.insert(FLAG_SEEN.to_string());
-    } else {
         add.insert(FLAG_SEEN.to_string());
+    } else {
+        remove.insert(FLAG_SEEN.to_string());
     }
 
     for flag in [FLAG_FLAGGED, FLAG_DRAFT, FLAG_IMPORTANT] {
@@ -284,5 +284,33 @@ mod tests {
         let patch = translate_flag_op(&FlagOp::Remove(set(&[FLAG_SEEN])), &[]);
         assert_eq!(patch.add_label_ids, vec![LABEL_UNREAD.to_string()]);
         assert!(patch.remove_label_ids.is_empty());
+    }
+
+    #[test]
+    fn set_seen_removes_unread() {
+        let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &[]);
+        assert!(patch.add_label_ids.is_empty());
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![
+                LABEL_DRAFT.to_string(),
+                LABEL_IMPORTANT.to_string(),
+                LABEL_STARRED.to_string(),
+                LABEL_UNREAD.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn set_without_seen_adds_unread() {
+        let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_FLAGGED])), &[]);
+        assert_eq!(
+            patch.add_label_ids,
+            vec![LABEL_STARRED.to_string(), LABEL_UNREAD.to_string()]
+        );
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![LABEL_DRAFT.to_string(), LABEL_IMPORTANT.to_string()]
+        );
     }
 }

@@ -20,58 +20,82 @@ enum MutationKind {
     Destroy,
 }
 
-pub(crate) async fn bulk_set_flags_events(
+pub(crate) fn bulk_set_flags_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
-) -> Vec<SyncEvent<MutationResult>> {
-    bulk_mutation_events(account, targets, MutationKind::SetFlags(op)).await
+) -> AccountStream<SyncEvent<MutationResult>> {
+    bulk_mutation_stream(account, targets, MutationKind::SetFlags(op))
 }
 
-pub(crate) async fn bulk_move_events(
+pub(crate) fn bulk_move_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
-) -> Vec<SyncEvent<MutationResult>> {
-    bulk_mutation_events(account, targets, MutationKind::Move(destination)).await
+) -> AccountStream<SyncEvent<MutationResult>> {
+    bulk_mutation_stream(account, targets, MutationKind::Move(destination))
 }
 
-pub(crate) async fn bulk_destroy_events(
+pub(crate) fn bulk_destroy_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     _key: IdempotencyKey,
-) -> Vec<SyncEvent<MutationResult>> {
-    bulk_mutation_events(account, targets, MutationKind::Destroy).await
+) -> AccountStream<SyncEvent<MutationResult>> {
+    bulk_mutation_stream(account, targets, MutationKind::Destroy)
 }
 
-async fn bulk_mutation_events(
+fn bulk_mutation_stream(
     account: GraphAccount,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
-) -> Vec<SyncEvent<MutationResult>> {
-    let mut ids = Vec::new();
-    while let Some(id) = targets.next().await {
-        ids.push(id);
-    }
-
-    let mut events = Vec::new();
-    for chunk in ids.chunks(account.capabilities.batching_policy.max_items) {
-        match submit_batch(&account, chunk, &kind).await {
-            Ok(mut batch_events) => events.append(&mut batch_events),
-            Err(error) => {
-                events.push(SyncEvent::Fatal(graph_error_to_fatal(
-                    error,
-                    bifrost_types::CursorScope::Account,
-                )));
-                events.push(SyncEvent::Done(None));
-                return events;
+) -> AccountStream<SyncEvent<MutationResult>> {
+    Box::pin(async_stream::stream! {
+        let max_items = account.capabilities.batching_policy.max_items.max(1);
+        let mut chunk = Vec::with_capacity(max_items);
+        while let Some(id) = targets.next().await {
+            chunk.push(id);
+            if chunk.len() >= max_items {
+                match submit_batch(&account, &chunk, &kind).await {
+                    Ok(batch_events) => {
+                        for event in batch_events {
+                            yield event;
+                        }
+                    }
+                    Err(error) => {
+                        yield SyncEvent::Fatal(graph_error_to_fatal(
+                            error,
+                            bifrost_types::CursorScope::Account,
+                        ));
+                        yield SyncEvent::Done(None);
+                        return;
+                    }
+                }
+                chunk.clear();
             }
         }
-    }
-    events.push(SyncEvent::Done(None));
-    events
+
+        if !chunk.is_empty() {
+            match submit_batch(&account, &chunk, &kind).await {
+                Ok(batch_events) => {
+                    for event in batch_events {
+                        yield event;
+                    }
+                }
+                Err(error) => {
+                    yield SyncEvent::Fatal(graph_error_to_fatal(
+                        error,
+                        bifrost_types::CursorScope::Account,
+                    ));
+                    yield SyncEvent::Done(None);
+                    return;
+                }
+            }
+        }
+
+        yield SyncEvent::Done(None);
+    })
 }
 
 async fn submit_batch(

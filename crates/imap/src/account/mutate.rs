@@ -105,13 +105,14 @@ async fn run_folder_mutation(
         .select_folder(&mut conn, folder, cursor.as_ref(), false)
         .await?;
     let uidvalidity = selected.mailbox.uid_validity.unwrap_or_default();
-    let valid: Vec<DecodedObjectId> = ids
-        .into_iter()
-        .filter(|id| id.uidvalidity == uidvalidity)
-        .collect();
+    let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
+    let stale_results = failed_all(
+        stale,
+        AccountError::Other("UIDVALIDITY changed before mutation".into()),
+    );
     let uids: Vec<u32> = valid.iter().map(|id| id.uid).collect();
     let Some(uid_set) = uid_set_from_u32(&uids) else {
-        return Ok(Vec::new());
+        return Ok(stale_results);
     };
 
     let outcome = match kind {
@@ -156,10 +157,12 @@ async fn run_folder_mutation(
         }
     };
 
-    Ok(match outcome {
+    let mut results = stale_results;
+    results.extend(match outcome {
         Ok(outcome) => mutation_results(valid, &uids, outcome),
         Err(err) => failed_all(valid, super::account_error(err)),
-    })
+    });
+    Ok(results)
 }
 
 async fn apply_flag_op(
@@ -294,6 +297,22 @@ fn failed_all_by_uids(ids: Vec<DecodedObjectId>, _requested_uids: &[u32]) -> Vec
     failed_all(ids, AccountError::Other("mutation failed".into()))
 }
 
+fn split_by_uidvalidity(
+    ids: Vec<DecodedObjectId>,
+    uidvalidity: u32,
+) -> (Vec<DecodedObjectId>, Vec<DecodedObjectId>) {
+    let mut valid = Vec::new();
+    let mut stale = Vec::new();
+    for id in ids {
+        if id.uidvalidity == uidvalidity {
+            valid.push(id);
+        } else {
+            stale.push(id);
+        }
+    }
+    (valid, stale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +344,28 @@ mod tests {
             StoreWireOutcome::from_response_code(None, false),
             StoreWireOutcome::Failed
         );
+    }
+
+    #[test]
+    fn stale_uidvalidity_targets_are_kept_for_failed_results() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let ids = vec![
+            DecodedObjectId {
+                folder: folder.clone(),
+                uidvalidity: 9,
+                uid: 1,
+            },
+            DecodedObjectId {
+                folder,
+                uidvalidity: 10,
+                uid: 2,
+            },
+        ];
+
+        let (valid, stale) = split_by_uidvalidity(ids, 10);
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].uid, 2);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].uid, 1);
     }
 }
