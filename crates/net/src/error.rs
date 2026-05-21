@@ -151,6 +151,19 @@ pub enum Error {
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
 
+    /// Request header name or value could not be encoded. Surfaced
+    /// lazily from `send` like `EncodeBody` so the fluent builder API
+    /// remains chainable while malformed headers do not disappear
+    /// silently.
+    #[error("invalid request header: {message}")]
+    InvalidHeader {
+        /// Human-readable description of the header failure.
+        message: String,
+        /// Boxed underlying error from the HTTP header parser.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    },
+
     /// OAuth refresh attempt failed for a reason other than the refresh
     /// token being rejected. The original error is preserved behind an
     /// `Arc` so multiple waiters on a single-flight refresh can share

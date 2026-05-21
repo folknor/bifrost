@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use bifrost_types::{Account, AccountId, CursorScope, HintPayload, InvalidationHint, WatchEvent};
+use bifrost_types::{
+    Account, AccountId, CursorScope, HintPayload, InvalidationHint, RecoveryClass, WatchEvent,
+};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -17,7 +19,9 @@ use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::error::{Error, Warning};
-use crate::multiplexer::{AckRequest, ChangesEvent, MultiplexerEvent, drive_changes_stream};
+use crate::multiplexer::{
+    AckRequest, ChangesEvent, MultiplexerEvent, ReopenRequest, drive_changes_stream,
+};
 
 pub struct Reconciler {
     pub account_id: AccountId,
@@ -28,6 +32,7 @@ pub struct Reconciler {
     pub shutdown: CancellationToken,
     pub control: SyncControl,
     pub ack_tx: Option<mpsc::Sender<AckRequest>>,
+    pub reopen_tx: mpsc::Sender<ReopenRequest>,
 }
 
 impl Reconciler {
@@ -102,10 +107,21 @@ impl Reconciler {
                 | ChangesEvent::Done
                 | ChangesEvent::Stopped
                 | ChangesEvent::Paused => {}
-                ChangesEvent::Fatal(_recovery) => {
+                ChangesEvent::Fatal(recovery) => {
+                    if let RecoveryClass::Retry { after } = recovery {
+                        tokio::time::sleep(after).await;
+                    } else {
+                        let _ = self
+                            .reopen_tx
+                            .send(ReopenRequest::Recovery {
+                                scope: scope.clone(),
+                                recovery,
+                            })
+                            .await;
+                    }
                     // Fatal already propagated through the broadcast
-                    // by the driver; bail out so the slot's restart
-                    // logic can take over.
+                    // by the driver; bail out after handing recovery
+                    // to the slot-level reopen listener.
                     return Ok(());
                 }
             }

@@ -120,6 +120,25 @@ impl Net {
     /// `AccountNet` carrying the per-account token source, rate
     /// limits, and default retry policy.
     pub fn attach_account(&self, id: AccountId, spec: AccountSpec) -> AccountNet {
+        let previous_hosts = {
+            let mut map = self
+                .inner
+                .account_hosts
+                .lock()
+                .expect("net account_hosts lock poisoned");
+            map.remove(&id).unwrap_or_default()
+        };
+        if !previous_hosts.is_empty() {
+            tracing::warn!(
+                target: "bifrost_net::rate",
+                account = ?id,
+                "attach_account called for an already-attached account; replacing previous host registrations",
+            );
+        }
+        for host in previous_hosts {
+            self.inner.governor.unregister(&host);
+        }
+
         // Register the meter so the per-account counters exist before
         // any request lands. Rate-limit registration walks the host
         // list the caller supplied.
@@ -581,7 +600,7 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
         return false;
     };
 
-    if resp_start_n != req_start_n {
+    if resp_start_n != req_start_n || resp_end_n < resp_start_n {
         return false;
     }
     let total_trim = total_part.trim();
@@ -593,6 +612,11 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
             Err(_) => return false,
         }
     };
+    if let Some(total) = total_known
+        && resp_end_n >= total
+    {
+        return false;
+    }
     match req_end_n {
         Some(end) => resp_end_n == end,
         // Open-ended request: must cover the full tail of the
@@ -738,4 +762,25 @@ pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
         source: Some(Box::new(e)),
     });
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::content_range_matches;
+
+    #[test]
+    fn content_range_rejects_inverted_response_range() {
+        assert!(!content_range_matches("bytes=100-", "bytes 100-99/100"));
+    }
+
+    #[test]
+    fn content_range_rejects_end_at_or_after_total() {
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-99/99"));
+        assert!(!content_range_matches("bytes=0-", "bytes 0-100/100"));
+    }
+
+    #[test]
+    fn content_range_accepts_valid_open_ended_tail() {
+        assert!(content_range_matches("bytes=10-", "bytes 10-99/100"));
+    }
 }

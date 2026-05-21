@@ -93,10 +93,28 @@ impl RequestBuilder {
     /// `Set-Cookie`-style multi-valued headers.
     #[must_use]
     pub fn header(mut self, key: &str, value: &str) -> Self {
-        if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
-            && let Ok(val) = HeaderValue::from_str(value)
-        {
-            self.inner.headers.append(name, val);
+        match HeaderName::from_bytes(key.as_bytes()) {
+            Ok(name) => match HeaderValue::from_str(value) {
+                Ok(val) => {
+                    self.inner.headers.append(name, val);
+                }
+                Err(e) => {
+                    if self.inner.pending_error.is_none() {
+                        self.inner.pending_error = Some(Error::InvalidHeader {
+                            message: format!("invalid value for header {key:?}: {e}"),
+                            source: Some(Box::new(e)),
+                        });
+                    }
+                }
+            },
+            Err(e) => {
+                if self.inner.pending_error.is_none() {
+                    self.inner.pending_error = Some(Error::InvalidHeader {
+                        message: format!("invalid header name {key:?}: {e}"),
+                        source: Some(Box::new(e)),
+                    });
+                }
+            }
         }
         self
     }

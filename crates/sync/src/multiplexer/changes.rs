@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use bifrost_types::{Account, AccountId, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent};
 use futures::stream::StreamExt;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::cancel::{BoundaryRequest, BoundaryView};
 use crate::control::SyncControl;
@@ -131,7 +131,6 @@ pub async fn drive_changes_stream(
 /// Ack request: scope + checkpoint the engine should durably persist.
 /// Consumers send these through `SyncEngine::ack_checkpoint` after
 /// their own item store commits the matching batch.
-#[derive(Debug, Clone)]
 pub struct AckRequest {
     pub scope: CursorScope,
     pub checkpoint: Checkpoint,
@@ -140,6 +139,21 @@ pub struct AckRequest {
     /// trace readability if old tests or callers construct requests
     /// directly inside the crate.
     pub auto: bool,
+    /// Completion channel for consumer-driven acks. `ack_checkpoint`
+    /// waits on this so it returns only after the checkpoint store
+    /// has accepted or rejected the write.
+    pub complete: Option<oneshot::Sender<Result<(), Error>>>,
+}
+
+impl std::fmt::Debug for AckRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AckRequest")
+            .field("scope", &self.scope)
+            .field("checkpoint", &self.checkpoint)
+            .field("auto", &self.auto)
+            .field("complete", &self.complete.is_some())
+            .finish()
+    }
 }
 
 fn checkpoint_for(event: &SyncEvent<Change>) -> Option<&Checkpoint> {

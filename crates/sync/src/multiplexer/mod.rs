@@ -173,27 +173,23 @@ impl Multiplexer {
 
         // Snapshot the known scopes from the registry; the engine has
         // populated it via `establish_one` before spawning us.
-        let initial_scopes = cursors.all_scopes();
+        spawn_missing_scope_polls(
+            account_id.clone(),
+            Arc::clone(&account),
+            Arc::clone(&cursors),
+            config,
+            boundary.clone(),
+            changes_tx.clone(),
+            control.clone(),
+            shutdown.clone(),
+            reopen_tx.clone(),
+            ack_tx.clone(),
+            Arc::clone(&scope_tokens),
+        );
 
-        for scope in initial_scopes {
-            spawn_and_track_scope_poll(
-                account_id.clone(),
-                Arc::clone(&account),
-                Arc::clone(&cursors),
-                config,
-                boundary.clone(),
-                changes_tx.clone(),
-                control.clone(),
-                shutdown.clone(),
-                reopen_tx.clone(),
-                ack_tx.clone(),
-                Arc::clone(&scope_tokens),
-                scope,
-            );
-        }
-
-        // Drive scope_lifecycle in the background. `Created` spawns a
-        // new poll task; `Deleted` cancels and drops the matching
+        // Drive scope_lifecycle in the background. `Created` asks the
+        // engine to establish a cursor; the scan loop below notices it
+        // and starts polling. `Deleted` cancels and drops the matching
         // scope; `Renamed` is delete+create on a fresh CursorScope id.
         let lifecycle_account = Arc::clone(&account);
         let lifecycle_shutdown = shutdown.clone();
@@ -269,8 +265,29 @@ impl Multiplexer {
             }
         });
 
-        // Park until shutdown; the per-scope tasks own their own loops.
-        shutdown.cancelled().await;
+        // Park until shutdown while periodically noticing cursors
+        // established by deferred inventory or lifecycle recovery.
+        let mut scan = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                _ = scan.tick() => {
+                    spawn_missing_scope_polls(
+                        account_id.clone(),
+                        Arc::clone(&account),
+                        Arc::clone(&cursors),
+                        config,
+                        boundary.clone(),
+                        changes_tx.clone(),
+                        control.clone(),
+                        shutdown.clone(),
+                        reopen_tx.clone(),
+                        ack_tx.clone(),
+                        Arc::clone(&scope_tokens),
+                    );
+                }
+            }
+        }
 
         // Cancel every tracked scope token so per-scope polls exit
         // cleanly. Tokens are dropped as part of the map clear.
@@ -338,20 +355,77 @@ fn spawn_and_track_scope_poll(
         .lock()
         .expect("poisoned")
         .insert(scope.clone(), scope_cancel.clone());
-    tokio::spawn(spawn_scope_poll_inner(
-        account_id,
-        account,
-        cursors,
-        config,
-        boundary,
-        changes_tx,
-        control,
-        shutdown,
-        scope_cancel,
-        reopen_tx,
-        ack_tx,
-        scope,
-    ));
+    let cleanup_tokens = Arc::clone(&scope_tokens);
+    let cleanup_scope = scope.clone();
+    let cleanup_cancel = scope_cancel.clone();
+    tokio::spawn(async move {
+        spawn_scope_poll_inner(
+            account_id,
+            account,
+            cursors,
+            config,
+            boundary,
+            changes_tx,
+            control,
+            shutdown,
+            scope_cancel,
+            reopen_tx,
+            ack_tx,
+            scope,
+        )
+        .await;
+        let mut g = cleanup_tokens.lock().expect("poisoned");
+        let should_remove = !cleanup_cancel.is_cancelled()
+            || matches!(g.get(&cleanup_scope), Some(token) if token.is_cancelled());
+        if should_remove {
+            g.remove(&cleanup_scope);
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_missing_scope_polls(
+    account_id: AccountId,
+    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    cursors: Arc<CursorRegistry>,
+    config: MultiplexerConfig,
+    boundary: BoundaryView,
+    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    control: SyncControl,
+    shutdown: CancellationToken,
+    reopen_tx: mpsc::Sender<ReopenRequest>,
+    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
+) {
+    for scope in cursors.all_scopes() {
+        let should_spawn = {
+            let mut g = scope_tokens.lock().expect("poisoned");
+            match g.get(&scope) {
+                Some(token) if !token.is_cancelled() => false,
+                Some(_) => {
+                    g.remove(&scope);
+                    true
+                }
+                None => true,
+            }
+        };
+        if should_spawn {
+            spawn_and_track_scope_poll(
+                account_id.clone(),
+                Arc::clone(&account),
+                Arc::clone(&cursors),
+                config,
+                boundary.clone(),
+                changes_tx.clone(),
+                control.clone(),
+                shutdown.clone(),
+                reopen_tx.clone(),
+                ack_tx.clone(),
+                Arc::clone(&scope_tokens),
+                scope,
+            );
+        }
+    }
 }
 
 /// Per-scope poll loop. Drives `changes_stream(cursor)` and sleeps

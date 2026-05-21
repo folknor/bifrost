@@ -18,7 +18,7 @@ use bifrost_types::{
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
@@ -147,6 +147,11 @@ impl Default for SyncEngineBuilder {
     }
 }
 
+enum InitialScope {
+    Ready,
+    DeferredInventory(CursorScope),
+}
+
 impl SyncEngine {
     #[must_use]
     pub fn builder() -> SyncEngineBuilder {
@@ -208,18 +213,19 @@ impl SyncEngine {
         // need the registry pre-populated for `Ready` scopes. For
         // `EstablishViaInventory` scopes the inventory walk IS the
         // cursor establishment AND surfaces inventory items - we
-        // forward those onto `changes_tx` so consumers observe
-        // cold-start data the same way they observe live changes.
+        // defer those walks until the slot can be subscribed to, so
+        // consumers observe cold-start data the same way they observe
+        // live changes.
         let scopes = self.discover_scopes(opened.as_ref()).await?;
+        let mut deferred_inventory_scopes = Vec::new();
         for scope in scopes.clone() {
-            self.establish_one(
-                &account_id,
-                opened.as_ref(),
-                scope,
-                Arc::clone(&cursors),
-                Some(changes_tx.clone()),
-            )
-            .await?;
+            match self
+                .establish_one(&account_id, opened.as_ref(), scope, Arc::clone(&cursors))
+                .await?
+            {
+                InitialScope::Ready => {}
+                InitialScope::DeferredInventory(scope) => deferred_inventory_scopes.push(scope),
+            }
         }
 
         // Drive membership discovery to populate the push-reconciler's
@@ -290,13 +296,11 @@ impl SyncEngine {
         let ack_writer_store = Arc::clone(&self.checkpoints);
         let ack_writer_aid = account_id.clone();
         let ack_writer_control = control.clone();
-        let ack_writer_shutdown = shutdown.clone();
         spawn(tokio::spawn(ack_writer(
             ack_writer_aid,
             ack_writer_store,
             ack_writer_control,
             ack_rx,
-            ack_writer_shutdown,
         )));
 
         // Control applier: forwards priority and bandwidth-cap
@@ -353,6 +357,7 @@ impl SyncEngine {
             shutdown: shutdown.clone(),
             control: control.clone(),
             ack_tx: Some(ack_tx.clone()),
+            reopen_tx: reopen_tx.clone(),
         };
         spawn(tokio::spawn(reconciler.run(watch_rx)));
 
@@ -453,6 +458,31 @@ impl SyncEngine {
             )
             .await;
         }));
+
+        // Deferred inventory establishment must happen after the slot
+        // can be subscribed to. The worker waits for a real subscriber
+        // before broadcasting cold-start inventory batches, so those
+        // batches do not vanish during attach.
+        if !deferred_inventory_scopes.is_empty() {
+            let inventory_account = Arc::clone(&current);
+            let inventory_cursors = Arc::clone(&cursors);
+            let inventory_store = Arc::clone(&self.checkpoints);
+            let inventory_changes = changes_tx.clone();
+            let inventory_shutdown = shutdown.clone();
+            let inventory_aid = account_id.clone();
+            spawn(tokio::spawn(async move {
+                run_deferred_inventory_establishment(
+                    inventory_account,
+                    inventory_cursors,
+                    inventory_store,
+                    inventory_changes,
+                    inventory_shutdown,
+                    inventory_aid,
+                    deferred_inventory_scopes,
+                )
+                .await;
+            }));
+        }
 
         // Spawn the reopen listener.
         let reopen_factory = Arc::clone(&factory);
@@ -572,13 +602,18 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let (complete_tx, complete_rx) = oneshot::channel();
         tx.send(AckRequest {
             scope,
             checkpoint,
             auto: false,
+            complete: Some(complete_tx),
         })
         .await
-        .map_err(|e| Error::Other(format!("ack channel closed: {e}")))
+        .map_err(|e| Error::Other(format!("ack channel closed: {e}")))?;
+        complete_rx
+            .await
+            .map_err(|e| Error::Other(format!("ack writer dropped before persisting: {e}")))?
     }
 
     /// Explicitly shutdown the engine. Awaits all attached accounts'
@@ -618,6 +653,10 @@ impl SyncEngine {
         self.ack_senders.remove(account_id);
         // Ask running workers to checkpoint cleanly, then stop.
         let _ = slot.boundary_tx.send(BoundaryRequest::Stop);
+        // Trip shutdown before awaiting workers. Some account-level
+        // workers park on the shutdown token rather than the boundary
+        // watch, so waiting first would always run to detach_timeout.
+        slot.shutdown.cancel();
 
         // Await spawned workers up to the configured timeout. Each
         // stored worker owns both its join and abort handles so a
@@ -643,7 +682,6 @@ impl SyncEngine {
         if let Some(worker) = ack_worker {
             await_worker_until(deadline, worker).await;
         }
-        slot.shutdown.cancel();
 
         let current = slot.current.load_full();
         if let Err(e) = current.close().await {
@@ -815,25 +853,26 @@ impl SyncEngine {
             }
 
             attempt = attempt.saturating_add(1);
-            if let Some(after) = fatal_retry
-                && attempt < max_retries
-            {
-                retry_after = Some(after);
-                let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
-                remaining.retain(|id| {
-                    retry_set.contains(id)
-                        || !matches!(
-                            outcomes.get(id),
-                            Some(
-                                MutationBucket::Applied
-                                    | MutationBucket::Skipped
-                                    | MutationBucket::FailedTerminal
-                            )
-                        )
-                });
-                if remaining.is_empty() {
-                    break;
-                }
+            let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
+            let mut next_remaining: Vec<_> = remaining
+                .iter()
+                .filter(|id| {
+                    retry_set.contains(*id)
+                        || (fatal_retry.is_some()
+                            && !matches!(
+                                outcomes.get(*id),
+                                Some(
+                                    MutationBucket::Applied
+                                        | MutationBucket::Skipped
+                                        | MutationBucket::FailedTerminal
+                                )
+                            ))
+                })
+                .cloned()
+                .collect();
+            if attempt < max_retries && !next_remaining.is_empty() {
+                retry_after = fatal_retry;
+                std::mem::swap(&mut remaining, &mut next_remaining);
                 continue;
             }
 
@@ -913,8 +952,7 @@ impl SyncEngine {
         account: &dyn Account,
         scope: CursorScope,
         cursors: Arc<CursorRegistry>,
-        changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
-    ) -> Result<(), Error> {
+    ) -> Result<InitialScope, Error> {
         // Check the store first - resume path.
         if let Some(existing) = self
             .checkpoints
@@ -922,7 +960,7 @@ impl SyncEngine {
             .await?
         {
             cursors.put(existing);
-            return Ok(());
+            return Ok(InitialScope::Ready);
         }
         match account
             .establish_initial_cursor(scope.clone())
@@ -930,31 +968,11 @@ impl SyncEngine {
             .map_err(|e| Error::EstablishCursorFailed(format!("{e}")))?
         {
             CursorEstablishment::Ready(cursor) => {
-                self.persist_cursor(account_id, cursor, cursors).await
+                self.persist_cursor(account_id, cursor, cursors).await?;
+                Ok(InitialScope::Ready)
             }
             CursorEstablishment::EstablishViaInventory => {
-                // Drive the inventory fusion through the per-account
-                // broadcast so the inventory items DO reach
-                // subscribers; the cursor establishes only on a
-                // successful terminal Done.
-                let fusion = crate::multiplexer::InventoryFusion {
-                    account_id: account_id.clone(),
-                    cursors: Arc::clone(&cursors),
-                    store: Arc::clone(&self.checkpoints),
-                };
-                match fusion
-                    .run_with_broadcast(account, scope, changes_tx)
-                    .await?
-                {
-                    crate::multiplexer::FusionOutcome::Established
-                    | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
-                    crate::multiplexer::FusionOutcome::Fatal(recovery) => {
-                        Err(Error::EstablishCursorFatal {
-                            message: "inventory fusion fatal".into(),
-                            recovery,
-                        })
-                    }
-                }
+                Ok(InitialScope::DeferredInventory(scope))
             }
             // `CursorEstablishment` is `#[non_exhaustive]`; treat any
             // future variant as "cannot establish" so the engine fails
@@ -990,33 +1008,7 @@ impl SyncEngine {
         account: &dyn Account,
         cursors: Arc<CursorRegistry>,
     ) -> Result<(), Error> {
-        let mut stream = account.discover_memberships();
-        let known_scopes = cursors.all_scopes();
-        while let Some(event) = stream.next().await {
-            match event {
-                SyncEvent::Batch(batch) => {
-                    for membership in batch.items {
-                        for scope in &known_scopes {
-                            if scope_covers_membership(scope, &membership) {
-                                cursors.link_membership(membership.clone(), scope.clone());
-                            }
-                        }
-                    }
-                }
-                SyncEvent::Done(_) => break,
-                SyncEvent::Fatal(f) => {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        message = %f.message,
-                        "discover_memberships fatal; continuing without index"
-                    );
-                    break;
-                }
-                SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
-                _ => {}
-            }
-        }
-        Ok(())
+        link_discovered_memberships(account, &cursors).await
     }
 }
 
@@ -1040,6 +1032,13 @@ fn scope_covers_membership(scope: &CursorScope, membership: &MembershipScope) ->
         (CursorScope::Folder(FolderId(folder_id)), MembershipScope::Mailbox(mbx)) => {
             folder_id == &mbx.0
         }
+        (
+            CursorScope::FolderType {
+                folder: FolderId(folder_id),
+                ..
+            },
+            MembershipScope::Mailbox(mbx),
+        ) => folder_id == &mbx.0,
         // Query cursors cover the same query membership.
         (CursorScope::Query(q), MembershipScope::Query(mq)) => q == mq,
         _ => false,
@@ -1129,6 +1128,125 @@ async fn run_backfill_orchestrator(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_deferred_inventory_establishment(
+    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    cursors: Arc<CursorRegistry>,
+    store: Arc<DynCheckpointStore>,
+    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    shutdown: CancellationToken,
+    account_id: AccountId,
+    scopes: Vec<CursorScope>,
+) {
+    if !wait_for_real_subscriber(&changes_tx, &shutdown).await {
+        return;
+    }
+    for scope in scopes {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let acc_arc = account.load_full();
+        let acc: &dyn Account = acc_arc.as_ref().as_ref();
+        let fusion = crate::multiplexer::InventoryFusion {
+            account_id: account_id.clone(),
+            cursors: Arc::clone(&cursors),
+            store: Arc::clone(&store),
+        };
+        match fusion
+            .run_with_broadcast(acc, scope.clone(), Some(changes_tx.clone()))
+            .await
+        {
+            Ok(crate::multiplexer::FusionOutcome::Established) => {
+                if let Err(err) = link_discovered_memberships(acc, &cursors).await {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        scope = ?scope,
+                        error = %err,
+                        "deferred inventory: membership refresh failed"
+                    );
+                }
+            }
+            Ok(crate::multiplexer::FusionOutcome::NoCursor) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?scope,
+                    "deferred inventory completed without a cursor"
+                );
+            }
+            Ok(crate::multiplexer::FusionOutcome::Fatal(recovery)) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?scope,
+                    recovery = ?recovery,
+                    "deferred inventory ended in fatal"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?scope,
+                    error = %err,
+                    "deferred inventory failed"
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_real_subscriber(
+    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    shutdown: &CancellationToken,
+) -> bool {
+    loop {
+        // One receiver is the slot's sentinel. A count above one
+        // means at least one consumer has called account_changes_stream.
+        if changes_tx.receiver_count() > 1 {
+            return true;
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => return false,
+            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+    }
+}
+
+async fn link_discovered_memberships(
+    account: &dyn Account,
+    cursors: &CursorRegistry,
+) -> Result<(), Error> {
+    let mut stream = account.discover_memberships();
+    while let Some(event) = stream.next().await {
+        match event {
+            SyncEvent::Batch(batch) => {
+                let known_scopes = cursors.all_scopes();
+                for membership in batch.items {
+                    for scope in &known_scopes {
+                        if scope_covers_membership(scope, &membership) {
+                            cursors.link_membership(membership.clone(), scope.clone());
+                        }
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            SyncEvent::Fatal(f) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    message = %f.message,
+                    "discover_memberships fatal; continuing without index"
+                );
+                break;
+            }
+            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Ack writer task. One per attached account. Receives `AckRequest`
 /// messages on `rx` and durably persists the carried checkpoint via
 /// the `CheckpointStore`. Notifies the control's checkpoint watch so
@@ -1139,56 +1257,45 @@ async fn ack_writer(
     store: Arc<DynCheckpointStore>,
     control: SyncControl,
     mut rx: mpsc::Receiver<AckRequest>,
-    shutdown: CancellationToken,
 ) {
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return,
-            req = rx.recv() => {
-                let Some(req) = req else { return; };
-                match &req.checkpoint {
-                    Checkpoint::Change(c) => {
-                        if let Err(err) = store
-                            .put_change_cursor(&account_id, c.clone())
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "bifrost.sync.changes",
-                                account = ?account_id,
-                                scope = ?req.scope,
-                                error = %err,
-                                auto = req.auto,
-                                "ack: persist_change_cursor failed"
-                            );
-                            continue;
-                        }
-                    }
-                    Checkpoint::Backfill(b) => {
-                        if let Err(err) = store
-                            .put_backfill(&account_id, b.clone())
-                            .await
-                        {
-                            tracing::warn!(
-                                target: "bifrost.sync.backfill",
-                                account = ?account_id,
-                                scope = ?req.scope,
-                                error = %err,
-                                "ack: put_backfill failed"
-                            );
-                            continue;
-                        }
-                    }
-                    _ => {
-                        // Unknown future Checkpoint variant; ignore.
-                        continue;
-                    }
-                }
+    while let Some(req) = rx.recv().await {
+        let result = persist_ack_request(&account_id, Arc::clone(&store), &req).await;
+        match result {
+            Ok(()) => {
                 // Notify pause / checkpoint_now waiters AFTER the
                 // durable write lands - the contract is that the
                 // returned checkpoint has been persisted.
                 control.record_checkpoint(req.checkpoint).await;
+                if let Some(done) = req.complete {
+                    let _ = done.send(Ok(()));
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?req.scope,
+                    error = %err,
+                    auto = req.auto,
+                    "ack: checkpoint persist failed"
+                );
+                if let Some(done) = req.complete {
+                    let _ = done.send(Err(err));
+                }
             }
         }
+    }
+}
+
+async fn persist_ack_request(
+    account_id: &AccountId,
+    store: Arc<DynCheckpointStore>,
+    req: &AckRequest,
+) -> Result<(), Error> {
+    match &req.checkpoint {
+        Checkpoint::Change(c) => store.put_change_cursor(account_id, c.clone()).await,
+        Checkpoint::Backfill(b) => store.put_backfill(account_id, b.clone()).await,
+        _ => Err(Error::Other("unknown checkpoint variant in ack".into())),
     }
 }
 
@@ -1231,7 +1338,7 @@ async fn handle_recovery(
             }
             let acc_arc = current.load_full();
             let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            if let Err(err) = run_establish(
+            match run_establish(
                 account_id,
                 acc,
                 scope.clone(),
@@ -1241,13 +1348,26 @@ async fn handle_recovery(
             )
             .await
             {
-                tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    account = ?account_id,
-                    scope = ?scope,
-                    error = %err,
-                    "RestartScope: re-establishment failed"
-                );
+                Ok(()) => {
+                    if let Err(err) = link_discovered_memberships(acc, cursors).await {
+                        tracing::warn!(
+                            target: "bifrost.sync.changes",
+                            account = ?account_id,
+                            scope = ?scope,
+                            error = %err,
+                            "RestartScope: membership refresh failed"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        scope = ?scope,
+                        error = %err,
+                        "RestartScope: re-establishment failed"
+                    );
+                }
             }
         }
         RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
@@ -1420,4 +1540,30 @@ fn is_terminal_mutation_error(err: &bifrost_types::Error) -> bool {
             | bifrost_types::Error::CursorEnvelopeUnknown
             | bifrost_types::Error::SchemaIncompatible
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_covers_membership;
+    use bifrost_types::{CursorScope, FolderId, MembershipScope, ObjectType};
+
+    #[test]
+    fn folder_type_scope_covers_matching_mailbox_membership() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        };
+        let membership = MembershipScope::Mailbox(bifrost_types::MailboxId("inbox".into()));
+        assert!(scope_covers_membership(&scope, &membership));
+    }
+
+    #[test]
+    fn folder_type_scope_rejects_other_mailbox_membership() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".into()),
+            ty: ObjectType::Email,
+        };
+        let membership = MembershipScope::Mailbox(bifrost_types::MailboxId("archive".into()));
+        assert!(!scope_covers_membership(&scope, &membership));
+    }
 }
