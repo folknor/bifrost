@@ -35,6 +35,8 @@ pub mod quota;
 pub mod share_notification;
 #[cfg(feature = "mail")]
 pub mod sieve;
+#[cfg(feature = "sync")]
+pub mod sync;
 #[cfg(feature = "mail")]
 pub mod thread;
 pub mod transport_reqwest;
