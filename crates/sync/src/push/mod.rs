@@ -98,33 +98,31 @@ impl InvalidationSink for InvalidationSinkInner {
         match tx.try_send(event.clone()) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(rejected)) => {
-                // Coalesce on overflow: replace the queued specifics
-                // with a single `Unknown` hint so the reconciler does a
-                // full reconcile. Dropping the precise hint is safe
-                // under uncertainty; doing a full reconcile against
-                // the wrong scope is wrong only when the queue is
-                // small enough that we can usefully discriminate, and
-                // at "full" we have lost that information already.
+                // Channel full: try to land a coalesced
+                // `HintPayload::Unknown` so the reconciler still
+                // performs a full reconcile. We spawn a short-lived
+                // sender task that uses `send().await` with a tight
+                // deadline so a transiently-full channel doesn't
+                // drop the wakeup entirely. Increment the drop counter
+                // for observability either way.
                 let unknown = WatchEvent::Invalidated {
                     hint: InvalidationHint {
-                        source: hint_source(&rejected),
+                        source: PushSource::Coalesced,
                         payload: HintPayload::Unknown,
                     },
                 };
-                let _ = tx.try_send(unknown);
+                let _ = rejected;
+                let sender = tx.clone();
                 self.drop_counter.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Duration::from_millis(100);
+                    let _ = tokio::time::timeout(deadline, sender.send(unknown)).await;
+                });
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Account detached during in-flight push.
             }
         }
-    }
-}
-
-fn hint_source(event: &WatchEvent) -> PushSource {
-    match event {
-        WatchEvent::Invalidated { hint } => hint.source,
-        _ => PushSource::JmapStateChange,
     }
 }
 

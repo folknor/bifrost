@@ -45,6 +45,21 @@ impl CursorRegistry {
         guard.insert(cursor.scope.clone(), cursor);
     }
 
+    /// Drop the cursor for a scope and any membership index entries
+    /// that referenced it. Used by `ScopeLifecycle::Deleted` and by
+    /// the engine's `RecoveryClass::RestartScope` recovery path.
+    pub fn delete(&self, scope: &CursorScope) {
+        {
+            let mut guard = self.cursors.write().expect("poisoned");
+            guard.remove(scope);
+        }
+        let mut idx = self.membership_index.write().expect("poisoned");
+        for entry in idx.values_mut() {
+            entry.retain(|s| s != scope);
+        }
+        idx.retain(|_, scopes| !scopes.is_empty());
+    }
+
     /// Read a snapshot of the cursor for a scope.
     #[must_use]
     pub fn snapshot(&self, scope: &CursorScope) -> Option<ChangeCursor> {

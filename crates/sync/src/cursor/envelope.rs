@@ -154,6 +154,14 @@ fn parse_envelope(bytes: &[u8]) -> Result<CursorEnvelope, Error> {
     if bytes[0] != MAGIC {
         return Err(Error::Other("cursor envelope: bad magic".into()));
     }
+    // Reserved bytes 1..4 must be zero. Future versions can repurpose
+    // them; until then any non-zero value indicates a corrupted or
+    // future-versioned envelope this engine cannot read.
+    if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
+        return Err(Error::Other(
+            "cursor envelope: reserved header bytes non-zero".into(),
+        ));
+    }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let kind = EnvelopeKind::from_tag(bytes[8])?;
     let scope_len = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]) as usize;

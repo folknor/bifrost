@@ -39,6 +39,23 @@ pub enum WorkKind {
     Mutation,
 }
 
+/// Shed policy when a lane is full. `DropOldest` is the v1 default
+/// (matching the original behavior); `DropNewest` rejects the
+/// incoming submission. Both increment the shed counter for
+/// observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LaneShedPolicy {
+    DropOldest,
+    DropNewest,
+}
+
+impl Default for LaneShedPolicy {
+    fn default() -> Self {
+        Self::DropOldest
+    }
+}
+
 /// Per-lane FIFO queue.
 #[derive(Debug)]
 pub struct LaneQueue {
@@ -46,6 +63,7 @@ pub struct LaneQueue {
     capacity: usize,
     queue: Mutex<VecDeque<WorkItem>>,
     shed_count: AtomicU64,
+    shed_policy: LaneShedPolicy,
 }
 
 impl LaneQueue {
@@ -64,6 +82,7 @@ impl LaneQueue {
             capacity: capacity.max(1),
             queue: Mutex::new(VecDeque::new()),
             shed_count: AtomicU64::new(0),
+            shed_policy: LaneShedPolicy::default(),
         }
     }
 

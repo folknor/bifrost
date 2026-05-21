@@ -75,10 +75,23 @@ pub(crate) struct HostBucket {
     pub(crate) burst_max: u32,
     /// Refill rate copied from `RateLimit::quota_per_second`.
     pub(crate) refill_rate: f64,
+    /// Per-host default cost copied from `RateLimit::cost_default` at
+    /// registration. `RequestBuilder::send_streaming_inner` looks this
+    /// up when the builder did not call `.cost()` so each host can
+    /// have a sensible default (Gmail's cheap reads are 5; Graph's
+    /// query endpoints are 10) without forcing every call site to
+    /// remember.
+    pub(crate) cost_default: u32,
     /// Wall-clock instant of the last refill calculation.
     pub(crate) last_refill: Instant,
     /// Notify handle used by `acquire` waiters and the refund path.
     pub(crate) notify: Arc<Notify>,
+    /// Per-host attach count. Each `register` increments; each
+    /// `unregister` decrements; the bucket is dropped when the count
+    /// reaches zero. Lets `Net::detach_account` shed unused host
+    /// buckets symmetrically without yanking the bucket out from
+    /// under accounts that still depend on it.
+    pub(crate) attach_count: u32,
 }
 
 impl RateLimitGovernor {
@@ -91,19 +104,83 @@ impl RateLimitGovernor {
         }
     }
 
-    /// Register a host with the governor. Idempotent: a second
-    /// registration on the same host with the same shape is a no-op;
-    /// callers should not rely on this for runtime quota tuning.
+    /// Register a host with the governor.
+    ///
+    /// Duplicate-host policy: the first registration wins. A second
+    /// registration that disagrees on `quota_per_second`, `burst`, or
+    /// `cost_default` is **not** silently dropped: we emit a
+    /// `tracing::warn!` so the caller sees the conflict, but leave the
+    /// installed bucket in place. The alternative (most-restrictive
+    /// merge) would let any consumer poison shared host quotas via a
+    /// misconfiguration; sticking with the first registration keeps
+    /// the rule deterministic.
     pub fn register(&self, limit: RateLimit) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
-        map.entry(limit.host.clone()).or_insert_with(|| HostBucket {
-            tokens: f64::from(limit.burst),
-            burst: f64::from(limit.burst),
-            burst_max: limit.burst,
-            refill_rate: limit.quota_per_second,
-            last_refill: Instant::now(),
-            notify: Arc::new(Notify::new()),
-        });
+        match map.get_mut(&limit.host) {
+            Some(existing) => {
+                #[allow(clippy::float_cmp)]
+                let conflict = existing.refill_rate != limit.quota_per_second
+                    || existing.burst_max != limit.burst
+                    || existing.cost_default != limit.cost_default;
+                if conflict {
+                    tracing::warn!(
+                        target: "bifrost_net::rate",
+                        host = %limit.host,
+                        existing_quota_per_second = existing.refill_rate,
+                        existing_burst = existing.burst_max,
+                        existing_cost_default = existing.cost_default,
+                        new_quota_per_second = limit.quota_per_second,
+                        new_burst = limit.burst,
+                        new_cost_default = limit.cost_default,
+                        "duplicate RateLimit registration with different quota; keeping first registration",
+                    );
+                }
+                existing.attach_count = existing.attach_count.saturating_add(1);
+            }
+            None => {
+                map.insert(
+                    limit.host.clone(),
+                    HostBucket {
+                        tokens: f64::from(limit.burst),
+                        burst: f64::from(limit.burst),
+                        burst_max: limit.burst,
+                        refill_rate: limit.quota_per_second,
+                        cost_default: limit.cost_default,
+                        last_refill: Instant::now(),
+                        notify: Arc::new(Notify::new()),
+                        attach_count: 1,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Decrement the attach count for a host; drop the bucket when
+    /// the count reaches zero. Called from `Net::detach_account` to
+    /// keep the governor's map from growing without bound across
+    /// account attach/detach cycles.
+    pub fn unregister(&self, host: &str) {
+        let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
+        let drop_it = match map.get_mut(host) {
+            Some(bucket) => {
+                bucket.attach_count = bucket.attach_count.saturating_sub(1);
+                bucket.attach_count == 0
+            }
+            None => false,
+        };
+        if drop_it {
+            map.remove(host);
+        }
+    }
+
+    /// Look up the host's registered `cost_default`. Returns `None`
+    /// if the host has no registration. Used by
+    /// `RequestBuilder::send_streaming_inner` when the builder did
+    /// not set a per-request cost via `.cost(n)`.
+    #[must_use]
+    pub fn cost_default_for(&self, host: &str) -> Option<u32> {
+        let map = self.buckets.lock().expect("rate-governor lock poisoned");
+        map.get(host).map(|b| b.cost_default)
     }
 
     /// Await enough tokens to debit `cost` from the host's bucket.
@@ -197,7 +274,20 @@ impl RateLimitGovernor {
 
     /// Refund `cost` tokens to the host's bucket, e.g. when the
     /// server returned 429 with a `Retry-After` and the request did
-    /// not actually consume the slot. Wakes one waiter.
+    /// not actually consume the slot.
+    ///
+    /// **Thundering-herd note:** waiters are tokio `Notify`
+    /// listeners. We call `notify_one()` so a single refund wakes
+    /// only one waiter, which is the right semantics for token-bucket
+    /// fairness: refunding `cost = 1` should not wake N waiters who
+    /// each consume the same slot. However, a burst of refunds (e.g.
+    /// a chain of 503s from a host that just came back up) will wake
+    /// one waiter per refund in quick succession, and they will all
+    /// re-enter `acquire` and race to debit the bucket. This is
+    /// acceptable: refilled tokens are still scarce on the
+    /// just-recovered host, so racing acquirers self-throttle. If a
+    /// caller adds higher-volume refund paths (currently only the
+    /// retry loop refunds), reconsider.
     pub fn refund(&self, host: &str, cost: u32) {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
         let Some(bucket) = map.get_mut(host) else {

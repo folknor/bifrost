@@ -3,13 +3,13 @@
 //! `bifrost_types::Control` is the consumer-facing trait. `SyncControl`
 //! is the engine's concrete implementor: holds the boundary sender,
 //! the priority watch sender, the bandwidth meters, and the
-//! checkpoint store handle.
+//! per-generation checkpoint signal.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{AccountId, Checkpoint, Control, Error as TypesError, Priority};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::cancel::{Boundary, BoundaryRequest};
 
@@ -22,38 +22,74 @@ pub struct SyncControl {
     inner: Arc<SyncControlInner>,
 }
 
+/// Latest checkpoint snapshot carried by the `watch` channel. The
+/// generation counter increments each time `pause` or
+/// `checkpoint_now` is invoked, so `wait_for_checkpoint` returns the
+/// FIRST checkpoint observed at or after the request's generation -
+/// never a stale pre-request value.
+#[derive(Debug, Clone)]
+struct CheckpointSnapshot {
+    /// Generation at which this checkpoint was recorded.
+    generation: u64,
+    /// The checkpoint itself, if any has been recorded yet.
+    checkpoint: Option<Checkpoint>,
+}
+
 struct SyncControlInner {
     account: AccountId,
     boundary: Boundary,
-    boundary_recipient: Arc<Notify>,
-    last_checkpoint: tokio::sync::Mutex<Option<Checkpoint>>,
+    /// Watch channel carrying the latest persisted checkpoint plus a
+    /// generation counter. The generation increments on every
+    /// boundary-flip request (pause / checkpoint_now) so waiters
+    /// distinguish their pre-request snapshot from the post-flip
+    /// checkpoint they actually want.
+    checkpoint_tx: watch::Sender<CheckpointSnapshot>,
+    /// Monotonic generation counter; bumped by `pause` /
+    /// `checkpoint_now` BEFORE flipping the boundary so the waiter
+    /// reads the new generation before parking.
+    generation: AtomicU64,
     priority: watch::Sender<Priority>,
-    bandwidth_cap: tokio::sync::Mutex<Option<u64>>,
+    bandwidth_cap: AtomicU64,
     bandwidth_observed: AtomicU64,
 }
+
+/// Sentinel value used for `bandwidth_cap` to mean "no cap".
+const BANDWIDTH_CAP_NONE: u64 = u64::MAX;
 
 impl SyncControl {
     #[must_use]
     pub fn new(account: AccountId, boundary: Boundary, priority: watch::Sender<Priority>) -> Self {
+        let (checkpoint_tx, _rx) = watch::channel(CheckpointSnapshot {
+            generation: 0,
+            checkpoint: None,
+        });
         Self {
             inner: Arc::new(SyncControlInner {
                 account,
                 boundary,
-                boundary_recipient: Arc::new(Notify::new()),
-                last_checkpoint: tokio::sync::Mutex::new(None),
+                checkpoint_tx,
+                generation: AtomicU64::new(0),
                 priority,
-                bandwidth_cap: tokio::sync::Mutex::new(None),
+                bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
                 bandwidth_observed: AtomicU64::new(0),
             }),
         }
     }
 
     /// Engine-side hook: workers report the last persisted checkpoint
-    /// so `pause` / `checkpoint_now` can return it.
+    /// so `pause` / `checkpoint_now` can return it. Each call advances
+    /// the watch channel with the current generation; waiters parked
+    /// on `wait_for_checkpoint` see exactly the checkpoint produced
+    /// at or after their own generation.
     pub async fn record_checkpoint(&self, checkpoint: Checkpoint) {
-        let mut guard = self.inner.last_checkpoint.lock().await;
-        *guard = Some(checkpoint);
-        self.inner.boundary_recipient.notify_waiters();
+        let generation = self.inner.generation.load(Ordering::SeqCst);
+        let snapshot = CheckpointSnapshot {
+            generation,
+            checkpoint: Some(checkpoint),
+        };
+        // `send` errors only if every receiver has dropped; the
+        // sender side holds the canonical value so that is fine.
+        let _ = self.inner.checkpoint_tx.send(snapshot);
     }
 
     /// Engine-side hook: bandwidth meter feeds observed throughput.
@@ -62,10 +98,15 @@ impl SyncControl {
     }
 
     /// Read the configured cap (used by `bifrost-net` if the engine
-    /// chooses to forward it).
-    pub async fn bandwidth_cap_snapshot(&self) -> Option<u64> {
-        let guard = self.inner.bandwidth_cap.lock().await;
-        *guard
+    /// chooses to forward it). `None` when no cap is set.
+    #[must_use]
+    pub fn bandwidth_cap_snapshot(&self) -> Option<u64> {
+        let raw = self.inner.bandwidth_cap.load(Ordering::Relaxed);
+        if raw == BANDWIDTH_CAP_NONE {
+            None
+        } else {
+            Some(raw)
+        }
     }
 
     /// Account id this control governs. Exposed for tracing spans.
@@ -74,18 +115,32 @@ impl SyncControl {
         &self.inner.account
     }
 
-    async fn wait_for_checkpoint(&self) -> Result<Checkpoint, TypesError> {
-        // The boundary worker calls record_checkpoint after persisting.
-        // We park on the recipient Notify until that happens.
+    /// Block until a checkpoint at or after the given generation
+    /// arrives. The caller bumps `generation` itself before flipping
+    /// the boundary, so the wait observes only post-request
+    /// checkpoints.
+    async fn wait_for_checkpoint_at_or_after(
+        &self,
+        generation: u64,
+    ) -> Result<Checkpoint, TypesError> {
+        // Subscribe to a fresh receiver. The current value is the
+        // last recorded snapshot; if it already matches the
+        // generation we return immediately.
+        let mut rx = self.inner.checkpoint_tx.subscribe();
         loop {
-            let notified = self.inner.boundary_recipient.notified();
             {
-                let guard = self.inner.last_checkpoint.lock().await;
-                if let Some(c) = guard.as_ref() {
-                    return Ok(c.clone());
+                let snap = rx.borrow();
+                if snap.generation >= generation
+                    && let Some(c) = snap.checkpoint.clone()
+                {
+                    return Ok(c);
                 }
             }
-            notified.await;
+            if rx.changed().await.is_err() {
+                return Err(TypesError::Other(
+                    "control: checkpoint watch channel closed".into(),
+                ));
+            }
         }
     }
 }
@@ -97,8 +152,12 @@ impl Control for SyncControl {
         Box<dyn std::future::Future<Output = Result<Checkpoint, TypesError>> + Send + '_>,
     > {
         Box::pin(async move {
+            // Bump the generation BEFORE flipping the boundary so
+            // `record_checkpoint` calls that race with us land in the
+            // new generation, not the old one.
+            let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
             self.inner.boundary.set(BoundaryRequest::Pause);
-            self.wait_for_checkpoint().await
+            self.wait_for_checkpoint_at_or_after(gen_id).await
         })
     }
 
@@ -108,8 +167,14 @@ impl Control for SyncControl {
         Box<dyn std::future::Future<Output = Result<Checkpoint, TypesError>> + Send + '_>,
     > {
         Box::pin(async move {
+            let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
             self.inner.boundary.set(BoundaryRequest::CheckpointNow);
-            self.wait_for_checkpoint().await
+            let cp = self.wait_for_checkpoint_at_or_after(gen_id).await?;
+            // `CheckpointNow` returns the boundary to `Run` after the
+            // flush; the worker observes the next batch's boundary
+            // peek and continues without waiting.
+            self.inner.boundary.set(BoundaryRequest::Run);
+            Ok(cp)
         })
     }
 
@@ -122,11 +187,8 @@ impl Control for SyncControl {
     }
 
     fn bandwidth_cap(&self, bps: Option<u64>) {
-        // Lock here is fine: bandwidth_cap is a control-plane knob,
-        // not on the hot path; the lock is uncontested.
-        if let Ok(mut g) = self.inner.bandwidth_cap.try_lock() {
-            *g = bps;
-        }
+        let stored = bps.unwrap_or(BANDWIDTH_CAP_NONE);
+        self.inner.bandwidth_cap.store(stored, Ordering::Relaxed);
     }
 
     fn bandwidth_observed(&self) -> u64 {

@@ -58,6 +58,37 @@ expiry budgets, push wiring); fixes were folded into
 four per-protocol plans in one coordinated pass before Phase 1
 launch.
 
+## Progress
+
+- **Phase 0** complete. Four per-protocol Account-impl plans
+  shipped; reviewer pass folded in.
+- **Phase 1** complete. `bifrost-types` and `bifrost-net`
+  skeletons landed; reviewer pass folded in. Trait surface
+  frozen for downstream consumers.
+- **Phase 2** partial:
+  - **P2-A5** (`bifrost-net` full impl): shipped. Real retry
+    loop with `Retry-After` honor, OAuth single-flight refresh,
+    per-host token-bucket rate limiter, sliding-window
+    bandwidth meter, `traceparent` injection. Reviewer pass
+    folded in. Current code state documented in
+    `reference/net.md`.
+  - **P2-A6** (`bifrost-sync` engine): shipped. Multiplexer,
+    backfill orchestrator, push reconciler, mutation pipeline,
+    cursor envelope versioning, `ArcSwap`-based reopen, bounded
+    lane queues, coalesce-on-overflow `InvalidationSink`,
+    `record_checkpoint` wired through every persistence path.
+    Reviewer pass folded in (architectural fixes after a first
+    agent shipped non-compiling code). Current code state
+    documented in `reference/sync.md`.
+  - **P2-A1..A4** (four protocol Account impls - JMAP, IMAP,
+    Gmail, Graph): not yet launched.
+- **Phase 3**: not yet launched.
+
+`brokkr check` passes workspace-wide. The four protocol crates
+still use their existing pre-Phase-2 shapes; the Phase 2
+`Account` trait impls land in `crates/{jmap,imap,gmail,graph}/`
+in Phase 2 wave 2.
+
 ## Phase 0 - Plan closure (4 agents, parallel)
 
 Write a per-protocol Account-impl plan for each crate. Each plan

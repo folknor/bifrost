@@ -9,17 +9,27 @@
 //!
 //! Concurrency caps are enforced by `budget::BudgetGate` (a layered
 //! `tokio::sync::Semaphore` pair: per-account and global).
+//!
+//! ## Scope status (v1)
+//!
+//! The scheduler and budget gate are CURRENTLY NOT WIRED into the
+//! engine's production work paths. Multiplexer, backfill, and
+//! mutation tasks acquire from `Account::*_stream` directly. The
+//! scheduler exists as infrastructure for a follow-up pass that
+//! threads every protocol call through `Scheduler::submit` and a
+//! `BudgetGate::acquire`. Until then the public re-exports of
+//! `Scheduler` / `BudgetGate` are intentionally absent from
+//! `bifrost-sync`'s lib.rs.
 
 pub mod budget;
 pub mod lanes;
 
 pub use budget::{BudgetGate, BudgetPermit, ConcurrencyBudget};
-pub use lanes::{LaneQueue, LaneSnapshot, WorkItem};
+pub use lanes::{LaneQueue, LaneSnapshot, WorkItem, WorkKind};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bifrost_types::Priority;
-use tokio::sync::Mutex;
 
 use crate::types::SchedulerConfig;
 
@@ -87,11 +97,12 @@ impl Scheduler {
     /// Strict-priority pull with starvation floor. Returns `None` if
     /// every lane is empty.
     ///
-    /// This is non-blocking; the worker decides whether to back off
-    /// or `yield_now` when the scheduler is empty. Workers normally
-    /// pair this with a notification source so they wake on `submit`.
-    pub async fn pull(&self) -> Option<WorkItem> {
-        let mut state = self.inner.state.lock().await;
+    /// This is non-blocking and synchronous; the worker decides
+    /// whether to back off or `yield_now` when the scheduler is
+    /// empty. Workers normally pair this with a notification source
+    /// so they wake on `submit`.
+    pub fn pull(&self) -> Option<WorkItem> {
+        let mut state = self.inner.state.lock().expect("poisoned");
         // If the starvation floor has been hit, take from the lowest
         // non-empty lane and reset.
         if state.higher_consecutive >= self.inner.starvation_floor {

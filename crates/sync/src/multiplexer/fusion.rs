@@ -30,6 +30,7 @@ use super::MultiplexerEvent;
 
 /// Outcome of an inventory fusion pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FusionOutcome {
     /// Inventory completed; the engine persisted the cursor.
     Established,

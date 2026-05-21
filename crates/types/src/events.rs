@@ -204,6 +204,10 @@ pub enum PushSource {
     GmailPubsub,
     GraphSubscription,
     EwsStreaming,
+    /// Engine-synthesized: the sink overflowed and the precise source
+    /// could not be preserved; the wake-up is a coalesced full
+    /// reconcile.
+    Coalesced,
 }
 
 /// Hint about which scope was touched. Engine treats `Unknown` and a

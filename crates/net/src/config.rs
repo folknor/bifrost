@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::auth::DEFAULT_TOKEN_MAX_AGE;
+
 /// Tunable parameters for the underlying reqwest client. Hidden behind
 /// an explicit config struct so future migrations off reqwest can
 /// remap fields without breaking the public surface.
@@ -29,6 +31,11 @@ pub struct NetConfig {
     /// Test-fixture escape hatch. Production callers must never set
     /// this true.
     pub dangerous_accept_invalid_certs: bool,
+    /// Proactive-refresh max-age for OAuth tokens that lack an
+    /// `expires_at` hint. The `OAuthRefresher` falls back to this
+    /// when the issuer did not surface a TTL. Defaults to 55 min;
+    /// typical OAuth access-token TTLs are 60 min.
+    pub token_max_age: Duration,
 }
 
 impl Default for NetConfig {
@@ -43,6 +50,7 @@ impl Default for NetConfig {
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             root_certs: Vec::new(),
             dangerous_accept_invalid_certs: false,
+            token_max_age: DEFAULT_TOKEN_MAX_AGE,
         }
     }
 }

@@ -269,13 +269,29 @@ pub(crate) async fn send_streaming_inner(
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
     let host = host_from_url(&url);
-    let cost_units = cost.unwrap_or(1);
+    // Cost precedence: explicit `RequestBuilder::cost(n)` wins;
+    // otherwise the registered host's `cost_default` wins; otherwise
+    // `1`. The host lookup is one mutex acquire on the governor, done
+    // once per request before the retry loop.
+    let cost_units = match cost {
+        Some(n) => n,
+        None => host
+            .as_deref()
+            .and_then(|h| account.net().governor().cost_default_for(h))
+            .unwrap_or(1),
+    };
 
     let mut attempt: u32 = 0;
     let mut retry_after_history: Vec<Duration> = Vec::new();
-    let mut refresh_attempted = false;
+    // Network retry budget is independent from the 401-recovery
+    // budget. A 401 forces a token refresh + retry that must not
+    // burn the network budget (otherwise a single stale cache hit
+    // halves the retries left for transient 5xx). Cap 401 retries at
+    // 1; the second 401 returns `Error::AuthLost`.
+    let mut auth_retries: u32 = 0;
+    const MAX_AUTH_RETRIES: u32 = 1;
 
-    loop {
+    'outer: loop {
         attempt = attempt.saturating_add(1);
         // Acquire a rate-limit slot. No-op if no host is configured.
         // Surfaces `Error::CostExceedsBurst` if the caller asked for
@@ -288,18 +304,25 @@ pub(crate) async fn send_streaming_inner(
 
         // Mint a fresh `Authorization` from the token source. The
         // token source itself handles single-flight refresh.
+        //
+        // Error classification: `auth.rs::arc_err_to_error` already
+        // sorts the underlying failure into the right typed variant -
+        // `AuthLost` for terminal auth failures (revoked refresh
+        // token, 401/403 from the token endpoint), `RefreshFailed`
+        // wrapping a transient `Network`/`Timeout` for everything
+        // else. We pass the variant through unchanged so callers can
+        // pattern-match for retry-vs-give-up decisions; collapsing
+        // every variant into `AuthLost` would discard that signal.
         let token = match account.token_source().current().await {
             Ok(t) => t,
-            Err(_e) => {
-                // Couldn't get a token. Surface as AuthLost; the
-                // underlying error chain is not propagated because
-                // the public `Error::AuthLost` does not carry a
-                // source. Refund the rate-limit slot since the
-                // request never reached the wire.
+            Err(e) => {
+                // The request never reached the wire; refund the
+                // rate-limit slot so neighbours aren't starved by a
+                // bookkeeping leak.
                 if let Some(ref h) = host {
                     account.net().governor().refund(h, cost_units);
                 }
-                return Err(Error::AuthLost);
+                return Err(e);
             }
         };
 
@@ -364,13 +387,17 @@ pub(crate) async fn send_streaming_inner(
         // AuthLost rather than `Error::Status { code: 401 }` so the
         // protocol crate can map straight to the terminal-auth
         // recovery class. We also refund the rate-limit slot so the
-        // retry does not double-debit the host bucket.
+        // retry does not double-debit the host bucket. The auth
+        // retry budget (`auth_retries`) is separate from the network
+        // retry budget (`attempt`): the retry loop's top
+        // `attempt = attempt + 1` increment is undone here so a 401
+        // recovery does not eat into the network attempts left.
         if status == StatusCode::UNAUTHORIZED {
-            if refresh_attempted {
+            if auth_retries >= MAX_AUTH_RETRIES {
                 drop(response);
                 return Err(Error::AuthLost);
             }
-            refresh_attempted = true;
+            auth_retries = auth_retries.saturating_add(1);
             drop(response);
             if let Some(ref h) = host {
                 account.net().governor().refund(h, cost_units);
@@ -378,12 +405,26 @@ pub(crate) async fn send_streaming_inner(
             if account.token_source().refresh().await.is_err() {
                 return Err(Error::AuthLost);
             }
-            // Don't bill the retry against the network retry budget;
-            // 401 is its own one-shot recovery path.
-            continue;
+            // Undo the top-of-loop network-budget increment: 401 is
+            // its own one-shot recovery path tracked by
+            // `auth_retries`. `continue 'outer` re-enters the loop;
+            // the next `attempt = attempt + 1` brings us back to the
+            // pre-401 attempt count.
+            attempt = attempt.saturating_sub(1);
+            continue 'outer;
         }
 
         // 2xx and 3xx: return.
+        //
+        // 3xx note: reqwest's default `RedirectPolicy` follows up to
+        // 10 hops, so a 3xx surfacing here means either the policy
+        // was disabled by the caller, the chain exceeded the
+        // 10-redirect limit, or the server returned a 3xx that
+        // reqwest considers terminal (e.g. 304 Not Modified). We
+        // pass it through to the caller because conditional-request
+        // flows (`If-None-Match` -> 304) rely on the headers being
+        // exposed. Callers that do not handle 3xx can downgrade to
+        // `Error::Status` themselves.
         if status.is_success() || status.is_redirection() {
             let headers_out = response.headers().clone();
             let stream = into_byte_stream(response);
@@ -416,6 +457,16 @@ pub(crate) async fn send_streaming_inner(
         // not remove specific codes.
         if policy.statuses.contains(&status) || status.is_server_error() {
             if attempt >= policy.max_attempts {
+                // Parse the final attempt's `Retry-After` and push it
+                // into the history before we surface the error. The
+                // previous code skipped the parse on exhaustion, so
+                // callers lost the server's last hint - the exact
+                // case where a planner wants to back off the longest.
+                let final_retry_after = parse_retry_after(response.headers().get(RETRY_AFTER))
+                    .map(|d| d.min(policy.honor_retry_after_cap));
+                if let Some(ra) = final_retry_after {
+                    retry_after_history.push(ra);
+                }
                 // Drop the response body so the connection can return
                 // to the pool. The body content is not surfaced in
                 // either `RateLimited` or `RetryBudgetExhausted`.
@@ -518,21 +569,37 @@ fn host_from_url(url: &str) -> Option<String> {
 /// capped at `policy.max_backoff`. Decorrelated jitter (half-to-full
 /// of the base) prevents thundering-herd retries from one shared
 /// outage.
+///
+/// Jitter is **proportional** to the capped backoff rather than a
+/// fixed 0..1 s window. With a short `initial_backoff` (e.g. 10 ms),
+/// a fixed-ms jitter would dominate by two orders of magnitude and
+/// make the backoff effectively a random-1-second sleep. By taking
+/// jitter from `0..capped`, the wait stays in the spirit of the
+/// policy: half-base plus up-to-full-base.
 fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
     let base = policy.initial_backoff;
     let exp = attempt.saturating_sub(1).min(16);
     let scaled = base.saturating_mul(2u32.saturating_pow(exp));
     let capped = scaled.min(policy.max_backoff);
-    // Cheap deterministic-ish jitter from the current time's nanos.
-    // Not a CSPRNG; the goal is decorrelation, not unguessability.
-    let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.subsec_nanos(),
-        Err(_) => 0,
-    };
+    // Cheap deterministic-ish jitter from the current monotonic
+    // clock's nanos. Not a CSPRNG; the goal is decorrelation, not
+    // unguessability. `Instant::elapsed` since process start avoids
+    // clock-jumps and `SystemTime::now` (which can go backwards).
+    let nanos = process_start_elapsed_ns();
+    let capped_ns = u128::from(u64::try_from(capped.as_nanos()).unwrap_or(u64::MAX)).max(1);
+    let jitter_ns = u64::try_from(nanos % capped_ns).unwrap_or(0);
     let half = capped / 2;
-    let jitter_ms = u64::from(nanos % 1000);
-    let jitter = Duration::from_millis(jitter_ms);
+    let jitter = Duration::from_nanos(jitter_ns);
     half.saturating_add(jitter).min(policy.max_backoff)
+}
+
+/// Nanoseconds elapsed since process start. Used by `backoff_for` as
+/// a cheap, monotonic, non-CSPRNG jitter source.
+fn process_start_elapsed_ns() -> u128 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos()
 }
 
 /// Parse a `Retry-After` header. Either delta-seconds (an integer) or

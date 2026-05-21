@@ -56,9 +56,9 @@ async fn foreground_preempts_background() {
         20,
     );
 
-    let first = scheduler.pull().await.expect("first item");
+    let first = scheduler.pull().expect("first item");
     assert_eq!(first.priority, Priority::Foreground);
-    let second = scheduler.pull().await.expect("second item");
+    let second = scheduler.pull().expect("second item");
     assert_eq!(second.priority, Priority::Background);
 }
 
@@ -84,7 +84,7 @@ async fn strict_priority_walks_lanes_in_order() {
     );
 
     let mut order = Vec::new();
-    while let Some(item) = scheduler.pull().await {
+    while let Some(item) = scheduler.pull() {
         order.push(item.priority);
     }
 
@@ -126,7 +126,7 @@ async fn starvation_floor_diverts_to_lower_lane_after_n_pulls() {
 
     let mut saw_background_at: Option<u32> = None;
     let mut step: u32 = 0;
-    while let Some(item) = scheduler.pull().await {
+    while let Some(item) = scheduler.pull() {
         if item.priority == Priority::Background && saw_background_at.is_none() {
             saw_background_at = Some(step);
         }
@@ -145,7 +145,7 @@ async fn starvation_floor_diverts_to_lower_lane_after_n_pulls() {
 #[tokio::test]
 async fn empty_scheduler_pulls_none() {
     let scheduler = make_scheduler(64);
-    assert!(scheduler.pull().await.is_none());
+    assert!(scheduler.pull().is_none());
 }
 
 #[tokio::test]
@@ -156,8 +156,8 @@ async fn account_isolation_does_not_reorder_lanes() {
     submit(&scheduler, "a", Priority::Normal, Arc::clone(&marker), 1);
     submit(&scheduler, "b", Priority::Normal, Arc::clone(&marker), 2);
 
-    let first = scheduler.pull().await.expect("first");
-    let second = scheduler.pull().await.expect("second");
+    let first = scheduler.pull().expect("first");
+    let second = scheduler.pull().expect("second");
     assert_eq!(first.account, AccountId("a".into()));
     assert_eq!(second.account, AccountId("b".into()));
 }

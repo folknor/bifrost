@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 bifrost-types = { path = "../types" }
+bifrost-net = { path = "../net" }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
 tokio-util = { workspace = true, features = ["rt"] }
 futures = { workspace = true }

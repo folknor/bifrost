@@ -39,6 +39,7 @@ pub struct BackfillRegistry {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum BackfillState {
     Pending,
     Running,

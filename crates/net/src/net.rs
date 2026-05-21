@@ -6,7 +6,9 @@
 //! and bandwidth metering can coordinate across accounts that share a
 //! host.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -44,6 +46,12 @@ pub(crate) struct NetInner {
     pub(crate) governor: RateLimitGovernor,
     /// Bandwidth meter, partitioned per account.
     pub(crate) meter: BandwidthMeter,
+    /// Hosts each registered account asked the governor to track.
+    /// Indexed by `AccountId` and populated at `attach_account`;
+    /// `detach_account` decrements the governor's per-host attach
+    /// count using this list so unused buckets drop to zero and the
+    /// map does not grow without bound across attach/detach cycles.
+    pub(crate) account_hosts: Mutex<HashMap<AccountId, Vec<String>>>,
 }
 
 impl Net {
@@ -103,6 +111,7 @@ impl Net {
                 client,
                 governor: RateLimitGovernor::new(),
                 meter: BandwidthMeter::new(),
+                account_hosts: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -115,8 +124,23 @@ impl Net {
         // any request lands. Rate-limit registration walks the host
         // list the caller supplied.
         self.inner.meter.register_account(id.clone());
+        let mut registered_hosts = Vec::with_capacity(spec.hosts.len());
         for limit in &spec.hosts {
+            registered_hosts.push(limit.host.clone());
             self.inner.governor.register(limit.clone());
+        }
+        // Remember which hosts this account registered so
+        // `detach_account` can unregister symmetrically. Multiple
+        // attach calls for the same account would overwrite an
+        // earlier entry; callers should not attach twice without
+        // detaching first.
+        {
+            let mut map = self
+                .inner
+                .account_hosts
+                .lock()
+                .expect("net account_hosts lock poisoned");
+            map.insert(id.clone(), registered_hosts);
         }
         AccountNet {
             inner: Arc::new(AccountNetInner {
@@ -132,17 +156,29 @@ impl Net {
 
     /// Drop the per-account state.
     ///
-    /// Idempotent for the bandwidth meter. **Asymmetric** with
-    /// `attach_account` for the rate-limit governor: governor buckets
-    /// are keyed by host string and shared across every account on
-    /// that host (e.g. five Gmail accounts all share the
-    /// `gmail.googleapis.com` bucket). Naively unregistering the host
-    /// would yank the bucket out from under other accounts, so the
-    /// skeleton leaks host buckets for the life of the process.
-    /// Phase 2 may refcount per-host registrations and drop on zero;
-    /// for now the asymmetry is by design.
+    /// Symmetric with `attach_account` for both the bandwidth meter
+    /// and the rate-limit governor. Each `attach_account` increments
+    /// the governor's per-host attach count for every host the
+    /// caller registered; `detach_account` decrements those same
+    /// counts, dropping the host bucket only when no other account
+    /// still depends on it. Five Gmail accounts sharing the
+    /// `gmail.googleapis.com` host all bump the same count to 5;
+    /// detaching one drops the count to 4 and the bucket survives.
+    /// Detaching the last account drops the count to 0 and the
+    /// bucket is reclaimed.
     pub fn detach_account(&self, id: &AccountId) {
         self.inner.meter.forget_account(id);
+        let hosts = {
+            let mut map = self
+                .inner
+                .account_hosts
+                .lock()
+                .expect("net account_hosts lock poisoned");
+            map.remove(id).unwrap_or_default()
+        };
+        for host in hosts {
+            self.inner.governor.unregister(&host);
+        }
     }
 
     /// Process-wide bandwidth meter handle. Per-account readings go
@@ -254,14 +290,37 @@ impl AccountNet {
     /// byte window, so we reject it with `Error::RangeNotHonored`
     /// before yielding any chunk. When no `Range` was requested we
     /// accept `200 OK` as before.
+    ///
+    /// A `range` with `length = Some(0)` is degenerate: the caller
+    /// asked for zero bytes. Rather than emit `bytes=N-N` (one byte)
+    /// or `bytes=N-(N-1)` (RFC-invalid), we short-circuit before
+    /// touching the network and return an empty `ByteStream`. The
+    /// bandwidth meter and rate-limit governor are not touched for a
+    /// zero-byte read.
     pub async fn download_stream(
         &self,
         url: &str,
         range: Option<ByteRange>,
     ) -> Result<ByteStream, Error> {
+        // Short-circuit zero-length: no network round-trip, empty
+        // stream. Avoids the degenerate `bytes=N-N` encoding (one
+        // byte) and the RFC-9110-invalid `bytes=N-(N-1)` form.
+        if matches!(
+            range,
+            Some(ByteRange {
+                length: Some(0),
+                ..
+            })
+        ) {
+            let empty = futures::stream::empty::<Result<bytes::Bytes, Error>>();
+            return Ok(Box::pin(empty));
+        }
         // Build the request: GET with optional Range header, going
         // through the full retry/rate-limit/traceparent stack.
-        let want_range = range.map(encode_range);
+        let want_range = match range {
+            Some(r) => Some(encode_range(r)?),
+            None => None,
+        };
         let mut builder = self.get(url);
         if let Some(ref r) = want_range {
             builder = builder.header(RANGE.as_str(), r);
@@ -317,11 +376,34 @@ impl AccountNet {
             .account(self.inner.account.clone())
     }
 
-    /// Set a per-account bandwidth cap in bytes per second. `None`
-    /// disables the cap. Single atomic store; safe to call from any
-    /// task without taking a lock.
+    /// Set a per-account bandwidth cap in bytes per second.
+    ///
+    /// `None` disables the cap. `Some(0)` is **not** a sentinel for
+    /// "unlimited" (that's `None`'s job) and not a sentinel for
+    /// "block everything" (the throttle is a smoothing layer; we
+    /// never park a stream forever on a caller mistake). It would
+    /// otherwise collide with the previous behaviour where the
+    /// `ByteBucket::consume` early-return treated 0 as no-cap, which
+    /// silently undid the cap. We normalise to `Some(1)` (one byte
+    /// per second, a trickle) and emit a `tracing::warn!` so a
+    /// caller misconfiguration is visible without crashing the
+    /// stream.
+    ///
+    /// Single atomic store after the normalisation; safe to call
+    /// from any task without taking a lock.
     pub fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        let raw = bps.unwrap_or(BANDWIDTH_CAP_NONE);
+        let raw = match bps {
+            None => BANDWIDTH_CAP_NONE,
+            Some(0) => {
+                tracing::warn!(
+                    target: "bifrost_net::bandwidth",
+                    account = ?self.inner.account,
+                    "set_bandwidth_cap(Some(0)) clamped to 1 B/s; use None for unlimited",
+                );
+                1
+            }
+            Some(n) => n,
+        };
         self.inner.bandwidth_cap.store(raw, Ordering::Relaxed);
     }
 
@@ -399,18 +481,43 @@ pub struct AccountSpec {
 ///
 /// `length = None` means "from start to the end of the resource",
 /// which is the RFC 9110 `bytes=N-` open-ended form. `length = Some(n)`
-/// means `bytes=start-(start+n-1)` inclusive. A zero-length range is
-/// degenerate; we emit `bytes=start-start` (a one-byte range), which
-/// is the closest valid encoding and avoids the negative-length
-/// `bytes=start-(start-1)` form that RFC 9110 would reject. Callers
-/// should not request a zero-length range in the first place.
-pub(crate) fn encode_range(range: ByteRange) -> String {
+/// means `bytes=start-(start+n-1)` inclusive.
+///
+/// A `length = Some(0)` request is rejected upstream by
+/// `AccountNet::download_stream`; the encoder treats `Some(0)` as a
+/// programmer error and returns `Error::RangeNotHonored` (the closest
+/// existing variant; no separate `RangeInvalid` because callers map
+/// both to the same recovery class).
+///
+/// `start + length` is checked for `u64` overflow. Previously the
+/// saturating math would silently emit `bytes=start-u64::MAX`, which
+/// servers either reject or fulfil with the full tail of the resource
+/// (silent semantics drift). We surface
+/// `Error::RangeNotHonored { message: "range overflow" }` instead so
+/// callers see the configuration bug immediately.
+// `Error` is intentionally wide (Bytes + HeaderMap), so a Result-wrapping
+// constructor trips `result_large_err`. The alternative (boxing) would
+// force a `Box<Error>` through every caller's error chain; ranges are an
+// uncommon path and the wide Err is a workspace-consistent tradeoff.
+#[allow(clippy::result_large_err)]
+pub(crate) fn encode_range(range: ByteRange) -> Result<String, Error> {
     match range.length {
-        None => format!("bytes={}-", range.start),
-        Some(0) => format!("bytes={}-{}", range.start, range.start),
+        None => Ok(format!("bytes={}-", range.start)),
+        Some(0) => Err(Error::RangeNotHonored {
+            message: "zero-length range".to_owned(),
+        }),
         Some(n) => {
-            let end = range.start.saturating_add(n).saturating_sub(1);
-            format!("bytes={}-{}", range.start, end)
+            let Some(end_plus_one) = range.start.checked_add(n) else {
+                return Err(Error::RangeNotHonored {
+                    message: format!(
+                        "range overflow: start {} + length {n} exceeds u64::MAX",
+                        range.start,
+                    ),
+                });
+            };
+            // `end_plus_one >= 1` because `n > 0` here.
+            let end = end_plus_one - 1;
+            Ok(format!("bytes={}-{}", range.start, end))
         }
     }
 }
@@ -418,9 +525,21 @@ pub(crate) fn encode_range(range: ByteRange) -> String {
 /// Compare a `Range` request header against the corresponding
 /// `Content-Range` response header. Server format is
 /// `bytes <first>-<last>/<total>` or `bytes <first>-<last>/*`.
-/// Returns `true` if `first` matches the request's first byte and
-/// `last` either matches the request's last byte (closed range) or
-/// is the resource's penultimate byte (open-ended `bytes=N-`).
+/// Returns `true` if:
+///
+/// - Closed request (`bytes=N-M`): the response's first/last match
+///   the request's first/last exactly.
+/// - Open-ended request (`bytes=N-`): the response's first matches
+///   the request's first AND, when the total is known
+///   (`/<total>`), the response's last equals `total - 1` (i.e.
+///   covers bytes N through the end of the resource). When the
+///   server returns `/*` (total unknown) we accept any last >= N
+///   because we cannot verify the tail.
+///
+/// The previous open-ended check accepted any response end >= start,
+/// which permitted truncated bodies (e.g. server returns `bytes
+/// 0-9/100` to `bytes=0-` and the caller assembled a 10-byte slice
+/// believing it had the full resource).
 fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
     // Parse `bytes=START-END?` from the request side.
     let Some(req_rest) = req_range.strip_prefix("bytes=") else {
@@ -443,7 +562,7 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
     let Some(resp_rest) = resp_range.strip_prefix("bytes ") else {
         return false;
     };
-    let Some((range_part, _total_part)) = resp_rest.split_once('/') else {
+    let Some((range_part, total_part)) = resp_rest.split_once('/') else {
         return false;
     };
     let Some((resp_start, resp_end)) = range_part.split_once('-') else {
@@ -459,11 +578,24 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
     if resp_start_n != req_start_n {
         return false;
     }
+    let total_trim = total_part.trim();
+    let total_known: Option<u64> = if total_trim == "*" {
+        None
+    } else {
+        match total_trim.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => return false,
+        }
+    };
     match req_end_n {
         Some(end) => resp_end_n == end,
-        // Open-ended request: any end the server picks is acceptable
-        // as long as it's >= start.
-        None => resp_end_n >= req_start_n,
+        // Open-ended request: must cover the full tail of the
+        // resource when the total is known. With total unknown
+        // (`*`), we cannot verify and accept any end >= start.
+        None => match total_known {
+            Some(total) => total > 0 && resp_end_n == total - 1,
+            None => resp_end_n >= req_start_n,
+        },
     }
 }
 
@@ -527,8 +659,11 @@ impl ByteBucket {
 
     /// Block until `n` bytes can be debited. `cap` is read at call
     /// time so the engine can hot-swap the bandwidth cap mid-stream.
-    /// A cap of `Some(0)` is treated as no-cap to avoid divide-by-zero
-    /// on the deficit calculation.
+    /// A cap of `Some(0)` cannot occur here because
+    /// `AccountNet::set_bandwidth_cap` normalises `Some(0)` to
+    /// `Some(1)` to avoid sentinel collision with `None` semantics;
+    /// the early return guards against a hand-rolled call site that
+    /// stores 0 anyway.
     ///
     /// When a single chunk is larger than the per-second cap, the
     /// bucket can never accumulate enough tokens for the steady-state
@@ -546,8 +681,17 @@ impl ByteBucket {
         let cap_f = cap as f64;
         let want = n as f64;
         // Oversized-chunk path: pay the proportional throttle and
-        // continue. We zero the bucket so the next chunk pays from
-        // scratch rather than benefiting from a stale token count.
+        // continue. We zero the bucket and reset `last_refill` to
+        // `now`. Side effect: the *next* normal-sized chunk starts
+        // from an empty bucket and has to wait one refill cycle even
+        // if real time has moved on - it will not benefit from the
+        // elapsed-since-last-refill credit. This is intentional: an
+        // oversized chunk already paid the proportional throttle, so
+        // crediting the elapsed time again would double-spend the
+        // throttle window. Callers that stream a steady mix of large
+        // and small chunks may see the small chunks throttled a hair
+        // more than the average rate suggests; the cap is a smoothing
+        // throttle, not a precision shaper.
         if n > cap {
             let secs = (want / cap_f).min(60.0);
             tokio::time::sleep(Duration::from_secs_f64(secs)).await;

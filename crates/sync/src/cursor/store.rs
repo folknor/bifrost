@@ -52,11 +52,34 @@ pub trait CheckpointStore: Send + Sync {
     /// Read the latest backfill checkpoint for `(account, scope)`.
     /// Returns the one with the most recent `items_done` if the store
     /// has more than one partition's worth of state.
+    ///
+    /// The default `InMemoryCheckpointStore` implementation scans
+    /// every backfill entry per call (O(n) on total partitions per
+    /// account). Production backends backing onto a real store
+    /// should maintain a per-`(account, scope)` "latest" index for
+    /// constant-time reads; the trait does not require it because
+    /// the engine calls `get_backfill` infrequently (resume path,
+    /// observability), not on the hot path.
     fn get_backfill<'a>(
         &'a self,
         account: &'a AccountId,
         scope: &'a CursorScope,
     ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
+
+    /// Drop the change cursor for `(account, scope)`. Used by the
+    /// engine's `RecoveryClass::RestartScope` recovery path so the
+    /// next attach / poll re-establishes via inventory. Default
+    /// implementation writes through a no-op via `put_change_cursor`
+    /// is wrong; implementors should remove the entry. The default
+    /// here returns Ok so existing third-party stores compile without
+    /// breaking changes - they should override.
+    fn delete_change_cursor<'a>(
+        &'a self,
+        _account: &'a AccountId,
+        _scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Engine-side erased handle type. The slot holds `Arc<dyn
@@ -158,6 +181,20 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 }
             }
             Ok(latest)
+        })
+    }
+
+    fn delete_change_cursor<'a>(
+        &'a self,
+        account: &'a AccountId,
+        scope: &'a CursorScope,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+        let account = account.clone();
+        let scope = scope.clone();
+        Box::pin(async move {
+            let mut guard = self.inner.lock().expect("poisoned");
+            guard.change.remove(&(account, scope));
+            Ok(())
         })
     }
 }

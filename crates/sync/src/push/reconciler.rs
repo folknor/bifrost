@@ -16,19 +16,18 @@ use arc_swap::ArcSwap;
 use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::DynCheckpointStore;
 use crate::error::{Error, Warning};
-use crate::multiplexer::{ChangesEvent, MultiplexerEvent, drive_changes_stream};
+use crate::multiplexer::{AckRequest, ChangesEvent, MultiplexerEvent, drive_changes_stream};
 
 pub struct Reconciler {
     pub account_id: AccountId,
     pub account: Arc<ArcSwap<Arc<dyn Account>>>,
     pub cursors: Arc<CursorRegistry>,
-    pub store: Arc<DynCheckpointStore>,
     pub changes_tx: broadcast::Sender<MultiplexerEvent>,
     pub boundary: BoundaryView,
     pub shutdown: CancellationToken,
     pub control: SyncControl,
+    pub ack_tx: Option<mpsc::Sender<AckRequest>>,
 }
 
 impl Reconciler {
@@ -91,16 +90,19 @@ impl Reconciler {
                 scope.clone(),
                 cursor,
                 Arc::clone(&self.cursors),
-                Arc::clone(&self.store),
                 self.account_id.clone(),
                 self.changes_tx.clone(),
                 self.boundary.clone(),
                 Some(self.control.clone()),
+                self.ack_tx.clone(),
             )
             .await?;
             match outcome {
-                ChangesEvent::Advanced | ChangesEvent::Done | ChangesEvent::Stopped => {}
-                ChangesEvent::Fatal => {
+                ChangesEvent::Advanced
+                | ChangesEvent::Done
+                | ChangesEvent::Stopped
+                | ChangesEvent::Paused => {}
+                ChangesEvent::Fatal(_recovery) => {
                     // Fatal already propagated through the broadcast
                     // by the driver; bail out so the slot's restart
                     // logic can take over.

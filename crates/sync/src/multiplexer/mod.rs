@@ -20,12 +20,13 @@ pub mod poll;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountId, ChangeCursor, Checkpoint, CursorScope, RecoveryClass, ScopeLifecycle,
-    SyncEvent, WatchEvent,
+    Account, AccountId, ChangeCursor, Checkpoint, CursorScope, MembershipScope, RecoveryClass,
+    ScopeLifecycle, SyncEvent, WatchEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, mpsc};
@@ -34,11 +35,10 @@ use tokio_util::sync::CancellationToken;
 use crate::cancel::BoundaryView;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::DynCheckpointStore;
 use crate::error::Error;
 use crate::types::MultiplexerConfig;
 
-pub use changes::{ChangesEvent, drive_changes_stream};
+pub use changes::{AckRequest, ChangesEvent, drive_changes_stream};
 pub use fusion::{FusionOutcome, InventoryFusion};
 pub use idle::{IdleHolder, IdleSignal};
 pub use poll::{AdaptiveCadence, PollSchedule};
@@ -66,17 +66,29 @@ pub struct MultiplexerEvent {
     pub checkpoint: Option<Checkpoint>,
 }
 
-/// Reopen request the multiplexer can raise when it observes a
-/// `RecoveryClass::RestartAccount` or `CapabilityChanged` Fatal. The
-/// engine listens on the receiver and calls its reopen path.
+/// Reopen request raised by per-scope drivers when a stream ends with
+/// a recoverable Fatal. The engine listens on the receiver and
+/// dispatches the recovery action carried in `RecoveryClass`.
+///
+/// The full `RecoveryClass` is preserved so the engine can:
+/// - `Retry { after }`: sleep then re-poll the same scope.
+/// - `RestartScope` / `DowngradeCapabilityForScope`: drop the scope's
+///   cursor and re-establish via inventory.
+/// - `RestartAccount` / `CapabilityChanged`: `factory.open()` + reseed
+///   the slot's `ArcSwap`.
+/// - `AuthLost` / `Fatal` / `OperatorOverrideRequired`: surface; do
+///   not auto-reopen.
+/// - `DowngradeStrategy` / `SchemaIncompatible`: surface (engine has
+///   no automated path; the protocol crate is expected to apply the
+///   downgrade on the next `establish_initial_cursor`).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReopenRequest {
-    /// Account-wide reopen: factory.open and restart every scope.
-    Account,
-    /// Single-scope restart: drop the cursor and re-establish via
-    /// inventory.
-    Scope(CursorScope),
+    /// Recovery class observed at the scope's stream terminus.
+    Recovery {
+        scope: CursorScope,
+        recovery: RecoveryClass,
+    },
 }
 
 /// Multiplexer task state. Constructed in `engine::attach` and run on
@@ -85,7 +97,6 @@ pub struct Multiplexer {
     pub account_id: AccountId,
     pub account: Arc<ArcSwap<Arc<dyn Account>>>,
     pub cursors: Arc<CursorRegistry>,
-    pub store: Arc<DynCheckpointStore>,
     pub config: MultiplexerConfig,
     pub boundary: BoundaryView,
     pub changes_tx: broadcast::Sender<MultiplexerEvent>,
@@ -93,7 +104,11 @@ pub struct Multiplexer {
     pub control: SyncControl,
     pub shutdown: CancellationToken,
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    pub ack_tx: Option<mpsc::Sender<AckRequest>>,
     pub poll: HashMap<CursorScope, AdaptiveCadence>,
+    /// Per-scope cancellation tokens keyed by membership-id so
+    /// `ScopeLifecycle::Deleted` can stop the matching poll task.
+    pub scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
 }
 
 impl Multiplexer {
@@ -135,15 +150,15 @@ impl Multiplexer {
     ///
     /// Spawns per-scope poll tasks (each driving
     /// `changes_stream(cursor)` with adaptive cadence) and a single
-    /// `scope_lifecycle_stream` task. New scopes added at runtime via
-    /// `add_scope` get their own poll task; deleted scopes have their
-    /// poll task signaled via the shared shutdown token (best-effort).
+    /// `scope_lifecycle_stream` task. New scopes added at runtime get
+    /// their own poll task via `ScopeLifecycle::Created`; deleted
+    /// scopes have their per-scope cancellation token tripped and the
+    /// cursor entry dropped from the registry.
     pub async fn run(self) {
         let Self {
             account_id,
             account,
             cursors,
-            store,
             config,
             boundary,
             changes_tx,
@@ -151,39 +166,40 @@ impl Multiplexer {
             control,
             shutdown,
             reopen_tx,
+            ack_tx,
             poll: _,
+            scope_tokens,
         } = self;
 
         // Snapshot the known scopes from the registry; the engine has
         // populated it via `establish_one` before spawning us.
         let initial_scopes = cursors.all_scopes();
-        let mut scope_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
         for scope in initial_scopes {
-            let h = spawn_scope_poll(
+            spawn_and_track_scope_poll(
                 account_id.clone(),
                 Arc::clone(&account),
                 Arc::clone(&cursors),
-                Arc::clone(&store),
                 config,
                 boundary.clone(),
                 changes_tx.clone(),
                 control.clone(),
                 shutdown.clone(),
                 reopen_tx.clone(),
+                ack_tx.clone(),
+                Arc::clone(&scope_tokens),
                 scope,
             );
-            scope_handles.push(h);
         }
 
-        // Drive scope_lifecycle in the background. Per the trait it's
-        // a long-lived stream; we forward observed events through the
-        // broadcast as informational ScopeChange events. Renames /
-        // deletions also adjust the registry side-index implicitly
-        // (consumers re-derive membership; we keep the simple path
-        // here).
+        // Drive scope_lifecycle in the background. `Created` spawns a
+        // new poll task; `Deleted` cancels and drops the matching
+        // scope; `Renamed` is delete+create on a fresh CursorScope id.
         let lifecycle_account = Arc::clone(&account);
         let lifecycle_shutdown = shutdown.clone();
+        let lifecycle_cursors = Arc::clone(&cursors);
+        let lifecycle_tokens = Arc::clone(&scope_tokens);
+        let lifecycle_reopen = reopen_tx.clone();
         let lifecycle_handle = tokio::spawn(async move {
             let acc = lifecycle_account.load_full();
             let mut stream = acc.scope_lifecycle_stream();
@@ -192,20 +208,62 @@ impl Multiplexer {
                     () = lifecycle_shutdown.cancelled() => return,
                     next = stream.next() => {
                         let Some(ev) = next else { return; };
-                        // Lifecycle events are surfaced as tracing
-                        // events for now; downstream consumers
-                        // consume the unified change broadcast.
-                        // Forwarding lifecycle into the broadcast as
-                        // typed events is the engine's contract once
-                        // the consumer wire-up lands; until then we
-                        // observe.
-                        tracing::debug!(
-                            target: "bifrost.sync.changes",
-                            event = ?ev,
-                            "scope lifecycle"
-                        );
-                        // Suppress unused warning.
-                        let _: ScopeLifecycle = ev;
+                        match ev {
+                            ScopeLifecycle::Created(membership) => {
+                                if let Some(scope) = membership_to_cursor_scope(&membership) {
+                                    // Track the new scope. The cursor
+                                    // registry has no entry yet; the
+                                    // poll task will see snapshot=None
+                                    // and exit cleanly unless the
+                                    // engine establishes a cursor for
+                                    // it first. We raise a Recovery
+                                    // request so the engine drives the
+                                    // initial cursor establishment.
+                                    let _ = lifecycle_reopen
+                                        .send(ReopenRequest::Recovery {
+                                            scope: scope.clone(),
+                                            recovery: RecoveryClass::RestartScope(scope.clone()),
+                                        })
+                                        .await;
+                                }
+                            }
+                            ScopeLifecycle::Deleted(membership) => {
+                                let scopes = lifecycle_cursors.scopes_for_membership(&membership);
+                                for scope in scopes {
+                                    if let Some(token) =
+                                        lifecycle_tokens.lock().expect("poisoned").remove(&scope)
+                                    {
+                                        token.cancel();
+                                    }
+                                    lifecycle_cursors.delete(&scope);
+                                }
+                            }
+                            ScopeLifecycle::Renamed { old, new } => {
+                                // Treat as delete + create: cancel the
+                                // old scope's poll task, drop the
+                                // cursor, then trigger a fresh
+                                // establishment for the new id.
+                                let old_scopes =
+                                    lifecycle_cursors.scopes_for_membership(&old);
+                                for scope in old_scopes {
+                                    if let Some(token) =
+                                        lifecycle_tokens.lock().expect("poisoned").remove(&scope)
+                                    {
+                                        token.cancel();
+                                    }
+                                    lifecycle_cursors.delete(&scope);
+                                }
+                                if let Some(scope) = membership_to_cursor_scope(&new) {
+                                    let _ = lifecycle_reopen
+                                        .send(ReopenRequest::Recovery {
+                                            scope: scope.clone(),
+                                            recovery: RecoveryClass::RestartScope(scope.clone()),
+                                        })
+                                        .await;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -214,8 +272,14 @@ impl Multiplexer {
         // Park until shutdown; the per-scope tasks own their own loops.
         shutdown.cancelled().await;
 
-        for h in scope_handles {
-            h.abort();
+        // Cancel every tracked scope token so per-scope polls exit
+        // cleanly. Tokens are dropped as part of the map clear.
+        let drained: Vec<CancellationToken> = {
+            let mut g = scope_tokens.lock().expect("poisoned");
+            g.drain().map(|(_, t)| t).collect()
+        };
+        for token in drained {
+            token.cancel();
         }
         lifecycle_handle.abort();
     }
@@ -251,84 +315,134 @@ impl Multiplexer {
     }
 }
 
-/// Spawn one polling task for a single scope. The task loops, driving
-/// `changes_stream(cursor)` and sleeping for the scope's adaptive
-/// cadence between passes. Stream-end recovery actions (RestartScope,
-/// RestartAccount, CapabilityChanged) raise a `ReopenRequest` to the
-/// engine.
+/// Spawn one polling task for a single scope and track its
+/// cancellation token in `scope_tokens` so lifecycle events can stop
+/// it later.
 #[allow(clippy::too_many_arguments)]
-fn spawn_scope_poll(
+fn spawn_and_track_scope_poll(
     account_id: AccountId,
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     cursors: Arc<CursorRegistry>,
-    store: Arc<DynCheckpointStore>,
     config: MultiplexerConfig,
     boundary: BoundaryView,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     control: SyncControl,
     shutdown: CancellationToken,
     reopen_tx: mpsc::Sender<ReopenRequest>,
+    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    scope_tokens: Arc<StdMutex<HashMap<CursorScope, CancellationToken>>>,
     scope: CursorScope,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut cadence = AdaptiveCadence {
-            interval: config.poll_initial,
-            no_change_streak: 0,
-        };
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            let Some(cursor) = cursors.snapshot(&scope) else {
-                // Scope was removed from the registry; exit cleanly.
-                return;
-            };
-            let pre_advance_state = cursor.server_state.bytes.clone();
-            let acc_arc = account.load_full();
-            let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            let outcome = drive_changes_stream(
-                acc,
-                scope.clone(),
-                cursor,
-                Arc::clone(&cursors),
-                Arc::clone(&store),
-                account_id.clone(),
-                changes_tx.clone(),
-                boundary.clone(),
-                Some(control.clone()),
-            )
-            .await;
-            // The driver yields a `ChangesEvent` or an `Error`; both
-            // are handled via the same recovery surface here.
-            let recovered = handle_drive_outcome(
-                &scope,
-                outcome,
-                &cursors,
-                &pre_advance_state,
-                &reopen_tx,
-                &account_id,
-            )
-            .await;
+) {
+    let scope_cancel = shutdown.child_token();
+    scope_tokens
+        .lock()
+        .expect("poisoned")
+        .insert(scope.clone(), scope_cancel.clone());
+    tokio::spawn(spawn_scope_poll_inner(
+        account_id,
+        account,
+        cursors,
+        config,
+        boundary,
+        changes_tx,
+        control,
+        shutdown,
+        scope_cancel,
+        reopen_tx,
+        ack_tx,
+        scope,
+    ));
+}
 
-            // Update cadence based on whether the cursor advanced.
-            cadence = Multiplexer::updated_cadence(
-                cadence,
-                recovered.advanced,
-                config.poll_min,
-                config.poll_max,
-            );
-            if recovered.exit {
-                return;
-            }
-
-            // Sleep for the adaptive interval, but exit early on
-            // shutdown.
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(cadence.interval) => {}
+/// Per-scope poll loop. Drives `changes_stream(cursor)` and sleeps
+/// for the scope's adaptive cadence between passes. Stream-end
+/// recovery actions are propagated to the engine via `ReopenRequest`
+/// with the full `RecoveryClass`.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_scope_poll_inner(
+    account_id: AccountId,
+    account: Arc<ArcSwap<Arc<dyn Account>>>,
+    cursors: Arc<CursorRegistry>,
+    config: MultiplexerConfig,
+    mut boundary: BoundaryView,
+    changes_tx: broadcast::Sender<MultiplexerEvent>,
+    control: SyncControl,
+    shutdown: CancellationToken,
+    scope_cancel: CancellationToken,
+    reopen_tx: mpsc::Sender<ReopenRequest>,
+    ack_tx: Option<mpsc::Sender<AckRequest>>,
+    scope: CursorScope,
+) {
+    let mut cadence = AdaptiveCadence {
+        interval: config.poll_initial,
+        no_change_streak: 0,
+    };
+    loop {
+        if shutdown.is_cancelled() || scope_cancel.is_cancelled() {
+            return;
+        }
+        // If the boundary is asking us to pause, park here until it
+        // changes back to Run (or Stop / Shutdown trips).
+        if matches!(boundary.peek(), crate::cancel::BoundaryRequest::Pause) {
+            // Park until the request changes.
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = scope_cancel.cancelled() => return,
+                    next = boundary.changed() => {
+                        match next {
+                            None => return,
+                            Some(crate::cancel::BoundaryRequest::Pause) => continue,
+                            Some(_) => break,
+                        }
+                    }
+                }
             }
         }
-    })
+        let Some(cursor) = cursors.snapshot(&scope) else {
+            // Scope was removed from the registry; exit cleanly.
+            return;
+        };
+        let pre_advance_state = cursor.server_state.bytes.clone();
+        let acc_arc = account.load_full();
+        let acc: &dyn Account = acc_arc.as_ref().as_ref();
+        let outcome = drive_changes_stream(
+            acc,
+            scope.clone(),
+            cursor,
+            Arc::clone(&cursors),
+            account_id.clone(),
+            changes_tx.clone(),
+            boundary.clone(),
+            Some(control.clone()),
+            ack_tx.clone(),
+        )
+        .await;
+        let recovered = handle_drive_outcome(
+            &scope,
+            outcome,
+            &cursors,
+            &pre_advance_state,
+            &reopen_tx,
+            &account_id,
+        )
+        .await;
+
+        cadence = Multiplexer::updated_cadence(
+            cadence,
+            recovered.advanced,
+            config.poll_min,
+            config.poll_max,
+        );
+        if recovered.exit {
+            return;
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = scope_cancel.cancelled() => return,
+            () = tokio::time::sleep(cadence.interval) => {}
+        }
+    }
 }
 
 struct DriveRecovery {
@@ -359,14 +473,28 @@ async fn handle_drive_outcome(
             advanced: false,
             exit: true,
         },
-        Ok(ChangesEvent::Fatal) => {
-            // A Fatal already crossed the broadcast; raise reopen if
-            // the consumer wants the engine to recover. We cannot
-            // observe the RecoveryClass directly from this layer
-            // (Fatal is broadcast and consumed by subscribers), so
-            // conservatively request an account-wide reopen and let
-            // the engine decide.
-            let _ = reopen_tx.send(ReopenRequest::Scope(scope.clone())).await;
+        Ok(ChangesEvent::Paused) => {
+            // Pause is a temporary park; the poll loop's boundary
+            // check picks it up at the top of the next iteration.
+            let advanced = cursors
+                .snapshot(scope)
+                .map(|c| c.server_state.bytes.as_slice() != pre_advance_state)
+                .unwrap_or(false);
+            DriveRecovery {
+                advanced,
+                exit: false,
+            }
+        }
+        Ok(ChangesEvent::Fatal(recovery)) => {
+            // Send the full RecoveryClass to the engine so it can
+            // dispatch the right action: Retry / RestartScope /
+            // RestartAccount / AuthLost / etc.
+            let _ = reopen_tx
+                .send(ReopenRequest::Recovery {
+                    scope: scope.clone(),
+                    recovery,
+                })
+                .await;
             DriveRecovery {
                 advanced: false,
                 exit: false,
@@ -388,20 +516,23 @@ async fn handle_drive_outcome(
     }
 }
 
-/// Engine-facing helper: translate the engine's view of a Fatal's
-/// `RecoveryClass` into the right reopen action. The multiplexer
-/// itself sees Fatals only through the broadcast, so this lives here
-/// for the engine task that listens on the broadcast and decides
-/// whether to dispatch reopen.
+/// Map a `MembershipScope` from `ScopeLifecycle` to the
+/// `CursorScope` shape the engine indexes on. The mapping mirrors
+/// `scope_covers_membership` in the engine: folder memberships map
+/// to per-folder cursor scopes; labels/queries map to their natural
+/// cursor scope shapes. Returns `None` when the membership has no
+/// obvious cursor-scope counterpart (e.g. Gmail labels under an
+/// account-wide cursor model).
 #[must_use]
-pub fn reopen_for_recovery(recovery: &RecoveryClass) -> Option<ReopenRequest> {
-    match recovery {
-        RecoveryClass::RestartScope(s) | RecoveryClass::DowngradeCapabilityForScope(s) => {
-            Some(ReopenRequest::Scope(s.clone()))
-        }
-        RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
-            Some(ReopenRequest::Account)
-        }
+pub fn membership_to_cursor_scope(membership: &MembershipScope) -> Option<CursorScope> {
+    use bifrost_types::FolderId;
+    match membership {
+        MembershipScope::Folder(folder) => Some(CursorScope::Folder(folder.clone())),
+        MembershipScope::Mailbox(mailbox) => Some(CursorScope::Folder(FolderId(mailbox.0.clone()))),
+        MembershipScope::Query(q) => Some(CursorScope::Query(q.clone())),
+        // Gmail labels are typically covered by the account-wide
+        // cursor; no per-label cursor exists.
+        MembershipScope::Label(_) => None,
         _ => None,
     }
 }

@@ -8,13 +8,21 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bifrost_types::AccountFuture;
 use tokio::sync::{Mutex, oneshot};
 use zeroize::Zeroizing;
 
 use crate::error::Error;
+
+/// Default age at which a token without an `expires_at` is treated as
+/// stale enough to refresh. Typical OAuth access tokens have a 60-min
+/// TTL; refreshing at 55 min leaves a 5-min safety margin without
+/// burning the issuer's quota on every request. Wired through
+/// `OAuthRefresher::with_max_age` so callers can lengthen or shorten
+/// it.
+pub const DEFAULT_TOKEN_MAX_AGE: Duration = Duration::from_secs(55 * 60);
 
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
@@ -106,6 +114,11 @@ pub struct OAuthRefresher {
     source: Arc<dyn TokenSource>,
     /// Shared state behind the single-flight lock.
     state: Arc<Mutex<RefreshState>>,
+    /// Maximum age for a cached token without an `expires_at` hint.
+    /// Past this age the refresher proactively refreshes instead of
+    /// waiting for a server 401. Defaults to `DEFAULT_TOKEN_MAX_AGE`
+    /// (55 min) and is tunable via `with_max_age`.
+    max_age: Duration,
 }
 
 impl OAuthRefresher {
@@ -123,7 +136,23 @@ impl OAuthRefresher {
         Self {
             source,
             state: Arc::new(Mutex::new(RefreshState::Empty)),
+            max_age: DEFAULT_TOKEN_MAX_AGE,
         }
+    }
+
+    /// Override the proactive-refresh max-age for tokens without an
+    /// `expires_at` hint. Defaults to `DEFAULT_TOKEN_MAX_AGE`.
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// Current proactive-refresh max-age for tokens without an
+    /// `expires_at` hint.
+    #[must_use]
+    pub fn max_age(&self) -> Duration {
+        self.max_age
     }
 
     /// Return the current access token, refreshing if the cached copy
@@ -159,7 +188,7 @@ impl OAuthRefresher {
                 RefreshState::Fresh {
                     token,
                     refreshed_at,
-                } if !force && !needs_refresh(token, *refreshed_at) => {
+                } if !force && !needs_refresh(token, *refreshed_at, self.max_age) => {
                     // Steady state: cached token is fresh enough.
                     return Ok(token.clone());
                 }
@@ -246,7 +275,9 @@ impl OAuthRefresher {
 
     /// Internal state handle. Crate-public so `Net` and `RequestBuilder`
     /// can drive the state machine when Phase 2 wires the refresh
-    /// path.
+    /// path. Not yet wired - `token()` / `force_refresh()` are the
+    /// only paths that read the state.
+    #[allow(dead_code)]
     pub(crate) fn state(&self) -> &Mutex<RefreshState> {
         &self.state
     }
@@ -256,6 +287,18 @@ impl OAuthRefresher {
 // freely substitute a refresher for a raw token source. `current()`
 // returns the cached token (refreshing only if stale); `refresh()`
 // forces a network round-trip.
+// `OAuthRefresher` is itself a `TokenSource` so call sites can
+// freely substitute a refresher for a raw token source. `current()`
+// returns the cached token (refreshing only if stale); `refresh()`
+// forces a network round-trip.
+//
+// **Do not nest refreshers.** Wrapping `OAuthRefresher` around
+// another `OAuthRefresher` makes the outer refresher's
+// `force_refresh` (via `refresh()`) bypass the inner state machine
+// and call the inner's `force_refresh` directly, which always drives
+// a network round-trip and defeats the inner's single-flight. If you
+// need composition, wrap the underlying provider, not another
+// refresher.
 impl TokenSource for OAuthRefresher {
     fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
         // Clone the source-bearing fields so the returned future is
@@ -264,6 +307,7 @@ impl TokenSource for OAuthRefresher {
         let me = OAuthRefresher {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
+            max_age: self.max_age,
         };
         Box::pin(async move { me.token().await })
     }
@@ -272,6 +316,7 @@ impl TokenSource for OAuthRefresher {
         let me = OAuthRefresher {
             source: Arc::clone(&self.source),
             state: Arc::clone(&self.state),
+            max_age: self.max_age,
         };
         Box::pin(async move { me.force_refresh().await })
     }
@@ -292,20 +337,24 @@ enum DriverRole {
 
 /// Has the cached token aged past the proactive-refresh threshold?
 ///
-/// The threshold is 60 seconds before the issuer-supplied expiry. If
-/// the issuer did not supply an expiry, the cached token is treated as
-/// fresh indefinitely: opaque tokens with no TTL refresh only on a
-/// 401 response, which is `force_refresh`'s job.
-fn needs_refresh(token: &AccessToken, _refreshed_at: Instant) -> bool {
-    let Some(expires_at) = token.expires_at() else {
-        return false;
-    };
+/// Two branches:
+///
+/// 1. Issuer supplied an `expires_at`: refresh 60 s before that
+///    instant. Standard proactive-refresh window.
+/// 2. No `expires_at` (opaque tokens without a TTL hint): refresh
+///    when the cached token is older than `max_age`. The previous
+///    behaviour treated such tokens as fresh indefinitely and waited
+///    for a server 401, which leaked latency into every request that
+///    happened to coincide with the server-side expiry.
+fn needs_refresh(token: &AccessToken, refreshed_at: Instant, max_age: Duration) -> bool {
     let now = Instant::now();
-    let window = std::time::Duration::from_secs(60);
-    // Refresh when `now + window >= expires_at`. Saturating math
-    // avoids panics on near-overflow Instant arithmetic.
-    let deadline = expires_at.checked_sub(window).unwrap_or(expires_at);
-    now >= deadline
+    if let Some(expires_at) = token.expires_at() {
+        let window = Duration::from_secs(60);
+        let deadline = expires_at.checked_sub(window).unwrap_or(expires_at);
+        return now >= deadline;
+    }
+    // Opaque token: fall back to the configured max-age.
+    now.saturating_duration_since(refreshed_at) >= max_age
 }
 
 /// Convert an `Arc<Error>` (the wrapper that lets us fan one refresh

@@ -150,16 +150,6 @@ impl Default for MutationConfig {
     }
 }
 
-/// What kind of work is requesting a permit. Used by the budget gate
-/// to pick between the mutation sub-pool and the general pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkKind {
-    /// Changes, inventory, backfill, reconcile.
-    Sync,
-    /// Mutations (bulk_set_flags / move / destroy).
-    Mutation,
-}
-
 /// Engine-side per-account state. Held inside the engine's
 /// `DashMap<AccountId, Arc<AccountSlot>>`.
 ///
@@ -167,28 +157,41 @@ pub enum WorkKind {
 /// becomes visible to spawned workers (reconciler, multiplexer,
 /// backfill, mutation) at their next iteration without re-spawning.
 /// Workers load with `current.load_full()`.
-#[allow(dead_code)]
 pub(crate) struct AccountSlot {
+    #[allow(dead_code)]
     pub factory: Arc<dyn AccountFactory>,
     pub current: Arc<ArcSwap<Arc<dyn Account>>>,
+    #[allow(dead_code)]
     pub capabilities: AccountCapabilities,
     pub multiplexer: MultiplexerHandle,
+    #[allow(dead_code)]
     pub backfill: BackfillHandle,
+    #[allow(dead_code)]
     pub push: PushHandle,
+    #[allow(dead_code)]
     pub mutation: MutationHandle,
+    #[allow(dead_code)]
     pub cursors: Arc<CursorRegistry>,
+    #[allow(dead_code)]
     pub checkpoints: Arc<DynCheckpointStore>,
+    #[allow(dead_code)]
     pub priority_tx: watch::Sender<Priority>,
     pub boundary_tx: watch::Sender<BoundaryRequest>,
     pub shutdown: CancellationToken,
+    #[allow(dead_code)]
     pub control: SyncControl,
     /// Sentinel receiver keeps `changes_tx` alive across periods with
     /// no subscribers so new subscribers don't get a closed-channel
     /// error.
+    #[allow(dead_code)]
     pub _sentinel_rx: tokio::sync::broadcast::Receiver<crate::multiplexer::MultiplexerEvent>,
-    /// `JoinHandle`s for every worker spawned in `attach`, in spawn
-    /// order: reconciler, push forwarder (optional), multiplexer,
-    /// backfill orchestrator. `detach` awaits these up to
-    /// `EngineConfig::detach_timeout`.
+    /// Per-worker abort handles, paired with their `JoinHandle`s.
+    /// `detach` aborts each handle on timeout so spawned tasks do not
+    /// leak past the configured deadline.
     pub workers: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
+    pub abort_handles: tokio::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Optional bandwidth meter wired through `bifrost-net` so
+    /// `Control::bandwidth_observed` returns a real reading.
+    #[allow(dead_code)]
+    pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
 }

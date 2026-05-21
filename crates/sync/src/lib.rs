@@ -54,10 +54,9 @@ pub use cursor::{
 pub use backfill::{BackfillPolicy, BackfillStrategy};
 
 // Engine configuration knobs.
-pub use scheduler::ConcurrencyBudget;
+pub use scheduler::{ConcurrencyBudget, WorkKind};
 pub use types::{
     BackfillConfig, EngineConfig, MultiplexerConfig, MutationConfig, PushConfig, SchedulerConfig,
-    WorkKind,
 };
 
 // Engine-side control implementation, exposed so tests / consumers

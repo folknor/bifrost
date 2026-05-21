@@ -49,8 +49,44 @@ impl Default for ConcurrencyBudget {
 }
 
 impl ConcurrencyBudget {
+    /// Reject obviously-degenerate configurations: a zero
+    /// `per_account` would mean no account can run any work, and a
+    /// zero `mutation_share_num` previously silently rewrote to 1.
+    /// Construct the budget through this validated accessor so the
+    /// failure surface is a typed `Error` rather than a silent
+    /// rewrite.
+    ///
+    /// Returns `Error::Other` with a descriptive message on
+    /// invalid input; the engine surfaces this to the consumer at
+    /// build time.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.per_account == 0 {
+            return Err(Error::Other(
+                "ConcurrencyBudget: per_account must be > 0".into(),
+            ));
+        }
+        if self.global == 0 {
+            return Err(Error::Other("ConcurrencyBudget: global must be > 0".into()));
+        }
+        if self.mutation_share_num == 0 {
+            return Err(Error::Other(
+                "ConcurrencyBudget: mutation_share_num must be > 0".into(),
+            ));
+        }
+        if self.mutation_share_den == 0 {
+            return Err(Error::Other(
+                "ConcurrencyBudget: mutation_share_den must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Number of permits carved out of `per_account` for the mutation
     /// sub-pool. Always at least 1 when `per_account >= 1`.
+    ///
+    /// Callers should call `validate` first; this accessor preserves
+    /// the historical `max(1)` rounding for backwards compatibility
+    /// with consumers that construct the struct directly.
     #[must_use]
     pub fn mutation_permits(&self) -> usize {
         if self.per_account == 0 {
