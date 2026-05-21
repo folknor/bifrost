@@ -1,0 +1,28 @@
+[package]
+name = "bifrost-sync"
+description = "Sync engine that drives bifrost-types Account implementations: scheduler, backfill, push reconciliation, mutation pipeline."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bifrost-types = { path = "../types" }
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["rt"] }
+futures = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+arc-swap = { workspace = true }

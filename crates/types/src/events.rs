@@ -41,7 +41,7 @@ pub struct BackfillCheckpoint {
 /// Backfill partition descriptor. Engine-side, opaque bytes; the
 /// engine chooses partitioning strategy (newest-first by day, by UID
 /// range, by page count).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Partition(pub Vec<u8>);
 
 /// Progress within a single backfill partition.

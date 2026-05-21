@@ -1,0 +1,77 @@
+//! `bifrost-sync` is the engine that drives `bifrost-types::Account`
+//! implementations.
+//!
+//! Three layers (see `reference/jmap.md`, `reference/imap.md` for
+//! per-protocol detail):
+//!
+//! - `bifrost-net` (sibling) - shared transport.
+//! - `bifrost-{jmap,imap,gmail,graph,smtp}` (sibling) - per-protocol
+//!   wire primitives.
+//! - `bifrost-sync` (this crate) - scheduler, multiplexer, backfill,
+//!   push reconciliation, mutation pipeline, checkpoint envelope,
+//!   cancellation, observability.
+//!
+//! Compile-time clean: the engine depends only on `bifrost-types`. Any
+//! protocol crate is opaque to the engine; consumers wire one
+//! `Arc<dyn AccountFactory>` per account and the engine owns the
+//! lifecycle.
+
+#![forbid(unsafe_code)]
+
+pub mod backfill;
+pub mod cancel;
+pub mod control;
+pub mod cursor;
+pub mod engine;
+pub mod error;
+pub mod multiplexer;
+pub mod mutation;
+pub mod push;
+pub mod scheduler;
+pub mod types;
+
+// Engine entry types.
+pub use engine::{SyncEngine, SyncEngineBuilder};
+
+// Control surface and priority (re-export from bifrost-types so
+// consumers can import them off the engine crate directly).
+pub use bifrost_types::{Control, Priority};
+
+// Push surface (sink + watch events).
+pub use bifrost_types::{InvalidationSink, WatchEvent};
+
+// Engine-side errors / fatals / warnings (distinct from
+// bifrost-types::Error which is per-operation).
+pub use error::{Error, Fatal, FatalAction, Warning};
+
+// Cursor and checkpoint plumbing.
+pub use cursor::{
+    CheckpointStore, CursorRegistry, DynCheckpointStore, ENGINE_VERSION, InMemoryCheckpointStore,
+    MIN_MIGRATABLE, decode_envelope, encode_envelope,
+};
+
+// Backfill policy types.
+pub use backfill::{BackfillPolicy, BackfillStrategy};
+
+// Engine configuration knobs.
+pub use scheduler::ConcurrencyBudget;
+pub use types::{
+    BackfillConfig, EngineConfig, MultiplexerConfig, MutationConfig, PushConfig, SchedulerConfig,
+    WorkKind,
+};
+
+// Engine-side control implementation, exposed so tests / consumers
+// pattern-match on the concrete type when convenient.
+pub use control::SyncControl;
+
+// Cancellation primitive.
+pub use cancel::{Boundary, BoundaryRequest, BoundaryView};
+
+// Mutation pipeline entry points.
+pub use mutation::{
+    IdempotencyVendor, MutationCampaignId, MutationCounters, ReadbackOutcome, run_readback_guard,
+};
+
+// Multiplexer types consumers want to pattern-match against (the
+// per-account broadcast yields `MultiplexerEvent`).
+pub use multiplexer::{MultiplexerEvent, ReopenRequest};

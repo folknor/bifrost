@@ -3,42 +3,44 @@
 //!
 //! Protocol crates never see a `reqwest::RequestBuilder` directly.
 //! Everything routes through this wrapper so the underlying HTTP
-//! stack can be swapped without breaking call sites.
+//! stack can be swapped without touching call sites.
 
 use std::pin::Pin;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
-use reqwest::{StatusCode, header::HeaderMap};
+use reqwest::{
+    StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER},
+};
 use serde::Serialize;
 
+use crate::auth::AccessToken;
 use crate::error::Error;
+use crate::net::{AccountNet, into_byte_stream, wrap_metered};
 use crate::retry::RetryPolicy;
 
-// `ByteRange` lives in `bifrost-types::blob` so the engine, the
-// protocol crates, and this crate all use one struct. Re-exported
-// from `crate::ByteRange` for ergonomic imports.
-
-/// Erased byte stream returned by streaming download endpoints. Same
-/// shape as `AccountStream<Bytes>` in the engine plan so blob
-/// download paths compose naturally.
+/// Erased byte-chunk stream, as returned by `AccountNet::download_stream`.
+/// One element per chunk reqwest yields off the underlying socket;
+/// bandwidth metering wraps every chunk.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + 'static>>;
 
 /// Fluent request builder. Consumes `self` on every setter so the
 /// final `send` call is a single move.
 pub struct RequestBuilder {
-    /// Method + URL + headers + body, captured opaquely. The v1
-    /// skeleton does not construct a backing reqwest request; that
-    /// lands in Phase 2.
+    /// Method + URL + headers + body, captured opaquely. Replaced
+    /// piecewise as the caller chains setters.
     inner: RequestBuilderInner,
 }
 
-/// Backing state for the builder. Kept private so the Phase 2
-/// implementation can replace the representation without touching
-/// the call sites.
-#[allow(dead_code)]
+/// Backing state for the builder. Kept private so the request
+/// pipeline can replace the representation without touching call
+/// sites.
 struct RequestBuilderInner {
+    /// Account-scoped transport handle. Carries the reqwest client,
+    /// token source, default retry, governor, and bandwidth meter.
+    account: AccountNet,
     /// HTTP method.
     method: reqwest::Method,
     /// Target URL.
@@ -55,14 +57,24 @@ struct RequestBuilderInner {
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
     timeout: Option<Duration>,
+    /// Deferred error captured at a fluent-setter call site (e.g.
+    /// `json()` could not serialize the body). The fluent API does
+    /// not return `Result` on every setter, so the error is stashed
+    /// here and surfaced from the subsequent `send` / `send_streaming`
+    /// before any network call. Only the first error is retained; if
+    /// a later setter fails too, we keep the earliest one because
+    /// that is what callers tend to debug first.
+    pending_error: Option<Error>,
 }
 
 impl RequestBuilder {
-    /// Construct a builder from a method and URL. The
-    /// account-scoped wrappers (`AccountNet::get` etc.) call this.
-    pub(crate) fn new(method: reqwest::Method, url: &str) -> Self {
+    /// Construct a builder from an account-scoped transport, method,
+    /// and URL. The account-scoped wrappers (`AccountNet::get` etc.)
+    /// call this.
+    pub(crate) fn new(account: AccountNet, method: reqwest::Method, url: &str) -> Self {
         Self {
             inner: RequestBuilderInner {
+                account,
                 method,
                 url: url.to_owned(),
                 headers: HeaderMap::new(),
@@ -70,26 +82,57 @@ impl RequestBuilder {
                 cost: None,
                 retry: None,
                 timeout: None,
+                pending_error: None,
             },
         }
     }
 
-    /// Set a header. Multiple calls with the same key append.
-    /// Phase 2 wires this through; the v1 skeleton refuses rather
-    /// than silently dropping the header (the prior draft accepted
-    /// and discarded the arguments, which would produce headerless
-    /// requests with no warning at all).
+    /// Set a header. Multiple calls with the same key append rather
+    /// than overwriting; this matches `reqwest::RequestBuilder::header`
+    /// semantics and is what callers expect for `Cookie` and
+    /// `Set-Cookie`-style multi-valued headers.
     #[must_use]
-    pub fn header(self, _key: &str, _value: &str) -> Self {
-        unimplemented!("RequestBuilder::header is filled in by Phase 2")
+    pub fn header(mut self, key: &str, value: &str) -> Self {
+        if let Ok(name) = HeaderName::from_bytes(key.as_bytes())
+            && let Ok(val) = HeaderValue::from_str(value)
+        {
+            self.inner.headers.append(name, val);
+        }
+        self
     }
 
-    /// Set the request body to a JSON-serialized value. Reqwest
-    /// serializes with `serde_json` under the hood. Phase 2 wires
-    /// this; v1 refuses rather than silently dropping the body.
+    /// Set the request body to a JSON-serialized value. Encoded with
+    /// `serde_json` and sets `Content-Type: application/json`.
+    ///
+    /// A serialization failure (custom `Serialize` impl returning an
+    /// error) is captured on the builder and surfaced from the next
+    /// `send` / `send_streaming` call as `Error::EncodeBody`. The
+    /// fluent setter does not return `Result` because the protocol
+    /// crates compose dozens of these chains; threading a `Result`
+    /// through every setter would force a `?` after each call and
+    /// hurt readability without catching anything callers cannot
+    /// already learn about at send time.
     #[must_use]
-    pub fn json<B: Serialize + ?Sized>(self, _body: &B) -> Self {
-        unimplemented!("RequestBuilder::json is filled in by Phase 2")
+    pub fn json<B: Serialize + ?Sized>(mut self, body: &B) -> Self {
+        match serde_json::to_vec(body) {
+            Ok(v) => {
+                self.inner.body = Some(Bytes::from(v));
+                let ct = HeaderName::from_static("content-type");
+                let val = HeaderValue::from_static("application/json");
+                self.inner.headers.insert(ct, val);
+            }
+            Err(e) => {
+                // Keep the first deferred error if one is already
+                // present; later failures often mask the root cause.
+                if self.inner.pending_error.is_none() {
+                    self.inner.pending_error = Some(Error::EncodeBody {
+                        message: format!("serde_json::to_vec failed: {e}"),
+                        source: Some(Box::new(e)),
+                    });
+                }
+            }
+        }
+        self
     }
 
     /// Set the request body to raw bytes.
@@ -123,14 +166,41 @@ impl RequestBuilder {
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
     pub async fn send(self) -> Result<Response, Error> {
-        unimplemented!("RequestBuilder::send is filled in by Phase 2")
+        let internal = send_streaming_inner(self).await?;
+        // Drain the body into a single `Bytes`. The retry loop has
+        // already validated status; everything from here is a
+        // straight body read. Apply the bandwidth meter to the read
+        // so buffered receives feed the same counters as streaming.
+        let meter = internal.account.meter();
+        let mut body_stream = internal.body;
+        let mut accum: Vec<u8> = Vec::new();
+        use futures::StreamExt;
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk?;
+            let n = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            meter.record_bytes_in(n);
+            accum.extend_from_slice(&chunk);
+        }
+        Ok(Response {
+            status: internal.status,
+            headers: internal.headers,
+            body: Bytes::from(accum),
+        })
     }
 
     /// Drive the request to completion but return the response body
     /// as a `ByteStream` rather than buffering. Used for blob
     /// download endpoints.
     pub async fn send_streaming(self) -> Result<StreamingResponse, Error> {
-        unimplemented!("RequestBuilder::send_streaming is filled in by Phase 2")
+        let internal = send_streaming_inner(self).await?;
+        // Caller-facing streaming response wraps the body in the
+        // bandwidth meter + cap adapter.
+        let metered = wrap_metered(internal.body, internal.account);
+        Ok(StreamingResponse {
+            status: internal.status,
+            headers: internal.headers,
+            body: metered,
+        })
     }
 }
 
@@ -156,4 +226,323 @@ pub struct StreamingResponse {
     /// Response body as an erased byte stream. Increments the
     /// bandwidth meter on every chunk.
     pub body: ByteStream,
+}
+
+/// Internal streaming response carrying the originating `AccountNet`
+/// so `send()` and `send_streaming()` can share one underlying call
+/// site without re-binding the body. `body` is unmetered here; the
+/// outer wrappers attach the meter at the point of public exposure.
+pub(crate) struct InternalStreaming {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: ByteStream,
+    pub(crate) account: AccountNet,
+}
+
+/// Drive a request to a streamable response, running the retry loop
+/// against the configured policy. The body is exposed unmetered;
+/// outer wrappers add metering. Used by `RequestBuilder::send` (which
+/// drains the body afterwards) and `RequestBuilder::send_streaming`
+/// (which exposes the stream).
+pub(crate) async fn send_streaming_inner(
+    builder: RequestBuilder,
+) -> Result<InternalStreaming, Error> {
+    let RequestBuilderInner {
+        account,
+        method,
+        url,
+        headers,
+        body,
+        cost,
+        retry,
+        timeout,
+        pending_error,
+    } = builder.inner;
+
+    // Surface any deferred error from a fluent setter (e.g. `json()`
+    // failing to serialize) before touching the network. We do this
+    // *before* acquiring a rate-limit slot so a malformed request
+    // does not burn anyone else's quota.
+    if let Some(err) = pending_error {
+        return Err(err);
+    }
+
+    let policy = retry.unwrap_or_else(|| account.default_retry().clone());
+    let host = host_from_url(&url);
+    let cost_units = cost.unwrap_or(1);
+
+    let mut attempt: u32 = 0;
+    let mut retry_after_history: Vec<Duration> = Vec::new();
+    let mut refresh_attempted = false;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        // Acquire a rate-limit slot. No-op if no host is configured.
+        // Surfaces `Error::CostExceedsBurst` if the caller asked for
+        // more units than the host's bucket can ever hold; that is a
+        // configuration bug, not a transient condition, so we do not
+        // burn retry budget on it.
+        if let Some(ref h) = host {
+            account.net().governor().acquire(h, cost_units).await?;
+        }
+
+        // Mint a fresh `Authorization` from the token source. The
+        // token source itself handles single-flight refresh.
+        let token = match account.token_source().current().await {
+            Ok(t) => t,
+            Err(_e) => {
+                // Couldn't get a token. Surface as AuthLost; the
+                // underlying error chain is not propagated because
+                // the public `Error::AuthLost` does not carry a
+                // source. Refund the rate-limit slot since the
+                // request never reached the wire.
+                if let Some(ref h) = host {
+                    account.net().governor().refund(h, cost_units);
+                }
+                return Err(Error::AuthLost);
+            }
+        };
+
+        // Record outbound body bytes against the per-account meter
+        // before we issue the request. Each retry is another wire
+        // transmission, so we count the body once per attempt. We do
+        // this even on 401-recovery retries because the failed
+        // attempt did put bytes on the wire. Header bytes are
+        // intentionally excluded - the meter is a payload sizing
+        // tool, not a TCP byte counter.
+        if let Some(ref b) = body {
+            let out_n = u64::try_from(b.len()).unwrap_or(u64::MAX);
+            account.meter().record_bytes_out(out_n);
+        }
+
+        let request = build_reqwest(
+            account.net().client(),
+            &method,
+            &url,
+            &headers,
+            &body,
+            &token,
+            timeout,
+        );
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(ref h) = host {
+                    account.net().governor().refund(h, cost_units);
+                }
+                if e.is_timeout() {
+                    if policy.network_errors && attempt < policy.max_attempts {
+                        let delay = backoff_for(&policy, attempt);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(Error::Timeout);
+                }
+                // Connect, body, decode failures are network-level.
+                // Retry per policy if `network_errors` is set.
+                let msg = format!("{e}");
+                if policy.network_errors && attempt < policy.max_attempts {
+                    let delay = backoff_for(&policy, attempt);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(Error::Network {
+                    message: msg,
+                    source: Some(Box::new(e)),
+                });
+            }
+        };
+
+        let status = response.status();
+
+        // 401 path. We allow exactly one forced-refresh + retry per
+        // request. If the refresh itself fails we surface AuthLost
+        // immediately - retrying the same stale token would just
+        // produce another 401. If the refresh succeeds and the
+        // server still returns 401, the credential is dead; surface
+        // AuthLost rather than `Error::Status { code: 401 }` so the
+        // protocol crate can map straight to the terminal-auth
+        // recovery class. We also refund the rate-limit slot so the
+        // retry does not double-debit the host bucket.
+        if status == StatusCode::UNAUTHORIZED {
+            if refresh_attempted {
+                drop(response);
+                return Err(Error::AuthLost);
+            }
+            refresh_attempted = true;
+            drop(response);
+            if let Some(ref h) = host {
+                account.net().governor().refund(h, cost_units);
+            }
+            if account.token_source().refresh().await.is_err() {
+                return Err(Error::AuthLost);
+            }
+            // Don't bill the retry against the network retry budget;
+            // 401 is its own one-shot recovery path.
+            continue;
+        }
+
+        // 2xx and 3xx: return.
+        if status.is_success() || status.is_redirection() {
+            let headers_out = response.headers().clone();
+            let stream = into_byte_stream(response);
+            return Ok(InternalStreaming {
+                status,
+                headers: headers_out,
+                body: stream,
+                account,
+            });
+        }
+
+        // 4xx that the policy does not call retryable: terminal.
+        if status.is_client_error() && !policy.statuses.contains(&status) {
+            let headers_out = response.headers().clone();
+            let body_bytes = response.bytes().await.unwrap_or_default();
+            return Err(Error::Status {
+                code: status,
+                body: crate::error::cap_status_body(body_bytes),
+                headers: headers_out,
+            });
+        }
+
+        // 5xx and configured-retryable statuses: retry path.
+        // `policy.statuses` is the *additive* set (typically just 429
+        // and the 5xx codes the default policy lists for clarity),
+        // and `is_server_error()` is applied unconditionally on top
+        // so 5xx is always retried. Callers that disable retries set
+        // `max_attempts = 1` and let the budget-exhausted branch
+        // below surface the failure on the first attempt; they do
+        // not remove specific codes.
+        if policy.statuses.contains(&status) || status.is_server_error() {
+            if attempt >= policy.max_attempts {
+                // Drop the response body so the connection can return
+                // to the pool. The body content is not surfaced in
+                // either `RateLimited` or `RetryBudgetExhausted`.
+                drop(response);
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    let last = retry_after_history.last().copied();
+                    return Err(Error::RateLimited { retry_after: last });
+                }
+                return Err(Error::RetryBudgetExhausted {
+                    last_status: Some(status),
+                    retry_after_history,
+                });
+            }
+            // `Retry-After` is capped by `policy.honor_retry_after_cap`,
+            // which is the sole source of truth for the cap. Earlier
+            // drafts also applied a hardcoded five-minute ceiling; that
+            // double-cap is gone so callers that want to honor an
+            // hour-long server hint can configure the policy and have
+            // it actually take effect.
+            let retry_after = parse_retry_after(response.headers().get(RETRY_AFTER))
+                .map(|d| d.min(policy.honor_retry_after_cap));
+            let wait = retry_after.unwrap_or_else(|| backoff_for(&policy, attempt));
+            if let Some(ra) = retry_after {
+                retry_after_history.push(ra);
+            }
+            // Discard the body so the underlying connection can be
+            // returned to the pool.
+            drop(response);
+            // Refund the rate-limit slot on every retried failure: the
+            // server did not consume real work on a 5xx or 429, so
+            // burning a token across the retry would just starve other
+            // waiters on the same host. Previously only 429+
+            // `Retry-After` refunded; a plain 503 with no header burned
+            // tokens across all three attempts and stalled neighboring
+            // requests for the duration of the backoff.
+            if let Some(ref h) = host {
+                account.net().governor().refund(h, cost_units);
+            }
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+
+        // Anything else: surface as Status, no retry.
+        let headers_out = response.headers().clone();
+        let body_bytes = response.bytes().await.unwrap_or_default();
+        return Err(Error::Status {
+            code: status,
+            body: crate::error::cap_status_body(body_bytes),
+            headers: headers_out,
+        });
+    }
+}
+
+/// Build the underlying `reqwest::RequestBuilder` from the captured
+/// pieces. Injects `Authorization`, `traceparent`, and the per-request
+/// timeout. Body is cloned from `Bytes` so each retry attempt sends
+/// the same payload.
+fn build_reqwest(
+    client: &reqwest::Client,
+    method: &reqwest::Method,
+    url: &str,
+    headers: &HeaderMap,
+    body: &Option<Bytes>,
+    token: &AccessToken,
+    timeout: Option<Duration>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.request(method.clone(), url);
+    for (k, v) in headers {
+        req = req.header(k.clone(), v.clone());
+    }
+    // Authorization: Bearer <token>. The token may be empty if the
+    // protocol crate is on no-auth mode; we still emit the header
+    // so call sites don't see undocumented gaps.
+    if let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
+        req = req.header(AUTHORIZATION, val);
+    }
+    // W3C traceparent.
+    let tp = crate::trace::current_traceparent();
+    if let Ok(val) = HeaderValue::from_str(&tp) {
+        req = req.header(HeaderName::from_static("traceparent"), val);
+    }
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    if let Some(b) = body {
+        req = req.body(b.clone());
+    }
+    req
+}
+
+/// Extract host string from a URL. Returns `None` if the URL is not
+/// parseable; the rate-limit governor then no-ops for this request.
+fn host_from_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+}
+
+/// Exponential backoff with jitter. The base doubles per attempt,
+/// capped at `policy.max_backoff`. Decorrelated jitter (half-to-full
+/// of the base) prevents thundering-herd retries from one shared
+/// outage.
+fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let base = policy.initial_backoff;
+    let exp = attempt.saturating_sub(1).min(16);
+    let scaled = base.saturating_mul(2u32.saturating_pow(exp));
+    let capped = scaled.min(policy.max_backoff);
+    // Cheap deterministic-ish jitter from the current time's nanos.
+    // Not a CSPRNG; the goal is decorrelation, not unguessability.
+    let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.subsec_nanos(),
+        Err(_) => 0,
+    };
+    let half = capped / 2;
+    let jitter_ms = u64::from(nanos % 1000);
+    let jitter = Duration::from_millis(jitter_ms);
+    half.saturating_add(jitter).min(policy.max_backoff)
+}
+
+/// Parse a `Retry-After` header. Either delta-seconds (an integer) or
+/// an HTTP-date per RFC 9110 section 10.2.3.
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    let v = value?.to_str().ok()?.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = httpdate::parse_http_date(v).ok()?;
+    let now = std::time::SystemTime::now();
+    when.duration_since(now).ok()
 }

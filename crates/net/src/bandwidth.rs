@@ -9,41 +9,105 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::AccountId;
 
+/// One second's worth of byte counts. Ten of these in a ring buffer
+/// form the sliding `observed_bps` window. Tracking in/out separately
+/// makes "uploading 50 MB while downloading something else" readable.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct WindowSample {
+    pub(crate) bytes_in: u64,
+    pub(crate) bytes_out: u64,
+}
+
 /// Sliding 10-second window of per-second byte counts. Smooths the
 /// `observed_bps` reading so a one-shot burst does not pin the
-/// reading at the burst peak forever. Fields are written at
-/// construction but unused until Phase 2 drives the sample loop.
-#[allow(dead_code)]
+/// reading at the burst peak forever.
 pub(crate) struct RateWindow {
-    /// Ten one-second buckets, indexed by `head`.
-    pub(crate) samples: [u64; 10],
-    /// Index of the current bucket.
+    /// Ten one-second buckets indexed by `head`.
+    pub(crate) samples: [WindowSample; 10],
+    /// Index of the bucket currently being filled.
     pub(crate) head: usize,
-    /// Instant at which the last sample bucket was rolled.
-    pub(crate) last_tick: Instant,
+    /// Instant at which the head bucket was opened. Each second we
+    /// advance `head` and zero the newly current bucket.
+    pub(crate) head_started: Instant,
+    /// Instant the window itself was first constructed. Used so the
+    /// warm-up bps reading divides by the elapsed window instead of
+    /// the full ten seconds and under-reports.
+    pub(crate) created_at: Instant,
 }
 
 impl RateWindow {
     /// Construct an empty window anchored at the given instant.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
-            samples: [0; 10],
+            samples: [WindowSample::default(); 10],
             head: 0,
-            last_tick: now,
+            head_started: now,
+            created_at: now,
         }
+    }
+
+    /// Roll the head bucket forward by the number of whole seconds
+    /// that have elapsed since the head was last opened. Zeros each
+    /// intermediate bucket. Bounded at 10 steps because beyond that
+    /// the entire window is stale anyway.
+    fn advance(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.head_started);
+        let steps_full = elapsed.as_secs();
+        if steps_full == 0 {
+            return;
+        }
+        let steps = usize::try_from(steps_full).unwrap_or(10).min(10);
+        for _ in 0..steps {
+            self.head = (self.head + 1) % self.samples.len();
+            self.samples[self.head] = WindowSample::default();
+        }
+        // Advance `head_started` by the full elapsed seconds, leaving
+        // the sub-second remainder so the next advance accumulates
+        // correctly.
+        self.head_started += Duration::from_secs(steps_full);
+    }
+
+    /// Add inbound bytes to the current head bucket. Rolls first.
+    pub(crate) fn add_in(&mut self, now: Instant, bytes: u64) {
+        self.advance(now);
+        self.samples[self.head].bytes_in = self.samples[self.head].bytes_in.saturating_add(bytes);
+    }
+
+    /// Add outbound bytes to the current head bucket. Rolls first.
+    pub(crate) fn add_out(&mut self, now: Instant, bytes: u64) {
+        self.advance(now);
+        self.samples[self.head].bytes_out = self.samples[self.head].bytes_out.saturating_add(bytes);
+    }
+
+    /// Bytes-per-second across the trailing 10-second window. Sums
+    /// in + out across every bucket and divides by the elapsed
+    /// window length, capped at ten seconds. During the warm-up
+    /// period (less than ten seconds since construction) the divisor
+    /// is the actual elapsed wall-clock time, so a fresh meter does
+    /// not under-report a small burst.
+    fn bps(&mut self, now: Instant) -> u64 {
+        self.advance(now);
+        let total: u64 = self
+            .samples
+            .iter()
+            .map(|s| s.bytes_in.saturating_add(s.bytes_out))
+            .sum();
+        // Divisor in whole seconds. Saturating to >=1 sec keeps the
+        // first sub-second sample from producing a huge spike.
+        let elapsed = now.duration_since(self.created_at).as_secs().max(1);
+        let divisor = elapsed.min(10);
+        total / divisor
     }
 }
 
 /// Per-account counter pair. Updated by the metered body-readers in
 /// `Net::download_stream`, `RequestBuilder::send`, and the IMAP/SMTP
-/// `MeterSink` paths. Allocated by the skeleton; read paths land in
-/// Phase 2.
-#[allow(dead_code)]
+/// `MeterSink` paths.
 pub(crate) struct AccountCounters {
     pub(crate) bytes_in: AtomicU64,
     pub(crate) bytes_out: AtomicU64,
@@ -56,6 +120,30 @@ impl AccountCounters {
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             window: Mutex::new(RateWindow::new(now)),
+        }
+    }
+
+    fn record_in(&self, n: u64) {
+        self.bytes_in.fetch_add(n, Ordering::Relaxed);
+        let now = Instant::now();
+        if let Ok(mut w) = self.window.lock() {
+            w.add_in(now, n);
+        }
+    }
+
+    fn record_out(&self, n: u64) {
+        self.bytes_out.fetch_add(n, Ordering::Relaxed);
+        let now = Instant::now();
+        if let Ok(mut w) = self.window.lock() {
+            w.add_out(now, n);
+        }
+    }
+
+    fn bps(&self) -> u64 {
+        let now = Instant::now();
+        match self.window.lock() {
+            Ok(mut w) => w.bps(now),
+            Err(_) => 0,
         }
     }
 }
@@ -106,7 +194,12 @@ impl BandwidthMeter {
     /// `AccountMeter::observed_bps`.
     #[must_use]
     pub fn observed_bps(&self) -> u64 {
-        unimplemented!("BandwidthMeter::observed_bps is filled in by Phase 2")
+        let map = self.accounts.lock().expect("meter lock poisoned");
+        let mut total: u64 = 0;
+        for c in map.values() {
+            total = total.saturating_add(c.bps());
+        }
+        total
     }
 
     fn lookup(&self, account: &AccountId) -> Option<Arc<AccountCounters>> {
@@ -121,6 +214,19 @@ impl Default for BandwidthMeter {
     }
 }
 
+impl MeterSink for BandwidthMeter {
+    fn record_bytes_in(&self, account: &AccountId, n: u64) {
+        if let Some(c) = self.lookup(account) {
+            c.record_in(n);
+        }
+    }
+    fn record_bytes_out(&self, account: &AccountId, n: u64) {
+        if let Some(c) = self.lookup(account) {
+            c.record_out(n);
+        }
+    }
+}
+
 /// Account-scoped view into the meter. Returned from `Net::meter` /
 /// `AccountNet::meter` and from `BandwidthMeter::account`.
 #[derive(Clone)]
@@ -129,10 +235,8 @@ pub struct AccountMeter {
     /// for `MeterSink` callers that report into a meter shared with
     /// other transports.
     account: AccountId,
-    /// Optional handle to per-account counters. `None` if the account
-    /// is not registered with the meter; readings then return 0. Held
-    /// for the v1 skeleton; Phase 2 drives the read paths through it.
-    #[allow(dead_code)]
+    /// Per-account counters. `None` if the account is not registered
+    /// with the meter; readings then return 0.
     counters: Option<Arc<AccountCounters>>,
 }
 
@@ -141,27 +245,47 @@ impl AccountMeter {
     /// samples have landed in the window yet.
     #[must_use]
     pub fn observed_bps(&self) -> u64 {
-        unimplemented!("AccountMeter::observed_bps is filled in by Phase 2")
+        self.counters.as_deref().map_or(0, AccountCounters::bps)
     }
 
     /// Cumulative bytes received for this account across the meter's
     /// lifetime.
     #[must_use]
     pub fn bytes_in(&self) -> u64 {
-        unimplemented!("AccountMeter::bytes_in is filled in by Phase 2")
+        self.counters
+            .as_ref()
+            .map_or(0, |c| c.bytes_in.load(Ordering::Relaxed))
     }
 
     /// Cumulative bytes sent for this account across the meter's
     /// lifetime.
     #[must_use]
     pub fn bytes_out(&self) -> u64 {
-        unimplemented!("AccountMeter::bytes_out is filled in by Phase 2")
+        self.counters
+            .as_ref()
+            .map_or(0, |c| c.bytes_out.load(Ordering::Relaxed))
     }
 
     /// The account this handle is scoped to.
     #[must_use]
     pub fn account(&self) -> &AccountId {
         &self.account
+    }
+
+    /// Record `n` inbound bytes against this account. Crate-internal:
+    /// the metered body-readers in `request.rs` and `net.rs` call
+    /// this on every chunk.
+    pub(crate) fn record_bytes_in(&self, n: u64) {
+        if let Some(c) = self.counters.as_ref() {
+            c.record_in(n);
+        }
+    }
+
+    /// Record `n` outbound bytes against this account.
+    pub(crate) fn record_bytes_out(&self, n: u64) {
+        if let Some(c) = self.counters.as_ref() {
+            c.record_out(n);
+        }
     }
 }
 

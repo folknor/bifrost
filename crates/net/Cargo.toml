@@ -16,7 +16,7 @@ workspace = true
 
 [dependencies]
 bifrost-types = { path = "../types" }
-reqwest = { workspace = true, features = ["native-tls", "stream", "json"] }
+reqwest = { workspace = true, features = ["native-tls", "stream", "json", "http2"] }
 native-tls = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
 tokio-util = { workspace = true }
@@ -26,4 +26,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 httpdate = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 zeroize = { workspace = true }
+uuid = { workspace = true }

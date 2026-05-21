@@ -129,18 +129,111 @@ impl OAuthRefresher {
     /// Return the current access token, refreshing if the cached copy
     /// is within the proactive-refresh window or absent.
     ///
-    /// Stub: the v1 skeleton does not yet drive the state machine.
-    /// Phase 2 fills this in.
+    /// Single-flights concurrent refresh attempts. The first caller
+    /// to find the state empty or stale transitions the state to
+    /// `Refreshing` and drives the network round-trip itself.
+    /// Concurrent callers register a oneshot receiver and await.
     pub async fn token(&self) -> Result<AccessToken, Error> {
-        unimplemented!("OAuthRefresher::token is filled in by Phase 2")
+        self.token_inner(false).await
     }
 
     /// Force a fresh token, bypassing the proactive-refresh window.
-    /// Called by the 401-retry path.
-    ///
-    /// Stub for the v1 skeleton.
+    /// Called by the 401-retry path. Itself single-flighted on the
+    /// same lock: a forced refresh while another refresh is in
+    /// flight registers as a waiter on the existing refresh rather
+    /// than launching a second network round-trip.
     pub async fn force_refresh(&self) -> Result<AccessToken, Error> {
-        unimplemented!("OAuthRefresher::force_refresh is filled in by Phase 2")
+        self.token_inner(true).await
+    }
+
+    /// Shared engine driving both `token()` and `force_refresh()`.
+    /// The only difference between the two flows is whether a `Fresh`
+    /// token within its proactive-refresh window short-circuits;
+    /// everything else is identical.
+    async fn token_inner(&self, force: bool) -> Result<AccessToken, Error> {
+        // Lifetime block: snapshot the state, decide the path, drop
+        // the guard before any `.await`.
+        let role = {
+            let mut state = self.state.lock().await;
+            match &mut *state {
+                RefreshState::Fresh {
+                    token,
+                    refreshed_at,
+                } if !force && !needs_refresh(token, *refreshed_at) => {
+                    // Steady state: cached token is fresh enough.
+                    return Ok(token.clone());
+                }
+                RefreshState::Fresh { .. } | RefreshState::Empty => {
+                    // We are the driving task. Mark the state as
+                    // `Refreshing` with an empty waiter list and drop
+                    // the lock.
+                    *state = RefreshState::Refreshing {
+                        waiters: Vec::new(),
+                    };
+                    DriverRole::Driver
+                }
+                RefreshState::Refreshing { waiters } => {
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    DriverRole::Waiter(rx)
+                }
+            }
+        };
+
+        match role {
+            DriverRole::Driver => self.drive_refresh().await,
+            DriverRole::Waiter(rx) => match rx.await {
+                Ok(Ok(t)) => Ok(t),
+                Ok(Err(e)) => Err(arc_err_to_error(e)),
+                // The driver task dropped without sending. Treat as
+                // a refresh failure; the caller will see AuthLost.
+                Err(_) => Err(Error::AuthLost),
+            },
+        }
+    }
+
+    /// Run the refresh future and fan the result out. Re-acquires
+    /// the state lock once the network call completes to install the
+    /// new `Fresh` entry and drain any waiters that joined while we
+    /// were off the lock.
+    async fn drive_refresh(&self) -> Result<AccessToken, Error> {
+        let result = self.source.refresh().await;
+        let mut state = self.state.lock().await;
+        // We were the driver. Whatever state we left behind in
+        // `Refreshing` must be replaced; pull the waiters out before
+        // installing the new `Fresh` or rolling back to `Empty`.
+        let waiters = match std::mem::replace(&mut *state, RefreshState::Empty) {
+            RefreshState::Refreshing { waiters } => waiters,
+            // The only way this can happen is if a second driver
+            // claimed the role concurrently, which the single-flight
+            // protocol forbids. Defensive.
+            _ => Vec::new(),
+        };
+
+        match result {
+            Ok(token) => {
+                *state = RefreshState::Fresh {
+                    token: token.clone(),
+                    refreshed_at: Instant::now(),
+                };
+                drop(state);
+                for waiter in waiters {
+                    let _ = waiter.send(Ok(token.clone()));
+                }
+                Ok(token)
+            }
+            Err(err) => {
+                // Leave state as `Empty` so the next caller drives a
+                // fresh attempt rather than parking on a dead
+                // `Refreshing` entry.
+                drop(state);
+                let shared = Arc::new(err);
+                for waiter in waiters {
+                    let _ = waiter.send(Err(Arc::clone(&shared)));
+                }
+                Err(arc_err_to_error(shared))
+            }
+        }
     }
 
     /// Underlying token source. Exposed so call sites that already
@@ -156,6 +249,92 @@ impl OAuthRefresher {
     /// path.
     pub(crate) fn state(&self) -> &Mutex<RefreshState> {
         &self.state
+    }
+}
+
+// `OAuthRefresher` itself implements `TokenSource` so call sites can
+// freely substitute a refresher for a raw token source. `current()`
+// returns the cached token (refreshing only if stale); `refresh()`
+// forces a network round-trip.
+impl TokenSource for OAuthRefresher {
+    fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+        // Clone the source-bearing fields so the returned future is
+        // `'static`. The trait return is `Pin<Box<...>>` for dyn
+        // safety; we don't capture `&self`.
+        let me = OAuthRefresher {
+            source: Arc::clone(&self.source),
+            state: Arc::clone(&self.state),
+        };
+        Box::pin(async move { me.token().await })
+    }
+
+    fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+        let me = OAuthRefresher {
+            source: Arc::clone(&self.source),
+            state: Arc::clone(&self.state),
+        };
+        Box::pin(async move { me.force_refresh().await })
+    }
+}
+
+/// Outcome of the lock-held inspection inside `token_inner`. Captures
+/// whether this caller is the refresh driver or one of the parked
+/// waiters; carried out of the `Mutex` guard so we can `await` outside
+/// the lock.
+enum DriverRole {
+    /// This caller transitioned the state to `Refreshing` and must
+    /// drive the network round-trip.
+    Driver,
+    /// Another task is already driving the refresh; this caller is
+    /// parked on a oneshot until the driver finishes.
+    Waiter(oneshot::Receiver<Result<AccessToken, Arc<Error>>>),
+}
+
+/// Has the cached token aged past the proactive-refresh threshold?
+///
+/// The threshold is 60 seconds before the issuer-supplied expiry. If
+/// the issuer did not supply an expiry, the cached token is treated as
+/// fresh indefinitely: opaque tokens with no TTL refresh only on a
+/// 401 response, which is `force_refresh`'s job.
+fn needs_refresh(token: &AccessToken, _refreshed_at: Instant) -> bool {
+    let Some(expires_at) = token.expires_at() else {
+        return false;
+    };
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(60);
+    // Refresh when `now + window >= expires_at`. Saturating math
+    // avoids panics on near-overflow Instant arithmetic.
+    let deadline = expires_at.checked_sub(window).unwrap_or(expires_at);
+    now >= deadline
+}
+
+/// Convert an `Arc<Error>` (the wrapper that lets us fan one refresh
+/// failure out to N waiters) back into a fresh owned `Error`. We
+/// cannot move out of the `Arc` because waiters may still hold
+/// references; instead we project by variant.
+///
+/// True auth failures (`AuthLost`) map straight through; the caller's
+/// downstream classification stays the same. A `Status` from a token
+/// endpoint with a 401 or 403 indicates the refresh token itself was
+/// rejected and is also an auth-terminal condition.
+///
+/// Every other failure (`Network`, `Timeout`, `Tls`, etc.) is
+/// transient from the consumer's point of view; collapsing them into
+/// `AuthLost` would discard the retry-vs-give-up distinction the
+/// engine needs. We preserve them inside `RefreshFailed { source }`
+/// so the caller can either pattern-match on the inner variant for a
+/// retry decision or treat the wrapper as a single "refresh failed"
+/// class.
+fn arc_err_to_error(err: Arc<Error>) -> Error {
+    match &*err {
+        Error::AuthLost => Error::AuthLost,
+        Error::Status { code, .. }
+            if *code == reqwest::StatusCode::UNAUTHORIZED
+                || *code == reqwest::StatusCode::FORBIDDEN =>
+        {
+            Error::AuthLost
+        }
+        _ => Error::RefreshFailed { source: err },
     }
 }
 

@@ -8,11 +8,11 @@
 //! configuration, and W3C `traceparent` injection. It does not own
 //! protocol-level JSON shapes, IMAP, or SMTP transport.
 //!
-//! The v1 surface in this crate is a skeleton: every type and method
-//! exists with the right signature, and bodies that would require
-//! real network logic return `unimplemented!()`. Phase 2 fills in the
-//! retry loop, single-flight refresher, token-bucket math, metering,
-//! and traceparent injection without changing the public surface.
+//! The Phase 2 implementation wires the retry loop, single-flight
+//! refresher, per-host token bucket, sliding-window bandwidth meter,
+//! and traceparent header. The public surface (`Net`, `AccountNet`,
+//! `RequestBuilder`, `Response`, `StreamingResponse`, `Error`) is
+//! frozen for Phase 2 consumers and matches the Phase 1 skeleton.
 
 pub mod auth;
 pub mod bandwidth;
@@ -22,6 +22,7 @@ pub mod net;
 pub mod rate;
 pub mod request;
 pub mod retry;
+pub(crate) mod trace;
 
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink};

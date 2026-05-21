@@ -1,0 +1,186 @@
+//! Concurrency budget.
+//!
+//! Two-layer `tokio::sync::Semaphore`: per-account first (so two
+//! big accounts under one engine do not starve each other), global
+//! second. A reserved mutation share carves out a sub-pool so a
+//! 200K-flag mutation cannot peg every permit and freeze the
+//! multiplexer.
+//!
+//! Rate-shaping (Gmail's quota-units-per-second budget) is NOT here -
+//! it lives in `bifrost-net`. This gate counts concurrent operations,
+//! not request rate.
+
+use std::sync::Arc;
+
+use bifrost_types::AccountId;
+use dashmap::DashMap;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::error::Error;
+use crate::scheduler::lanes::WorkKind;
+
+/// Tunable concurrency budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ConcurrencyBudget {
+    /// Per-account permit pool. Default 8.
+    pub per_account: usize,
+    /// Engine-wide permit pool. Default 64.
+    pub global: usize,
+    /// Numerator of the per-account mutation share. Default 1.
+    ///
+    /// Encoded as a rational `(num, den)` so we avoid float math and
+    /// avoid clippy's cast lints. Default `(1, 4)` = 25% of
+    /// `per_account` reserved for mutation work, rounded up to at
+    /// least 1.
+    pub mutation_share_num: u32,
+    /// Denominator of the per-account mutation share. Default 4.
+    pub mutation_share_den: u32,
+}
+
+impl Default for ConcurrencyBudget {
+    fn default() -> Self {
+        Self {
+            per_account: 8,
+            global: 64,
+            mutation_share_num: 1,
+            mutation_share_den: 4,
+        }
+    }
+}
+
+impl ConcurrencyBudget {
+    /// Number of permits carved out of `per_account` for the mutation
+    /// sub-pool. Always at least 1 when `per_account >= 1`.
+    #[must_use]
+    pub fn mutation_permits(&self) -> usize {
+        if self.per_account == 0 {
+            return 0;
+        }
+        let den = self.mutation_share_den.max(1) as usize;
+        let num = (self.mutation_share_num as usize).min(den);
+        // Round up: (a * num + den - 1) / den.
+        let raw = self.per_account.saturating_mul(num).saturating_add(den - 1) / den;
+        raw.max(1).min(self.per_account)
+    }
+
+    /// Number of permits left in the sync (non-mutation) sub-pool.
+    #[must_use]
+    pub fn sync_permits(&self) -> usize {
+        self.per_account.saturating_sub(self.mutation_permits())
+    }
+}
+
+/// Engine-internal layered budget gate.
+#[derive(Clone)]
+pub struct BudgetGate {
+    inner: Arc<BudgetInner>,
+}
+
+impl std::fmt::Debug for BudgetGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BudgetGate")
+            .field("budget", &self.inner.budget)
+            .finish_non_exhaustive()
+    }
+}
+
+struct BudgetInner {
+    budget: ConcurrencyBudget,
+    global: Arc<Semaphore>,
+    account_sync: DashMap<AccountId, Arc<Semaphore>>,
+    account_mutation: DashMap<AccountId, Arc<Semaphore>>,
+}
+
+impl BudgetGate {
+    #[must_use]
+    pub fn new(budget: ConcurrencyBudget) -> Self {
+        let global_permits = budget.global.max(1);
+        Self {
+            inner: Arc::new(BudgetInner {
+                budget,
+                global: Arc::new(Semaphore::new(global_permits)),
+                account_sync: DashMap::new(),
+                account_mutation: DashMap::new(),
+            }),
+        }
+    }
+
+    /// Ensure per-account semaphores exist for `account` so the first
+    /// `acquire` call doesn't race with later config changes. Called
+    /// from `SyncEngine::attach`.
+    pub fn register(&self, account: AccountId) {
+        let sync = Arc::new(Semaphore::new(self.inner.budget.sync_permits().max(1)));
+        let mutation = Arc::new(Semaphore::new(self.inner.budget.mutation_permits().max(1)));
+        self.inner.account_sync.insert(account.clone(), sync);
+        self.inner.account_mutation.insert(account, mutation);
+    }
+
+    /// Drop per-account semaphores. Called from `SyncEngine::detach`.
+    pub fn forget(&self, account: &AccountId) {
+        self.inner.account_sync.remove(account);
+        self.inner.account_mutation.remove(account);
+    }
+
+    /// Acquire a permit. Returns a `BudgetPermit` that releases the
+    /// permit on drop.
+    ///
+    /// `kind` picks between the sync and mutation sub-pools. The
+    /// global outer permit is shared.
+    pub async fn acquire(
+        &self,
+        account: &AccountId,
+        kind: WorkKind,
+    ) -> Result<BudgetPermit, Error> {
+        let outer = Arc::clone(&self.inner.global)
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?;
+        let inner_sem = match kind {
+            WorkKind::Sync => self.sync_semaphore(account),
+            WorkKind::Mutation => self.mutation_semaphore(account),
+        };
+        let inner = inner_sem
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::Other(format!("account semaphore closed: {e}")))?;
+        Ok(BudgetPermit {
+            _outer: outer,
+            _inner: inner,
+        })
+    }
+
+    fn sync_semaphore(&self, account: &AccountId) -> Arc<Semaphore> {
+        // `entry().or_insert_with` is atomic on `DashMap`; this
+        // closes the race where two concurrent `acquire` calls on an
+        // unregistered account would each allocate a fresh
+        // `Semaphore`, with the loser then gating against an orphan
+        // that has no permits drained by the winner's holders.
+        let permits = self.inner.budget.sync_permits().max(1);
+        self.inner
+            .account_sync
+            .entry(account.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(permits)))
+            .clone()
+    }
+
+    fn mutation_semaphore(&self, account: &AccountId) -> Arc<Semaphore> {
+        let permits = self.inner.budget.mutation_permits().max(1);
+        self.inner
+            .account_mutation
+            .entry(account.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(permits)))
+            .clone()
+    }
+}
+
+/// Held permit; releases on drop.
+pub struct BudgetPermit {
+    _outer: OwnedSemaphorePermit,
+    _inner: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for BudgetPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BudgetPermit").finish()
+    }
+}
