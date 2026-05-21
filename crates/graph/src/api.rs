@@ -34,6 +34,40 @@ impl GraphClient {
         Ok(folders)
     }
 
+    pub async fn list_mail_folders_recursive(&self) -> Result<Vec<GraphMailFolder>, String> {
+        let prefix = self.api_path_prefix();
+        let mut folders = self.list_mail_folders().await?;
+        let mut queue: std::collections::VecDeque<String> = folders
+            .iter()
+            .filter(|folder| folder.child_folder_count.unwrap_or(0) > 0)
+            .map(|folder| folder.id.clone())
+            .collect();
+
+        while let Some(parent_id) = queue.pop_front() {
+            let enc_parent_id = urlencoding::encode(&parent_id);
+            let mut next_url = Some(format!(
+                "{prefix}/mailFolders/{enc_parent_id}/childFolders?$select=id,displayName,parentFolderId,childFolderCount&$top=100"
+            ));
+
+            while let Some(url) = next_url {
+                let page: ODataCollection<GraphMailFolder> = if url.starts_with("http") {
+                    self.get_absolute(&url).await?
+                } else {
+                    self.get_json(&url).await?
+                };
+                for folder in page.value {
+                    if folder.child_folder_count.unwrap_or(0) > 0 {
+                        queue.push_back(folder.id.clone());
+                    }
+                    folders.push(folder);
+                }
+                next_url = page.next_link;
+            }
+        }
+
+        Ok(folders)
+    }
+
     pub async fn get_mail_folder(&self, folder_id: &str) -> Result<GraphMailFolder, String> {
         let prefix = self.api_path_prefix();
         let enc_folder_id = urlencoding::encode(folder_id);

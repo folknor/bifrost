@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Microsoft Graph client for Rust."]
 
+pub mod account;
 pub mod api;
 pub mod autodiscover;
 pub mod blob;
