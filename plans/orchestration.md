@@ -25,13 +25,38 @@ Resolved decisions:
 - **InvalidationSink.** Channel-based. See `bifrost-sync.md`.
 - **TLS.** `native-tls` workspace-wide. No rustls dependency.
   See `bifrost-net.md` -> TLS.
+- **Cursor establishment.** Per-scope and dynamic, returned from
+  `Account::establish_initial_cursor(scope)`. Two variants:
+  `Ready(cursor)` (cheap mint — JMAP all scopes, Gmail Account,
+  IMAP-QRESYNC folders) and `EstablishViaInventory` (Graph all
+  scopes, IMAP-Basic / IMAP-CONDSTORE-only folders). Replaces the
+  account-level `inventory_is_change_cursor_establish` capability
+  that could not represent IMAP mixed-tier accounts or Graph's
+  full-sync-on-first-delta semantics. See
+  `plans/account-trait.md` -> Cursor establishment.
+- **Replay safety.** No current protocol declares
+  `MutationReplaySafety::ReplayToken`. Microsoft Graph's
+  `client-request-id` is debugging correlation; Google's
+  `X-Goog-Request-Id` is not documented as a Gmail-side dedup
+  primitive; JMAP and IMAP have no wire replay tokens. All four
+  protocols declare `MutationReplaySafety::None` and rely on the
+  engine's read-back guard. The enum variant stays in the trait
+  for forward-compatibility. See `plans/bifrost-sync.md` ->
+  Read-back guard.
 
 Plans landed: `account-trait.md`, `account-trait-shape.md`,
 `sync-engine.md`, `bifrost-net.md`, `bifrost-sync.md`,
-`imap/backpressure.md`.
+`imap/backpressure.md`, four per-protocol Account-impl plans
+(`jmap/account-impl.md`, `imap/account-impl.md`,
+`gmail/account-impl.md`, `graph/account-impl.md`).
 
-Plans outstanding: four per-protocol Account-impl plans (one
-each for JMAP, IMAP, Gmail, Graph).
+Post-Phase-0 cross-document reconciliation also landed: outside
+reviewer feedback on the four per-protocol plans surfaced trait
+shape gaps and incorrect attributions (replay tokens, cursor
+expiry budgets, push wiring); fixes were folded into
+`account-trait.md`, `bifrost-sync.md`, `sync-engine.md`, and the
+four per-protocol plans in one coordinated pass before Phase 1
+launch.
 
 ## Phase 0 - Plan closure (4 agents, parallel)
 
@@ -66,13 +91,21 @@ frozen for downstream agents.
   `Change` (sum of `ObjectChange` + `ScopeChange`), `Projection`,
   `BlobHandle`, all capability types, `CursorScope`,
   `MembershipScope`, `OpaqueChangeState`, `ChangeCursor`,
-  `RecoveryClass`, `WatchEvent`, `InvalidationHint`,
-  `InvalidationSink`, `MutationResult`, `IdempotencyKey`,
-  `Priority`, `Control`, `Checkpoint`, `Progress`,
-  `HydratedObject`, `InventoryEntry`, error taxonomy.
+  `CursorEstablishment`, `RecoveryClass`, `WatchEvent`,
+  `InvalidationHint`, `InvalidationSink`, `MutationResult`,
+  `IdempotencyKey`, `Priority`, `Control`, `Checkpoint`,
+  `Progress`, `HydratedObject`, `InventoryEntry`, error taxonomy.
   Zero workspace deps. No protocol-specific code. No engine
   code. Type aliases for `AccountStream<T>` and
   `AccountFuture<T>` here.
+
+  Trait surface includes `establish_initial_cursor(scope)`
+  returning `AccountFuture<Result<CursorEstablishment, Error>>`.
+  `AccountCapabilities` does NOT carry an
+  `inventory_is_change_cursor_establish` field (the prior
+  account-level binary was removed during Phase 0 cross-document
+  reconciliation; establishment is per-scope and dynamic). See
+  `plans/account-trait.md` -> Cursor establishment.
 - **P1-A2**: `crates/net/` -> `bifrost-net`. Skeleton only.
   Owns: `Net`, `NetConfig`, `AccountNet`, `RequestBuilder`,
   `TokenSource`, `OAuthRefresher` (trait + single-flight

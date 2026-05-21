@@ -113,7 +113,27 @@ trait Account: Send + Sync {
     fn scope_lifecycle_stream(&self)
         -> AccountStream<ScopeLifecycle>;
 
-    // Inventory: projection-only cold-start primitive.
+    // Initial cursor establishment. The engine calls this exactly
+    // once per (account, scope) pair before its first
+    // changes_stream(cursor) call. Two outcomes:
+    //   - Ready(cursor): cursor minted cheaply (one round-trip or
+    //     factory-cached), engine starts changes_stream immediately
+    //     and runs inventory_stream in parallel as backfill.
+    //   - EstablishViaInventory: protocol has no cheap-mint
+    //     primitive; engine must call inventory_stream(scope) first
+    //     and consume the cursor from its terminal Done event.
+    //     inventory_stream IS the cursor establishment.
+    // Per-scope (not account-level) because IMAP can have mixed
+    // tiers — one QRESYNC folder Ready, one Basic-downgraded
+    // folder EstablishViaInventory.
+    fn establish_initial_cursor(&self, scope: CursorScope)
+        -> AccountFuture<Result<CursorEstablishment, Error>>;
+
+    // Inventory: projection-only cold-start primitive. Also the
+    // cursor-establishment pass for scopes that returned
+    // CursorEstablishment::EstablishViaInventory above; the
+    // terminal SyncEvent::Done carries the established
+    // ChangeCursor in its checkpoint for those scopes.
     fn inventory_stream(&self, scope: CursorScope)
         -> AccountStream<SyncEvent<Batch<InventoryEntry>>>;
 
@@ -136,9 +156,21 @@ trait Account: Send + Sync {
     fn push_unsubscribe(&self, handle: SubscriptionHandle)
         -> AccountFuture<Result<(), Error>>;
 
-    // In-process event stream. IMAP IDLE / JMAP WebSocket deliver
-    // here. Gmail Pub/Sub and Graph webhooks deliver out-of-process;
-    // the engine wires those via InvalidationSink (see sync-engine.md).
+    // Event stream from the protocol crate to the engine.
+    // Contents depend on push_in_process:
+    //   - In-process (IMAP IDLE, JMAP WebSocket, EWS streaming):
+    //     full WatchEvent traffic — Invalidated + Disconnected +
+    //     Reconnected.
+    //   - Out-of-process (Gmail Pub/Sub, Graph webhooks):
+    //     Invalidated events go through InvalidationSink (see
+    //     sync-engine.md), NOT through this stream. Sustained
+    //     subscription-health failures (renewal expiry, repeated
+    //     auth lapses) MAY be surfaced here as Disconnected /
+    //     Reconnected so the engine can downgrade scheduling to
+    //     poll-only. The protocol crate decides whether to emit;
+    //     a v1 implementation may yield nothing and terminate.
+    // No SyncEvent::Done sentinel — stream-end is the natural
+    // termination.
     fn push_stream(&self) -> AccountStream<WatchEvent>;
 
     // Blobs.
@@ -191,6 +223,21 @@ enum ScopeLifecycle {
     Renamed { old: MembershipScope, new: MembershipScope },
     Deleted(MembershipScope),
 }
+
+// Initial cursor-establishment outcome. Returned per scope from
+// Account::establish_initial_cursor(scope). See "Cursor
+// establishment" section below.
+enum CursorEstablishment {
+    // Cursor minted cheaply (one round-trip, or factory-cached).
+    // Engine starts changes_stream(cursor) immediately and runs
+    // inventory_stream(scope) in parallel as backfill.
+    Ready(ChangeCursor),
+    // No cheap mint primitive on this protocol/scope. Engine must
+    // call inventory_stream(scope) first; the terminal Done event
+    // carries the established ChangeCursor in its checkpoint.
+    // Graph (all scopes), IMAP-Basic / IMAP-CONDSTORE-only folders.
+    EstablishViaInventory,
+}
 ```
 
 `Account` is single-account by contract. Multi-account multiplexing
@@ -214,7 +261,14 @@ change is a recovery event.
 ```rust
 struct AccountCapabilities {
     cursor_freshness: CursorFreshness,           // ServerIssued | Hybrid
-    inventory_is_change_cursor_establish: bool,  // IMAP Basic/CONDSTORE
+
+    // No `inventory_is_change_cursor_establish` field.
+    // Establishment mode is per-scope and dynamic, returned by
+    // Account::establish_initial_cursor(scope). The previous
+    // account-level binary couldn't represent IMAP mixed-tier
+    // accounts (one QRESYNC folder + one Basic-downgraded folder)
+    // and overstated Graph (which is always EstablishViaInventory
+    // per Microsoft's delta semantics).
 
     blob_range: BlobRangeSupport,
     blob_digest_pre_download: bool,
@@ -257,9 +311,15 @@ enum MutationConcurrency {
 }
 
 enum MutationReplaySafety {
-    ReplayToken,         // Gmail X-Goog-Request-Id,
-                         // Graph batch request-id
-    None,                // engine guards via read-back-after-retry
+    ReplayToken,         // reserved; no protocol uses this today.
+                         // Microsoft Graph's client-request-id is
+                         // debugging correlation only; Gmail's
+                         // X-Goog-Request-Id is not documented as
+                         // a Gmail-side dedup token. JMAP has no
+                         // wire replay token. IMAP has no wire
+                         // replay token.
+    None,                // engine guards via read-back-after-retry.
+                         // Used by all four protocols today.
 }
 
 struct BatchingPolicy {
@@ -272,18 +332,59 @@ struct BatchingPolicy {
 
 Two distinct concerns. `MutationConcurrency` prevents lost updates
 when state changed under the client. `MutationReplaySafety` prevents
-double-apply on retry. They are orthogonal: JMAP has StateBased
-concurrency but no replay token; Gmail has ReplayToken but no
-concurrency check; Graph has both; IMAP has both only after
-`STORE UNCHANGEDSINCE` lands (see
-`plans/imap/condstore-qresync.md`).
+double-apply on retry. They are orthogonal:
 
-`inventory_is_change_cursor_establish` is the IMAP-on-Basic-or-
-CONDSTORE-only case: establishing a baseline across hundreds of
-folders is itself an inventory pass, and the engine schedules
-backfill differently when this flag is true (the "start cheap,
-backfill underneath" pattern does not apply because the cheap-
-start step does not exist).
+- **JMAP**: `StateBased` (`ifInState`), no documented replay
+  token (`None`).
+- **Gmail**: `None` concurrency (no `ifInState` / `If-Match`),
+  no documented replay token (`None`). Cloud-API conventions
+  like `X-Goog-Request-Id` do NOT apply to the Gmail REST
+  surface per Google's docs; the prior draft incorrectly
+  attributed `ReplayToken` here.
+- **Graph**: `StateBased` (`If-Match` with ETag), no documented
+  client-mintable replay token (`None`). Microsoft documents
+  `client-request-id` as debugging/support correlation and JSON
+  batch `id` as per-batch request/response correlation; neither
+  is a dedup primitive. The prior draft incorrectly attributed
+  `ReplayToken` here.
+- **IMAP**: `StateBased` (`UID STORE UNCHANGEDSINCE`) once
+  per-message MODSEQ parsing lands; `None` until then. Replay
+  safety is always `None` on IMAP.
+
+All `MutationReplaySafety::None` protocols rely on the engine's
+read-back guard (`plans/bifrost-sync.md` -> Read-back guard) to
+resolve ambiguous transport failure. Today that means all four
+protocols.
+
+### Cursor establishment
+
+`Account::establish_initial_cursor(scope)` is the engine's
+once-per-(account, scope) call to obtain (or stage) the initial
+`ChangeCursor`. Two paths per the `CursorEstablishment` enum:
+
+- `Ready(cursor)` — cheap-mint path. JMAP (via `*/get { ids: [] }`
+  probe at `factory.open()`), Gmail (via `users.getProfile`
+  historyId at `factory.open()`), and IMAP-QRESYNC folders (when
+  detected). The cursor is produced from already-fetched session
+  state without a wire round-trip at call time. Engine starts
+  `changes_stream(cursor)` immediately and `inventory_stream` in
+  parallel as backfill.
+- `EstablishViaInventory` — establish-by-walking path. Graph
+  (all scopes per Microsoft's delta semantics: the initial delta
+  call IS the full folder sync), IMAP-Basic and
+  IMAP-CONDSTORE-only folders. Engine must call
+  `inventory_stream(scope)` first; its terminal Done event
+  carries the established `ChangeCursor` in its checkpoint, at
+  which point the engine persists the cursor and may issue
+  subsequent `changes_stream(cursor)` calls for incremental
+  deltas.
+
+Per-scope, not account-level. An IMAP account with mixed-tier
+folders returns different `CursorEstablishment` variants per
+folder, and the engine schedules each accordingly. The prior
+draft's account-level binary capability
+(`inventory_is_change_cursor_establish`) could not represent
+this and has been removed.
 
 ## Ownership and contracts
 
@@ -469,29 +570,35 @@ struct IdempotencyKey {
 }
 
 enum ProtocolSalt {
-    Jmap(String),         // optional; combines with ifInState
-                          // (concurrency) where used
-    Gmail(String),        // becomes X-Goog-Request-Id header
-                          // (replay token)
-    Graph(String),        // becomes batch request-id (replay token);
-                          // combines with If-Match (concurrency)
-                          // for per-item ops
-    Imap,                 // no native replay token; engine guards
-                          // via read-back. STORE UNCHANGEDSINCE
-                          // is the optimistic-concurrency hook,
-                          // separate from idempotency.
+    Jmap(String),         // engine bookkeeping only. JMAP has no
+                          // wire replay token; ifInState
+                          // (concurrency) is separate.
+    Gmail(String),        // engine bookkeeping only. Gmail has no
+                          // documented wire replay token; do not
+                          // emit on the wire.
+    Graph(String),        // engine bookkeeping only. Graph has no
+                          // documented wire replay token; If-Match
+                          // (concurrency) is separate. Do not emit
+                          // on the wire.
+    Imap,                 // engine bookkeeping only. STORE
+                          // UNCHANGEDSINCE is the
+                          // optimistic-concurrency hook, separate
+                          // from idempotency.
 }
 ```
 
 **`run_id` is consumer-minted and persisted across process
 restarts** for a given mutation campaign. If `run_id` resets on
-restart, retries from the previous process look new to the server
-and double-apply. The consumer mints once per campaign and persists
-alongside the campaign state.
+restart, retries from the previous process look new to engine
+bookkeeping and the read-back guard cannot correlate prior-attempt
+state. The consumer mints once per campaign and persists alongside
+the campaign state.
 
-For protocols without native replay tokens (IMAP) the engine reads
-back the affected items after retry and skips items already in the
-target state.
+No protocol today carries `ProtocolSalt` onto the wire. The salt
+is engine bookkeeping for retry-queue dedup and campaign
+correlation. All four protocols rely on the engine's read-back
+guard for replay safety per `plans/bifrost-sync.md` -> Read-back
+guard.
 
 ### Digest
 
@@ -551,12 +658,15 @@ implementable, not to specify the implementation.
 - `close()` -> close WebSocket cleanly.
 
 Capabilities: `cursor_freshness = ServerIssued`,
-`inventory_is_change_cursor_establish = false`,
 `push_in_process = true`,
 `mutation.concurrency = StateBased`,
 `mutation.replay_safety = None`,
 `batching_policy = { max_items: 500, max_wait: 100ms,
 flush_on_input_close: true }`.
+
+`establish_initial_cursor(scope)` returns `Ready(cursor)` for all
+JMAP top-level scopes — the factory probes via
+`*/get { ids: [] }` at `open()` time and caches the state.
 
 ### Gmail
 
@@ -576,21 +686,32 @@ flush_on_input_close: true }`.
 - `push_subscribe` -> Pub/Sub `users.watch`; `push_unsubscribe` ->
   `users.stop`. `push_in_process = false`; out-of-process Pub/Sub
   listener feeds the engine's `InvalidationSink`. `push_stream`
-  yields nothing.
+  yields no items (terminates immediately).
 - `open_blob` -> `messages.attachments.get`;
-  `blob_range = No` (base64url in JSON).
-- `bulk_set_flags` -> `messages.batchModify` with
-  X-Goog-Request-Id from `MutationReplaySafety::ReplayToken`.
-- `close()` -> stop Pub/Sub watch.
+  `blob_range = No` (base64url in JSON; v1 is full-buffered
+  decode).
+- `bulk_set_flags` -> `messages.batchModify`. No wire replay
+  token: Gmail does not document `X-Goog-Request-Id` (or any
+  other header) as a messages-endpoint dedup primitive. Engine
+  read-back guard handles ambiguous transport failure.
+- `close()` -> local handle teardown only. Does NOT call
+  `users.stop` (server-side push subscription tear-down is
+  `push_unsubscribe`'s job).
 
 Capabilities: `cursor_freshness = ServerIssued`,
-`historyid_expires_after = Some(7 days)`,
+`historyid_expires_after = None` (Gmail docs say historyId is
+*typically* valid at least a week but can age out in hours; a
+deterministic value misleads scheduling),
 `push_in_process = false`,
 `mutation.concurrency = None`,
-`mutation.replay_safety = ReplayToken`,
+`mutation.replay_safety = None`,
 `blob_digest_pre_download = false`,
 `batching_policy = { max_items: 1000, max_wait: 200ms,
 flush_on_input_close: true }`.
+
+`establish_initial_cursor(CursorScope::Account)` returns
+`Ready(cursor)` — `users.getProfile` is called at `factory.open()`
+and the historyId is cached.
 
 ### IMAP
 
@@ -620,48 +741,83 @@ flush_on_input_close: true }`.
 - `close()` -> `LOGOUT`.
 
 Capabilities: `cursor_freshness = Hybrid`,
-`inventory_is_change_cursor_establish = true` on Basic /
-CONDSTORE-only, `requires_uidvalidity_recheck = true`,
+`requires_uidvalidity_recheck = true`,
 `push_in_process = true`,
 `mutation.concurrency = None` (or `StateBased` once
 `STORE UNCHANGEDSINCE` lands),
 `mutation.replay_safety = None` (engine reads back after retry).
 
+`establish_initial_cursor(scope)` is per-folder:
+`Ready(cursor)` for QRESYNC folders where a probe SELECT yields
+the modseq baseline; `EstablishViaInventory` for
+CONDSTORE-only and Basic-downgraded folders where the
+inventory FETCH IS the cursor-establishment pass. Mixed-tier
+accounts return different variants per folder.
+
 ### Graph
 
 - `discover_cursor_scopes()` yields `CursorScope::FolderType
-  { folder, ty }` from folder enumeration per type.
+  { folder, ty }` from folder enumeration per type. Mail folder
+  walk MUST recurse through `/me/mailFolders/{id}/childFolders`
+  (`/me/mailFolders` returns only root children per Microsoft's
+  user-list-mailfolders docs).
 - `discover_memberships()` yields `MembershipScope::Folder(_)`
-  from folder enumeration.
-- `scope_lifecycle_stream()` yields `ScopeLifecycle` from folder
-  delta queries.
-- `inventory_stream(FolderType{folder, Email})` -> delta query with
-  `$select=id,parentFolderId,internetMessageId,subject,changeKey,
-  size,...`. `parentFolderId` becomes `memberships` (singleton).
-- `get_stream(ids, projection)` -> `$select` widened per projection.
-- `changes_stream(cursor)` -> delta query from `cursor.server_state`
-  (a `@odata.deltaLink` URL).
-- `push_subscribe` -> Graph `/subscriptions` CRUD;
-  `push_unsubscribe` -> DELETE. `push_in_process = false` for
-  webhook subscriptions; out-of-process webhook receiver feeds the
-  engine's `InvalidationSink`. EWS `StreamingSubscription` is
-  in-process when chosen, yielding `push_in_process = true`.
-- `open_blob` / `open_blob_range` -> `$value` for file attachments
-  (range supported); JSON-wrapped body for item attachments (range
-  not supported).
+  from the same recursive enumeration.
+- `scope_lifecycle_stream()` yields `ScopeLifecycle` from
+  `/mailFolders/delta` polling (mailFolder container lifecycle
+  is NOT a subscribable resource per Outlook change-notification
+  docs; webhooks cover only messages/events/contacts).
+- `inventory_stream(FolderType{folder, Email})` -> initial delta
+  query (no token) with `$select=id,parentFolderId,
+  internetMessageId,subject,receivedDateTime,isRead,categories,
+  flag,changeKey,conversationId,internetMessageHeaders`. Note:
+  `size` is NOT in `$select`; Graph does not expose message size
+  on the message resource. `parentFolderId` becomes
+  `memberships` (singleton). The delta walk paginates a full
+  folder sync before yielding `@odata.deltaLink`; the terminal
+  `Done` event carries the established `ChangeCursor`.
+- `get_stream(ids, projection)` -> `$select` widened per
+  projection via `$batch`.
+- `changes_stream(cursor)` -> delta query from
+  `cursor.server_state` (a `@odata.deltaLink` URL). Requires a
+  cursor established by a prior `inventory_stream` pass.
+- `push_subscribe` -> Graph `/subscriptions` CRUD per type:
+  messages and contacts subscribe per-folder; events subscribe
+  account-wide (`/me/events`; no per-calendar event
+  subscription per Outlook docs). `push_unsubscribe` -> DELETE.
+  `push_in_process = false` for webhook subscriptions;
+  out-of-process webhook receiver feeds the engine's
+  `InvalidationSink`. EWS `StreamingSubscription` is in-process
+  when chosen, yielding `push_in_process = true`.
+- `open_blob` / `open_blob_range` -> `$value` for file
+  attachments (range supported) and item attachments
+  (MIME/vCard/iCal bytes; range not supported). Reference
+  attachments return `405` from `$value` and surface as
+  `Warning { kind: BlobNotByteStream }`.
 - `bulk_set_flags` -> batched `PATCH` with `If-Match: <etag>`
-  (StateBased concurrency) and request-id header on the batch
-  envelope (ReplayToken).
+  (StateBased concurrency). No wire replay token: Microsoft
+  documents JSON-batch `id` as per-batch correlation and
+  `client-request-id` as debugging/support correlation; neither
+  is a dedup primitive. Engine read-back guard handles
+  ambiguous transport failure.
 - `close()` -> end EWS streaming subscription where in use.
 
-Capabilities: `cursor_freshness = ServerIssued`,
-`delta_token_expires_after = Some(30 days)`,
+Capabilities: `cursor_freshness = Hybrid` (first inventory is a
+full sync; subsequent deltas are server-issued and cheap),
+`delta_token_expires_after = None` (Microsoft documents delta
+token lifetime as not fixed — depends on server-internal cache;
+expiry is an event, not a budget),
 `blob_range = Conditional`,
 `push_in_process` depends on subscription type,
 `mutation.concurrency = StateBased`,
-`mutation.replay_safety = ReplayToken`,
+`mutation.replay_safety = None`,
 `batching_policy = { max_items: 20, max_wait: 100ms,
 flush_on_input_close: true }`.
+
+`establish_initial_cursor(scope)` returns
+`EstablishViaInventory` for every Graph scope. There is no
+"delta from now" API on Graph; the initial delta call IS the
+full folder sync, which is `inventory_stream`'s job.
 
 **Thread id quirks.** Graph's `conversationId` is per-tenant unique
 but can change on resubmit; `conversationIndex` encodes position in
@@ -718,3 +874,16 @@ Types referenced from this document and defined elsewhere:
   Graph webhooks) feeds events into the engine. Exact API of the
   sink (push channel, queue, callback?) needs spec in `sync-
   engine.md` before consumers wire receivers.
+- **Out-of-process subscription-health surfacing.** `push_stream`
+  CAN carry `Disconnected` / `Reconnected` for out-of-process
+  paths (Gmail Pub/Sub, Graph webhooks) when the protocol crate
+  detects sustained renewal failure, but a v1 impl may yield
+  nothing. Engine policy on how to react (downgrade to poll-only?
+  surface a Warning to the consumer? both?) needs pinning before
+  consumers depend on the signal. Cross-protocol concern.
+- **`MutationReplaySafety::ReplayToken` is reserved but unused.**
+  No protocol today implements it on the wire. The enum variant
+  stays in the trait for forward-compatibility (a future Google or
+  Microsoft API surface might document a real dedup primitive),
+  but every current protocol declares `None` and relies on the
+  engine's read-back guard.

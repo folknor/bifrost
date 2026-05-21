@@ -41,7 +41,10 @@ crates/sync/
   - mutation/
     - mod.rs                // mutation pipeline entry
     - idempotency.rs        // IdempotencyKey vending, run_id persistence
-    - readback.rs           // post-retry read-back guard for IMAP
+    - readback.rs           // post-retry read-back guard;
+                          // applies to every protocol today
+                          // (all four declare
+                          // MutationReplaySafety::None)
     - fanout.rs             // cross-account bulk_set_flags composition
   - cursor/
     - mod.rs                // cursor envelope + persistence shim
@@ -315,23 +318,33 @@ in a row, its interval doubles (max 30 minutes). This per-scope
 backoff is held in a `HashMap<CursorScope, AdaptiveCadence>` on
 the multiplexer.
 
-### IMAP non-QRESYNC fusion
+### Inventory-fusion (establish-via-inventory)
 
-When `AccountCapabilities::inventory_is_change_cursor_establish`
-is true (IMAP Basic/CONDSTORE-only), the multiplexer fuses
-inventory and cursor establishment:
+The multiplexer's cursor-establishment path is governed by
+`Account::establish_initial_cursor(scope)` (per
+`plans/account-trait.md` -> Cursor establishment), called
+per-scope on first attach. Two cases:
 
-1. `inventory_stream(scope)` is the cursor establishment baseline.
-   Its terminal `Batch` carries the `ChangeCursor` for that scope
-   inside the page boundary.
-2. The multiplexer registers the cursor in `CursorRegistry` only
-   on inventory completion (the `Done` event).
-3. Subsequent `changes_stream(cursor)` calls work as on
-   QRESYNC paths.
+1. **`CursorEstablishment::EstablishViaInventory`** (Graph all
+   scopes, IMAP-Basic / IMAP-CONDSTORE-only folders). The
+   multiplexer fuses inventory and cursor establishment:
+   - `inventory_stream(scope)` is the cursor-establishment
+     pass. Its terminal `Batch` carries the `ChangeCursor` for
+     that scope inside the page boundary.
+   - The multiplexer registers the cursor in `CursorRegistry`
+     only on inventory completion (the `Done` event).
+   - Subsequent `changes_stream(cursor)` calls drive incremental
+     deltas cheaply.
+2. **`CursorEstablishment::Ready(cursor)`** (JMAP all scopes,
+   Gmail Account scope, IMAP-QRESYNC folders). The cursor is
+   already minted (factory-cached or one cheap probe). The
+   multiplexer registers it immediately and starts both
+   `changes_stream(cursor)` and `inventory_stream(scope)` in
+   parallel; inventory runs underneath as backfill.
 
-On QRESYNC and JMAP/Gmail/Graph, the inventory pass is decoupled
-- the cursor is established cheaply on first `changes_stream`
-call, and inventory runs underneath as backfill.
+Per-scope decision, not per-account. An IMAP account with one
+QRESYNC folder + one Basic-downgraded folder runs both paths
+concurrently, each on its own folder.
 
 ### Output funnel
 
@@ -405,28 +418,30 @@ client_now`, and offsets time-windowed partition edges by
 
 ### Interleaving with live changes
 
-Two regimes per `AccountCapabilities::
-inventory_is_change_cursor_establish`:
+Two regimes per `CursorEstablishment` (returned from
+`Account::establish_initial_cursor(scope)`):
 
-- **Cheap-cursor protocols (JMAP, Gmail, Graph, IMAP QRESYNC).**
-  Cursor establishment is O(1) (server-issued state token).
-  `changes_stream` starts immediately on account attach. The
-  backfill orchestrator submits the first partition to the lane
-  selected by `Control::priority(p)`. Live changes stream
-  through the multiplexer in parallel. When the backfill runner
-  observes an `ObjectChange::Updated` for an item it has not yet
-  hydrated, it drops the corresponding inventory entry on the
-  floor; the live stream supersedes it. When it observes
+- **`Ready(cursor)` scopes (JMAP all scopes, Gmail Account,
+  IMAP-QRESYNC folders).** Cursor is minted cheaply.
+  `changes_stream(cursor)` starts immediately on account attach.
+  The backfill orchestrator submits the first inventory partition
+  to the lane selected by `Control::priority(p)`. Live changes
+  stream through the multiplexer in parallel. When the backfill
+  runner observes an `ObjectChange::Updated` for an item it has
+  not yet hydrated, it drops the corresponding inventory entry on
+  the floor; the live stream supersedes it. When it observes
   `ObjectChange::Created` for an item it has not yet seen, the
   runner notes the id in a `LiveSupersedes` set; on hitting that
   id during backfill, it skips.
-- **Expensive-cursor protocols (IMAP Basic/CONDSTORE-only).**
-  Backfill's first partition pass *is* the cursor establishment
-  for that folder. Live tracking starts only when the first
-  partition completes and the cursor is registered. Other folders
-  may already have live tracking running (cursor establishment is
-  per-folder on IMAP). This is the asymmetry called out in
-  `sync-engine.md` and `account-trait.md`.
+- **`EstablishViaInventory` scopes (Graph all scopes,
+  IMAP-Basic and IMAP-CONDSTORE-only folders).** Inventory's
+  walk IS the cursor establishment for that scope. Live
+  tracking starts only when inventory completes and the cursor
+  from its terminal `Done` is registered. Other scopes on the
+  same account may already have live tracking running because
+  establishment is per-scope. This is the asymmetry called out
+  in `sync-engine.md` and `account-trait.md` -> Cursor
+  establishment.
 
 The runner persists `BackfillCheckpoint` at every partition
 boundary (a `Batch` with `checkpoint: Some(..)`) via
@@ -593,15 +608,16 @@ batch upstream and tracks aggregate counters on the campaign:
 
 `pending_retry` items live on a per-campaign retry queue. On
 transient failure (`RecoveryClass::Retry { after }`), the
-mutation runner sleeps for `after`, then re-submits the same
-`IdempotencyKey` (sequence reused). The protocol crate honors
-replay-safety via its native token where available; the engine's
-read-back guard handles the rest.
+mutation runner sleeps for `after`, then re-submits the batch
+with the same `IdempotencyKey` (sequence reused) for engine-side
+correlation. No protocol crate today emits the key on the wire as
+a dedup token; all four declare `MutationReplaySafety::None`. The
+engine's read-back guard (next section) is therefore the
+universal disambiguation step after retry.
 
 ### Read-back guard
 
-For `MutationReplaySafety::None` (IMAP today), the engine
-post-retry runs:
+For `MutationReplaySafety::None`, the engine post-retry runs:
 
 ```text
 for batch in retried_batches {
@@ -620,9 +636,35 @@ for batch in retried_batches {
 }
 ```
 
-This is the IMAP-specific path. JMAP / Gmail / Graph skip the
-read-back entirely because their replay-safety primitives prevent
-double-apply at the wire.
+**Applies to all four protocols today.** None of JMAP, Gmail,
+Graph, or IMAP has a documented client-mintable replay token on
+the wire:
+
+- **JMAP**: `ifInState` is optimistic concurrency, not replay
+  protection. A `StateMismatch` on retry can fire for any
+  unrelated state change.
+- **Gmail**: Google's REST docs do not document
+  `X-Goog-Request-Id` (or any other header) as a Gmail-side
+  dedup primitive for `messages.modify` /
+  `messages.batchModify` / `messages.batchDelete`. Cloud-API
+  conventions from other Google products do not transfer.
+- **Graph**: Microsoft documents JSON-batch `id` as per-batch
+  request/response correlation only, and `client-request-id` as
+  debugging/support correlation (per the dev-proxy
+  troubleshooting docs). Neither is a dedup primitive.
+- **IMAP**: No native replay token. `STORE UNCHANGEDSINCE` is
+  optimistic concurrency, separate from idempotency.
+
+The read-back guard is the universal safety net. The prior
+"JMAP / Gmail / Graph skip read-back" claim was based on
+incorrect attribution of replay-token semantics to those
+protocols' debugging or correlation primitives and has been
+removed.
+
+If a future protocol surface lands a real client-mintable dedup
+token (`MutationReplaySafety::ReplayToken` is reserved in the
+trait enum for this), the engine can skip read-back for it. No
+protocol qualifies today.
 
 ### Cross-account fanout
 

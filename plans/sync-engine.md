@@ -482,16 +482,22 @@ Two orthogonal mutation concerns, distinguished by capability:
   `ifInState`, Graph `If-Match: <etag>`, IMAP `STORE UNCHANGEDSINCE`.
   The mutation fails if the state has advanced; the consumer must
   re-read and retry.
-- **Replay safety** (`MutationReplaySafety::ReplayToken`) prevents
-  double-apply on transient-failure retry: Gmail
-  `X-Goog-Request-Id`, Graph batch request-id. The server dedupes
-  exact retries on the token.
+- **Replay safety** (`MutationReplaySafety::ReplayToken`) is a
+  trait-level concept reserved for a future protocol that
+  documents a real client-mintable dedup primitive. **No current
+  protocol qualifies.** Microsoft's `client-request-id` is
+  debugging correlation; Google's `X-Goog-Request-Id` is not
+  documented as a Gmail-side dedup token; JMAP has none; IMAP has
+  none. All four protocols declare `MutationReplaySafety::None`
+  and the engine reads back affected items after retry. The prior
+  claim that Gmail / Graph had real wire replay tokens was wrong.
 
 `IdempotencyKey` (defined in `plans/account-trait.md`) is engine
-bookkeeping that compiles to a `ReplayToken` where the protocol
-supports it, otherwise the engine reads back affected items after
-retry. Partial-success surfaces let the consumer recover from "12
-of 5000 failed."
+bookkeeping for retry-queue dedup and campaign correlation; it
+never compiles to a wire header today. The engine's read-back
+guard (`plans/bifrost-sync.md` -> Read-back guard) is the
+universal disambiguation step after retry. Partial-success
+surfaces let the consumer recover from "12 of 5000 failed."
 
 SMTP bulk send (mailing lists, scheduled sends, retry queues) has
 the same shape but is out of scope for v1. Send remains request /
@@ -526,11 +532,17 @@ Internally:
 On IMAP without QRESYNC, change-cursor baseline establishment is
 itself an inventory pass: `UID FETCH 1:* (FLAGS MODSEQ RFC822.SIZE
 ...)` produces both the cursor anchor and the per-message
-fingerprints for the diff. The capability flag
-`inventory_is_change_cursor_establish` signals this fusion. The
-engine schedules differently when it is true: the "start cheap,
-backfill underneath" pattern does not apply because the cheap-start
-step does not exist.
+fingerprints for the diff. Graph delta is similar: the initial
+delta call without a token paginates a full folder sync before
+yielding `@odata.deltaLink`. Both surface as
+`CursorEstablishment::EstablishViaInventory` from
+`Account::establish_initial_cursor(scope)` — the engine schedules
+inventory first and reads the cursor out of its terminal `Done`,
+because the cheap-start step does not exist. Per
+`plans/account-trait.md` -> Cursor establishment, this is a
+per-scope decision: an IMAP account can mix QRESYNC folders
+(`Ready(cursor)`) with Basic-downgraded folders
+(`EstablishViaInventory`).
 
 The same multiplexer handles cross-protocol cases: JMAP push +
 per-type cursor, Gmail watch + history list, Graph subscriptions +
