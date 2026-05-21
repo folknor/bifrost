@@ -53,7 +53,7 @@ Per protocol:
 - **Graph.** `CursorScope::FolderType { folder, ty }` (finer than
   membership); `MembershipScope::Folder(_)`.
 
-`ChangeCursor<S>` carries `CursorScope`. `ScopeChange` and
+`ChangeCursor` carries `CursorScope`. `ScopeChange` and
 `InventoryEntry::memberships: Vec<MembershipScope>` carry
 `MembershipScope`. The engine multiplexes one `changes_stream` per
 cursor scope; tracks per-object membership across membership scopes
@@ -61,93 +61,124 @@ to derive `Destroyed` (engine cannot see scopes the consumer does
 not sync, which is the correct level of fallibility).
 
 ```rust
-struct ChangeCursor<S> {
+struct ChangeCursor {
     scope: CursorScope,
-    server_state: S,                          // opaque to engine
+    server_state: OpaqueChangeState,          // protocol-owned, tagged
     advanced_through: Option<OpaqueProgressBytes>,  // protocol-owned
     envelope_version: u32,
+}
+
+// Concrete opaque cursor state. `protocol` and `envelope_version`
+// let the protocol impl reject a cursor that was minted for a
+// different protocol or an older schema. See plans/account-trait-
+// shape.md (Q1).
+struct OpaqueChangeState {
+    protocol: ProtocolKind,
+    envelope_version: u32,
+    bytes: Vec<u8>,
 }
 ```
 
 ## The trait surface
 
-```rust
-trait Account: Send + Sync {
-    type ChangeState: Send + Sync;
+The trait is dyn-safe by construction: all stream and future
+returns are erased through type aliases, the cursor state is a
+concrete tagged blob rather than an associated type, and `close`
+takes `&self` so it composes with `Arc<dyn Account>`. Rationale
+and full erasure list in `plans/account-trait-shape.md` (Q1).
 
+```rust
+type AccountStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
+type AccountFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+trait Account: Send + Sync {
     fn capabilities(&self) -> &AccountCapabilities;
 
     // Cursor introspection. Account-aware because cost depends on
     // capability state, not the cursor in isolation.
-    fn describe_cursor(&self, cursor: &ChangeCursor<Self::ChangeState>)
+    fn describe_cursor(&self, cursor: &ChangeCursor)
         -> CursorDescriptor;
 
     // Cursor-scope discovery: what scopes does the engine multiplex
     // changes_stream over? Bounded, terminates with Done.
     fn discover_cursor_scopes(&self)
-        -> impl Stream<Item = SyncEvent<Batch<CursorScope>>>;
+        -> AccountStream<SyncEvent<Batch<CursorScope>>>;
 
     // Membership-scope discovery: what containers (folders, labels,
     // mailboxes, queries) can the consumer ask about? Bounded.
     fn discover_memberships(&self)
-        -> impl Stream<Item = SyncEvent<Batch<MembershipScope>>>;
+        -> AccountStream<SyncEvent<Batch<MembershipScope>>>;
 
     // Ongoing scope lifecycle.
     fn scope_lifecycle_stream(&self)
-        -> impl Stream<Item = ScopeLifecycle>;
+        -> AccountStream<ScopeLifecycle>;
 
     // Inventory: projection-only cold-start primitive.
     fn inventory_stream(&self, scope: CursorScope)
-        -> impl Stream<Item = SyncEvent<Batch<InventoryEntry>>>;
+        -> AccountStream<SyncEvent<Batch<InventoryEntry>>>;
 
     // Hydrate: fetch known ids at a chosen projection.
     fn get_stream(
         &self,
-        ids: impl Stream<Item = ObjectId> + Send,
+        ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> impl Stream<Item = SyncEvent<Batch<HydratedObject>>>;
+    ) -> AccountStream<SyncEvent<Batch<HydratedObject>>>;
 
     // Post-cursor diff.
     fn changes_stream(
         &self,
-        cursor: ChangeCursor<Self::ChangeState>,
-    ) -> impl Stream<Item = SyncEvent<Batch<Change>>>;
+        cursor: ChangeCursor,
+    ) -> AccountStream<SyncEvent<Batch<Change>>>;
 
     // Push subscription CRUD. Creates / destroys the server-side hook.
-    async fn push_subscribe(&self, scopes: &[CursorScope])
-        -> Result<SubscriptionHandle, Error>;
-    async fn push_unsubscribe(&self, handle: SubscriptionHandle)
-        -> Result<(), Error>;
+    fn push_subscribe(&self, scopes: &[CursorScope])
+        -> AccountFuture<Result<SubscriptionHandle, Error>>;
+    fn push_unsubscribe(&self, handle: SubscriptionHandle)
+        -> AccountFuture<Result<(), Error>>;
 
     // In-process event stream. IMAP IDLE / JMAP WebSocket deliver
     // here. Gmail Pub/Sub and Graph webhooks deliver out-of-process;
     // the engine wires those via InvalidationSink (see sync-engine.md).
-    fn push_stream(&self) -> impl Stream<Item = WatchEvent>;
+    fn push_stream(&self) -> AccountStream<WatchEvent>;
 
     // Blobs.
     fn open_blob(&self, handle: BlobHandle)
-        -> impl Stream<Item = SyncEvent<Bytes>>;
+        -> AccountStream<SyncEvent<Bytes>>;
     fn open_blob_range(&self, handle: BlobHandle, range: ByteRange)
-        -> impl Stream<Item = SyncEvent<Bytes>>;
+        -> AccountStream<SyncEvent<Bytes>>;
 
     // Mutations. Streaming input so engine-driven mutation pipelines
     // ("for each item in inventory, set this flag") backpressure
     // cleanly. Consumers with a static list adapt via
-    // `stream::iter(vec)`. The protocol crate batches the stream
-    // per BatchingPolicy from its capabilities.
+    // `stream::iter(vec).boxed()`. The protocol crate batches the
+    // stream per BatchingPolicy from its capabilities.
     fn bulk_set_flags(
         &self,
-        targets: impl Stream<Item = ObjectId> + Send,
+        targets: AccountStream<ObjectId>,
         flags: FlagSet,
         op: FlagOp,
         key: IdempotencyKey,
-    ) -> impl Stream<Item = SyncEvent<Batch<MutationResult>>>;
+    ) -> AccountStream<SyncEvent<Batch<MutationResult>>>;
     fn bulk_move(&self, ...) -> ...;
     fn bulk_destroy(&self, ...) -> ...;
 
-    // Graceful shutdown. IMAP LOGOUT, JMAP WebSocket close,
-    // Graph subscription cancellation. Required, not Drop-and-hope.
-    async fn close(self) -> Result<(), Error>;
+    // Graceful local-handle teardown. IMAP LOGOUT + pool drain,
+    // JMAP WebSocket close, Graph subscription stream end, local
+    // worker shutdown. Idempotent: takes &self so it composes with
+    // Arc<dyn Account>; safe to call more than once. Does NOT
+    // destroy durable server-side push subscriptions - those go
+    // through push_unsubscribe explicitly. See
+    // plans/account-trait-shape.md (Q3).
+    fn close(&self) -> AccountFuture<Result<(), Error>>;
+}
+
+// Engine-facing factory. Consumers register one per account so the
+// engine can perform reopen cycles (capability change, transport
+// reset) without knowing protocol config. The engine owns the
+// current open Arc<dyn Account> and calls open() when it needs a
+// fresh one. See plans/account-trait-shape.md (Q3).
+trait AccountFactory: Send + Sync + 'static {
+    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, Error>>;
 }
 
 struct ByteRange {
@@ -663,10 +694,6 @@ Types referenced from this document and defined elsewhere:
 
 ## Open questions
 
-- **Dispatch shape.** `dyn Account` for engine internals or
-  generics all the way? Hybrid: generic per-Account, `dyn` for the
-  multi-protocol selector (one user with JMAP + IMAP fallback for
-  the same mailbox).
 - **Scope discovery cache TTL.** Cost ranges O(1) (Gmail) to
   O(folders x types) (Graph). Engine caches the result; cache TTL
   needs spec.
@@ -681,9 +708,12 @@ Types referenced from this document and defined elsewhere:
   in FETCH responses, which `imap-proto` does not currently parse.
   Adding it unlocks IMAP `MutationConcurrency::StateBased`. See
   `plans/imap/condstore-qresync.md`.
-- **`Account: Send + Sync` vs interior mutability.** IMAP sessions
-  are stateful and not trivially `Sync`. Either wrap the session in
-  `Mutex` internally or relax the trait bound. Lean internal mutex.
+- **Account lifecycle and ownership.** Resolved in
+  `plans/account-trait-shape.md` (Q3). Consumer registers an
+  `AccountFactory` per account, engine owns the current open
+  `Arc<dyn Account>` and calls `factory.open()` for reopen cycles,
+  `close(&self)` is idempotent local handle teardown only (does
+  not destroy server-side push subscriptions).
 - **`InvalidationSink` shape.** Out-of-process push (Gmail Pub/Sub,
   Graph webhooks) feeds events into the engine. Exact API of the
   sink (push channel, queue, callback?) needs spec in `sync-
