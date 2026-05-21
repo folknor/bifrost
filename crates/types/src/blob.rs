@@ -44,6 +44,7 @@ pub enum BlobEncoding {
     Raw7Bit,
     Raw8Bit,
     Base64,
+    Base64Url,
     QuotedPrintable,
 }
 

@@ -197,6 +197,14 @@ async fn apply_destroy(
     };
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
         Ok(()) => MutationApply::Batch(applied(ids)),
+        Err(error) if is_batch_delete_scope_failure(&error) => {
+            let fallback = LabelPatch {
+                add_label_ids: vec!["TRASH".to_string()],
+                remove_label_ids: vec!["INBOX".to_string()],
+                unsupported_flags: Vec::new(),
+            };
+            apply_label_patch(client, ids, fallback, key).await
+        }
         Err(error) => mutation_error(ids, error),
     }
 }
@@ -255,7 +263,11 @@ fn move_patch(destination: &MembershipScope) -> LabelPatch {
     match destination {
         MembershipScope::Label(LabelId(label_id)) => LabelPatch {
             add_label_ids: vec![label_id.clone()],
-            remove_label_ids: vec!["INBOX".to_string()],
+            remove_label_ids: if label_id.eq_ignore_ascii_case("INBOX") {
+                Vec::new()
+            } else {
+                vec!["INBOX".to_string()]
+            },
             unsupported_flags: Vec::new(),
         },
         _ => LabelPatch {
@@ -284,26 +296,36 @@ async fn post_empty_json<B: Serialize>(
     body: &B,
     key: &IdempotencyKey,
 ) -> crate::Result<()> {
-    debug_assert!(idempotency::wire_idempotency_headers(key).is_empty());
     let url = if path.starts_with('/') {
         format!("{}{}", client.api_base(), path)
     } else {
         format!("{}/{}", client.api_base(), path)
     };
     let access_token = client.access_token().await;
-    let response = client
+    let mut request = client
         .http_client()
         .post(url)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .map_err(GmailError::from)?;
+        .json(body);
+    for (name, value) in idempotency::wire_idempotency_headers(key) {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await.map_err(GmailError::from)?;
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
     let body = response.text().await.map_err(GmailError::from)?;
     Err(GmailError::status("Gmail API", status, body))
+}
+
+fn is_batch_delete_scope_failure(error: &GmailError) -> bool {
+    matches!(
+        error,
+        GmailError::HttpStatus {
+            status,
+            ..
+        } if *status == reqwest::StatusCode::FORBIDDEN
+    )
 }

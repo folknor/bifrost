@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
+    AccountStream, Batch, Checkpoint, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
     InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary, Projection, RecoveryClass,
     ServerVersion, SyncEvent, ThreadId,
 };
@@ -16,6 +16,7 @@ use crate::headers::find_header_value_case_insensitive;
 use crate::types::{GmailHeader, GmailLabel, GmailMessage};
 
 use super::blobs;
+use super::cursor::cursor_for_history;
 use super::flags;
 use super::recovery;
 use super::scopes::{ScopeCache, snapshot};
@@ -52,73 +53,92 @@ pub(crate) fn inventory_stream(
         ]));
     }
 
-    let state = InventoryState {
-        client,
-        cache,
-        page_token: None,
-        finished: false,
-        emitted_done: false,
-    };
+    Box::pin(async_stream::stream! {
+        let mut page_token = None;
 
-    Box::pin(stream::unfold(state, |mut state| async move {
-        if state.finished {
-            if state.emitted_done {
-                return None;
-            }
-            state.emitted_done = true;
-            return Some((SyncEvent::Done(None), state));
-        }
+        loop {
+            let started = Instant::now();
+            let page = match list_messages_page(&client, page_token.as_deref()).await {
+                Ok(page) => page,
+                Err(error) => {
+                    let recovery = recovery::classify_general_error(&error);
+                    yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                    return;
+                }
+            };
 
-        let started = Instant::now();
-        match list_messages_page(&state.client, state.page_token.as_deref()).await {
-            Ok(page) => {
-                let labels = snapshot(&state.cache).labels;
-                let mut items = Vec::with_capacity(page.messages.len());
-                for stub in page.messages {
-                    match state.client.get_message(&stub.id, "metadata").await {
-                        Ok(message) => items.push(inventory_entry_from_message(&message, &labels)),
-                        Err(error) => {
-                            let recovery = recovery::classify_general_error(&error);
-                            state.finished = true;
-                            state.emitted_done = true;
-                            return Some((
-                                SyncEvent::Fatal(recovery::fatal_for_error(error, recovery)),
-                                state,
-                            ));
+            let final_page = page.next_page_token.is_none();
+            let labels = Arc::new(snapshot(&cache).labels);
+            let mut hydrated = stream::iter(page.messages.into_iter().map(|stub| {
+                let client = Arc::clone(&client);
+                let labels = Arc::clone(&labels);
+                async move {
+                    client
+                        .get_message(&stub.id, "metadata")
+                        .await
+                        .map(|message| inventory_entry_from_message(&message, labels.as_slice()))
+                }
+            }))
+            .buffer_unordered(HYDRATE_BATCH_SIZE);
+
+            let mut items = Vec::with_capacity(HYDRATE_BATCH_SIZE);
+            while let Some(result) = hydrated.next().await {
+                match result {
+                    Ok(item) => {
+                        items.push(item);
+                        if items.len() >= HYDRATE_BATCH_SIZE {
+                            let out = std::mem::take(&mut items);
+                            yield SyncEvent::Batch(Batch {
+                                items: out,
+                                page_boundary: PageBoundary::Page,
+                                server_latency: started.elapsed(),
+                                bytes_in: 0,
+                                checkpoint: None,
+                            });
                         }
                     }
+                    Err(error) => {
+                        let recovery = recovery::classify_general_error(&error);
+                        yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                        return;
+                    }
                 }
-                let final_page = page.next_page_token.is_none();
-                state.page_token = page.next_page_token;
-                if final_page {
-                    state.finished = true;
-                }
-                Some((
-                    SyncEvent::Batch(Batch {
+            }
+
+            if final_page {
+                let checkpoint = match inventory_checkpoint(&client).await {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        let recovery = recovery::classify_general_error(&error);
+                        yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                        return;
+                    }
+                };
+                if !items.is_empty() {
+                    yield SyncEvent::Batch(Batch {
                         items,
-                        page_boundary: if final_page {
-                            PageBoundary::Final
-                        } else {
-                            PageBoundary::Page
-                        },
+                        page_boundary: PageBoundary::Final,
                         server_latency: started.elapsed(),
                         bytes_in: 0,
-                        checkpoint: None,
-                    }),
-                    state,
-                ))
+                        checkpoint: checkpoint.clone(),
+                    });
+                }
+                yield SyncEvent::Done(checkpoint);
+                break;
             }
-            Err(error) => {
-                let recovery = recovery::classify_general_error(&error);
-                state.finished = true;
-                state.emitted_done = true;
-                Some((
-                    SyncEvent::Fatal(recovery::fatal_for_error(error, recovery)),
-                    state,
-                ))
+
+            if !items.is_empty() {
+                yield SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Page,
+                    server_latency: started.elapsed(),
+                    bytes_in: 0,
+                    checkpoint: None,
+                });
             }
+            page_token = page.next_page_token;
         }
-    }))
+    })
 }
 
 pub(crate) fn get_stream(
@@ -189,14 +209,6 @@ pub(crate) fn get_stream(
     }))
 }
 
-struct InventoryState {
-    client: Arc<GmailClient>,
-    cache: ScopeCache,
-    page_token: Option<String>,
-    finished: bool,
-    emitted_done: bool,
-}
-
 struct HydrateState {
     client: Arc<GmailClient>,
     cache: ScopeCache,
@@ -216,6 +228,17 @@ async fn list_messages_page(
         path.push_str(&urlencoding::encode(page_token));
     }
     client.get(&path).await
+}
+
+async fn inventory_checkpoint(client: &GmailClient) -> crate::Result<Option<Checkpoint>> {
+    let profile = client.get_profile().await?;
+    let history_id = profile.history_id.parse::<u64>().map_err(|error| {
+        crate::Error::MalformedPayload(format!("gmail profile carried invalid history id: {error}"))
+    })?;
+    Ok(Some(Checkpoint::Change(cursor_for_history(
+        history_id,
+        &profile.email_address,
+    ))))
 }
 
 async fn hydrate_one(

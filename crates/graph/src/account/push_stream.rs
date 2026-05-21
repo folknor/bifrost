@@ -8,15 +8,24 @@ pub(crate) fn push_stream(account: GraphAccount) -> AccountStream<WatchEvent> {
         PushMode::GraphSubscriptions => Box::pin(stream::empty()),
         PushMode::EwsStreaming => {
             let receiver = account.push_tx.subscribe();
-            Box::pin(stream::unfold(receiver, |mut receiver| async move {
-                loop {
-                    match receiver.recv().await {
-                        Ok(event) => return Some((event, receiver)),
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            let shutdown = account.shutdown.clone();
+            Box::pin(stream::unfold(
+                (receiver, shutdown),
+                |(mut receiver, shutdown)| async move {
+                    loop {
+                        tokio::select! {
+                            () = shutdown.cancelled() => return None,
+                            result = receiver.recv() => {
+                                match result {
+                                    Ok(event) => return Some((event, (receiver, shutdown))),
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                                }
+                            }
+                        }
                     }
-                }
-            }))
+                },
+            ))
         }
     }
 }

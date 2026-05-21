@@ -13,6 +13,7 @@ use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
 use super::GraphAccount;
 use super::error::{fatal_from_recovery, graph_error_to_fatal, mutation_outcome_for_status};
 use super::get::folder_destination;
+use super::inventory::graph_etag;
 
 enum MutationKind {
     SetFlags(FlagOp),
@@ -107,11 +108,15 @@ async fn submit_batch(
         return Ok(Vec::new());
     }
 
-    let etags = account.etag_index.read().await;
+    let mut etags = account.etag_index.read().await.clone();
+    let mut results = refresh_missing_etags(account, ids, kind, &mut etags).await;
     let mut preflight = Vec::new();
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
     for id in ids {
+        if requires_etag(kind) && !etags.contains_key(&id.0) {
+            continue;
+        }
         let Some(request) = request_for_mutation(account, id, kind, &etags)? else {
             preflight.push(MutationResult {
                 id: id.clone(),
@@ -122,9 +127,8 @@ async fn submit_batch(
         request_ids.push(id.clone());
         requests.push(request);
     }
-    drop(etags);
 
-    let mut results = preflight;
+    results.extend(preflight);
     let mut retry_after = None;
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
@@ -139,7 +143,9 @@ async fn submit_batch(
                 .cloned()
                 .unwrap_or_else(|| ObjectId(item.id.clone()));
             if item.status == 429 {
-                retry_after = Some(Duration::from_secs(30));
+                retry_after = retry_after_from_headers(item.headers.as_ref())
+                    .or(retry_after)
+                    .or(Some(Duration::from_secs(30)));
             }
             results.push(MutationResult {
                 id: id.clone(),
@@ -166,6 +172,65 @@ async fn submit_batch(
         )));
     }
     Ok(events)
+}
+
+async fn refresh_missing_etags(
+    account: &GraphAccount,
+    ids: &[ObjectId],
+    kind: &MutationKind,
+    etags: &mut HashMap<String, String>,
+) -> Vec<MutationResult> {
+    if !matches!(kind, MutationKind::SetFlags(_) | MutationKind::Move(_)) {
+        return Vec::new();
+    }
+
+    let missing = ids
+        .iter()
+        .filter(|id| !etags.contains_key(&id.0))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Vec::new();
+    }
+
+    let prefix = account.client.api_path_prefix();
+    let mut refreshed = Vec::new();
+    let mut failed = Vec::new();
+    for id in missing {
+        let enc_id = urlencoding::encode(&id.0);
+        let path = format!("{prefix}/messages/{enc_id}?$select=id");
+        match account.client.get_json::<Value>(&path).await {
+            Ok(value) => {
+                if let Some(etag) = graph_etag(&value) {
+                    etags.insert(id.0.clone(), etag.clone());
+                    refreshed.push((id.0.clone(), etag));
+                } else {
+                    failed.push(MutationResult {
+                        id,
+                        outcome: MutationOutcome::Failed(Error::Other(
+                            "Graph message did not expose an etag".to_string(),
+                        )),
+                    });
+                }
+            }
+            Err(error) => failed.push(MutationResult {
+                id,
+                outcome: MutationOutcome::Failed(Error::Transport(error)),
+            }),
+        }
+    }
+
+    if !refreshed.is_empty() {
+        let mut cache = account.etag_index.write().await;
+        for (id, etag) in refreshed {
+            cache.insert(id, etag);
+        }
+    }
+    failed
+}
+
+fn requires_etag(kind: &MutationKind) -> bool {
+    matches!(kind, MutationKind::SetFlags(_) | MutationKind::Move(_))
 }
 
 fn request_for_mutation(
@@ -220,6 +285,14 @@ fn request_for_mutation(
             }))
         }
     }
+}
+
+fn retry_after_from_headers(headers: Option<&HashMap<String, String>>) -> Option<Duration> {
+    let value = headers?.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("retry-after")
+            .then_some(value.as_str())
+    })?;
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 pub(crate) fn assign_batch_ids(requests: &mut [BatchRequestItem]) {
@@ -282,6 +355,9 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -305,5 +381,14 @@ mod tests {
         assign_batch_ids(&mut requests);
         assert_eq!(requests[0].id, "0");
         assert_eq!(requests[1].id, "1");
+    }
+
+    #[test]
+    fn retry_after_header_is_read_case_insensitively() {
+        let headers = HashMap::from([("Retry-After".to_string(), "17".to_string())]);
+        assert_eq!(
+            retry_after_from_headers(Some(&headers)),
+            Some(Duration::from_secs(17))
+        );
     }
 }

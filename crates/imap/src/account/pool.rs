@@ -45,6 +45,9 @@ impl Pool {
 
     #[allow(dead_code)]
     pub(crate) async fn checkout(&self) -> Result<PooledConn, Error> {
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let permit = Arc::clone(&self.inner.permits)
             .acquire_owned()
             .await
@@ -79,6 +82,9 @@ impl Pool {
         &self,
         folder: &MailboxName,
     ) -> Result<PooledConn, Error> {
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let permit = Arc::clone(&self.inner.permits)
             .acquire_owned()
             .await
@@ -116,6 +122,9 @@ impl Pool {
     }
 
     pub(crate) async fn dial_idle(&self) -> Result<ImapConnection, Error> {
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
         let (conn, _auth) = self
             .inner
             .config

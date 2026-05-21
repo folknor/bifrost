@@ -29,6 +29,14 @@ pub(crate) enum FolderCursor {
 }
 
 impl FolderCursor {
+    pub(crate) fn uidvalidity(&self) -> u32 {
+        match self {
+            Self::QResync { uidvalidity, .. }
+            | Self::Condstore { uidvalidity, .. }
+            | Self::Basic { uidvalidity, .. } => *uidvalidity,
+        }
+    }
+
     pub(crate) fn known_uids(&self) -> Option<&CompactUidSet> {
         match self {
             Self::Condstore { known_uids, .. } | Self::Basic { known_uids, .. } => Some(known_uids),

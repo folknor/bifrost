@@ -84,27 +84,33 @@ pub(crate) fn push_unsubscribe(
 
 pub(crate) fn push_stream(account: ImapAccount) -> AccountStream<WatchEvent> {
     let mut rx = account.push.tx.subscribe();
+    let shutdown = account.shutdown.clone();
     let (tx, out) = tokio::sync::mpsc::channel(128);
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if tx.send(event).await.is_err() {
-                        break;
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let event = WatchEvent::Invalidated {
+                                hint: InvalidationHint {
+                                    source: PushSource::Coalesced,
+                                    payload: HintPayload::Unknown,
+                                },
+                            };
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let event = WatchEvent::Invalidated {
-                        hint: InvalidationHint {
-                            source: PushSource::Coalesced,
-                            payload: HintPayload::Unknown,
-                        },
-                    };
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

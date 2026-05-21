@@ -208,7 +208,7 @@ impl Account for JmapAccount {
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push::stream(self.ws.tx.subscribe())
+        push::stream(self.ws.tx.subscribe(), self.shutdown.clone())
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {

@@ -336,14 +336,12 @@ impl Consumer for StreamingFetchConsumer {
 /// Item yielded by the VANISHED-aware streaming FETCH consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-#[allow(dead_code)]
 pub(crate) enum FetchStreamItem {
     Fetch(FetchResponse),
     VanishedEarlier(Vec<UidRange>),
 }
 
 /// Bounded streaming consumer for UID FETCH CHANGEDSINCE VANISHED.
-#[allow(dead_code)]
 pub(crate) struct BoundedStreamingFetchVanishedConsumer {
     pipe: BoundedStreamingPipe<FetchStreamItem>,
     requested_set: Option<ParsedUidSet>,
@@ -351,7 +349,6 @@ pub(crate) struct BoundedStreamingFetchVanishedConsumer {
     buffered: Vec<UntaggedResponse>,
 }
 
-#[allow(dead_code)]
 impl BoundedStreamingFetchVanishedConsumer {
     pub(crate) fn new(
         tx: tokio::sync::mpsc::Sender<Result<FetchStreamItem, Error>>,

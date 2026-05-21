@@ -121,7 +121,7 @@ fn collect_blob_handles(message_id: &str, part: &GmailPayload, handles: &mut Vec
                 supports_range: false,
                 supports_parallel: false,
                 digest_available_pre_download: false,
-                encoding: BlobEncoding::Base64,
+                encoding: BlobEncoding::Base64Url,
             },
         });
     }
@@ -217,7 +217,7 @@ mod tests {
                 supports_range: false,
                 supports_parallel: false,
                 digest_available_pre_download: false,
-                encoding: BlobEncoding::Base64,
+                encoding: BlobEncoding::Base64Url,
             },
         };
 

@@ -18,6 +18,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+async-stream = "0.3"
 base64 = { workspace = true }
 bifrost-types = { path = "../types" }
 blake3 = { workspace = true }

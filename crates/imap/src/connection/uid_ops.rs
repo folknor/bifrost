@@ -144,6 +144,58 @@ impl ImapConnection {
         .map_err(|_| Error::Timeout)?
     }
 
+    /// UID FETCH with CHANGEDSINCE and VANISHED as a bounded stream.
+    ///
+    /// This has the same wire semantics as [`uid_fetch_vanished`], but
+    /// backpressures before reading more responses so a large
+    /// `VANISHED (EARLIER)` set is not buffered behind the caller.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn uid_fetch_vanished_stream<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        mod_seq: u64,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<dispatch::FetchStreamItem, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.require_state(&[SessionState::Selected])?;
+        self.validate_requested_fetch_items(items)?;
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        {
+            let snap = self.state_rx.borrow();
+            if !snap.enabled.iter().any(|e| e == "QRESYNC") {
+                return Err(Error::MissingCapability("QRESYNC (not ENABLEd)".into()));
+            }
+        }
+        let parsed_set = ParsedUidSet::new(sequence_set);
+        let (tx, rx) = tokio::sync::mpsc::channel(DEFAULT_FETCH_STREAM_CAPACITY);
+        let cmd = Command::UidFetch {
+            sequence_set: sequence_set.clone(),
+            items: format_fetch_attrs(items),
+            changed_since: Some(mod_seq),
+            vanished: true,
+        };
+        let fut = async move {
+            tokio::time::timeout(
+                timeout,
+                self.submit_streaming(
+                    cmd,
+                    dispatch::BoundedStreamingFetchVanishedConsumer::new(tx, parsed_set),
+                ),
+            )
+            .await
+            .map_err(|_| Error::Timeout)?
+        };
+        Ok((rx, fut))
+    }
+
     /// UID FETCH streaming (RFC 3501 Section 6.4.5).
     ///
     /// Returns a bounded receiver and the driver-side future that must be

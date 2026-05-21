@@ -294,6 +294,8 @@ pub struct BatchRequest {
 pub struct BatchResponseItem {
     pub id: String,
     pub status: u16,
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
     pub body: Option<serde_json::Value>,
 }
 

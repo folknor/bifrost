@@ -34,7 +34,8 @@ pub(crate) use auth::{
 #[cfg(test)]
 pub(crate) use fetch::StreamingFetchConsumer;
 pub(crate) use fetch::{
-    BoundedStreamingFetchConsumer, FetchConsumer, FetchVanishedConsumer, StoreConsumer,
+    BoundedStreamingFetchConsumer, BoundedStreamingFetchVanishedConsumer, FetchConsumer,
+    FetchStreamItem, FetchVanishedConsumer, StoreConsumer,
 };
 pub(crate) use list::{
     ListConsumer, ListExtendedConsumer, ListStatusConsumer, LsubConsumer, StatusConsumer,

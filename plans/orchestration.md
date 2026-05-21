@@ -100,19 +100,170 @@ remain alongside them.
 
 ## Outstanding work
 
-Two tracks remain before the engine drives the four Account
-impls end-to-end.
-
 - **Close P2-A2: CONDSTORE/QRESYNC.** Implement
   `STORE UNCHANGEDSINCE` and the QRESYNC resync path in
   `crates/imap/`, then flip IMAP's advertised mutation
   concurrency from `None` to the appropriate non-`None` value.
   Spec lives in `plans/imap/condstore-qresync.md`.
-- **Phase 3: Reconcile and validate.** Wire `bifrost-sync`
-  against the four `Account` impls under unit tests (no live
-  servers per `AGENTS.md`). Workspace-wide `brokkr check`
-  cleanup. Update `reference/{jmap,imap,gmail,graph}.md` to
-  describe the new account-layer code.
+- **Phase 3: Reconcile and validate.** Round out per-protocol
+  conformance tests, add a minimal cross-crate conformance
+  assertion in `bifrost-sync`, write `reference/{jmap,imap,
+  gmail,graph}.md` to describe the account-layer code, and
+  clean `brokkr check` workspace-wide. Full spec under
+  **Phase 3** below.
+- **Phase 4: Error model convergence.** Reconcile the
+  per-crate error stories (rich `Response`-carrying variants in
+  `bifrost-smtp`, separate models in `bifrost-jmap` and
+  `bifrost-imap`) into a shared shape that gives ratatoskr a
+  unified error-handling pattern. The open question framing
+  lives in `plans/error-model-convergence.md`; that doc needs
+  to be expanded into an agent brief (decision + file
+  ownership + exit criteria) before launch.
+
+## Reference material
+
+`research/{gmail,graph,imap,jmap,provider-sync}/` contains the
+existing ratatoskr implementations being replaced. Not part of
+the workspace build. Useful as precedent when writing engine
+tests, reconciling protocol semantics, or describing the
+account-layer code in the reference docs.
+
+## Phase 3
+
+### Sequencing
+
+CONDSTORE/QRESYNC runs first. Phase 3's IMAP touchpoints
+(`reference/imap.md`, IMAP conformance tests) need a stable
+mutation-concurrency surface; rewriting them after the flip is
+wasteful. Phase 3's gmail / jmap / graph / `bifrost-sync` work
+can proceed once CONDSTORE/QRESYNC merges - or in parallel from
+the start, owning files outside `crates/imap/`.
+
+### Test scope
+
+Project rules cap bifrost tests at small deterministic unit
+tests. No integration tests, no mock protocol servers, no
+external harnesses. Phase 3 stays inside that envelope.
+
+Three buckets:
+
+1. **Per-protocol conformance.** Each crate gets unit tests for
+   cursor envelope round-trip, capability shape, error
+   classification to the recovery taxonomy, and scope-to-method
+   wiring. Most of these already exist from P2; Phase 3 fills
+   gaps and pins behavior the reviewer pass flagged.
+2. **Cross-crate conformance.** A small assertion in
+   `bifrost-sync` (or `bifrost-types`) that constructs each
+   `AccountFactory`, verifies `dyn Account` object-safety, and
+   confirms the four impls compose with `SyncEngine::attach` at
+   the type level. Catches accidental trait-surface breakage
+   that per-crate tests miss.
+3. **No engine integration tests.** `bifrost-sync` keeps its
+   existing fake-`Account` engine tests from P2-A6. Phase 3 does
+   not drive the real four impls through the engine - that
+   surface is exercised downstream in ratatoskr.
+
+### Reference doc structure
+
+`reference/net.md` and `reference/sync.md` are the exemplars.
+Each new `reference/{jmap,imap,gmail,graph}.md` covers:
+
+- Crate purpose and scope (1-2 paragraphs)
+- Module layout under `src/account/` (or `src/sync/` for jmap)
+- `Account` / `AccountFactory` shape and lifecycle
+- Capabilities advertised and the rationale for each
+- Cursor envelope: tag, version, payload, validation
+- Per-scope inventory / changes / hydration approach
+- Push mechanism and reconnect policy
+- Mutation pipeline and replay-safety classification
+- Error mapping to the recovery taxonomy
+- Known limitations (e.g., Gmail blob ranges unsupported,
+  Graph discovery limited to mail, IMAP mutation concurrency
+  pending CONDSTORE)
+
+### File ownership
+
+Five agents, disjoint ownership. CONDSTORE/QRESYNC ships first;
+the other four launch after.
+
+- **P3-A0 (CONDSTORE/QRESYNC)**: `crates/imap/src/account/
+  {capabilities,changes,mutate}.rs`,
+  `crates/imap/src/connection/dispatch.rs`, and whichever
+  connection-layer files the spec in
+  `plans/imap/condstore-qresync.md` names. May add new files in
+  `crates/imap/src/connection/`. Does not touch
+  `reference/imap.md`.
+- **P3-A1 (jmap)**: `reference/jmap.md` (new) + jmap conformance
+  test additions inside `crates/jmap/src/sync/` modules.
+- **P3-A2 (imap)**: `reference/imap.md` (new) + imap conformance
+  test additions inside `crates/imap/src/account/` modules.
+  Waits on P3-A0.
+- **P3-A3 (gmail)**: `reference/gmail.md` (new) + gmail
+  conformance test additions inside `crates/gmail/src/account/`
+  modules.
+- **P3-A4 (graph)**: `reference/graph.md` (new) + graph
+  conformance test additions inside `crates/graph/src/account/`
+  modules.
+- **Orchestrator**: writes the cross-crate conformance assertion
+  in `bifrost-sync` (or `bifrost-types`), runs `brokkr check`
+  cleanup workspace-wide.
+
+### Brokkr check cleanup
+
+Orchestrator work, not agent work. Scope:
+
+- Resolve workspace clippy warnings introduced by P2 wiring.
+- Remove dead imports and `pub` items that P2 staged but no
+  consumer ended up using.
+- Verify every `bifrost-types` export has at least one consumer
+  (delete dead exports rather than carry them).
+- Drop scaffolding `#[allow(...)]` annotations whose
+  justifications no longer apply.
+
+### Exit criteria
+
+Phase 3 is done when all of these hold:
+
+- CONDSTORE/QRESYNC merged; IMAP advertises non-`None` mutation
+  concurrency and the `STORE UNCHANGEDSINCE` path is wired into
+  the mutation pipeline.
+- All four `reference/{jmap,imap,gmail,graph}.md` files exist
+  and match the section list above.
+- Per-protocol conformance tests cover cursor envelope round-
+  trip, capability shape, error classification, and scope-to-
+  method wiring for each crate.
+- Cross-crate conformance assertion in `bifrost-sync` /
+  `bifrost-types` compiles and passes for all four factories.
+- `brokkr check` is clean workspace-wide: no warnings, no
+  scaffolding allows, no orphan exports.
+
+## Phase 4
+
+Error model convergence across `bifrost-smtp`, `bifrost-jmap`,
+`bifrost-imap`, and (now) the four account-layer error
+taxonomies in the Phase 2 work.
+
+Not yet planned at agent-launch depth. The open question framing
+in `plans/error-model-convergence.md` (whether to converge, and
+what convergence buys ratatoskr) needs to be resolved into a
+concrete shape before file ownership and exit criteria can be
+written. Expected predecessors of that fleshing-out:
+
+- Survey the current error types in each protocol crate
+  (`bifrost-{smtp,jmap,imap,gmail,graph}`) and the recovery
+  taxonomy in `bifrost-types`. Decide what "converged" means in
+  practice - a shared trait, a shared enum, or a documented
+  pattern each crate implements independently.
+- Decide whether `bifrost-smtp`'s rich `Response`-carrying shape
+  is the target, a starting point, or out of scope (sync-layer
+  errors and SMTP submission errors may not benefit from the
+  same model).
+- Decide whether `bifrost-types::AccountError` (the account-
+  layer error already in use) is the convergence target or sits
+  alongside protocol-native errors.
+
+Once those decisions are taken, this section gets the same
+treatment as Phase 3: sequencing, file ownership, exit criteria.
 
 ## Coordination rules
 

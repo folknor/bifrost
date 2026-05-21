@@ -111,7 +111,7 @@ async fn apply_batch(
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<MutationResult>>> {
     let started = Instant::now();
-    let state = current_or_probe_state(mail, email_state).await?;
+    let mut state = current_or_probe_state(mail, email_state).await?;
     let ids = batch.drain(..).collect::<Vec<_>>();
     if ids.is_empty() {
         return Ok(None);
@@ -125,13 +125,14 @@ async fn apply_batch(
             }
             let fresh = probe_email_state(mail).await?;
             set_email_state(email_state, fresh.clone()).await;
-            send_set(mail, &fresh, &ids, kind).await?
+            state = fresh;
+            send_set(mail, &state, &ids, kind).await?
         }
     };
 
     let new_state = response.new_state().to_string();
     if !new_state.is_empty() {
-        set_email_state(email_state, new_state).await;
+        advance_email_state(email_state, Some(&state), new_state).await;
     }
 
     let mut results = Vec::with_capacity(ids.len());
@@ -227,8 +228,14 @@ async fn current_or_probe_state(
         Some(state) => Ok(state),
         None => {
             let state = probe_email_state(mail).await?;
-            set_email_state(email_state, state.clone()).await;
-            Ok(state)
+            let mut guard = email_state.lock().await;
+            match guard.clone() {
+                Some(existing) => Ok(existing),
+                None => {
+                    *guard = Some(state.clone());
+                    Ok(state)
+                }
+            }
         }
     }
 }
@@ -243,4 +250,16 @@ pub(crate) async fn probe_email_state(mail: &MailAccount) -> crate::Result<Strin
 async fn set_email_state(email_state: &Arc<Mutex<Option<String>>>, state: String) {
     let mut guard = email_state.lock().await;
     *guard = Some(state);
+}
+
+async fn advance_email_state(
+    email_state: &Arc<Mutex<Option<String>>>,
+    expected: Option<&str>,
+    state: String,
+) {
+    let mut guard = email_state.lock().await;
+    match (guard.as_deref(), expected) {
+        (Some(current), Some(expected)) if current != expected => {}
+        _ => *guard = Some(state),
+    }
 }

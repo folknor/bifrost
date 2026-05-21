@@ -6,7 +6,8 @@ use bifrost_types::{
 };
 
 use crate::core::query;
-use crate::email::{Email, EmailGet, EmailId, EmailQuery, Property};
+use crate::email::{Email, EmailGet, EmailId, EmailQuery, Property as EmailProperty};
+use crate::mailbox::{Mailbox, MailboxGet, Property as MailboxProperty};
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
@@ -20,9 +21,7 @@ pub(crate) fn stream(
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match scope {
         CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
-        CursorScope::Type(ObjectType::Mailbox) => Box::pin(async_stream::stream! {
-                yield SyncEvent::Done(None);
-        }),
+        CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
         CursorScope::Type(ObjectType::Thread) => Box::pin(async_stream::stream! {
                 yield super::error::fatal_unsupported(
                     "JMAP thread inventory is derived from Email inventory in this implementation",
@@ -134,18 +133,69 @@ fn email_inventory(
     })
 }
 
-pub(crate) fn inventory_properties() -> Vec<Property> {
+pub(crate) fn inventory_properties() -> Vec<EmailProperty> {
     vec![
-        Property::Id,
-        Property::MailboxIds,
-        Property::ThreadId,
-        Property::BlobId,
-        Property::Size,
-        Property::Keywords,
-        Property::MessageId,
-        Property::References,
-        Property::InReplyTo,
-        Property::ReceivedAt,
+        EmailProperty::Id,
+        EmailProperty::MailboxIds,
+        EmailProperty::ThreadId,
+        EmailProperty::BlobId,
+        EmailProperty::Size,
+        EmailProperty::Keywords,
+        EmailProperty::MessageId,
+        EmailProperty::References,
+        EmailProperty::InReplyTo,
+        EmailProperty::ReceivedAt,
+    ]
+}
+
+fn mailbox_inventory(mail: MailAccount) -> AccountStream<SyncEvent<InventoryEntry>> {
+    Box::pin(async_stream::stream! {
+        let started = Instant::now();
+        let response = mail
+            .call(MailboxGet::new().properties(mailbox_inventory_properties()))
+            .await;
+
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                yield super::error::fatal_from_jmap(
+                    err,
+                    Some(CursorScope::Type(ObjectType::Mailbox)),
+                );
+                return;
+            }
+        };
+
+        let state = response.state().to_string();
+        let items = response
+            .into_list()
+            .into_iter()
+            .map(|mailbox| mailbox_to_inventory(mailbox, &state))
+            .collect::<Vec<_>>();
+
+        yield SyncEvent::Batch(Batch {
+            items,
+            page_boundary: PageBoundary::Final,
+            server_latency: started.elapsed(),
+            bytes_in: 0,
+            checkpoint: None,
+        });
+        yield SyncEvent::Done(None);
+    })
+}
+
+fn mailbox_inventory_properties() -> Vec<MailboxProperty> {
+    vec![
+        MailboxProperty::Id,
+        MailboxProperty::Name,
+        MailboxProperty::ParentId,
+        MailboxProperty::Role,
+        MailboxProperty::SortOrder,
+        MailboxProperty::TotalEmails,
+        MailboxProperty::UnreadEmails,
+        MailboxProperty::TotalThreads,
+        MailboxProperty::UnreadThreads,
+        MailboxProperty::IsSubscribed,
     ]
 }
 
@@ -178,6 +228,64 @@ pub(crate) fn email_to_inventory(email: Email, state: &str) -> InventoryEntry {
         references,
         in_reply_to,
     }
+}
+
+fn mailbox_to_inventory(mailbox: Mailbox, state: &str) -> InventoryEntry {
+    let id = mailbox.id().map(ToString::to_string).unwrap_or_default();
+    let memberships = mailbox
+        .parent_id()
+        .map(|parent| MembershipScope::Mailbox(bifrost_types::MailboxId(parent.to_string())))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let flags_hash = mailbox_flags_hash(&mailbox);
+
+    InventoryEntry {
+        id: ObjectId(id),
+        memberships,
+        size: None,
+        blob_id: None,
+        fingerprint: Fingerprint {
+            server_version: ServerVersion::StateAt(state.to_string()),
+            size: None,
+            flags_hash,
+        },
+        thread_id: None,
+        message_id: None,
+        references: Vec::new(),
+        in_reply_to: None,
+    }
+}
+
+fn mailbox_flags_hash(mailbox: &Mailbox) -> u64 {
+    let mut parts = Vec::new();
+    if let Some(name) = mailbox.name() {
+        parts.push(format!("name={name}"));
+    }
+    if let Some(parent) = mailbox.parent_id() {
+        parts.push(format!("parent={parent}"));
+    }
+    if let Some(role) = mailbox.role() {
+        parts.push(format!("role={role:?}"));
+    }
+    if let Some(sort_order) = mailbox.sort_order() {
+        parts.push(format!("sort={sort_order}"));
+    }
+    if let Some(total) = mailbox.total_emails() {
+        parts.push(format!("totalEmails={total}"));
+    }
+    if let Some(unread) = mailbox.unread_emails() {
+        parts.push(format!("unreadEmails={unread}"));
+    }
+    if let Some(total) = mailbox.total_threads() {
+        parts.push(format!("totalThreads={total}"));
+    }
+    if let Some(unread) = mailbox.unread_threads() {
+        parts.push(format!("unreadThreads={unread}"));
+    }
+    if let Some(is_subscribed) = mailbox.is_subscribed() {
+        parts.push(format!("subscribed={is_subscribed}"));
+    }
+    fnv1a64(parts)
 }
 
 pub(crate) fn flags_hash(email: &Email) -> u64 {

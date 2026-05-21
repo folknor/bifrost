@@ -55,6 +55,7 @@ mod uid_ops;
 pub(super) mod wire;
 
 pub use config::ImapConfig;
+pub(crate) use dispatch::FetchStreamItem;
 use literals::{
     AppendLiteralKind, find_literal_boundary, patch_literals_to_plus_with_binary,
     patch_small_literals_to_plus_with_binary,

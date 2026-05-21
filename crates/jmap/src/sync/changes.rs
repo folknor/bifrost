@@ -102,7 +102,7 @@ fn email_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            set_state(&shared_state, new_state.clone()).await;
+            advance_state(&shared_state, &since_state, new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -157,7 +157,7 @@ fn mailbox_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            set_state(&shared_state, new_state.clone()).await;
+            advance_state(&shared_state, &since_state, new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -209,7 +209,7 @@ fn thread_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            set_state(&shared_state, new_state.clone()).await;
+            advance_state(&shared_state, &since_state, new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -305,7 +305,10 @@ fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
 }
 
-async fn set_state(state: &Arc<Mutex<Option<String>>>, value: String) {
+async fn advance_state(state: &Arc<Mutex<Option<String>>>, expected: &str, value: String) {
     let mut guard = state.lock().await;
-    *guard = Some(value);
+    match guard.as_deref() {
+        Some(current) if current != expected => {}
+        _ => *guard = Some(value),
+    }
 }

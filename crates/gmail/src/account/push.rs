@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,7 @@ pub(crate) struct PubSubControl {
     last_history_id: Mutex<Option<String>>,
     expiration: Mutex<Option<SystemTime>>,
     renewer: Mutex<Option<JoinHandle<()>>>,
+    active_handles: Mutex<HashSet<String>>,
 }
 
 impl PubSubControl {
@@ -56,6 +58,7 @@ impl PubSubControl {
             last_history_id: Mutex::new(None),
             expiration: Mutex::new(None),
             renewer: Mutex::new(None),
+            active_handles: Mutex::new(HashSet::new()),
         }
     }
 
@@ -72,6 +75,16 @@ impl PubSubControl {
         if let Some(handle) = self.renewer.lock().await.take() {
             handle.abort();
         }
+    }
+
+    async fn insert_handle(&self, handle: &SubscriptionHandle) {
+        self.active_handles.lock().await.insert(handle.0.clone());
+    }
+
+    async fn remove_handle(&self, handle: &SubscriptionHandle) -> bool {
+        let mut handles = self.active_handles.lock().await;
+        handles.remove(&handle.0);
+        handles.is_empty()
     }
 }
 
@@ -122,9 +135,11 @@ pub(crate) fn push_subscribe(
             history_id: response.history_id,
             expiration: response.expiration,
         };
-        serde_json::to_string(&handle)
+        let handle = serde_json::to_string(&handle)
             .map(SubscriptionHandle)
-            .map_err(|error| AccountError::Other(error.to_string()))
+            .map_err(|error| AccountError::Other(error.to_string()))?;
+        pubsub.insert_handle(&handle).await;
+        Ok(handle)
     })
 }
 
@@ -138,6 +153,9 @@ pub(crate) fn push_unsubscribe(
             serde_json::from_str(&handle.0).map_err(|error| {
                 AccountError::Other(format!("invalid gmail subscription handle: {error}"))
             })?;
+        if !pubsub.remove_handle(&handle).await {
+            return Ok(());
+        }
         stop_watch(&client)
             .await
             .map_err(|error| recovery::account_error_from_gmail(&error))?;

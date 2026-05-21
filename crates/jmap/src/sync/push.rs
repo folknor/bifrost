@@ -57,20 +57,28 @@ impl WsState {
     }
 }
 
-pub(crate) fn stream(mut rx: broadcast::Receiver<WatchEvent>) -> AccountStream<WatchEvent> {
+pub(crate) fn stream(
+    mut rx: broadcast::Receiver<WatchEvent>,
+    shutdown: CancellationToken,
+) -> AccountStream<WatchEvent> {
     Box::pin(async_stream::stream! {
         loop {
-            match rx.recv().await {
-                Ok(event) => yield event,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    yield WatchEvent::Invalidated {
-                        hint: InvalidationHint {
-                            source: PushSource::Coalesced,
-                            payload: HintPayload::Unknown,
-                        },
-                    };
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => yield event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            yield WatchEvent::Invalidated {
+                                hint: InvalidationHint {
+                                    source: PushSource::Coalesced,
+                                    payload: HintPayload::Unknown,
+                                },
+                            };
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })

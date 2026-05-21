@@ -50,6 +50,12 @@ struct NotificationBuilder {
     parent_folder_change_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamLoopExit {
+    Disconnected,
+    Shutdown,
+}
+
 pub(crate) async fn run_streaming_worker(account: GraphAccount) {
     let ews = EwsClient::new();
     let mut disconnected = false;
@@ -69,9 +75,11 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
                 record_subscription_id(&account, &subscription).await;
                 if disconnected {
                     let _ = account.push_tx.send(WatchEvent::Reconnected);
-                    disconnected = false;
                 }
-                run_get_events_loop(&ews, &account, subscription).await;
+                match run_get_events_loop(&ews, &account, subscription).await {
+                    StreamLoopExit::Disconnected => disconnected = true,
+                    StreamLoopExit::Shutdown => return,
+                }
             }
             Err(error) => {
                 if !disconnected {
@@ -279,11 +287,11 @@ async fn run_get_events_loop(
     ews: &EwsClient,
     account: &GraphAccount,
     subscription: EwsStreamingSubscription,
-) {
+) -> StreamLoopExit {
     let mut subscription_id = subscription.subscription_id;
     loop {
         if account.shutdown.is_cancelled() {
-            return;
+            return StreamLoopExit::Shutdown;
         }
         let token = account.client.access_token().await;
         let body = build_get_streaming_events_request(&subscription_id, 30);
@@ -292,7 +300,12 @@ async fn run_get_events_loop(
                 Ok(notifications) => {
                     for notification in notifications {
                         if let Some(watermark) = notification.watermark.as_ref() {
-                            record_watermark(account, watermark).await;
+                            record_watermark(
+                                account,
+                                notification.subscription_id.as_deref(),
+                                watermark,
+                            )
+                            .await;
                         }
                         let scope = notification
                             .parent_folder_id
@@ -315,13 +328,13 @@ async fn run_get_events_loop(
                 Err(error) => {
                     log::warn!("[Graph EWS] GetStreamingEvents parse failed: {error}");
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
-                    return;
+                    return StreamLoopExit::Disconnected;
                 }
             },
             Err(error) => {
                 log::warn!("[Graph EWS] GetStreamingEvents failed: {error}");
                 let _ = account.push_tx.send(WatchEvent::Disconnected);
-                return;
+                return StreamLoopExit::Disconnected;
             }
         }
         subscription_id = current_subscription_id(account)
@@ -347,10 +360,20 @@ async fn record_subscription_id(account: &GraphAccount, subscription: &EwsStream
     }
 }
 
-async fn record_watermark(account: &GraphAccount, watermark: &str) {
+async fn record_watermark(account: &GraphAccount, subscription_id: Option<&str>, watermark: &str) {
     let mut states = account.ews_subscriptions.write().await;
+    let mut matched = false;
     for state in states.values_mut() {
+        if subscription_id.is_some() && state.ews_subscription_id.as_deref() != subscription_id {
+            continue;
+        }
         state.watermark = Some(watermark.to_string());
+        matched = true;
+    }
+    if !matched && subscription_id.is_none() {
+        for state in states.values_mut() {
+            state.watermark = Some(watermark.to_string());
+        }
     }
 }
 
