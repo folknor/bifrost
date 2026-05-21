@@ -23,9 +23,11 @@ default = []
 
 [dependencies]
 base64 = { workspace = true }
+bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 encoding_rs = "0.8"
 flate2 = "1"
+futures = { workspace = true }
 getrandom = { workspace = true }
 hmac = "0.13.0"
 md-5 = "0.11.0"

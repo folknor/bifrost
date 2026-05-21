@@ -90,8 +90,7 @@ impl ImapConnection {
     where
         F: FnMut(FetchResponse) -> Result<(), Error>,
     {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let fetch_fut = self.uid_fetch_streaming(uids.as_sequence_set(), attrs, tx, timeout);
+        let (mut rx, fetch_fut) = self.uid_fetch_stream(uids.as_sequence_set(), attrs, timeout)?;
         let drain_fut = async {
             while let Some(fetch) = rx.recv().await {
                 on_fetch(fetch?)?;

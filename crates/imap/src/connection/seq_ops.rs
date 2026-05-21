@@ -1,6 +1,8 @@
 #![allow(clippy::wildcard_imports)]
 use super::*;
 
+const DEFAULT_FETCH_STREAM_CAPACITY: usize = 64;
+
 impl ImapConnection {
     // -----------------------------------------------------------------------
     // Message operations (sequence-number variants)
@@ -64,6 +66,55 @@ impl ImapConnection {
 
     /// FETCH streaming by sequence number (RFC 3501 Section 6.4.5).
     ///
+    /// Returns a bounded receiver and the driver-side future that must be
+    /// polled to execute the command.
+    #[allow(clippy::type_complexity)]
+    pub fn fetch_stream<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.fetch_stream_with_capacity(sequence_set, items, DEFAULT_FETCH_STREAM_CAPACITY, timeout)
+    }
+
+    /// FETCH streaming by sequence number with explicit bounded capacity.
+    #[allow(clippy::type_complexity)]
+    pub fn fetch_stream_with_capacity<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        capacity: usize,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.validate_requested_fetch_items(items)?;
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+        let cmd = Command::Fetch {
+            sequence_set: sequence_set.clone(),
+            items: format_fetch_attrs(items),
+            changed_since: None,
+        };
+        let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
+        Ok((rx, fut))
+    }
+
+    /// FETCH streaming by sequence number (RFC 3501 Section 6.4.5).
+    ///
     /// Pushes each [`FetchResponse`] through the provided unbounded channel as
     /// it arrives from the server, rather than buffering the entire result set
     /// in memory. The channel is closed when the tagged OK is received.
@@ -80,21 +131,18 @@ impl ImapConnection {
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
-        self.fetch_streaming_impl(
-            Command::Fetch {
-                sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
-                changed_since: None,
-            },
-            tx,
-            timeout,
-        )
-        .await
+        let (mut rx, fetch_fut) = self.fetch_stream(sequence_set, items, timeout)?;
+        let drain_fut = async move {
+            while let Some(item) = rx.recv().await {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+            Ok::<(), Error>(())
+        };
+        let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
+        drain_result?;
+        fetch_result
     }
 
     /// SEARCH by sequence number (RFC 3501 Section 6.4.4).

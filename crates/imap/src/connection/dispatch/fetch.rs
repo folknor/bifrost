@@ -1,10 +1,14 @@
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::connection::NotifyFlags;
 use crate::error::Error;
 use crate::types::response::{TaggedResponse, UntaggedResponse};
 use crate::types::validated::ParsedUidSet;
 use crate::types::{FetchResponse, StoreResult, UidRange};
 
-use super::{Consumer, ConsumerContext, Finalized};
+use super::{BackpressureState, Consumer, ConsumerContext, Finalized, StreamingConsumer};
 
 /// Default warn-on-large threshold in bytes (10 MB).
 ///
@@ -144,6 +148,7 @@ impl Consumer for FetchConsumer {
 ///
 /// Non-FETCH responses classified as `Either` are buffered and returned
 /// in `finalize` for the dispatcher to re-emit as events.
+#[cfg(test)]
 pub(crate) struct StreamingFetchConsumer {
     tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
     /// Buffer for ambiguous responses the dispatcher routed here but
@@ -151,6 +156,7 @@ pub(crate) struct StreamingFetchConsumer {
     ambiguous_buffer: Vec<UntaggedResponse>,
 }
 
+#[cfg(test)]
 impl StreamingFetchConsumer {
     pub(crate) fn new(
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
@@ -162,6 +168,136 @@ impl StreamingFetchConsumer {
     }
 }
 
+struct BoundedStreamingPipe<T> {
+    tx: Option<tokio::sync::mpsc::Sender<Result<T, Error>>>,
+    permit: Option<tokio::sync::mpsc::OwnedPermit<Result<T, Error>>>,
+    pending: VecDeque<T>,
+    drained: bool,
+}
+
+impl<T: Send + 'static> BoundedStreamingPipe<T> {
+    fn new(tx: tokio::sync::mpsc::Sender<Result<T, Error>>) -> Self {
+        Self {
+            tx: Some(tx),
+            permit: None,
+            pending: VecDeque::new(),
+            drained: false,
+        }
+    }
+
+    fn push(&mut self, item: T) {
+        if self.drained {
+            return;
+        }
+        if let Some(permit) = self.permit.take() {
+            permit.send(Ok(item));
+        } else {
+            self.pending.push_back(item);
+        }
+    }
+
+    fn backpressure_state(&self) -> BackpressureState {
+        if self.drained {
+            BackpressureState::Drained
+        } else if self.permit.is_some() {
+            BackpressureState::Ready
+        } else {
+            BackpressureState::NeedsCapacity
+        }
+    }
+
+    fn reserve_capacity(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        Box::pin(async move {
+            if self.drained || self.permit.is_some() {
+                return Ok(());
+            }
+
+            let Some(tx) = self.tx.as_ref().cloned() else {
+                self.drained = true;
+                self.pending.clear();
+                return Ok(());
+            };
+
+            match tx.reserve_owned().await {
+                Ok(permit) => {
+                    if let Some(item) = self.pending.pop_front() {
+                        permit.send(Ok(item));
+                    } else {
+                        self.permit = Some(permit);
+                    }
+                    Ok(())
+                }
+                Err(_) => {
+                    self.drained = true;
+                    self.tx = None;
+                    self.permit = None;
+                    self.pending.clear();
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
+/// Bounded streaming consumer for FETCH / UID FETCH.
+///
+/// Capacity is pre-reserved by the driver before each read. If the
+/// receiver stops polling, the driver stops reading and TCP backpressure
+/// reaches the server.
+pub(crate) struct BoundedStreamingFetchConsumer {
+    pipe: BoundedStreamingPipe<FetchResponse>,
+    ambiguous_buffer: Vec<UntaggedResponse>,
+}
+
+impl BoundedStreamingFetchConsumer {
+    pub(crate) fn new(tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>) -> Self {
+        Self {
+            pipe: BoundedStreamingPipe::new(tx),
+            ambiguous_buffer: Vec::new(),
+        }
+    }
+}
+
+impl Consumer for BoundedStreamingFetchConsumer {
+    type Output = ();
+
+    fn on_response(
+        &mut self,
+        resp: UntaggedResponse,
+        _notify_snapshot: NotifyFlags,
+        _ctx: &ConsumerContext,
+    ) {
+        if let UntaggedResponse::Fetch(fr) = resp {
+            self.pipe.push(*fr);
+        } else {
+            self.ambiguous_buffer.push(resp);
+        }
+    }
+
+    fn finalize(
+        self: Box<Self>,
+        tagged: TaggedResponse,
+        _ctx: &ConsumerContext,
+    ) -> Result<Finalized<()>, Error> {
+        tagged.require_ok()?;
+        Ok(Finalized {
+            output: (),
+            reclassified_as_events: self.ambiguous_buffer,
+        })
+    }
+}
+
+impl StreamingConsumer for BoundedStreamingFetchConsumer {
+    fn backpressure_state(&self) -> BackpressureState {
+        self.pipe.backpressure_state()
+    }
+
+    fn reserve_capacity(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        self.pipe.reserve_capacity()
+    }
+}
+
+#[cfg(test)]
 impl Consumer for StreamingFetchConsumer {
     type Output = ();
 
@@ -194,6 +330,98 @@ impl Consumer for StreamingFetchConsumer {
             output: (),
             reclassified_as_events: self.ambiguous_buffer,
         })
+    }
+}
+
+/// Item yielded by the VANISHED-aware streaming FETCH consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+#[allow(dead_code)]
+pub(crate) enum FetchStreamItem {
+    Fetch(FetchResponse),
+    VanishedEarlier(Vec<UidRange>),
+}
+
+/// Bounded streaming consumer for UID FETCH CHANGEDSINCE VANISHED.
+#[allow(dead_code)]
+pub(crate) struct BoundedStreamingFetchVanishedConsumer {
+    pipe: BoundedStreamingPipe<FetchStreamItem>,
+    requested_set: Option<ParsedUidSet>,
+    dropped_vanished_count: usize,
+    buffered: Vec<UntaggedResponse>,
+}
+
+#[allow(dead_code)]
+impl BoundedStreamingFetchVanishedConsumer {
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::Sender<Result<FetchStreamItem, Error>>,
+        requested_set: Option<ParsedUidSet>,
+    ) -> Self {
+        Self {
+            pipe: BoundedStreamingPipe::new(tx),
+            requested_set,
+            dropped_vanished_count: 0,
+            buffered: Vec::new(),
+        }
+    }
+}
+
+impl Consumer for BoundedStreamingFetchVanishedConsumer {
+    type Output = ();
+
+    fn on_response(
+        &mut self,
+        resp: UntaggedResponse,
+        _notify_snapshot: NotifyFlags,
+        _ctx: &ConsumerContext,
+    ) {
+        match resp {
+            UntaggedResponse::Fetch(fr) => self.pipe.push(FetchStreamItem::Fetch(*fr)),
+            UntaggedResponse::Vanished {
+                earlier: true,
+                uids,
+            } => {
+                let filtered = if let Some(ref set) = self.requested_set {
+                    let (filtered, dropped) = set.intersect_uid_ranges(&uids);
+                    self.dropped_vanished_count += dropped;
+                    filtered
+                } else {
+                    uids
+                };
+                if !filtered.is_empty() {
+                    self.pipe.push(FetchStreamItem::VanishedEarlier(filtered));
+                }
+            }
+            other => self.buffered.push(other),
+        }
+    }
+
+    fn finalize(
+        self: Box<Self>,
+        tagged: TaggedResponse,
+        _ctx: &ConsumerContext,
+    ) -> Result<Finalized<()>, Error> {
+        tagged.require_ok()?;
+        if self.dropped_vanished_count > 0 {
+            tracing::debug!(
+                dropped = self.dropped_vanished_count,
+                "filtered out-of-set VANISHED (EARLIER) UIDs per RFC 7162 Section 3.2.6",
+            );
+        }
+        Ok(Finalized {
+            output: (),
+            reclassified_as_events: self.buffered,
+        })
+    }
+}
+
+impl StreamingConsumer for BoundedStreamingFetchVanishedConsumer {
+    fn backpressure_state(&self) -> BackpressureState {
+        self.pipe.backpressure_state()
+    }
+
+    fn reserve_capacity(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
+        self.pipe.reserve_capacity()
     }
 }
 

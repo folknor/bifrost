@@ -2,6 +2,8 @@
 use super::*;
 use crate::types::validated::ParsedUidSet;
 
+const DEFAULT_FETCH_STREAM_CAPACITY: usize = 64;
+
 impl ImapConnection {
     // -----------------------------------------------------------------------
     // Message operations (UID variants)
@@ -144,6 +146,62 @@ impl ImapConnection {
 
     /// UID FETCH streaming (RFC 3501 Section 6.4.5).
     ///
+    /// Returns a bounded receiver and the driver-side future that must be
+    /// polled to execute the command. When the receiver is not drained, the
+    /// driver stops reading before the bounded channel fills further.
+    #[allow(clippy::type_complexity)]
+    pub fn uid_fetch_stream<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.uid_fetch_stream_with_capacity(
+            sequence_set,
+            items,
+            DEFAULT_FETCH_STREAM_CAPACITY,
+            timeout,
+        )
+    }
+
+    /// UID FETCH streaming with an explicit bounded-channel capacity.
+    #[allow(clippy::type_complexity)]
+    pub fn uid_fetch_stream_with_capacity<'a>(
+        &'a self,
+        sequence_set: &'a SequenceSet,
+        items: &'a [FetchAttr],
+        capacity: usize,
+        timeout: Duration,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<Result<FetchResponse, Error>>,
+            impl std::future::Future<Output = Result<(), Error>> + Send + 'a,
+        ),
+        Error,
+    > {
+        self.validate_requested_fetch_items(items)?;
+        if sequence_set.as_str().contains('$') {
+            self.require_searchres()?;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+        let cmd = Command::UidFetch {
+            sequence_set: sequence_set.clone(),
+            items: format_fetch_attrs(items),
+            changed_since: None,
+            vanished: false,
+        };
+        let fut = self.fetch_stream_bounded_impl(cmd, tx, timeout);
+        Ok((rx, fut))
+    }
+
+    /// UID FETCH streaming (RFC 3501 Section 6.4.5).
+    ///
     /// Pushes each [`FetchResponse`] through the provided unbounded channel as
     /// it arrives from the server, rather than buffering the entire result set
     /// in memory. The channel is closed when the tagged OK is received.
@@ -160,40 +218,35 @@ impl ImapConnection {
         tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.validate_requested_fetch_items(items)?;
-        // RFC 5182 Section 2: `$` references saved search results and requires SEARCHRES.
-        if sequence_set.as_str().contains('$') {
-            self.require_searchres()?;
-        }
-        self.fetch_streaming_impl(
-            Command::UidFetch {
-                sequence_set: sequence_set.clone(),
-                items: format_fetch_attrs(items),
-                changed_since: None,
-                vanished: false,
-            },
-            tx,
-            timeout,
-        )
-        .await
+        let (mut rx, fetch_fut) = self.uid_fetch_stream(sequence_set, items, timeout)?;
+        let drain_fut = async move {
+            while let Some(item) = rx.recv().await {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+            Ok::<(), Error>(())
+        };
+        let (fetch_result, drain_result) = tokio::join!(fetch_fut, drain_fut);
+        drain_result?;
+        fetch_result
     }
 
     /// Shared implementation for streaming FETCH and UID FETCH
     /// (RFC 3501 Section 6.4.5).
     ///
     /// Validates session state and dispatches the command with a
-    /// [`StreamingFetchConsumer`](dispatch::StreamingFetchConsumer) that
-    /// pushes each response through `tx`.
-    pub(super) async fn fetch_streaming_impl(
+    /// bounded streaming consumer that pushes each response through `tx`.
+    pub(super) async fn fetch_stream_bounded_impl(
         &self,
         cmd: Command,
-        tx: tokio::sync::mpsc::UnboundedSender<Result<FetchResponse, Error>>,
+        tx: tokio::sync::mpsc::Sender<Result<FetchResponse, Error>>,
         timeout: Duration,
     ) -> Result<(), Error> {
         self.require_state(&[SessionState::Selected])?;
         tokio::time::timeout(
             timeout,
-            self.submit_regular(cmd, dispatch::StreamingFetchConsumer::new(tx)),
+            self.submit_streaming(cmd, dispatch::BoundedStreamingFetchConsumer::new(tx)),
         )
         .await
         .map_err(|_| Error::Timeout)?

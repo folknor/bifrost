@@ -20,7 +20,8 @@ use crate::types::validated::MailboxName;
 
 use super::NotifyFlags;
 use super::dispatch::{
-    Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply, Finalized,
+    BackpressureState, Consumer, ConsumerContext, ContinuationConsumer, ContinuationReply,
+    Finalized, StreamingConsumer,
 };
 mod events;
 mod idle;
@@ -182,6 +183,31 @@ pub(super) trait ConsumerErased: Send {
     ) -> Result<Finalized<Box<dyn std::any::Any + Send>>, Error>;
 }
 
+/// Object-safe wrapper for streaming consumers that can await
+/// downstream capacity before the driver reads more wire data.
+pub(super) trait StreamingConsumerErased: ConsumerErased {
+    fn backpressure_state_erased(&self) -> BackpressureState;
+
+    fn reserve_capacity_erased(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>>;
+}
+
+impl<C: StreamingConsumer + 'static> StreamingConsumerErased for C
+where
+    C::Output: 'static,
+{
+    fn backpressure_state_erased(&self) -> BackpressureState {
+        <C as StreamingConsumer>::backpressure_state(self)
+    }
+
+    fn reserve_capacity_erased(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + '_>> {
+        <C as StreamingConsumer>::reserve_capacity(self)
+    }
+}
+
 /// Blanket impl that erases `C::Output` to `Box<dyn Any + Send>`.
 impl<C: Consumer + 'static> ConsumerErased for C
 where
@@ -245,6 +271,9 @@ where
 pub(super) enum DriverConsumer {
     /// Regular consumer  -  unexpected continuations are a protocol error.
     Regular(Box<dyn ConsumerErased>),
+    /// Streaming consumer  -  regular command with async pre-read
+    /// backpressure.
+    StreamingRegular(Box<dyn StreamingConsumerErased>),
     /// Continuation consumer  -  `+` responses are routed to the
     /// consumer's `on_continuation` handler (AUTHENTICATE, SASL).
     WithContinuations(Box<dyn ContinuationConsumerErased>),
@@ -260,6 +289,7 @@ impl DriverConsumer {
     ) {
         match self {
             Self::Regular(c) => c.on_response(resp, notify_snapshot, ctx),
+            Self::StreamingRegular(c) => c.on_response(resp, notify_snapshot, ctx),
             Self::WithContinuations(c) => c.on_response(resp, notify_snapshot, ctx),
         }
     }
@@ -272,8 +302,21 @@ impl DriverConsumer {
     ) -> Result<Finalized<Box<dyn std::any::Any + Send>>, Error> {
         match self {
             Self::Regular(c) => c.finalize_erased(tagged, ctx),
+            Self::StreamingRegular(c) => c.finalize_erased(tagged, ctx),
             Self::WithContinuations(c) => c.finalize_erased(tagged, ctx),
         }
+    }
+
+    async fn prepare_to_read(&mut self) -> Result<(), Error> {
+        if let Self::StreamingRegular(c) = self
+            && matches!(
+                c.backpressure_state_erased(),
+                BackpressureState::NeedsCapacity
+            )
+        {
+            c.reserve_capacity_erased().await?;
+        }
+        Ok(())
     }
 
     /// Handle a `+` continuation. Returns `Err` for regular consumers
@@ -286,6 +329,9 @@ impl DriverConsumer {
         match self {
             Self::Regular(_) => Err(Error::Protocol(
                 "unexpected continuation during command that does not expect one".into(),
+            )),
+            Self::StreamingRegular(_) => Err(Error::Protocol(
+                "unexpected continuation during streaming command".into(),
             )),
             Self::WithContinuations(c) => c.on_continuation_erased(cont, ctx),
         }
@@ -516,6 +562,7 @@ pub(in crate::connection) async fn run_one_command(
     loop {
         let notify_before = state.notify();
         let utf8 = utf8_mode(state);
+        consumer.prepare_to_read().await?;
         let resp = wire_reader.read_one(utf8).await?;
         let _digest = state.apply_side_effects(&resp);
 
@@ -617,6 +664,7 @@ pub(in crate::connection) async fn run_prebuilt_command(
     loop {
         let notify_before = state.notify();
         let utf8 = utf8_mode(state);
+        consumer.prepare_to_read().await?;
         let resp = wire_reader.read_one(utf8).await?;
         let _digest = state.apply_side_effects(&resp);
 

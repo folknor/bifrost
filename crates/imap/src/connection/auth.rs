@@ -629,6 +629,37 @@ impl ImapConnection {
         Ok(output)
     }
 
+    /// Submit a streaming regular command to the driver task and await the
+    /// typed result.
+    pub(super) async fn submit_streaming<C: super::dispatch::StreamingConsumer + 'static>(
+        &self,
+        cmd: Command,
+        consumer: C,
+    ) -> Result<C::Output, Error>
+    where
+        C::Output: 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let dcmd = driver::DriverCommand::Run {
+            payload: driver::DriverCommandPayload::Standard(cmd),
+            consumer: driver::DriverConsumer::StreamingRegular(
+                Box::new(consumer) as Box<dyn driver::StreamingConsumerErased>
+            ),
+            result_tx,
+        };
+        if self.cmd_tx.send(dcmd).await.is_err() {
+            return Err(self.observe_driver_panic().await);
+        }
+        let result = match result_rx.await {
+            Ok(inner) => inner?,
+            Err(_) => return Err(self.observe_driver_panic().await),
+        };
+        let output = *result
+            .downcast::<C::Output>()
+            .map_err(|_| Error::Internal("type mismatch in driver result".into()))?;
+        Ok(output)
+    }
+
     /// Submit a continuation-aware command to the driver task and await
     /// the typed result.
     ///

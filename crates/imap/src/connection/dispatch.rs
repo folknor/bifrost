@@ -8,6 +8,9 @@
 //! `ConsumerErased` is a blanket-impl wrapper for the pipeline path,
 //! which needs `Box<dyn ...>`.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::connection::NotifyFlags;
 use crate::error::Error;
 use crate::types::response::{
@@ -28,8 +31,10 @@ pub(crate) use auth::{
     AuthenticateCramMd5Consumer, AuthenticatePlainConsumer, AuthenticateScramConsumer,
     AuthenticateXoauth2Consumer, LoginConsumer, ScramMechanism,
 };
+#[cfg(test)]
+pub(crate) use fetch::StreamingFetchConsumer;
 pub(crate) use fetch::{
-    FetchConsumer, FetchVanishedConsumer, StoreConsumer, StreamingFetchConsumer,
+    BoundedStreamingFetchConsumer, FetchConsumer, FetchVanishedConsumer, StoreConsumer,
 };
 pub(crate) use list::{
     ListConsumer, ListExtendedConsumer, ListStatusConsumer, LsubConsumer, StatusConsumer,
@@ -82,6 +87,29 @@ pub(crate) trait Consumer: Send {
         tagged: TaggedResponse,
         ctx: &ConsumerContext,
     ) -> Result<Finalized<Self::Output>, Error>;
+}
+
+/// Current downstream-capacity state for a streaming consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackpressureState {
+    /// Consumer can accept the next routed response without awaiting.
+    Ready,
+    /// Consumer needs the driver to await downstream capacity before
+    /// reading more bytes from the wire.
+    NeedsCapacity,
+    /// Downstream receiver is closed. The driver should keep draining the
+    /// command to tagged completion and the consumer will discard data.
+    Drained,
+}
+
+/// Consumer that can apply async backpressure before the driver reads.
+pub(crate) trait StreamingConsumer: Consumer {
+    /// Whether the driver should reserve downstream capacity before
+    /// reading the next response from the wire.
+    fn backpressure_state(&self) -> BackpressureState;
+
+    /// Reserve capacity for the next delivered item.
+    fn reserve_capacity(&mut self) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>>;
 }
 
 /// Output of [`Consumer::finalize`].
