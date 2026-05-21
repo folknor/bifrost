@@ -15,6 +15,8 @@ pub(crate) enum FolderCursor {
     QResync {
         uidvalidity: u32,
         modseq: u64,
+        known_uids: CompactUidSet,
+        known_uids_complete: bool,
     },
     Condstore {
         uidvalidity: u32,
@@ -39,8 +41,9 @@ impl FolderCursor {
 
     pub(crate) fn known_uids(&self) -> Option<&CompactUidSet> {
         match self {
-            Self::Condstore { known_uids, .. } | Self::Basic { known_uids, .. } => Some(known_uids),
-            Self::QResync { .. } => None,
+            Self::QResync { known_uids, .. }
+            | Self::Condstore { known_uids, .. }
+            | Self::Basic { known_uids, .. } => Some(known_uids),
         }
     }
 }
@@ -75,10 +78,14 @@ fn encode_folder_cursor(cursor: &FolderCursor) -> Vec<u8> {
         FolderCursor::QResync {
             uidvalidity,
             modseq,
+            known_uids,
+            known_uids_complete,
         } => {
             out.push(1);
             push_u32(&mut out, *uidvalidity);
             push_u64(&mut out, *modseq);
+            encode_uid_set(&mut out, known_uids);
+            out.push(u8::from(*known_uids_complete));
         }
         FolderCursor::Condstore {
             uidvalidity,
@@ -109,10 +116,35 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
     input.expect_magic()?;
     let tag = input.take_u8()?;
     match tag {
-        1 => Ok(FolderCursor::QResync {
-            uidvalidity: input.take_u32()?,
-            modseq: input.take_u64()?,
-        }),
+        1 => {
+            let uidvalidity = input.take_u32()?;
+            let modseq = input.take_u64()?;
+            // Three on-disk shapes are accepted:
+            //   * pre-baseline v1: no bytes after modseq -> empty set,
+            //     incomplete (legacy cursors written before known_uids
+            //     was tracked at all)
+            //   * mid-PR shape: uid set bytes only, no completeness
+            //     byte -> assume complete (the only writer that emits
+            //     this shape hardcodes `complete: true`)
+            //   * current shape: uid set bytes followed by a u8 flag
+            let (known_uids, known_uids_complete) = if input.remaining() == 0 {
+                (CompactUidSet::default(), false)
+            } else {
+                let set = input.take_uid_set()?;
+                let complete = if input.remaining() == 0 {
+                    true
+                } else {
+                    input.take_u8()? != 0
+                };
+                (set, complete)
+            };
+            Ok(FolderCursor::QResync {
+                uidvalidity,
+                modseq,
+                known_uids,
+                known_uids_complete,
+            })
+        }
         2 => Ok(FolderCursor::Condstore {
             uidvalidity: input.take_u32()?,
             modseq: input.take_u64()?,
@@ -173,6 +205,10 @@ impl<'a> CursorBytes<'a> {
             .ok_or(AccountError::SchemaIncompatible)?;
         self.offset = end;
         Ok(out)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 
     fn take_u8(&mut self) -> Result<u8, AccountError> {
@@ -327,6 +363,8 @@ mod tests {
             FolderCursor::QResync {
                 uidvalidity: 7,
                 modseq: 99,
+                known_uids: CompactUidSet::from_uids([1, 2]),
+                known_uids_complete: true,
             },
             FolderCursor::Condstore {
                 uidvalidity: 7,
@@ -353,6 +391,8 @@ mod tests {
             &FolderCursor::QResync {
                 uidvalidity: 1,
                 modseq: 2,
+                known_uids: CompactUidSet::default(),
+                known_uids_complete: true,
             },
         );
         change.server_state.envelope_version = ENVELOPE_VERSION + 1;
@@ -360,6 +400,59 @@ mod tests {
             decode_cursor(&change),
             Err(AccountError::CursorEnvelopeUnknown)
         ));
+    }
+
+    #[test]
+    fn qresync_cursor_decodes_legacy_payload_without_known_uids() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(1);
+        push_u32(&mut bytes, 7);
+        push_u64(&mut bytes, 99);
+
+        let cursor = decode_folder_cursor(&bytes).expect("decode legacy qresync");
+        assert_eq!(
+            cursor,
+            FolderCursor::QResync {
+                uidvalidity: 7,
+                modseq: 99,
+                known_uids: CompactUidSet::default(),
+                known_uids_complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn qresync_cursor_decodes_mid_pr_payload_without_complete_flag() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(1);
+        push_u32(&mut bytes, 7);
+        push_u64(&mut bytes, 99);
+        encode_uid_set(&mut bytes, &CompactUidSet::from_uids([1, 2]));
+
+        let cursor = decode_folder_cursor(&bytes).expect("decode mid-pr qresync");
+        assert_eq!(
+            cursor,
+            FolderCursor::QResync {
+                uidvalidity: 7,
+                modseq: 99,
+                known_uids: CompactUidSet::from_uids([1, 2]),
+                known_uids_complete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn qresync_cursor_roundtrips_incomplete_baseline() {
+        let cursor = FolderCursor::QResync {
+            uidvalidity: 7,
+            modseq: 99,
+            known_uids: CompactUidSet::default(),
+            known_uids_complete: false,
+        };
+        let change = encode_cursor(CursorScope::Account, &cursor);
+        assert_eq!(decode_cursor(&change).expect("decode"), cursor);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub struct ImapAccountConfig {
     pub auth_policy: AuthPolicy,
     pub pool_cap: usize,
     pub idle_timeout: Duration,
-    pub disable_qresync: bool,
+    pub enable_qresync: bool,
     pub flag_sync_interval: Duration,
     pub deletion_check_interval: Duration,
     pub mutation_batch_size: usize,
@@ -30,7 +30,7 @@ impl ImapAccountConfig {
             auth_policy,
             pool_cap: 4,
             idle_timeout: Duration::from_secs(29 * 60),
-            disable_qresync: false,
+            enable_qresync: false,
             flag_sync_interval: Duration::from_secs(300),
             deletion_check_interval: Duration::from_secs(600),
             mutation_batch_size: 1024,
@@ -84,7 +84,7 @@ async fn negotiate_qresync(
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
 ) -> Result<bool, crate::Error> {
-    if cfg.disable_qresync || !profile.supports_qresync() {
+    if !cfg.enable_qresync || !profile.supports_qresync() {
         return Ok(false);
     }
     let enabled = conn.enable(&["QRESYNC"], cfg.imap.command_timeout).await?;
@@ -110,4 +110,19 @@ async fn list_folders(
         }
     }
     conn.list("", "*", cfg.imap.command_timeout).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qresync_runtime_gate_defaults_off() {
+        let cfg = ImapAccountConfig::new(
+            ImapConfig::tls("imap.example.test"),
+            Credentials::password("user", "pass"),
+            AuthPolicy::default(),
+        );
+        assert!(!cfg.enable_qresync);
+    }
 }

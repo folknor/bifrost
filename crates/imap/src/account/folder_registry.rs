@@ -57,6 +57,19 @@ impl CompactUidSet {
         self.ranges.iter().copied().flat_map(expand_range).collect()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|range| {
+                range
+                    .end
+                    .map(|end| end.saturating_sub(range.start).saturating_add(1))
+                    .unwrap_or(1)
+            })
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
+            .sum()
+    }
+
     pub(crate) fn diff(&self, newer: &Self) -> UidSetDiff {
         let old: BTreeSet<u32> = self.to_uids().into_iter().collect();
         let new: BTreeSet<u32> = newer.to_uids().into_iter().collect();
@@ -204,6 +217,7 @@ mod tests {
         let diff = set.diff(&newer);
         assert_eq!(diff.added, vec![4]);
         assert_eq!(diff.removed, vec![1, 7, 10]);
+        assert_eq!(set.len(), 6);
     }
 
     #[test]

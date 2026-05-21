@@ -183,11 +183,10 @@ fn reclassify_select_responses(
 /// marked LIST responses (OLDNAME, `\NonExistent`, `\NoAccess`) are
 /// always reclassified as events.
 ///
-/// Note: `Vanished { earlier: false }` is consumed here even though
-/// `build_selected_mailbox` only extracts `earlier: true`. Non-earlier
-/// VANISHED during SELECT is rare (an asynchronous expunge for the new
-/// mailbox arriving before the tagged OK) and is silently consumed,
-/// consistent with the pre-dispatcher implementation.
+/// Non-EARLIER VANISHED during SELECT is an asynchronous expunge
+/// notification for the selected mailbox and must be reclassified as
+/// an event. Only VANISHED (EARLIER) is part of the QRESYNC SELECT
+/// result.
 fn is_select_solicited_response(
     resp: &UntaggedResponse,
     ctx: &ConsumerContext,
@@ -197,7 +196,7 @@ fn is_select_solicited_response(
         UntaggedResponse::Exists(_)
         | UntaggedResponse::Recent(_)
         | UntaggedResponse::Flags(_)
-        | UntaggedResponse::Vanished { .. }
+        | UntaggedResponse::Vanished { earlier: true, .. }
         | UntaggedResponse::Fetch(_)
         | UntaggedResponse::Status { code: Some(_), .. } => true,
         // RFC 9051 Section6.3.2: rev2 SELECT solicits exactly one LIST for
@@ -300,4 +299,46 @@ fn validate_select_responses(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::UidRange;
+
+    fn default_ctx() -> ConsumerContext<'static> {
+        ConsumerContext {
+            capabilities: &[],
+            enabled: &[],
+            command_target: None,
+            command_tag: "A001",
+        }
+    }
+
+    #[test]
+    fn select_reclassifies_plain_vanished_as_event() {
+        let responses = vec![
+            UntaggedResponse::Exists(3),
+            UntaggedResponse::Recent(0),
+            UntaggedResponse::Flags(vec![]),
+            UntaggedResponse::Vanished {
+                earlier: true,
+                uids: vec![UidRange::single(10)],
+            },
+            UntaggedResponse::Vanished {
+                earlier: false,
+                uids: vec![UidRange::single(11)],
+            },
+        ];
+
+        let reclassified = reclassify_select_responses(responses, &default_ctx());
+
+        assert_eq!(
+            reclassified,
+            vec![UntaggedResponse::Vanished {
+                earlier: false,
+                uids: vec![UidRange::single(11)],
+            }]
+        );
+    }
 }

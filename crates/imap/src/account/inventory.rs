@@ -9,35 +9,17 @@ use bifrost_types::{
 use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
 use super::{
-    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, account_error, batch,
-    boxed_receiver_stream, encode_cursor, encode_object_id, fatal_event, folder_from_scope,
-    folder_scope, membership_scope,
+    BATCH_ITEMS, CompactUidSet, ImapAccount, batch, boxed_receiver_stream, encode_cursor,
+    encode_object_id, fatal_event, folder_from_scope, folder_scope, membership_scope,
 };
 
 pub(crate) fn establish_initial_cursor(
-    account: ImapAccount,
+    _account: ImapAccount,
     scope: CursorScope,
 ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
     Box::pin(async move {
-        let folder = folder_from_scope(&scope)?;
-        if !account.qresync_enabled {
-            return Ok(CursorEstablishment::EstablishViaInventory);
-        }
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(account_error)?;
-        let selected = account
-            .select_folder(&mut conn, &folder, None, true)
-            .await
-            .map_err(account_error)?;
-        let cursor = account.cursor_from_select(&selected.mailbox, None);
-        account.folders.set_cursor(&folder, cursor.clone());
-        if matches!(cursor, FolderCursor::QResync { .. }) {
-            Ok(CursorEstablishment::Ready(encode_cursor(scope, &cursor)))
-        } else {
-            Ok(CursorEstablishment::EstablishViaInventory)
-        }
+        let _folder = folder_from_scope(&scope)?;
+        Ok(CursorEstablishment::EstablishViaInventory)
     })
 }
 

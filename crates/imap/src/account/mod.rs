@@ -57,7 +57,7 @@ pub struct ImapAccountInner {
     pub(crate) capabilities: bifrost_types::AccountCapabilities,
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
-    pub(crate) qresync_enabled: bool,
+    pub(crate) qresync_enabled: AtomicBool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) priority: AtomicU8,
@@ -79,7 +79,7 @@ impl ImapAccount {
                 capabilities,
                 pool,
                 folders,
-                qresync_enabled,
+                qresync_enabled: AtomicBool::new(qresync_enabled),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
@@ -134,10 +134,11 @@ impl ImapAccount {
             SyncSelectOptions::read_write()
         };
 
-        if self.qresync_enabled
+        if self.qresync_enabled()
             && let Some(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
+                ..
             }) = cursor
             && let Some(validity) = UidValidity::new(*uidvalidity)
         {
@@ -152,13 +153,16 @@ impl ImapAccount {
         known_uids: Option<CompactUidSet>,
     ) -> FolderCursor {
         let uidvalidity = selected.uid_validity.unwrap_or_default();
-        if self.qresync_enabled
+        let known_uids = known_uids.unwrap_or_default();
+        if self.qresync_enabled()
             && let Some(modseq) = selected.highest_mod_seq
             && !selected.no_mod_seq
         {
             return FolderCursor::QResync {
                 uidvalidity,
                 modseq,
+                known_uids,
+                known_uids_complete: true,
             };
         }
         if let Some(modseq) = selected.highest_mod_seq
@@ -167,14 +171,25 @@ impl ImapAccount {
             return FolderCursor::Condstore {
                 uidvalidity,
                 modseq,
-                known_uids: known_uids.unwrap_or_default(),
+                known_uids,
             };
         }
         FolderCursor::Basic {
             uidvalidity,
             uidnext: selected.uid_next.unwrap_or_default(),
-            known_uids: known_uids.unwrap_or_default(),
+            known_uids,
         }
+    }
+
+    pub(crate) fn qresync_enabled(&self) -> bool {
+        self.qresync_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn disable_qresync_for_session(&self) {
+        // Other folder syncs may already have passed their QRESYNC gate
+        // on this account. They are allowed to finish or independently
+        // downgrade; this one-way flag only prevents new QRESYNC work.
+        self.qresync_enabled.store(false, Ordering::Release);
     }
 }
 
