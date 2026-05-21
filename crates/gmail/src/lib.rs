@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "Gmail API client for Rust."]
 
+pub mod account;
 pub mod api;
 pub mod auth_parser;
 pub mod blob;

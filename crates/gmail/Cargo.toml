@@ -19,12 +19,16 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bifrost-types = { path = "../types" }
 blake3 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 log = { workspace = true }
 reqwest = { workspace = true, features = ["json", "native-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio-util = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
