@@ -8,15 +8,16 @@
 
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::auth::TokenSource;
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
 use crate::error::Error;
 use crate::rate::{RateLimit, RateLimitGovernor};
-use crate::request::{ByteRange, ByteStream, RequestBuilder};
+use crate::request::{ByteStream, RequestBuilder};
 use crate::retry::RetryPolicy;
-use crate::{AccountId, Priority};
+use crate::{AccountId, ByteRange, Priority};
 
 /// Process-wide HTTP transport. Holds the shared reqwest client, the
 /// per-host rate-limit governor, and the bandwidth meter. Cheap to
@@ -66,22 +67,34 @@ impl Net {
         // Register the meter so the per-account counters exist before
         // any request lands. Rate-limit registration walks the host
         // list the caller supplied.
-        self.inner.meter.register_account(id);
+        self.inner.meter.register_account(id.clone());
         for limit in &spec.hosts {
             self.inner.governor.register(limit.clone());
         }
         AccountNet {
-            net: self.clone(),
-            account: id,
-            token_source: spec.token_source,
-            default_retry: spec.default_retry,
-            priority: RwLock::new(Priority::Foreground),
-            bandwidth_cap: RwLock::new(None),
+            inner: Arc::new(AccountNetInner {
+                net: self.clone(),
+                account: id,
+                token_source: spec.token_source,
+                default_retry: spec.default_retry,
+                priority: AtomicU8::new(Priority::Foreground as u8),
+                bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_NONE),
+            }),
         }
     }
 
-    /// Drop the per-account state. Idempotent.
-    pub fn detach_account(&self, id: AccountId) {
+    /// Drop the per-account state.
+    ///
+    /// Idempotent for the bandwidth meter. **Asymmetric** with
+    /// `attach_account` for the rate-limit governor: governor buckets
+    /// are keyed by host string and shared across every account on
+    /// that host (e.g. five Gmail accounts all share the
+    /// `gmail.googleapis.com` bucket). Naively unregistering the host
+    /// would yank the bucket out from under other accounts, so the
+    /// skeleton leaks host buckets for the life of the process.
+    /// Phase 2 may refcount per-host registrations and drop on zero;
+    /// for now the asymmetry is by design.
+    pub fn detach_account(&self, id: &AccountId) {
         self.inner.meter.forget_account(id);
     }
 
@@ -105,10 +118,24 @@ impl Net {
     }
 }
 
+/// Sentinel encoding `None` on the `bandwidth_cap: AtomicU64` field.
+/// `u64::MAX` is unreachable in practice (it implies ~18 EB/s) and
+/// distinguishable from any real cap.
+const BANDWIDTH_CAP_NONE: u64 = u64::MAX;
+
 /// Account-scoped view onto `Net`. Carries the account identity used
 /// for metering, the token source for OAuth, and the rate-limit plus
 /// retry defaults the protocol crate supplied at registration.
+///
+/// `Clone` is one `Arc` refcount bump. Protocol crates typically clone
+/// this once per spawned task so each stream owns its own handle.
+#[derive(Clone)]
 pub struct AccountNet {
+    inner: Arc<AccountNetInner>,
+}
+
+#[allow(dead_code)]
+struct AccountNetInner {
     /// Shared underlying transport.
     net: Net,
     /// Account identity for metering and tracing.
@@ -118,37 +145,45 @@ pub struct AccountNet {
     /// Default retry policy applied to every request unless the
     /// caller overrides via `RequestBuilder::retry`.
     default_retry: RetryPolicy,
-    /// Engine-controlled priority hint. The rate-limit governor
-    /// divides the bucket size for `Background` and `Bulk` accounts.
-    priority: RwLock<Priority>,
-    /// Engine-controlled bandwidth cap in bytes per second. `None`
-    /// means unlimited.
-    bandwidth_cap: RwLock<Option<u64>>,
+    /// Engine-controlled priority hint. Atomic so the hot per-request
+    /// read does not take a lock. Stored as the `Priority` enum's
+    /// discriminant byte; `priority()` converts back.
+    priority: AtomicU8,
+    /// Engine-controlled bandwidth cap in bytes per second.
+    /// `BANDWIDTH_CAP_NONE` (sentinel `u64::MAX`) means unlimited.
+    bandwidth_cap: AtomicU64,
 }
 
 impl AccountNet {
-    /// Start a `GET` request.
-    pub async fn get(&self, url: &str) -> RequestBuilder {
+    /// Start a `GET` request. Not async because the builder itself is
+    /// pure construction; the network round-trip happens in
+    /// `RequestBuilder::send`.
+    #[must_use]
+    pub fn get(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(reqwest::Method::GET, url)
     }
 
     /// Start a `POST` request.
-    pub async fn post(&self, url: &str) -> RequestBuilder {
+    #[must_use]
+    pub fn post(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(reqwest::Method::POST, url)
     }
 
     /// Start a `PUT` request.
-    pub async fn put(&self, url: &str) -> RequestBuilder {
+    #[must_use]
+    pub fn put(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(reqwest::Method::PUT, url)
     }
 
     /// Start a `PATCH` request.
-    pub async fn patch(&self, url: &str) -> RequestBuilder {
+    #[must_use]
+    pub fn patch(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(reqwest::Method::PATCH, url)
     }
 
     /// Start a `DELETE` request.
-    pub async fn delete(&self, url: &str) -> RequestBuilder {
+    #[must_use]
+    pub fn delete(&self, url: &str) -> RequestBuilder {
         RequestBuilder::new(reqwest::Method::DELETE, url)
     }
 
@@ -165,46 +200,69 @@ impl AccountNet {
     /// Per-account meter handle.
     #[must_use]
     pub fn meter(&self) -> AccountMeter {
-        self.net.inner.meter.account(self.account)
+        self.inner
+            .net
+            .inner
+            .meter
+            .account(self.inner.account.clone())
     }
 
     /// Set a per-account bandwidth cap in bytes per second. `None`
-    /// disables the cap.
+    /// disables the cap. Single atomic store; safe to call from any
+    /// task without taking a lock.
     pub fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        let mut guard = self
-            .bandwidth_cap
-            .write()
-            .expect("AccountNet bandwidth-cap lock poisoned");
-        *guard = bps;
+        let raw = bps.unwrap_or(BANDWIDTH_CAP_NONE);
+        self.inner.bandwidth_cap.store(raw, Ordering::Relaxed);
     }
 
-    /// Set the engine-controlled priority hint. The rate-limit
-    /// governor reads this on every request.
+    /// Current bandwidth cap if any. `None` means unlimited.
+    #[must_use]
+    pub fn bandwidth_cap(&self) -> Option<u64> {
+        let raw = self.inner.bandwidth_cap.load(Ordering::Relaxed);
+        if raw == BANDWIDTH_CAP_NONE {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+
+    /// Set the engine-controlled priority hint. Single atomic store.
     pub fn set_priority(&self, p: Priority) {
-        let mut guard = self
-            .priority
-            .write()
-            .expect("AccountNet priority lock poisoned");
-        *guard = p;
+        self.inner.priority.store(p as u8, Ordering::Relaxed);
+    }
+
+    /// Current priority hint.
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        match self.inner.priority.load(Ordering::Relaxed) {
+            x if x == Priority::Foreground as u8 => Priority::Foreground,
+            x if x == Priority::Normal as u8 => Priority::Normal,
+            x if x == Priority::Background as u8 => Priority::Background,
+            x if x == Priority::Bulk as u8 => Priority::Bulk,
+            // Unreachable in practice: only set_priority writes to
+            // this atomic and the enum is non-exhaustive only at the
+            // public API boundary, not on the wire.
+            _ => Priority::Normal,
+        }
     }
 
     /// The account this handle is scoped to.
     #[must_use]
-    pub fn account(&self) -> AccountId {
-        self.account
+    pub fn account(&self) -> &AccountId {
+        &self.inner.account
     }
 
     /// Default retry policy applied to requests on this account.
     #[must_use]
     pub fn default_retry(&self) -> &RetryPolicy {
-        &self.default_retry
+        &self.inner.default_retry
     }
 
     /// Underlying token source. Exposed so the OAuth refresher in
     /// `auth.rs` can share the trait object across requests.
     #[must_use]
     pub fn token_source(&self) -> &Arc<dyn TokenSource> {
-        &self.token_source
+        &self.inner.token_source
     }
 }
 

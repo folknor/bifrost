@@ -3,6 +3,15 @@
 //! Protocol crates map each variant onto their own typed errors and
 //! recovery classes. The engine never sees `bifrost_net::Error`
 //! directly.
+//!
+//! `Error::Status` (and `Response` in `request.rs`) carries
+//! `reqwest::StatusCode` and `reqwest::header::HeaderMap` straight
+//! through. That couples downstream protocol crates to reqwest; a
+//! future swap to a different HTTP client would break every
+//! pattern-match on status across the four protocol crates.
+//! Acceptable for v1 because all four current protocols are on
+//! reqwest and `StatusCode` is a thin u16 wrapper. Phase 2 may wrap
+//! these in opaque newtypes if the surface fans out further.
 
 use std::time::Duration;
 

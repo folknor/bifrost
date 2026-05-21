@@ -30,9 +30,9 @@ pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, Di
 
 // Capability snapshot.
 pub use capabilities::{
-    AccountCapabilities, BatchingPolicy, BlobRangeSupport, CapabilityDelta, CapabilityKey,
-    CursorFreshness, MutationCapabilities, MutationConcurrency, MutationReplaySafety, NewValue,
-    OldValue, PushCapability, QuotaSignal, RateLimitClass,
+    AccountCapabilities, BatchingPolicy, BlobRangeSupport, CapabilityChange, CapabilityDelta,
+    CapabilityKey, CapabilityValue, CursorFreshness, MutationCapabilities, MutationConcurrency,
+    MutationReplaySafety, PushCapability, QuotaSignal, RateLimitClass,
 };
 
 // Cursor + scope types.
@@ -46,10 +46,10 @@ pub use error::{Error, Fatal, RecoveryClass, StrategyDowngrade, Warning, Warning
 
 // Stream-event types.
 pub use events::{
-    BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control, CursorDelta,
-    HintPayload, InvalidationHint, InvalidationSink, InventoryEntry, ObjectChange,
-    ObjectChangeKind, PageBoundary, PageBoundaryKind, Partition, Priority, Progress, PushSource,
-    ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
+    BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control, HintPayload,
+    InvalidationHint, InvalidationSink, InventoryEntry, ObjectChange, ObjectChangeKind,
+    PageBoundary, Partition, Priority, Progress, PushSource, ScopeChange, ScopeChangeKind,
+    SyncEvent, WatchEvent,
 };
 
 // Newtype ids.
@@ -60,8 +60,8 @@ pub use ids::{
 
 // Mutation + projection + hydration types.
 pub use mutation::{
-    Fingerprint, FlagOp, FlagSet, HydratedObject, HydratedObjectKind, IdempotencyKey,
-    MutationOutcome, MutationResult, Projection, ProtocolSalt, ServerVersion,
+    Fingerprint, FlagOp, HydratedObject, HydratedObjectKind, IdempotencyKey, MutationOutcome,
+    MutationResult, Projection, ProtocolSalt, ServerVersion,
 };
 
 /// Compile-time dyn-safety check for `Account`. If this function

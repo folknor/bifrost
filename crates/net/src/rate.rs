@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -45,11 +45,18 @@ pub trait RequestCost {
 /// Per-host token-bucket governor. Holds one `HostBucket` per
 /// registered host and looks them up by `&str` on every call.
 pub struct RateLimitGovernor {
-    /// Per-host bucket state. Behind a `Mutex` because the steady
-    /// state path takes the lock only to debit tokens or wait, which
-    /// is not held across `.await`. The `Notify` lives outside the
-    /// `Mutex` so wake calls do not contend.
-    buckets: Mutex<HashMap<String, HostBucket>>,
+    /// Per-host bucket state. Behind `Arc<Mutex<_>>` rather than
+    /// plain `Mutex<_>` because `acquire(...)` returns a
+    /// `Pin<Box<dyn Future + Send + 'static>>` that must capture
+    /// the bucket map by ownership (it cannot borrow from `&self`,
+    /// which would require a non-`'static` lifetime). Phase 2 wires
+    /// the wait/notify loop inside that future and needs to
+    /// re-acquire the lock after each park; the `Arc` clone is
+    /// what makes that legal. Steady-state path takes the lock only
+    /// to debit tokens or wait, which is not held across `.await`.
+    /// The `Notify` lives outside the `Mutex` so wake calls do not
+    /// contend.
+    buckets: Arc<Mutex<HashMap<String, HostBucket>>>,
 }
 
 /// Internal bucket state for one host. Public only inside the crate
@@ -77,7 +84,7 @@ impl RateLimitGovernor {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

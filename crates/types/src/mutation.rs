@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use bytes::Bytes;
+
 use crate::blob::BlobHandle;
 use crate::error::Error;
 use crate::ids::{ObjectId, RunId};
@@ -85,17 +87,18 @@ pub enum Projection {
 #[allow(clippy::large_enum_variant)]
 pub enum HydratedObjectKind {
     /// `Projection::FlagsOnly`. Carries the canonical flag set as
-    /// the protocol observes it.
-    FlagsOnly(FlagSet),
+    /// the protocol observes it (current state, not a mutation).
+    FlagsOnly(HashSet<String>),
     /// `Projection::Metadata`. Same shape inventory uses, hydrated
     /// from a fresh fetch.
     Metadata(crate::events::InventoryEntry),
     /// `Projection::Headers`, `Preview`, `TextOnly`, `Full`,
     /// `FullWithBlobs`. The raw RFC 822 / MIME bytes the protocol
     /// returned for the requested projection; consumers parse with
-    /// their own MIME library. Per-protocol crates may swap this
-    /// for a richer typed payload in a future revision.
-    RawMime(Vec<u8>),
+    /// their own MIME library. `Bytes` not `Vec<u8>` so a 5MB
+    /// `HydratedObject::clone()` is a cheap refcount bump, not a
+    /// copy.
+    RawMime(Bytes),
 }
 
 /// Hydrated object payload yielded by `get_stream`.
@@ -167,21 +170,30 @@ pub enum MutationOutcome {
     Failed(Error),
 }
 
-/// Bulk-flag mutation target description.
-#[derive(Debug, Clone, Default)]
-pub struct FlagSet {
-    pub add: HashSet<String>,
-    pub remove: HashSet<String>,
-}
-
-/// Which kind of flag mutation to apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bulk flag mutation. Carries both the operation and the flag set
+/// in one type so a `FlagOp::Set` actually pins the target state
+/// (the prior `FlagSet { add, remove } + separate FlagOp` shape
+/// couldn't - `Set` had nowhere to put the target flags). Use
+/// `Patch` for the IMAP-style additive+subtractive case where a
+/// single STORE needs to mention both adds and removes.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum FlagOp {
-    /// Union the flag set into existing flags (IMAP `+FLAGS`).
-    Add,
-    /// Difference the flag set from existing flags (IMAP `-FLAGS`).
-    Remove,
-    /// Replace the flag set wholesale (IMAP `FLAGS`).
-    Set,
+    /// Union the carried flag set into existing flags
+    /// (IMAP `+FLAGS`, Gmail `addLabelIds`).
+    Add(HashSet<String>),
+    /// Difference the carried flag set from existing flags
+    /// (IMAP `-FLAGS`, Gmail `removeLabelIds`).
+    Remove(HashSet<String>),
+    /// Replace existing flags with the carried set wholesale
+    /// (IMAP `FLAGS`). Not directly expressible on Gmail; the
+    /// Account impl translates via add+remove.
+    Set(HashSet<String>),
+    /// Both add and remove in one wire operation
+    /// (IMAP `+FLAGS` then `-FLAGS` is two STOREs; Gmail
+    /// `messages.batchModify` accepts both in one request).
+    Patch {
+        add: HashSet<String>,
+        remove: HashSet<String>,
+    },
 }

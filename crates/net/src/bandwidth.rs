@@ -89,18 +89,16 @@ impl BandwidthMeter {
 
     /// Drop the per-account counters. Called from
     /// `Net::detach_account`.
-    pub fn forget_account(&self, account: AccountId) {
+    pub fn forget_account(&self, account: &AccountId) {
         let mut map = self.accounts.lock().expect("meter lock poisoned");
-        map.remove(&account);
+        map.remove(account);
     }
 
     /// Build a handle scoped to one account. Cloneable, cheap.
     #[must_use]
     pub fn account(&self, account: AccountId) -> AccountMeter {
-        AccountMeter {
-            account,
-            counters: self.lookup(account),
-        }
+        let counters = self.lookup(&account);
+        AccountMeter { account, counters }
     }
 
     /// Sum bytes/second across every registered account. Used for
@@ -111,9 +109,9 @@ impl BandwidthMeter {
         unimplemented!("BandwidthMeter::observed_bps is filled in by Phase 2")
     }
 
-    fn lookup(&self, account: AccountId) -> Option<Arc<AccountCounters>> {
+    fn lookup(&self, account: &AccountId) -> Option<Arc<AccountCounters>> {
         let map = self.accounts.lock().expect("meter lock poisoned");
-        map.get(&account).map(Arc::clone)
+        map.get(account).map(Arc::clone)
     }
 }
 
@@ -162,8 +160,8 @@ impl AccountMeter {
 
     /// The account this handle is scoped to.
     #[must_use]
-    pub fn account(&self) -> AccountId {
-        self.account
+    pub fn account(&self) -> &AccountId {
+        &self.account
     }
 }
 
@@ -174,7 +172,7 @@ impl AccountMeter {
 /// metering stack.
 pub trait MeterSink: Send + Sync + 'static {
     /// Record `n` inbound bytes for `account`.
-    fn record_bytes_in(&self, account: AccountId, n: u64);
+    fn record_bytes_in(&self, account: &AccountId, n: u64);
     /// Record `n` outbound bytes for `account`.
-    fn record_bytes_out(&self, account: AccountId, n: u64);
+    fn record_bytes_out(&self, account: &AccountId, n: u64);
 }

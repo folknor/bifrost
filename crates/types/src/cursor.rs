@@ -70,6 +70,15 @@ pub enum ProtocolKind {
 /// Concrete opaque cursor state. `protocol` and `envelope_version`
 /// let the protocol impl reject a cursor minted for a different
 /// protocol or an older schema.
+///
+/// Note on `envelope_version`: this field versions the layout of
+/// `bytes` (the protocol-owned cursor payload). `ChangeCursor` carries
+/// its own `envelope_version` versioning the enclosing
+/// `ChangeCursor` struct layout (e.g. whether `advanced_through` is
+/// present, what type aliases compose into the cursor). The two are
+/// intentionally independent - one is "protocol said its payload
+/// shape ticked", the other is "the trait crate said its outer
+/// cursor shape ticked" - and they tick on different events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpaqueChangeState {
     pub protocol: ProtocolKind,

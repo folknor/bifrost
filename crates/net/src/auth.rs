@@ -7,19 +7,14 @@
 //! do not trigger N independent refreshes.
 
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bifrost_types::AccountFuture;
 use tokio::sync::{Mutex, oneshot};
 use zeroize::Zeroizing;
 
 use crate::error::Error;
-
-/// Erased future used by the token-source trait. Kept local so the
-/// crate is self-contained; will be unified with `bifrost-types`
-/// `AccountFuture<T>` in a later phase.
-pub type AccountFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
 
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
@@ -115,15 +110,19 @@ pub struct OAuthRefresher {
 
 impl OAuthRefresher {
     /// Build a refresher around the given token source. The initial
-    /// state is `Refreshing { waiters: [] }`; the first `token()` call
-    /// will drive the first refresh.
+    /// state is `Empty` - no cached token, no in-flight refresh. The
+    /// first `token()` call transitions to `Refreshing` and drives
+    /// the network round-trip itself; concurrent callers join the
+    /// `waiters` list. The prior draft initialized to
+    /// `Refreshing { waiters: [] }` which left no way to distinguish
+    /// "refresh in progress" from "first caller hasn't claimed the
+    /// refresher role yet" - a naive `token()` impl would park
+    /// callers as waiters forever.
     #[must_use]
     pub fn new(source: Arc<dyn TokenSource>) -> Self {
         Self {
             source,
-            state: Arc::new(Mutex::new(RefreshState::Refreshing {
-                waiters: Vec::new(),
-            })),
+            state: Arc::new(Mutex::new(RefreshState::Empty)),
         }
     }
 
@@ -161,9 +160,15 @@ impl OAuthRefresher {
 }
 
 /// Internal state of `OAuthRefresher`. Wrapped in a `Mutex` so the
-/// `Fresh -> Refreshing` transition is atomic.
+/// `Empty -> Refreshing`, `Fresh -> Refreshing`, and
+/// `Refreshing -> Fresh` transitions are atomic.
 #[non_exhaustive]
 pub enum RefreshState {
+    /// Initial state: no cached token, no in-flight refresh. The
+    /// first `token()` call transitions to `Refreshing` with the
+    /// refreshing role implicitly claimed (`waiters` empty); it
+    /// drives the network round-trip itself.
+    Empty,
     /// Steady state. The cached token is valid and outside the
     /// proactive-refresh window.
     Fresh {
@@ -172,11 +177,20 @@ pub enum RefreshState {
         /// Wall-clock instant at which the cached token was minted.
         refreshed_at: Instant,
     },
-    /// A refresh is in flight. New callers append a oneshot sender to
-    /// `waiters` and await; the refreshing task fans the result out
-    /// to every waiter when it completes.
+    /// A refresh is in flight. The task that transitioned the state
+    /// to `Refreshing` is driving the network call; concurrent
+    /// callers append a oneshot sender to `waiters` and await. On
+    /// completion the driving task fans the result out to every
+    /// waiter.
+    ///
+    /// Errors fan out via `Arc<Error>` because `crate::error::Error`
+    /// is not `Clone` (it carries `Box<dyn std::error::Error>` and
+    /// `Bytes` and a `HeaderMap`). Each waiter receives the same
+    /// `Arc<Error>`; cloning the `Arc` is one refcount bump.
     Refreshing {
-        /// Pending oneshot senders, one per waiting caller.
-        waiters: Vec<oneshot::Sender<Result<AccessToken, Error>>>,
+        /// Pending oneshot senders, one per waiting caller. The
+        /// driving task is NOT in this list - it owns the refresh
+        /// future directly.
+        waiters: Vec<oneshot::Sender<Result<AccessToken, Arc<Error>>>>,
     },
 }

@@ -1,9 +1,10 @@
 //! Stream event types shared between protocol crates and the engine.
 //!
-//! Every Account-trait stream yields `SyncEvent<Batch<T>>` (or, for
-//! `push_stream`, raw `WatchEvent`s). The checkpoint travels inside
-//! the batch so the consumer persists data and cursor in one
-//! transaction.
+//! Every Account-trait batched stream yields `SyncEvent<T>`, where
+//! `SyncEvent::Batch(Batch<T>)` is the dominant variant. The
+//! checkpoint travels inside the batch so the consumer persists data
+//! and cursor in one transaction. `push_stream` yields raw
+//! `WatchEvent`s - those are wake-up signals, not paged data.
 
 use std::time::Duration;
 
@@ -52,36 +53,23 @@ pub struct BackfillProgress {
 
 /// Page boundary marker on a batch.
 ///
-/// The engine writes `Some(checkpoint)` only when `cursor_delta` is
-/// `Some(CursorDelta::Advanced(_))`. Mid-page or non-advance boundaries
-/// carry `None`.
-#[derive(Debug, Clone)]
-pub struct PageBoundary {
-    pub kind: PageBoundaryKind,
-    pub cursor_delta: Option<CursorDelta>,
-}
-
-/// What kind of page boundary this batch ends on.
+/// `kind` is metadata for observability. The cursor advance itself
+/// lives on `Batch::checkpoint`, not here - keeping two encodings
+/// (one in PageBoundary, one in Batch.checkpoint) let them disagree.
+/// `Batch::checkpoint = Some(_)` IS the cursor-advance signal; the
+/// page boundary just tells the engine what shape of boundary it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PageBoundaryKind {
+pub enum PageBoundary {
     /// Mid-page partial flush (e.g., max_wait elapsed before page
-    /// filled).
+    /// filled). Batch::checkpoint is `None`.
     Partial,
     /// Natural page boundary as the protocol crate defines it.
+    /// Batch::checkpoint MAY be `Some` if the cursor advanced.
     Page,
-    /// Stream terminus.
+    /// Stream terminus. Batch::checkpoint carries the final cursor
+    /// if there is one to carry.
     Final,
-}
-
-/// Cursor advance carried with a page boundary.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum CursorDelta {
-    /// Cursor advanced to the carried checkpoint.
-    Advanced(Checkpoint),
-    /// Cursor unchanged on this boundary.
-    Unchanged,
 }
 
 /// Streaming batch envelope.
@@ -179,7 +167,10 @@ pub enum Change {
 pub struct InventoryEntry {
     pub id: ObjectId,
     pub memberships: Vec<MembershipScope>,
-    pub size: u64,
+    /// Message size in bytes. `Option` because Microsoft Graph does
+    /// not expose `size` on the message resource; consumers fall
+    /// back to `(server_version, flags_hash)` for diff there.
+    pub size: Option<u64>,
     pub blob_id: Option<crate::ids::BlobId>,
     pub fingerprint: Fingerprint,
     pub thread_id: Option<crate::ids::ThreadId>,
@@ -256,15 +247,20 @@ pub trait Control: Send + Sync {
 }
 
 /// Scheduling priority on the four-lane scheduler.
+///
+/// `#[repr(u8)]` so the discriminant is stable for `AtomicU8`
+/// storage in hot per-request paths (see `bifrost-net`'s
+/// `AccountNet`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 #[non_exhaustive]
 pub enum Priority {
     /// User-visible; preempts background work.
-    Foreground,
+    Foreground = 0,
     /// Default.
-    Normal,
+    Normal = 1,
     /// Backfill, archive-folder polling.
-    Background,
+    Background = 2,
     /// Batch operations the user will not watch.
-    Bulk,
+    Bulk = 3,
 }

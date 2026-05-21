@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use crate::capabilities::CapabilityDelta;
-use crate::cursor::CursorScope;
+use crate::cursor::{CursorScope, SyncStrategy};
 
 /// Per-operation failure type. Returned by methods that yield a
 /// future (`establish_initial_cursor`, `push_subscribe`,
@@ -159,9 +159,14 @@ pub enum WarningKind {
     /// Protocol downgraded its strategy mid-stream (QRESYNC ->
     /// CONDSTORE on iCloud `ENABLE` failure, etc.). Recovery is
     /// transparent; the warning surfaces for observability only.
+    /// `from`/`to` are `SyncStrategy` states (the protocol's
+    /// strategy *position*), not `StrategyDowngrade` transitions -
+    /// "QResync -> Condstore" is one downgrade, naming the two
+    /// positions is unambiguous; naming the transition twice would
+    /// be nonsense.
     StrategyDowngraded {
-        from: StrategyDowngrade,
-        to: StrategyDowngrade,
+        from: SyncStrategy,
+        to: SyncStrategy,
     },
     /// Persistent strategy failure pattern; consumer should consider
     /// a runtime configuration override.

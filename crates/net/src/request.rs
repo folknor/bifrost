@@ -16,20 +16,14 @@ use serde::Serialize;
 use crate::error::Error;
 use crate::retry::RetryPolicy;
 
+// `ByteRange` lives in `bifrost-types::blob` so the engine, the
+// protocol crates, and this crate all use one struct. Re-exported
+// from `crate::ByteRange` for ergonomic imports.
+
 /// Erased byte stream returned by streaming download endpoints. Same
 /// shape as `AccountStream<Bytes>` in the engine plan so blob
 /// download paths compose naturally.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + 'static>>;
-
-/// Byte-range selector for partial downloads. Maps onto an HTTP
-/// `Range: bytes=start-end` header at the transport level.
-#[derive(Debug, Clone, Copy)]
-pub struct ByteRange {
-    /// Inclusive start offset.
-    pub start: u64,
-    /// Length in bytes. `None` means "from start to EOF".
-    pub length: Option<u64>,
-}
 
 /// Fluent request builder. Consumes `self` on every setter so the
 /// final `send` call is a single move.
@@ -81,19 +75,21 @@ impl RequestBuilder {
     }
 
     /// Set a header. Multiple calls with the same key append.
+    /// Phase 2 wires this through; the v1 skeleton refuses rather
+    /// than silently dropping the header (the prior draft accepted
+    /// and discarded the arguments, which would produce headerless
+    /// requests with no warning at all).
     #[must_use]
     pub fn header(self, _key: &str, _value: &str) -> Self {
-        // Header insertion is delegated to Phase 2; the skeleton
-        // accepts and discards so call sites compile.
-        self
+        unimplemented!("RequestBuilder::header is filled in by Phase 2")
     }
 
     /// Set the request body to a JSON-serialized value. Reqwest
-    /// serializes with `serde_json` under the hood.
+    /// serializes with `serde_json` under the hood. Phase 2 wires
+    /// this; v1 refuses rather than silently dropping the body.
     #[must_use]
     pub fn json<B: Serialize + ?Sized>(self, _body: &B) -> Self {
-        // Phase 2 wires this to `reqwest::RequestBuilder::json`.
-        self
+        unimplemented!("RequestBuilder::json is filled in by Phase 2")
     }
 
     /// Set the request body to raw bytes.

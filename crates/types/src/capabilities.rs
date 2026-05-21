@@ -138,10 +138,6 @@ pub struct AccountCapabilities {
     pub blob_range: BlobRangeSupport,
     pub blob_digest_pre_download: bool,
     pub push: PushCapability,
-    /// `true` for IMAP IDLE / JMAP WebSocket / EWS streaming;
-    /// `false` for Gmail Pub/Sub and Graph webhooks. Engine uses
-    /// this to wire the push channel.
-    pub push_in_process: bool,
     pub mutation: MutationCapabilities,
     pub batching_policy: BatchingPolicy,
     pub rate_limit_class: RateLimitClass,
@@ -158,6 +154,21 @@ pub struct AccountCapabilities {
     pub delta_token_expires_after: Option<Duration>,
 }
 
+impl AccountCapabilities {
+    /// True iff `push_stream` delivers `Invalidated` events directly
+    /// (IMAP IDLE / NOTIFY, JMAP WebSocket, EWS streaming
+    /// notifications). False for out-of-process push paths (Gmail
+    /// Pub/Sub, Graph webhooks), where `Invalidated` arrives via
+    /// the engine's `InvalidationSink` and `push_stream` carries
+    /// only optional subscription-health transitions.
+    ///
+    /// Derived from `push` so the two encodings cannot drift.
+    #[must_use]
+    pub fn push_in_process(&self) -> bool {
+        matches!(self.push, PushCapability::InProcess)
+    }
+}
+
 /// Capability-key surface used to describe changes in
 /// `CapabilityDelta`. Opaque newtype around a String so the engine and
 /// observability layers can name capabilities without coupling to a
@@ -165,13 +176,21 @@ pub struct AccountCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CapabilityKey(pub String);
 
-/// Capability value snapshot before a transition.
-#[derive(Debug, Clone)]
-pub struct OldValue(pub String);
+/// A capability's stringified value at some point in time. Used for
+/// both the "before" and "after" sides of a transition; the position
+/// in `CapabilityChange` distinguishes them. (The prior draft had
+/// separate `OldValue` / `NewValue` newtypes wrapping the same
+/// `String` shape, which was redundant.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityValue(pub String);
 
-/// Capability value snapshot after a transition.
+/// One named capability transition.
 #[derive(Debug, Clone)]
-pub struct NewValue(pub String);
+pub struct CapabilityChange {
+    pub key: CapabilityKey,
+    pub from: CapabilityValue,
+    pub to: CapabilityValue,
+}
 
 /// Delta between two `AccountCapabilities` snapshots. Carried on
 /// `RecoveryClass::CapabilityChanged` so the engine can reason about
@@ -180,5 +199,5 @@ pub struct NewValue(pub String);
 pub struct CapabilityDelta {
     pub added: Vec<CapabilityKey>,
     pub removed: Vec<CapabilityKey>,
-    pub changed: Vec<(CapabilityKey, OldValue, NewValue)>,
+    pub changed: Vec<CapabilityChange>,
 }

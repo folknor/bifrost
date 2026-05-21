@@ -15,6 +15,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+bifrost-types = { path = "../types" }
 reqwest = { workspace = true, features = ["native-tls", "stream", "json"] }
 native-tls = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }

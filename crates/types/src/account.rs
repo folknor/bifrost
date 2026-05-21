@@ -21,11 +21,9 @@ use crate::cursor::{
     ScopeLifecycle,
 };
 use crate::error::Error;
-use crate::events::{Batch, Change, InventoryEntry, SyncEvent, WatchEvent};
+use crate::events::{Change, InventoryEntry, SyncEvent, WatchEvent};
 use crate::ids::{ObjectId, SubscriptionHandle};
-use crate::mutation::{
-    FlagOp, FlagSet, HydratedObject, IdempotencyKey, MutationResult, Projection,
-};
+use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, MutationResult, Projection};
 
 /// Erased streaming return type for `Account` methods.
 ///
@@ -57,11 +55,11 @@ pub trait Account: Send + Sync {
 
     /// Cursor-scope discovery: what scopes does the engine multiplex
     /// `changes_stream` over? Bounded; terminates with `Done`.
-    fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<Batch<CursorScope>>>;
+    fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>>;
 
     /// Membership-scope discovery: what containers can the consumer
     /// ask about (folder trees, labels, mailboxes, queries)? Bounded.
-    fn discover_memberships(&self) -> AccountStream<SyncEvent<Batch<MembershipScope>>>;
+    fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>>;
 
     /// Ongoing scope lifecycle events (folder created, renamed, deleted).
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle>;
@@ -80,10 +78,7 @@ pub trait Account: Send + Sync {
     /// `CursorEstablishment::EstablishViaInventory`; for those scopes
     /// the terminal `SyncEvent::Done` carries the established cursor
     /// in its checkpoint.
-    fn inventory_stream(
-        &self,
-        scope: CursorScope,
-    ) -> AccountStream<SyncEvent<Batch<InventoryEntry>>>;
+    fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>>;
 
     /// Hydrate known ids at a chosen projection. Input ids are
     /// streamed so the engine can backpressure long fetch passes.
@@ -91,11 +86,11 @@ pub trait Account: Send + Sync {
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<Batch<HydratedObject>>>;
+    ) -> AccountStream<SyncEvent<HydratedObject>>;
 
     /// Post-cursor diff. Yields `Change` (the sum of `ObjectChange`
     /// and `ScopeChange`).
-    fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Batch<Change>>>;
+    fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>>;
 
     /// Server-side push subscription CRUD: create.
     fn push_subscribe(
@@ -131,13 +126,15 @@ pub trait Account: Send + Sync {
 
     /// Bulk flag mutation. `targets` is a streaming input so
     /// engine-driven mutation pipelines backpressure cleanly.
+    /// `op` carries both the operation kind AND the flag set per
+    /// variant; a `FlagOp::Set(HashSet)` pins the target flag set
+    /// directly.
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,
-        flags: FlagSet,
         op: FlagOp,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<Batch<MutationResult>>>;
+    ) -> AccountStream<SyncEvent<MutationResult>>;
 
     /// Bulk move. Targets are moved into `destination`.
     fn bulk_move(
@@ -145,14 +142,14 @@ pub trait Account: Send + Sync {
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<Batch<MutationResult>>>;
+    ) -> AccountStream<SyncEvent<MutationResult>>;
 
     /// Bulk destroy.
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<Batch<MutationResult>>>;
+    ) -> AccountStream<SyncEvent<MutationResult>>;
 
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,
     /// JMAP WebSocket close, Graph subscription stream end, local
