@@ -138,4 +138,97 @@ mod tests {
             MutationOutcome::Skipped
         ));
     }
+
+    #[test]
+    fn maps_invalid_authentication_token_to_auth_lost() {
+        let recovery = recovery_for_graph_error(
+            "Graph API error 401 Unauthorized: InvalidAuthenticationToken",
+            &scope(),
+        )
+        .expect("recovery expected");
+        assert!(matches!(recovery, RecoveryClass::AuthLost));
+    }
+
+    #[test]
+    fn maps_503_to_retry() {
+        let recovery =
+            recovery_for_graph_error("Graph API error 503 Service Unavailable", &scope())
+                .expect("recovery expected");
+        assert!(matches!(recovery, RecoveryClass::Retry { .. }));
+    }
+
+    #[test]
+    fn maps_504_to_retry() {
+        let recovery = recovery_for_graph_error("Graph API error 504 Gateway Timeout", &scope())
+            .expect("recovery expected");
+        assert!(matches!(recovery, RecoveryClass::Retry { .. }));
+    }
+
+    #[test]
+    fn maps_sync_state_not_found_to_restart_scope() {
+        let recovery = recovery_for_graph_error(
+            "Graph API error 400 Bad Request: syncStateNotFound",
+            &scope(),
+        )
+        .expect("recovery expected");
+        assert!(matches!(recovery, RecoveryClass::RestartScope(_)));
+    }
+
+    #[test]
+    fn unrecognized_error_returns_none_classification() {
+        assert!(recovery_for_graph_error("totally unrelated failure", &scope()).is_none());
+    }
+
+    #[test]
+    fn fatal_constructor_defaults_to_retry_for_unknown_shape() {
+        let fatal = graph_error_to_fatal("totally unrelated failure", scope());
+        assert!(matches!(fatal.recovery, RecoveryClass::Retry { .. }));
+    }
+
+    #[test]
+    fn fatal_constructor_defaults_to_auth_for_unauthorized_shape() {
+        let fatal = graph_error_to_fatal("got 401 from the server", scope());
+        assert!(matches!(fatal.recovery, RecoveryClass::AuthLost));
+    }
+
+    #[test]
+    fn fatal_from_recovery_preserves_schema_incompatible() {
+        let fatal = fatal_from_recovery(RecoveryClass::SchemaIncompatible, "stale cursor");
+        assert!(matches!(fatal.recovery, RecoveryClass::SchemaIncompatible));
+        assert_eq!(fatal.message, "stale cursor");
+    }
+
+    #[test]
+    fn mutation_outcome_throttled_status_is_failed() {
+        let id = ObjectId("m1".to_string());
+        let outcome = mutation_outcome_for_status(429, false, &id);
+        assert!(matches!(outcome, MutationOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn mutation_outcome_destroy_404_is_skipped() {
+        let id = ObjectId("m1".to_string());
+        assert!(matches!(
+            mutation_outcome_for_status(404, true, &id),
+            MutationOutcome::Skipped
+        ));
+    }
+
+    #[test]
+    fn mutation_outcome_non_destroy_404_is_failed() {
+        let id = ObjectId("m1".to_string());
+        assert!(matches!(
+            mutation_outcome_for_status(404, false, &id),
+            MutationOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn mutation_outcome_2xx_is_applied() {
+        let id = ObjectId("m1".to_string());
+        assert!(matches!(
+            mutation_outcome_for_status(204, false, &id),
+            MutationOutcome::Applied
+        ));
+    }
 }

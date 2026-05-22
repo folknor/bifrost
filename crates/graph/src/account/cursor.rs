@@ -197,4 +197,100 @@ mod tests {
             Err(Error::CursorProtocolMismatch)
         ));
     }
+
+    #[test]
+    fn rejects_future_envelope_version() {
+        let cursor = ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                bytes: b"{}".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(Error::CursorEnvelopeUnknown)
+        ));
+    }
+
+    #[test]
+    fn rejects_past_envelope_version_as_schema_incompatible() {
+        let cursor = ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: 0,
+                bytes: b"{}".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(Error::SchemaIncompatible)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_payload_bytes() {
+        let cursor = ChangeCursor {
+            scope: CursorScope::Account,
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                bytes: b"{not-json".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        assert!(matches!(decode_cursor(&cursor), Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn rejects_truncated_progress_bytes() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = ChangeCursor {
+            scope: scope.clone(),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                bytes: serde_json::to_vec(&payload).expect("serialize"),
+            },
+            advanced_through: Some(OpaqueProgressBytes(b"{nope".to_vec())),
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        assert!(matches!(decode_cursor(&cursor), Err(Error::Other(_))));
+    }
+
+    #[test]
+    fn kind_for_scope_rejects_unsupported_object_type() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Mailbox,
+        };
+        assert!(matches!(kind_for_scope(&scope), Err(Error::Unsupported)));
+    }
+
+    #[test]
+    fn kind_for_scope_rejects_non_folder_type_scope() {
+        assert!(matches!(
+            kind_for_scope(&CursorScope::Account),
+            Err(Error::Unsupported)
+        ));
+    }
 }

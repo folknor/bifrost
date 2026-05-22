@@ -301,9 +301,115 @@ fn flags_hash(value: &Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use bifrost_types::QueryId;
+    use futures_util::StreamExt;
     use serde_json::json;
 
+    use crate::client::GraphClient;
+
+    use super::super::PushMode;
     use super::*;
+
+    fn test_account() -> GraphAccount {
+        GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    #[test]
+    fn initial_delta_url_supports_email_scope() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let url = initial_delta_url(&account, &scope).expect("email scope is supported");
+        assert!(url.starts_with("/me/mailFolders/inbox/messages/delta?"));
+    }
+
+    #[test]
+    fn initial_delta_url_supports_event_scope() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let url = initial_delta_url(&account, &scope).expect("event scope is supported");
+        assert!(url.starts_with("/me/calendars/calendar/calendarView/delta?"));
+    }
+
+    #[test]
+    fn initial_delta_url_supports_contact_scope() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("contacts".to_string()),
+            ty: ObjectType::Contact,
+        };
+        let url = initial_delta_url(&account, &scope).expect("contact scope is supported");
+        assert!(url.starts_with("/me/contactFolders/contacts/contacts/delta?"));
+    }
+
+    #[test]
+    fn initial_delta_url_rejects_account_scope() {
+        let account = test_account();
+        assert!(initial_delta_url(&account, &CursorScope::Account).is_err());
+    }
+
+    #[test]
+    fn initial_delta_url_rejects_query_scope() {
+        let account = test_account();
+        let scope = CursorScope::Query(QueryId("q1".to_string()));
+        assert!(initial_delta_url(&account, &scope).is_err());
+    }
+
+    #[test]
+    fn initial_delta_url_rejects_bare_folder_scope() {
+        let account = test_account();
+        let scope = CursorScope::Folder(FolderId("inbox".to_string()));
+        assert!(initial_delta_url(&account, &scope).is_err());
+    }
+
+    #[test]
+    fn initial_delta_url_rejects_unsupported_object_type() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Mailbox,
+        };
+        assert!(initial_delta_url(&account, &scope).is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_rejects_account_scope_with_fatal() {
+        let account = test_account();
+        let mut stream = inventory_stream(account, CursorScope::Account);
+        let first = stream.next().await.expect("fatal event");
+        assert!(matches!(first, SyncEvent::Fatal(_)));
+        let second = stream.next().await.expect("done event");
+        assert!(matches!(second, SyncEvent::Done(None)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inventory_rejects_query_scope_with_fatal() {
+        let account = test_account();
+        let scope = CursorScope::Query(QueryId("q1".to_string()));
+        let mut stream = inventory_stream(account, scope);
+        let first = stream.next().await.expect("fatal event");
+        assert!(matches!(first, SyncEvent::Fatal(_)));
+        let second = stream.next().await.expect("done event");
+        assert!(matches!(second, SyncEvent::Done(None)));
+    }
+
+    #[tokio::test]
+    async fn inventory_rejects_unsupported_folder_type_with_fatal() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Mailbox,
+        };
+        let mut stream = inventory_stream(account, scope);
+        let first = stream.next().await.expect("fatal event");
+        assert!(matches!(first, SyncEvent::Fatal(_)));
+    }
 
     #[test]
     fn membership_scope_uses_parent_folder_id() {

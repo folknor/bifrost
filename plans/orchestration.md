@@ -188,10 +188,10 @@ Each new `reference/{jmap,imap,gmail,graph}.md` covers:
 
 ### File ownership
 
-P3-A0, P3-A2, and P3-A3 are merged. P3-A1's reference doc is
-merged; its conformance tests are deferred behind in-flight
-sync-engine work in `crates/jmap/src/sync/`. P3-A4 and the
-orchestrator cross-crate work remain.
+P3-A0, P3-A2, P3-A3, and P3-A4 are merged. P3-A1's reference
+doc is merged; its conformance tests are deferred behind
+in-flight sync-engine work in `crates/jmap/src/sync/`. Only the
+orchestrator cross-crate work remains.
 
 - **P3-A0 (CONDSTORE/QRESYNC)**: merged. Code lives across
   `crates/imap/src/account/{factory,capabilities,changes,
@@ -218,9 +218,14 @@ orchestrator cross-crate work remain.
   added across `crates/gmail/src/account/{cursor,capabilities,
   recovery,inventory}.rs` cover cursor round-trip, capability
   shape, error classification, and scope-to-method wiring.
-- **P3-A4 (graph)**: `reference/graph.md` (new) + graph
-  conformance test additions inside `crates/graph/src/account/`
-  modules.
+- **P3-A4 (graph)**: merged. `reference/graph.md` covers the
+  delta-token sync, webhook + EWS streaming push (with the
+  renewal health worker that just landed), the cursor envelope
+  validation, and the recovery-taxonomy error mapping.
+  Conformance tests added across
+  `crates/graph/src/account/{cursor,capabilities,error,
+  inventory}.rs` cover cursor round-trip, capability shape,
+  error classification, and scope-to-method wiring.
 - **Orchestrator**: writes the cross-crate conformance assertion
   in `bifrost-sync` (or `bifrost-types`), runs `brokkr check`
   cleanup workspace-wide.
@@ -268,8 +273,7 @@ Phase 3 is done when all of these hold:
   design because the modseq cache is cold-startable. Any future
   flip to `StateBased` would need a separate plan.
 - All four `reference/{jmap,imap,gmail,graph}.md` files exist
-  and match the section list above. `imap`, `jmap`, and `gmail`
-  are done; `graph` is still outstanding.
+  and match the section list above. All four are done.
 - Per-protocol conformance tests cover cursor envelope round-
   trip, capability shape, error classification, and scope-to-
   method wiring for each crate.
