@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use serde::Deserialize;
 
+// types: protocol-specific RFC 7807 body kept so JMAP error mapping can inspect type and limit.
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct ProblemDetails {

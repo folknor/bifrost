@@ -288,8 +288,24 @@ fn set_response_deserializes() {
 
 #[test]
 fn request_serializes_correctly() {
-    let mut get = TestGet::new();
+    let handle = make_handle::<TestQuery>("q0");
+    let mut get = TestGet::new()
+        .ids([TestObjId::new("obj-1")])
+        .ids_ref(handle.result_reference("/ids"))
+        .properties([TestProp::Id])
+        .properties_ref(handle.result_reference("/properties"));
     get.set_account_id(&crate::core::id::AccountId::new("account-1"));
     let value = serde_json::to_value(&get).unwrap();
     assert_eq!(value.get("accountId"), Some(&json!("account-1")));
+
+    let query = TestQuery::new()
+        .filter(())
+        .sort([super::query::Comparator::new(())])
+        .position(1)
+        .anchor("obj-1")
+        .anchor_offset(-1)
+        .limit(50)
+        .calculate_total(true);
+    let value = serde_json::to_value(&query).unwrap();
+    assert_eq!(value.get("limit"), Some(&json!(50)));
 }

@@ -34,7 +34,7 @@ use crate::{
         Email, EmailGet, EmailId, EmailQuery, EmailSet, Property,
         query::{self as eq, Filter as EmailFilter},
     },
-    mailbox::{Mailbox, MailboxGet, MailboxId, MailboxQuery},
+    mailbox::{Mailbox, MailboxGet, MailboxId},
 };
 
 /// The mail workflow facade. Construct via [`Account::mail`].
@@ -256,12 +256,4 @@ impl<'a, Tr: HttpTransport> EmailsQuery<'a, Tr> {
         }
         query
     }
-}
-
-// MailboxQuery is exported for completeness; the helper-style listing
-// is `Mail::mailboxes`. Anything more elaborate goes through the
-// protocol layer.
-#[allow(dead_code)]
-fn _mailbox_query_is_used() -> MailboxQuery {
-    MailboxQuery::new()
 }

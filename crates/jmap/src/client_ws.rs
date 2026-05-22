@@ -39,11 +39,7 @@ struct WebSocketRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct WebSocketResponse {
-    #[serde(rename = "requestId")]
-    request_id: Option<String>,
-
     #[serde(rename = "methodResponses")]
     method_responses: Vec<serde_json::Value>,
 
@@ -89,14 +85,9 @@ enum WebSocketPushDisableType {
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub(crate) struct WebSocketPushObject {
     #[serde(flatten)]
     pub push: PushObject,
-
-    #[serde(rename = "pushState")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub push_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

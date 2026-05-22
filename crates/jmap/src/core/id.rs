@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 /// let mailbox_id: bifrost_jmap::mailbox::MailboxId = "mbox-1".into();
 /// // email_id == mailbox_id  // compile error - different types
 /// ```
+// types: separate from bifrost-types IDs because JMAP wire models need per-object phantom typing.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);

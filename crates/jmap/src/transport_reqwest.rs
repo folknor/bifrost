@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::Response;
-use bifrost_net::{AccountId, AccountNet, AccountSpec, Net, NetConfig, RateLimit, RetryPolicy};
+use bifrost_net::{
+    AccountId, AccountNet, AccountSpec, Net, NetConfig, Priority, RateLimit, RetryPolicy,
+};
 use bytes::Bytes;
 use reqwest::Url;
 use reqwest::header;
@@ -16,7 +18,6 @@ use futures::Stream;
 ///
 /// Routes through the shared HTTP pipeline for retry, metering, and
 /// token handling.
-#[allow(dead_code)]
 pub struct ReqwestTransport {
     net: AccountNet,
     headers: header::HeaderMap,
@@ -60,6 +61,14 @@ impl ReqwestTransport {
             timeout,
             trusted_hosts,
         })
+    }
+
+    pub(crate) fn set_priority(&self, priority: Priority) {
+        self.net.set_priority(priority);
+    }
+
+    pub(crate) fn set_bandwidth_cap(&self, bps: Option<u64>) {
+        self.net.set_bandwidth_cap(bps);
     }
 
     async fn send(

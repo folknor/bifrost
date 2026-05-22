@@ -4,6 +4,7 @@ use bytes::Bytes;
 
 /// Transport-level error. Wraps the underlying HTTP client error
 /// without leaking it into the crate's public error model.
+// types: crate-owned so custom transports can still carry response bodies for ProblemDetails.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct TransportError {

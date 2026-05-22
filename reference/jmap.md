@@ -115,9 +115,9 @@ Cursors are encoded as protocol-tagged opaque bytes via a hand-rolled length-pre
 
 ```
 crates/jmap/src/sync/
-  mod.rs           - module re-exports (JmapAccount, JmapAccountFactory,
+  mod.rs           - module re-exports (JmapAccountFactory,
                      JmapAccountFactoryBuilder, JmapCredentials, ReconnectPolicy)
-  account.rs       - JmapAccount struct + impl Account
+  account.rs       - pub(crate) JmapAccount struct + impl Account
   factory.rs       - JmapAccountFactory + builder + JmapCredentials
   capabilities.rs  - AccountCapabilities builder, CoreLimits
   state.rs         - cursor envelope (V1 tag/length format)
@@ -135,7 +135,7 @@ crates/jmap/src/sync/
 
 `JmapAccountFactory` is the consumer-registered factory. It carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic` or `JmapCredentials::Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open` connects a `Client`, resolves the primary `Mail` account, reads the session, builds `AccountCapabilities` and `CoreLimits`, and probes initial `Email` / `Mailbox` / `Thread` state strings to seed cursors. It spawns the WebSocket reader task with a `CancellationToken` and returns `Arc<dyn Account>`.
 
-`JmapAccount` owns the `Client`, the `Mail`-capability `Account` handle, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. The `priority` and `bandwidth_cap` are `Atomic*` so engine-side adjustments do not require a lock.
+`JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail`-capability `Account` handle, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. `set_priority` and `set_bandwidth_cap` delegate to the underlying `bifrost-net::AccountNet` rather than storing local atomics; the transport owns the canonical knobs.
 
 Reopen is delegated to the engine: when an account drops or `close()` returns, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (which terminates the WebSocket reader loop and any in-flight streams), then awaits a clean teardown. The `closed` flag short-circuits subsequent calls. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!` in the push stream; no `Account` method holds non-cancel-safe state across an await.
 
@@ -156,7 +156,7 @@ Reopen is delegated to the engine: when an account drops or `close()` returns, t
 - `requires_uidvalidity_recheck: false`.
 - `historyid_expires_after: None` and `delta_token_expires_after: None` - JMAP state strings are not time-bound.
 
-`CoreLimits` holds `maxCallsInRequest`, `maxObjectsInGet`, `maxObjectsInSet`, and `maxSizeRequest` for batch sizing. `build` rejects a session whose core limits are zero.
+`CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` rejects a session whose advertised core limits (including `maxCallsInRequest` and `maxSizeRequest`) are zero, even though those latter two are validated and discarded.
 
 ### Cursor envelope
 

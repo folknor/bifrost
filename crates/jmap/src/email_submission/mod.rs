@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::email::{Email, EmailId, EmailPatch};
+use crate::email::{EmailId, EmailPatch};
 use crate::identity::IdentityId;
 use crate::thread::ThreadId;
 
@@ -272,8 +272,3 @@ crate::define_query_changes_method!(
     "EmailSubmission/queryChanges",
     crate::core::capability::Submission
 );
-
-// Reference to suppress unused-import warning if Email isn't used after refactor.
-#[doc(hidden)]
-#[allow(dead_code)]
-type _EmailRef = Email;

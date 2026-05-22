@@ -8,8 +8,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, Credentials};
 use crate::core::capability;
-use crate::email::EmailId;
-use crate::mailbox::MailboxId;
 use crate::thread::ThreadId;
 
 use super::account::JmapAccount;
@@ -19,11 +17,13 @@ use super::mutation;
 use super::push::{ReconnectPolicy, WsState};
 use super::state;
 
+// pub: re-exported through crate::sync for engine AccountFactory registration.
 #[derive(Debug, Clone)]
 pub struct JmapAccountFactory {
     config: JmapAccountFactoryBuilder,
 }
 
+// pub: returned by JmapAccountFactory::builder for open-time configuration.
 #[derive(Debug, Clone)]
 pub struct JmapAccountFactoryBuilder {
     url: String,
@@ -33,6 +33,7 @@ pub struct JmapAccountFactoryBuilder {
     reconnect_policy: ReconnectPolicy,
 }
 
+// pub: caller-supplied auth material for constructing a JMAP AccountFactory.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum JmapCredentials {
@@ -206,26 +207,6 @@ async fn probe_thread_state(
 ) -> crate::Result<String> {
     Ok(mail
         .call(crate::thread::ThreadGet::new().ids(Vec::<ThreadId>::new()))
-        .await?
-        .into_state())
-}
-
-#[allow(dead_code)]
-async fn probe_mailbox_state(
-    mail: &crate::account::Account<crate::transport_reqwest::ReqwestTransport>,
-) -> crate::Result<String> {
-    Ok(mail
-        .call(crate::mailbox::MailboxGet::new().ids(Vec::<MailboxId>::new()))
-        .await?
-        .into_state())
-}
-
-#[allow(dead_code)]
-async fn probe_email_state(
-    mail: &crate::account::Account<crate::transport_reqwest::ReqwestTransport>,
-) -> crate::Result<String> {
-    Ok(mail
-        .call(crate::email::EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?
         .into_state())
 }

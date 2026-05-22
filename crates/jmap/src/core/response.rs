@@ -7,31 +7,6 @@ use super::error::MethodError;
 use super::method::JmapMethod;
 use super::request::CallHandle;
 
-/// Raw deserialized JMAP response envelope (used internally).
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct RawResponse<T> {
-    #[serde(rename = "methodResponses")]
-    method_responses: Vec<T>,
-
-    #[serde(rename = "createdIds")]
-    created_ids: Option<HashMap<String, String>>,
-
-    #[serde(rename = "sessionState")]
-    session_state: String,
-}
-
-#[allow(dead_code)]
-impl<T> RawResponse<T> {
-    pub fn unwrap_method_responses(self) -> Vec<T> {
-        self.method_responses
-    }
-
-    pub fn session_state(&self) -> &str {
-        &self.session_state
-    }
-}
-
 /// A parsed JMAP response with typed method result extraction.
 #[derive(Debug)]
 pub struct Response {

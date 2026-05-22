@@ -32,11 +32,6 @@ macro_rules! define_get_method {
             }
         }
 
-        // Methods are part of the crate's public API surface; downstream
-        // consumers (e.g. ratatoskr) call them. `dead_code` triggers
-        // because the bifrost-jmap test/example tree happens not to use
-        // every variant.
-        #[allow(dead_code)]
         impl $name {
             pub fn new() -> Self {
                 Self {
@@ -243,7 +238,6 @@ macro_rules! define_query_method {
             }
         }
 
-        #[allow(dead_code)]
         impl $name {
             pub fn new() -> Self {
                 Self {

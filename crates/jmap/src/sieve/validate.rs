@@ -13,11 +13,7 @@ pub struct SieveScriptValidateRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SieveScriptValidateResponse {
-    #[serde(rename = "accountId")]
-    account_id: AccountId,
-
     error: Option<SetError<String>>,
 }
 

@@ -14,11 +14,12 @@ use crate::{DataType, PushObject};
 
 pub(crate) type DataTypeSet = HashSet<DataType>;
 
-pub struct WsState {
+pub(crate) struct WsState {
     pub(crate) tx: broadcast::Sender<WatchEvent>,
     pub(crate) enabled: Arc<Mutex<DataTypeSet>>,
 }
 
+// pub: re-exported through crate::sync for AccountFactory reconnect tuning.
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectPolicy {
     pub initial: Duration,

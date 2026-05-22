@@ -9,12 +9,9 @@ use bifrost_types::{
 use crate::core::session::Session;
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct CoreLimits {
-    pub(crate) max_calls_in_request: usize,
     pub(crate) max_objects_in_get: usize,
     pub(crate) max_objects_in_set: usize,
-    pub(crate) max_size_request: usize,
 }
 
 pub(crate) fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimits), Error> {
@@ -63,10 +60,8 @@ pub(crate) fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimit
     };
 
     let limits = CoreLimits {
-        max_calls_in_request: core.max_calls_in_request(),
         max_objects_in_get: core.max_objects_in_get(),
         max_objects_in_set: core.max_objects_in_set(),
-        max_size_request: core.max_size_request(),
     };
 
     Ok((caps, limits))

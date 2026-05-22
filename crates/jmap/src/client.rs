@@ -93,10 +93,7 @@ pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
 
     default_account_id: crate::core::id::AccountId,
     timeout: Duration,
-    /// Used only by the websocket transport; without that feature, the
-    /// field is otherwise unread but kept on the struct for build-shape
-    /// stability across feature flags.
-    #[cfg_attr(not(feature = "websockets"), allow(dead_code))]
+    #[cfg(feature = "websockets")]
     pub(crate) accept_invalid_certs: bool,
 
     #[cfg(feature = "websockets")]
@@ -240,10 +237,11 @@ impl ClientBuilder {
                 session: std::sync::Mutex::new(Arc::new(session)),
                 session_url,
                 session_updated: true.into(),
-                accept_invalid_certs: self.accept_invalid_certs,
                 timeout: self.timeout,
                 transport,
                 default_account_id,
+                #[cfg(feature = "websockets")]
+                accept_invalid_certs: self.accept_invalid_certs,
                 #[cfg(feature = "websockets")]
                 authorization,
                 #[cfg(feature = "websockets")]
@@ -282,10 +280,11 @@ impl<T: HttpTransport> Client<T> {
                 session_url: String::new(),
                 session: std::sync::Mutex::new(Arc::new(session)),
                 session_updated: true.into(),
-                accept_invalid_certs: false,
                 timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
                 transport,
                 default_account_id,
+                #[cfg(feature = "websockets")]
+                accept_invalid_certs: false,
                 #[cfg(feature = "websockets")]
                 authorization: Authorization::Basic(String::new()),
                 #[cfg(feature = "websockets")]

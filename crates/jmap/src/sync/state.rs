@@ -12,6 +12,7 @@ const SCOPE_TAG_MAILBOX: u8 = 2;
 const SCOPE_TAG_THREAD: u8 = 3;
 const SCOPE_TAG_QUERY: u8 = 4;
 
+// types: protocol-owned cursor payload inside bifrost-types::OpaqueChangeState.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JmapCursorState {
     V1 {

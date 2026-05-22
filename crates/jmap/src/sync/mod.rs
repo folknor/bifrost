@@ -5,19 +5,20 @@
 //! cursors are encoded as protocol-tagged opaque bytes and every stream
 //! emits checkpoints at server state boundaries.
 
-pub mod account;
-pub mod blob;
-pub mod capabilities;
-pub mod changes;
-pub mod discover;
-pub mod error;
-pub mod factory;
-pub mod hydrate;
-pub mod inventory;
-pub mod mutation;
-pub mod push;
-pub mod state;
+mod account;
+mod blob;
+mod capabilities;
+mod changes;
+mod discover;
+mod error;
+mod factory;
+mod hydrate;
+mod inventory;
+mod mutation;
+mod push;
+mod state;
 
-pub use account::JmapAccount;
+// pub: engine registration surface consumed by bifrost-sync users.
 pub use factory::{JmapAccountFactory, JmapAccountFactoryBuilder, JmapCredentials};
+// pub: account-open configuration for JMAP WebSocket reconnect behavior.
 pub use push::ReconnectPolicy;

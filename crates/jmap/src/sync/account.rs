@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountFuture, AccountStream, BlobHandle, ByteRange,
@@ -20,9 +20,7 @@ use super::{blob, changes, discover, hydrate, inventory, mutation, push, state};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
-const BANDWIDTH_CAP_UNLIMITED: u64 = u64::MAX;
-
-pub struct JmapAccount {
+pub(crate) struct JmapAccount {
     pub(crate) client: Client,
     pub(crate) mail: MailAccount,
     pub(crate) caps: AccountCapabilities,
@@ -32,8 +30,6 @@ pub struct JmapAccount {
     pub(crate) subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, push::DataTypeSet>>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
-    pub(crate) priority: AtomicU8,
-    pub(crate) bandwidth_cap: AtomicU64,
     pub(crate) subscription_seq: AtomicU64,
     pub(crate) email_state: Arc<Mutex<Option<String>>>,
     pub(crate) mailbox_state: Arc<Mutex<Option<String>>>,
@@ -66,8 +62,6 @@ impl JmapAccount {
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
             shutdown,
             closed: AtomicBool::new(false),
-            priority: AtomicU8::new(Priority::Normal as u8),
-            bandwidth_cap: AtomicU64::new(BANDWIDTH_CAP_UNLIMITED),
             subscription_seq: AtomicU64::new(1),
             email_state: Arc::new(Mutex::new(email_state)),
             mailbox_state: Arc::new(Mutex::new(mailbox_state)),
@@ -100,12 +94,11 @@ impl Account for JmapAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        self.priority.store(priority as u8, Ordering::Release);
+        self.client.transport().set_priority(priority);
     }
 
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.bandwidth_cap
-            .store(bps.unwrap_or(BANDWIDTH_CAP_UNLIMITED), Ordering::Release);
+        self.client.transport().set_bandwidth_cap(bps);
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
