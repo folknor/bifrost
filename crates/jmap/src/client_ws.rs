@@ -1,14 +1,12 @@
 use std::pin::Pin;
 
+use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
-use reqwest::header::SEC_WEBSOCKET_PROTOCOL;
+use http::{HeaderValue, Uri, header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message, client::IntoClientRequest},
-};
+use tokio_websockets::{ClientBuilder, Connector, MaybeTlsStream, Message, WebSocketStream};
 
 use crate::{
     DataType, PushObject,
@@ -143,27 +141,38 @@ impl Client {
             .websocket_capabilities()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
 
-        let mut request = capabilities.url().into_client_request()?;
-        let authorization = self.authorization();
-        request
-            .headers_mut()
-            .insert("Authorization", authorization.parse().unwrap());
-        request
-            .headers_mut()
-            .insert(SEC_WEBSOCKET_PROTOCOL, "jmap".parse().unwrap());
+        let url = capabilities.url().to_string();
+        let uri: Uri = url
+            .parse()
+            .map_err(|e: http::uri::InvalidUri| crate::Error::InvalidUrl(e.to_string()))?;
 
-        let (stream, _) = if self.accept_invalid_certs && capabilities.url().starts_with("wss") {
-            let connector = Connector::NativeTls(
-                native_tls::TlsConnector::builder()
-                    .danger_accept_invalid_certs(true)
-                    .build()
-                    .map_err(|e| tokio_tungstenite::tungstenite::error::Error::Tls(e.into()))?,
-            );
-            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector.into())
-                .await?
+        let authorization = self.authorization();
+        let auth_value =
+            HeaderValue::from_str(&authorization).map_err(crate::Error::from_invalid_header)?;
+
+        let connector = if url.starts_with("wss") {
+            let native = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(self.accept_invalid_certs)
+                .build()
+                .map_err(crate::Error::from_tls)?;
+            Some(Connector::NativeTls(tokio_native_tls::TlsConnector::from(
+                native,
+            )))
         } else {
-            tokio_tungstenite::connect_async(request).await?
+            None
         };
+
+        let mut builder = ClientBuilder::from_uri(uri)
+            .add_header(header::AUTHORIZATION, auth_value)?
+            .add_header(
+                header::SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("jmap"),
+            )?;
+        if let Some(ref connector) = connector {
+            builder = builder.connector(connector);
+        }
+
+        let (stream, _) = builder.connect().await?;
         let (tx, mut rx) = stream.split();
 
         *self.ws.lock().await = WsStream { tx, req_id: 0 }.into();
@@ -172,7 +181,8 @@ impl Client {
             while let Some(message) = rx.next().await {
                 match message {
                     Ok(message) if message.is_text() => {
-                        match serde_json::from_slice::<WebSocketMessage_>(&message.into_data()) {
+                        let payload = message.into_payload();
+                        match serde_json::from_slice::<WebSocketMessage_>(payload.as_ref()) {
                             Ok(message) => match message {
                                 WebSocketMessage_::Response(response) => {
                                     // Deserialize the raw method responses into a Response
@@ -280,7 +290,7 @@ impl Client {
             .as_mut()
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?
             .tx
-            .send(Message::Ping(vec![].into()))
+            .send(Message::ping(Bytes::new()))
             .await
             .map_err(std::convert::Into::into)
     }

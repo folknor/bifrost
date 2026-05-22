@@ -206,7 +206,11 @@ pub enum Error {
     },
     #[cfg(feature = "websockets")]
     /// WebSocket transport error.
-    WebSocket(tokio_tungstenite::tungstenite::error::Error),
+    WebSocket(tokio_websockets::Error),
+    #[cfg(feature = "websockets")]
+    /// WebSocket handshake or TLS setup failed before the connection
+    /// was established.
+    WebSocketSetup(String),
     #[cfg(feature = "websockets")]
     /// WebSocket connection not established.
     WebSocketNotConnected,
@@ -250,9 +254,20 @@ impl From<SetError<String>> for Error {
 }
 
 #[cfg(feature = "websockets")]
-impl From<tokio_tungstenite::tungstenite::error::Error> for Error {
-    fn from(e: tokio_tungstenite::tungstenite::error::Error) -> Self {
+impl From<tokio_websockets::Error> for Error {
+    fn from(e: tokio_websockets::Error) -> Self {
         Error::WebSocket(e)
+    }
+}
+
+#[cfg(feature = "websockets")]
+impl Error {
+    pub(crate) fn from_invalid_header(e: http::header::InvalidHeaderValue) -> Self {
+        Error::WebSocketSetup(format!("invalid WebSocket header value: {e}"))
+    }
+
+    pub(crate) fn from_tls(e: native_tls::Error) -> Self {
+        Error::WebSocketSetup(format!("TLS connector build failed: {e}"))
     }
 }
 
@@ -275,6 +290,8 @@ impl Display for Error {
             ),
             #[cfg(feature = "websockets")]
             Error::WebSocket(e) => write!(f, "WebSocket error: {e}"),
+            #[cfg(feature = "websockets")]
+            Error::WebSocketSetup(msg) => write!(f, "WebSocket setup failed: {msg}"),
             #[cfg(feature = "websockets")]
             Error::WebSocketNotConnected => write!(f, "WebSocket connection not established"),
         }

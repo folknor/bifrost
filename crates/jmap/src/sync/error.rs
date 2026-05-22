@@ -124,6 +124,7 @@ pub(crate) fn to_recovery(
         crate::Error::WebSocket(_) | crate::Error::WebSocketNotConnected => RecoveryClass::Retry {
             after: Duration::from_secs(5),
         },
+        crate::Error::WebSocketSetup(_) => RecoveryClass::Fatal,
         crate::Error::Parse(_)
         | crate::Error::Set(_)
         | crate::Error::CallNotFound(_)
