@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -83,6 +84,10 @@ impl Net {
             .user_agent(&config.user_agent)
             .danger_accept_invalid_certs(config.dangerous_accept_invalid_certs);
 
+        if !config.follow_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+
         for cert in &config.root_certs {
             // `native_tls::Certificate` -> `reqwest::Certificate` via
             // DER round-trip; both backends share the same DER format
@@ -114,6 +119,17 @@ impl Net {
                 account_hosts: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Shared default transport for simple constructors. Applications
+    /// with explicit transport ownership can still call `Net::new`
+    /// and pass account handles into protocol clients directly.
+    #[must_use]
+    pub fn shared_default() -> Self {
+        static DEFAULT: OnceLock<Net> = OnceLock::new();
+        DEFAULT
+            .get_or_init(|| Net::new(NetConfig::default()).expect("default NetConfig should build"))
+            .clone()
     }
 
     /// Register an account with the transport. Returns an

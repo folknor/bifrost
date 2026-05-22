@@ -25,7 +25,7 @@ use bifrost_types::{
     WatchEvent,
 };
 use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures::{StreamExt, stream};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

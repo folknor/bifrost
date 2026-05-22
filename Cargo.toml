@@ -25,6 +25,7 @@ tokio = { version = "1.47", default-features = false }
 tokio-util = "0.7"
 tokio-native-tls = "0.3"
 futures = { version = "0.3", default-features = false }
+async-stream = "0.3"
 
 # Networking and TLS
 reqwest = { version = "0.13.2", default-features = false }
@@ -42,7 +43,6 @@ thiserror = "2"
 # Encoding
 base64 = "0.22"
 percent-encoding = "2.3"
-urlencoding = "2"
 
 # Parsing
 nom = "8"
@@ -62,12 +62,11 @@ uuid = { version = "1", features = ["v4"] }
 
 # Cryptography
 sha2 = "0.11.0"
-getrandom = "0.4.2"
+getrandom = { version = "0.4.2", features = ["std"] }
 zeroize = "1"
 blake3 = "1.5"
 
 # Diagnostics
-log = "0.4"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = "0.3"
 

@@ -5,42 +5,31 @@ use super::{
     parse_get_item_response, xml_escape,
 };
 
-impl Default for EwsClient {
-    fn default() -> Self {
+impl EwsClient {
+    pub fn new(net: bifrost_net::AccountNet) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            net,
             ews_url: EWS_URL.to_string(),
         }
     }
-}
 
-impl EwsClient {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_url(url: String) -> Self {
-        Self {
-            http: reqwest::Client::new(),
-            ews_url: url,
-        }
+    pub fn with_url(net: bifrost_net::AccountNet, url: String) -> Self {
+        Self { net, ews_url: url }
     }
 
     /// Execute a raw EWS SOAP request. Wraps `body_xml` in the SOAP envelope,
     /// sends it, checks for SOAP faults, and returns the response body.
     pub async fn execute(
         &self,
-        access_token: &str,
         body_xml: &str,
         headers: Option<&EwsHeaders>,
     ) -> Result<String, String> {
         let envelope = build_soap_envelope(body_xml);
 
         let mut req = self
-            .http
+            .net
             .post(&self.ews_url)
-            .header("Content-Type", "text/xml; charset=utf-8")
-            .header("Authorization", format!("Bearer {access_token}"));
+            .header("Content-Type", "text/xml; charset=utf-8");
 
         if let Some(h) = headers {
             if let Some(ref anchor) = h.anchor_mailbox {
@@ -52,21 +41,18 @@ impl EwsClient {
         }
 
         let resp = req
-            .body(envelope)
+            .body(bytes::Bytes::from(envelope))
             .send()
             .await
             .map_err(|e| format!("EWS request failed: {e}"))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(resp.body.as_ref());
             return Err(format!("EWS returned {status}: {body}"));
         }
 
-        let xml = resp
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read EWS response: {e}"))?;
+        let xml = String::from_utf8_lossy(resp.body.as_ref()).into_owned();
 
         check_soap_fault(&xml)?;
         Ok(xml)
@@ -78,7 +64,6 @@ impl EwsClient {
     /// Use `"publicfoldersroot"` for the top-level public folder hierarchy.
     pub async fn find_folder(
         &self,
-        access_token: &str,
         parent_folder_id: &str,
         headers: Option<&EwsHeaders>,
     ) -> Result<Vec<EwsFolder>, String> {
@@ -105,14 +90,13 @@ impl EwsClient {
 </m:FindFolder>"#
         );
 
-        let xml = self.execute(access_token, &body_xml, headers).await?;
+        let xml = self.execute(&body_xml, headers).await?;
         parse_find_folder_response(&xml)
     }
 
     /// Get detailed info for a single folder, including `PR_REPLICA_LIST`.
     pub async fn get_folder(
         &self,
-        access_token: &str,
         folder_id: &str,
         headers: Option<&EwsHeaders>,
     ) -> Result<EwsFolder, String> {
@@ -133,14 +117,13 @@ impl EwsClient {
 </m:GetFolder>"#
         );
 
-        let xml = self.execute(access_token, &body_xml, headers).await?;
+        let xml = self.execute(&body_xml, headers).await?;
         parse_get_folder_response(&xml)
     }
 
     /// Find items (messages) in a folder with paging and optional date filter.
     pub async fn find_items(
         &self,
-        access_token: &str,
         folder_id: &str,
         since: Option<&str>,
         offset: u32,
@@ -191,14 +174,13 @@ impl EwsClient {
 </m:FindItem>"#
         );
 
-        let xml = self.execute(access_token, &body_xml, headers).await?;
+        let xml = self.execute(&body_xml, headers).await?;
         parse_find_items_response(&xml)
     }
 
     /// Get full details of a single item (message).
     pub async fn get_item(
         &self,
-        access_token: &str,
         item_id: &str,
         headers: Option<&EwsHeaders>,
     ) -> Result<EwsItem, String> {
@@ -221,14 +203,13 @@ impl EwsClient {
 </m:GetItem>"#
         );
 
-        let xml = self.execute(access_token, &body_xml, headers).await?;
+        let xml = self.execute(&body_xml, headers).await?;
         parse_get_item_response(&xml)
     }
 
     /// Create a new message item in a public folder.
     pub async fn create_item(
         &self,
-        access_token: &str,
         folder_id: &str,
         subject: &str,
         body_html: &str,
@@ -268,7 +249,7 @@ impl EwsClient {
 </m:CreateItem>"#
         );
 
-        let xml = self.execute(access_token, &body_xml, headers).await?;
+        let xml = self.execute(&body_xml, headers).await?;
         parse_create_item_response(&xml)
     }
 }

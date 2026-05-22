@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use bifrost_types::AccountFuture;
@@ -54,6 +55,56 @@ pub struct AccessToken {
     /// the token. `None` for opaque tokens without a TTL hint, in
     /// which case the refresher falls back to the 401 path.
     expires_at: Option<Instant>,
+}
+
+/// Mutable in-memory token source for clients whose caller supplies
+/// already-minted access tokens. `refresh()` returns the current token
+/// because there is no refresh material inside bifrost-net for this
+/// shape.
+#[derive(Debug, Clone)]
+pub struct StaticTokenSource {
+    token: Arc<RwLock<AccessToken>>,
+}
+
+impl StaticTokenSource {
+    /// Build a static source from raw bearer bytes and an optional
+    /// expiry deadline.
+    #[must_use]
+    pub fn new(secret: impl Into<String>, expires_at: Option<Instant>) -> Self {
+        Self::from_token(AccessToken::new(secret, expires_at))
+    }
+
+    /// Build a static source from an existing access-token wrapper.
+    #[must_use]
+    pub fn from_token(token: AccessToken) -> Self {
+        Self {
+            token: Arc::new(RwLock::new(token)),
+        }
+    }
+
+    /// Replace the currently exposed token.
+    pub fn set(&self, token: AccessToken) {
+        *self.token.write().expect("static token lock poisoned") = token;
+    }
+
+    /// Snapshot the current token.
+    pub fn token(&self) -> AccessToken {
+        self.token
+            .read()
+            .expect("static token lock poisoned")
+            .clone()
+    }
+}
+
+impl TokenSource for StaticTokenSource {
+    fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+        let token = Arc::clone(&self.token);
+        Box::pin(async move { Ok(token.read().expect("static token lock poisoned").clone()) })
+    }
+
+    fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+        self.current()
+    }
 }
 
 impl AccessToken {

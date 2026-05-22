@@ -5,7 +5,7 @@ use bifrost_types::{
     AccountStream, Batch, HydratedObject, HydratedObjectKind, ObjectId, PageBoundary, Projection,
     SyncEvent,
 };
-use futures_util::StreamExt;
+use futures::StreamExt;
 
 use crate::email::{EmailGet, EmailId, Property};
 use crate::transport_reqwest::ReqwestTransport;

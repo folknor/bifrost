@@ -23,8 +23,9 @@ pub mod rate;
 pub mod request;
 pub mod retry;
 pub(crate) mod trace;
+pub mod url;
 
-pub use auth::{AccessToken, OAuthRefresher, RefreshState, TokenSource};
+pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink};
 // Shared identity / priority / byte-range / future-alias types live
 // in bifrost-types so the engine, the protocol crates, and this

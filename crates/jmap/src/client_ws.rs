@@ -1,6 +1,6 @@
 use std::pin::Pin;
 
-use futures_util::{SinkExt, Stream, StreamExt, stream::SplitSink};
+use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use reqwest::header::SEC_WEBSOCKET_PROTOCOL;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -144,9 +144,10 @@ impl Client {
             .ok_or_else(|| crate::Error::WebSocketNotConnected)?;
 
         let mut request = capabilities.url().into_client_request()?;
+        let authorization = self.authorization();
         request
             .headers_mut()
-            .insert("Authorization", self.authorization.parse().unwrap());
+            .insert("Authorization", authorization.parse().unwrap());
         request
             .headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, "jmap".parse().unwrap());

@@ -12,6 +12,60 @@ This phase runs *before* Phase 3.5: the structural fix in finding 1
 dissolves most of the other findings, and doing the small items
 before the big one creates rebase churn.
 
+## Status
+
+Phase 3.1 is **complete**. Items 1-6 in the order of operations
+below landed in a single workstream; the exit-criteria checklist
+at the bottom is satisfied.
+
+What actually landed:
+
+- **Routing through `bifrost-net`.** `bifrost-jmap`, `bifrost-gmail`,
+  and `bifrost-graph` no longer own a `reqwest::Client`. Gmail and
+  Graph default constructors register against `Net::shared_default()`
+  (a `OnceLock<Net>` process-wide singleton) with unique
+  `AccountId` suffixes (`gmail-1`, `gmail-2`, ...) so multiple default
+  clients in the same process share the connection pool, the per-host
+  `RateLimitGovernor`, and the `BandwidthMeter`. Consumers that want
+  their own `Net` keep calling `with_account_net(...)`.
+- **JMAP redirect policy preserved.** `NetConfig.follow_redirects`
+  was added and wired through to `reqwest::redirect::Policy::none()`.
+  `bifrost-jmap` sets it to `false` and runs a manual 5-redirect
+  loop that consults `ClientBuilder::follow_redirects(trusted_hosts)`
+  and strips `Authorization` on cross-host hops by comparing the
+  next-hop host against the original.
+- **`bifrost-net::AccessToken` everywhere.** Plain `String` bearer
+  storage in the three clients is gone. JMAP wraps the credential
+  in a `StaticTokenSource` (sync-mutable via `std::sync::RwLock`),
+  and `JmapCredentials::set_access_token` plus the WS-feature-gated
+  `Client::set_access_token` update the same `Arc<RwLock<AccessToken>>`
+  that the `AccountNet`'s token source observes.
+- **`urlencoding` removed.** Duplicate per-crate encoders were
+  hoisted into `bifrost_net::url::encode_component`. Every call
+  site goes through that helper.
+- **`log` removed.** Gmail and Graph log via `tracing` exclusively.
+- **Workspace pin housekeeping.** `async-stream`, `thiserror`,
+  `getrandom`'s `std` feature, and the `futures` umbrella are
+  declared once at the workspace level; per-crate manifests use
+  `{ workspace = true }`. `futures-util` is gone.
+
+Known limitations carried into Phase 3.5:
+
+- **JMAP manual redirect loop is not RFC-7231 method-aware.** It
+  replays method and body across every hop instead of converting
+  `POST` to `GET` and dropping the body on `301`/`302`/`303`.
+  Harmless for JMAP today (the server endpoints we hit are POST for
+  `api_request` and GET for session/blob/SSE), but worth tightening
+  if redirect handling grows into a shared primitive.
+- **Per-host rate buckets serve a process-wide pool.** Multiple
+  Gmail accounts sharing `Net::shared_default()` all share one
+  `www.googleapis.com` token bucket. Gmail's actual quota is
+  per-user, so a multi-account ratatoskr workload may under-provision
+  itself relative to the API ceiling. Consumers that need per-account
+  isolation can construct their own `Net` and pass it through
+  `with_account_net`. Revisit if multi-account throughput becomes
+  an issue.
+
 ## Findings
 
 ### 1. bifrost-net is not wired into jmap / gmail / graph (structural)
@@ -241,24 +295,25 @@ surface as a follow-up bullet for an A0-A2 agent, not a direct edit.
 
 ## Exit criteria
 
-Phase 3.1 is done when all of these hold:
+All satisfied (see **Status** at the top for the landing summary).
 
-- `bifrost-jmap`, `bifrost-gmail`, and `bifrost-graph` route every
+- [x] `bifrost-jmap`, `bifrost-gmail`, and `bifrost-graph` route every
   HTTP call through `bifrost-net`. No `reqwest::Client` lives
   outside `crates/net/src/`.
-- All OAuth bearer tokens use `bifrost-net::AccessToken` (or
+- [x] All OAuth bearer tokens use `bifrost-net::AccessToken` (or
   another `Zeroizing<String>`-backed wrapper). No plain `String`
   bearer tokens in any client struct.
-- `urlencoding` is gone from the workspace. `gmail` and `graph`
-  URL-encode through `percent-encoding`.
-- `log` is gone from the workspace. `gmail` and `graph` log
+- [x] `urlencoding` is gone from the workspace. `gmail` and `graph`
+  URL-encode through `bifrost_net::url::encode_component`
+  (percent-encoding under the hood).
+- [x] `log` is gone from the workspace. `gmail` and `graph` log
   through `tracing`.
-- `async-stream`, `thiserror`, and `futures-util` (or whichever is
-  chosen) are declared in `[workspace.dependencies]`. Per-crate
-  `Cargo.toml`s reference them as `{ workspace = true }`.
-- One of `futures` or `futures-util` chosen workspace-wide; the
-  other removed.
-- `brokkr check` remains clean under `--all-features`.
+- [x] `async-stream`, `thiserror`, and `futures` are declared in
+  `[workspace.dependencies]`. Per-crate `Cargo.toml`s reference them
+  as `{ workspace = true }`.
+- [x] `futures` chosen workspace-wide; `futures-util` removed.
+- [x] `brokkr check` clean under `--all-features` (orchestrator
+  validated).
 
 ## Sources
 

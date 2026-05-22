@@ -44,7 +44,7 @@ impl GraphClient {
             .collect();
 
         while let Some(parent_id) = queue.pop_front() {
-            let enc_parent_id = urlencoding::encode(&parent_id);
+            let enc_parent_id = bifrost_net::url::encode_component(&parent_id);
             let mut next_url = Some(format!(
                 "{prefix}/mailFolders/{enc_parent_id}/childFolders?$select=id,displayName,parentFolderId,childFolderCount&$top=100"
             ));
@@ -70,7 +70,7 @@ impl GraphClient {
 
     pub async fn get_mail_folder(&self, folder_id: &str) -> Result<GraphMailFolder, String> {
         let prefix = self.api_path_prefix();
-        let enc_folder_id = urlencoding::encode(folder_id);
+        let enc_folder_id = bifrost_net::url::encode_component(folder_id);
         self.get_json(&format!(
             "{prefix}/mailFolders/{enc_folder_id}?$select=id,displayName,parentFolderId,childFolderCount"
         ))
@@ -88,7 +88,7 @@ impl GraphClient {
         };
         let path = match parent_folder_id {
             Some(parent) => {
-                let enc_parent = urlencoding::encode(parent);
+                let enc_parent = bifrost_net::url::encode_component(parent);
                 format!("{prefix}/mailFolders/{enc_parent}/childFolders")
             }
             None => format!("{prefix}/mailFolders"),
@@ -102,7 +102,7 @@ impl GraphClient {
         display_name: &str,
     ) -> Result<(), String> {
         let prefix = self.api_path_prefix();
-        let enc_folder_id = urlencoding::encode(folder_id);
+        let enc_folder_id = bifrost_net::url::encode_component(folder_id);
         let body = GraphRenameFolderRequest {
             display_name: display_name.to_string(),
         };
@@ -112,14 +112,14 @@ impl GraphClient {
 
     pub async fn delete_mail_folder(&self, folder_id: &str) -> Result<(), String> {
         let prefix = self.api_path_prefix();
-        let enc_folder_id = urlencoding::encode(folder_id);
+        let enc_folder_id = bifrost_net::url::encode_component(folder_id);
         self.delete(&format!("{prefix}/mailFolders/{enc_folder_id}"))
             .await
     }
 
     pub async fn get_message(&self, message_id: &str) -> Result<GraphMessage, String> {
         let prefix = self.api_path_prefix();
-        let enc_message_id = urlencoding::encode(message_id);
+        let enc_message_id = bifrost_net::url::encode_component(message_id);
         self.get_json(&format!("{prefix}/messages/{enc_message_id}"))
             .await
     }
@@ -130,7 +130,7 @@ impl GraphClient {
         patch: &GraphMessagePatch,
     ) -> Result<(), String> {
         let prefix = self.api_path_prefix();
-        let enc_message_id = urlencoding::encode(message_id);
+        let enc_message_id = bifrost_net::url::encode_component(message_id);
         self.patch(&format!("{prefix}/messages/{enc_message_id}"), patch)
             .await
     }
@@ -141,7 +141,7 @@ impl GraphClient {
         destination_id: &str,
     ) -> Result<GraphMessage, String> {
         let prefix = self.api_path_prefix();
-        let enc_message_id = urlencoding::encode(message_id);
+        let enc_message_id = bifrost_net::url::encode_component(message_id);
         let body = GraphMoveRequest {
             destination_id: destination_id.to_string(),
         };
@@ -151,7 +151,7 @@ impl GraphClient {
 
     pub async fn delete_message(&self, message_id: &str) -> Result<(), String> {
         let prefix = self.api_path_prefix();
-        let enc_message_id = urlencoding::encode(message_id);
+        let enc_message_id = bifrost_net::url::encode_component(message_id);
         self.delete(&format!("{prefix}/messages/{enc_message_id}"))
             .await
     }
@@ -162,8 +162,8 @@ impl GraphClient {
         attachment_id: &str,
     ) -> Result<Vec<u8>, String> {
         let prefix = self.api_path_prefix();
-        let enc_message_id = urlencoding::encode(message_id);
-        let enc_attachment_id = urlencoding::encode(attachment_id);
+        let enc_message_id = bifrost_net::url::encode_component(message_id);
+        let enc_attachment_id = bifrost_net::url::encode_component(attachment_id);
         self.get_bytes(&format!(
             "{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value"
         ))
@@ -213,7 +213,7 @@ impl GraphClient {
         let prefix = self.api_path_prefix();
         let initial_url = match folder_id {
             Some(folder_id) => {
-                let enc_folder_id = urlencoding::encode(folder_id);
+                let enc_folder_id = bifrost_net::url::encode_component(folder_id);
                 format!(
                     "{prefix}/contactFolders/{enc_folder_id}/contacts?$select={CONTACT_SELECT}&$top=250"
                 )

@@ -14,7 +14,7 @@ const UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 pub async fn send_via_draft(client: &GraphClient, raw_base64url: &str) -> Result<String, String> {
     let draft_id = create_draft(client, raw_base64url).await?;
-    let enc_draft_id = urlencoding::encode(&draft_id);
+    let enc_draft_id = bifrost_net::url::encode_component(&draft_id);
     let me = client.api_path_prefix();
     client
         .post_no_content::<()>(&format!("{me}/messages/{enc_draft_id}/send"), None)
@@ -121,7 +121,7 @@ async fn upload_attachments_from_mime(
     draft_id: &str,
     parsed: &mail_parser::Message<'_>,
 ) -> Result<(), String> {
-    let enc_draft_id = urlencoding::encode(draft_id);
+    let enc_draft_id = bifrost_net::url::encode_component(draft_id);
     for attachment in parsed.attachments() {
         let name = attachment
             .attachment_name()

@@ -10,7 +10,7 @@
 #[cfg(feature = "websockets")]
 use bifrost_jmap::{client::Client, client_ws::WebSocketMessage};
 #[cfg(feature = "websockets")]
-use futures_util::StreamExt;
+use futures::StreamExt;
 
 #[cfg(feature = "websockets")]
 async fn websocket_example() -> bifrost_jmap::Result<()> {

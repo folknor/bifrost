@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use bifrost_net::{AccessToken, StaticTokenSource};
 use reqwest::header;
 
 use crate::{
@@ -24,11 +25,57 @@ use crate::{
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 1000;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum Credentials {
     Basic(String),
-    Bearer(String),
+    Bearer(StaticTokenSource),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Authorization {
+    Basic(String),
+    Bearer(StaticTokenSource),
+}
+
+impl Authorization {
+    fn from_credentials(credentials: Credentials) -> Self {
+        match credentials {
+            Credentials::Basic(value) => Self::Basic(value),
+            Credentials::Bearer(token) => Self::Bearer(token),
+        }
+    }
+
+    pub(crate) fn header_value(&self) -> String {
+        match self {
+            Self::Basic(value) => format!("Basic {value}"),
+            Self::Bearer(source) => format!("Bearer {}", source.token().as_str()),
+        }
+    }
+
+    pub(crate) fn account_token_source(&self) -> StaticTokenSource {
+        match self {
+            // AccountNet requires a token source even when JMAP is
+            // using Basic auth. This source is intentionally inert;
+            // the request builder disables bearer injection for Basic.
+            Self::Basic(_) => StaticTokenSource::new("", None),
+            Self::Bearer(source) => source.clone(),
+        }
+    }
+
+    pub(crate) fn uses_bearer_pipeline(&self) -> bool {
+        matches!(self, Self::Bearer(_))
+    }
+
+    pub(crate) fn set_bearer_token(&self, token: AccessToken) -> bool {
+        match self {
+            Self::Basic(_) => false,
+            Self::Bearer(source) => {
+                source.set(token);
+                true
+            }
+        }
+    }
 }
 
 /// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
@@ -53,7 +100,7 @@ pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
     pub(crate) accept_invalid_certs: bool,
 
     #[cfg(feature = "websockets")]
-    pub(crate) authorization: String,
+    pub(crate) authorization: Authorization,
     #[cfg(feature = "websockets")]
     pub(crate) ws: tokio::sync::Mutex<Option<crate::client_ws::WsStream>>,
 }
@@ -146,24 +193,8 @@ impl ClientBuilder {
                 "Missing credentials - call .credentials() before .connect()",
             )
         })?;
-        let authorization = match credentials {
-            Credentials::Basic(s) => format!("Basic {s}"),
-            Credentials::Bearer(s) => format!("Bearer {s}"),
-        };
+        let authorization = Authorization::from_credentials(credentials);
         let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::USER_AGENT,
-            header::HeaderValue::from_static(concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION"))),
-        );
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&authorization).map_err(|e| {
-                crate::core::transport::TransportError::with_source(
-                    "Invalid authorization header",
-                    e,
-                )
-            })?,
-        );
         if let Some(forwarded_for) = self.forwarded_for {
             headers.insert(
                 header::FORWARDED,
@@ -180,6 +211,7 @@ impl ClientBuilder {
 
         let transport = ReqwestTransport::new(
             headers.clone(),
+            authorization.clone(),
             self.timeout,
             self.accept_invalid_certs,
             Arc::clone(&trusted_hosts),
@@ -255,7 +287,7 @@ impl<T: HttpTransport> Client<T> {
                 transport,
                 default_account_id,
                 #[cfg(feature = "websockets")]
-                authorization: String::new(),
+                authorization: Authorization::Basic(String::new()),
                 #[cfg(feature = "websockets")]
                 ws: None.into(),
             }),
@@ -346,8 +378,17 @@ impl<T: HttpTransport> Client<T> {
 
     /// Returns the `Authorization` header value used by this client.
     #[cfg(feature = "websockets")]
-    pub fn authorization(&self) -> &str {
-        &self.inner.authorization
+    pub fn authorization(&self) -> String {
+        self.inner.authorization.header_value()
+    }
+
+    /// Replace the bearer token used by the default HTTP and
+    /// WebSocket transports. Returns `false` for Basic-auth clients.
+    #[cfg(feature = "websockets")]
+    pub fn set_access_token(&self, token: impl Into<String>) -> bool {
+        self.inner
+            .authorization
+            .set_bearer_token(AccessToken::new(token, None))
     }
 }
 
@@ -358,7 +399,11 @@ impl Credentials {
     }
 
     pub fn bearer(token: impl Into<String>) -> Self {
-        Credentials::Bearer(token.into())
+        Credentials::Bearer(StaticTokenSource::new(token, None))
+    }
+
+    pub fn bearer_source(source: StaticTokenSource) -> Self {
+        Credentials::Bearer(source)
     }
 }
 

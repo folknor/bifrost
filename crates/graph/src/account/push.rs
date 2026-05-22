@@ -177,7 +177,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                     }
                 }
                 Err(error) => {
-                    log::warn!(
+                    tracing::warn!(
                         "[Graph webhooks] Failed to renew subscription {server_id}: {error}"
                     );
                     had_error = true;
@@ -224,12 +224,12 @@ fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<Str
     match scope {
         CursorScope::FolderType { folder, ty } => match ty {
             ObjectType::Email => {
-                let encoded = urlencoding::encode(&folder.0);
+                let encoded = bifrost_net::url::encode_component(&folder.0);
                 Some(format!("{prefix}/mailFolders/{encoded}/messages"))
             }
             ObjectType::Event | ObjectType::CalendarEvent => Some(format!("{prefix}/events")),
             ObjectType::Contact => {
-                let encoded = urlencoding::encode(&folder.0);
+                let encoded = bifrost_net::url::encode_component(&folder.0);
                 Some(format!("{prefix}/contactFolders/{encoded}/contacts"))
             }
             _ => None,

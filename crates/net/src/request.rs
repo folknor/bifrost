@@ -57,6 +57,11 @@ struct RequestBuilderInner {
     retry: Option<RetryPolicy>,
     /// Optional per-request timeout override.
     timeout: Option<Duration>,
+    /// Whether the transport should inject `Authorization: Bearer`.
+    /// Some protocol flows use a pre-authenticated upload URL or an
+    /// explicit Basic authorization header, but still need the shared
+    /// retry, rate-limit, and metering pipeline.
+    bearer_auth: bool,
     /// Deferred error captured at a fluent-setter call site (e.g.
     /// `json()` could not serialize the body). The fluent API does
     /// not return `Result` on every setter, so the error is stashed
@@ -82,6 +87,7 @@ impl RequestBuilder {
                 cost: None,
                 retry: None,
                 timeout: None,
+                bearer_auth: true,
                 pending_error: None,
             },
         }
@@ -181,6 +187,14 @@ impl RequestBuilder {
         self
     }
 
+    /// Disable automatic bearer-token injection for this request.
+    /// Existing caller-provided headers are still sent unchanged.
+    #[must_use]
+    pub fn without_bearer_auth(mut self) -> Self {
+        self.inner.bearer_auth = false;
+        self
+    }
+
     /// Drive the request to completion with the configured retry
     /// budget, returning the buffered response.
     pub async fn send(self) -> Result<Response, Error> {
@@ -231,6 +245,20 @@ pub struct Response {
     pub body: Bytes,
 }
 
+impl Response {
+    /// HTTP status code of the final attempt.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Response headers as received.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+}
+
 /// Streaming HTTP response. The body is a `ByteStream` so the caller
 /// can apply backpressure and avoid buffering large attachments.
 #[non_exhaustive]
@@ -242,6 +270,20 @@ pub struct StreamingResponse {
     /// Response body as an erased byte stream. Increments the
     /// bandwidth meter on every chunk.
     pub body: ByteStream,
+}
+
+impl StreamingResponse {
+    /// HTTP status code of the final attempt.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    /// Response headers as received.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
 }
 
 /// Internal streaming response carrying the originating `AccountNet`
@@ -272,6 +314,7 @@ pub(crate) async fn send_streaming_inner(
         cost,
         retry,
         timeout,
+        bearer_auth,
         pending_error,
     } = builder.inner;
 
@@ -329,17 +372,21 @@ pub(crate) async fn send_streaming_inner(
         // else. We pass the variant through unchanged so callers can
         // pattern-match for retry-vs-give-up decisions; collapsing
         // every variant into `AuthLost` would discard that signal.
-        let token = match account.token_source().current().await {
-            Ok(t) => t,
-            Err(e) => {
-                // The request never reached the wire; refund the
-                // rate-limit slot so neighbours aren't starved by a
-                // bookkeeping leak.
-                if let Some(ref h) = host {
-                    account.net().governor().refund(h, cost_units);
+        let token = if bearer_auth {
+            match account.token_source().current().await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // The request never reached the wire; refund the
+                    // rate-limit slot so neighbours aren't starved by
+                    // a bookkeeping leak.
+                    if let Some(ref h) = host {
+                        account.net().governor().refund(h, cost_units);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
+        } else {
+            None
         };
 
         // Record outbound body bytes against the per-account meter
@@ -360,7 +407,7 @@ pub(crate) async fn send_streaming_inner(
             &url,
             &headers,
             &body,
-            &token,
+            token.as_ref(),
             timeout,
         );
 
@@ -408,7 +455,7 @@ pub(crate) async fn send_streaming_inner(
         // retry budget (`attempt`): the retry loop's top
         // `attempt = attempt + 1` increment is undone here so a 401
         // recovery does not eat into the network attempts left.
-        if status == StatusCode::UNAUTHORIZED {
+        if bearer_auth && status == StatusCode::UNAUTHORIZED {
             if auth_retries >= MAX_AUTH_RETRIES {
                 drop(response);
                 return Err(Error::AuthLost);
@@ -544,7 +591,7 @@ fn build_reqwest(
     url: &str,
     headers: &HeaderMap,
     body: &Option<Bytes>,
-    token: &AccessToken,
+    token: Option<&AccessToken>,
     timeout: Option<Duration>,
 ) -> reqwest::RequestBuilder {
     let mut req = client.request(method.clone(), url);
@@ -554,7 +601,9 @@ fn build_reqwest(
     // Authorization: Bearer <token>. The token may be empty if the
     // protocol crate is on no-auth mode; we still emit the header
     // so call sites don't see undocumented gaps.
-    if let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
+    if let Some(token) = token
+        && let Ok(val) = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))
+    {
         req = req.header(AUTHORIZATION, val);
     }
     // W3C traceparent.

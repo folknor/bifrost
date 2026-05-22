@@ -57,7 +57,7 @@ enum StreamLoopExit {
 }
 
 pub(crate) async fn run_streaming_worker(account: GraphAccount) {
-    let ews = EwsClient::new();
+    let ews = EwsClient::new(account.client.account_net().clone());
     let mut disconnected = false;
 
     loop {
@@ -86,7 +86,7 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
                     disconnected = true;
                 }
-                log::warn!("[Graph EWS] Subscribe failed: {error}");
+                tracing::warn!("[Graph EWS] Subscribe failed: {error}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -273,10 +273,9 @@ async fn subscribe(
     account: &GraphAccount,
     scopes: &[CursorScope],
 ) -> Result<EwsStreamingSubscription, String> {
-    let token = account.client.access_token().await;
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
-    let xml = ews.execute(&token, &body, None).await?;
+    let xml = ews.execute(&body, None).await?;
     parse_subscribe_response(&xml)?
         .into_iter()
         .next()
@@ -293,9 +292,8 @@ async fn run_get_events_loop(
         if account.shutdown.is_cancelled() {
             return StreamLoopExit::Shutdown;
         }
-        let token = account.client.access_token().await;
         let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&token, &body, None).await {
+        match ews.execute(&body, None).await {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {
@@ -326,13 +324,13 @@ async fn run_get_events_loop(
                     }
                 }
                 Err(error) => {
-                    log::warn!("[Graph EWS] GetStreamingEvents parse failed: {error}");
+                    tracing::warn!("[Graph EWS] GetStreamingEvents parse failed: {error}");
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
                     return StreamLoopExit::Disconnected;
                 }
             },
             Err(error) => {
-                log::warn!("[Graph EWS] GetStreamingEvents failed: {error}");
+                tracing::warn!("[Graph EWS] GetStreamingEvents failed: {error}");
                 let _ = account.push_tx.send(WatchEvent::Disconnected);
                 return StreamLoopExit::Disconnected;
             }

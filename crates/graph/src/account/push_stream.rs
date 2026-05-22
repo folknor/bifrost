@@ -1,5 +1,5 @@
 use bifrost_types::{AccountStream, WatchEvent};
-use futures_util::stream;
+use futures::stream;
 
 use super::{GraphAccount, PushMode};
 

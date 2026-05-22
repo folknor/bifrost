@@ -5,6 +5,7 @@ mod xml_helpers;
 pub(crate) use xml_helpers::push_general_ref;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use bifrost_net::AccountNet;
 
 // Re-export parsers and xml_helpers for internal use within the ews module
 use self::parsers::*;
@@ -15,7 +16,7 @@ const EWS_URL: &str = "https://outlook.office365.com/EWS/Exchange.asmx";
 // Client.
 
 pub struct EwsClient {
-    http: reqwest::Client,
+    net: AccountNet,
     ews_url: String,
 }
 

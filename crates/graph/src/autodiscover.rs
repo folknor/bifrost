@@ -2,6 +2,9 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 
+use bifrost_net::AccountNet;
+use bytes::Bytes;
+
 use super::ews::{EwsHeaders, push_general_ref};
 
 const AUTODISCOVER_URL: &str = "https://outlook.office365.com/autodiscover/autodiscover.xml";
@@ -54,8 +57,7 @@ pub fn construct_replica_smtp(guid: &str, domain: &str) -> String {
 /// Calls the Autodiscover endpoint with an OAuth bearer token and parses
 /// `AlternativeMailbox` elements from the response.
 pub async fn discover_shared_mailboxes(
-    http_client: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     user_email: &str,
 ) -> Result<Vec<SharedMailbox>, String> {
     let escaped_email = quick_xml::escape::escape(user_email);
@@ -69,25 +71,21 @@ pub async fn discover_shared_mailboxes(
 </Autodiscover>"#
     );
 
-    let resp = http_client
+    let resp = net
         .post(AUTODISCOVER_URL)
         .header("Content-Type", "text/xml")
-        .header("Authorization", format!("Bearer {access_token}"))
-        .body(request_body)
+        .body(Bytes::from(request_body))
         .send()
         .await
         .map_err(|e| format!("Autodiscover request failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(resp.body.as_ref());
         return Err(format!("Autodiscover returned {status}: {body}"));
     }
 
-    let xml = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Autodiscover response: {e}"))?;
+    let xml = String::from_utf8_lossy(resp.body.as_ref());
 
     Ok(parse_alternative_mailboxes(&xml))
 }
@@ -130,36 +128,31 @@ fn build_get_user_settings_soap(email: &str, settings: &[&str]) -> String {
 
 /// Send a GetUserSettings SOAP request and parse the response into name/value pairs.
 async fn soap_get_user_settings(
-    http_client: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     email: &str,
     settings: &[&str],
 ) -> Result<Vec<(String, String)>, String> {
     let body = build_get_user_settings_soap(email, settings);
 
-    let resp = http_client
+    let resp = net
         .post(AUTODISCOVER_SOAP_URL)
         .header("Content-Type", "text/xml; charset=utf-8")
-        .header("Authorization", format!("Bearer {access_token}"))
         .header(
             "SOAPAction",
             "\"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetUserSettings\"",
         )
-        .body(body)
+        .body(Bytes::from(body))
         .send()
         .await
         .map_err(|e| format!("Autodiscover SOAP request failed: {e}"))?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(resp.body.as_ref());
         return Err(format!("Autodiscover SOAP returned {status}: {body}"));
     }
 
-    let xml = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Autodiscover SOAP response: {e}"))?;
+    let xml = String::from_utf8_lossy(resp.body.as_ref());
 
     Ok(parse_user_settings(&xml))
 }
@@ -170,15 +163,13 @@ async fn soap_get_user_settings(
 /// - `PublicFolderInformation` - the hierarchy mailbox SMTP address
 /// - `InternalRpcClientServer` - the mailbox server (used as X-PublicFolderMailbox)
 pub async fn discover_public_folder_routing(
-    http_client: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     user_email: &str,
 ) -> Result<PublicFolderRouting, String> {
-    log::info!("Discovering public folder routing for {user_email}");
+    tracing::info!("Discovering public folder routing for {user_email}");
 
     let settings = soap_get_user_settings(
-        http_client,
-        access_token,
+        net,
         user_email,
         &["PublicFolderInformation", "InternalRpcClientServer"],
     )
@@ -198,7 +189,7 @@ pub async fn discover_public_folder_routing(
     let hierarchy_mailbox = hierarchy_mailbox
         .ok_or_else(|| "PublicFolderInformation not found in autodiscover response".to_string())?;
 
-    log::info!(
+    tracing::info!(
         "Public folder routing: hierarchy_mailbox={hierarchy_mailbox}, server={hierarchy_server:?}"
     );
 
@@ -214,23 +205,16 @@ pub async fn discover_public_folder_routing(
 /// calls autodiscover to resolve its `AutoDiscoverSMTPAddress`, which is the actual
 /// content mailbox routing address.
 pub async fn discover_content_mailbox(
-    http_client: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     replica_smtp: &str,
 ) -> Result<String, String> {
-    log::info!("Discovering content mailbox for replica {replica_smtp}");
+    tracing::info!("Discovering content mailbox for replica {replica_smtp}");
 
-    let settings = soap_get_user_settings(
-        http_client,
-        access_token,
-        replica_smtp,
-        &["AutoDiscoverSMTPAddress"],
-    )
-    .await?;
+    let settings = soap_get_user_settings(net, replica_smtp, &["AutoDiscoverSMTPAddress"]).await?;
 
     for (name, value) in &settings {
         if name == "AutoDiscoverSMTPAddress" {
-            log::info!("Content mailbox for {replica_smtp}: {value}");
+            tracing::info!("Content mailbox for {replica_smtp}: {value}");
             return Ok(value.clone());
         }
     }

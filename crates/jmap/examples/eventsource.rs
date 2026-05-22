@@ -1,5 +1,5 @@
 use bifrost_jmap::{DataType, client::Client};
-use futures_util::StreamExt;
+use futures::StreamExt;
 
 async fn event_source() {
     // Connect to the JMAP server using Basic authentication

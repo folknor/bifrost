@@ -12,7 +12,7 @@ use crate::{
         parser::{EventParser, EventType},
     },
 };
-use futures_util::{Stream, StreamExt};
+use futures::{Stream, StreamExt};
 
 impl<T: HttpTransport + SseTransport> Client<T> {
     pub async fn event_source(

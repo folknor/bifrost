@@ -4,6 +4,8 @@
 //! then creates a sharing link. Uses the resumable upload session protocol
 //! with 320 KiB-aligned chunks.
 
+use bifrost_net::AccountNet;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::client::GraphClient;
@@ -75,7 +77,7 @@ pub async fn create_upload_session(
     client: &GraphClient,
     filename: &str,
 ) -> Result<UploadSession, String> {
-    log::debug!("[OneDrive] Creating upload session for '{filename}'");
+    tracing::debug!("[OneDrive] Creating upload session for '{filename}'");
     let encoded_path = encode_onedrive_path(filename);
     let path = format!("/me/drive/root:/Bifrost Attachments/{encoded_path}:/createUploadSession");
 
@@ -94,10 +96,9 @@ pub async fn create_upload_session(
 /// `chunk_size` must be a multiple of 320 KiB (`CHUNK_ALIGNMENT`).
 /// Returns the OneDrive drive item ID of the completed upload.
 ///
-/// The upload URL is pre-authenticated (no Bearer token needed), so this
-/// uses a raw `reqwest::Client` rather than `GraphClient`.
+/// The upload URL is pre-authenticated, so bearer injection is disabled.
 pub async fn upload_file_chunked(
-    http: &reqwest::Client,
+    net: &AccountNet,
     upload_url: &str,
     data: &[u8],
     chunk_size: usize,
@@ -119,11 +120,12 @@ pub async fn upload_file_chunked(
         let chunk = &data[offset..end];
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
 
-        let response = http
+        let response = net
             .put(upload_url)
+            .without_bearer_auth()
             .header("Content-Range", &content_range)
-            .header("Content-Length", chunk.len().to_string())
-            .body(chunk.to_vec())
+            .header("Content-Length", &chunk.len().to_string())
+            .body(Bytes::copy_from_slice(chunk))
             .send()
             .await
             .map_err(|e| format!("Upload chunk failed: {e}"))?;
@@ -132,16 +134,14 @@ pub async fn upload_file_chunked(
         match status {
             // 200 or 201 = final chunk accepted, response contains the drive item
             200 | 201 => {
-                let item: DriveItemResponse = response
-                    .json()
-                    .await
+                let item: DriveItemResponse = serde_json::from_slice(response.body.as_ref())
                     .map_err(|e| format!("Failed to parse completed upload response: {e}"))?;
                 return Ok(item.id);
             }
             // 202 = more chunks expected
             202 => {}
             _ => {
-                let body = response.text().await.unwrap_or_default();
+                let body = String::from_utf8_lossy(response.body.as_ref());
                 return Err(format!("Upload chunk failed: {status} {body}"));
             }
         }
@@ -157,12 +157,10 @@ pub async fn upload_file_chunked(
 /// Returns a list of `(start, end)` byte ranges that need to be uploaded.
 /// An empty `end` in the Graph API response (e.g. `"128-"`) is represented
 /// as `u64::MAX`, meaning "from start to the end of the file."
-pub async fn resume_upload(
-    http: &reqwest::Client,
-    upload_url: &str,
-) -> Result<Vec<(u64, u64)>, String> {
-    let response = http
+pub async fn resume_upload(net: &AccountNet, upload_url: &str) -> Result<Vec<(u64, u64)>, String> {
+    let response = net
         .get(upload_url)
+        .without_bearer_auth()
         .send()
         .await
         .map_err(|e| format!("Failed to query upload status: {e}"))?;
@@ -172,13 +170,11 @@ pub async fn resume_upload(
         return Err("Upload session has expired".to_string());
     }
     if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = String::from_utf8_lossy(response.body.as_ref());
         return Err(format!("Upload status query failed: {status} {body}"));
     }
 
-    let status_resp: UploadStatusResponse = response
-        .json()
-        .await
+    let status_resp: UploadStatusResponse = serde_json::from_slice(response.body.as_ref())
         .map_err(|e| format!("Failed to parse upload status: {e}"))?;
 
     let mut ranges = Vec::new();

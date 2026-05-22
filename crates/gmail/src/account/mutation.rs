@@ -301,22 +301,20 @@ async fn post_empty_json<B: Serialize>(
     } else {
         format!("{}/{}", client.api_base(), path)
     };
-    let access_token = client.access_token().await;
     let mut request = client
-        .http_client()
-        .post(url)
-        .header("Authorization", format!("Bearer {access_token}"))
+        .account_net()
+        .post(&url)
         .header("Content-Type", "application/json")
         .json(body);
     for (name, value) in idempotency::wire_idempotency_headers(key) {
-        request = request.header(*name, *value);
+        request = request.header(name, value);
     }
-    let response = request.send().await.map_err(GmailError::from)?;
+    let response = client.execute_builder(request, "Gmail API").await?;
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
-    let body = response.text().await.map_err(GmailError::from)?;
+    let body = String::from_utf8_lossy(response.body.as_ref()).into_owned();
     Err(GmailError::status("Gmail API", status, body))
 }
 

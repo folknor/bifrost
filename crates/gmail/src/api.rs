@@ -68,7 +68,7 @@ impl GmailClient {
     ) -> Result<(Vec<GmailThreadStub>, Option<String>)> {
         let mut params = Vec::new();
         if let Some(q) = query {
-            params.push(format!("q={}", urlencoding::encode(q)));
+            params.push(format!("q={}", bifrost_net::url::encode_component(q)));
         }
         if let Some(max) = max_results {
             params.push(format!("maxResults={max}"));
@@ -231,7 +231,7 @@ impl GmailClient {
         send_as_email: &str,
         signature_html: &str,
     ) -> Result<GmailSendAs> {
-        let encoded = urlencoding::encode(send_as_email);
+        let encoded = bifrost_net::url::encode_component(send_as_email);
         self.put(
             &format!("/settings/sendAs/{encoded}"),
             &json!({ "signature": signature_html }),

@@ -77,7 +77,7 @@ pub async fn resolve_group_members(
     client: &GraphClient,
     group_id: &str,
 ) -> Result<GroupResolutionResult, String> {
-    let enc_id = urlencoding::encode(group_id);
+    let enc_id = bifrost_net::url::encode_component(group_id);
     let initial_url = format!(
         "/groups/{enc_id}/transitiveMembers/microsoft.graph.user\
          ?$select=displayName,mail,userPrincipalName&$top=999"

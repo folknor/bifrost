@@ -1,15 +1,16 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bifrost_net::{
+    AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response,
+    RetryPolicy, StaticTokenSource, TokenSource,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
 
 use crate::{Error, Result};
 
 pub const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
-
-const MAX_RETRY_ATTEMPTS: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 1000;
 
 #[derive(Clone)]
 pub struct GmailClient {
@@ -17,36 +18,38 @@ pub struct GmailClient {
 }
 
 struct ClientInner {
-    http: reqwest::Client,
+    net: AccountNet,
     api_base: String,
-    access_token: RwLock<String>,
+    token_source: StaticTokenSource,
 }
 
 impl GmailClient {
     pub fn new(access_token: impl Into<String>) -> Self {
-        Self::with_http_client(reqwest::Client::new(), GMAIL_API_BASE, access_token)
+        Self::with_api_base(GMAIL_API_BASE, access_token)
     }
 
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
-        Self::with_http_client(reqwest::Client::new(), api_base, access_token)
+        let token_source = StaticTokenSource::new(access_token, None);
+        let net = default_account_net("gmail", "www.googleapis.com", token_source.clone());
+        Self::with_account_net(net, api_base, token_source)
     }
 
-    pub fn with_http_client(
-        http: reqwest::Client,
+    pub fn with_account_net(
+        net: AccountNet,
         api_base: impl Into<String>,
-        access_token: impl Into<String>,
+        token_source: StaticTokenSource,
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
-                http,
+                net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
-                access_token: RwLock::new(access_token.into()),
+                token_source,
             }),
         }
     }
 
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.inner.http
+    pub fn account_net(&self) -> &AccountNet {
+        &self.inner.net
     }
 
     pub fn api_base(&self) -> &str {
@@ -54,11 +57,13 @@ impl GmailClient {
     }
 
     pub async fn access_token(&self) -> String {
-        self.inner.access_token.read().await.clone()
+        self.inner.token_source.token().as_str().to_string()
     }
 
     pub async fn set_access_token(&self, access_token: impl Into<String>) {
-        *self.inner.access_token.write().await = access_token.into();
+        self.inner
+            .token_source
+            .set(AccessToken::new(access_token, None));
     }
 
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -119,11 +124,14 @@ impl GmailClient {
     }
 
     pub async fn delete_absolute(&self, url: &str, service: &str) -> Result<()> {
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(url, "DELETE", None::<&()>, &access_token)
-            .await?;
+        let response = self.execute(url, "DELETE", None::<&()>).await?;
         check_response_status(response, service).await
+    }
+
+    pub async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+        let url = self.api_url(path);
+        let response = self.execute(&url, "POST", Some(body)).await?;
+        check_response_status(response, "Gmail API").await
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -142,54 +150,22 @@ impl GmailClient {
         method: &str,
         body: Option<&B>,
     ) -> Result<T> {
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(url, method, body, &access_token)
-            .await?;
+        let response = self.execute(url, method, body).await?;
         parse_json_response(response, "Gmail API").await
     }
 
-    async fn execute_with_retry<B: Serialize>(
+    async fn execute<B: Serialize>(
         &self,
         url: &str,
         method: &str,
         body: Option<&B>,
-        access_token: &str,
-    ) -> Result<reqwest::Response> {
-        let mut last_response = None;
-
-        for attempt in 0..MAX_RETRY_ATTEMPTS {
-            let response = self.execute_once(url, method, body, access_token).await?;
-
-            if response.status().as_u16() != 429 {
-                return Ok(response);
-            }
-
-            last_response = Some(response);
-            if attempt == MAX_RETRY_ATTEMPTS - 1 {
-                break;
-            }
-
-            let delay = retry_delay(last_response.as_ref(), attempt);
-            tokio::time::sleep(delay).await;
-        }
-
-        last_response.ok_or_else(|| Error::MalformedPayload("no response received".to_string()))
-    }
-
-    async fn execute_once<B: Serialize>(
-        &self,
-        url: &str,
-        method: &str,
-        body: Option<&B>,
-        access_token: &str,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<Response> {
         let mut builder = match method {
-            "GET" => self.inner.http.get(url),
-            "POST" => self.inner.http.post(url),
-            "PUT" => self.inner.http.put(url),
-            "PATCH" => self.inner.http.patch(url),
-            "DELETE" => self.inner.http.delete(url),
+            "GET" => self.inner.net.get(url),
+            "POST" => self.inner.net.post(url),
+            "PUT" => self.inner.net.put(url),
+            "PATCH" => self.inner.net.patch(url),
+            "DELETE" => self.inner.net.delete(url),
             _ => {
                 return Err(Error::InvalidInput(format!(
                     "unsupported HTTP method: {method}"
@@ -197,9 +173,7 @@ impl GmailClient {
             }
         };
 
-        builder = builder
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json");
+        builder = builder.header("Content-Type", "application/json");
 
         if let Some(b) = body {
             builder = builder.json(b);
@@ -207,14 +181,22 @@ impl GmailClient {
 
         builder.send().await.map_err(Error::from)
     }
+
+    pub(crate) async fn execute_builder(
+        &self,
+        builder: RequestBuilder,
+        service: &str,
+    ) -> Result<Response> {
+        builder
+            .send()
+            .await
+            .map_err(|error| Error::from_net(service, error))
+    }
 }
 
-async fn parse_json_response<T: DeserializeOwned>(
-    response: reqwest::Response,
-    service: &str,
-) -> Result<T> {
+async fn parse_json_response<T: DeserializeOwned>(response: Response, service: &str) -> Result<T> {
     let status = response.status();
-    let body = response.text().await.map_err(Error::from)?;
+    let body = response_body_string(response);
     if !status.is_success() {
         return Err(Error::status(service, status, body));
     }
@@ -222,26 +204,42 @@ async fn parse_json_response<T: DeserializeOwned>(
     serde_json::from_str(&body).map_err(Error::from)
 }
 
-async fn check_response_status(response: reqwest::Response, service: &str) -> Result<()> {
+async fn check_response_status(response: Response, service: &str) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
 
-    let body = response.text().await.map_err(Error::from)?;
+    let body = response_body_string(response);
     Err(Error::status(service, status, body))
 }
 
-fn retry_delay(response: Option<&reqwest::Response>, attempt: u32) -> Duration {
-    if let Some(delay) = response
-        .and_then(|r| r.headers().get(reqwest::header::RETRY_AFTER))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return Duration::from_secs(delay);
-    }
+fn response_body_string(response: Response) -> String {
+    String::from_utf8_lossy(response.body.as_ref()).into_owned()
+}
 
-    Duration::from_millis(INITIAL_BACKOFF_MS * u64::from(attempt + 1))
+fn default_account_net(
+    account: impl Into<String>,
+    host: impl Into<String>,
+    token_source: StaticTokenSource,
+) -> AccountNet {
+    static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
+    let net = Net::shared_default();
+    let token_source: Arc<dyn TokenSource> = Arc::new(token_source);
+    net.attach_account(
+        AccountId(format!("{}-{id}", account.into())),
+        AccountSpec {
+            hosts: vec![RateLimit {
+                host: host.into(),
+                quota_per_second: 250.0,
+                cost_default: 1,
+                burst: 250,
+            }],
+            token_source,
+            default_retry: RetryPolicy::default(),
+        },
+    )
 }
 
 #[cfg(test)]

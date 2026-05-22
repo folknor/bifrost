@@ -126,7 +126,7 @@ pub(crate) fn scope_lifecycle_stream(
                     state.pending = diff_snapshots(&old, &new).into();
                 }
                 Err(error) => {
-                    log::warn!("gmail label lifecycle poll failed: {error}");
+                    tracing::warn!("gmail label lifecycle poll failed: {error}");
                 }
             }
         }
@@ -144,7 +144,7 @@ pub(crate) async fn labels_for_flags(
     match refresh_scope_snapshot(client, cache).await {
         Ok(snapshot) => snapshot.labels,
         Err(error) => {
-            log::warn!("gmail label refresh failed during flag translation: {error}");
+            tracing::warn!("gmail label refresh failed during flag translation: {error}");
             current.labels
         }
     }

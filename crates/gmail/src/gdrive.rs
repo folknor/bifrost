@@ -1,9 +1,11 @@
 //! Google Drive resumable file upload and sharing via the Drive API v3.
 //!
 //! Uploads files to the user's Google Drive using the resumable upload protocol,
-//! then creates sharing permissions. Uses `reqwest::Client` directly (not
-//! `GmailClient`) since the Drive API has a different base URL.
+//! then creates sharing permissions. Uses `bifrost-net` directly since
+//! the Drive API has a different base URL.
 
+use bifrost_net::{AccountNet, Response};
+use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -71,8 +73,7 @@ struct FileWebLinkResponse {
 /// Returns the upload URL from the `Location` header. The upload URL is
 /// pre-authenticated - subsequent PUT requests do not need a Bearer token.
 pub async fn create_upload_session(
-    http: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     file_name: &str,
     mime_type: &str,
     file_size: u64,
@@ -82,25 +83,24 @@ pub async fn create_upload_session(
         mime_type: mime_type.to_string(),
     };
 
-    let response = http
+    let response = net
         .post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
-        .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
         .header("X-Upload-Content-Type", mime_type)
-        .header("X-Upload-Content-Length", file_size.to_string())
+        .header("X-Upload-Content-Length", &file_size.to_string())
         .json(&metadata)
         .send()
         .await
-        .map_err(Error::from)?;
+        .map_err(|error| Error::from_net("Google Drive", error))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.map_err(Error::from)?;
-        log::error!("[GDrive] Failed to create upload session for '{file_name}': {status}");
+        let body = response_body_string(response);
+        tracing::error!("[GDrive] Failed to create upload session for '{file_name}': {status}");
         return Err(Error::status("Google Drive", status, body));
     }
 
-    log::debug!("[GDrive] Created upload session for '{file_name}' ({file_size} bytes)");
+    tracing::debug!("[GDrive] Created upload session for '{file_name}' ({file_size} bytes)");
     let upload_url = response
         .headers()
         .get("location")
@@ -116,12 +116,11 @@ pub async fn create_upload_session(
 /// Upload a file in chunks using a resumable upload session.
 ///
 /// `chunk_size` must be a multiple of 256 KiB (`GDRIVE_CHUNK_ALIGN`).
-/// The upload URL is pre-authenticated (no Bearer token needed), so this
-/// uses a raw `reqwest::Client`.
+/// The upload URL is pre-authenticated, so bearer injection is disabled.
 ///
 /// Returns the Drive file metadata of the completed upload.
 pub async fn upload_file_chunked(
-    http: &reqwest::Client,
+    net: &AccountNet,
     upload_url: &str,
     data: &[u8],
     chunk_size: usize,
@@ -143,14 +142,15 @@ pub async fn upload_file_chunked(
         let chunk = &data[offset..end];
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
 
-        let response = http
+        let response = net
             .put(upload_url)
+            .without_bearer_auth()
             .header("Content-Range", &content_range)
-            .header("Content-Length", chunk.len().to_string())
-            .body(chunk.to_vec())
+            .header("Content-Length", &chunk.len().to_string())
+            .body(Bytes::copy_from_slice(chunk))
             .send()
             .await
-            .map_err(Error::from)?;
+            .map_err(|error| Error::from_net("Google Drive resumable upload", error))?;
 
         let status = response.status();
         match status.as_u16() {
@@ -171,7 +171,7 @@ pub async fn upload_file_chunked(
                 offset = end;
             }
             _ => {
-                let body = response.text().await.map_err(Error::from)?;
+                let body = response_body_string(response);
                 return Err(Error::status("Google Drive resumable upload", status, body));
             }
         }
@@ -186,21 +186,18 @@ pub async fn upload_file_chunked(
 ///
 /// Sends an empty PUT with `Content-Range: bytes */{total}` to probe the upload
 /// status. Returns the next byte offset to resume from.
-pub async fn resume_upload(
-    http: &reqwest::Client,
-    upload_url: &str,
-    total_size: u64,
-) -> Result<u64> {
+pub async fn resume_upload(net: &AccountNet, upload_url: &str, total_size: u64) -> Result<u64> {
     let content_range = format!("bytes */{total_size}");
 
-    let response = http
+    let response = net
         .put(upload_url)
+        .without_bearer_auth()
         .header("Content-Range", &content_range)
         .header("Content-Length", "0")
-        .body(Vec::<u8>::new())
+        .body(Bytes::new())
         .send()
         .await
-        .map_err(Error::from)?;
+        .map_err(|error| Error::from_net("Google Drive resumable upload", error))?;
 
     let status = response.status();
     match status.as_u16() {
@@ -235,7 +232,7 @@ pub async fn resume_upload(
             "upload session has expired".to_string(),
         )),
         _ => {
-            let body = response.text().await.map_err(Error::from)?;
+            let body = response_body_string(response);
             Err(Error::status("Google Drive resumable upload", status, body))
         }
     }
@@ -246,8 +243,7 @@ pub async fn resume_upload(
 /// After creating the permission, fetches and returns the web view link
 /// for the file.
 pub async fn create_sharing_permission(
-    http: &reqwest::Client,
-    access_token: &str,
+    net: &AccountNet,
     file_id: &str,
     scope: GDriveSharingScope,
 ) -> Result<String> {
@@ -265,49 +261,45 @@ pub async fn create_sharing_permission(
 
     let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions?fields=id");
 
-    let response = http
+    let response = net
         .post(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
         .await
-        .map_err(Error::from)?;
+        .map_err(|error| Error::from_net("Google Drive", error))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.map_err(Error::from)?;
-        log::error!("[GDrive] Failed to create sharing permission for file {file_id}: {status}");
+        let body = response_body_string(response);
+        tracing::error!(
+            "[GDrive] Failed to create sharing permission for file {file_id}: {status}"
+        );
         return Err(Error::status("Google Drive", status, body));
     }
-    log::info!("[GDrive] Created sharing permission for file {file_id}");
+    tracing::info!("[GDrive] Created sharing permission for file {file_id}");
 
     let _perm: PermissionResponse = parse_success_json(response).await?;
 
     // Fetch the web view link for the shared file
-    get_file_web_link(http, access_token, file_id).await
+    get_file_web_link(net, file_id).await
 }
 
 /// Get the web view link for a file.
 ///
 /// Returns the shareable URL suitable for insertion into email bodies.
-pub async fn get_file_web_link(
-    http: &reqwest::Client,
-    access_token: &str,
-    file_id: &str,
-) -> Result<String> {
+pub async fn get_file_web_link(net: &AccountNet, file_id: &str) -> Result<String> {
     let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=webViewLink");
 
-    let response = http
+    let response = net
         .get(&url)
-        .header("Authorization", format!("Bearer {access_token}"))
         .send()
         .await
-        .map_err(Error::from)?;
+        .map_err(|error| Error::from_net("Google Drive", error))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.map_err(Error::from)?;
+        let body = response_body_string(response);
         return Err(Error::status("Google Drive", status, body));
     }
 
@@ -316,9 +308,13 @@ pub async fn get_file_web_link(
     Ok(file.web_view_link)
 }
 
-async fn parse_success_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-    let body = response.text().await.map_err(Error::from)?;
+async fn parse_success_json<T: DeserializeOwned>(response: Response) -> Result<T> {
+    let body = response_body_string(response);
     serde_json::from_str(&body).map_err(Error::from)
+}
+
+fn response_body_string(response: Response) -> String {
+    String::from_utf8_lossy(response.body.as_ref()).into_owned()
 }
 
 #[cfg(test)]

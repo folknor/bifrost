@@ -1,5 +1,6 @@
+use bifrost_net::StreamingResponse;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -121,7 +122,12 @@ fn open_blob_inner_stream(
 
         let response = match fetch_blob_response(&account, &locator, range).await {
             Ok(response) => response,
-            Err(error) => {
+            Err(BlobFetchError::MethodNotAllowed) => {
+                yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
+                yield SyncEvent::Done(None);
+                return;
+            }
+            Err(BlobFetchError::Failed(error)) => {
                 yield SyncEvent::Fatal(graph_error_to_fatal(
                     error,
                     bifrost_types::CursorScope::Account,
@@ -139,11 +145,6 @@ fn open_blob_inner_stream(
             yield SyncEvent::Done(None);
             return;
         }
-        if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
-            yield SyncEvent::Done(None);
-            return;
-        }
         if !status.is_success() {
             yield SyncEvent::Fatal(graph_error_to_fatal(
                 format!("Graph blob request failed with HTTP {status}"),
@@ -153,7 +154,7 @@ fn open_blob_inner_stream(
             return;
         }
 
-        let mut stream = response.bytes_stream();
+        let mut stream = response.body;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => yield SyncEvent::Batch(Batch {
@@ -180,27 +181,42 @@ async fn fetch_blob_response(
     account: &GraphAccount,
     locator: &GraphBlobLocator,
     range: Option<ByteRange>,
-) -> Result<reqwest::Response, String> {
+) -> Result<StreamingResponse, BlobFetchError> {
     let prefix = account.client.api_path_prefix();
-    let enc_message_id = urlencoding::encode(&locator.message_id);
-    let enc_attachment_id = urlencoding::encode(&locator.attachment_id);
+    let enc_message_id = bifrost_net::url::encode_component(&locator.message_id);
+    let enc_attachment_id = bifrost_net::url::encode_component(&locator.attachment_id);
     let url = format!(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
         account.client.api_base()
     );
-    let token = account.client.access_token().await;
-    let mut request = account
-        .client
-        .http_client()
-        .get(url)
-        .header("Authorization", format!("Bearer {token}"));
+    let mut request = account.client.account_net().get(&url);
     if let Some(range) = range {
-        request = request.header(reqwest::header::RANGE, encode_range(range)?);
+        let range = encode_range(range).map_err(BlobFetchError::Failed)?;
+        request = request.header(reqwest::header::RANGE.as_str(), &range);
     }
-    request
-        .send()
-        .await
-        .map_err(|error| format!("Graph blob request failed: {error}"))
+    request.send_streaming().await.map_err(BlobFetchError::from)
+}
+
+enum BlobFetchError {
+    MethodNotAllowed,
+    Failed(String),
+}
+
+impl From<bifrost_net::Error> for BlobFetchError {
+    fn from(error: bifrost_net::Error) -> Self {
+        match error {
+            bifrost_net::Error::Status { code, .. }
+                if code == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+            {
+                Self::MethodNotAllowed
+            }
+            bifrost_net::Error::Status { code, body, .. } => Self::Failed(format!(
+                "Graph blob request failed with HTTP {code}: {}",
+                String::from_utf8_lossy(body.as_ref())
+            )),
+            other => Self::Failed(format!("Graph blob request failed: {other}")),
+        }
+    }
 }
 
 fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, Error> {

@@ -5,7 +5,7 @@ use bifrost_types::{
     AccountStream, Batch, Checkpoint, Error, FlagOp, IdempotencyKey, MembershipScope,
     MutationOutcome, MutationResult, ObjectId, PageBoundary, RecoveryClass, SyncEvent,
 };
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
@@ -197,7 +197,7 @@ async fn refresh_missing_etags(
     let mut refreshed = Vec::new();
     let mut failed = Vec::new();
     for id in missing {
-        let enc_id = urlencoding::encode(&id.0);
+        let enc_id = bifrost_net::url::encode_component(&id.0);
         let path = format!("{prefix}/messages/{enc_id}?$select=id");
         match account.client.get_json::<Value>(&path).await {
             Ok(value) => {
@@ -239,7 +239,7 @@ fn request_for_mutation(
     kind: &MutationKind,
     etags: &HashMap<String, String>,
 ) -> Result<Option<BatchRequestItem>, String> {
-    let enc_id = urlencoding::encode(&id.0);
+    let enc_id = bifrost_net::url::encode_component(&id.0);
     let prefix = account.client.api_path_prefix();
     let mut headers = HashMap::new();
     match kind {

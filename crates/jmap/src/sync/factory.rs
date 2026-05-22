@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bifrost_net::{AccessToken, StaticTokenSource};
 use bifrost_types::{Account, AccountFactory, AccountFuture, CursorScope, Error, ObjectType};
 use tokio_util::sync::CancellationToken;
 
@@ -36,7 +37,7 @@ pub struct JmapAccountFactoryBuilder {
 #[non_exhaustive]
 pub enum JmapCredentials {
     Basic { username: String, password: String },
-    Bearer { token: String },
+    Bearer { token_source: StaticTokenSource },
 }
 
 impl JmapAccountFactory {
@@ -173,10 +174,29 @@ async fn connect(config: JmapAccountFactoryBuilder) -> crate::Result<Client> {
 }
 
 impl JmapCredentials {
+    #[must_use]
+    pub fn bearer(token: impl Into<String>) -> Self {
+        Self::Bearer {
+            token_source: StaticTokenSource::new(token, None),
+        }
+    }
+
+    /// Replace the bearer token for every factory/client clone that
+    /// shares this credential source. Returns `false` for Basic auth.
+    pub fn set_access_token(&self, token: impl Into<String>) -> bool {
+        match self {
+            Self::Basic { .. } => false,
+            Self::Bearer { token_source } => {
+                token_source.set(AccessToken::new(token, None));
+                true
+            }
+        }
+    }
+
     fn into_client_credentials(self) -> Credentials {
         match self {
             Self::Basic { username, password } => Credentials::basic(&username, &password),
-            Self::Bearer { token } => Credentials::bearer(token),
+            Self::Bearer { token_source } => Credentials::bearer_source(token_source),
         }
     }
 }

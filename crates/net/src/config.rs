@@ -31,6 +31,10 @@ pub struct NetConfig {
     /// Test-fixture escape hatch. Production callers must never set
     /// this true.
     pub dangerous_accept_invalid_certs: bool,
+    /// Whether the underlying HTTP client follows redirects
+    /// automatically. Protocols that need a tighter redirect policy
+    /// can disable this and handle 3xx responses themselves.
+    pub follow_redirects: bool,
     /// Proactive-refresh max-age for OAuth tokens that lack an
     /// `expires_at` hint. The `OAuthRefresher` falls back to this
     /// when the issuer did not surface a TTL. Defaults to 55 min;
@@ -50,6 +54,7 @@ impl Default for NetConfig {
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             root_certs: Vec::new(),
             dangerous_accept_invalid_certs: false,
+            follow_redirects: true,
             token_max_age: DEFAULT_TOKEN_MAX_AGE,
         }
     }

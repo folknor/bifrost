@@ -160,7 +160,7 @@ pub async fn create_subscription(
 
     let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
 
-    log::info!(
+    tracing::info!(
         "[Graph webhooks] Created subscription {} for resource '{}' (expires {})",
         response.id,
         resource,
@@ -191,7 +191,7 @@ pub async fn renew_subscription(
 
     client.patch(&path, &body).await?;
 
-    log::info!(
+    tracing::info!(
         "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {new_expiry})"
     );
 
@@ -214,10 +214,12 @@ pub async fn delete_subscription(
         if !e.contains("404") {
             return Err(e.clone());
         }
-        log::info!("[Graph webhooks] Subscription {subscription_id} already gone on server (404)");
+        tracing::info!(
+            "[Graph webhooks] Subscription {subscription_id} already gone on server (404)"
+        );
     }
 
-    log::info!("[Graph webhooks] Deleted subscription {subscription_id}");
+    tracing::info!("[Graph webhooks] Deleted subscription {subscription_id}");
     Ok(())
 }
 
@@ -262,20 +264,20 @@ pub async fn check_and_renew_subscriptions(
         if minutes_remaining < 0 {
             expired.push(sub.id.clone());
         } else if minutes_remaining < RENEWAL_THRESHOLD_MINUTES {
-            log::info!(
+            tracing::info!(
                 "[Graph webhooks] Subscription {} expires in {minutes_remaining}min, renewing",
                 sub.id
             );
             match renew_subscription(client, &sub.id, None).await {
                 Ok(new_expiry) => {
-                    log::info!(
+                    tracing::info!(
                         "[Graph webhooks] Renewed subscription {} until {new_expiry}",
                         sub.id
                     );
                     renewed.push((sub.id.clone(), new_expiry));
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "[Graph webhooks] Failed to renew subscription {}: {e}",
                         sub.id
                     );

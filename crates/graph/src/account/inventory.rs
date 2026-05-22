@@ -202,7 +202,7 @@ pub(crate) fn initial_delta_url(
     let prefix = account.client.api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => {
-            let encoded = urlencoding::encode(&folder.0);
+            let encoded = bifrost_net::url::encode_component(&folder.0);
             match ty {
                 ObjectType::Email => Ok(format!(
                     "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
@@ -319,7 +319,7 @@ fn flags_hash(value: &Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use bifrost_types::QueryId;
-    use futures_util::StreamExt;
+    use futures::StreamExt;
     use serde_json::json;
 
     use crate::client::GraphClient;

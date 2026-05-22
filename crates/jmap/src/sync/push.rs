@@ -203,7 +203,7 @@ async fn reader_loop(
                 let _ = tx.send(WatchEvent::Reconnected);
                 backoff = policy.initial;
 
-                while let Some(message) = futures_util::StreamExt::next(&mut ws).await {
+                while let Some(message) = futures::StreamExt::next(&mut ws).await {
                     if shutdown.is_cancelled() {
                         break;
                     }

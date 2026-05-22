@@ -225,7 +225,7 @@ async fn list_messages_page(
     let mut path = format!("/messages?maxResults={LIST_PAGE_SIZE}");
     if let Some(page_token) = page_token {
         path.push_str("&pageToken=");
-        path.push_str(&urlencoding::encode(page_token));
+        path.push_str(&bifrost_net::url::encode_component(page_token));
     }
     client.get(&path).await
 }

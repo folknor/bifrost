@@ -30,7 +30,12 @@ impl Display for Base64Encoding {
 #[non_exhaustive]
 pub enum Error {
     /// Network, TLS, timeout, or response-body read failure.
-    Transport(reqwest::Error),
+    Transport {
+        /// Human-readable transport failure.
+        message: String,
+        /// True when callers can retry without changing inputs.
+        retryable: bool,
+    },
     /// Server returned an unsuccessful HTTP status.
     HttpStatus {
         /// Logical service being called.
@@ -127,7 +132,7 @@ impl Error {
     /// Whether this failure is worth retrying without changing credentials.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(err) => err.is_connect() || err.is_timeout(),
+            Self::Transport { retryable, .. } => *retryable,
             Self::HttpStatus { status, .. } | Self::QuotaExhausted { status, .. } => {
                 *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
             }
@@ -143,7 +148,7 @@ impl Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(err) => write!(f, "transport error: {err}"),
+            Self::Transport { message, .. } => write!(f, "transport error: {message}"),
             Self::HttpStatus {
                 service,
                 status,
@@ -185,10 +190,10 @@ impl Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Transport(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::Base64 { source, .. } => Some(source),
-            Self::HttpStatus { .. }
+            Self::Transport { .. }
+            | Self::HttpStatus { .. }
             | Self::Auth { .. }
             | Self::QuotaExhausted { .. }
             | Self::MalformedPayload(_)
@@ -199,7 +204,59 @@ impl StdError for Error {
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
-        Self::Transport(err)
+        let retryable = err.is_connect() || err.is_timeout();
+        Self::Transport {
+            message: err.to_string(),
+            retryable,
+        }
+    }
+}
+
+impl From<bifrost_net::Error> for Error {
+    fn from(err: bifrost_net::Error) -> Self {
+        Self::from_net("Gmail API", err)
+    }
+}
+
+impl Error {
+    pub(crate) fn from_net(service: impl Into<String>, err: bifrost_net::Error) -> Self {
+        let message = err.to_string();
+        match err {
+            bifrost_net::Error::Status { code, body, .. } => Self::status(
+                service,
+                code,
+                String::from_utf8_lossy(body.as_ref()).into_owned(),
+            ),
+            bifrost_net::Error::AuthLost => Self::Auth {
+                service: service.into(),
+                status: Some(reqwest::StatusCode::UNAUTHORIZED),
+                body: "authorization lost".to_string(),
+                refresh_required: true,
+            },
+            bifrost_net::Error::RateLimited { .. } => Self::QuotaExhausted {
+                service: service.into(),
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body: "rate limited".to_string(),
+            },
+            bifrost_net::Error::RetryBudgetExhausted {
+                last_status: Some(status),
+                ..
+            } => Self::status(service, status, "retry budget exhausted".to_string()),
+            bifrost_net::Error::Timeout => Self::Transport {
+                message,
+                retryable: true,
+            },
+            bifrost_net::Error::Network { .. } | bifrost_net::Error::RefreshFailed { .. } => {
+                Self::Transport {
+                    message,
+                    retryable: true,
+                }
+            }
+            _ => Self::Transport {
+                message,
+                retryable: false,
+            },
+        }
     }
 }
 

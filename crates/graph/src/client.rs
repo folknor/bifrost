@@ -1,6 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bifrost_net::{
+    AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy,
+    StaticTokenSource, TokenSource,
+};
+use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, RwLock, Semaphore};
@@ -10,8 +16,6 @@ use crate::folder_mapper::FolderMap;
 pub const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 pub const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
 
-const MAX_RETRY_ATTEMPTS: u32 = 3;
-const INITIAL_BACKOFF_MS: u64 = 1000;
 const CONCURRENCY_LIMIT: usize = 3;
 
 #[derive(Clone)]
@@ -20,10 +24,10 @@ pub struct GraphClient {
 }
 
 struct ClientInner {
-    http: reqwest::Client,
+    net: AccountNet,
     api_base: String,
     api_beta_base: String,
-    access_token: Arc<RwLock<String>>,
+    token_source: StaticTokenSource,
     mailbox_id: Option<String>,
     semaphore: Arc<Semaphore>,
     folder_map: RwLock<Option<(FolderMap, Instant)>>,
@@ -32,24 +36,14 @@ struct ClientInner {
 
 impl GraphClient {
     pub fn new(access_token: impl Into<String>) -> Self {
-        Self::with_http_client(
-            reqwest::Client::new(),
-            GRAPH_API_BASE,
-            GRAPH_API_BETA,
-            access_token,
-        )
+        Self::with_api_bases(GRAPH_API_BASE, GRAPH_API_BETA, access_token)
     }
 
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
         let api_base = api_base.into();
         let api_beta_base =
             derive_beta_base(&api_base).unwrap_or_else(|| GRAPH_API_BETA.to_string());
-        Self::with_http_client(
-            reqwest::Client::new(),
-            api_base,
-            api_beta_base,
-            access_token,
-        )
+        Self::with_api_bases(api_base, api_beta_base, access_token)
     }
 
     pub fn with_api_bases(
@@ -57,26 +51,23 @@ impl GraphClient {
         api_beta_base: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Self {
-        Self::with_http_client(
-            reqwest::Client::new(),
-            api_base,
-            api_beta_base,
-            access_token,
-        )
+        let token_source = StaticTokenSource::new(access_token, None);
+        let net = default_account_net("graph", "graph.microsoft.com", token_source.clone());
+        Self::with_account_net(net, api_base, api_beta_base, token_source)
     }
 
-    pub fn with_http_client(
-        http: reqwest::Client,
+    pub fn with_account_net(
+        net: AccountNet,
         api_base: impl Into<String>,
         api_beta_base: impl Into<String>,
-        access_token: impl Into<String>,
+        token_source: StaticTokenSource,
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
-                http,
+                net,
                 api_base: trim_base(api_base.into()),
                 api_beta_base: trim_base(api_beta_base.into()),
-                access_token: Arc::new(RwLock::new(access_token.into())),
+                token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
                 folder_map: RwLock::new(None),
@@ -85,8 +76,8 @@ impl GraphClient {
         }
     }
 
-    pub fn http_client(&self) -> &reqwest::Client {
-        &self.inner.http
+    pub fn account_net(&self) -> &AccountNet {
+        &self.inner.net
     }
 
     pub fn api_base(&self) -> &str {
@@ -98,16 +89,18 @@ impl GraphClient {
     }
 
     pub async fn access_token(&self) -> String {
-        self.inner.access_token.read().await.clone()
+        self.inner.token_source.token().as_str().to_string()
     }
 
     pub async fn set_access_token(&self, access_token: impl Into<String>) {
-        *self.inner.access_token.write().await = access_token.into();
+        self.inner
+            .token_source
+            .set(AccessToken::new(access_token, None));
     }
 
     pub fn api_path_prefix(&self) -> String {
         match &self.inner.mailbox_id {
-            Some(id) => format!("/users/{}", urlencoding::encode(id)),
+            Some(id) => format!("/users/{}", bifrost_net::url::encode_component(id)),
             None => "/me".to_string(),
         }
     }
@@ -115,10 +108,10 @@ impl GraphClient {
     pub fn for_shared_mailbox(&self, mailbox_id: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(ClientInner {
-                http: self.inner.http.clone(),
+                net: self.inner.net.clone(),
                 api_base: self.inner.api_base.clone(),
                 api_beta_base: self.inner.api_beta_base.clone(),
-                access_token: Arc::clone(&self.inner.access_token),
+                token_source: self.inner.token_source.clone(),
                 mailbox_id: Some(mailbox_id.into()),
                 semaphore: Arc::clone(&self.inner.semaphore),
                 folder_map: RwLock::new(None),
@@ -172,10 +165,7 @@ impl GraphClient {
 
     pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
         let url = self.api_url(path);
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(&url, "GET", None::<&()>, &access_token)
-            .await?;
+        let response = self.execute(&url, "GET", None::<&()>).await?;
         parse_bytes_response(response, "Graph API").await
     }
 
@@ -215,28 +205,19 @@ impl GraphClient {
         body: Option<&B>,
     ) -> Result<(), String> {
         let url = self.api_url(path);
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(&url, "POST", body, &access_token)
-            .await?;
+        let response = self.execute(&url, "POST", body).await?;
         check_response_status(response, "Graph API").await
     }
 
     pub async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
         let url = self.api_url(path);
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(&url, "PATCH", Some(body), &access_token)
-            .await?;
+        let response = self.execute(&url, "PATCH", Some(body)).await?;
         check_response_status(response, "Graph API").await
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), String> {
         let url = self.api_url(path);
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(&url, "DELETE", None::<&()>, &access_token)
-            .await?;
+        let response = self.execute(&url, "DELETE", None::<&()>).await?;
         check_response_status(response, "Graph API").await
     }
 
@@ -247,23 +228,24 @@ impl GraphClient {
         start: usize,
         end: usize,
         total: usize,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<Response, String> {
         let response = self
             .inner
-            .http
+            .net
             .put(url)
-            .header("Content-Range", format!("bytes {start}-{end}/{total}"))
-            .header("Content-Length", data.len().to_string())
-            .body(data.to_vec())
+            .without_bearer_auth()
+            .header("Content-Range", &format!("bytes {start}-{end}/{total}"))
+            .header("Content-Length", &data.len().to_string())
+            .body(Bytes::copy_from_slice(data))
             .send()
             .await
-            .map_err(|e| format!("Graph upload request failed: {e}"))?;
+            .map_err(|error| net_error("Graph upload", error))?;
 
         if response.status().is_success() {
             Ok(response)
         } else {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response_body_string(response);
             Err(format!("Graph upload error {status}: {body}"))
         }
     }
@@ -289,48 +271,16 @@ impl GraphClient {
         method: &str,
         body: Option<&B>,
     ) -> Result<T, String> {
-        let access_token = self.access_token().await;
-        let response = self
-            .execute_with_retry(url, method, body, &access_token)
-            .await?;
+        let response = self.execute(url, method, body).await?;
         parse_json_response(response, "Graph API").await
     }
 
-    async fn execute_with_retry<B: Serialize>(
+    async fn execute<B: Serialize>(
         &self,
         url: &str,
         method: &str,
         body: Option<&B>,
-        access_token: &str,
-    ) -> Result<reqwest::Response, String> {
-        let mut last_response = None;
-
-        for attempt in 0..MAX_RETRY_ATTEMPTS {
-            let response = self.execute_once(url, method, body, access_token).await?;
-
-            if !is_retryable(response.status()) {
-                return Ok(response);
-            }
-
-            last_response = Some(response);
-            if attempt == MAX_RETRY_ATTEMPTS - 1 {
-                break;
-            }
-
-            let delay = retry_delay(last_response.as_ref(), attempt);
-            tokio::time::sleep(delay).await;
-        }
-
-        last_response.ok_or_else(|| "No response received".to_string())
-    }
-
-    async fn execute_once<B: Serialize>(
-        &self,
-        url: &str,
-        method: &str,
-        body: Option<&B>,
-        access_token: &str,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<Response, String> {
         let _permit = self
             .inner
             .semaphore
@@ -339,16 +289,14 @@ impl GraphClient {
             .map_err(|_| "Graph request semaphore closed".to_string())?;
 
         let mut builder = match method {
-            "GET" => self.inner.http.get(url),
-            "POST" => self.inner.http.post(url),
-            "PATCH" => self.inner.http.patch(url),
-            "DELETE" => self.inner.http.delete(url),
+            "GET" => self.inner.net.get(url),
+            "POST" => self.inner.net.post(url),
+            "PATCH" => self.inner.net.patch(url),
+            "DELETE" => self.inner.net.delete(url),
             _ => return Err(format!("Unsupported HTTP method: {method}")),
         };
 
-        builder = builder
-            .header("Authorization", format!("Bearer {access_token}"))
-            .header("Content-Type", "application/json");
+        builder = builder.header("Content-Type", "application/json");
 
         if let Some(b) = body {
             builder = builder.json(b);
@@ -357,7 +305,7 @@ impl GraphClient {
         builder
             .send()
             .await
-            .map_err(|e| format!("Graph API request failed: {e}"))
+            .map_err(|error| net_error("Graph API", error))
     }
 }
 
@@ -382,63 +330,86 @@ fn build_url(base: &str, path: &str) -> String {
     }
 }
 
-fn is_retryable(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-}
-
 async fn parse_json_response<T: DeserializeOwned>(
-    response: reqwest::Response,
+    response: Response,
     service: &str,
 ) -> Result<T, String> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = response_body_string(response);
         return Err(format!("{service} error {status}: {body}"));
     }
 
-    response
-        .json()
-        .await
+    serde_json::from_slice(response.body.as_ref())
         .map_err(|e| format!("{service} JSON parse failed: {e}"))
 }
 
-async fn parse_bytes_response(
-    response: reqwest::Response,
-    service: &str,
-) -> Result<Vec<u8>, String> {
+async fn parse_bytes_response(response: Response, service: &str) -> Result<Vec<u8>, String> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = response_body_string(response);
         return Err(format!("{service} error {status}: {body}"));
     }
 
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|e| format!("{service} body read failed: {e}"))
+    Ok(response.body.to_vec())
 }
 
-async fn check_response_status(response: reqwest::Response, service: &str) -> Result<(), String> {
+async fn check_response_status(response: Response, service: &str) -> Result<(), String> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
 
-    let body = response.text().await.unwrap_or_default();
+    let body = response_body_string(response);
     Err(format!("{service} error {status}: {body}"))
 }
 
-fn retry_delay(response: Option<&reqwest::Response>, attempt: u32) -> Duration {
-    if let Some(delay) = response
-        .and_then(|r| r.headers().get(reqwest::header::RETRY_AFTER))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return Duration::from_secs(delay);
-    }
+fn response_body_string(response: Response) -> String {
+    String::from_utf8_lossy(response.body.as_ref()).into_owned()
+}
 
-    Duration::from_millis(INITIAL_BACKOFF_MS * u64::from(attempt + 1))
+fn net_error(service: &str, err: bifrost_net::Error) -> String {
+    match err {
+        bifrost_net::Error::Status { code, body, .. } => {
+            format!(
+                "{service} error {code}: {}",
+                String::from_utf8_lossy(body.as_ref())
+            )
+        }
+        bifrost_net::Error::AuthLost => format!("{service} error 401 Unauthorized: auth lost"),
+        bifrost_net::Error::RateLimited { .. } => {
+            format!("{service} error 429 Too Many Requests: rate limited")
+        }
+        bifrost_net::Error::RetryBudgetExhausted {
+            last_status: Some(status),
+            ..
+        } => format!("{service} error {status}: retry budget exhausted"),
+        other => format!("{service} request failed: {other}"),
+    }
+}
+
+fn default_account_net(
+    account: impl Into<String>,
+    host: impl Into<String>,
+    token_source: StaticTokenSource,
+) -> AccountNet {
+    static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
+    let net = Net::shared_default();
+    let token_source: Arc<dyn TokenSource> = Arc::new(token_source);
+    net.attach_account(
+        AccountId(format!("{}-{id}", account.into())),
+        AccountSpec {
+            hosts: vec![RateLimit {
+                host: host.into(),
+                quota_per_second: 10.0,
+                cost_default: 1,
+                burst: 10,
+            }],
+            token_source,
+            default_retry: RetryPolicy::default(),
+        },
+    )
 }
 
 #[cfg(test)]

@@ -42,9 +42,7 @@ fn jmap_factory() -> Arc<dyn AccountFactory> {
     Arc::new(
         JmapAccountFactory::builder(
             "https://jmap.example.test/session",
-            JmapCredentials::Bearer {
-                token: "test-token".to_owned(),
-            },
+            JmapCredentials::bearer("test-token"),
         )
         .build(),
     )

@@ -6,7 +6,7 @@ use bifrost_types::{
     WarningKind,
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures::StreamExt;
 use serde_json::Value;
 
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, MESSAGE_SELECT};
@@ -75,7 +75,7 @@ async fn fetch_batch(
         .iter()
         .enumerate()
         .map(|(index, id)| {
-            let enc_id = urlencoding::encode(&id.0);
+            let enc_id = bifrost_net::url::encode_component(&id.0);
             BatchRequestItem {
                 id: index.to_string(),
                 method: "GET".to_string(),

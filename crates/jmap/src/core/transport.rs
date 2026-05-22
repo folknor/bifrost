@@ -89,7 +89,7 @@ pub trait HttpTransport: Send + Sync + 'static {
 /// The default implementation uses reqwest's byte streaming.
 pub trait SseTransport: Send + Sync + 'static {
     /// The byte stream type returned by the SSE connection.
-    type ByteStream: futures_util::Stream<Item = Result<Vec<u8>, TransportError>> + Send + Unpin;
+    type ByteStream: futures::Stream<Item = Result<Vec<u8>, TransportError>> + Send + Unpin;
 
     /// Open an SSE connection to the given URL.
     ///

@@ -312,7 +312,7 @@ pub async fn graph_sync_calendar_events(
     cancellation_token: &CancellationToken,
 ) -> Result<GraphCalendarSyncResult, String> {
     let me = client.api_path_prefix();
-    let enc_cal_id = urlencoding::encode(calendar_remote_id);
+    let enc_cal_id = bifrost_net::url::encode_component(calendar_remote_id);
 
     let mut created = Vec::new();
     let mut updated = Vec::new();
@@ -391,7 +391,7 @@ pub async fn graph_create_event(
     event: &GraphEventCreate,
 ) -> Result<GraphCalendarEvent, String> {
     let me = client.api_path_prefix();
-    let enc_cal_id = urlencoding::encode(calendar_remote_id);
+    let enc_cal_id = bifrost_net::url::encode_component(calendar_remote_id);
     let response: serde_json::Value = client
         .post(&format!("{me}/calendars/{enc_cal_id}/events"), event)
         .await?;
@@ -460,7 +460,7 @@ pub async fn graph_update_event(
     event: &serde_json::Value,
 ) -> Result<GraphCalendarEvent, String> {
     let me = client.api_path_prefix();
-    let enc_event_id = urlencoding::encode(remote_event_id);
+    let enc_event_id = bifrost_net::url::encode_component(remote_event_id);
     // PATCH the event (returns 200 with no parsed body via our patch method)
     client
         .patch(&format!("{me}/events/{enc_event_id}"), event)
@@ -477,7 +477,7 @@ pub async fn graph_update_event(
 /// Delete an event.
 pub async fn graph_delete_event(client: &GraphClient, remote_event_id: &str) -> Result<(), String> {
     let me = client.api_path_prefix();
-    let enc_event_id = urlencoding::encode(remote_event_id);
+    let enc_event_id = bifrost_net::url::encode_component(remote_event_id);
     client.delete(&format!("{me}/events/{enc_event_id}")).await
 }
 
@@ -787,7 +787,7 @@ fn parse_graph_datetime(
     // operator running with debug logs can tell why an event is showing
     // up at the wall-clock-as-UTC instant rather than the intended one.
     if !(dt.time_zone.is_empty() || dt.time_zone.eq_ignore_ascii_case("UTC")) {
-        log::warn!(
+        tracing::warn!(
             "Graph timeZone {:?} did not resolve to a known zone; treating wall clock as UTC",
             dt.time_zone
         );

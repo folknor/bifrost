@@ -5,7 +5,7 @@ use bifrost_types::{
     AccountStream, Batch, Error, FlagOp, IdempotencyKey, MembershipScope, MutationOutcome,
     MutationResult, ObjectId, PageBoundary, SyncEvent,
 };
-use futures_util::StreamExt;
+use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::email::{EmailGet, EmailId, EmailPatch, EmailSet};

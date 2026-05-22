@@ -10,7 +10,7 @@ const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 pub(crate) fn account_error_from_gmail(error: &GmailError) -> AccountError {
     match error {
         GmailError::Auth { service, body, .. } => AccountError::Auth(format!("{service}: {body}")),
-        GmailError::Transport(err) => AccountError::Transport(err.to_string()),
+        GmailError::Transport { message, .. } => AccountError::Transport(message.clone()),
         GmailError::QuotaExhausted { service, body, .. } => {
             AccountError::Transport(format!("{service} quota exhausted: {body}"))
         }
@@ -62,11 +62,11 @@ pub(crate) fn classify_general_error(error: &GmailError) -> RecoveryClass {
         GmailError::QuotaExhausted { .. } => RecoveryClass::Retry {
             after: DEFAULT_RETRY_AFTER,
         },
-        GmailError::Transport(err) if err.is_timeout() || err.is_connect() => {
-            RecoveryClass::Retry {
-                after: DEFAULT_RETRY_AFTER,
-            }
-        }
+        GmailError::Transport {
+            retryable: true, ..
+        } => RecoveryClass::Retry {
+            after: DEFAULT_RETRY_AFTER,
+        },
         GmailError::HttpStatus { status, .. } if status.is_server_error() => RecoveryClass::Retry {
             after: DEFAULT_RETRY_AFTER,
         },

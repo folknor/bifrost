@@ -13,7 +13,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
-use crate::error::Error as GmailError;
 
 use super::recovery;
 
@@ -235,7 +234,7 @@ async fn start_renewer(
                     }
                 }
                 Err(error) => {
-                    log::warn!("gmail Pub/Sub watch renewal failed: {error}");
+                    tracing::warn!("gmail Pub/Sub watch renewal failed: {error}");
                     if !disconnected {
                         control.report_health(WatchEvent::Disconnected);
                         disconnected = true;
@@ -259,23 +258,7 @@ async fn watch_once(
 }
 
 async fn stop_watch(client: &GmailClient) -> crate::Result<()> {
-    let url = format!("{}/stop", client.api_base());
-    let access_token = client.access_token().await;
-    let response = client
-        .http_client()
-        .post(url)
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("Content-Type", "application/json")
-        .json(&json!({}))
-        .send()
-        .await
-        .map_err(GmailError::from)?;
-    let status = response.status();
-    if status.is_success() {
-        return Ok(());
-    }
-    let body = response.text().await.map_err(GmailError::from)?;
-    Err(GmailError::status("Gmail API", status, body))
+    client.post_no_content("/stop", &json!({})).await
 }
 
 fn parse_expiration(value: &str) -> Option<SystemTime> {
