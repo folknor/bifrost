@@ -6,6 +6,15 @@
 //! associated type, and `close` takes `&self` so it composes with
 //! `Arc<dyn Account>`. A compile-time `_dyn_safe` check in
 //! `lib.rs` verifies this at every build.
+//!
+//! Two-tier surface:
+//!
+//! - Primitives (no default impl): wire-level operations every
+//!   protocol crate implements. The Account-impl-side surface.
+//! - Conveniences (default impl in terms of primitives): ratatoskr-
+//!   shaped composites. Protocol crates override only when the
+//!   default is wrong for that provider; consumers who disagree with
+//!   ratatoskr's defaults use the primitives directly.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,7 +24,9 @@ use futures::future::Future;
 use futures::stream::Stream;
 
 use crate::blob::{BlobHandle, ByteRange};
-use crate::capabilities::AccountCapabilities;
+use crate::capabilities::{AccountCapabilities, StarredFlagShape};
+use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest};
+use crate::container::{Container, ContainerId, ContainerKind, Label, MutationTarget};
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycle,
@@ -25,8 +36,12 @@ use crate::events::{
     Change, InventoryEntry, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
     WatchEvent,
 };
-use crate::ids::{ObjectId, SubscriptionHandle};
+use crate::hydration::{HydrationProjection, Message, ThreadHydration};
+use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, MutationResult, Projection};
+use crate::page::Page;
+use crate::search::SearchRequest;
+use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 
 /// Erased streaming return type for `Account` methods.
 ///
@@ -198,6 +213,378 @@ pub trait Account: Send + Sync {
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>>;
 
+    // ------------------------------------------------------------
+    // Mail mutation primitives (S1-W1)
+    //
+    // Each maps to one wire-level operation. Account impls that do
+    // not natively support a given primitive return
+    // `Err(Error::Unsupported)` and clear the matching flag in
+    // `capabilities().pim_methods`.
+    // ------------------------------------------------------------
+
+    /// Add `target` to `container`. JMAP `Email/set` mailboxIds add;
+    /// IMAP `COPY`; Gmail `messages.modify` addLabels; Graph
+    /// `POST /messages/{id}/move`.
+    fn add_to_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Remove `target` from `container`. JMAP `Email/set` mailboxIds
+    /// remove; IMAP `+FLAGS \Deleted` + `EXPUNGE`; Gmail
+    /// `messages.modify` removeLabels; Graph has no symmetric op
+    /// (move replaces source).
+    fn remove_from_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Set or clear a single IMAP / JMAP keyword. Gmail and Graph
+    /// return `Err(Unsupported)`; the convenience layer chooses an
+    /// alternate primitive instead.
+    fn set_keyword(
+        &self,
+        target: MutationTarget,
+        keyword: String,
+        value: bool,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Set or clear membership in a Gmail-style label. JMAP / IMAP /
+    /// Graph return `Err(Unsupported)`.
+    fn set_label_membership(
+        &self,
+        target: MutationTarget,
+        label: ContainerId,
+        value: bool,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Set or clear a Graph category. JMAP / IMAP / Gmail return
+    /// `Err(Unsupported)`.
+    fn set_category(
+        &self,
+        target: MutationTarget,
+        category: String,
+        value: bool,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Set or clear a Graph singleValueExtendedProperty. JMAP / IMAP
+    /// / Gmail return `Err(Unsupported)`.
+    fn set_extended_property(
+        &self,
+        target: MutationTarget,
+        property_id: String,
+        value: Option<String>,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Mark read state. Every protocol implements this; canonical
+    /// across the four.
+    fn set_is_read(
+        &self,
+        target: MutationTarget,
+        is_read: bool,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    // ------------------------------------------------------------
+    // Mail composition primitives (S1-W1)
+    // ------------------------------------------------------------
+
+    /// Send an RFC 5322 message. JMAP `EmailSubmission/set`; Gmail
+    /// `messages.send`; Graph `POST /me/sendMail`; IMAP via the
+    /// configured `bifrost-smtp` transport.
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, Error>>;
+
+    /// Streaming upload of an attachment. Returns a handle the
+    /// consumer references in subsequent `SendRequest` /
+    /// `DraftPatch` payloads. The `mime` argument is the
+    /// Content-Type the server should record on the resulting
+    /// attachment.
+    fn attachment_upload(
+        &self,
+        bytes: AccountStream<Result<Bytes, Error>>,
+        mime: String,
+    ) -> AccountFuture<Result<AttachmentHandle, Error>>;
+
+    /// Create a new draft.
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, Error>>;
+
+    /// Update an existing draft. The patch is partial: only `Some`
+    /// fields are applied.
+    fn draft_update(
+        &self,
+        draft: DraftHandle,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Discard (delete) a draft without sending.
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), Error>>;
+
+    /// Convert a draft into a sent message. The provider chooses
+    /// atomicity; protocols that don't support atomic draft->send
+    /// implement this as draft fetch + send + discard.
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, Error>>;
+
+    // ------------------------------------------------------------
+    // Search primitives (S1-W1)
+    // ------------------------------------------------------------
+
+    /// Thread-shaped search. Returns a page of `ThreadId`. Each
+    /// call's page cursor is opaque; pass the previous page's
+    /// `next_cursor` back to fetch the next page.
+    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, Error>>;
+
+    /// Message-shaped search using the same request AST.
+    fn search_messages(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ObjectId>, Error>>;
+
+    // ------------------------------------------------------------
+    // Container CRUD primitives (S1-W1)
+    // ------------------------------------------------------------
+
+    /// Enumerate containers (folders, labels, mailboxes).
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, Error>>;
+
+    /// Create a new container of the given `kind` with `name` under
+    /// `parent`. Returns the engine-facing id.
+    ///
+    /// Contract: protocols that do not support nesting return
+    /// `Err(Unsupported)` when `parent` is `Some`.
+    fn container_create(
+        &self,
+        kind: ContainerKind,
+        name: String,
+        parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<ContainerId, Error>>;
+
+    /// Rename a container.
+    fn container_rename(
+        &self,
+        container: ContainerId,
+        name: String,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Move a container under a new parent. Folder-kind only;
+    /// label-kind containers return `Err(Unsupported)`.
+    fn container_move(
+        &self,
+        container: ContainerId,
+        new_parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Delete a container. Contract: a non-empty container either
+    /// fails or moves contents to Trash; protocols MUST NOT silently
+    /// drop messages.
+    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), Error>>;
+
+    // ------------------------------------------------------------
+    // Settings primitives (S1-W1)
+    // ------------------------------------------------------------
+
+    /// List all sending identities on this account.
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, Error>>;
+
+    /// Update one identity. `patch` is partial; only `Some` fields
+    /// are applied.
+    fn identity_update(
+        &self,
+        identity: IdentityId,
+        patch: IdentityPatch,
+    ) -> AccountFuture<Result<(), Error>>;
+
+    /// Read the vacation responder config, when supported.
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, Error>>;
+
+    /// Replace the vacation responder config.
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), Error>>;
+
+    /// Read the storage quota readout, when supported.
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, Error>>;
+
+    // ------------------------------------------------------------
+    // Threading + hydration primitives (S1-W1)
+    // ------------------------------------------------------------
+
+    /// Hydrate every message in a thread. JMAP `Thread/get` +
+    /// `Email/get`; IMAP `THREAD REFERENCES` + per-message FETCH;
+    /// Gmail `threads.get`; Graph conversation API.
+    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, Error>>;
+
+    /// Hydrate one message at a specific projection level.
+    fn message_hydrate(
+        &self,
+        message: ObjectId,
+        projection: HydrationProjection,
+    ) -> AccountFuture<Result<Message, Error>>;
+
+    // ------------------------------------------------------------
+    // Conveniences (S1-W1)
+    //
+    // Default impls encode ratatoskr's product opinions. Each
+    // dispatches into primitives and reads
+    // `capabilities().conveniences` to pick the right one.
+    //
+    // Default-impl strategy notes (see S1-W1 report):
+    //
+    // - Single-call conveniences (`apply_label`, `remove_label`,
+    //   `set_read`, `set_starred`, `mark_replied`, `mark_forwarded`)
+    //   have a real default impl. `set_starred`, `mark_replied`,
+    //   and `mark_forwarded` use capability-based dispatch through
+    //   `capabilities().conveniences` rather than a hard-coded
+    //   protocol switch, so consumers can override the dispatch
+    //   shape per-account without subclassing the trait.
+    // - Multi-call conveniences (`move_thread`, `delete_thread`)
+    //   default to `Err(Unsupported)`: the boxed `'static` future
+    //   returned by a trait method cannot borrow `&self` across the
+    //   await boundary between the first and second primitive, and
+    //   demanding every Account impl ship around in `Arc<Self>`
+    //   shape was the wrong tradeoff. Protocol crates implement
+    //   these in-crate where they have access to their own `Arc`-
+    //   shaped handle.
+    // ------------------------------------------------------------
+
+    /// Move a thread between containers. `source` is the container
+    /// being moved out of (`None` when the consumer is not tracking
+    /// a source container, e.g. unifying a flat label-rendering UI).
+    ///
+    /// Default impl returns `Err(Unsupported)`; protocol crates
+    /// override with `add_to_container(target)` followed by
+    /// `remove_from_container(source)`. Order: add-then-remove so a
+    /// failure on the second step leaves the message in both
+    /// containers (recoverable) rather than neither (lost).
+    fn move_thread(
+        &self,
+        _thread: ThreadId,
+        _target: ContainerId,
+        _source: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    /// Apply a label to `target`. Dispatches by `label.provenance`
+    /// to the right primitive.
+    fn apply_label(
+        &self,
+        target: MutationTarget,
+        label: Label,
+    ) -> AccountFuture<Result<(), Error>> {
+        dispatch_label(self, target, label, true)
+    }
+
+    /// Remove a label from `target`. Same dispatch shape as
+    /// `apply_label`.
+    fn remove_label(
+        &self,
+        target: MutationTarget,
+        label: Label,
+    ) -> AccountFuture<Result<(), Error>> {
+        dispatch_label(self, target, label, false)
+    }
+
+    /// Alias for `set_is_read`. Exists for naming symmetry with the
+    /// other convenience setters.
+    fn set_read(&self, target: MutationTarget, is_read: bool) -> AccountFuture<Result<(), Error>> {
+        self.set_is_read(target, is_read)
+    }
+
+    /// Toggle the starred / flagged bit. Dispatches by
+    /// `capabilities().conveniences.starred` to the right primitive.
+    ///
+    /// Capability-based dispatch (rather than a `match` on
+    /// `ProtocolKind`) is the chosen design here: protocol crates
+    /// know best which primitive corresponds to "starred" for their
+    /// account (Graph has both `flag.flagStatus` and categories;
+    /// IMAP has both `\Flagged` and Sieve flag-keyword adjuncts;
+    /// custom deployments may differ). The capability shape lets
+    /// the protocol crate declare the answer once at open-time
+    /// rather than have the convenience embed a hard-coded provider
+    /// switch.
+    fn set_starred(
+        &self,
+        target: MutationTarget,
+        starred: bool,
+    ) -> AccountFuture<Result<(), Error>> {
+        const STARRED_KEYWORD: &str = "$flagged";
+        const STARRED_LABEL: &str = "STARRED";
+        match self.capabilities().conveniences.starred {
+            StarredFlagShape::Keyword => {
+                self.set_keyword(target, STARRED_KEYWORD.to_string(), starred)
+            }
+            StarredFlagShape::LabelMembership => {
+                self.set_label_membership(target, ContainerId(STARRED_LABEL.to_string()), starred)
+            }
+            StarredFlagShape::Category => {
+                self.set_category(target, STARRED_KEYWORD.to_string(), starred)
+            }
+            StarredFlagShape::None => Box::pin(async { Err(Error::Unsupported) }),
+        }
+    }
+
+    /// Mark a message as replied. Default impl dispatches based on
+    /// `capabilities().conveniences.replied_via_keyword` /
+    /// `replied_via_extended_property`; if neither flag is set,
+    /// returns `Err(Unsupported)` (Gmail's case: replied state is
+    /// derived on sync, not a writeable flag).
+    fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), Error>> {
+        const ANSWERED_KEYWORD: &str = "$answered";
+        const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
+        const PR_LAST_VERB_REPLIED: &str = "102";
+        let target = MutationTarget::Message(message);
+        let conv = self.capabilities().conveniences;
+        if conv.replied_via_keyword {
+            return self.set_keyword(target, ANSWERED_KEYWORD.to_string(), true);
+        }
+        if conv.replied_via_extended_property {
+            return self.set_extended_property(
+                target,
+                PR_LAST_VERB_EXECUTED.to_string(),
+                Some(PR_LAST_VERB_REPLIED.to_string()),
+            );
+        }
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    /// Mark a message as forwarded. Same dispatch shape as
+    /// `mark_replied`.
+    fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), Error>> {
+        const FORWARDED_KEYWORD: &str = "$forwarded";
+        const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
+        const PR_LAST_VERB_FORWARDED: &str = "104";
+        let target = MutationTarget::Message(message);
+        let conv = self.capabilities().conveniences;
+        if conv.forwarded_via_keyword {
+            return self.set_keyword(target, FORWARDED_KEYWORD.to_string(), true);
+        }
+        if conv.forwarded_via_extended_property {
+            return self.set_extended_property(
+                target,
+                PR_LAST_VERB_EXECUTED.to_string(),
+                Some(PR_LAST_VERB_FORWARDED.to_string()),
+            );
+        }
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    /// Move a thread to Trash, or delete-permanently if already in
+    /// Trash.
+    ///
+    /// Default impl returns `Err(Unsupported)`. The wire-level
+    /// dispatch ("trash if elsewhere; expunge if in Trash") needs
+    /// to read the current container set, which is a chained call;
+    /// the default impl cannot perform a chained call without
+    /// borrowing `&self` across the await boundary into a `'static`
+    /// future. Protocol crates ship this convenience using their
+    /// own `Arc<Self>`-shaped handle.
+    fn delete_thread(
+        &self,
+        _thread: ThreadId,
+        _current: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,
     /// JMAP WebSocket close, Graph subscription stream end, local
     /// worker shutdown. Idempotent: takes `&self` so it composes
@@ -213,7 +600,54 @@ pub trait Account: Send + Sync {
 /// Consumers register one per account so the engine can perform
 /// reopen cycles (capability change, transport reset) without
 /// knowing protocol config. The engine owns the current open
-/// `Arc<dyn Account>` and calls `open()` when it needs a fresh one.
+/// `Arc<dyn Account>` and calls `open(account_id)` when it needs a
+/// fresh one. The engine-minted `AccountId` is threaded through so
+/// the protocol crate can attach to `bifrost-net` / `MeterSink` /
+/// trace correlation under the right key on every reopen.
 pub trait AccountFactory: Send + Sync + 'static {
-    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, Error>>;
+    /// Open the account with the engine's identifier for it.
+    ///
+    /// The `AccountId` is the engine-minted handle the consumer
+    /// passed to `SyncEngine::attach`. Protocol crates that wire
+    /// `bifrost-net` (JMAP, Gmail, Graph), drive a `MeterSink`
+    /// (IMAP, SMTP), or correlate logs to a per-account trace use
+    /// it as the registration key. On reopen the engine calls
+    /// `open` with the same id so attached resources can be
+    /// re-registered against the same key.
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, Error>>;
+}
+
+/// Shared dispatch for `apply_label` / `remove_label`.
+///
+/// Reads `label.provenance` to decide which primitive to invoke.
+/// The mapping is fixed at the trait surface because
+/// `Provenance::kind` (Folder | Label) is the load-bearing signal:
+/// a label-kind id under Gmail's provider is a label-membership
+/// flip; under JMAP / IMAP it is a keyword flip; under Graph it is
+/// a category. Folder-kind ids are container-membership flips
+/// (Graph maps to categories when the consumer wants the same
+/// behaviour with a category id).
+fn dispatch_label<T: Account + ?Sized>(
+    receiver: &T,
+    target: MutationTarget,
+    label: Label,
+    value: bool,
+) -> AccountFuture<Result<(), Error>> {
+    use crate::cursor::ProtocolKind;
+    match (label.provenance.kind, label.provenance.provider) {
+        (ContainerKind::Label, ProtocolKind::Gmail) => {
+            receiver.set_label_membership(target, label.id, value)
+        }
+        (ContainerKind::Label, _) => receiver.set_keyword(target, label.provenance.native, value),
+        (ContainerKind::Folder, ProtocolKind::Graph) => {
+            receiver.set_category(target, label.provenance.native, value)
+        }
+        (ContainerKind::Folder, _) => {
+            if value {
+                receiver.add_to_container(target, label.id)
+            } else {
+                receiver.remove_from_container(target, label.id)
+            }
+        }
+    }
 }

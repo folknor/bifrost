@@ -298,9 +298,77 @@ impl AccountMeter {
 /// `bifrost-net` because the engine already depends on net for the
 /// HTTP path; IMAP/SMTP poke a handle rather than carrying a separate
 /// metering stack.
+///
+/// The trait is dyn-safe so a protocol crate can hold
+/// `Arc<dyn MeterSink>` without naming the concrete `BandwidthMeter`
+/// type, and so test doubles can substitute one in. The HTTP path
+/// goes through `AccountMeter` directly because it already owns an
+/// `Arc<AccountCounters>` from `attach_account`; raw-socket
+/// transports go through a `MeterSinkHandle` which composes the
+/// account id with the sink so the transport call site does not
+/// need to thread the id alongside every byte count.
 pub trait MeterSink: Send + Sync + 'static {
     /// Record `n` inbound bytes for `account`.
     fn record_bytes_in(&self, account: &AccountId, n: u64);
     /// Record `n` outbound bytes for `account`.
     fn record_bytes_out(&self, account: &AccountId, n: u64);
+}
+
+/// Account-scoped adapter around a `MeterSink`.
+///
+/// Raw-socket transports (IMAP, SMTP) construct one of these per
+/// connection and call `record_bytes_in` / `record_bytes_out` on
+/// every wire read / write. The handle owns the account id so the
+/// transport call site does not have to thread it. Cloneable; one
+/// per spawned task is the expected usage.
+///
+/// `S1-W1 status`: the adapter is shipped for use; IMAP / SMTP
+/// wiring lands in S1-W2.
+#[derive(Clone)]
+pub struct MeterSinkHandle {
+    sink: Arc<dyn MeterSink>,
+    account: AccountId,
+}
+
+impl MeterSinkHandle {
+    /// Construct an account-scoped handle around a sink.
+    #[must_use]
+    pub fn new(sink: Arc<dyn MeterSink>, account: AccountId) -> Self {
+        Self { sink, account }
+    }
+
+    /// Construct a handle backed by the process-wide
+    /// `BandwidthMeter` on `Net`. Convenience for raw-socket
+    /// transports that already have a `Net` reference.
+    #[must_use]
+    pub fn from_meter(meter: Arc<BandwidthMeter>, account: AccountId) -> Self {
+        Self {
+            sink: meter as Arc<dyn MeterSink>,
+            account,
+        }
+    }
+
+    /// Account this handle is scoped to.
+    #[must_use]
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+
+    /// Record `n` inbound bytes against the scoped account.
+    pub fn record_bytes_in(&self, n: u64) {
+        self.sink.record_bytes_in(&self.account, n);
+    }
+
+    /// Record `n` outbound bytes against the scoped account.
+    pub fn record_bytes_out(&self, n: u64) {
+        self.sink.record_bytes_out(&self.account, n);
+    }
+}
+
+impl std::fmt::Debug for MeterSinkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeterSinkHandle")
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
 }

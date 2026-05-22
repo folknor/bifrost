@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::auth::DEFAULT_TOKEN_MAX_AGE;
+use crate::redirect::{FollowRedirects, RedirectPolicy};
 
 /// Tunable parameters for the underlying reqwest client. Hidden behind
 /// an explicit config struct so future migrations off reqwest can
@@ -31,10 +32,14 @@ pub struct NetConfig {
     /// Test-fixture escape hatch. Production callers must never set
     /// this true.
     pub dangerous_accept_invalid_certs: bool,
-    /// Whether the underlying HTTP client follows redirects
-    /// automatically. Protocols that need a tighter redirect policy
-    /// can disable this and handle 3xx responses themselves.
-    pub follow_redirects: bool,
+    /// Method-aware HTTP redirect policy applied by `bifrost-net`'s
+    /// own redirect loop. The underlying `reqwest` client's redirect
+    /// policy is set to `redirect::Policy::none()` in every config -
+    /// `bifrost-net` owns the loop so RFC 7231 §6.4 method
+    /// rewriting, the trusted-host allowlist, and `Authorization`-
+    /// stripping on cross-host hops happen exactly once and the same
+    /// way for every HTTP protocol crate.
+    pub follow_redirects: FollowRedirects,
     /// Proactive-refresh max-age for OAuth tokens that lack an
     /// `expires_at` hint. The `OAuthRefresher` falls back to this
     /// when the issuer did not surface a TTL. Defaults to 55 min;
@@ -54,7 +59,7 @@ impl Default for NetConfig {
             user_agent: format!("bifrost-net/{}", env!("CARGO_PKG_VERSION")),
             root_certs: Vec::new(),
             dangerous_accept_invalid_certs: false,
-            follow_redirects: true,
+            follow_redirects: FollowRedirects::default_on(),
             token_max_age: DEFAULT_TOKEN_MAX_AGE,
         }
     }
@@ -72,6 +77,30 @@ impl NetConfig {
     #[must_use]
     pub fn with_root_cert(mut self, cert: native_tls::Certificate) -> Self {
         self.root_certs.push(cert);
+        self
+    }
+
+    /// Replace the redirect policy. Builder-style; returns `self`.
+    ///
+    /// Pass `FollowRedirects::Disabled` to turn redirect-following
+    /// off entirely (3xx responses surface as terminal statuses). Pass
+    /// `FollowRedirects::Enabled(RedirectPolicy { .. })` to configure
+    /// the trusted-host allowlist and max hop count; the default
+    /// constructed by `NetConfig::default()` is
+    /// `FollowRedirects::default_on()` (no allowlist, ten hops).
+    #[must_use]
+    pub fn follow_redirects(mut self, policy: FollowRedirects) -> Self {
+        self.follow_redirects = policy;
+        self
+    }
+
+    /// Replace the redirect policy with an `Enabled` variant carrying
+    /// the supplied policy. Shorthand for the common case of
+    /// configuring the allowlist and hop count without naming the
+    /// outer enum.
+    #[must_use]
+    pub fn with_redirect_policy(mut self, policy: RedirectPolicy) -> Self {
+        self.follow_redirects = FollowRedirects::Enabled(policy);
         self
     }
 }

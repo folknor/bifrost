@@ -20,13 +20,14 @@ pub mod config;
 pub mod error;
 pub mod net;
 pub mod rate;
+pub mod redirect;
 pub mod request;
 pub mod retry;
 pub(crate) mod trace;
 pub mod url;
 
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
-pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink};
+pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // Shared identity / priority / byte-range / future-alias types live
 // in bifrost-types so the engine, the protocol crates, and this
 // crate all speak the same language. Re-exported here for ergonomic
@@ -36,5 +37,6 @@ pub use config::NetConfig;
 pub use error::Error;
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
+pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};
 pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse};
 pub use retry::RetryPolicy;

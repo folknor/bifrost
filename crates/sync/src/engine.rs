@@ -162,7 +162,8 @@ impl SyncEngine {
     /// Attach an account to the engine.
     ///
     /// Flow per `bifrost-sync.md` -> attach:
-    /// 1. Call `factory.open()` to obtain the first `Arc<dyn Account>`.
+    /// 1. Call `factory.open(account_id)` to obtain the first
+    ///    `Arc<dyn Account>`.
     /// 2. Read `capabilities()` and stash on the slot.
     /// 3. For each scope from `discover_cursor_scopes()`, call
     ///    `establish_initial_cursor(scope)` and react accordingly.
@@ -198,7 +199,10 @@ impl SyncEngine {
         account_id: AccountId,
         factory: Arc<dyn AccountFactory>,
     ) -> Result<SyncControl, Error> {
-        let opened = factory.open().await.map_err(Error::OpenFailed)?;
+        let opened = factory
+            .open(account_id.clone())
+            .await
+            .map_err(Error::OpenFailed)?;
         let capabilities: AccountCapabilities = opened.capabilities().clone();
 
         let cursors = Arc::new(CursorRegistry::new());
@@ -710,7 +714,11 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let next = slot.factory.open().await.map_err(Error::OpenFailed)?;
+        let next = slot
+            .factory
+            .open(account_id.clone())
+            .await
+            .map_err(Error::OpenFailed)?;
         next.as_ref().set_priority(slot.control.priority_snapshot());
         next.as_ref()
             .set_bandwidth_cap(slot.control.bandwidth_cap_snapshot());
@@ -1515,7 +1523,7 @@ async fn handle_recovery(
             }
         }
         RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
-            match factory.open().await {
+            match factory.open(account_id.clone()).await {
                 Ok(next) => {
                     next.as_ref().set_priority(control.priority_snapshot());
                     next.as_ref()

@@ -19,6 +19,7 @@ use serde::Serialize;
 use crate::auth::AccessToken;
 use crate::error::Error;
 use crate::net::{AccountNet, into_byte_stream, wrap_metered};
+use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
 
 /// Erased byte-chunk stream, as returned by `AccountNet::download_stream`.
@@ -302,6 +303,16 @@ pub(crate) struct InternalStreaming {
 /// outer wrappers add metering. Used by `RequestBuilder::send` (which
 /// drains the body afterwards) and `RequestBuilder::send_streaming`
 /// (which exposes the stream).
+///
+/// The function also walks 3xx redirect chains under the configured
+/// `FollowRedirects` policy. Redirect classification calls
+/// `redirect::classify_redirect` which enforces RFC 7231 §6.4 method
+/// rewriting, the trusted-host allowlist, and `Authorization` stripping
+/// on cross-host hops; this function then rebuilds the request from
+/// the resulting `RedirectStep` and re-enters the retry loop with the
+/// rewritten state. Each redirect step counts as zero retries (it is
+/// a fresh logical request) but counts as one hop against
+/// `RedirectPolicy::max_hops`.
 pub(crate) async fn send_streaming_inner(
     builder: RequestBuilder,
 ) -> Result<InternalStreaming, Error> {
@@ -327,18 +338,18 @@ pub(crate) async fn send_streaming_inner(
     }
 
     let policy = retry.unwrap_or_else(|| account.default_retry().clone());
-    let host = host_from_url(&url);
-    // Cost precedence: explicit `RequestBuilder::cost(n)` wins;
-    // otherwise the registered host's `cost_default` wins; otherwise
-    // `1`. The host lookup is one mutex acquire on the governor, done
-    // once per request before the retry loop.
-    let cost_units = match cost {
-        Some(n) => n,
-        None => host
-            .as_deref()
-            .and_then(|h| account.net().governor().cost_default_for(h))
-            .unwrap_or(1),
-    };
+    let redirect_policy = account.net().config().follow_redirects.clone();
+    // Per-request method, URL, body, headers, host, cost. These
+    // change across redirect hops: 301/302/303 rewrite to GET and
+    // drop the body, 307/308 preserve, and a cross-host hop changes
+    // the host bucket the rate-limit governor uses.
+    let mut method = method;
+    let mut url = url;
+    let mut body = body;
+    let mut headers = headers;
+    let mut auth_for_next_hop = bearer_auth;
+    let mut host = host_from_url(&url);
+    let mut cost_units = recompute_cost_units(account.net().governor(), host.as_deref(), cost);
 
     let mut attempt: u32 = 0;
     let mut retry_after_history: Vec<Duration> = Vec::new();
@@ -349,6 +360,10 @@ pub(crate) async fn send_streaming_inner(
     // 1; the second 401 returns `Error::AuthLost`.
     let mut auth_retries: u32 = 0;
     const MAX_AUTH_RETRIES: u32 = 1;
+    // Redirect hop count. Each redirect hop is a fresh logical
+    // request - retry-budget zero, auth-budget zero, but one tick
+    // against the configured `RedirectPolicy::max_hops`.
+    let mut redirect_hops: u8 = 0;
 
     'outer: loop {
         attempt = attempt.saturating_add(1);
@@ -372,7 +387,7 @@ pub(crate) async fn send_streaming_inner(
         // else. We pass the variant through unchanged so callers can
         // pattern-match for retry-vs-give-up decisions; collapsing
         // every variant into `AuthLost` would discard that signal.
-        let token = if bearer_auth {
+        let token = if auth_for_next_hop {
             match account.token_source().current().await {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -455,7 +470,7 @@ pub(crate) async fn send_streaming_inner(
         // retry budget (`attempt`): the retry loop's top
         // `attempt = attempt + 1` increment is undone here so a 401
         // recovery does not eat into the network attempts left.
-        if bearer_auth && status == StatusCode::UNAUTHORIZED {
+        if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
             if auth_retries >= MAX_AUTH_RETRIES {
                 drop(response);
                 return Err(Error::AuthLost);
@@ -475,18 +490,12 @@ pub(crate) async fn send_streaming_inner(
             continue 'outer;
         }
 
-        // 2xx and 3xx: return.
-        //
-        // 3xx note: reqwest's default `RedirectPolicy` follows up to
-        // 10 hops, so a 3xx surfacing here means either the policy
-        // was disabled by the caller, the chain exceeded the
-        // 10-redirect limit, or the server returned a 3xx that
-        // reqwest considers terminal (e.g. 304 Not Modified). We
-        // pass it through to the caller because conditional-request
-        // flows (`If-None-Match` -> 304) rely on the headers being
-        // exposed. Callers that do not handle 3xx can downgrade to
-        // `Error::Status` themselves.
-        if status.is_success() || status.is_redirection() {
+        // 2xx: return directly. 3xx: classify against the redirect
+        // policy. The classifier yields `PassThrough` for non-followed
+        // 3xx (304 Not Modified, 305, 306) so conditional-request
+        // flows (`If-None-Match` -> 304) and protocol-specific
+        // surfaces (Graph's 304 on `$delta`) keep working.
+        if status.is_success() {
             let headers_out = response.headers().clone();
             let stream = into_byte_stream(response);
             return Ok(InternalStreaming {
@@ -495,6 +504,97 @@ pub(crate) async fn send_streaming_inner(
                 body: stream,
                 account,
             });
+        }
+
+        if status.is_redirection() {
+            let resp_headers = response.headers().clone();
+            // Do not refund the rate-limit slot at this point: a 3xx
+            // is a real server response. The refund happens only on
+            // the `RedirectAction::Follow` path below, where the
+            // next hop will issue a fresh request that should debit
+            // anew.
+            let active_policy: Option<&RedirectPolicy> = match &redirect_policy {
+                FollowRedirects::Disabled => None,
+                FollowRedirects::Enabled(p) => Some(p),
+            };
+            match active_policy {
+                None => {
+                    // Pass 3xx through to the caller exactly as the
+                    // original implementation did. Caller code
+                    // (conditional GET, 304 handling) reads the
+                    // status + headers.
+                    let stream = into_byte_stream(response);
+                    return Ok(InternalStreaming {
+                        status,
+                        headers: resp_headers,
+                        body: stream,
+                        account,
+                    });
+                }
+                Some(policy) => {
+                    drop(response);
+                    let parsed_url = reqwest::Url::parse(&url).map_err(|e| Error::Network {
+                        message: format!("could not re-parse request URL for redirect: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+                    match classify_redirect(policy, &method, &parsed_url, status, &resp_headers)? {
+                        RedirectAction::PassThrough => {
+                            // Build an empty byte stream so downstream
+                            // unwrap paths (e.g. send().drain) still
+                            // work; 304/305/306 carry no body the
+                            // caller cares about.
+                            let empty: futures::stream::Empty<Result<Bytes, Error>> =
+                                futures::stream::empty();
+                            return Ok(InternalStreaming {
+                                status,
+                                headers: resp_headers,
+                                body: Box::pin(empty),
+                                account,
+                            });
+                        }
+                        RedirectAction::Follow(step) => {
+                            redirect_hops = redirect_hops.saturating_add(1);
+                            if redirect_hops > policy.max_hops {
+                                return Err(Error::RedirectLoop {
+                                    hops: redirect_hops,
+                                });
+                            }
+                            // The next hop will issue a fresh request
+                            // and debit anew, so refund the slot the
+                            // 3xx debited. Otherwise a 10-hop chain
+                            // would burn 10 units instead of one.
+                            if let Some(ref h) = host {
+                                account.net().governor().refund(h, cost_units);
+                            }
+                            method = step.next_method;
+                            url = step.next_url;
+                            if !step.preserve_body {
+                                body = None;
+                                // RFC 7231 §6.4 also drops content-
+                                // describing headers when the body is
+                                // dropped, otherwise the next hop
+                                // carries a content-type for a body
+                                // that no longer exists.
+                                strip_body_headers(&mut headers);
+                            }
+                            auth_for_next_hop = step.keep_auth && auth_for_next_hop;
+                            host = host_from_url(&url);
+                            cost_units = recompute_cost_units(
+                                account.net().governor(),
+                                host.as_deref(),
+                                cost,
+                            );
+                            // Reset retry counter for the next hop:
+                            // a redirect is a fresh logical request,
+                            // its retries should not eat into the
+                            // budget of the prior hop.
+                            attempt = 0;
+                            auth_retries = 0;
+                            continue 'outer;
+                        }
+                    }
+                }
+            }
         }
 
         // 4xx that the policy does not call retryable: terminal.
@@ -626,6 +726,32 @@ fn host_from_url(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
+}
+
+/// Resolve the rate-limit cost units for `host`, honoring the
+/// per-request override `cost_override` when present and falling
+/// back to the governor's registered host default. Used at request
+/// start and recomputed on every redirect hop because a cross-host
+/// hop changes which host bucket the request debits against.
+fn recompute_cost_units(
+    governor: &crate::rate::RateLimitGovernor,
+    host: Option<&str>,
+    cost_override: Option<u32>,
+) -> u32 {
+    match cost_override {
+        Some(n) => n,
+        None => host.and_then(|h| governor.cost_default_for(h)).unwrap_or(1),
+    }
+}
+
+/// Strip body-describing headers after a redirect demands the body
+/// be dropped (RFC 7231 §6.4 method rewrite to GET). Without this,
+/// the next hop carries `Content-Type` / `Content-Length` /
+/// `Content-Encoding` for a body that no longer exists.
+fn strip_body_headers(headers: &mut HeaderMap) {
+    headers.remove(reqwest::header::CONTENT_TYPE);
+    headers.remove(reqwest::header::CONTENT_LENGTH);
+    headers.remove(reqwest::header::CONTENT_ENCODING);
 }
 
 /// Exponential backoff with jitter. The base doubles per attempt,

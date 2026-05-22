@@ -201,4 +201,23 @@ pub enum Error {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
+
+    /// Server attempted to redirect to a host outside the configured
+    /// `RedirectPolicy::trusted_hosts` allowlist. Returned by the
+    /// `bifrost-net` redirect loop before any further request is
+    /// issued.
+    #[error("redirect rejected: {message}")]
+    RedirectRejected {
+        /// Description of why the redirect was rejected.
+        message: String,
+    },
+
+    /// Redirect chain exceeded `RedirectPolicy::max_hops`. The
+    /// `bifrost-net` redirect loop surfaces this rather than spin
+    /// indefinitely.
+    #[error("redirect loop: {hops} hops exceeded the configured maximum")]
+    RedirectLoop {
+        /// Hops walked before the loop was aborted.
+        hops: u8,
+    },
 }

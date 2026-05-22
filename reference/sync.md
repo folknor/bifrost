@@ -71,7 +71,10 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    `Error::AccountAlreadyAttached`. The guard is released on both
    success and failure paths so a failed `attach_inner` does not
    strand the slot.
-2. `factory.open().await` -> `Arc<dyn Account>`.
+2. `factory.open(account_id).await` -> `Arc<dyn Account>`. The
+   engine threads its own `AccountId` through so the protocol crate
+   can register against `bifrost-net` / `MeterSink` / trace
+   correlation under the same key the engine knows the account by.
 3. Read `capabilities()` (snapshotted on the slot).
 4. `discover_cursor_scopes()` -> for each, `establish_initial_cursor(scope)`:
    - `Ready(cursor)`: persist, start `changes_stream` immediately.
@@ -101,7 +104,7 @@ cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
 `reopen` (driven by `RecoveryClass::RestartAccount` or
-`CapabilityChanged`) calls `factory.open()` again and
+`CapabilityChanged`) calls `factory.open(account_id)` again and
 `slot.current.store(Arc::new(next))` after reapplying the
 priority and bandwidth-cap snapshots. Spawned tasks pick up the
 new handle on their next `load_full()`.

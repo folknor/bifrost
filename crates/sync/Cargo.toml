@@ -28,8 +28,13 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 arc-swap = { workspace = true }
 
-[dev-dependencies]
-bifrost-imap = { path = "../imap" }
-bifrost-jmap = { path = "../jmap", features = ["sync"] }
-bifrost-gmail = { path = "../gmail" }
-bifrost-graph = { path = "../graph" }
+# Protocol-crate dev-deps will return in S1-W2 once the protocol
+# `Account` impls have caught up with the new trait surface. During
+# S1-W1 they are gone so `crates/sync/tests/cross_crate_conformance.rs`
+# can compile against the trait-only stub.
+#
+# [dev-dependencies]
+# bifrost-imap = { path = "../imap" }
+# bifrost-jmap = { path = "../jmap", features = ["sync"] }
+# bifrost-gmail = { path = "../gmail" }
+# bifrost-graph = { path = "../graph" }

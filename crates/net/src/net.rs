@@ -84,9 +84,13 @@ impl Net {
             .user_agent(&config.user_agent)
             .danger_accept_invalid_certs(config.dangerous_accept_invalid_certs);
 
-        if !config.follow_redirects {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
+        // bifrost-net owns the redirect loop unconditionally. Reqwest's
+        // default policy follows 3xx but without RFC 7231 method
+        // rewriting or a trusted-host allowlist; our loop in
+        // `redirect.rs` plus `request.rs::send_streaming_inner` enforces
+        // both. Installing `Policy::none()` here is the only handoff
+        // point - everything else is bifrost-net code.
+        builder = builder.redirect(reqwest::redirect::Policy::none());
 
         for cert in &config.root_certs {
             // `native_tls::Certificate` -> `reqwest::Certificate` via

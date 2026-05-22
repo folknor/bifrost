@@ -214,7 +214,14 @@ response body reader, both buffered and streaming.
 
 `MeterSink` trait lets IMAP/SMTP (which bypass this crate's
 transport) feed `record_bytes_in` / `record_bytes_out` into the
-same meter when the engine wires them.
+same meter when the engine wires them. `MeterSinkHandle` is the
+account-scoped adapter raw-socket transports compose around a
+`MeterSink`: it owns the `AccountId` so the connection-level call
+site does not have to thread the id alongside every byte count.
+`MeterSinkHandle::from_meter` wraps the process-wide
+`BandwidthMeter` directly; the trait-object form
+`MeterSinkHandle::new` accepts any `Arc<dyn MeterSink>` for test
+doubles. Wiring against IMAP / SMTP lands in S1-W2.
 
 ### Bandwidth cap
 
@@ -270,13 +277,46 @@ known total, which silently admitted truncated bodies.
 one `native_tls::Certificate` onto `root_certs` and returns `self`
 so callers can chain.
 
-`NetConfig::follow_redirects` (default `true`) toggles the
-underlying `reqwest::redirect::Policy`. When set to `false`,
-`Net::new` installs `redirect::Policy::none()` so the HTTP client
-does not chase 3xx responses; protocols that need a tighter redirect
-policy (JMAP strips bearer credentials across cross-host hops
-itself, for example) disable this and walk the chain in their own
-code.
+`NetConfig::follow_redirects` is a `FollowRedirects` enum with two
+variants: `Disabled` and `Enabled(RedirectPolicy)`. The default is
+`Enabled` with an empty trusted-host allowlist and a ten-hop maximum.
+Regardless of the variant, `Net::new` always installs
+`reqwest::redirect::Policy::none()` on the underlying HTTP client -
+`bifrost-net` owns the redirect loop unconditionally so RFC 7231
+§6.4 method rewriting, the trusted-host allowlist, and
+`Authorization`-stripping on cross-host hops happen exactly once
+and the same way for every HTTP protocol crate.
+
+### Redirect loop (`redirect.rs`)
+
+Inside `send_streaming_inner` the retry loop classifies every 3xx
+response through `classify_redirect`:
+
+- 304 / 305 / 306: `PassThrough`. Status + headers surface to the
+  caller; conditional-request flows (`If-None-Match` -> 304,
+  Graph's 304 on `$delta`) keep working.
+- 301 / 302: rewrite to GET and drop the body when the prior method
+  is not safe (POST / PUT / DELETE / PATCH); preserve method + body
+  for GET / HEAD.
+- 303 See Other: rewrite to GET and drop the body unconditionally.
+- 307 / 308: preserve method and body.
+
+`RedirectPolicy::trusted_hosts` is an allowlist for cross-host hops:
+empty means every host is acceptable; populated means only matching
+hosts are admitted (case-insensitive host comparison per RFC 3986
+§3.2.2) and `Error::RedirectRejected` is returned otherwise.
+`Authorization` headers are stripped on every cross-host hop
+regardless of allowlist membership, so a bearer token never travels
+to a host the original request did not target. `max_hops` (default
+10) caps the chain; `Error::RedirectLoop` surfaces past it. Each
+redirect hop resets the retry counter to 0 - hops are fresh logical
+requests, not retries.
+
+`FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
+to the caller exactly as it did before the loop landed. The
+`NetConfig::follow_redirects(policy)` and
+`NetConfig::with_redirect_policy(RedirectPolicy)` builder helpers
+let callers configure the policy without naming the outer enum.
 
 `Net::new` returns `Result<Net, Error::NetSetup>` on bad TLS
 config; consumer-supplied data is a runtime condition, not a
@@ -320,6 +360,10 @@ variants:
   way `EncodeBody` is, so the fluent setter stays chainable.
 - `RangeNotHonored { message }` - server returned non-206 or
   mismatched `Content-Range` to a Range request.
+- `RedirectRejected { message }` - 3xx target host fell outside
+  the configured `RedirectPolicy::trusted_hosts` allowlist.
+- `RedirectLoop { hops }` - redirect chain exceeded
+  `RedirectPolicy::max_hops`.
 - `NetSetup { message, source }` - `Net::new` construction
   failure.
 
@@ -345,16 +389,20 @@ whole workspace.
 crates/net/src/
   lib.rs          // re-exports; AccountFuture/AccountId/Priority/
                   // ByteRange from bifrost-types
-  config.rs       // NetConfig + with_root_cert
+  config.rs       // NetConfig + with_root_cert + follow_redirects
   net.rs          // Net + AccountNet; shared_default; attach/detach;
                   // download_stream
   request.rs      // RequestBuilder + Response/StreamingResponse;
-                  // retry loop
+                  // retry loop + method-aware redirect walk
+  redirect.rs     // FollowRedirects + RedirectPolicy + classify_redirect
+                  // (RFC 7231 §6.4 method rewriting, trusted-host
+                  //  allowlist, Authorization stripping)
   auth.rs         // TokenSource + OAuthRefresher state machine +
                   // StaticTokenSource
   retry.rs        // RetryPolicy
   rate.rs         // RateLimitGovernor + HostBucket
-  bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink
+  bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink +
+                  // MeterSinkHandle
   error.rs        // Error + cap_status_body
   trace.rs        // traceparent injection (current: uuid trace id)
   url.rs          // encode_component for URL path/query segments
