@@ -46,7 +46,7 @@ tokio-native-tls = { workspace = true, optional = true }
 
 sha2 = { workspace = true, features = ["oid"], optional = true }
 rsa = { version = "0.10.0-rc.18", optional = true }
-ed25519-dalek = { version = "2", optional = true }
+ed25519-compact = { version = "2", optional = true }
 
 [dev-dependencies]
 tracing = { workspace = true, features = ["std"] }
@@ -67,7 +67,7 @@ tokio = [
     "dep:tokio-native-tls",
 ]
 
-dkim = ["dep:sha2", "dep:rsa", "dep:ed25519-dalek"]
+dkim = ["dep:sha2", "dep:rsa", "dep:ed25519-compact"]
 
 [package.metadata.docs.rs]
 all-features = true

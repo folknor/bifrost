@@ -5,7 +5,7 @@ use std::{
     time::SystemTime,
 };
 
-use ed25519_dalek::Signer;
+use ed25519_compact::{KeyPair, Seed};
 use rsa::{RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::Pkcs1v15Sign};
 use sha2::{Digest, Sha256};
 
@@ -79,7 +79,7 @@ pub struct DkimSigningKeyError(InnerDkimSigningKeyError);
 enum InnerDkimSigningKeyError {
     Base64(base64::DecodeError),
     Rsa(rsa::pkcs1::Error),
-    Ed25519(ed25519_dalek::ed25519::Error),
+    Ed25519(ed25519_compact::Error),
 }
 
 impl Display for DkimSigningKeyError {
@@ -109,7 +109,7 @@ pub struct DkimSigningKey(InnerDkimSigningKey);
 #[derive(Debug)]
 enum InnerDkimSigningKey {
     Rsa(RsaPrivateKey),
-    Ed25519(ed25519_dalek::SigningKey),
+    Ed25519(KeyPair),
 }
 
 impl From<RsaPrivateKey> for DkimSigningKey {
@@ -118,8 +118,8 @@ impl From<RsaPrivateKey> for DkimSigningKey {
     }
 }
 
-impl From<ed25519_dalek::SigningKey> for DkimSigningKey {
-    fn from(value: ed25519_dalek::SigningKey) -> Self {
+impl From<KeyPair> for DkimSigningKey {
+    fn from(value: KeyPair) -> Self {
         Self(InnerDkimSigningKey::Ed25519(value))
     }
 }
@@ -135,16 +135,15 @@ impl DkimSigningKey {
                     .map_err(|err| DkimSigningKeyError(InnerDkimSigningKeyError::Rsa(err)))?,
             ),
             DkimSigningAlgorithm::Ed25519 => {
-                InnerDkimSigningKey::Ed25519(ed25519_dalek::SigningKey::from_bytes(
-                    &crate::base64::decode(private_key)
-                        .map_err(|err| DkimSigningKeyError(InnerDkimSigningKeyError::Base64(err)))?
-                        .try_into()
-                        .map_err(|_| {
-                            DkimSigningKeyError(InnerDkimSigningKeyError::Ed25519(
-                                ed25519_dalek::ed25519::Error::new(),
-                            ))
-                        })?,
-                ))
+                let seed_bytes: [u8; 32] = crate::base64::decode(private_key)
+                    .map_err(|err| DkimSigningKeyError(InnerDkimSigningKeyError::Base64(err)))?
+                    .try_into()
+                    .map_err(|_| {
+                        DkimSigningKeyError(InnerDkimSigningKeyError::Ed25519(
+                            ed25519_compact::Error::InvalidSeed,
+                        ))
+                    })?;
+                InnerDkimSigningKey::Ed25519(KeyPair::from_seed(Seed::new(seed_bytes)))
             }
         }))
     }
@@ -407,8 +406,8 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
                 .sign(Pkcs1v15Sign::new::<Sha256>(), &hashed_headers)
                 .unwrap(),
         ),
-        InnerDkimSigningKey::Ed25519(private_key) => {
-            crate::base64::encode(private_key.sign(&hashed_headers).to_bytes())
+        InnerDkimSigningKey::Ed25519(keypair) => {
+            crate::base64::encode(keypair.sk.sign(hashed_headers, None).as_ref())
         }
     };
     let dkim_header = dkim_header_format(
@@ -434,7 +433,8 @@ mod test {
             header::{HeaderName, HeaderValue},
         },
         DkimCanonicalization, DkimCanonicalizationType, DkimConfig, DkimSigningAlgorithm,
-        DkimSigningKey, dkim_canonicalize_body, dkim_canonicalize_headers, dkim_sign_fixed_time,
+        DkimSigningKey, KeyPair, Seed, dkim_canonicalize_body, dkim_canonicalize_headers,
+        dkim_sign_fixed_time,
     };
     use crate::StdError;
 
@@ -562,7 +562,7 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
 
     #[test]
     fn signing_key_can_wrap_ed25519_key_object() {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let key = KeyPair::from_seed(Seed::new([42; 32]));
         let signing_key = DkimSigningKey::from(key);
 
         assert!(matches!(
