@@ -131,8 +131,10 @@ pub(crate) fn scope_lifecycle(
                     let destroyed = response.destroyed().to_vec();
                     set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
 
-                    if !created.is_empty() || !updated.is_empty() {
-                        if let Ok(fetched) = fetch_mailboxes(&mail, created.iter().chain(&updated)).await {
+                    if (!created.is_empty() || !updated.is_empty())
+                        && let Ok(fetched) =
+                            fetch_mailboxes(&mail, created.iter().chain(&updated)).await
+                    {
                             for mailbox in fetched {
                                 let id = mailbox.id().map(ToString::to_string);
                                 let name = mailbox.name().unwrap_or("").to_string();
@@ -167,7 +169,6 @@ pub(crate) fn scope_lifecycle(
                                 }
                             }
                         }
-                    }
 
                     for destroyed_id in destroyed {
                         let id = destroyed_id.into_string();

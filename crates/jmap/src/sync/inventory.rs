@@ -6,7 +6,7 @@ use bifrost_types::{
 };
 
 use crate::core::query;
-use crate::email::{Email, EmailGet, EmailId, EmailQuery, Property as EmailProperty};
+use crate::email::{Email, EmailGet, EmailQuery, Property as EmailProperty};
 use crate::mailbox::{Mailbox, MailboxGet, Property as MailboxProperty};
 use crate::transport_reqwest::ReqwestTransport;
 

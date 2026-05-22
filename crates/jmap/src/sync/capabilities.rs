@@ -34,7 +34,7 @@ pub(crate) fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimit
         .websocket_capabilities()
         .is_some_and(crate::core::session::WebSocketCapabilities::supports_push);
 
-    let max_items = core.max_objects_in_set().min(500).max(1);
+    let max_items = core.max_objects_in_set().clamp(1, 500);
     let caps = AccountCapabilities {
         cursor_freshness: CursorFreshness::ServerIssued,
         // The existing JMAP transport exposes whole-blob downloads only.

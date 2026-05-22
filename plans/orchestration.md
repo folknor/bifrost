@@ -72,14 +72,21 @@ rationale is not obvious from the code alone.
     WebSocket push, blob fetch, mutations, and error mapping
     onto the recovery taxonomy. Unit tests cover cursor
     round-trip, capability building, and error classification.
-  - **P2-A2** (`crates/imap/` Account impl): partial. Bounded
-    streaming FETCH backpressure rework landed; `ImapAccount` +
-    `ImapAccountFactory` wired with pool, registry, cursor
-    envelope, capabilities, inventory, changes, get, blob,
-    mutation, push, and close submodules. CONDSTORE/QRESYNC
-    integration intentionally deferred: mutation concurrency is
-    advertised as `None` and no STORE UNCHANGEDSINCE capability
-    is claimed.
+  - **P2-A2** (`crates/imap/` Account impl): shipped.
+    `ImapAccount` + `ImapAccountFactory` wired with pool,
+    registry, cursor envelope, capabilities, inventory, changes,
+    get, blob, mutation, push, and close submodules. QRESYNC
+    negotiation (with iCloud server-ID downgrade, parse-failure
+    session disable, and known-UID baseline seeding via
+    `UID SEARCH ALL`), CONDSTORE-only fallback, per-folder
+    UIDVALIDITY-scoped modseq cache, and opportunistic
+    `STORE UNCHANGEDSINCE` in flag and destroy mutations all
+    landed. Mutation concurrency is still advertised as
+    `MutationConcurrency::None`: the modseq cache is
+    opportunistic and may be cold, so promoting to `StateBased`
+    would let the engine assume UNCHANGEDSINCE is always wired
+    up when it is not. The engine's read-back-after-retry path
+    remains the lost-update safety net.
   - **P2-A3** (`crates/gmail/` Account impl): shipped.
     `GmailAccount` + `GmailAccountFactory` with cached
     `getProfile` historyId seed, history-based changes,
@@ -100,11 +107,6 @@ remain alongside them.
 
 ## Outstanding work
 
-- **Close P2-A2: CONDSTORE/QRESYNC.** Implement
-  `STORE UNCHANGEDSINCE` and the QRESYNC resync path in
-  `crates/imap/`, then flip IMAP's advertised mutation
-  concurrency from `None` to the appropriate non-`None` value.
-  Spec lives in `plans/imap/condstore-qresync.md`.
 - **Phase 3: Reconcile and validate.** Round out per-protocol
   conformance tests, add a minimal cross-crate conformance
   assertion in `bifrost-sync`, write `reference/{jmap,imap,
@@ -132,12 +134,14 @@ account-layer code in the reference docs.
 
 ### Sequencing
 
-CONDSTORE/QRESYNC runs first. Phase 3's IMAP touchpoints
-(`reference/imap.md`, IMAP conformance tests) need a stable
-mutation-concurrency surface; rewriting them after the flip is
-wasteful. Phase 3's gmail / jmap / graph / `bifrost-sync` work
-can proceed once CONDSTORE/QRESYNC merges - or in parallel from
-the start, owning files outside `crates/imap/`.
+CONDSTORE/QRESYNC has merged (P3-A0). `reference/imap.md` has
+been refreshed with the account-layer architecture, the
+QRESYNC / CONDSTORE / Basic cursor strategy, the modseq cache,
+and the rationale for keeping `MutationConcurrency::None`. The
+remaining Phase 3 work (jmap / gmail / graph reference docs,
+conformance test fill-in, cross-crate assertion in
+`bifrost-sync`, and the workspace-wide `brokkr check` cleanup)
+can proceed in parallel.
 
 ### Test scope
 
@@ -179,25 +183,28 @@ Each new `reference/{jmap,imap,gmail,graph}.md` covers:
 - Error mapping to the recovery taxonomy
 - Known limitations (e.g., Gmail blob ranges unsupported,
   Graph discovery limited to mail, IMAP mutation concurrency
-  pending CONDSTORE)
+  intentionally still `None` because the modseq cache is
+  opportunistic)
 
 ### File ownership
 
-Five agents, disjoint ownership. CONDSTORE/QRESYNC ships first;
-the other four launch after.
+Four remaining agents, disjoint ownership. P3-A0 and P3-A2 are
+already merged; P3-A1, P3-A3, P3-A4 and the orchestrator
+cross-crate work can launch in parallel.
 
-- **P3-A0 (CONDSTORE/QRESYNC)**: `crates/imap/src/account/
-  {capabilities,changes,mutate}.rs`,
-  `crates/imap/src/connection/dispatch.rs`, and whichever
-  connection-layer files the spec in
-  `plans/imap/condstore-qresync.md` names. May add new files in
-  `crates/imap/src/connection/`. Does not touch
-  `reference/imap.md`.
+- **P3-A0 (CONDSTORE/QRESYNC)**: merged. Code lives across
+  `crates/imap/src/account/{factory,capabilities,changes,
+  folder_registry,inventory,mutate,push,get,blob,mod,pool}.rs`.
+  Mutation concurrency stays `MutationConcurrency::None` by
+  design; see the P2-A2 note above.
 - **P3-A1 (jmap)**: `reference/jmap.md` (new) + jmap conformance
   test additions inside `crates/jmap/src/sync/` modules.
-- **P3-A2 (imap)**: `reference/imap.md` (new) + imap conformance
-  test additions inside `crates/imap/src/account/` modules.
-  Waits on P3-A0.
+- **P3-A2 (imap)**: merged. `reference/imap.md` describes the
+  account-layer architecture, the QRESYNC / CONDSTORE / Basic
+  cursor strategy, the modseq cache lifecycle, and the
+  mutation-concurrency rationale. Conformance test additions
+  inside `crates/imap/src/account/` modules are still
+  outstanding.
 - **P3-A3 (gmail)**: `reference/gmail.md` (new) + gmail
   conformance test additions inside `crates/gmail/src/account/`
   modules.
@@ -224,11 +231,14 @@ Orchestrator work, not agent work. Scope:
 
 Phase 3 is done when all of these hold:
 
-- CONDSTORE/QRESYNC merged; IMAP advertises non-`None` mutation
-  concurrency and the `STORE UNCHANGEDSINCE` path is wired into
-  the mutation pipeline.
+- CONDSTORE/QRESYNC merged (done). `STORE UNCHANGEDSINCE` is
+  wired into the IMAP mutation pipeline opportunistically;
+  mutation concurrency stays `MutationConcurrency::None` by
+  design because the modseq cache is cold-startable. Any future
+  flip to `StateBased` would need a separate plan.
 - All four `reference/{jmap,imap,gmail,graph}.md` files exist
-  and match the section list above.
+  and match the section list above. `reference/imap.md` is
+  done; `jmap`, `gmail`, `graph` are still outstanding.
 - Per-protocol conformance tests cover cursor envelope round-
   trip, capability shape, error classification, and scope-to-
   method wiring for each crate.

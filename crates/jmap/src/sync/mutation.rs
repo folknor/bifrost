@@ -74,10 +74,11 @@ fn mutation_stream(
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<MutationResult>> {
     Box::pin(async_stream::stream! {
-        let mut batch = Vec::with_capacity(limits.max_objects_in_set.min(500).max(1));
+        let batch_size = limits.max_objects_in_set.clamp(1, 500);
+        let mut batch = Vec::with_capacity(batch_size);
         while let Some(target) = targets.next().await {
             batch.push(target);
-            if batch.len() >= limits.max_objects_in_set.min(500).max(1) {
+            if batch.len() >= batch_size {
                 match apply_batch(&mail, &email_state, &kind, &mut batch).await {
                     Ok(Some(out)) => yield SyncEvent::Batch(out),
                     Ok(None) => {}
@@ -112,7 +113,7 @@ async fn apply_batch(
 ) -> crate::Result<Option<Batch<MutationResult>>> {
     let started = Instant::now();
     let mut state = current_or_probe_state(mail, email_state).await?;
-    let ids = batch.drain(..).collect::<Vec<_>>();
+    let ids = std::mem::take(batch);
     if ids.is_empty() {
         return Ok(None);
     }

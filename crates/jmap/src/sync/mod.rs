@@ -19,6 +19,5 @@ pub mod push;
 pub mod state;
 
 pub use account::JmapAccount;
-pub use factory::{
-    JmapAccountFactory, JmapAccountFactoryBuilder, JmapCredentials, ReconnectPolicy,
-};
+pub use factory::{JmapAccountFactory, JmapAccountFactoryBuilder, JmapCredentials};
+pub use push::ReconnectPolicy;

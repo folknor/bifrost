@@ -78,9 +78,58 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 ## Sync helpers
 
-`SyncSelectOptions` / `SyncSelectResult` wrap SELECT/EXAMINE with CONDSTORE and QRESYNC parameters (UIDVALIDITY, last-known MODSEQ, known UIDs, VANISHED).
+`SyncSelectOptions` / `SyncSelectResult` wrap SELECT/EXAMINE with CONDSTORE and QRESYNC parameters (UIDVALIDITY, last-known MODSEQ, known UIDs, VANISHED parsed off the SELECT response).
 
-`SyncFetchRequest` / `SyncFetchResult` wrap FETCH with CHANGEDSINCE and VANISHED. `sync_fetch()` drives the call.
+`SyncFetchRequest` / `SyncFetchResult` wrap UID FETCH with `CHANGEDSINCE` and `VANISHED`. `sync_fetch()` drives the call and surfaces both VANISHED ranges and per-UID FETCH responses.
+
+`SelectedMailbox` carries `highest_mod_seq`, `uid_validity`, `uid_next`, `no_mod_seq`, and the SELECT-side VANISHED list. A missing `UIDVALIDITY` is a protocol error rather than a silent 0; a `MODSEQ 0` in a FETCH response is rejected for the same reason.
+
+## Account layer
+
+The shared `bifrost_types::Account` implementation lives under `crates/imap/src/account/`. `ImapAccount` and `ImapAccountFactory` open a connection pool, list folders, build capabilities, and back the trait methods.
+
+Submodules:
+
+- `factory.rs` - `ImapAccountConfig`, `ID` probe, QRESYNC negotiation, initial folder LIST.
+- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest.
+- `folder_registry.rs` - mailbox map plus per-folder cursor cache and per-folder MODSEQ cache (`record_modseq`, `modseq`, `clear_modseqs`). Cache is keyed by `(folder, uidvalidity, uid)` and clears on UIDVALIDITY change, delete, or rename.
+- `envelope.rs` - `FolderCursor` (QResync / Condstore / Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
+- `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group.
+
+### CONDSTORE / QRESYNC strategy
+
+`FolderCursor` has three variants and `changes_stream()` dispatches diff strategy by variant:
+
+- `QResync { uidvalidity, modseq, known_uids, known_uids_complete }`. Change diff uses `UID FETCH ... CHANGEDSINCE ... VANISHED` against the cached MODSEQ, plus SELECT-side VANISHED and changed-FETCH data.
+- `Condstore { uidvalidity, modseq, known_uids }`. Flag diff via `CHANGEDSINCE`; expunge detection via UID-list diff against `known_uids`.
+- `Basic { uidvalidity, uidnext, known_uids }`. Neither extension. UID-list diff for both flags and expunges.
+
+Negotiation in `factory.rs`:
+
+1. `ID` probe runs when advertised; failures are non-fatal. iCloud is preconfigured off via exact-match `name` checks against `"icloud"` / `"icloud imap"`; substring matches do not trip the downgrade.
+2. If `enable_qresync` and the server advertises QRESYNC, the factory runs `ENABLE QRESYNC`. The `ENABLED` reply must echo `QRESYNC` (or `ServerProfile::enabled` must confirm it); otherwise the session continues in CONDSTORE-only mode with a one-shot `OperatorAttentionNeeded` warning emitted on first changes-stream attach.
+3. The QRESYNC capability check is exact, not substring, to avoid false positives on capabilities that contain `QRESYNC` as a suffix.
+
+Runtime downgrades:
+
+- A QRESYNC SELECT response that fails to parse calls `disable_qresync_for_session()` (one-shot, no retry on the same session), discards the suspect pooled connection, and retries on the CONDSTORE path.
+- A QRESYNC cursor that lacks a complete UID baseline (`known_uids_complete == false`) seeds the baseline via `UID SEARCH ALL` before the first `CHANGEDSINCE` round-trip and emits a benign downgrade warning.
+- A CONDSTORE cursor with an incomplete baseline seeds the same way before the first UID-list diff.
+- VANISHED and FETCH may report the same UID in non-conformant servers. The change stream de-duplicates so a single message does not surface as both expunge and update.
+
+### Mutations
+
+`bulk_set_flags` and `bulk_destroy` partition targets by cached MODSEQ. Targets with a cache hit go out under `STORE UNCHANGEDSINCE <modseq>`; cache misses fall back to unprotected STORE. Protected batches are ordered before unprotected batches so a successful protected pass updates cache entries before the unprotected pass runs.
+
+- The MODSEQ cache is populated from inventory, get, changes, mutation SELECT data, and push IDLE FETCH events.
+- Successful flag mutations, expunges, VANISHED notifications, moves, and folder delete/rename clear the affected entries.
+- `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; expunge failures only apply to the UIDs being expunged in that round, not the whole batch.
+
+Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is opportunistic - cold cache means unprotected STORE - so promoting to `StateBased` would let the engine assume UNCHANGEDSINCE is always wired up when it is not. The engine's read-back-after-retry path remains the lost-update safety net.
+
+### Folder lifecycle
+
+`FolderRegistry::apply_mailbox_event` handles delete, rename, and delete-then-recreate. Delete and rename drop the in-memory entry. A recreate (fresh UIDVALIDITY at the same name) installs a fresh `FolderEntry` with empty modseq cache and cursor, so a recreated mailbox cannot reuse the prior epoch's state.
 
 ## Error model
 
@@ -106,6 +155,21 @@ crates/imap/src/
 │   ├── pipeline/    - command pipelining
 │   ├── seq_ops.rs   - sequence-number command surface
 │   └── uid_ops.rs   - UID command surface
+├── account/         - bifrost_types::Account implementation
+│   ├── blob.rs            - open_blob, open_blob_range
+│   ├── capabilities.rs    - AccountCapabilities builder
+│   ├── changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
+│   ├── close.rs           - graceful shutdown
+│   ├── envelope.rs        - FolderCursor encode/decode
+│   ├── factory.rs         - ImapAccountConfig, QRESYNC negotiation
+│   ├── folder_registry.rs - mailbox map, cursor cache, MODSEQ cache
+│   ├── get.rs             - hydration
+│   ├── inventory.rs       - inventory + initial cursor establishment
+│   ├── mod.rs             - ImapAccount trait impl, helpers
+│   ├── mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
+│   ├── pool.rs            - per-folder connection checkout
+│   ├── push.rs            - IDLE-driven WatchEvents
+│   └── scopes.rs          - folder discovery, lifecycle stream
 ├── types/           - public types (auth, ids, profile, secret, sync, events)
 └── error.rs         - Error, ErrorCategory, Recovery, ResponseCode
 ```

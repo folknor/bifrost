@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope, MembershipScope,
-    ObjectChange, ObjectChangeKind, ObjectId, ObjectType, PageBoundary, ScopeChange,
-    ScopeChangeKind, SyncEvent,
+    ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind,
+    SyncEvent,
 };
 use tokio::sync::Mutex;
 

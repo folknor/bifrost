@@ -1089,7 +1089,9 @@ pub struct TestEmail {
 impl From<Email> for TestEmail {
     fn from(email: Email) -> Self {
         TestEmail {
-            mailbox_ids: email.mailbox_ids.map(|ids| ids.into_iter().collect()),
+            mailbox_ids: email
+                .mailbox_ids
+                .map(|ids| ids.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
             keywords: email
                 .keywords
                 .map(|keywords| keywords.into_iter().collect()),

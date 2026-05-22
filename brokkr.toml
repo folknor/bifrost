@@ -1,12 +1,1 @@
 project = "bifrost"
-
-# Default feature sweep for the workspace. Per-crate minimal or alternate
-# feature checks are run explicitly so package-scoped checks do not inherit
-# another crate's feature names.
-
-[[check]]
-name = "default"
-# default features
-
-[test]
-default_package = "bifrost-jmap"

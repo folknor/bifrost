@@ -97,7 +97,6 @@ pub(crate) fn to_recovery(
             | MethodErrorType::AnchorNotFound
             | MethodErrorType::AlreadyExists
             | MethodErrorType::Other => RecoveryClass::Fatal,
-            _ => RecoveryClass::Fatal,
         },
         crate::Error::Problem(problem) => match problem.error() {
             ProblemType::JMAP(JMAPError::Limit) => RecoveryClass::Retry {
@@ -117,7 +116,6 @@ pub(crate) fn to_recovery(
                 },
                 _ => RecoveryClass::Fatal,
             },
-            _ => RecoveryClass::Fatal,
         },
         crate::Error::Transport(_) => RecoveryClass::Retry {
             after: Duration::from_secs(5),
@@ -133,7 +131,6 @@ pub(crate) fn to_recovery(
         | crate::Error::EmptyResponse
         | crate::Error::NotParsable(_)
         | crate::Error::InvalidUrl(_) => RecoveryClass::Fatal,
-        _ => RecoveryClass::Fatal,
     }
 }
 
