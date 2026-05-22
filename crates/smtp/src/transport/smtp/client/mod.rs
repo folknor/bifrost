@@ -30,7 +30,9 @@ use crate::transport::smtp::{Error, error};
 pub(crate) use self::async_connection::AsyncSmtpConnection;
 pub(crate) use self::connection::SmtpConnection;
 use self::net::NetworkStream;
+// pub: re-exported by smtp for caller-supplied native-tls credentials.
 pub use self::tls::{Certificate, Identity};
+// pub: re-exported by smtp for caller-supplied SMTP TLS configuration.
 pub use self::tls::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
 
 #[cfg(feature = "tokio")]

@@ -7,6 +7,7 @@ pub(super) mod sync_impl;
 /// Configuration for a connection pool
 #[derive(Debug, Clone)]
 #[allow(missing_copy_implementations)]
+// pub: users tune SMTP and LMTP pool size and idle behavior.
 pub struct PoolConfig {
     min_idle: u32,
     max_size: u32,

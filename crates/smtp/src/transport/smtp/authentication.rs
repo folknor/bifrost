@@ -3,25 +3,27 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
 use crate::transport::smtp::error::{self, Error};
+// pub: Credentials exposes zeroizing fields and constructors accept this type.
 pub use zeroize::Zeroizing;
 
 /// Accepted password authentication mechanisms.
 ///
 /// Trying LOGIN last as it is deprecated.
-pub const PASSWORD_MECHANISMS: &[Mechanism] = &[Mechanism::Plain, Mechanism::Login];
+pub(crate) const PASSWORD_MECHANISMS: &[Mechanism] = &[Mechanism::Plain, Mechanism::Login];
 
 /// Accepted OAuth 2.0 bearer-token authentication mechanisms.
 ///
 /// `OAUTHBEARER` is the standard mechanism. `XOAUTH2` is kept for providers
 /// that only expose the older non-standard mechanism.
-pub const OAUTH2_MECHANISMS: &[Mechanism] = &[Mechanism::OAuthBearer, Mechanism::Xoauth2];
+pub(crate) const OAUTH2_MECHANISMS: &[Mechanism] = &[Mechanism::OAuthBearer, Mechanism::Xoauth2];
 
 /// Default authentication mechanisms.
-pub const DEFAULT_MECHANISMS: &[Mechanism] = PASSWORD_MECHANISMS;
+pub(crate) const DEFAULT_MECHANISMS: &[Mechanism] = PASSWORD_MECHANISMS;
 
 /// Contains user credentials
 #[derive(PartialEq, Eq, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users configure password or OAuth bearer SASL credentials.
 pub enum Credentials {
     /// Username and password credentials.
     Password {
@@ -40,6 +42,7 @@ pub enum Credentials {
 }
 
 /// Converts owned secret material into a zeroizing string.
+// pub: Credentials constructors expose this bound for secret inputs.
 pub trait IntoSecretString {
     /// Move the secret into zeroizing storage.
     fn into_secret_string(self) -> Zeroizing<String>;
@@ -129,6 +132,7 @@ impl Debug for Credentials {
 /// Represents authentication mechanisms
 #[derive(PartialEq, Eq, Copy, Clone, Hash, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users can constrain or inspect the SASL mechanism selection.
 pub enum Mechanism {
     /// PLAIN authentication mechanism, defined in
     /// [RFC 4616](https://tools.ietf.org/html/rfc4616)

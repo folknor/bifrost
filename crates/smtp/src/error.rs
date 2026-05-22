@@ -8,6 +8,7 @@ use std::{
 /// Error type for email content
 #[derive(Debug)]
 #[non_exhaustive]
+// pub: message construction errors are local content failures, not Account recovery failures.
 pub enum Error {
     /// Missing from in envelope
     MissingFrom,

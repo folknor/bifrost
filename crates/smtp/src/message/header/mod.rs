@@ -9,6 +9,7 @@ use std::{
 
 use email_encoding::headers::writer::EmailWriter;
 
+// pub: users select typed headers from the message::header module.
 pub use self::{
     content::*,
     content_disposition::ContentDisposition,
@@ -31,6 +32,7 @@ mod textual;
 /// Represents an email header
 ///
 /// Email header as defined in [RFC5322](https://datatracker.ietf.org/doc/html/rfc5322) and extensions.
+// pub: users implement and pass typed custom headers through MessageBuilder.
 pub trait Header: Clone {
     fn name() -> HeaderName;
 
@@ -41,6 +43,7 @@ pub trait Header: Clone {
 
 /// A set of email headers
 #[derive(Debug, Clone, Default)]
+// pub: users inspect and mutate headers on built messages.
 pub struct Headers {
     headers: Vec<HeaderValue>,
 }
@@ -159,6 +162,7 @@ impl Display for Headers {
 #[allow(missing_copy_implementations)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
+// pub: users receive this from custom raw header name validation.
 pub struct InvalidHeaderName;
 
 impl fmt::Display for InvalidHeaderName {
@@ -171,6 +175,7 @@ impl Error for InvalidHeaderName {}
 
 /// A valid header name
 #[derive(Debug, Clone)]
+// pub: users construct safe raw header names for HeaderValue.
 pub struct HeaderName(Cow<'static, str>);
 
 impl HeaderName {
@@ -253,6 +258,7 @@ impl PartialEq<HeaderName> for &str {
 
 /// A safe for use header value
 #[derive(Debug, Clone, PartialEq)]
+// pub: users insert raw custom headers through MessageBuilder.
 pub struct HeaderValue {
     name: HeaderName,
     raw_value: String,

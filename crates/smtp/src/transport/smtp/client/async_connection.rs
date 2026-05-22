@@ -8,7 +8,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use super::async_net::AsyncDeadline;
 #[cfg(feature = "tracing")]
 use super::escape_crlf;
-#[allow(deprecated)]
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, TlsParameters,
     async_net::AsyncNetworkStream,
@@ -73,7 +72,6 @@ where
 pub(crate) struct AsyncSmtpConnection {
     /// TCP stream between client and server
     /// Value is None before connection
-    #[allow(deprecated)]
     stream: BufReader<AsyncNetworkStream>,
     /// Information about the server
     server_info: ServerInfo,
@@ -154,7 +152,6 @@ impl AsyncSmtpConnection {
         protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
-        #[allow(deprecated)]
         let stream =
             AsyncNetworkStream::connect_until(server, deadline, tls_parameters, local_address)
                 .await?;
@@ -176,7 +173,6 @@ impl AsyncSmtpConnection {
         protocol: Protocol,
     ) -> Result<AsyncSmtpConnection, Error> {
         let deadline = AsyncDeadline::new(timeout);
-        #[allow(deprecated)]
         let stream = AsyncNetworkStream::connect_unix_until(path, deadline).await?;
         Self::connect_impl(
             stream,
@@ -188,7 +184,6 @@ impl AsyncSmtpConnection {
         .await
     }
 
-    #[allow(deprecated)]
     async fn connect_impl(
         stream: AsyncNetworkStream,
         hello_name: &ClientId,
@@ -780,7 +775,6 @@ impl AsyncSmtpConnection {
     }
 
     // Async STARTTLS is only wired when the tokio backend is enabled.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) fn can_starttls(&self) -> bool {
         !self.is_encrypted() && self.server_info.supports_feature(Extension::StartTls)
     }
@@ -792,7 +786,6 @@ impl AsyncSmtpConnection {
     /// [rfc3207]: https://www.rfc-editor.org/rfc/rfc3207
     /// [rfc8314]: https://www.rfc-editor.org/rfc/rfc8314
     // Async STARTTLS is only wired when the tokio backend is enabled.
-    #[cfg_attr(not(feature = "tokio"), allow(dead_code))]
     pub(crate) async fn starttls(
         &mut self,
         tls_parameters: TlsParameters,

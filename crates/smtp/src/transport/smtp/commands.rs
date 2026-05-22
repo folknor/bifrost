@@ -25,7 +25,7 @@ fn validate_single_line_argument(command: &str, argument: &str) -> Result<(), Er
 /// EHLO command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Ehlo {
+pub(crate) struct Ehlo {
     client_id: ClientId,
 }
 
@@ -37,7 +37,7 @@ impl Display for Ehlo {
 
 impl Ehlo {
     /// Creates a EHLO command
-    pub fn new(client_id: ClientId) -> Ehlo {
+    pub(crate) fn new(client_id: ClientId) -> Ehlo {
         Ehlo { client_id }
     }
 }
@@ -45,7 +45,7 @@ impl Ehlo {
 /// LHLO command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Lhlo {
+pub(crate) struct Lhlo {
     client_id: ClientId,
 }
 
@@ -57,7 +57,7 @@ impl Display for Lhlo {
 
 impl Lhlo {
     /// Creates a LHLO command
-    pub fn new(client_id: ClientId) -> Lhlo {
+    pub(crate) fn new(client_id: ClientId) -> Lhlo {
         Lhlo { client_id }
     }
 }
@@ -65,7 +65,7 @@ impl Lhlo {
 /// STARTTLS command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Starttls;
+pub(crate) struct Starttls;
 
 impl Display for Starttls {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -76,7 +76,7 @@ impl Display for Starttls {
 /// MAIL command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Mail {
+pub(crate) struct Mail {
     sender: Option<Address>,
     parameters: Vec<MailParameter>,
 }
@@ -97,7 +97,7 @@ impl Display for Mail {
 
 impl Mail {
     /// Creates a MAIL command
-    pub fn new(sender: Option<Address>, parameters: Vec<MailParameter>) -> Mail {
+    pub(crate) fn new(sender: Option<Address>, parameters: Vec<MailParameter>) -> Mail {
         Mail { sender, parameters }
     }
 }
@@ -105,7 +105,7 @@ impl Mail {
 /// RCPT command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Rcpt {
+pub(crate) struct Rcpt {
     recipient: Address,
     parameters: Vec<RcptParameter>,
 }
@@ -122,7 +122,7 @@ impl Display for Rcpt {
 
 impl Rcpt {
     /// Creates an RCPT command
-    pub fn new(recipient: Address, parameters: Vec<RcptParameter>) -> Rcpt {
+    pub(crate) fn new(recipient: Address, parameters: Vec<RcptParameter>) -> Rcpt {
         Rcpt {
             recipient,
             parameters,
@@ -133,7 +133,7 @@ impl Rcpt {
 /// DATA command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Data;
+pub(crate) struct Data;
 
 impl Display for Data {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -144,7 +144,7 @@ impl Display for Data {
 /// BDAT command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Bdat {
+pub(crate) struct Bdat {
     size: usize,
     last: bool,
 }
@@ -160,37 +160,16 @@ impl Display for Bdat {
 }
 
 impl Bdat {
-    /// Creates a BDAT command.
-    pub fn new(size: usize, last: bool) -> Bdat {
-        Bdat { size, last }
-    }
-
-    /// Creates a BDAT command for a non-final chunk.
-    pub fn chunk(size: usize) -> Bdat {
-        Bdat { size, last: false }
-    }
-
     /// Creates a BDAT command for the final chunk.
-    pub fn last(size: usize) -> Bdat {
+    pub(crate) fn last(size: usize) -> Bdat {
         Bdat { size, last: true }
-    }
-}
-
-/// QUIT command
-#[derive(PartialEq, Eq, Clone, Debug, Copy)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Quit;
-
-impl Display for Quit {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str("QUIT\r\n")
     }
 }
 
 /// NOOP command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Noop;
+pub(crate) struct Noop;
 
 impl Display for Noop {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -198,34 +177,10 @@ impl Display for Noop {
     }
 }
 
-/// HELP command
-#[derive(PartialEq, Eq, Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Help {
-    argument: Option<String>,
-}
-
-impl Display for Help {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str("HELP")?;
-        if let Some(argument) = &self.argument {
-            write!(f, " {argument}")?;
-        }
-        f.write_str("\r\n")
-    }
-}
-
-impl Help {
-    /// Creates an HELP command
-    pub fn new(argument: Option<String>) -> Help {
-        Help { argument }
-    }
-}
-
 /// VRFY command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Vrfy {
+pub(crate) struct Vrfy {
     argument: String,
 }
 
@@ -237,7 +192,7 @@ impl Display for Vrfy {
 
 impl Vrfy {
     /// Creates a VRFY command
-    pub fn new(argument: String) -> Result<Vrfy, Error> {
+    pub(crate) fn new(argument: String) -> Result<Vrfy, Error> {
         validate_single_line_argument("VRFY", &argument)?;
         Ok(Vrfy { argument })
     }
@@ -246,7 +201,7 @@ impl Vrfy {
 /// EXPN command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Expn {
+pub(crate) struct Expn {
     argument: String,
 }
 
@@ -258,7 +213,7 @@ impl Display for Expn {
 
 impl Expn {
     /// Creates an EXPN command
-    pub fn new(argument: String) -> Result<Expn, Error> {
+    pub(crate) fn new(argument: String) -> Result<Expn, Error> {
         validate_single_line_argument("EXPN", &argument)?;
         Ok(Expn { argument })
     }
@@ -267,7 +222,7 @@ impl Expn {
 /// RSET command
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Rset;
+pub(crate) struct Rset;
 
 impl Display for Rset {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -278,7 +233,7 @@ impl Display for Rset {
 /// AUTH command
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Auth {
+pub(crate) struct Auth {
     mechanism: Mechanism,
     credentials: Credentials,
     challenge: Option<String>,
@@ -305,7 +260,7 @@ impl Display for Auth {
 
 impl Auth {
     /// Creates an AUTH command (from a challenge if provided)
-    pub fn new(
+    pub(crate) fn new(
         mechanism: Mechanism,
         credentials: Credentials,
         challenge: Option<String>,
@@ -325,7 +280,7 @@ impl Auth {
 
     /// Creates an AUTH command from a response that needs to be a
     /// valid challenge (with 334 response code)
-    pub fn new_from_response(
+    pub(crate) fn new_from_response(
         mechanism: Mechanism,
         credentials: Credentials,
         response: &Response,
@@ -411,18 +366,9 @@ mod test {
             format!("{}", Rcpt::new(email, vec![rcpt_parameter])),
             "RCPT TO:<test@example.com> TEST=value\r\n"
         );
-        assert_eq!(format!("{}", Bdat::new(42, false)), "BDAT 42\r\n");
-        assert_eq!(format!("{}", Bdat::new(42, true)), "BDAT 42 LAST\r\n");
-        assert_eq!(format!("{}", Bdat::chunk(42)), "BDAT 42\r\n");
         assert_eq!(format!("{}", Bdat::last(42)), "BDAT 42 LAST\r\n");
-        assert_eq!(format!("{Quit}"), "QUIT\r\n");
         assert_eq!(format!("{Data}"), "DATA\r\n");
         assert_eq!(format!("{Noop}"), "NOOP\r\n");
-        assert_eq!(format!("{}", Help::new(None)), "HELP\r\n");
-        assert_eq!(
-            format!("{}", Help::new(Some("test".to_owned()))),
-            "HELP test\r\n"
-        );
         assert_eq!(
             format!("{}", Vrfy::new("test".to_owned()).unwrap()),
             "VRFY test\r\n"

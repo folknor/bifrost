@@ -52,6 +52,7 @@ use crate::{Transport, address::Envelope};
 /// An error returned by the stub transport
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone)]
+// pub: users can assert the stub transport's configured failure.
 pub struct Error;
 
 impl fmt::Display for Error {
@@ -64,6 +65,7 @@ impl StdError for Error {}
 
 /// This transport logs messages and always returns the given response
 #[derive(Debug, Clone)]
+// pub: users can substitute a sync logging transport in tests.
 pub struct StubTransport {
     response: Result<(), Error>,
     message_log: Arc<Mutex<Vec<(Envelope, String)>>>,
@@ -73,6 +75,7 @@ pub struct StubTransport {
 #[derive(Debug, Clone)]
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+// pub: users can substitute an async logging transport in tests.
 pub struct AsyncStubTransport {
     response: Result<(), Error>,
     message_log: Arc<Mutex<Vec<(Envelope, String)>>>,

@@ -7,6 +7,7 @@ use crate::transport::smtp::{Error, error};
 /// TLS protocol versions.
 #[derive(Debug, Copy, Clone)]
 #[non_exhaustive]
+// pub: users choose the native-tls minimum version for SMTP connections.
 pub enum TlsVersion {
     /// TLS 1.0
     ///
@@ -35,6 +36,7 @@ pub enum TlsVersion {
 /// server, and [`Tls::None`] when connecting to a trusted local server.
 #[derive(Clone)]
 #[allow(missing_copy_implementations)]
+// pub: users choose plaintext, STARTTLS, required STARTTLS, or wrapper TLS.
 pub enum Tls {
     /// Insecure plaintext connection only.
     ///
@@ -71,6 +73,7 @@ impl Debug for Tls {
 #[allow(missing_copy_implementations)]
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
+// pub: users choose platform roots or an explicit custom root set.
 pub enum CertificateStore {
     /// Use the platform certificate store selected by native-tls.
     ///
@@ -88,6 +91,7 @@ pub enum CertificateStore {
 
 /// Parameters to use for secure clients.
 #[derive(Clone)]
+// pub: SMTP owns TLS parameters because STARTTLS upgrades raw TCP, not HTTP.
 pub struct TlsParameters {
     pub(crate) connector: TlsConnector,
     /// The domain name expected in the server TLS certificate.
@@ -96,6 +100,7 @@ pub struct TlsParameters {
 
 /// Builder for [`TlsParameters`].
 #[derive(Debug, Clone)]
+// pub: users configure native-tls roots, identity, and validation policy.
 pub struct TlsParametersBuilder {
     domain: String,
     cert_store: CertificateStore,
@@ -248,6 +253,7 @@ impl From<(String, TlsConnector)> for TlsParameters {
 /// [`TlsParametersBuilder::add_root_certificate`].
 #[derive(Clone)]
 #[allow(missing_copy_implementations)]
+// pub: users pass native-tls certificates without depending on internals.
 pub struct Certificate {
     native_tls: native_tls::Certificate,
 }
@@ -288,6 +294,7 @@ impl Debug for Certificate {
 /// An identity that can be used with [`TlsParametersBuilder::identify_with`].
 #[derive(Clone)]
 #[allow(missing_copy_implementations)]
+// pub: users configure client certificates for SMTP TLS.
 pub struct Identity {
     native_tls: native_tls::Identity,
 }

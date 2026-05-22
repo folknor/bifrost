@@ -93,10 +93,13 @@
 use crate::Envelope;
 use crate::Message;
 
+// pub: users configure and send through the SMTP/LMTP transport module.
 pub mod smtp;
+// pub: users can swap in a logging transport for tests and dry runs.
 pub mod stub;
 
 /// Blocking Transport method for emails
+// pub: concrete transports implement this user-facing send trait.
 pub trait Transport {
     /// Response produced by the Transport
     type Ok;
@@ -120,6 +123,7 @@ pub trait Transport {
 }
 
 /// Boxed blocking transport trait object.
+// pub: users can erase concrete sync transport choices.
 pub type BoxedTransport<Ok, Error> = Box<dyn Transport<Ok = Ok, Error = Error> + Send + Sync>;
 
 impl<T> Transport for Box<T>
@@ -168,6 +172,7 @@ where
 /// [`Send`] futures.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+// pub: concrete async transports implement this user-facing send trait.
 pub trait AsyncTransport: Sync {
     /// Response produced by the Transport
     type Ok;
@@ -295,6 +300,7 @@ where
 /// frame and may be shared between runtime tasks.
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+// pub: users can erase concrete async transport choices.
 pub struct BoxedAsyncTransport<Ok, Error> {
     inner: Box<dyn ErasedAsyncTransport<Ok, Error>>,
 }

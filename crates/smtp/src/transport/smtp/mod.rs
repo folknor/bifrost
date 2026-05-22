@@ -194,15 +194,20 @@
 use std::{path::PathBuf, time::Duration};
 
 #[cfg(feature = "tokio")]
+// pub: async SMTP and LMTP transports are the tokio user-facing API.
 pub use self::async_transport::{
     AsyncLmtpTransport, AsyncLmtpTransportBuilder, AsyncSmtpTransport, AsyncSmtpTransportBuilder,
 };
 #[cfg(feature = "tokio")]
 pub(crate) use self::client::AsyncSmtpConnection;
 pub(crate) use self::client::SmtpConnection;
+// pub: callers configure SMTP TLS roots and client identities explicitly.
 pub use self::client::{Certificate, Identity};
+// pub: callers choose SMTP TLS mode, SNI, and native-tls parameters.
 pub use self::client::{CertificateStore, Tls, TlsParameters, TlsParametersBuilder, TlsVersion};
+// pub: callers tune connection pooling on transport builders.
 pub use self::pool::PoolConfig;
+// pub: SMTP transports return rich protocol errors, send options, and builders.
 pub use self::{
     error::{Error, ErrorKind},
     extension::SendOptions,
@@ -216,13 +221,16 @@ use crate::transport::smtp::{
 
 #[cfg(feature = "tokio")]
 mod async_transport;
+// pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
 mod client;
-pub mod commands;
+mod commands;
 mod connection_url;
 pub(crate) mod error;
+// pub: users build typed ESMTP send options and parameters.
 pub mod extension;
 mod pool;
+// pub: transport results and errors expose typed SMTP replies.
 pub mod response;
 #[cfg(test)]
 mod test_support;
@@ -234,17 +242,21 @@ pub(super) mod util;
 // org/assignments/service-names-port-numbers/service-names-port-numbers.xhtml
 
 /// Default smtp port
+// pub: callers use standard SMTP ports when building custom configs.
 pub const SMTP_PORT: u16 = 25;
 /// Common LMTP TCP port.
 ///
 /// RFC 2033 does not assign a TCP port for LMTP. Port 24 is the closest
 /// deployed convention, notably used by Dovecot for TCP LMTP listeners.
+// pub: callers use the deployed LMTP TCP convention for local delivery.
 pub const LMTP_PORT: u16 = 24;
 /// Default submission port
+// pub: callers use the standard message-submission port in configs.
 pub const SUBMISSION_PORT: u16 = 587;
 /// Default submission over TLS port
 ///
 /// Defined in [RFC8314](https://tools.ietf.org/html/rfc8314)
+// pub: callers use the standard implicit-TLS submission port in configs.
 pub const SUBMISSIONS_PORT: u16 = 465;
 
 /// Default timeout

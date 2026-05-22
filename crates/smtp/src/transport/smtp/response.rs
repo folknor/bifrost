@@ -21,6 +21,7 @@ use crate::transport::smtp::{Error, error};
 /// The first digit indicates severity
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users inspect and construct typed SMTP status codes.
 pub enum Severity {
     /// 2yx
     PositiveCompletion = 2,
@@ -41,6 +42,7 @@ impl Display for Severity {
 /// Second digit
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users inspect and construct typed SMTP status codes.
 pub enum Category {
     /// x0z
     Syntax = 0,
@@ -65,6 +67,7 @@ impl Display for Category {
 /// The detail digit of a response code (third digit)
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users inspect and construct typed SMTP status codes.
 pub enum Detail {
     #[allow(missing_docs)]
     Zero = 0,
@@ -97,6 +100,7 @@ impl Display for Detail {
 /// Represents a 3 digit SMTP response code
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: Response and Error expose this typed SMTP status code.
 pub struct Code {
     /// First digit of the response code
     pub severity: Severity,
@@ -144,6 +148,7 @@ impl From<Code> for u16 {
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users inspect RFC 2034 enhanced status codes on replies.
 pub struct EnhancedStatusCode {
     /// Status class: 2 for success, 4 for transient failure, 5 for permanent
     /// failure.
@@ -173,6 +178,7 @@ impl FromStr for EnhancedStatusCode {
 /// The text message is optional, only the code is mandatory
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: transports return full SMTP replies for success and status errors.
 pub struct Response {
     /// Response code
     code: Code,

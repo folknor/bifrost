@@ -10,6 +10,7 @@ use crate::{
 // Inspired by https://github.com/seanmonstar/reqwest/blob/a8566383168c0ef06c21f38cbc9213af6ff6db31/src/error.rs
 
 /// The Errors that may occur when sending an email over SMTP
+// pub: SMTP keeps full Response-carrying errors instead of Account recovery errors.
 pub struct Error {
     inner: Box<Inner>,
 }
@@ -141,6 +142,7 @@ impl Error {
 /// Public classification for [`Error`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
+// pub: callers classify SMTP reply, transport, TLS, and policy failures.
 pub enum ErrorKind {
     /// Transient SMTP reply, 4xx status.
     Transient(Response),

@@ -198,17 +198,24 @@
 
 use std::{io::Write, iter, time::SystemTime};
 
+// pub: users attach files and inline parts through the message builder.
 pub use attachment::Attachment;
+// pub: users provide raw, string, or pre-encoded message bodies.
 pub use body::{Body, IntoBody, MaybeString};
 #[cfg(feature = "dkim")]
+// pub: users opt into DKIM signing types when the feature is enabled.
 pub use dkim::*;
+// pub: users construct typed mailbox headers and address lists.
 pub use mailbox::*;
+// pub: users construct MIME singlepart and multipart bodies.
 pub use mimebody::*;
 
 mod attachment;
 mod body;
 #[cfg(feature = "dkim")]
+// pub: users opt into direct DKIM signing helpers with the dkim feature.
 pub mod dkim;
+// pub: users set typed and raw RFC 5322/MIME headers.
 pub mod header;
 mod mailbox;
 mod mimebody;
@@ -229,6 +236,7 @@ trait EmailFormat {
 
 /// A builder for messages
 #[derive(Debug, Clone)]
+// pub: users build validated messages through this builder.
 pub struct MessageBuilder {
     headers: Headers,
     envelope: Option<Envelope>,
@@ -493,6 +501,7 @@ impl MessageBuilder {
 
 /// Email message which can be formatted
 #[derive(Clone, Debug)]
+// pub: users pass built messages to transports or inspect formatted output.
 pub struct Message {
     headers: Headers,
     body: MessageBody,

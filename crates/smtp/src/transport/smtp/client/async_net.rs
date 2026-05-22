@@ -81,10 +81,6 @@ where
 
 /// A network stream
 #[derive(Debug)]
-#[deprecated(
-    since = "0.11.14",
-    note = "This struct was not meant to be made public"
-)]
 pub(crate) struct AsyncNetworkStream {
     inner: InnerAsyncNetworkStream,
     state: ConnectionState,
@@ -103,7 +99,6 @@ impl AsyncTokioStream for TokioUnixStream {}
 // usually only one TLS backend at a time is going to be enabled,
 // so clippy::large_enum_variant doesn't make sense here
 #[allow(clippy::large_enum_variant)]
-#[allow(dead_code)]
 #[derive(Debug)]
 enum InnerAsyncNetworkStream {
     /// Plain Tokio 1.x TCP stream
@@ -117,7 +112,6 @@ enum InnerAsyncNetworkStream {
     None,
 }
 
-#[allow(deprecated)]
 impl AsyncNetworkStream {
     fn new(inner: InnerAsyncNetworkStream) -> Self {
         if let InnerAsyncNetworkStream::None = inner {
@@ -275,7 +269,6 @@ impl AsyncNetworkStream {
     }
 }
 
-#[allow(deprecated)]
 impl AsyncRead for AsyncNetworkStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -295,7 +288,6 @@ impl AsyncRead for AsyncNetworkStream {
     }
 }
 
-#[allow(deprecated)]
 impl AsyncWrite for AsyncNetworkStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -362,7 +354,6 @@ mod tokio_test {
         assert!(error.is_timeout(), "expected timeout, got {error:?}");
     }
 
-    #[allow(deprecated)]
     #[tokio::test(crate = "tokio")]
     async fn tokio_tls_handshake_uses_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

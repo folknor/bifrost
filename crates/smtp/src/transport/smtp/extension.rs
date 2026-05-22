@@ -20,6 +20,7 @@ use crate::{
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: transport builders expose EHLO/LHLO identity configuration.
 pub enum ClientId {
     /// A fully-qualified domain name
     Domain(String),
@@ -62,7 +63,7 @@ impl Display for ClientId {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
-pub enum Extension {
+pub(crate) enum Extension {
     /// 8BITMIME keyword
     ///
     /// Defined in [RFC 6152](https://tools.ietf.org/html/rfc6152)
@@ -172,7 +173,7 @@ impl Display for Extension {
 /// Contains information about an SMTP server
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ServerInfo {
+pub(crate) struct ServerInfo {
     /// Server name
     ///
     /// The name given in the server banner
@@ -196,7 +197,7 @@ impl Display for ServerInfo {
 
 impl ServerInfo {
     /// Parses a EHLO response to create a `ServerInfo`
-    pub fn from_response(response: &Response) -> Result<ServerInfo, Error> {
+    pub(crate) fn from_response(response: &Response) -> Result<ServerInfo, Error> {
         let Some(name) = response.first_word() else {
             return Err(error::parse("Could not read server name"));
         };
@@ -305,12 +306,12 @@ impl ServerInfo {
     }
 
     /// Checks if the server supports an ESMTP feature
-    pub fn supports_feature(&self, keyword: Extension) -> bool {
+    pub(crate) fn supports_feature(&self, keyword: Extension) -> bool {
         self.features.contains(&keyword)
     }
 
     /// Returns the server-advertised SIZE limit, if any.
-    pub fn size_limit(&self) -> Option<usize> {
+    pub(crate) fn size_limit(&self) -> Option<usize> {
         self.features.iter().find_map(|feature| {
             if let Extension::Size(limit) = feature {
                 *limit
@@ -321,51 +322,46 @@ impl ServerInfo {
     }
 
     /// Checks if the server supports SIZE.
-    pub fn supports_size(&self) -> bool {
+    pub(crate) fn supports_size(&self) -> bool {
         self.features
             .iter()
             .any(|feature| matches!(feature, Extension::Size(_)))
     }
 
     /// Checks if the server supports PIPELINING.
-    pub fn supports_pipelining(&self) -> bool {
+    pub(crate) fn supports_pipelining(&self) -> bool {
         self.supports_feature(Extension::Pipelining)
     }
 
     /// Checks if the server supports CHUNKING.
-    pub fn supports_chunking(&self) -> bool {
+    pub(crate) fn supports_chunking(&self) -> bool {
         self.supports_feature(Extension::Chunking)
     }
 
     /// Checks if the server supports BINARYMIME.
-    pub fn supports_binary_mime(&self) -> bool {
+    pub(crate) fn supports_binary_mime(&self) -> bool {
         self.supports_feature(Extension::BinaryMime)
     }
 
-    /// Checks if the server supports ENHANCEDSTATUSCODES.
-    pub fn supports_enhanced_status_codes(&self) -> bool {
-        self.supports_feature(Extension::EnhancedStatusCodes)
-    }
-
     /// Checks if the server supports DSN.
-    pub fn supports_dsn(&self) -> bool {
+    pub(crate) fn supports_dsn(&self) -> bool {
         self.supports_feature(Extension::Dsn)
     }
 
     /// Checks if the server supports REQUIRETLS.
-    pub fn supports_require_tls(&self) -> bool {
+    pub(crate) fn supports_require_tls(&self) -> bool {
         self.supports_feature(Extension::RequireTls)
     }
 
     /// Checks if the server supports FUTURERELEASE.
-    pub fn supports_future_release(&self) -> bool {
+    pub(crate) fn supports_future_release(&self) -> bool {
         self.features
             .iter()
             .any(|feature| matches!(feature, Extension::FutureRelease { .. }))
     }
 
     /// Returns the server-advertised FUTURERELEASE maximum hold interval.
-    pub fn future_release_max_interval(&self) -> Option<u64> {
+    pub(crate) fn future_release_max_interval(&self) -> Option<u64> {
         self.features.iter().find_map(|feature| {
             if let Extension::FutureRelease { max_interval, .. } = feature {
                 *max_interval
@@ -375,26 +371,15 @@ impl ServerInfo {
         })
     }
 
-    /// Returns the server-advertised FUTURERELEASE maximum hold-until datetime.
-    pub fn future_release_max_datetime(&self) -> Option<&str> {
-        self.features.iter().find_map(|feature| {
-            if let Extension::FutureRelease { max_datetime, .. } = feature {
-                max_datetime.as_deref()
-            } else {
-                None
-            }
-        })
-    }
-
     /// Checks if the server supports DELIVERBY.
-    pub fn supports_deliver_by(&self) -> bool {
+    pub(crate) fn supports_deliver_by(&self) -> bool {
         self.features
             .iter()
             .any(|feature| matches!(feature, Extension::DeliverBy(_)))
     }
 
     /// Returns the server-advertised DELIVERBY minimum time, if any.
-    pub fn deliver_by_minimum(&self) -> Option<i64> {
+    pub(crate) fn deliver_by_minimum(&self) -> Option<i64> {
         self.features.iter().find_map(|feature| {
             if let Extension::DeliverBy(minimum) = feature {
                 *minimum
@@ -405,28 +390,18 @@ impl ServerInfo {
     }
 
     /// Checks if the server supports MT-PRIORITY.
-    pub fn supports_mt_priority(&self) -> bool {
+    pub(crate) fn supports_mt_priority(&self) -> bool {
         self.supports_feature(Extension::MtPriority)
     }
 
-    /// Checks if the server supports VRFY.
-    pub fn supports_vrfy(&self) -> bool {
-        self.supports_feature(Extension::Vrfy)
-    }
-
-    /// Checks if the server supports EXPN.
-    pub fn supports_expn(&self) -> bool {
-        self.supports_feature(Extension::Expn)
-    }
-
     /// Checks if the server supports an ESMTP feature
-    pub fn supports_auth_mechanism(&self, mechanism: Mechanism) -> bool {
+    pub(crate) fn supports_auth_mechanism(&self, mechanism: Mechanism) -> bool {
         self.features
             .contains(&Extension::Authentication(mechanism))
     }
 
     /// Gets a compatible mechanism from a list
-    pub fn get_auth_mechanism(&self, mechanisms: &[Mechanism]) -> Option<Mechanism> {
+    pub(crate) fn get_auth_mechanism(&self, mechanisms: &[Mechanism]) -> Option<Mechanism> {
         for mechanism in mechanisms {
             if self.supports_auth_mechanism(*mechanism) {
                 return Some(*mechanism);
@@ -434,16 +409,12 @@ impl ServerInfo {
         }
         None
     }
-
-    /// The name given in the server banner
-    pub fn name(&self) -> &str {
-        self.name.as_ref()
-    }
 }
 
 /// A `MAIL FROM` extension parameter
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: SendOptions exposes raw and typed MAIL FROM parameter construction.
 pub enum MailParameter {
     /// `BODY` parameter
     Body(MailBodyParameter),
@@ -552,6 +523,7 @@ impl MailParameter {
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users choose DSN return-body behavior through SendOptions.
 pub enum DsnReturn {
     /// Return the full message in delivery status notifications.
     Full,
@@ -575,6 +547,7 @@ impl Display for DsnReturn {
 /// `DELIVERBY` and `FUTURERELEASE` describe one message, not the SMTP session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users attach per-message ESMTP options to send_raw_with_options.
 pub struct SendOptions {
     mail_parameters: Vec<MailParameter>,
     rcpt_parameters: Vec<RcptParameter>,
@@ -792,6 +765,7 @@ fn upsert_rcpt_parameter(parameters: &mut Vec<RcptParameter>, parameter: RcptPar
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users can attach HOLDFOR or HOLDUNTIL through raw MAIL parameters.
 pub enum FutureReleaseParameter {
     /// `HOLDFOR=<seconds>`
     HoldFor(u64),
@@ -814,6 +788,7 @@ impl Display for FutureReleaseParameter {
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users can validate and inspect DELIVERBY parameters.
 pub struct DeliverByParameter {
     /// Seconds until delivery deadline.
     ///
@@ -877,6 +852,7 @@ impl Display for DeliverByParameter {
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users select DELIVERBY notify or return behavior.
 pub enum DeliverByMode {
     /// Notify if delivery fails within the time limit.
     Notify,
@@ -897,6 +873,7 @@ impl Display for DeliverByMode {
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users can validate and inspect MT-PRIORITY values.
 pub struct MtPriorityParameter {
     value: i8,
 }
@@ -928,6 +905,7 @@ impl Display for MtPriorityParameter {
 /// Values for the `BODY` parameter to `MAIL FROM`
 #[derive(PartialEq, Eq, Clone, Debug, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: users can send raw BODY parameters through SendOptions.
 pub enum MailBodyParameter {
     /// `7BIT`
     SevenBit,
@@ -950,6 +928,7 @@ impl Display for MailBodyParameter {
 /// A `RCPT TO` extension parameter
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// pub: SendOptions exposes raw and typed RCPT TO parameter construction.
 pub enum RcptParameter {
     /// `NOTIFY` parameter
     Notify(DsnNotifyParameter),
@@ -1020,6 +999,7 @@ impl RcptParameter {
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users can validate and inspect DSN NOTIFY parameter lists.
 pub struct DsnNotifyParameter {
     values: Vec<DsnNotify>,
 }
@@ -1079,6 +1059,7 @@ impl Display for DsnNotifyParameter {
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
+// pub: users choose DSN notification conditions through SendOptions.
 pub enum DsnNotify {
     /// Notify on successful delivery.
     Success,
@@ -1354,20 +1335,13 @@ mod test {
         assert!(server_info2.supports_pipelining());
         assert!(server_info2.supports_chunking());
         assert!(server_info2.supports_binary_mime());
-        assert!(server_info2.supports_enhanced_status_codes());
         assert!(server_info2.supports_dsn());
         assert!(server_info2.supports_require_tls());
         assert!(server_info2.supports_future_release());
         assert_eq!(server_info2.future_release_max_interval(), Some(3600));
-        assert_eq!(
-            server_info2.future_release_max_datetime(),
-            Some("20260519T120000Z")
-        );
         assert!(server_info2.supports_deliver_by());
         assert_eq!(server_info2.deliver_by_minimum(), Some(240));
         assert!(server_info2.supports_mt_priority());
-        assert!(server_info2.supports_vrfy());
-        assert!(server_info2.supports_expn());
         assert!(server_info2.supports_auth_mechanism(Mechanism::Plain));
         assert!(server_info2.supports_auth_mechanism(Mechanism::OAuthBearer));
         assert!(!server_info2.supports_feature(Extension::StartTls));

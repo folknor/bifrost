@@ -23,8 +23,7 @@ greeting -> EHLO/LHLO -> [STARTTLS -> EHLO/LHLO] -> [AUTH -> EHLO/LHLO] -> ready
 
 EHLO is re-sent after STARTTLS and AUTH because capabilities can change.
 
-- `quit()` sends QUIT and reads the final response.
-- `abort()` closes without sending QUIT. Used after protocol failure when the stream may no longer be writable.
+- `abort()` closes the connection. There is no live QUIT path; the Quit command builder is gone. If a graceful shutdown is wanted later it will need to be re-added with a real call site.
 
 ## Connection state and cancel-safety
 
