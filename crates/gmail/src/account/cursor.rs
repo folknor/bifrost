@@ -7,6 +7,8 @@ pub(crate) const GMAIL_PROTOCOL: ProtocolKind = ProtocolKind::Gmail;
 pub(crate) const GMAIL_ENVELOPE_VERSION: u32 = 1;
 const GMAIL_SCHEMA_VERSION: u8 = 1;
 
+// Gmail needs a protocol-specific cursor payload for historyId plus
+// account identity; bifrost-types supplies only the opaque envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GmailChangeState {
     pub history_id: u64,

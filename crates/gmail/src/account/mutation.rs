@@ -13,7 +13,6 @@ use crate::error::Error as GmailError;
 
 use super::capabilities::GMAIL_BATCH_MODIFY_LIMIT;
 use super::flags::{LabelPatch, translate_flag_op};
-use super::idempotency;
 use super::recovery;
 use super::scopes::{ScopeCache, labels_for_flags};
 
@@ -294,21 +293,20 @@ async fn post_empty_json<B: Serialize>(
     client: &GmailClient,
     path: &str,
     body: &B,
-    key: &IdempotencyKey,
+    _key: &IdempotencyKey,
 ) -> crate::Result<()> {
+    // Gmail messages endpoints accept no documented client-mintable
+    // replay token, so the Account idempotency key stays engine-side.
     let url = if path.starts_with('/') {
         format!("{}{}", client.api_base(), path)
     } else {
         format!("{}/{}", client.api_base(), path)
     };
-    let mut request = client
+    let request = client
         .account_net()
         .post(&url)
         .header("Content-Type", "application/json")
         .json(body);
-    for (name, value) in idempotency::wire_idempotency_headers(key) {
-        request = request.header(name, value);
-    }
     let response = client.execute_builder(request, "Gmail API").await?;
     let status = response.status();
     if status.is_success() {

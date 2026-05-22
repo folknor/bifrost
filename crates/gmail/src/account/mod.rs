@@ -3,7 +3,6 @@ mod capabilities;
 mod changes;
 mod cursor;
 mod flags;
-mod idempotency;
 mod inventory;
 mod mutation;
 mod push;
@@ -27,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::GmailClient;
 use crate::types::GmailProfile;
 
+// pub: downstream consumers configure Gmail Pub/Sub before registering the factory.
 pub use push::PubSubConfig;
 
 use self::capabilities::gmail_capabilities;
@@ -38,12 +38,14 @@ use self::scopes::{ScopeCache, ScopeSnapshot};
 
 const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
+// pub: the sync engine's cross-crate conformance test and downstream engines register this factory.
 pub struct GmailAccountFactory {
     client: Arc<GmailClient>,
     pubsub: Option<PubSubConfig>,
 }
 
 impl GmailAccountFactory {
+    // pub: direct callers with a preconfigured GmailClient can still register an AccountFactory.
     #[must_use]
     pub fn new(client: GmailClient) -> Self {
         Self {
@@ -52,24 +54,23 @@ impl GmailAccountFactory {
         }
     }
 
+    // pub: ergonomic AccountFactory construction for callers that already hold a bearer token.
     #[must_use]
     pub fn from_access_token(access_token: impl Into<String>) -> Self {
         Self::new(GmailClient::new(access_token))
     }
 
+    // pub: Gmail Pub/Sub subscription ownership is configured on the factory before open.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {
         self.pubsub = Some(config);
         self
     }
 
+    // pub: common Pub/Sub setup needs only a topic and no label filter.
     #[must_use]
     pub fn with_pubsub_topic(self, topic: impl Into<String>) -> Self {
         self.with_pubsub_config(PubSubConfig::new(topic))
-    }
-
-    pub async fn open_gmail(&self) -> Result<Arc<GmailAccount>, AccountError> {
-        GmailAccount::open(Arc::clone(&self.client), self.pubsub.clone()).await
     }
 }
 
@@ -84,7 +85,7 @@ impl AccountFactory for GmailAccountFactory {
     }
 }
 
-pub struct GmailAccount {
+struct GmailAccount {
     client: Arc<GmailClient>,
     capabilities: AccountCapabilities,
     profile: GmailProfile,
@@ -98,7 +99,7 @@ pub struct GmailAccount {
 }
 
 impl GmailAccount {
-    pub async fn open(
+    async fn open(
         client: Arc<GmailClient>,
         pubsub: Option<PubSubConfig>,
     ) -> Result<Arc<Self>, AccountError> {
@@ -125,29 +126,6 @@ impl GmailAccount {
             priority: AtomicU8::new(priority_to_u8(Priority::Normal)),
             bandwidth_cap: AtomicU64::new(UNLIMITED_BANDWIDTH),
         }))
-    }
-
-    #[must_use]
-    pub fn client(&self) -> &Arc<GmailClient> {
-        &self.client
-    }
-
-    #[must_use]
-    pub fn profile(&self) -> &GmailProfile {
-        &self.profile
-    }
-
-    #[must_use]
-    pub fn priority(&self) -> Priority {
-        priority_from_u8(self.priority.load(Ordering::Acquire))
-    }
-
-    #[must_use]
-    pub fn bandwidth_cap(&self) -> Option<u64> {
-        match self.bandwidth_cap.load(Ordering::Acquire) {
-            UNLIMITED_BANDWIDTH => None,
-            value => Some(value),
-        }
     }
 }
 
@@ -337,14 +315,5 @@ fn priority_to_u8(priority: Priority) -> u8 {
         Priority::Background => 2,
         Priority::Bulk => 3,
         _ => 1,
-    }
-}
-
-fn priority_from_u8(value: u8) -> Priority {
-    match value {
-        0 => Priority::Foreground,
-        2 => Priority::Background,
-        3 => Priority::Bulk,
-        _ => Priority::Normal,
     }
 }

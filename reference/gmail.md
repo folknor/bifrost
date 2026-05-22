@@ -17,7 +17,7 @@ that route through `messages.batchModify` / `batchDelete`.
 
 `crates/gmail/src/account/`:
 
-- `mod.rs` - `GmailAccount`, `GmailAccountFactory`, `impl Account`.
+- `mod.rs` - `pub(crate) GmailAccount`, public `GmailAccountFactory`, `impl Account`.
 - `capabilities.rs` - `AccountCapabilities` builder.
 - `cursor.rs` - `GmailChangeState`, envelope encode/decode,
   `cursor_from_state`.
@@ -33,7 +33,6 @@ that route through `messages.batchModify` / `batchDelete`.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
   attachments.
 - `recovery.rs` - error classification onto `RecoveryClass`.
-- `idempotency.rs` - idempotency-key wire mapping (no headers).
 
 ## GmailAccount / GmailAccountFactory
 
@@ -56,7 +55,8 @@ the resulting `GmailChangeState` as `seed_state`. The opened
 - `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the label list.
 - `shutdown: CancellationToken` for the renewer and the
   lifecycle stream.
-- Atomics for `priority` and `bandwidth_cap`.
+- `set_priority` and `set_bandwidth_cap` delegate to the
+  underlying `AccountNet`; the transport owns the canonical knobs.
 
 `AccountFactory::open` returns `Arc<dyn Account>`. `reopen`
 flows from the engine: the engine drops the previous `Arc` and
@@ -93,8 +93,9 @@ on the same cancellation token.
   `batchModify`. The engine's read-back guard is the
   lost-update safety net.
 - `mutation.replay_safety: MutationReplaySafety::None`. Gmail
-  does not document a client-mintable dedup token; see
-  `idempotency.rs`.
+  does not document a client-mintable dedup token, so the
+  shared `IdempotencyKey` is accepted and held engine-side
+  rather than wired onto the request.
 - `batching_policy: BatchingPolicy { max_items: 1000, max_wait:
   75ms, flush_on_input_close: true }`. 1000 matches Gmail's
   `batchModify` cap.
@@ -283,10 +284,11 @@ Flag canonicalization in `flags.rs`:
 - A canonical flag set is hashed (FNV-1a) into the
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 
-`idempotency.rs` documents that Gmail does not accept a
-client-mintable idempotency header on these endpoints. The
-helper returns an empty header slice so call sites stay
-explicit about the no-wire-token posture.
+Gmail does not accept a client-mintable idempotency header on
+these endpoints. The mutation impls take the shared
+`IdempotencyKey` argument and hold it engine-side rather than
+wiring it onto the request, keeping the no-wire-token posture
+explicit at the call sites.
 
 ## Blobs
 

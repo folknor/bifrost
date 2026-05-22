@@ -4,14 +4,14 @@ use std::fmt::{self, Display, Formatter};
 const MAX_BODY_EXCERPT_CHARS: usize = 4096;
 
 /// Result type for Gmail client operations.
+// pub: direct Gmail REST callers use the crate-specific error alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Base64 alphabet used by a failed decoder.
+/// Base64 alphabet used by a failed Gmail body decoder.
+// pub: surfaced by Error::Base64 for direct REST callers.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Base64Encoding {
-    /// RFC 4648 standard base64 alphabet.
-    Standard,
     /// RFC 4648 URL-safe alphabet without padding, as used by Gmail bodies.
     UrlSafeNoPad,
 }
@@ -19,13 +19,13 @@ pub enum Base64Encoding {
 impl Display for Base64Encoding {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Standard => f.write_str("standard base64"),
             Self::UrlSafeNoPad => f.write_str("base64url without padding"),
         }
     }
 }
 
-/// Error type for Gmail and Google Drive API operations.
+/// Error type for Gmail API operations.
+// pub: direct Gmail REST callers need protocol-specific transport, auth, quota, and decode detail.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -45,7 +45,7 @@ pub enum Error {
         /// Truncated response body suitable for diagnostics.
         body: String,
     },
-    /// Gmail or Drive refused the bearer token.
+    /// Gmail refused the bearer token.
     Auth {
         /// Logical service being called.
         service: String,
@@ -56,7 +56,7 @@ pub enum Error {
         /// True when callers should refresh the token before retrying.
         refresh_required: bool,
     },
-    /// Quota, rate-limit, or upload bandwidth limit response.
+    /// Quota or rate-limit response.
     QuotaExhausted {
         /// Logical service being called.
         service: String,
@@ -74,7 +74,7 @@ pub enum Error {
         /// Decoder failure.
         source: base64::DecodeError,
     },
-    /// Gmail or Drive returned a response shape that is not usable.
+    /// Gmail returned a response shape that is not usable.
     MalformedPayload(String),
     /// Caller supplied an invalid argument.
     InvalidInput(String),
@@ -112,13 +112,6 @@ impl Error {
             service,
             status,
             body,
-        }
-    }
-
-    pub(crate) fn base64_standard(source: base64::DecodeError) -> Self {
-        Self::Base64 {
-            encoding: Base64Encoding::Standard,
-            source,
         }
     }
 

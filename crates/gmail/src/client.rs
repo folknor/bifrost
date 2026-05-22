@@ -10,8 +10,9 @@ use serde::de::DeserializeOwned;
 
 use crate::{Error, Result};
 
-pub const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
+const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
 
+// pub: non-engine consumers use GmailClient as the direct Gmail REST facade.
 #[derive(Clone)]
 pub struct GmailClient {
     inner: Arc<ClientInner>,
@@ -24,16 +25,19 @@ struct ClientInner {
 }
 
 impl GmailClient {
+    // pub: constructs the direct REST facade with the shared default Net.
     pub fn new(access_token: impl Into<String>) -> Self {
         Self::with_api_base(GMAIL_API_BASE, access_token)
     }
 
+    // pub: tests and private deployments can point the direct facade at an alternate API base.
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
         let token_source = StaticTokenSource::new(access_token, None);
         let net = default_account_net("gmail", "www.googleapis.com", token_source.clone());
         Self::with_account_net(net, api_base, token_source)
     }
 
+    // pub: consumers that need a custom NetConfig can supply the shared AccountNet.
     pub fn with_account_net(
         net: AccountNet,
         api_base: impl Into<String>,
@@ -48,38 +52,46 @@ impl GmailClient {
         }
     }
 
+    // pub: advanced callers can share the Gmail HTTP pipeline instead of building their own.
     pub fn account_net(&self) -> &AccountNet {
         &self.inner.net
     }
 
+    // pub: direct REST callers sometimes need to build Gmail URLs for batch endpoints.
     pub fn api_base(&self) -> &str {
         &self.inner.api_base
     }
 
+    // pub: direct REST callers can inspect the currently installed bearer token.
     pub async fn access_token(&self) -> String {
         self.inner.token_source.token().as_str().to_string()
     }
 
+    // pub: out-of-band token rotation updates both direct REST and Account traffic.
     pub async fn set_access_token(&self, access_token: impl Into<String>) {
         self.inner
             .token_source
             .set(AccessToken::new(access_token, None));
     }
 
+    // pub: low-level GET escape hatch for direct Gmail REST consumers.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.api_url(path);
         self.request::<T, ()>(&url, "GET", None).await
     }
 
+    // pub: low-level absolute-URL GET escape hatch for direct Gmail REST consumers.
     pub async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
         self.request::<T, ()>(url, "GET", None).await
     }
 
+    // pub: low-level POST escape hatch for direct Gmail REST consumers.
     pub async fn post<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = self.api_url(path);
         self.request(&url, "POST", Some(body)).await
     }
 
+    // pub: low-level absolute-URL POST escape hatch for direct Gmail REST consumers.
     pub async fn post_absolute<T: DeserializeOwned, B: Serialize>(
         &self,
         url: &str,
@@ -88,11 +100,13 @@ impl GmailClient {
         self.request(url, "POST", Some(body)).await
     }
 
+    // pub: low-level PUT escape hatch for direct Gmail REST consumers.
     pub async fn put<T: DeserializeOwned, B: Serialize>(&self, path: &str, body: &B) -> Result<T> {
         let url = self.api_url(path);
         self.request(&url, "PUT", Some(body)).await
     }
 
+    // pub: low-level absolute-URL PUT escape hatch for direct Gmail REST consumers.
     pub async fn put_absolute<T: DeserializeOwned, B: Serialize>(
         &self,
         url: &str,
@@ -101,6 +115,7 @@ impl GmailClient {
         self.request(url, "PUT", Some(body)).await
     }
 
+    // pub: low-level PATCH escape hatch for direct Gmail REST consumers.
     pub async fn patch<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
@@ -110,6 +125,7 @@ impl GmailClient {
         self.request(&url, "PATCH", Some(body)).await
     }
 
+    // pub: low-level absolute-URL PATCH escape hatch for direct Gmail REST consumers.
     pub async fn patch_absolute<T: DeserializeOwned, B: Serialize>(
         &self,
         url: &str,
@@ -118,16 +134,19 @@ impl GmailClient {
         self.request(url, "PATCH", Some(body)).await
     }
 
+    // pub: low-level DELETE escape hatch for direct Gmail REST consumers.
     pub async fn delete(&self, path: &str) -> Result<()> {
         let url = self.api_url(path);
         self.delete_absolute(&url, "Gmail API").await
     }
 
+    // pub: low-level absolute-URL DELETE escape hatch for companion Google APIs.
     pub async fn delete_absolute(&self, url: &str, service: &str) -> Result<()> {
         let response = self.execute(url, "DELETE", None::<&()>).await?;
         check_response_status(response, service).await
     }
 
+    // pub: direct Gmail REST endpoints such as users.stop return no JSON body.
     pub async fn post_no_content<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
         let url = self.api_url(path);
         let response = self.execute(&url, "POST", Some(body)).await?;

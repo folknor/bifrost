@@ -20,6 +20,7 @@ const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
+// pub: callers supply Gmail Pub/Sub topic details before the Account is opened.
 #[derive(Debug, Clone)]
 pub struct PubSubConfig {
     pub topic: String,
@@ -27,6 +28,7 @@ pub struct PubSubConfig {
 }
 
 impl PubSubConfig {
+    // pub: minimal Pub/Sub config for account-wide Gmail watch subscriptions.
     pub fn new(topic: impl Into<String>) -> Self {
         Self {
             topic: topic.into(),
@@ -34,6 +36,7 @@ impl PubSubConfig {
         }
     }
 
+    // pub: callers can restrict Gmail watch subscriptions to selected labels.
     pub fn with_label_ids(
         mut self,
         label_ids: impl IntoIterator<Item = impl Into<String>>,

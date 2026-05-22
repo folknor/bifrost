@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+// pub: direct Gmail REST methods return messages and nested message payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailMessage {
@@ -16,6 +17,7 @@ pub struct GmailMessage {
     pub raw: Option<String>,
 }
 
+// pub: nested in GmailMessage payloads returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailPayload {
@@ -30,12 +32,14 @@ pub struct GmailPayload {
     pub parts: Vec<GmailPayload>,
 }
 
+// pub: nested in GmailPayload headers returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GmailHeader {
     pub name: String,
     pub value: String,
 }
 
+// pub: nested in GmailPayload bodies returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailBody {
@@ -45,6 +49,7 @@ pub struct GmailBody {
     pub data: Option<String>,
 }
 
+// pub: returned by GmailClient thread hydration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailThread {
@@ -54,6 +59,7 @@ pub struct GmailThread {
     pub messages: Vec<GmailMessage>,
 }
 
+// pub: returned by GmailClient thread listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailThreadStub {
@@ -62,6 +68,7 @@ pub struct GmailThreadStub {
     pub history_id: Option<String>,
 }
 
+// pub: returned by GmailClient label methods and used by Account label discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailLabel {
@@ -78,6 +85,7 @@ pub struct GmailLabel {
     pub color: Option<GmailLabelColor>,
 }
 
+// pub: nested in GmailLabel responses returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailLabelColor {
@@ -85,6 +93,7 @@ pub struct GmailLabelColor {
     pub background_color: String,
 }
 
+// pub: returned by GmailClient history listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailHistoryResponse {
@@ -94,6 +103,7 @@ pub struct GmailHistoryResponse {
     pub next_page_token: Option<String>,
 }
 
+// pub: nested in GmailHistoryResponse returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailHistoryItem {
@@ -110,11 +120,13 @@ pub struct GmailHistoryItem {
     pub labels_removed: Vec<GmailHistoryLabelWrapper>,
 }
 
+// pub: nested in GmailHistoryItem returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GmailHistoryMessageWrapper {
     pub message: GmailMessage,
 }
 
+// pub: nested in GmailHistoryItem returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailHistoryLabelWrapper {
@@ -124,7 +136,7 @@ pub struct GmailHistoryLabelWrapper {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ListThreadsResponse {
+pub(crate) struct ListThreadsResponse {
     #[serde(default)]
     pub threads: Vec<GmailThreadStub>,
     pub next_page_token: Option<String>,
@@ -132,11 +144,12 @@ pub struct ListThreadsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListLabelsResponse {
+pub(crate) struct ListLabelsResponse {
     #[serde(default)]
     pub labels: Vec<GmailLabel>,
 }
 
+// pub: returned by GmailClient attachment fetches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailAttachmentData {
@@ -145,12 +158,14 @@ pub struct GmailAttachmentData {
     pub data: String,
 }
 
+// pub: returned by GmailClient draft creation and update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GmailDraft {
     pub id: String,
     pub message: GmailMessage,
 }
 
+// pub: returned by GmailClient draft listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailDraftStub {
@@ -158,6 +173,7 @@ pub struct GmailDraftStub {
     pub message: GmailDraftMessageRef,
 }
 
+// pub: nested in GmailDraftStub returned by the direct REST facade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailDraftMessageRef {
@@ -167,12 +183,13 @@ pub struct GmailDraftMessageRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ListDraftsResponse {
+pub(crate) struct ListDraftsResponse {
     #[serde(default)]
     pub drafts: Vec<GmailDraftStub>,
     pub next_page_token: Option<String>,
 }
 
+// pub: returned by GmailClient send-as listing and update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailSendAs {
@@ -187,11 +204,12 @@ pub struct GmailSendAs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ListSendAsResponse {
+pub(crate) struct ListSendAsResponse {
     #[serde(default)]
     pub send_as: Vec<GmailSendAs>,
 }
 
+// pub: returned by GmailClient profile fetches and used by Account cursor identity checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GmailProfile {
