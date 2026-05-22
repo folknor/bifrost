@@ -47,9 +47,9 @@ pub use error::{Error, Fatal, RecoveryClass, StrategyDowngrade, Warning, Warning
 // Stream-event types.
 pub use events::{
     BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control, HintPayload,
-    InvalidationHint, InvalidationSink, InventoryEntry, ObjectChange, ObjectChangeKind,
-    PageBoundary, Partition, Priority, Progress, PushSource, ScopeChange, ScopeChangeKind,
-    SyncEvent, WatchEvent,
+    InvalidationHint, InvalidationSink, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    ObjectChange, ObjectChangeKind, PageBoundary, Partition, Priority, Progress, PushSource,
+    ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
 };
 
 // Newtype ids.

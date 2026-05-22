@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountFuture, CursorScope, Error as AccountError, SubscriptionHandle, WatchEvent,
+    AccountFuture, AccountStream, CursorScope, Error as AccountError, SubscriptionHandle,
+    WatchEvent,
 };
-use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +19,7 @@ use super::recovery;
 
 const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct PubSubConfig {
@@ -49,16 +50,19 @@ pub(crate) struct PubSubControl {
     expiration: Mutex<Option<SystemTime>>,
     renewer: Mutex<Option<JoinHandle<()>>>,
     active_handles: Mutex<HashSet<String>>,
+    health_tx: broadcast::Sender<WatchEvent>,
 }
 
 impl PubSubControl {
     pub(crate) fn new(config: Option<PubSubConfig>) -> Self {
+        let (health_tx, _) = broadcast::channel(32);
         Self {
             config,
             last_history_id: Mutex::new(None),
             expiration: Mutex::new(None),
             renewer: Mutex::new(None),
             active_handles: Mutex::new(HashSet::new()),
+            health_tx,
         }
     }
 
@@ -85,6 +89,10 @@ impl PubSubControl {
         let mut handles = self.active_handles.lock().await;
         handles.remove(&handle.0);
         handles.is_empty()
+    }
+
+    fn report_health(&self, event: WatchEvent) {
+        let _ = self.health_tx.send(event);
     }
 }
 
@@ -123,6 +131,7 @@ pub(crate) fn push_subscribe(
             .await
             .map_err(|error| recovery::account_error_from_gmail(&error))?;
         pubsub.store_watch_response(&response).await;
+        pubsub.report_health(WatchEvent::Reconnected);
         start_renewer(
             Arc::clone(&client),
             Arc::clone(&pubsub),
@@ -166,8 +175,28 @@ pub(crate) fn push_unsubscribe(
     })
 }
 
-pub(crate) fn push_stream() -> bifrost_types::AccountStream<WatchEvent> {
-    Box::pin(stream::empty())
+pub(crate) fn push_stream(
+    pubsub: Arc<PubSubControl>,
+    shutdown: CancellationToken,
+) -> AccountStream<WatchEvent> {
+    let receiver = pubsub.health_tx.subscribe();
+    Box::pin(futures::stream::unfold(
+        (receiver, shutdown),
+        |(mut receiver, shutdown)| async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return None,
+                    result = receiver.recv() => {
+                        match result {
+                            Ok(event) => return Some((event, (receiver, shutdown))),
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                }
+            }
+        },
+    ))
 }
 
 async fn start_renewer(
@@ -182,20 +211,36 @@ async fn start_renewer(
     }
     let control = Arc::clone(&pubsub);
     *guard = Some(tokio::spawn(async move {
+        let mut disconnected = false;
+        let mut retry_after = None;
         loop {
-            let delay = {
-                let expiration = *control.expiration.lock().await;
-                renewal_delay(expiration)
+            let delay = match retry_after.take() {
+                Some(delay) => delay,
+                None => {
+                    let expiration = *control.expiration.lock().await;
+                    renewal_delay(expiration)
+                }
             };
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
             }
             match watch_once(&client, &config).await {
-                Ok(response) => control.store_watch_response(&response).await,
+                Ok(response) => {
+                    control.store_watch_response(&response).await;
+                    retry_after = None;
+                    if disconnected {
+                        control.report_health(WatchEvent::Reconnected);
+                        disconnected = false;
+                    }
+                }
                 Err(error) => {
                     log::warn!("gmail Pub/Sub watch renewal failed: {error}");
-                    return;
+                    if !disconnected {
+                        control.report_health(WatchEvent::Disconnected);
+                        disconnected = true;
+                    }
+                    retry_after = Some(RENEW_RETRY_AFTER);
                 }
             }
         }

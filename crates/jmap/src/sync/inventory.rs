@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, BlobId, CursorScope, Fingerprint, InventoryEntry, MembershipScope,
-    ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent, ThreadId,
+    AccountStream, Batch, BlobId, CursorScope, Fingerprint, InventoryEntry, InventoryPartition,
+    MembershipScope, ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent, ThreadId,
 };
 
 use crate::core::query;
@@ -34,6 +34,27 @@ pub(crate) fn stream(
         }),
         _ => Box::pin(async_stream::stream! {
                 yield super::error::fatal_unsupported("cursor scope is not supported by JMAP");
+        }),
+    }
+}
+
+pub(crate) fn stream_partition(
+    mail: MailAccount,
+    limits: CoreLimits,
+    scope: CursorScope,
+    partition: InventoryPartition,
+) -> AccountStream<SyncEvent<InventoryEntry>> {
+    match partition {
+        InventoryPartition::Full => stream(mail, limits, scope),
+        InventoryPartition::Page { from, to }
+            if matches!(scope, CursorScope::Type(ObjectType::Email)) =>
+        {
+            email_inventory_page(mail, limits, from, to)
+        }
+        _ => Box::pin(async_stream::stream! {
+            yield super::error::fatal_unsupported(
+                "JMAP inventory partition is not supported for this cursor scope",
+            );
         }),
     }
 }
@@ -130,6 +151,98 @@ fn email_inventory(
                 }
             };
         }
+    })
+}
+
+fn email_inventory_page(
+    mail: MailAccount,
+    _limits: CoreLimits,
+    from: u32,
+    to: u32,
+) -> AccountStream<SyncEvent<InventoryEntry>> {
+    Box::pin(async_stream::stream! {
+        if to <= from {
+            yield SyncEvent::Done(None);
+            return;
+        }
+
+        let started = Instant::now();
+        let limit = match usize::try_from(to - from) {
+            Ok(limit) if limit != 0 => limit,
+            _ => {
+                yield super::error::fatal_unsupported(
+                    "JMAP inventory page range could not be converted to usize",
+                );
+                return;
+            }
+        };
+        let position = match i32::try_from(from) {
+            Ok(position) => position,
+            Err(_) => {
+                yield super::error::fatal_unsupported(
+                    "JMAP inventory page position exceeded i32",
+                );
+                return;
+            }
+        };
+        let query_response = mail
+            .call(
+                EmailQuery::new()
+                    .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
+                    .position(position)
+                    .limit(limit),
+            )
+            .await;
+
+        let query_response = match query_response {
+            Ok(response) => response,
+            Err(err) => {
+                yield super::error::fatal_from_jmap(
+                    err,
+                    Some(CursorScope::Type(ObjectType::Email)),
+                );
+                return;
+            }
+        };
+
+        let ids = query_response.ids().to_vec();
+        if ids.is_empty() {
+            yield SyncEvent::Done(None);
+            return;
+        }
+
+        let get_response = mail
+            .call(EmailGet::new().ids(ids).properties(inventory_properties()))
+            .await;
+
+        let get_response = match get_response {
+            Ok(response) => response,
+            Err(err) => {
+                yield super::error::fatal_from_jmap(
+                    err,
+                    Some(CursorScope::Type(ObjectType::Email)),
+                );
+                return;
+            }
+        };
+
+        let state = get_response.state().to_string();
+        let items = get_response
+            .into_list()
+            .into_iter()
+            .map(|email| email_to_inventory(email, &state))
+            .collect::<Vec<_>>();
+
+        if !items.is_empty() {
+            yield SyncEvent::Batch(Batch {
+                items,
+                page_boundary: PageBoundary::Final,
+                server_latency: started.elapsed(),
+                bytes_in: 0,
+                checkpoint: None,
+            });
+        }
+        yield SyncEvent::Done(None);
     })
 }
 

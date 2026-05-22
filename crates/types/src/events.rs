@@ -38,11 +38,60 @@ pub struct BackfillCheckpoint {
     pub envelope_version: u32,
 }
 
-/// Backfill partition descriptor. Engine-side, opaque bytes; the
-/// engine chooses partitioning strategy (newest-first by day, by UID
-/// range, by page count).
+/// Backfill partition descriptor. Consumer-store key, opaque outside
+/// the engine. `InventoryPartition` is the Account-facing shape; this
+/// byte key is the durable checkpoint identity derived from it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Partition(pub Vec<u8>);
+
+/// Account-facing inventory partition.
+///
+/// `Full` preserves the original one-pass inventory contract. Other
+/// variants let the engine request a finite slice without coupling to
+/// a specific protocol crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InventoryPartition {
+    Full,
+    /// Time window as Unix epoch seconds, inclusive-exclusive.
+    Time {
+        from_unix_seconds: Option<i64>,
+        to_unix_seconds: Option<i64>,
+    },
+    /// Inclusive UID range.
+    Uid {
+        from: u32,
+        to: u32,
+    },
+    /// Count-based page range, inclusive-exclusive.
+    Page {
+        from: u32,
+        to: u32,
+    },
+}
+
+/// Partitioning modes an Account can honor for a scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InventoryPartitioning {
+    /// Only the original full `inventory_stream(scope)` pass is
+    /// supported.
+    Full,
+    /// Account can honor `InventoryPartition::Time` windows.
+    TimeWindowed,
+    /// Account can honor `InventoryPartition::Uid` ranges. `max_uid`
+    /// is optional because some protocol impls only know it after a
+    /// folder open; the engine falls back to `Full` when it is absent.
+    UidRange { max_uid: Option<u32> },
+    /// Account can honor `InventoryPartition::Page` ranges. `total`
+    /// is optional; when absent, the engine walks pages until a short
+    /// page is observed. `page_size` lets the account cap engine
+    /// requests at a protocol-advertised per-page maximum.
+    PageCount {
+        total: Option<u32>,
+        page_size: Option<u32>,
+    },
+}
 
 /// Progress within a single backfill partition.
 #[derive(Debug, Clone, Copy, Default)]

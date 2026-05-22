@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use bifrost_types::{CursorScope, Error, ObjectType, SubscriptionHandle};
+use bifrost_types::{CursorScope, Error, ObjectType, SubscriptionHandle, WatchEvent};
 
-use crate::webhooks::{create_subscription, delete_subscription};
+use crate::webhooks::{
+    create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
+};
 
 use super::{GraphAccount, PushMode};
+
+const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct PushEndpoint {
@@ -91,6 +97,8 @@ async fn subscribe_graph(
             scopes: all_scopes,
         },
     );
+    let _ = account.push_tx.send(WatchEvent::Reconnected);
+    ensure_graph_worker(account).await;
     Ok(handle)
 }
 
@@ -103,7 +111,90 @@ async fn unsubscribe_graph(account: GraphAccount, handle: SubscriptionHandle) ->
             .await
             .map_err(Error::Transport)?;
     }
+    if account.graph_subscriptions.read().await.is_empty()
+        && let Some(worker) = account.graph_worker.lock().await.take()
+    {
+        worker.abort();
+    }
     Ok(())
+}
+
+async fn ensure_graph_worker(account: GraphAccount) {
+    if account.push_mode != PushMode::GraphSubscriptions {
+        return;
+    }
+    let mut worker = account.graph_worker.lock().await;
+    let needs_start = worker
+        .as_ref()
+        .is_none_or(tokio::task::JoinHandle::is_finished);
+    if needs_start {
+        let worker_account = account.clone();
+        *worker = Some(tokio::spawn(async move {
+            run_graph_subscription_worker(worker_account).await;
+        }));
+    }
+}
+
+async fn run_graph_subscription_worker(account: GraphAccount) {
+    let mut disconnected = false;
+    loop {
+        tokio::select! {
+            () = account.shutdown.cancelled() => return,
+            () = tokio::time::sleep(RENEWAL_CHECK_INTERVAL) => {}
+        }
+
+        let due = {
+            let groups = account.graph_subscriptions.read().await;
+            if groups.is_empty() {
+                return;
+            }
+            groups
+                .iter()
+                .flat_map(|(handle, group)| {
+                    group.subscriptions.iter().filter_map(move |state| {
+                        if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
+                            Some((handle.clone(), state.server_id.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut had_error = false;
+        for (handle, server_id) in due {
+            match renew_subscription(&account.client, &server_id, None).await {
+                Ok(new_expiry) => {
+                    let mut groups = account.graph_subscriptions.write().await;
+                    if let Some(group) = groups.get_mut(&handle)
+                        && let Some(state) = group
+                            .subscriptions
+                            .iter_mut()
+                            .find(|state| state.server_id == server_id)
+                    {
+                        state.expires_at = new_expiry;
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[Graph webhooks] Failed to renew subscription {server_id}: {error}"
+                    );
+                    had_error = true;
+                }
+            }
+        }
+
+        if had_error {
+            if !disconnected {
+                let _ = account.push_tx.send(WatchEvent::Disconnected);
+                disconnected = true;
+            }
+        } else if disconnected {
+            let _ = account.push_tx.send(WatchEvent::Reconnected);
+            disconnected = false;
+        }
+    }
 }
 
 async fn subscribe_ews(

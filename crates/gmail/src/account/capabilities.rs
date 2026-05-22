@@ -32,9 +32,11 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use bifrost_types::{
         BlobRangeSupport, CursorFreshness, MutationConcurrency, MutationReplaySafety,
-        PushCapability,
+        PushCapability, QuotaSignal, RateLimitClass,
     };
 
     use super::*;
@@ -51,5 +53,27 @@ mod tests {
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.batching_policy.max_items, 1000);
         assert!(caps.historyid_expires_after.is_none());
+    }
+
+    #[test]
+    fn batching_policy_matches_gmail_batch_modify_limit() {
+        let caps = gmail_capabilities();
+        assert_eq!(caps.batching_policy.max_items, GMAIL_BATCH_MODIFY_LIMIT);
+        assert_eq!(caps.batching_policy.max_wait, Duration::from_millis(75));
+        assert!(caps.batching_policy.flush_on_input_close);
+    }
+
+    #[test]
+    fn rate_limit_and_quota_match_gmail_quota_units() {
+        let caps = gmail_capabilities();
+        assert_eq!(caps.rate_limit_class, RateLimitClass::Tiered);
+        assert_eq!(caps.quota_signal, QuotaSignal::QuotaUnits);
+    }
+
+    #[test]
+    fn no_uidvalidity_recheck_or_delta_token() {
+        let caps = gmail_capabilities();
+        assert!(!caps.requires_uidvalidity_recheck);
+        assert!(caps.delta_token_expires_after.is_none());
     }
 }

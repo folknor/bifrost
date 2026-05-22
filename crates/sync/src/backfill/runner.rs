@@ -13,14 +13,18 @@ use std::sync::Mutex;
 
 use bifrost_types::{
     Account, AccountId, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint,
-    CursorScope, InventoryEntry, ObjectChange, ObjectChangeKind, ObjectId, Partition, SyncEvent,
+    CursorScope, InventoryEntry, InventoryPartition, ObjectChange, ObjectChangeKind, ObjectId,
+    SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
 
+use crate::control::SyncControl;
 use crate::cursor::store::DynCheckpointStore;
 use crate::error::Error;
 use crate::multiplexer::MultiplexerEvent;
+
+use super::partitioner::partition_key;
 
 /// Default cap on `LiveSupersedes`. Beyond this many entries, the
 /// oldest insertions are evicted via a FIFO ring so the set does not
@@ -124,6 +128,15 @@ impl LiveSupersedes {
 /// One partition's runner.
 pub struct BackfillRunner;
 
+/// Outcome for one partition pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackfillPartitionOutcome {
+    /// Inventory entries observed before the live-supersedes filter.
+    pub seen: u64,
+    /// Inventory entries forwarded after the live-supersedes filter.
+    pub kept: u64,
+}
+
 impl BackfillRunner {
     /// Walk one inventory pass to completion. Forwards each `Batch`
     /// onto the per-account `changes_tx` broadcast as
@@ -135,18 +148,23 @@ impl BackfillRunner {
     pub async fn run_partition(
         account: &dyn Account,
         scope: CursorScope,
-        partition: Partition,
+        partition: InventoryPartition,
         live: &LiveSupersedes,
         account_id: &AccountId,
         store: Arc<DynCheckpointStore>,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+        control: Option<SyncControl>,
         envelope_version: u32,
-    ) -> Result<u64, Error> {
-        let mut stream = account.inventory_stream(scope.clone());
+    ) -> Result<BackfillPartitionOutcome, Error> {
+        let partition_key = partition_key(&partition);
+        let mut stream = account.inventory_partition_stream(scope.clone(), partition);
+        let mut seen_total: u64 = 0;
         let mut kept_total: u64 = 0;
         while let Some(event) = stream.next().await {
             match event {
                 SyncEvent::Batch(batch) => {
+                    let seen = u64::try_from(batch.items.len()).unwrap_or(u64::MAX);
+                    seen_total = seen_total.saturating_add(seen);
                     let kept = filter_supersedes(&batch.items, live);
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
@@ -154,7 +172,7 @@ impl BackfillRunner {
                     // Build the BackfillCheckpoint for this page.
                     let bf = BackfillCheckpoint {
                         scope: scope.clone(),
-                        partition: partition.clone(),
+                        partition: partition_key.clone(),
                         progress_marker: None,
                         progress: BackfillProgress {
                             items_done: kept_total,
@@ -190,7 +208,10 @@ impl BackfillRunner {
                     }
 
                     // Persist at every page boundary.
-                    store.put_backfill(account_id, bf).await?;
+                    store.put_backfill(account_id, bf.clone()).await?;
+                    if let Some(control) = &control {
+                        control.record_checkpoint(Checkpoint::Backfill(bf)).await;
+                    }
                 }
                 SyncEvent::Done(_) => break,
                 SyncEvent::Fatal(f) => {
@@ -209,7 +230,10 @@ impl BackfillRunner {
                 _ => {}
             }
         }
-        Ok(kept_total)
+        Ok(BackfillPartitionOutcome {
+            seen: seen_total,
+            kept: kept_total,
+        })
     }
 }
 

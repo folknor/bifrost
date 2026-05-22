@@ -188,32 +188,63 @@ Each new `reference/{jmap,imap,gmail,graph}.md` covers:
 
 ### File ownership
 
-Four remaining agents, disjoint ownership. P3-A0 and P3-A2 are
-already merged; P3-A1, P3-A3, P3-A4 and the orchestrator
-cross-crate work can launch in parallel.
+P3-A0, P3-A2, and P3-A3 are merged. P3-A1's reference doc is
+merged; its conformance tests are deferred behind in-flight
+sync-engine work in `crates/jmap/src/sync/`. P3-A4 and the
+orchestrator cross-crate work remain.
 
 - **P3-A0 (CONDSTORE/QRESYNC)**: merged. Code lives across
   `crates/imap/src/account/{factory,capabilities,changes,
   folder_registry,inventory,mutate,push,get,blob,mod,pool}.rs`.
   Mutation concurrency stays `MutationConcurrency::None` by
   design; see the P2-A2 note above.
-- **P3-A1 (jmap)**: `reference/jmap.md` (new) + jmap conformance
-  test additions inside `crates/jmap/src/sync/` modules.
+- **P3-A1 (jmap)**: reference doc merged. `reference/jmap.md`
+  now appends an "Account layer" section describing
+  `JmapAccount` / `JmapAccountFactory`, the hand-rolled cursor
+  envelope, per-scope inventory / changes / hydration, WebSocket
+  push + `ReconnectPolicy`, the mutation pipeline, and the
+  recovery-taxonomy error mapping. Conformance test additions
+  inside `crates/jmap/src/sync/` are deferred until the sync
+  engine's `InventoryPartition` rework settles in that tree.
 - **P3-A2 (imap)**: merged. `reference/imap.md` describes the
   account-layer architecture, the QRESYNC / CONDSTORE / Basic
   cursor strategy, the modseq cache lifecycle, and the
   mutation-concurrency rationale. Conformance test additions
   inside `crates/imap/src/account/` modules are still
   outstanding.
-- **P3-A3 (gmail)**: `reference/gmail.md` (new) + gmail
-  conformance test additions inside `crates/gmail/src/account/`
-  modules.
+- **P3-A3 (gmail)**: merged. `reference/gmail.md` covers the
+  history-id seeded sync, Cloud Pub/Sub push with renewer task,
+  and the recovery-taxonomy error mapping. Conformance tests
+  added across `crates/gmail/src/account/{cursor,capabilities,
+  recovery,inventory}.rs` cover cursor round-trip, capability
+  shape, error classification, and scope-to-method wiring.
 - **P3-A4 (graph)**: `reference/graph.md` (new) + graph
   conformance test additions inside `crates/graph/src/account/`
   modules.
 - **Orchestrator**: writes the cross-crate conformance assertion
   in `bifrost-sync` (or `bifrost-types`), runs `brokkr check`
   cleanup workspace-wide.
+
+### Sync-engine follow-ups (resolved)
+
+The follow-up list at the bottom of `reference/sync.md` has been
+worked off. Notable items landed alongside Phase 3:
+
+- Protocol-neutral `InventoryPartition` and `InventoryPartitioning`
+  added to `bifrost-types`, with default full-pass behavior on
+  `Account`.
+- Sync backfill plans and runs real partitions, calls
+  `inventory_partition_stream`, and records durable backfill
+  checkpoints through `SyncControl`.
+- JMAP Email inventory supports open-ended page partitions.
+- Push forwarding runs for every push-capable account, not only
+  in-process push.
+- Gmail Pub/Sub publishes health events and applies retry
+  backoff.
+- Graph webhook subscriptions stream health events and run a
+  renewal health worker.
+- `reference/sync.md` describes the resulting behavior; the old
+  follow-up section has been removed.
 
 ### Brokkr check cleanup
 
@@ -237,8 +268,8 @@ Phase 3 is done when all of these hold:
   design because the modseq cache is cold-startable. Any future
   flip to `StateBased` would need a separate plan.
 - All four `reference/{jmap,imap,gmail,graph}.md` files exist
-  and match the section list above. `reference/imap.md` is
-  done; `jmap`, `gmail`, `graph` are still outstanding.
+  and match the section list above. `imap`, `jmap`, and `gmail`
+  are done; `graph` is still outstanding.
 - Per-protocol conformance tests cover cursor envelope round-
   trip, capability shape, error classification, and scope-to-
   method wiring for each crate.

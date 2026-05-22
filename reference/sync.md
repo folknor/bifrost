@@ -1,7 +1,6 @@
 # bifrost-sync reference
 
-Current architecture of the sync engine. In-flight design lives in
-`plans/bifrost-sync.md` and `plans/sync-engine.md`.
+Current architecture of the sync engine.
 
 Scope: scheduler, multiplexer, backfill orchestrator, push
 reconciler, mutation pipeline, checkpoint envelope versioning,
@@ -90,23 +89,31 @@ persists only on a successful `Done`.
   helper.
 - **Scope lifecycle** events from `Account::scope_lifecycle_stream`.
 - **Reopen requests** on a `mpsc::Sender<ReopenRequest>` channel:
-  `RestartScope` resets the scope's cursor to an empty-bytes stub
-  and re-establishes via inventory; `RestartAccount` and
-  `CapabilityChanged` route up to the engine's reopen path.
+  `RestartScope` deletes the in-memory and durable cursor before
+  re-establishing; `RestartAccount` and `CapabilityChanged` route
+  up to the engine's reopen path.
 
 Output goes to the per-account `broadcast::Sender<MultiplexerEvent>`
 that the consumer subscribes to.
 
 ## Backfill
 
-`BackfillRunner::run_partition` walks `inventory_stream(scope)` and
-emits `BackfillCheckpoint`s at partition boundaries via
-`CheckpointStore::put_backfill`. The orchestrator spawns one
-runner per scope from `discover_cursor_scopes()`.
+`BackfillRunner::run_partition` walks
+`inventory_partition_stream(scope, partition)` and emits
+`BackfillCheckpoint`s at partition boundaries via
+`CheckpointStore::put_backfill`. The orchestrator spawns runners
+from `discover_cursor_scopes()` and plans partitions from
+`Account::inventory_partitioning(scope)`: `Full` preserves the
+legacy one-pass inventory, `TimeWindowed` uses the default
+time-boundary policy, `UidRange` uses `BackfillConfig` UID chunks
+when the account supplies `max_uid`, and `PageCount` uses finite
+or open-ended page partitions. JMAP Email currently advertises
+open-ended `PageCount`; non-partitioned protocols fall back to
+`Full`.
 
-Current shape: one inventory pass per scope; the
-`BackfillPolicy::Strategy` (TimeWindow / UidRange / PageCount)
-informs page-size hints but partition planning is a follow-up.
+Backfill persistence calls `SyncControl::record_checkpoint` only
+after `CheckpointStore::put_backfill` succeeds, so pause and
+checkpoint waiters observe durable boundaries.
 
 ## Push
 
@@ -123,8 +130,11 @@ membership index populated at attach), then drives
 `changes_stream` to completion for each affected scope.
 `Disconnected` / `Reconnected` surface as `Warning`s.
 
-For `push_in_process = true` accounts, the push forwarder task
-relays `Account::push_stream` directly into the sink.
+For every account with push capability other than `None`, the
+push forwarder task relays `Account::push_stream` into the sink.
+In-process push streams carry invalidations plus health events;
+out-of-process streams carry subscription-health events while
+their invalidations still enter through `InvalidationSink`.
 
 ## Mutation pipeline
 
@@ -272,17 +282,4 @@ crates/sync/src/
 
 ## Open follow-ups (post-Phase-2 hardening)
 
-- `BackfillPolicy::Strategy` informs page sizing but partition
-  planning is a single inventory pass per scope today.
-- `RestartScope` resets the cursor to an empty-bytes stub with a
-  placeholder `ProtocolKind`; replaced on the next
-  `establish_initial_cursor`. Engine-internal bookkeeping; should
-  never escape.
-- The multiplexer routes `ChangesEvent::Fatal` conservatively to
-  `ReopenRequest::Scope` regardless of inner `RecoveryClass`;
-  more nuanced mapping (Retry vs RestartScope vs
-  CapabilityChanged) needs a side-channel from
-  `drive_changes_stream`.
-- Subscription-health surfacing for out-of-process push (Gmail
-  Pub/Sub, Graph webhooks) is silent today; tracked in
-  `plans/account-trait.md` -> Open questions.
+No sync-engine hardening follow-ups are currently tracked here.

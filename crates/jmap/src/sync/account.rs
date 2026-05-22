@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use bifrost_types::{
     Account, AccountCapabilities, AccountFuture, AccountStream, BlobHandle, ByteRange,
     ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, Error,
-    HydratedObject, IdempotencyKey, InventoryEntry, MembershipScope, MutationResult, ObjectId,
-    Priority, Projection, ScopeLifecycle, SubscriptionHandle, SyncEvent, SyncStrategy, WatchEvent,
+    HydratedObject, IdempotencyKey, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    MembershipScope, MutationResult, ObjectId, Priority, Projection, ScopeLifecycle,
+    SubscriptionHandle, SyncEvent, SyncStrategy, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -160,6 +161,26 @@ impl Account for JmapAccount {
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
         inventory::stream(self.mail.clone(), self.core_limits, scope)
+    }
+
+    fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
+        match scope {
+            CursorScope::Type(bifrost_types::ObjectType::Email) => {
+                InventoryPartitioning::PageCount {
+                    total: None,
+                    page_size: u32::try_from(self.core_limits.max_objects_in_get).ok(),
+                }
+            }
+            _ => InventoryPartitioning::Full,
+        }
+    }
+
+    fn inventory_partition_stream(
+        &self,
+        scope: CursorScope,
+        partition: InventoryPartition,
+    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+        inventory::stream_partition(self.mail.clone(), self.core_limits, scope, partition)
     }
 
     fn get_stream(

@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use bifrost_types::{InventoryPartition, Partition};
 use chrono::{DateTime, Utc};
 
 /// Account-level backfill policy.
@@ -85,6 +86,54 @@ pub enum PartitionBounds {
     Uid { from: u32, to: u32 },
     /// `[from, to)` page-count range.
     Page { from: u32, to: u32 },
+}
+
+/// Convert planner bounds into the protocol-neutral Account trait
+/// partition shape.
+#[must_use]
+pub fn inventory_partition_for(bounds: &PartitionBounds) -> InventoryPartition {
+    match bounds {
+        PartitionBounds::Time { from, to } => InventoryPartition::Time {
+            from_unix_seconds: if *from == DateTime::<Utc>::MIN_UTC {
+                None
+            } else {
+                Some(from.timestamp())
+            },
+            to_unix_seconds: Some(to.timestamp()),
+        },
+        PartitionBounds::Uid { from, to } => InventoryPartition::Uid {
+            from: *from,
+            to: *to,
+        },
+        PartitionBounds::Page { from, to } => InventoryPartition::Page {
+            from: *from,
+            to: *to,
+        },
+    }
+}
+
+/// Stable durable checkpoint key for an inventory partition.
+#[must_use]
+pub fn partition_key(partition: &InventoryPartition) -> Partition {
+    let key = match partition {
+        InventoryPartition::Full => "full".to_string(),
+        InventoryPartition::Time {
+            from_unix_seconds,
+            to_unix_seconds,
+        } => format!(
+            "time:{}:{}",
+            optional_i64(*from_unix_seconds),
+            optional_i64(*to_unix_seconds)
+        ),
+        InventoryPartition::Uid { from, to } => format!("uid:{from}:{to}"),
+        InventoryPartition::Page { from, to } => format!("page:{from}:{to}"),
+        _ => "unknown".to_string(),
+    };
+    Partition(key.into_bytes())
+}
+
+fn optional_i64(value: Option<i64>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_default()
 }
 
 /// Plan a partition list for the given policy.
@@ -230,6 +279,49 @@ mod tests {
                 PartitionBounds::Page { from: 250, to: 500 },
                 PartitionBounds::Page { from: 500, to: 700 },
             ]
+        );
+    }
+
+    #[test]
+    fn bounds_convert_to_account_partitions() {
+        let time = PartitionBounds::Time {
+            from: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            to: Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
+        };
+        assert_eq!(
+            inventory_partition_for(&time),
+            InventoryPartition::Time {
+                from_unix_seconds: Some(1_777_593_600),
+                to_unix_seconds: Some(1_777_680_000),
+            }
+        );
+
+        assert_eq!(
+            inventory_partition_for(&PartitionBounds::Uid { from: 10, to: 20 }),
+            InventoryPartition::Uid { from: 10, to: 20 }
+        );
+        assert_eq!(
+            inventory_partition_for(&PartitionBounds::Page { from: 0, to: 50 }),
+            InventoryPartition::Page { from: 0, to: 50 }
+        );
+    }
+
+    #[test]
+    fn partition_keys_are_stable() {
+        assert_eq!(
+            partition_key(&InventoryPartition::Page { from: 25, to: 50 }),
+            Partition(b"page:25:50".to_vec())
+        );
+        assert_eq!(
+            partition_key(&InventoryPartition::Uid { from: 7, to: 9 }),
+            Partition(b"uid:7:9".to_vec())
+        );
+        assert_eq!(
+            partition_key(&InventoryPartition::Time {
+                from_unix_seconds: None,
+                to_unix_seconds: Some(123),
+            }),
+            Partition(b"time::123".to_vec())
         );
     }
 

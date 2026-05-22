@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use checkpoint::BackfillCheckpointWriter;
 pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
-pub use runner::{BackfillRunner, LiveSupersedes};
+pub use runner::{BackfillPartitionOutcome, BackfillRunner, LiveSupersedes};
 
 /// Engine-side handle stashed in the per-account slot.
 #[derive(Debug)]

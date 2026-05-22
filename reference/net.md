@@ -1,7 +1,6 @@
 # bifrost-net reference
 
-Current architecture of the shared HTTP transport crate. In-flight
-design lives in `plans/bifrost-net.md`.
+Current architecture of the shared HTTP transport crate.
 
 Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry
 budget, per-host rate limiting, per-account bandwidth metering,

@@ -5,7 +5,27 @@ use super::{GraphAccount, PushMode};
 
 pub(crate) fn push_stream(account: GraphAccount) -> AccountStream<WatchEvent> {
     match account.push_mode {
-        PushMode::GraphSubscriptions => Box::pin(stream::empty()),
+        PushMode::GraphSubscriptions => {
+            let receiver = account.push_tx.subscribe();
+            let shutdown = account.shutdown.clone();
+            Box::pin(stream::unfold(
+                (receiver, shutdown),
+                |(mut receiver, shutdown)| async move {
+                    loop {
+                        tokio::select! {
+                            () = shutdown.cancelled() => return None,
+                            result = receiver.recv() => {
+                                match result {
+                                    Ok(event) => return Some((event, (receiver, shutdown))),
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                                }
+                            }
+                        }
+                    }
+                },
+            ))
+        }
         PushMode::EwsStreaming => {
             let receiver = account.push_tx.subscribe();
             let shutdown = account.shutdown.clone();

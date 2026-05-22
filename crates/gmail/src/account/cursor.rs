@@ -123,4 +123,63 @@ mod tests {
             decode_gmail_state_for_profile(&opaque, "b@example.test").expect_err("profile swap");
         assert!(matches!(err, AccountError::Other(_)));
     }
+
+    #[test]
+    fn accepts_matching_profile() {
+        let opaque = encode_gmail_state(&GmailChangeState::new(42, "a@example.test"));
+        let decoded =
+            decode_gmail_state_for_profile(&opaque, "a@example.test").expect("matching profile");
+        assert_eq!(decoded.history_id, 42);
+        assert_eq!(decoded.profile_email, "a@example.test");
+        assert_eq!(decoded.schema_version, GMAIL_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rejects_schema_version_mismatch() {
+        // Synthesize a payload with a future schema version.
+        let payload = serde_json::json!({
+            "history_id": 7u64,
+            "profile_email": "a@example.test",
+            "schema_version": GMAIL_SCHEMA_VERSION + 1,
+        });
+        let opaque = OpaqueChangeState {
+            protocol: GMAIL_PROTOCOL,
+            envelope_version: GMAIL_ENVELOPE_VERSION,
+            bytes: serde_json::to_vec(&payload).expect("serialize"),
+        };
+        assert!(matches!(
+            decode_gmail_state(&opaque),
+            Err(AccountError::SchemaIncompatible)
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_bytes() {
+        let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
+        // Truncate to a definitely-invalid prefix.
+        opaque.bytes.truncate(opaque.bytes.len() / 2);
+        let err = decode_gmail_state(&opaque).expect_err("truncated bytes");
+        assert!(matches!(err, AccountError::Other(_)));
+    }
+
+    #[test]
+    fn rejects_empty_bytes() {
+        let opaque = OpaqueChangeState {
+            protocol: GMAIL_PROTOCOL,
+            envelope_version: GMAIL_ENVELOPE_VERSION,
+            bytes: Vec::new(),
+        };
+        let err = decode_gmail_state(&opaque).expect_err("empty bytes");
+        assert!(matches!(err, AccountError::Other(_)));
+    }
+
+    #[test]
+    fn cursor_for_history_round_trips_via_envelope() {
+        let cursor = cursor_for_history(99, "a@example.test");
+        assert_eq!(cursor.scope, CursorScope::Account);
+        assert_eq!(cursor.envelope_version, GMAIL_ENVELOPE_VERSION);
+        let decoded =
+            decode_gmail_state_for_profile(&cursor.server_state, "a@example.test").expect("decode");
+        assert_eq!(decoded.history_id, 99);
+    }
 }

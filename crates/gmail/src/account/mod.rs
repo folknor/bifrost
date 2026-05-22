@@ -259,7 +259,7 @@ impl Account for GmailAccount {
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
-        push::push_stream()
+        push::push_stream(Arc::clone(&self.pubsub), self.shutdown.clone())
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>> {

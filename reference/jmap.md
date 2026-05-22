@@ -1,6 +1,6 @@
 # bifrost-jmap reference
 
-Current architecture of the JMAP client crate. Examples live in `crates/jmap/examples/`; in-flight design lives in `plans/`.
+Current architecture of the JMAP client crate. Examples live in `crates/jmap/examples/`.
 
 ## Trait-based method dispatch
 
@@ -104,3 +104,156 @@ RFC 8620: `null` removes map keys, not `false`. Email `patch` field uses `HashMa
 - `Field::is_omitted` for `skip_serializing_if` on `Field<T>` fields (with `#[serde(default)]`).
 - `SetObjectCreatable::new()` initializes optional fields to `None`/`Omitted`, not empty collections.
 - Helper impl blocks use `impl<Tr: HttpTransport> Client<Tr>` (not bare `impl Client`).
+
+## Account layer
+
+The `bifrost_types::Account` implementation lives under `crates/jmap/src/sync/`, gated behind the `sync` feature. It is intentionally engine-facing only: the sync tree depends on `bifrost-types`, not on `bifrost-sync`. The implementation wraps the existing JMAP client (`Client<ReqwestTransport>` plus a `Mail`-capability `Account` handle) and maps every method on the `Account` trait onto one or more JMAP method calls.
+
+Cursors are encoded as protocol-tagged opaque bytes via a hand-rolled length-prefixed format, scope-aware in both establishment and change streams. Push uses the JMAP WebSocket subprotocol with a single reader task and a broadcast fan-out.
+
+### Module layout
+
+```
+crates/jmap/src/sync/
+  mod.rs           - module re-exports (JmapAccount, JmapAccountFactory,
+                     JmapAccountFactoryBuilder, JmapCredentials, ReconnectPolicy)
+  account.rs       - JmapAccount struct + impl Account
+  factory.rs       - JmapAccountFactory + builder + JmapCredentials
+  capabilities.rs  - AccountCapabilities builder, CoreLimits
+  state.rs         - cursor envelope (V1 tag/length format)
+  discover.rs      - cursor_scopes / memberships / scope_lifecycle_stream
+  inventory.rs     - per-scope inventory streaming
+  changes.rs       - per-scope change stream dispatch
+  hydrate.rs       - get_stream projection logic
+  push.rs          - WebSocket push, ReconnectPolicy, subscribe/unsubscribe
+  mutation.rs      - bulk_set_flags / bulk_move / bulk_destroy pipeline
+  blob.rs          - open_blob / open_blob_range
+  error.rs         - to_recovery / to_account_error mapping
+```
+
+### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
+
+`JmapAccountFactory` is the consumer-registered factory. It carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic` or `JmapCredentials::Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open` connects a `Client`, resolves the primary `Mail` account, reads the session, builds `AccountCapabilities` and `CoreLimits`, and probes initial `Email` / `Mailbox` / `Thread` state strings to seed cursors. It spawns the WebSocket reader task with a `CancellationToken` and returns `Arc<dyn Account>`.
+
+`JmapAccount` owns the `Client`, the `Mail`-capability `Account` handle, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. The `priority` and `bandwidth_cap` are `Atomic*` so engine-side adjustments do not require a lock.
+
+Reopen is delegated to the engine: when an account drops or `close()` returns, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (which terminates the WebSocket reader loop and any in-flight streams), then awaits a clean teardown. The `closed` flag short-circuits subsequent calls. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!` in the push stream; no `Account` method holds non-cancel-safe state across an await.
+
+### Capabilities advertised
+
+`capabilities::build` reads `session.core_capabilities()` and `session.websocket_capabilities()` to construct `AccountCapabilities`:
+
+- `cursor_freshness: ServerIssued` - JMAP `state` strings are server-issued tokens; the engine can persist them and resume.
+- `blob_range: BlobRangeSupport::No` - the existing JMAP transport exposes whole-blob downloads only. Range support would need a request hook for the HTTP `Range` header.
+- `blob_digest_pre_download: false` - JMAP does not surface a content digest before download.
+- `push: PushCapability::InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, otherwise `PushCapability::None`.
+- `mutation.concurrency: MutationConcurrency::StateBased` - the pipeline gates every `Email/set` with `ifInState`, which forces the server to reject the set on a state mismatch.
+- `mutation.replay_safety: MutationReplaySafety::None` - JMAP has no wire replay token; the engine's read-back guard is the lost-update safety net.
+- `batching_policy.max_items` - `core.maxObjectsInSet`, clamped to `[1, 500]`.
+- `batching_policy.max_wait: 100ms`, `flush_on_input_close: true`.
+- `rate_limit_class: RateLimitClass::Generous` - JMAP servers typically rate-limit per request size and per session rather than per second.
+- `quota_signal: QuotaSignal::None` - quota capability is not surfaced through `Account` in this wave.
+- `requires_uidvalidity_recheck: false`.
+- `historyid_expires_after: None` and `delta_token_expires_after: None` - JMAP state strings are not time-bound.
+
+`CoreLimits` holds `maxCallsInRequest`, `maxObjectsInGet`, `maxObjectsInSet`, and `maxSizeRequest` for batch sizing. `build` rejects a session whose core limits are zero.
+
+### Cursor envelope
+
+`OpaqueChangeState` for JMAP is tagged with `ProtocolKind::Jmap` and `envelope_version = ENVELOPE_VERSION_V1` (currently `1`). `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching `ChangeCursor.envelope_version`.
+
+The payload is hand-rolled, length-prefixed bytes (little-endian `u32` lengths, single-byte tags):
+
+```
+state-tag:u8        // STATE_TAG_V1 = 1
+scope-tag:u8        // 1=Email 2=Mailbox 3=Thread 4=Query
+[query-id:length-prefixed-utf8 when Query]
+state-string:length-prefixed-utf8
+```
+
+`JmapCursorState::V1 { scope: JmapScopeRepr, state_string }` is the only current variant. `JmapScopeRepr` mirrors the four supported scope shapes: `Email`, `Mailbox`, `Thread`, and `Query(String)`.
+
+Validation rules in `state::decode`:
+
+- Wrong `ProtocolKind` returns `Error::CursorProtocolMismatch`.
+- Unknown `envelope_version` returns `Error::CursorEnvelopeUnknown`.
+- Any decode failure (unknown state tag, unknown scope tag, truncated payload, trailing bytes, non-UTF-8 string) returns `Error::SchemaIncompatible`.
+- `decode_cursor` additionally rejects a payload whose embedded scope does not match the `ChangeCursor.scope`, returning `Error::Other`.
+
+`establish_initial_cursor(scope)` returns `CursorEstablishment::Ready` with a freshly encoded cursor built from the cached seed state captured at factory `open()` time. Scopes that are not seeded (anything outside the supported four) return `Error::Unsupported`. `describe_cursor` reports `CostClass::Cheap` and `SyncStrategy::ServerCursor` for valid cursors and `Expensive` / `None` otherwise.
+
+### Per-scope inventory, changes, hydration
+
+Supported scopes for `inventory_stream` and `changes_stream`:
+
+- `CursorScope::Type(ObjectType::Email)` - inventory paginates via `Email/query` sorted by `receivedAt` descending then hydrates with `Email/get` using a fixed property set (`Id`, `MailboxIds`, `ThreadId`, `BlobId`, `Size`, `Keywords`, `MessageId`, `References`, `InReplyTo`, `ReceivedAt`). Changes use `Email/changes` against the cached state string and emit `Created` / `Updated` / `Destroyed` `ObjectChange`s. `inventory_partitioning` exposes a `Page { from, to }` partition for Email only.
+- `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` call with the inventory properties (`Id`, `Name`, `ParentId`, `Role`, `SortOrder`, totals, unread counts, `IsSubscribed`). Changes use `Mailbox/changes`.
+- `CursorScope::Type(ObjectType::Thread)` - changes use `Thread/changes`. Inventory is not implemented and emits a fatal-unsupported event explaining that thread inventory derives from email inventory.
+- `CursorScope::Query(_)` - changes use `Email/queryChanges` and surface `ScopeChange` events; inventory emits a fatal-unsupported event because registered query definitions are out of scope for the v1 trait.
+
+Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The change loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done(Some(Checkpoint::Change(...)))`. Shared `Mutex<Option<String>>` state caches are advanced compare-and-swap style so a stale writer does not clobber a newer state.
+
+`get_stream` (hydration) supports `Projection::FlagsOnly` and `Projection::Metadata` for Email. Raw-MIME projections emit a fatal-unsupported event - MIME assembly is outside this wave. Batches are sized at `max_objects_in_get`.
+
+### Push and reconnect
+
+Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. The task connects to the JMAP WebSocket endpoint (`Client::connect_ws`, `dep:tokio-tungstenite/native-tls`), re-applies the union of currently subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` notifications as `WatchEvent::Invalidated { hint: InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::SpecificCursorScope(...) } }`. Per-message disconnects (and stream-level errors) emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
+
+`ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff. Each successful reconnect resets `backoff` to `initial`; failures double `backoff` (saturating) up to `max`.
+
+`push_stream` is a thin broadcast subscriber. A `Lagged` broadcast slot emits a coalesced `WatchEvent::Invalidated { source: PushSource::Coalesced, payload: Unknown }` so the engine triggers a full re-poll rather than silently losing notifications.
+
+`subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
+
+`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Destroyed` for membership scope churn.
+
+### Mutation pipeline
+
+`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets are accumulated into batches sized at `max_objects_in_set` clamped to `[1, 500]`. Each batch is sent as a single `Email/set` call gated by `ifInState(current_state)`. On a `stateMismatch` method error the pipeline probes the current state via `Email/get` (empty ids), updates the cached state, and retries the same batch once. Other errors abort the stream with `SyncEvent::Fatal`.
+
+`IdempotencyKey` is currently accepted on the API surface but not used at the wire level - JMAP exposes no idempotency token, so replay safety stays `MutationReplaySafety::None` and the engine's read-back guard is the protection against double-apply.
+
+Per-id outcomes flow from `SetResponse::updated` / `destroyed`. A `MutationOutcome::Failed(Error::ConcurrencyConflict)` is emitted when a `stateMismatch` survives the retry; other JMAP errors are mapped through `to_account_error` and surfaced as `MutationOutcome::Failed(...)`.
+
+`bulk_move` only accepts `MembershipScope::Mailbox`; other membership shapes emit a fatal-unsupported event before any wire write.
+
+### Error mapping to the recovery taxonomy
+
+`error::to_recovery` maps `crate::Error` onto `RecoveryClass`:
+
+- `Error::Method` cases:
+  - `cannotCalculateChanges` -> `RestartScope(scope)` if a scope is known, else `RestartAccount`.
+  - `stateMismatch` -> `Retry { after: 0 }`.
+  - `accountNotFound`, `fromAccountNotFound`, `accountNotSupportedByMethod`, `fromAccountNotSupportedByMethod`, `accountReadOnly` -> `RestartAccount`.
+  - `serverUnavailable` -> `Retry { after: 5s }`. `serverFail` / `serverPartialFail` -> `Retry { after: 30s }`.
+  - `requestTooLarge` / `tooManyChanges` -> `Retry { after: 1s }`.
+  - `forbidden` -> `AuthLost`.
+  - argument-shape errors (`invalidArguments`, `unknownMethod`, `unsupportedSort`, etc.) -> `Fatal`.
+- `Error::Problem` (RFC 7807 problem-details):
+  - JMAP `limit` -> `Retry { after: 30s }`.
+  - JMAP `unknownCapability` -> `CapabilityChanged { delta: default }`.
+  - `notJSON` / `notRequest` -> `Fatal`.
+  - HTTP status fallback: 401/403 -> `AuthLost`, 429 -> `Retry { after: 30s }`, 5xx -> `Retry { after: 30s }`, other -> `Fatal`.
+- `Error::Transport(_)` -> `Retry { after: 5s }`.
+- `Error::WebSocket(_)` / `Error::WebSocketNotConnected` -> `Retry { after: 5s }`.
+- `Error::NoPrimaryAccount { .. }` -> `RestartAccount`.
+- Parse / set / shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`) -> `Fatal`.
+
+`error::to_account_error` collapses `crate::Error` onto `bifrost_types::Error`:
+
+- `stateMismatch` -> `Error::ConcurrencyConflict`.
+- Problem-details with status 401/403 -> `Error::Auth(...)`.
+- `NoPrimaryAccount` -> `Error::Auth(...)`.
+- Everything else -> `Error::Transport(other.to_string())`.
+
+`fatal_from_account_error` is the parallel mapping for cursor / capability / range errors raised by the sync tree itself: `CursorProtocolMismatch` and `CursorEnvelopeUnknown` -> `SchemaIncompatible`, `Unsupported` and `RangeNotSupported` / `BlobNotByteStream` / `RangeOutOfBounds` -> `Fatal`, `ConcurrencyConflict` -> `Retry { after: 0 }`, `Auth` -> `AuthLost`, `Transport` -> `Retry { after: 5s }`, `MissingCoreCapability` -> `CapabilityChanged`, `IdleBusy` / `Other` -> `RestartScope(scope)` if known else `Fatal`.
+
+### Known limitations
+
+- `Thread` and `Query` inventory are not implemented and emit fatal-unsupported events. Thread changes and query changes are supported.
+- Raw-MIME hydration projections are not supported; only `Projection::FlagsOnly` and `Projection::Metadata` work.
+- Push is only available via the JMAP WebSocket subprotocol. There is no HTTP push or EventSource fallback in the account layer.
+- `BlobRangeSupport::No` and `blob_digest_pre_download: false`. `open_blob_range` returns a fatal `Error::Unsupported` even when the handle advertises range support, because the existing transport has no `Range` header hook.
+- `MutationReplaySafety::None` and `IdempotencyKey` is currently a no-op on the wire. The engine's read-back guard is the only lost-update protection.
+- `bulk_move` only supports `MembershipScope::Mailbox`.
+- `inventory_partitioning` only supports `Page { from, to }` for `Email`; all other scope/partition combinations fatal as unsupported.

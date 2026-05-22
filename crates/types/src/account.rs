@@ -20,8 +20,11 @@ use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycle,
 };
-use crate::error::Error;
-use crate::events::{Change, InventoryEntry, Priority, SyncEvent, WatchEvent};
+use crate::error::{Error, Fatal, RecoveryClass};
+use crate::events::{
+    Change, InventoryEntry, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
+    WatchEvent,
+};
 use crate::ids::{ObjectId, SubscriptionHandle};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, MutationResult, Projection};
 
@@ -94,6 +97,35 @@ pub trait Account: Send + Sync {
     /// the terminal `SyncEvent::Done` carries the established cursor
     /// in its checkpoint.
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>>;
+
+    /// Which inventory partition shape this account can serve for
+    /// `scope`. Implementations that do not override this keep the
+    /// original full-pass behavior.
+    fn inventory_partitioning(&self, _scope: &CursorScope) -> InventoryPartitioning {
+        InventoryPartitioning::Full
+    }
+
+    /// Inventory for a single partition. The default implementation
+    /// supports only `InventoryPartition::Full`; protocol crates that
+    /// advertise a stronger `inventory_partitioning` must override
+    /// this to honor the matching partition variants.
+    fn inventory_partition_stream(
+        &self,
+        scope: CursorScope,
+        partition: InventoryPartition,
+    ) -> AccountStream<SyncEvent<InventoryEntry>> {
+        match partition {
+            InventoryPartition::Full => self.inventory_stream(scope),
+            _ => Box::pin(futures::stream::iter([
+                SyncEvent::Fatal(Fatal {
+                    recovery: RecoveryClass::Fatal,
+                    message: "inventory partition is not supported by this account".to_string(),
+                    source: Some(Error::Unsupported),
+                }),
+                SyncEvent::Done(None),
+            ])),
+        }
+    }
 
     /// Hydrate known ids at a chosen projection. Input ids are
     /// streamed so the engine can backpressure long fetch passes.

@@ -1,6 +1,6 @@
 # bifrost-imap reference
 
-Current architecture of the IMAP client crate. Daaki-derived (see `plans/imap-daaki-migration.md` for migration history). Tokio + native-tls only.
+Current architecture of the IMAP client crate. Daaki-derived. Tokio + native-tls only.
 
 ## Driver-owned I/O
 

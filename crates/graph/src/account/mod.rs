@@ -61,6 +61,7 @@ pub struct GraphAccount {
     pub(crate) folder_tree: Arc<RwLock<FolderTree>>,
     pub(crate) graph_subscriptions:
         Arc<RwLock<HashMap<SubscriptionHandle, GraphSubscriptionGroup>>>,
+    pub(crate) graph_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
     pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) shutdown: CancellationToken,
@@ -85,6 +86,7 @@ impl GraphAccount {
             cursor_index: Arc::new(RwLock::new(CursorIndex::default())),
             folder_tree: Arc::new(RwLock::new(FolderTree::default())),
             graph_subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            graph_worker: Arc::new(Mutex::new(None)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: Arc::new(Mutex::new(None)),
             shutdown: CancellationToken::new(),

@@ -13,8 +13,8 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountCapabilities, AccountFactory, AccountId, AccountStream, ChangeCursor,
-    Checkpoint, CursorEstablishment, CursorScope, InvalidationSink, MembershipScope, Priority,
-    SubscriptionHandle, SyncEvent, WatchEvent,
+    Checkpoint, CursorEstablishment, CursorScope, InvalidationSink, InventoryPartition,
+    InventoryPartitioning, MembershipScope, Priority, SubscriptionHandle, SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -22,7 +22,8 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
-    BackfillHandle, BackfillRegistry, BackfillRunner, BackfillState, LiveSupersedes,
+    BackfillHandle, BackfillPolicy, BackfillRegistry, BackfillRunner, BackfillState,
+    BackfillStrategy, LiveSupersedes,
 };
 use crate::cancel::{Boundary, BoundaryRequest};
 use crate::control::SyncControl;
@@ -35,7 +36,7 @@ use crate::multiplexer::{
 use crate::mutation::MutationHandle;
 use crate::push::{InvalidationSinkInner, PushHandle, SubscriptionRegistry};
 use crate::scheduler::{BudgetGate, ConcurrencyBudget, Scheduler};
-use crate::types::{AccountSlot, EngineConfig, WorkerTask};
+use crate::types::{AccountSlot, BackfillConfig, EngineConfig, WorkerTask};
 
 /// Top-level engine.
 pub struct SyncEngine {
@@ -361,10 +362,11 @@ impl SyncEngine {
         };
         spawn(tokio::spawn(reconciler.run(watch_rx)));
 
-        // In-process push forwarder: drain `Account::push_stream` into
-        // the per-account mpsc. Reload `current.load_full()` inside
-        // the loop so reopens take effect.
-        if capabilities.push_in_process() {
+        // Push forwarder: drain `Account::push_stream` into the
+        // per-account mpsc. In-process accounts carry invalidations
+        // and health here; out-of-process accounts may carry only
+        // subscription-health transitions.
+        if capabilities.push != bifrost_types::PushCapability::None {
             let acc = Arc::clone(&current);
             let aid = account_id.clone();
             let tx = watch_tx.clone();
@@ -445,6 +447,8 @@ impl SyncEngine {
         let bf_aid = account_id.clone();
         let bf_store = Arc::clone(&self.checkpoints);
         let bf_changes = changes_tx.clone();
+        let bf_config = self.config.backfill;
+        let bf_control = control.clone();
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
                 bf_account,
@@ -455,6 +459,8 @@ impl SyncEngine {
                 bf_aid,
                 bf_store,
                 Some(bf_changes),
+                bf_control,
+                bf_config,
             )
             .await;
         }));
@@ -1088,6 +1094,8 @@ async fn run_backfill_orchestrator(
     account_id: AccountId,
     store: Arc<DynCheckpointStore>,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+    control: SyncControl,
+    config: BackfillConfig,
 ) {
     let scopes = cursors.all_scopes();
     for scope in scopes {
@@ -1097,34 +1105,170 @@ async fn run_backfill_orchestrator(
         registry.mark(scope.clone(), BackfillState::Running);
         let acc_arc = account.load_full();
         let acc: &dyn Account = acc_arc.as_ref().as_ref();
-        // Use a single-partition policy for v1; partition planning
-        // beyond one inventory pass is tracked as a follow-up.
-        let partition = bifrost_types::Partition(Vec::new());
-        match BackfillRunner::run_partition(
-            acc,
-            scope.clone(),
-            partition,
-            live.as_ref(),
-            &account_id,
-            Arc::clone(&store),
-            changes_tx.clone(),
-            crate::cursor::ENGINE_VERSION,
-        )
-        .await
-        {
-            Ok(_kept) => {
-                registry.mark(scope.clone(), BackfillState::Completed);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "bifrost.sync.backfill",
-                    scope = ?scope,
-                    error = %err,
-                    "backfill partition failed; leaving scope Pending"
+        match backfill_plan_for(acc, &scope, config) {
+            BackfillPlan::Fixed(partitions) => {
+                let mut completed = true;
+                for partition in partitions {
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    if let Err(err) = BackfillRunner::run_partition(
+                        acc,
+                        scope.clone(),
+                        partition,
+                        live.as_ref(),
+                        &account_id,
+                        Arc::clone(&store),
+                        changes_tx.clone(),
+                        Some(control.clone()),
+                        crate::cursor::ENGINE_VERSION,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            scope = ?scope,
+                            error = %err,
+                            "backfill partition failed; leaving scope Pending"
+                        );
+                        completed = false;
+                        break;
+                    }
+                }
+                registry.mark(
+                    scope.clone(),
+                    if completed {
+                        BackfillState::Completed
+                    } else {
+                        BackfillState::Pending
+                    },
                 );
-                registry.mark(scope.clone(), BackfillState::Pending);
+            }
+            BackfillPlan::OpenPages { chunk } => {
+                let mut completed = true;
+                let mut from = 0_u32;
+                loop {
+                    if shutdown.is_cancelled() {
+                        return;
+                    }
+                    let to = from.saturating_add(chunk);
+                    let partition = InventoryPartition::Page { from, to };
+                    match BackfillRunner::run_partition(
+                        acc,
+                        scope.clone(),
+                        partition,
+                        live.as_ref(),
+                        &account_id,
+                        Arc::clone(&store),
+                        changes_tx.clone(),
+                        Some(control.clone()),
+                        crate::cursor::ENGINE_VERSION,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => {
+                            if outcome.seen < u64::from(chunk) {
+                                break;
+                            }
+                            from = to;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bifrost.sync.backfill",
+                                scope = ?scope,
+                                error = %err,
+                                "backfill page partition failed; leaving scope Pending"
+                            );
+                            completed = false;
+                            break;
+                        }
+                    }
+                }
+                registry.mark(
+                    scope.clone(),
+                    if completed {
+                        BackfillState::Completed
+                    } else {
+                        BackfillState::Pending
+                    },
+                );
             }
         }
+    }
+}
+
+enum BackfillPlan {
+    Fixed(Vec<InventoryPartition>),
+    OpenPages { chunk: u32 },
+}
+
+fn backfill_plan_for(
+    account: &dyn Account,
+    scope: &CursorScope,
+    config: BackfillConfig,
+) -> BackfillPlan {
+    match account.inventory_partitioning(scope) {
+        InventoryPartitioning::Full => BackfillPlan::Fixed(vec![InventoryPartition::Full]),
+        InventoryPartitioning::TimeWindowed => {
+            let policy = BackfillPolicy::default();
+            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), 0);
+            BackfillPlan::Fixed(
+                plan.partitions
+                    .iter()
+                    .map(crate::backfill::partitioner::inventory_partition_for)
+                    .collect(),
+            )
+        }
+        InventoryPartitioning::UidRange {
+            max_uid: Some(max_uid),
+        } => {
+            let policy = BackfillPolicy {
+                strategy: BackfillStrategy::UidRange {
+                    chunk_size: config.uid_range_chunk,
+                },
+                clock_skew: std::time::Duration::ZERO,
+            };
+            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), max_uid);
+            BackfillPlan::Fixed(
+                plan.partitions
+                    .iter()
+                    .map(crate::backfill::partitioner::inventory_partition_for)
+                    .collect(),
+            )
+        }
+        InventoryPartitioning::UidRange { max_uid: None } => {
+            tracing::warn!(
+                target: "bifrost.sync.backfill",
+                scope = ?scope,
+                "uid-range partitioning requested without max_uid; using full inventory pass"
+            );
+            BackfillPlan::Fixed(vec![InventoryPartition::Full])
+        }
+        InventoryPartitioning::PageCount {
+            total: Some(total),
+            page_size,
+        } => {
+            let policy = BackfillPolicy {
+                strategy: BackfillStrategy::PageCount {
+                    items_per_partition: page_size.unwrap_or(config.page_count_chunk).max(1),
+                },
+                clock_skew: std::time::Duration::ZERO,
+            };
+            let plan = crate::backfill::partitioner::plan(&policy, chrono::Utc::now(), total);
+            BackfillPlan::Fixed(
+                plan.partitions
+                    .iter()
+                    .map(crate::backfill::partitioner::inventory_partition_for)
+                    .collect(),
+            )
+        }
+        InventoryPartitioning::PageCount {
+            total: None,
+            page_size,
+        } => BackfillPlan::OpenPages {
+            chunk: page_size.unwrap_or(config.page_count_chunk).max(1),
+        },
+        _ => BackfillPlan::Fixed(vec![InventoryPartition::Full]),
     }
 }
 
