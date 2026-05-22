@@ -188,10 +188,11 @@ Each new `reference/{jmap,imap,gmail,graph}.md` covers:
 
 ### File ownership
 
-P3-A0, P3-A2, P3-A3, and P3-A4 are merged. P3-A1's reference
-doc is merged; its conformance tests are deferred behind
-in-flight sync-engine work in `crates/jmap/src/sync/`. Only the
-orchestrator cross-crate work remains.
+P3-A0, P3-A2, P3-A3, P3-A4, and the orchestrator cross-crate
+conformance are merged. P3-A1's reference doc is merged; its
+conformance tests are deferred behind in-flight sync-engine work
+in `crates/jmap/src/sync/`. The workspace-wide `brokkr check`
+cleanup is the only remaining Phase 3 item.
 
 - **P3-A0 (CONDSTORE/QRESYNC)**: merged. Code lives across
   `crates/imap/src/account/{factory,capabilities,changes,
@@ -226,9 +227,18 @@ orchestrator cross-crate work remains.
   `crates/graph/src/account/{cursor,capabilities,error,
   inventory}.rs` cover cursor round-trip, capability shape,
   error classification, and scope-to-method wiring.
-- **Orchestrator**: writes the cross-crate conformance assertion
-  in `bifrost-sync` (or `bifrost-types`), runs `brokkr check`
-  cleanup workspace-wide.
+- **Orchestrator**: cross-crate conformance assertion merged.
+  `crates/sync/tests/cross_crate_conformance.rs` constructs each
+  of the four `AccountFactory` impls (`ImapAccountFactory`,
+  `JmapAccountFactory`, `GmailAccountFactory`,
+  `GraphAccountFactory`), witnesses `dyn Account` and
+  `dyn AccountFactory` object-safety, and verifies that each
+  factory composes with `SyncEngine::attach` at the type level
+  by constructing the returned future without polling it (so no
+  network work runs). The four protocol crates enter as
+  `[dev-dependencies]` of `crates/sync`; JMAP is enabled with
+  the `sync` feature. Workspace-wide `brokkr check` cleanup is
+  still outstanding.
 
 ### Sync-engine follow-ups (resolved)
 
@@ -276,11 +286,12 @@ Phase 3 is done when all of these hold:
   and match the section list above. All four are done.
 - Per-protocol conformance tests cover cursor envelope round-
   trip, capability shape, error classification, and scope-to-
-  method wiring for each crate.
-- Cross-crate conformance assertion in `bifrost-sync` /
-  `bifrost-types` compiles and passes for all four factories.
+  method wiring for imap, gmail, and graph. jmap is deferred
+  behind in-flight engine work in `crates/jmap/src/sync/`.
+- Cross-crate conformance assertion in `bifrost-sync` compiles
+  and passes for all four factories (done).
 - `brokkr check` is clean workspace-wide: no warnings, no
-  scaffolding allows, no orphan exports.
+  scaffolding allows, no orphan exports. (Outstanding.)
 
 ## Phase 4
 

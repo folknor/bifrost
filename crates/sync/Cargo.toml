@@ -27,3 +27,9 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 arc-swap = { workspace = true }
+
+[dev-dependencies]
+bifrost-imap = { path = "../imap" }
+bifrost-jmap = { path = "../jmap", features = ["sync"] }
+bifrost-gmail = { path = "../gmail" }
+bifrost-graph = { path = "../graph" }
