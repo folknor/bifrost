@@ -109,10 +109,26 @@ remain alongside them.
 
 - **Phase 3: Reconcile and validate.** Round out per-protocol
   conformance tests, add a minimal cross-crate conformance
-  assertion in `bifrost-sync`, write `reference/{jmap,imap,
-  gmail,graph}.md` to describe the account-layer code, and
-  clean `brokkr check` workspace-wide. Full spec under
-  **Phase 3** below.
+  assertion in `bifrost-sync`, and write `reference/{jmap,imap,
+  gmail,graph}.md` to describe the account-layer code. Full
+  spec under **Phase 3** below.
+- **Phase 3.1: Dependency and shared-crate-wiring audit.** The
+  structural shoehorn left `bifrost-jmap`, `bifrost-gmail`, and
+  `bifrost-graph` each maintaining their own HTTP client,
+  bearer-token storage, and URL-encoding path instead of
+  routing through `bifrost-net`. Workspace dependency pins are
+  also inconsistent (per-crate `async-stream` / `thiserror` /
+  `futures-util`, `log` in gmail / graph while everyone else
+  uses `tracing`). Full spec in
+  `plans/dependency-audit.md`. Runs before Phase 3.5; the
+  structural fix dissolves most of Phase 3.5's
+  `Shared -> protocol duplication` bucket.
+- **Phase 3.5: Post-shoehorn surface audit.** Trait shoehorns
+  leave dead and duplicated code in their wake. Audit each
+  crate that was modified to host the `Account` / `AccountFactory`
+  traits, `bifrost-net`, or `bifrost-types` for items that can
+  be made private, deleted outright, or collapsed into a single
+  way of doing things. Full spec under **Phase 3.5** below.
 - **Phase 4: Error model convergence.** Reconcile the
   per-crate error stories (rich `Response`-carrying variants in
   `bifrost-smtp`, separate models in `bifrost-jmap` and
@@ -140,8 +156,8 @@ QRESYNC / CONDSTORE / Basic cursor strategy, the modseq cache,
 and the rationale for keeping `MutationConcurrency::None`. The
 remaining Phase 3 work (jmap / gmail / graph reference docs,
 conformance test fill-in, cross-crate assertion in
-`bifrost-sync`, and the workspace-wide `brokkr check` cleanup)
-can proceed in parallel.
+`bifrost-sync`) proceeded in parallel and is now merged
+modulo the deferred jmap tests.
 
 ### Test scope
 
@@ -191,8 +207,10 @@ Each new `reference/{jmap,imap,gmail,graph}.md` covers:
 P3-A0, P3-A2, P3-A3, P3-A4, and the orchestrator cross-crate
 conformance are merged. P3-A1's reference doc is merged; its
 conformance tests are deferred behind in-flight sync-engine work
-in `crates/jmap/src/sync/`. The workspace-wide `brokkr check`
-cleanup is the only remaining Phase 3 item.
+in `crates/jmap/src/sync/`. `brokkr check` was held green across
+the phase. Phase 3 is functionally complete; the deferred jmap
+tests will be picked up after the coworker's sync-engine work in
+that tree settles.
 
 - **P3-A0 (CONDSTORE/QRESYNC)**: merged. Code lives across
   `crates/imap/src/account/{factory,capabilities,changes,
@@ -237,8 +255,7 @@ cleanup is the only remaining Phase 3 item.
   by constructing the returned future without polling it (so no
   network work runs). The four protocol crates enter as
   `[dev-dependencies]` of `crates/sync`; JMAP is enabled with
-  the `sync` feature. Workspace-wide `brokkr check` cleanup is
-  still outstanding.
+  the `sync` feature.
 
 ### Sync-engine follow-ups (resolved)
 
@@ -261,18 +278,6 @@ worked off. Notable items landed alongside Phase 3:
 - `reference/sync.md` describes the resulting behavior; the old
   follow-up section has been removed.
 
-### Brokkr check cleanup
-
-Orchestrator work, not agent work. Scope:
-
-- Resolve workspace clippy warnings introduced by P2 wiring.
-- Remove dead imports and `pub` items that P2 staged but no
-  consumer ended up using.
-- Verify every `bifrost-types` export has at least one consumer
-  (delete dead exports rather than carry them).
-- Drop scaffolding `#[allow(...)]` annotations whose
-  justifications no longer apply.
-
 ### Exit criteria
 
 Phase 3 is done when all of these hold:
@@ -283,15 +288,148 @@ Phase 3 is done when all of these hold:
   design because the modseq cache is cold-startable. Any future
   flip to `StateBased` would need a separate plan.
 - All four `reference/{jmap,imap,gmail,graph}.md` files exist
-  and match the section list above. All four are done.
+  and match the section list above (done).
 - Per-protocol conformance tests cover cursor envelope round-
   trip, capability shape, error classification, and scope-to-
-  method wiring for imap, gmail, and graph. jmap is deferred
-  behind in-flight engine work in `crates/jmap/src/sync/`.
+  method wiring for imap, gmail, and graph (done). jmap
+  conformance tests are deferred behind in-flight engine work
+  in `crates/jmap/src/sync/`.
 - Cross-crate conformance assertion in `bifrost-sync` compiles
   and passes for all four factories (done).
-- `brokkr check` is clean workspace-wide: no warnings, no
-  scaffolding allows, no orphan exports. (Outstanding.)
+- `brokkr check` clean workspace-wide (done; held green
+  throughout Phase 3).
+
+## Phase 3.1
+
+Dependency and shared-crate-wiring audit. The big-ticket finding
+is that `bifrost-net` was shoehorned into the workspace but never
+adopted by `bifrost-jmap`, `bifrost-gmail`, or `bifrost-graph`:
+each of those still maintains its own `reqwest::Client`, its own
+bearer-token storage (plain `String`, not `Zeroizing<String>`),
+and its own URL-encoding path. Five smaller findings sit around
+that core: per-crate `async-stream` / `thiserror` / `futures-util`
+pins that should be workspace-pinned, `log` in gmail / graph
+while everyone else is on `tracing` (events silently dropped if
+the downstream installs only `tracing-subscriber`), the
+abandoned `urlencoding` crate that should be replaced with
+`percent-encoding`, and a handful of cosmetic odds and ends.
+
+Full spec, per-finding methodology, file ownership, suggested
+order of operations, and exit criteria live in
+`plans/dependency-audit.md`.
+
+Sequencing: Phase 3.1 runs before Phase 3.5. The structural fix
+(routing the three HTTP-based crates through `bifrost-net`)
+dissolves most of Phase 3.5's `Shared -> protocol duplication`
+bucket and the secret-handling half of Phase 3.5's two-ways
+audit, so doing the smaller surface-level work first would just
+create rebase churn.
+
+## Phase 3.5
+
+Post-shoehorn surface audit. `Account` / `AccountFactory`,
+`bifrost-net`, and the whole of `bifrost-types` were grafted
+onto pre-existing crates. Shoehorns leave behind three kinds of
+debris:
+
+1. **Newly-internal public items.** Code that was `pub` before
+   the shoehorn but now only has internal callers.
+2. **Duplicated surfaces, protocol → shared.** Types or helpers
+   the protocol crate carried that now have a canonical home in
+   `bifrost-types` or `bifrost-net`. Two-`AccountId`-types,
+   parallel `ProblemDetails`, per-crate retry-classifier shapes,
+   etc.
+3. **Duplicated surfaces, shared → protocol.** The reverse
+   direction. `bifrost-net` likely now has a hardened HTTP
+   transport with retries, rate-limit handling, and OAuth refresh
+   that supersedes whatever each HTTP-based protocol crate built
+   for itself pre-shoehorn. `bifrost-sync` likely has canonical
+   shapes (idempotency keys, mutation outcome enums, cursor
+   envelope versioning, checkpoint persistence) that some
+   protocol crates still re-implement locally.
+4. **Two ways to accomplish the same thing.** Every Account
+   method has a pre-Account equivalent (a direct method on the
+   underlying `Client` or driver). Some of those equivalents are
+   still useful for non-engine consumers. Some are not. Decide
+   per case; eliminate the dead ones.
+
+### Methodology
+
+For each crate, in this order:
+
+1. `pub` audit. Every `pub` / `pub use` in `lib.rs` and module
+   roots gets justified or downgraded. Use `cargo doc --no-deps`
+   output and grep for `use <crate>::Name` patterns in the rest
+   of the workspace to find external consumers. Anything with no
+   external consumer becomes `pub(crate)` or `pub(super)`.
+2. Type-duplication audit, both directions. For each type
+   definition in the crate, ask whether `bifrost-types` already
+   has it, or should. For each `bifrost-types` type, ask whether
+   any protocol crate has a sibling. Resolve toward the shared
+   home unless there is a documented protocol-specific reason
+   for the divergence.
+3. Shared-supersedes-local audit. Walk each protocol crate's
+   transport / retry / rate-limit / OAuth-refresh code and ask
+   whether `bifrost-net` now does the same job better. Walk each
+   protocol crate's mutation-result / idempotency-key /
+   cursor-envelope code and ask whether `bifrost-sync` (via
+   `bifrost-types`) now does the same job better.
+4. Two-ways audit. For each Account method, identify the
+   pre-Account equivalent. Decide: keep both with documented
+   non-overlapping use cases, deprecate the legacy path, or
+   delete it.
+5. Dead-code audit. Items with no callers inside or outside the
+   crate.
+
+### Sequencing
+
+One agent per crate, six in total, run-in-parallel-safe because
+each agent owns one crate's `src/` tree and `Cargo.toml`.
+`bifrost-net` and `bifrost-types` audits should run *last*: the
+protocol-crate audits will surface requests of the form "I want
+to use `bifrost-types::X` but `bifrost-types` doesn't expose it"
+or "this would be cleaner as a `bifrost-net::Y`". Collecting
+those signals first lets the shared-crate audits delete dead
+exports and add new ones in one pass.
+
+### File ownership
+
+- **P3.5-A0 (imap)**: `crates/imap/src/` and `crates/imap/Cargo.toml`.
+- **P3.5-A1 (jmap)**: `crates/jmap/src/` and `crates/jmap/Cargo.toml`.
+- **P3.5-A2 (gmail)**: `crates/gmail/src/` and `crates/gmail/Cargo.toml`.
+- **P3.5-A3 (graph)**: `crates/graph/src/` and `crates/graph/Cargo.toml`.
+- **P3.5-A4 (smtp)**: `crates/smtp/src/` and `crates/smtp/Cargo.toml`.
+  Smaller scope: bifrost-smtp was not modified by the Account
+  shoehorn, but bifrost-types and bifrost-net likely still
+  apply. Quick sweep.
+- **P3.5-A5 (net + types)**: `crates/net/src/`, `crates/types/src/`,
+  and both `Cargo.toml`s. Runs after the protocol-crate agents
+  report. Folds in the cross-crate signals they surface.
+
+Agents must NOT edit any crate other than their assigned one.
+Cross-crate findings get reported to the orchestrator for
+P3.5-A5 to fold in.
+
+### Exit criteria
+
+Phase 3.5 is done when all of these hold:
+
+- Every `pub` / `pub use` in every crate has an external
+  consumer, or a one-line `pub` justification in the surrounding
+  code.
+- No type defined in a protocol crate has a sibling in
+  `bifrost-types` that means the same thing. Either the
+  protocol-crate type goes (replaced by the `bifrost-types`
+  one) or the divergence is documented.
+- No protocol crate re-implements an HTTP transport / retry
+  loop / OAuth refresh that `bifrost-net` already provides.
+- No protocol crate re-implements an idempotency-key shape /
+  mutation-outcome enum / checkpoint envelope that
+  `bifrost-types` already provides.
+- For every `Account` method on each impl, there is a
+  documented reason the pre-Account equivalent still exists, or
+  the equivalent has been removed.
+- `brokkr check` remains clean under `--all-features`.
 
 ## Phase 4
 

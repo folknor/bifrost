@@ -103,6 +103,14 @@ Workspace-wide conventions. Per-crate conventions live in `reference/<crate>.md`
 
 Per-crate architecture and conventions. Single source of truth for current code state; in-flight design lives in `plans/`.
 
-- `reference/jmap.md` - bifrost-jmap dispatch, transport, module pattern, capabilities, error model.
-- `reference/imap.md` - bifrost-imap driver model, cancellation safety, streaming FETCH, typed IDs, auth.
+**Before working in a crate, read its `reference/<crate>.md` first.** These docs are kept in sync with the code and exist precisely so agents do not have to rediscover module layout, trait surfaces, or invariants from scratch. Skipping the read is how mistakes that the reference would have flagged get made.
+
+**Each `reference/*.md` file must stay under 30,000 bytes.** They are read into context on every relevant task; bloat is a tax paid by every future agent. If a doc is approaching the cap, cut prose before adding more - prefer engineering density over exhaustive coverage, and lean on the code as the authoritative source for anything that can be derived from it.
+
+- `reference/jmap.md` - bifrost-jmap dispatch, transport, module pattern, capabilities, error model, and the `Account` impl under `crates/jmap/src/sync/` (cursor envelope, inventory / changes / hydration, WebSocket push, mutation pipeline, recovery taxonomy).
+- `reference/imap.md` - bifrost-imap driver model, cancellation safety, streaming FETCH, typed IDs, auth, and the account layer under `crates/imap/src/account/` (QRESYNC / CONDSTORE / Basic cursor strategy, per-folder modseq cache, opportunistic `STORE UNCHANGEDSINCE`).
+- `reference/gmail.md` - bifrost-gmail `Account` impl: history-id seeded sync, Cloud Pub/Sub push with renewer and health stream, mutation pipeline with flag canonicalization and TRASH fallback, error mapping to the recovery taxonomy.
+- `reference/graph.md` - bifrost-graph `Account` impl: Microsoft Graph delta-token sync, webhook push with renewal health worker plus EWS streaming fallback, cursor envelope and validation, `If-Match` etag mutations, error mapping.
 - `reference/smtp.md` - bifrost-smtp transport types, PIPELINING, DSN, message builder, LMTP.
+- `reference/net.md` - bifrost-net shared HTTP transport: retry, rate-limiting, observability.
+- `reference/sync.md` - bifrost-sync engine: scheduler, multiplexer, partitioned backfill, push reconciler, mutation pipeline, checkpoint envelope versioning, scope lifecycle.
