@@ -207,9 +207,12 @@ delta-eligible variants, then returns
 within `FolderType`, types other than `Email`, `Event` /
 `CalendarEvent`, and `Contact` also return `Error::Unsupported`.
 
-`describe_cursor` is currently a flat
-`CursorDescriptor { cost_class: Cheap, strategy: ServerCursor, freshness: None }`
-for every input; per-scope freshness sampling is not implemented.
+`describe_cursor` validates the cursor via `decode_cursor`. On
+success it reports `cost_class: Cheap`, `strategy: ServerCursor`,
+and `freshness: Some(Instant::now())`. On failure (wrong
+protocol, unknown envelope version, malformed payload) it
+reports `cost_class: Expensive`, `strategy: None`, and
+`freshness: None` so the engine reseeds via inventory.
 
 ## Per-scope inventory, changes, hydration
 
@@ -427,8 +430,18 @@ false` matches the account capability).
 ## Error mapping to the recovery taxonomy
 
 `recovery_for_graph_error(message, scope)` in `error.rs` is the
-shared message-shape classifier; it inspects the lowercased
-message body. Mappings:
+shared message-shape classifier. It receives a `&str` because the
+underlying `GraphClient` returns `Result<T, String>` end-to-end:
+every method in `api.rs` and the HTTP plumbing in `client.rs`
+formats the upstream status code and body into a string of the
+shape `"Graph upload error {status}: {body}"`. The classifier
+therefore matches on the lowercased message body rather than on
+a structured status enum. The format is stable because the
+client itself produces it, but the approach is fragile to any
+upstream change to the error envelope shape or to localization
+of the status text. Reconciling onto a structured per-call error
+type with a typed `status: u16` is in scope for Phase 4 error
+model convergence. Mappings:
 
 - 410 / "gone" -> `RecoveryClass::RestartScope(scope.clone())`.
   The Graph delta token has been compacted past retention; the
@@ -494,6 +507,8 @@ referenceAttachment in a mixed batch.
   the API surface but not transmitted; the engine's read-back
   guard is the only lost-update protection beyond the
   `If-Match` etag gate.
-- `describe_cursor` is a flat `Cheap / ServerCursor / None`
-  for every cursor; per-scope freshness sampling is not
-  implemented.
+- `recovery_for_graph_error` is a substring-matching classifier
+  because the underlying `GraphClient` returns `Result<T, String>`
+  end-to-end. Reconciling onto a structured `status: u16` error
+  type is Phase 4 (error model convergence) work, not a local
+  follow-up.

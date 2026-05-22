@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Instant;
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountFactory, AccountFuture, AccountStream, BlobHandle,
@@ -169,11 +170,20 @@ impl Account for GraphAccount {
             .store(bps.unwrap_or(UNLIMITED_BANDWIDTH), Ordering::Release);
     }
 
-    fn describe_cursor(&self, _cursor: &ChangeCursor) -> CursorDescriptor {
+    fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
+        let valid = cursor::decode_cursor(cursor).is_ok();
         CursorDescriptor {
-            cost_class: CostClass::Cheap,
-            strategy: SyncStrategy::ServerCursor,
-            freshness: None,
+            cost_class: if valid {
+                CostClass::Cheap
+            } else {
+                CostClass::Expensive
+            },
+            strategy: if valid {
+                SyncStrategy::ServerCursor
+            } else {
+                SyncStrategy::None
+            },
+            freshness: valid.then(Instant::now),
         }
     }
 

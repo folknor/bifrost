@@ -241,7 +241,24 @@ pub(crate) fn batch<T>(
 }
 
 pub(crate) fn scope_matches_payload(scope: &CursorScope, payload: &GraphCursorPayload) -> bool {
-    *scope == scope_for_kind(&payload.kind)
+    let canonical = scope_for_kind(&payload.kind);
+    *scope == canonical || event_aliases(scope, &canonical)
+}
+
+fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
+    let (
+        CursorScope::FolderType { folder: fa, ty: ta },
+        CursorScope::FolderType { folder: fb, ty: tb },
+    ) = (a, b)
+    else {
+        return false;
+    };
+    let aliased = matches!(
+        (ta, tb),
+        (ObjectType::Event, ObjectType::CalendarEvent)
+            | (ObjectType::CalendarEvent, ObjectType::Event)
+    );
+    aliased && fa == fb
 }
 
 async fn fetch_page(account: &GraphAccount, url: &str) -> Result<ODataCollection<Value>, String> {
@@ -375,6 +392,63 @@ mod tests {
             ty: ObjectType::Mailbox,
         };
         assert!(initial_delta_url(&account, &scope).is_err());
+    }
+
+    #[test]
+    fn scope_matches_payload_treats_event_and_calendar_event_as_aliases() {
+        let event_scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let calendar_event_scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::CalendarEvent,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&calendar_event_scope).expect("calendar event scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+
+        assert!(scope_matches_payload(&calendar_event_scope, &payload));
+        assert!(scope_matches_payload(&event_scope, &payload));
+    }
+
+    #[test]
+    fn scope_matches_payload_rejects_unrelated_object_types() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let other_scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::Event,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&other_scope).expect("event scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+
+        assert!(!scope_matches_payload(&scope, &payload));
+    }
+
+    #[test]
+    fn scope_matches_payload_rejects_aliased_object_types_for_different_folders() {
+        use super::super::cursor::GraphCursorKind;
+
+        let payload = GraphCursorPayload::new(
+            GraphCursorKind::EventsDelta {
+                calendar_id: "calendar-a".to_string(),
+            },
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar-b".to_string()),
+            ty: ObjectType::CalendarEvent,
+        };
+        assert!(!scope_matches_payload(&scope, &payload));
     }
 
     #[tokio::test]
