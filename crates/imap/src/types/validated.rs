@@ -433,6 +433,7 @@ impl From<MailboxName> for String {
 /// ```
 ///
 /// Used for `MAILBOXID`, `EMAILID`, and `THREADID` values.
+// protocol-specific: RFC 8474 objectid is validated IMAP metadata, not bifrost_types::ObjectId.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectId(String);
 

@@ -43,41 +43,6 @@ impl Pool {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn checkout(&self) -> Result<PooledConn, Error> {
-        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::Closed);
-        }
-        let permit = Arc::clone(&self.inner.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Closed)?;
-        let member = self.inner.idle.lock().expect("pool lock poisoned").pop();
-        let member = match member {
-            Some(member) => member,
-            None => {
-                let (conn, _auth) = self
-                    .inner
-                    .config
-                    .imap
-                    .connect_authenticated(
-                        &self.inner.config.credentials,
-                        &self.inner.config.auth_policy,
-                    )
-                    .await?;
-                PoolMember {
-                    conn,
-                    selected: None,
-                }
-            }
-        };
-        Ok(PooledConn {
-            member: Some(member),
-            pool: Arc::clone(&self.inner),
-            _permit: permit,
-        })
-    }
-
     pub(crate) async fn checkout_for_folder(
         &self,
         folder: &MailboxName,

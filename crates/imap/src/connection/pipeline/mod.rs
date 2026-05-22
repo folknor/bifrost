@@ -34,7 +34,9 @@ use super::driver::ConsumerErased;
 mod error;
 mod unfold;
 
+// pub: Pipeline::execute returns this error to direct pipelining callers.
 pub use error::PipelineError;
+// pub: Pipeline::execute uses this public bound for typed tuple unfolding.
 pub use unfold::UnfoldTuple;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +66,7 @@ pub use unfold::UnfoldTuple;
 /// // pipeline: Pipeline<'_, (Vec<Capability>, ((), ()))>
 /// // execute() would return (Result<(), Error>, Result<Vec<Capability>, Error>)
 /// ```
+// pub: returned by ImapConnection::pipeline for direct pipelined command batches.
 pub struct Pipeline<'conn, Accumulated> {
     conn: &'conn super::ImapConnection,
     pending: Vec<Box<dyn ConsumerErased>>,

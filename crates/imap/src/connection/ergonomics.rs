@@ -7,6 +7,9 @@ impl ImapConnection {
     /// If a complete QRESYNC cursor is provided and the server advertises
     /// QRESYNC, this method enables QRESYNC before selecting the mailbox.
     /// Otherwise it falls back to CONDSTORE when requested and available.
+    ///
+    /// Direct API counterpart to Account cursor establishment and changes:
+    /// callers keep native IMAP types and own cursor persistence.
     pub async fn select_for_sync(
         &self,
         mailbox: &str,
@@ -44,6 +47,9 @@ impl ImapConnection {
     }
 
     /// Execute a sync-oriented UID FETCH.
+    ///
+    /// Direct API counterpart to Account change streams: callers provide
+    /// native UID sets and receive protocol FETCH data.
     pub async fn sync_fetch(
         &self,
         request: &crate::types::SyncFetchRequest,
@@ -80,6 +86,9 @@ impl ImapConnection {
     }
 
     /// Stream a UID FETCH into a callback without exposing channel ceremony.
+    ///
+    /// Direct API counterpart to Account hydration: callers consume native
+    /// FETCH responses instead of shared HydratedObject batches.
     pub async fn uid_fetch_each<F>(
         &self,
         uids: &crate::types::UidSet,
@@ -112,6 +121,8 @@ impl ImapConnection {
     /// after the tagged completion. The driver still drains the command to
     /// keep the IMAP stream synchronized, so callers that need strict
     /// back-pressure should use [`uid_fetch_each`](Self::uid_fetch_each).
+    ///
+    /// Direct API counterpart to Account get/blob streams for buffered callers.
     pub async fn uid_fetch_limited(
         &self,
         uids: &crate::types::UidSet,
@@ -145,6 +156,8 @@ impl ImapConnection {
     /// `max_estimated_bytes` caps the buffered response size. Use
     /// [`uid_fetch_each`](Self::uid_fetch_each) for unbounded or large
     /// result sets.
+    ///
+    /// Direct API counterpart to Account full-message hydration.
     pub async fn uid_fetch_full_messages(
         &self,
         uids: &crate::types::UidSet,

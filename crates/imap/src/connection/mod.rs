@@ -45,15 +45,11 @@ mod sort_thread;
 pub(super) mod state;
 mod stream;
 mod tag;
-/// Typed event enum for asynchronous server notifications.
-///
-/// See [`TypedEvent`](typed_event::TypedEvent) for the event variants
-/// observable via [`drain_events`](ImapConnection::drain_events) and
-/// [`next_event`](ImapConnection::next_event).
 pub mod typed_event;
 mod uid_ops;
 pub(super) mod wire;
 
+// pub: ImapConfig is re-exported at the crate root for direct connections.
 pub use config::ImapConfig;
 pub(crate) use dispatch::FetchStreamItem;
 use literals::{
@@ -67,6 +63,7 @@ use stream::{CompressedStream, ImapStream, InnerStream};
 mod tests;
 
 /// TLS policy for an IMAP connection.
+// pub: callers choose the direct connection security mode in ImapConfig.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TlsMode {
     /// Connect directly over TLS.
@@ -88,6 +85,7 @@ impl TlsMode {
 }
 
 /// TCP keepalive configuration for the underlying socket.
+// pub: callers tune direct socket keepalive through ImapConfig.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpKeepalive {
@@ -108,6 +106,7 @@ impl TcpKeepalive {
 ///
 /// Tracks the current protocol state of the connection. State transitions
 /// are managed automatically by `ImapConnection` methods.
+// pub: direct clients inspect state before selecting command paths.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionState {
@@ -122,6 +121,7 @@ pub enum SessionState {
 }
 
 /// Event received during an IDLE session (RFC 2177).
+// pub: direct IDLE users receive this lower-level event shape.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IdleEvent {
@@ -275,6 +275,7 @@ pub enum IdleEvent {
 ///
 /// Contains both the matching sequence numbers/UIDs and the optional
 /// highest mod-sequence value (RFC 7162 Section 3.1.5).
+// pub: direct SEARCH APIs return this protocol-native result.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SearchResult {
@@ -307,6 +308,7 @@ pub struct SearchResult {
 /// [`Error::Protocol`] if not. For example, [`uid_fetch()`](Self::uid_fetch)
 /// requires the Selected state and will fail if called before
 /// [`select()`](Self::select).
+// pub: this remains the raw IMAP command API; Account wraps it for engine-managed sync.
 pub struct ImapConnection {
     /// Channel for submitting commands to the driver task.
     cmd_tx: tokio::sync::mpsc::Sender<driver::DriverCommand>,

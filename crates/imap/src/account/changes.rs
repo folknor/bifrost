@@ -509,7 +509,7 @@ async fn run_basic(
     cursor: FolderCursor,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    let known_uids = cursor.known_uids().cloned().unwrap_or_default();
+    let known_uids = cursor.known_uids().clone();
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::types::{AuthMechanism, ResponseCode};
 
 /// Error type for IMAP client operations.
+// protocol-specific: direct IMAP APIs preserve response codes beyond bifrost_types::Error.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -329,6 +330,7 @@ impl Error {
 }
 
 /// Broad error category for consumer policy decisions.
+// protocol-specific: direct IMAP callers classify RFC 5530 response codes locally.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCategory {
@@ -477,6 +479,7 @@ impl ErrorCategory {
 }
 
 /// Suggested high-level recovery action for an IMAP error.
+// protocol-specific: mapped into bifrost_types::RecoveryClass only at the Account boundary.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recovery {

@@ -92,7 +92,9 @@ macro_rules! u64_id {
 }
 
 u64_id!(ModSeq, "A CONDSTORE/QRESYNC modification sequence value.");
+// protocol-specific: X-GM-MSGID is a Gmail IMAP extension value, not a shared object id.
 u64_id!(GmailMessageId, "A Gmail X-GM-MSGID value.");
+// protocol-specific: X-GM-THRID is exposed through IMAP as u64, not bifrost_types::ThreadId.
 u64_id!(GmailThreadId, "A Gmail X-GM-THRID value.");
 
 /// A typed UID set for UID commands.

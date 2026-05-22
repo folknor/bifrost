@@ -5,6 +5,7 @@ use super::{
 };
 
 /// Options for selecting a mailbox for synchronization.
+// protocol-specific: direct IMAP sync helpers carry QRESYNC SELECT operands.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncSelectOptions {
@@ -78,6 +79,7 @@ impl SyncSelectOptions {
 }
 
 /// Result of selecting a mailbox for synchronization.
+// protocol-specific: direct IMAP sync helpers expose SELECT extension usage.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncSelectResult {
@@ -90,6 +92,7 @@ pub struct SyncSelectResult {
 }
 
 /// Common fetch shape for mailbox synchronization.
+// protocol-specific: direct IMAP sync helpers carry UID FETCH operands.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncFetchRequest {
@@ -165,6 +168,7 @@ impl SyncFetchRequest {
 }
 
 /// Result of a sync fetch.
+// protocol-specific: direct IMAP sync helpers expose FETCH plus VANISHED data.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncFetchResult {

@@ -7,8 +7,9 @@ use crate::types::{MailboxAttribute, MailboxInfo, MailboxName, UidRange};
 use super::FolderCursor;
 
 /// Compact sorted UID set used in Basic and CONDSTORE cursor payloads.
+// protocol-specific: IMAP cursors need a compact UID baseline, not a wire sequence set.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompactUidSet {
+pub(crate) struct CompactUidSet {
     ranges: Vec<UidRange>,
 }
 
@@ -95,8 +96,6 @@ pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
 
 pub(crate) struct FolderEntry {
     pub(crate) name: MailboxName,
-    #[allow(dead_code)]
-    pub(crate) attributes: Vec<MailboxAttribute>,
     pub(crate) selectable: bool,
     cursor: RwLock<Option<FolderCursor>>,
     modseq_by_uid: RwLock<ModSeqCache>,
@@ -119,7 +118,6 @@ impl FolderEntry {
         });
         Self {
             name: info.name,
-            attributes: info.attributes,
             selectable,
             cursor: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
@@ -339,12 +337,6 @@ mod tests {
         };
         let entry = FolderEntry::from_mailbox(info);
         assert!(!entry.selectable);
-        assert!(
-            entry
-                .attributes
-                .iter()
-                .any(MailboxAttribute::is_special_use)
-        );
     }
 
     #[test]

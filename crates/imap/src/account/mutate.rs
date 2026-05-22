@@ -380,8 +380,9 @@ async fn store_flags(
     ))
 }
 
+// protocol-specific: IMAP STORE can return MODIFIED before it maps to shared MutationOutcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StoreWireOutcome {
+enum StoreWireOutcome {
     Applied,
     Modified(Vec<u32>),
     PendingRetry(Vec<u32>),
@@ -389,7 +390,7 @@ pub(crate) enum StoreWireOutcome {
 }
 
 impl StoreWireOutcome {
-    pub(crate) fn from_response_code(code: Option<&ResponseCode>, tagged_ok: bool) -> Self {
+    fn from_response_code(code: Option<&ResponseCode>, tagged_ok: bool) -> Self {
         match (tagged_ok, modified_uids(code)) {
             (true, None) => Self::Applied,
             (true, Some(modified)) => Self::Modified(modified),

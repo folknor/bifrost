@@ -34,6 +34,8 @@ impl ImapConnection {
     /// Sends the IDLE command to the driver task, then waits for
     /// the first event, a timeout, or cancellation. On any of these,
     /// sends DONE to end the IDLE session and returns the result.
+    /// Direct API counterpart to Account push streams: callers receive
+    /// protocol-native IDLE events and own resync policy.
     ///
     /// # Cancellation safety
     ///

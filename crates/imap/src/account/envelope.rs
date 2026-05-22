@@ -10,6 +10,7 @@ use super::CompactUidSet;
 pub(crate) const ENVELOPE_VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"IMAPCUR1";
 
+// protocol-specific: this is the IMAP payload carried inside OpaqueChangeState.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FolderCursor {
     QResync {
@@ -39,11 +40,11 @@ impl FolderCursor {
         }
     }
 
-    pub(crate) fn known_uids(&self) -> Option<&CompactUidSet> {
+    pub(crate) fn known_uids(&self) -> &CompactUidSet {
         match self {
             Self::QResync { known_uids, .. }
             | Self::Condstore { known_uids, .. }
-            | Self::Basic { known_uids, .. } => Some(known_uids),
+            | Self::Basic { known_uids, .. } => known_uids,
         }
     }
 }

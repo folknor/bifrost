@@ -63,6 +63,7 @@
 //! (`pub(crate)`, for already-parsed wire data in the codec). The
 //! compiler refuses to smuggle wire-form bytes through any public type.
 
+// pub: consumers register the IMAP AccountFactory through this module.
 pub mod account;
 pub mod error;
 pub mod types;

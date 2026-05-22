@@ -33,6 +33,7 @@ mod pool;
 mod push;
 mod scopes;
 
+// pub: consumers register this factory with bifrost-sync without naming ImapAccount.
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
 
 pub(crate) use envelope::{
@@ -48,11 +49,11 @@ const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
 /// Open IMAP account handle. The handle owns the connection pool.
 #[derive(Clone)]
-pub struct ImapAccount {
+pub(crate) struct ImapAccount {
     inner: Arc<ImapAccountInner>,
 }
 
-pub struct ImapAccountInner {
+pub(crate) struct ImapAccountInner {
     pub(crate) config: Arc<ImapAccountConfig>,
     pub(crate) capabilities: bifrost_types::AccountCapabilities,
     pub(crate) pool: Arc<Pool>,
@@ -223,35 +224,43 @@ impl ImapAccount {
 }
 
 impl Account for ImapAccount {
+    // Account: exposes the factory-built capability snapshot; direct users call server_profile().
     fn capabilities(&self) -> &bifrost_types::AccountCapabilities {
         &self.capabilities
     }
 
+    // Account: stores the engine priority hint; direct ImapConnection calls remain caller scheduled.
     fn set_priority(&self, priority: Priority) {
         self.priority.store(priority as u8, Ordering::Release);
     }
 
+    // Account: records the engine bandwidth cap until IMAP byte-metering is wired.
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
         self.bandwidth_cap
             .store(bps.unwrap_or(UNLIMITED_BANDWIDTH), Ordering::Release);
     }
 
+    // Account: describes opaque engine cursors; direct users inspect SyncSelectResult.
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
         changes::describe_cursor(self, cursor)
     }
 
+    // Account: discovers engine cursor scopes from the folder registry; direct users call LIST.
     fn discover_cursor_scopes(&self) -> AccountStream<SyncEvent<CursorScope>> {
         scopes::discover_cursor_scopes(self.clone())
     }
 
+    // Account: reports engine membership scopes; direct users call LIST/LIST-STATUS.
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
         scopes::discover_memberships(self.clone())
     }
 
+    // Account: streams folder lifecycle events from push state; direct users consume IDLE/NOTIFY.
     fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycle> {
         scopes::scope_lifecycle_stream(self.clone())
     }
 
+    // Account: mints an engine cursor from folder state; direct users call select_for_sync().
     fn establish_initial_cursor(
         &self,
         scope: CursorScope,
@@ -259,10 +268,12 @@ impl Account for ImapAccount {
         inventory::establish_initial_cursor(self.clone(), scope)
     }
 
+    // Account: emits engine inventory batches; direct users compose UID SEARCH/FETCH.
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
         inventory::inventory_stream(self.clone(), scope)
     }
 
+    // Account: hydrates bifrost ObjectIds; direct users call uid_fetch* with native UIDs.
     fn get_stream(
         &self,
         ids: AccountStream<bifrost_types::ObjectId>,
@@ -271,10 +282,12 @@ impl Account for ImapAccount {
         get::get_stream(self.clone(), ids, projection)
     }
 
+    // Account: advances opaque cursors; direct users call sync_fetch() or UID commands.
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
         changes::changes_stream(self.clone(), cursor)
     }
 
+    // Account: IMAP has no durable server-side subscription, so this starts in-process push.
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
@@ -282,6 +295,7 @@ impl Account for ImapAccount {
         push::push_subscribe(self.clone(), scopes.to_vec())
     }
 
+    // Account: unsubscribes the synthetic in-process push handle; direct users call notify_none().
     fn push_unsubscribe(
         &self,
         handle: SubscriptionHandle,
@@ -289,14 +303,17 @@ impl Account for ImapAccount {
         push::push_unsubscribe(self.clone(), handle)
     }
 
+    // Account: forwards IDLE/NOTIFY wakeups as WatchEvents; direct users call idle().
     fn push_stream(&self) -> AccountStream<WatchEvent> {
         push::push_stream(self.clone())
     }
 
+    // Account: streams a bifrost BlobHandle; direct users fetch BODY[] sections.
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
         blob::open_blob(self.clone(), handle)
     }
 
+    // Account: maps shared byte ranges to IMAP partial BODY[]; direct users choose sections.
     fn open_blob_range(
         &self,
         handle: BlobHandle,
@@ -305,6 +322,7 @@ impl Account for ImapAccount {
         blob::open_blob_range(self.clone(), handle, range)
     }
 
+    // Account: maps shared FlagOp batches to UID STORE; direct users call uid_store().
     fn bulk_set_flags(
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
@@ -314,6 +332,7 @@ impl Account for ImapAccount {
         mutate::bulk_set_flags(self.clone(), targets, op, key)
     }
 
+    // Account: maps shared membership moves to UID MOVE; direct users call uid_move_messages().
     fn bulk_move(
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
@@ -323,6 +342,7 @@ impl Account for ImapAccount {
         mutate::bulk_move(self.clone(), targets, destination, key)
     }
 
+    // Account: maps shared destroy batches to STORE Deleted plus UID EXPUNGE.
     fn bulk_destroy(
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
@@ -331,6 +351,7 @@ impl Account for ImapAccount {
         mutate::bulk_destroy(self.clone(), targets, key)
     }
 
+    // Account: closes the pool; direct users close a single connection with logout().
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         close::close(self.clone())
     }

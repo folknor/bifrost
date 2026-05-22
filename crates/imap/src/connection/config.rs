@@ -99,11 +99,17 @@ impl ImapConfig {
     }
 
     /// Connect using this configuration.
+    ///
+    /// Direct API counterpart to `ImapAccountFactory`: use this when the
+    /// caller owns command scheduling instead of bifrost-sync.
     pub async fn connect(&self) -> Result<ImapConnection, Error> {
         ImapConnection::connect_config(self).await
     }
 
     /// Connect and authenticate using automatic mechanism selection.
+    ///
+    /// Direct API counterpart to `ImapAccountFactory::open`: returns the
+    /// raw connection and auth outcome instead of an engine trait object.
     pub async fn connect_authenticated(
         &self,
         credentials: &crate::types::Credentials,
@@ -136,6 +142,8 @@ impl std::fmt::Debug for ImapConfig {
 
 impl ImapConnection {
     /// Connect using a configuration object.
+    ///
+    /// Direct API counterpart to the Account factory's pool dial path.
     pub async fn connect_config(config: &ImapConfig) -> Result<Self, Error> {
         let conn = if let Some(connector) = &config.tls_connector {
             Self::connect_with_tls_connector(
