@@ -99,7 +99,11 @@ async fn run_blob(
     let selected = account
         .select_folder(&mut conn, &decoded.folder, cursor.as_ref(), true)
         .await?;
-    if selected.mailbox.uid_validity.unwrap_or_default() != decoded.uidvalidity {
+    let uidvalidity = selected
+        .mailbox
+        .uid_validity
+        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
+    if uidvalidity != decoded.uidvalidity {
         return Err(AccountError::Other("UIDVALIDITY changed before blob fetch".into()).into());
     }
     let Some(uid_set) = uid_set_from_u32(&[decoded.uid]) else {

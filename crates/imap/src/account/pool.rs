@@ -171,6 +171,10 @@ impl PooledConn {
             member.selected = Some(folder);
         }
     }
+
+    pub(crate) fn discard(&mut self) {
+        self.member.take();
+    }
 }
 
 impl Drop for PooledConn {

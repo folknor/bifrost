@@ -56,4 +56,11 @@ mod tests {
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert!(caps.requires_uidvalidity_recheck);
     }
+
+    #[test]
+    fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let caps = build_capabilities(&profile);
+        assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
+    }
 }

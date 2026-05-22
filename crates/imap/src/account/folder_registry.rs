@@ -99,7 +99,14 @@ pub(crate) struct FolderEntry {
     pub(crate) attributes: Vec<MailboxAttribute>,
     pub(crate) selectable: bool,
     cursor: RwLock<Option<FolderCursor>>,
+    modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
+}
+
+#[derive(Debug, Default)]
+struct ModSeqCache {
+    uidvalidity: Option<u32>,
+    by_uid: HashMap<u32, u64>,
 }
 
 impl FolderEntry {
@@ -115,6 +122,7 @@ impl FolderEntry {
             attributes: info.attributes,
             selectable,
             cursor: RwLock::new(None),
+            modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
         }
     }
@@ -128,6 +136,61 @@ impl FolderEntry {
 
     pub(crate) fn set_cursor(&self, cursor: FolderCursor) {
         *self.cursor.write().expect("folder cursor lock poisoned") = Some(cursor);
+    }
+
+    pub(crate) fn modseq(&self, uidvalidity: u32, uid: u32) -> Option<u64> {
+        let cache = self
+            .modseq_by_uid
+            .read()
+            .expect("folder modseq lock poisoned");
+        if cache.uidvalidity != Some(uidvalidity) {
+            return None;
+        }
+        cache.by_uid.get(&uid).copied()
+    }
+
+    pub(crate) fn record_modseq(
+        &self,
+        uidvalidity: u32,
+        uid: u32,
+        modseq: u64,
+    ) -> Result<(), crate::Error> {
+        if uidvalidity == 0 {
+            return Err(crate::Error::Protocol(
+                "MODSEQ cache update missing UIDVALIDITY".into(),
+            ));
+        }
+        if uid == 0 {
+            return Err(crate::Error::Protocol(
+                "MODSEQ cache update missing UID".into(),
+            ));
+        }
+        if modseq == 0 {
+            return Err(crate::Error::Protocol("FETCH returned MODSEQ 0".into()));
+        }
+        let mut modseqs = self
+            .modseq_by_uid
+            .write()
+            .map_err(|_| crate::Error::Internal("folder modseq lock poisoned".into()))?;
+        if modseqs.uidvalidity != Some(uidvalidity) {
+            modseqs.uidvalidity = Some(uidvalidity);
+            modseqs.by_uid.clear();
+        }
+        modseqs.by_uid.insert(uid, modseq);
+        Ok(())
+    }
+
+    pub(crate) fn clear_modseqs(&self, uidvalidity: u32, uids: &[u32]) {
+        let mut modseqs = self
+            .modseq_by_uid
+            .write()
+            .expect("folder modseq lock poisoned");
+        if modseqs.uidvalidity != Some(uidvalidity) {
+            return;
+        }
+        for uid in uids {
+            modseqs.by_uid.remove(uid);
+        }
     }
 
     pub(crate) fn mark_seen(&self) {
@@ -166,6 +229,27 @@ impl FolderRegistry {
         }
     }
 
+    pub(crate) fn apply_mailbox_event(&self, info: MailboxInfo) {
+        let name = info.name.as_str().to_owned();
+        let old_name = info.old_name.as_ref().map(|name| name.as_str().to_owned());
+        let deleted = info
+            .attributes
+            .iter()
+            .any(|attr| matches!(attr, MailboxAttribute::NonExistent));
+        let mut map = self.by_name.write().expect("folder registry lock poisoned");
+        if let Some(old_name) = old_name {
+            map.remove(&old_name);
+        }
+        if deleted {
+            map.remove(&name);
+            return;
+        }
+        if !map.contains_key(&name) || info.old_name.is_some() {
+            let entry = Arc::new(FolderEntry::from_mailbox(info));
+            map.insert(name, entry);
+        }
+    }
+
     pub(crate) fn entries(&self) -> Vec<Arc<FolderEntry>> {
         self.by_name
             .read()
@@ -186,6 +270,30 @@ impl FolderRegistry {
     pub(crate) fn set_cursor(&self, folder: &MailboxName, cursor: FolderCursor) {
         if let Some(entry) = self.get(folder) {
             entry.set_cursor(cursor);
+        }
+    }
+
+    pub(crate) fn modseq(&self, folder: &MailboxName, uidvalidity: u32, uid: u32) -> Option<u64> {
+        self.get(folder)
+            .and_then(|entry| entry.modseq(uidvalidity, uid))
+    }
+
+    pub(crate) fn record_modseq(
+        &self,
+        folder: &MailboxName,
+        uidvalidity: u32,
+        uid: u32,
+        modseq: u64,
+    ) -> Result<(), crate::Error> {
+        if let Some(entry) = self.get(folder) {
+            return entry.record_modseq(uidvalidity, uid, modseq);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_modseqs(&self, folder: &MailboxName, uidvalidity: u32, uids: &[u32]) {
+        if let Some(entry) = self.get(folder) {
+            entry.clear_modseqs(uidvalidity, uids);
         }
     }
 
@@ -237,5 +345,88 @@ mod tests {
                 .iter()
                 .any(MailboxAttribute::is_special_use)
         );
+    }
+
+    #[test]
+    fn folder_entry_tracks_modseq_by_uid() {
+        let info = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            ..Default::default()
+        };
+        let entry = FolderEntry::from_mailbox(info);
+
+        entry.record_modseq(11, 7, 99).expect("valid modseq");
+        assert!(entry.record_modseq(0, 7, 100).is_err());
+        assert!(entry.record_modseq(11, 0, 100).is_err());
+        assert!(entry.record_modseq(11, 8, 0).is_err());
+
+        assert_eq!(entry.modseq(11, 7), Some(99));
+        assert_eq!(entry.modseq(0, 7), None);
+        assert_eq!(entry.modseq(11, 0), None);
+        assert_eq!(entry.modseq(11, 8), None);
+        assert_eq!(entry.modseq(12, 7), None);
+
+        entry.clear_modseqs(11, &[7]);
+        assert_eq!(entry.modseq(11, 7), None);
+    }
+
+    #[test]
+    fn folder_entry_drops_modseqs_from_old_uidvalidity_epoch() {
+        let info = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            ..Default::default()
+        };
+        let entry = FolderEntry::from_mailbox(info);
+
+        entry.record_modseq(11, 7, 99).expect("valid modseq");
+        entry.record_modseq(12, 7, 100).expect("valid modseq");
+
+        assert_eq!(entry.modseq(11, 7), None);
+        assert_eq!(entry.modseq(12, 7), Some(100));
+    }
+
+    #[test]
+    fn mailbox_delete_and_recreate_gets_fresh_entry() {
+        let folder = MailboxName::new("Projects").expect("valid mailbox");
+        let registry = FolderRegistry::from_list(vec![MailboxInfo {
+            name: folder.clone(),
+            ..Default::default()
+        }]);
+        let entry = registry.get(&folder).expect("folder entry");
+        entry.record_modseq(11, 7, 99).expect("valid modseq");
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: folder.clone(),
+            attributes: vec![MailboxAttribute::NonExistent],
+            ..Default::default()
+        });
+        assert!(registry.get(&folder).is_none());
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: folder.clone(),
+            ..Default::default()
+        });
+        let entry = registry.get(&folder).expect("recreated folder entry");
+        assert_eq!(entry.modseq(11, 7), None);
+        assert!(entry.cursor().is_none());
+    }
+
+    #[test]
+    fn mailbox_rename_removes_old_entry() {
+        let old = MailboxName::new("Old").expect("valid mailbox");
+        let new = MailboxName::new("New").expect("valid mailbox");
+        let registry = FolderRegistry::from_list(vec![MailboxInfo {
+            name: old.clone(),
+            ..Default::default()
+        }]);
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: new.clone(),
+            old_name: Some(old.clone()),
+            ..Default::default()
+        });
+
+        assert!(registry.get(&old).is_none());
+        assert!(registry.get(&new).is_some());
     }
 }

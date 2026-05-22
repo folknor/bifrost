@@ -58,6 +58,8 @@ pub struct ImapAccountInner {
     pub(crate) pool: Arc<Pool>,
     pub(crate) folders: Arc<FolderRegistry>,
     pub(crate) qresync_enabled: AtomicBool,
+    pub(crate) qresync_negotiation_warning: Option<String>,
+    pub(crate) qresync_negotiation_warning_sent: AtomicBool,
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) priority: AtomicU8,
@@ -72,6 +74,7 @@ impl ImapAccount {
         pool: Arc<Pool>,
         folders: Arc<FolderRegistry>,
         qresync_enabled: bool,
+        qresync_negotiation_warning: Option<String>,
     ) -> Self {
         Self {
             inner: Arc::new(ImapAccountInner {
@@ -80,6 +83,8 @@ impl ImapAccount {
                 pool,
                 folders,
                 qresync_enabled: AtomicBool::new(qresync_enabled),
+                qresync_negotiation_warning,
+                qresync_negotiation_warning_sent: AtomicBool::new(false),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
@@ -138,11 +143,22 @@ impl ImapAccount {
             && let Some(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
-                ..
+                known_uids,
+                known_uids_complete,
             }) = cursor
             && let Some(validity) = UidValidity::new(*uidvalidity)
         {
-            options = options.with_qresync(validity, crate::types::ModSeq::new(*modseq), None);
+            let known_uids = if *known_uids_complete {
+                let uids = known_uids
+                    .to_uids()
+                    .into_iter()
+                    .filter_map(crate::types::Uid::new);
+                crate::types::UidSet::from_uids(uids)
+            } else {
+                None
+            };
+            options =
+                options.with_qresync(validity, crate::types::ModSeq::new(*modseq), known_uids);
         }
         options
     }
@@ -151,34 +167,36 @@ impl ImapAccount {
         &self,
         selected: &crate::types::SelectedMailbox,
         known_uids: Option<CompactUidSet>,
-    ) -> FolderCursor {
-        let uidvalidity = selected.uid_validity.unwrap_or_default();
+    ) -> Result<FolderCursor, Error> {
+        let uidvalidity = selected
+            .uid_validity
+            .ok_or_else(|| Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
         let known_uids = known_uids.unwrap_or_default();
         if self.qresync_enabled()
             && let Some(modseq) = selected.highest_mod_seq
             && !selected.no_mod_seq
         {
-            return FolderCursor::QResync {
+            return Ok(FolderCursor::QResync {
                 uidvalidity,
                 modseq,
                 known_uids,
                 known_uids_complete: true,
-            };
+            });
         }
         if let Some(modseq) = selected.highest_mod_seq
             && !selected.no_mod_seq
         {
-            return FolderCursor::Condstore {
+            return Ok(FolderCursor::Condstore {
                 uidvalidity,
                 modseq,
                 known_uids,
-            };
+            });
         }
-        FolderCursor::Basic {
+        Ok(FolderCursor::Basic {
             uidvalidity,
             uidnext: selected.uid_next.unwrap_or_default(),
             known_uids,
-        }
+        })
     }
 
     pub(crate) fn qresync_enabled(&self) -> bool {
@@ -190,6 +208,17 @@ impl ImapAccount {
         // on this account. They are allowed to finish or independently
         // downgrade; this one-way flag only prevents new QRESYNC work.
         self.qresync_enabled.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn take_qresync_negotiation_warning(&self) -> Option<String> {
+        let warning = self.qresync_negotiation_warning.as_ref()?;
+        if self
+            .qresync_negotiation_warning_sent
+            .swap(true, Ordering::Release)
+        {
+            return None;
+        }
+        Some(warning.clone())
     }
 }
 

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use bifrost_types::{
     AccountFuture, AccountStream, Checkpoint, CursorEstablishment, CursorScope,
     Error as AccountError, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
-    ThreadId,
+    SyncStrategy, ThreadId, Warning, WarningKind,
 };
 
 use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
@@ -41,13 +41,31 @@ async fn run_inventory(
     scope: CursorScope,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
 ) -> Result<(), crate::Error> {
+    if let Some(reason) = account.take_qresync_negotiation_warning() {
+        tx.send(SyncEvent::Warning(Warning {
+            kind: WarningKind::StrategyDowngraded {
+                from: SyncStrategy::QResync,
+                to: SyncStrategy::Condstore,
+            },
+            message: reason,
+            retry_count: 0,
+            next_action: None,
+            protocol_detail: Some("imap".to_string()),
+        }))
+        .await
+        .map_err(|_| crate::Error::Closed)?;
+    }
     let folder = folder_from_scope(&scope).map_err(|e| crate::Error::Protocol(e.to_string()))?;
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, None, true)
         .await?;
-    let uidvalidity = selected.mailbox.uid_validity.unwrap_or_default();
-    let attrs = inventory_attrs();
+    let uidvalidity = selected
+        .mailbox
+        .uid_validity
+        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
+    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
+    let attrs = inventory_attrs(include_modseq);
     let all_uids = UidSet::all();
     let (mut fetch_rx, fetch_fut) = conn.connection().uid_fetch_stream(
         all_uids.as_sequence_set(),
@@ -69,6 +87,11 @@ async fn run_inventory(
                 match item {
                     Some(Ok(fetch)) => {
                         if let Some(uid) = fetch.uid {
+                            if let Some(modseq) = fetch.mod_seq {
+                                account
+                                    .folders
+                                    .record_modseq(&folder, uidvalidity, uid, modseq)?;
+                            }
                             known.push(uid);
                             batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch));
                             if batch_items.len() >= BATCH_ITEMS {
@@ -90,7 +113,7 @@ async fn run_inventory(
     }
 
     let known_uids = CompactUidSet::from_uids(known);
-    let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids));
+    let cursor = account.cursor_from_select(&selected.mailbox, Some(known_uids))?;
     account.folders.set_cursor(&folder, cursor.clone());
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
         folder_scope(&folder),
@@ -111,14 +134,17 @@ async fn run_inventory(
     Ok(())
 }
 
-pub(crate) fn inventory_attrs() -> Vec<FetchAttr> {
-    vec![
+pub(crate) fn inventory_attrs(include_modseq: bool) -> Vec<FetchAttr> {
+    let mut attrs = vec![
         FetchAttr::Uid,
         FetchAttr::Flags,
         FetchAttr::Envelope,
         FetchAttr::Rfc822Size,
-        FetchAttr::ModSeq,
-    ]
+    ];
+    if include_modseq {
+        attrs.push(FetchAttr::ModSeq);
+    }
+    attrs
 }
 
 pub(crate) fn fetch_to_inventory(
@@ -176,4 +202,23 @@ pub(crate) fn flags_set(flags: &[crate::types::Flag]) -> HashSet<String> {
         .iter()
         .map(|flag| flag.as_imap_str().to_ascii_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_attrs_request_modseq_only_when_available() {
+        assert!(
+            inventory_attrs(true)
+                .iter()
+                .any(|attr| matches!(attr, FetchAttr::ModSeq))
+        );
+        assert!(
+            inventory_attrs(false)
+                .iter()
+                .all(|attr| !matches!(attr, FetchAttr::ModSeq))
+        );
+    }
 }

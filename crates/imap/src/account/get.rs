@@ -69,7 +69,10 @@ async fn run_folder_get(
     let selected = account
         .select_folder(&mut conn, folder, cursor.as_ref(), true)
         .await?;
-    let uidvalidity = selected.mailbox.uid_validity.unwrap_or_default();
+    let uidvalidity = selected
+        .mailbox
+        .uid_validity
+        .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
     let valid: Vec<u32> = ids
         .into_iter()
         .filter(|id| id.uidvalidity == uidvalidity)
@@ -78,16 +81,22 @@ async fn run_folder_get(
     let Some(uid_set) = uid_set_from_u32(&valid) else {
         return Ok(());
     };
+    let include_modseq = selected.mailbox.highest_mod_seq.is_some() && !selected.mailbox.no_mod_seq;
     let fetches = conn
         .connection()
         .uid_fetch(
             uid_set.as_sequence_set(),
-            &attrs_for_projection(projection),
+            &attrs_for_projection(projection, include_modseq),
             account.command_timeout(),
         )
         .await?;
     let mut out = Vec::with_capacity(BATCH_ITEMS);
     for fetch in fetches {
+        if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
+            account
+                .folders
+                .record_modseq(folder, uidvalidity, uid, modseq)?;
+        }
         if let Some(object) = fetch_to_hydrated(folder, uidvalidity, fetch, projection) {
             out.push(object);
             if out.len() >= BATCH_ITEMS {
@@ -105,16 +114,27 @@ async fn run_folder_get(
     Ok(())
 }
 
-fn attrs_for_projection(projection: Projection) -> Vec<FetchAttr> {
+fn attrs_for_projection(projection: Projection, include_modseq: bool) -> Vec<FetchAttr> {
     match projection {
-        Projection::FlagsOnly => vec![FetchAttr::Uid, FetchAttr::Flags],
-        Projection::Metadata => vec![
-            FetchAttr::Uid,
-            FetchAttr::Flags,
-            FetchAttr::Envelope,
-            FetchAttr::Rfc822Size,
-            FetchAttr::ModSeq,
-        ],
+        Projection::FlagsOnly => {
+            let mut attrs = vec![FetchAttr::Uid, FetchAttr::Flags];
+            if include_modseq {
+                attrs.push(FetchAttr::ModSeq);
+            }
+            attrs
+        }
+        Projection::Metadata => {
+            let mut attrs = vec![
+                FetchAttr::Uid,
+                FetchAttr::Flags,
+                FetchAttr::Envelope,
+                FetchAttr::Rfc822Size,
+            ];
+            if include_modseq {
+                attrs.push(FetchAttr::ModSeq);
+            }
+            attrs
+        }
         Projection::Headers => vec![FetchAttr::Uid, FetchAttr::Rfc822Header],
         Projection::Preview(count) => vec![
             FetchAttr::Uid,
@@ -175,4 +195,23 @@ fn fetch_to_hydrated(
         kind,
         blobs: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_projection_requests_modseq_only_when_available() {
+        assert!(
+            attrs_for_projection(Projection::Metadata, true)
+                .iter()
+                .any(|attr| matches!(attr, FetchAttr::ModSeq))
+        );
+        assert!(
+            attrs_for_projection(Projection::Metadata, false)
+                .iter()
+                .all(|attr| !matches!(attr, FetchAttr::ModSeq))
+        );
+    }
 }

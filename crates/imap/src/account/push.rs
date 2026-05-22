@@ -153,15 +153,18 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
                 continue;
             }
         };
-        if conn
+        let selected = match conn
             .select(folder.as_str(), account.command_timeout())
             .await
-            .is_err()
         {
-            let _ = account.push.tx.send(WatchEvent::Disconnected);
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        }
+            Ok(selected) => selected,
+            Err(_) => {
+                let _ = account.push.tx.send(WatchEvent::Disconnected);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        let uidvalidity = selected.uid_validity;
         let _ = account.push.tx.send(WatchEvent::Reconnected);
         loop {
             if cancel.is_cancelled() || account.shutdown.is_cancelled() {
@@ -170,6 +173,9 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             }
             match conn.idle(account.config.idle_timeout, cancel.clone()).await {
                 Ok(event) => {
+                    if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() {
+                        let _ = account.push.tx.send(invalidated(HintPayload::Unknown));
+                    }
                     if let Some(event) = map_idle_event(event, &folder) {
                         let _ = account.push.tx.send(event);
                     }
@@ -205,6 +211,36 @@ fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName
         .into_iter()
         .find(|entry| entry.name.as_str().eq_ignore_ascii_case("INBOX"))
         .map(|entry| entry.name.clone())
+}
+
+fn absorb_idle_event(
+    account: &ImapAccount,
+    selected: &crate::types::MailboxName,
+    uidvalidity: Option<u32>,
+    event: &IdleEvent,
+) -> Result<(), crate::Error> {
+    match event {
+        IdleEvent::Fetch(fetch) => {
+            if let (Some(uidvalidity), Some(uid), Some(modseq)) =
+                (uidvalidity, fetch.uid, fetch.mod_seq)
+            {
+                account
+                    .folders
+                    .record_modseq(selected, uidvalidity, uid, modseq)?;
+            }
+        }
+        IdleEvent::Vanished { uids, .. } => {
+            if let Some(uidvalidity) = uidvalidity {
+                for range in uids {
+                    let uids = super::folder_registry::expand_range(*range);
+                    account.folders.clear_modseqs(selected, uidvalidity, &uids);
+                }
+            }
+        }
+        IdleEvent::MailboxEvent(info) => account.folders.apply_mailbox_event(info.clone()),
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn map_idle_event(
