@@ -438,7 +438,7 @@ mod tests {
         use super::super::cursor::GraphCursorKind;
 
         let payload = GraphCursorPayload::new(
-            GraphCursorKind::EventsDelta {
+            GraphCursorKind::Events {
                 calendar_id: "calendar-a".to_string(),
             },
             "https://graph.example/delta".to_string(),

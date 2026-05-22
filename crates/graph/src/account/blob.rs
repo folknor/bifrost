@@ -1,4 +1,3 @@
-use bifrost_net::StreamingResponse;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,7 @@ use bifrost_types::{
 };
 
 use super::GraphAccount;
-use super::error::{fatal_from_recovery, graph_error_to_fatal, warning_blob_not_byte_stream};
+use super::error::{graph_error_to_fatal, warning_blob_not_byte_stream};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum GraphBlobKind {
@@ -20,6 +19,7 @@ enum GraphBlobKind {
     Unknown,
 }
 
+// Graph blob ids need message id, attachment id, and attachment kind inside bifrost_types::BlobId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GraphBlobLocator {
     message_id: String,
@@ -120,8 +120,8 @@ fn open_blob_inner_stream(
             return;
         }
 
-        let response = match fetch_blob_response(&account, &locator, range).await {
-            Ok(response) => response,
+        let mut stream = match fetch_blob_stream(&account, &locator, range).await {
+            Ok(stream) => stream,
             Err(BlobFetchError::MethodNotAllowed) => {
                 yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
                 yield SyncEvent::Done(None);
@@ -136,25 +136,7 @@ fn open_blob_inner_stream(
                 return;
             }
         };
-        let status = response.status();
-        if range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            yield SyncEvent::Fatal(fatal_from_recovery(
-                RecoveryClass::Fatal,
-                format!("Graph range request returned HTTP {status} instead of 206"),
-            ));
-            yield SyncEvent::Done(None);
-            return;
-        }
-        if !status.is_success() {
-            yield SyncEvent::Fatal(graph_error_to_fatal(
-                format!("Graph blob request failed with HTTP {status}"),
-                bifrost_types::CursorScope::Account,
-            ));
-            yield SyncEvent::Done(None);
-            return;
-        }
 
-        let mut stream = response.body;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => yield SyncEvent::Batch(Batch {
@@ -177,11 +159,11 @@ fn open_blob_inner_stream(
     })
 }
 
-async fn fetch_blob_response(
+async fn fetch_blob_stream(
     account: &GraphAccount,
     locator: &GraphBlobLocator,
     range: Option<ByteRange>,
-) -> Result<StreamingResponse, BlobFetchError> {
+) -> Result<bifrost_net::ByteStream, BlobFetchError> {
     let prefix = account.client.api_path_prefix();
     let enc_message_id = bifrost_net::url::encode_component(&locator.message_id);
     let enc_attachment_id = bifrost_net::url::encode_component(&locator.attachment_id);
@@ -189,12 +171,12 @@ async fn fetch_blob_response(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
         account.client.api_base()
     );
-    let mut request = account.client.account_net().get(&url);
-    if let Some(range) = range {
-        let range = encode_range(range).map_err(BlobFetchError::Failed)?;
-        request = request.header(reqwest::header::RANGE.as_str(), &range);
-    }
-    request.send_streaming().await.map_err(BlobFetchError::from)
+    account
+        .client
+        .account_net()
+        .download_stream(&url, range)
+        .await
+        .map_err(BlobFetchError::from)
 }
 
 enum BlobFetchError {
@@ -214,6 +196,9 @@ impl From<bifrost_net::Error> for BlobFetchError {
                 "Graph blob request failed with HTTP {code}: {}",
                 String::from_utf8_lossy(body.as_ref())
             )),
+            bifrost_net::Error::RangeNotHonored { message } => {
+                Self::Failed(format!("Graph range request failed: {message}"))
+            }
             other => Self::Failed(format!("Graph blob request failed: {other}")),
         }
     }
@@ -225,21 +210,6 @@ fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, Error> {
             "Graph blob handle is not an account blob locator: {error}"
         ))
     })
-}
-
-fn encode_range(range: ByteRange) -> Result<String, String> {
-    match range.length {
-        Some(0) => Err("zero-length blob range".to_string()),
-        Some(length) => {
-            let end = range
-                .start
-                .checked_add(length)
-                .and_then(|end| end.checked_sub(1))
-                .ok_or_else(|| "blob range overflow".to_string())?;
-            Ok(format!("bytes={}-{}", range.start, end))
-        }
-        None => Ok(format!("bytes={}-", range.start)),
-    }
 }
 
 #[cfg(test)]

@@ -1,23 +1,20 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use bifrost_net::{
     AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy,
     StaticTokenSource, TokenSource,
 };
-use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::Semaphore;
 
-use crate::folder_mapper::FolderMap;
-
-pub const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
-pub const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
+pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
+pub(crate) const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
 
 const CONCURRENCY_LIMIT: usize = 3;
 
+// pub: GraphAccountFactory consumers need a constructible Graph client handle.
 #[derive(Clone)]
 pub struct GraphClient {
     inner: Arc<ClientInner>,
@@ -30,15 +27,15 @@ struct ClientInner {
     token_source: StaticTokenSource,
     mailbox_id: Option<String>,
     semaphore: Arc<Semaphore>,
-    folder_map: RwLock<Option<(FolderMap, Instant)>>,
-    category_lock: Mutex<()>,
 }
 
 impl GraphClient {
+    // pub: ergonomic constructor for the default Microsoft Graph endpoint.
     pub fn new(access_token: impl Into<String>) -> Self {
         Self::with_api_bases(GRAPH_API_BASE, GRAPH_API_BETA, access_token)
     }
 
+    // pub: consumers may need sovereign-cloud or test Graph API endpoints before registration.
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
         let api_base = api_base.into();
         let api_beta_base =
@@ -46,6 +43,7 @@ impl GraphClient {
         Self::with_api_bases(api_base, api_beta_base, access_token)
     }
 
+    // pub: lets callers configure v1.0 and beta endpoints independently for non-public clouds.
     pub fn with_api_bases(
         api_base: impl Into<String>,
         api_beta_base: impl Into<String>,
@@ -56,6 +54,7 @@ impl GraphClient {
         Self::with_account_net(net, api_base, api_beta_base, token_source)
     }
 
+    // pub: custom Net injection lets consumers opt out of Net::shared_default host buckets.
     pub fn with_account_net(
         net: AccountNet,
         api_base: impl Into<String>,
@@ -70,41 +69,43 @@ impl GraphClient {
                 token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
-                folder_map: RwLock::new(None),
-                category_lock: Mutex::new(()),
             }),
         }
     }
 
-    pub fn account_net(&self) -> &AccountNet {
+    pub(crate) fn account_net(&self) -> &AccountNet {
         &self.inner.net
     }
 
-    pub fn api_base(&self) -> &str {
+    pub(crate) fn api_base(&self) -> &str {
         &self.inner.api_base
     }
 
-    pub fn api_beta_base(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn api_beta_base(&self) -> &str {
         &self.inner.api_beta_base
     }
 
-    pub async fn access_token(&self) -> String {
+    #[cfg(test)]
+    pub(crate) async fn access_token(&self) -> String {
         self.inner.token_source.token().as_str().to_string()
     }
 
+    // pub: token rotation must update the shared source held by open factories and accounts.
     pub async fn set_access_token(&self, access_token: impl Into<String>) {
         self.inner
             .token_source
             .set(AccessToken::new(access_token, None));
     }
 
-    pub fn api_path_prefix(&self) -> String {
+    pub(crate) fn api_path_prefix(&self) -> String {
         match &self.inner.mailbox_id {
             Some(id) => format!("/users/{}", bifrost_net::url::encode_component(id)),
             None => "/me".to_string(),
         }
     }
 
+    // pub: shared-mailbox consumers derive a scoped client before building the factory.
     pub fn for_shared_mailbox(&self, mailbox_id: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(ClientInner {
@@ -114,66 +115,30 @@ impl GraphClient {
                 token_source: self.inner.token_source.clone(),
                 mailbox_id: Some(mailbox_id.into()),
                 semaphore: Arc::clone(&self.inner.semaphore),
-                folder_map: RwLock::new(None),
-                category_lock: Mutex::new(()),
             }),
         }
     }
 
-    pub fn is_shared_mailbox(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_shared_mailbox(&self) -> bool {
         self.inner.mailbox_id.is_some()
     }
 
-    pub fn mailbox_id(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn mailbox_id(&self) -> Option<&str> {
         self.inner.mailbox_id.as_deref()
     }
 
-    pub async fn folder_map(&self) -> Option<FolderMap> {
-        self.inner
-            .folder_map
-            .read()
-            .await
-            .as_ref()
-            .map(|(map, _)| map.clone())
-    }
-
-    pub async fn set_folder_map(&self, map: FolderMap) {
-        *self.inner.folder_map.write().await = Some((map, Instant::now()));
-    }
-
-    pub async fn folder_map_age(&self) -> Option<Duration> {
-        self.inner
-            .folder_map
-            .read()
-            .await
-            .as_ref()
-            .map(|(_, instant)| instant.elapsed())
-    }
-
-    pub async fn clear_folder_map(&self) {
-        *self.inner.folder_map.write().await = None;
-    }
-
-    pub async fn lock_categories(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.inner.category_lock.lock().await
-    }
-
-    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let url = self.api_url(path);
         self.request::<T, ()>(&url, "GET", None).await
     }
 
-    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        let url = self.api_url(path);
-        let response = self.execute(&url, "GET", None::<&()>).await?;
-        parse_bytes_response(response, "Graph API").await
-    }
-
-    pub async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
+    pub(crate) async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
         self.request::<T, ()>(url, "GET", None).await
     }
 
-    pub async fn post<T: DeserializeOwned, B: Serialize>(
+    pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
         body: &B,
@@ -182,75 +147,19 @@ impl GraphClient {
         self.request(&url, "POST", Some(body)).await
     }
 
-    pub async fn post_absolute<T: DeserializeOwned, B: Serialize>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T, String> {
-        self.request(url, "POST", Some(body)).await
-    }
-
-    pub async fn post_beta<T: DeserializeOwned, B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<T, String> {
-        let url = self.api_beta_url(path);
-        self.request(&url, "POST", Some(body)).await
-    }
-
-    pub async fn post_no_content<B: Serialize>(
-        &self,
-        path: &str,
-        body: Option<&B>,
-    ) -> Result<(), String> {
-        let url = self.api_url(path);
-        let response = self.execute(&url, "POST", body).await?;
-        check_response_status(response, "Graph API").await
-    }
-
-    pub async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
+    pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
         let url = self.api_url(path);
         let response = self.execute(&url, "PATCH", Some(body)).await?;
         check_response_status(response, "Graph API").await
     }
 
-    pub async fn delete(&self, path: &str) -> Result<(), String> {
+    pub(crate) async fn delete(&self, path: &str) -> Result<(), String> {
         let url = self.api_url(path);
         let response = self.execute(&url, "DELETE", None::<&()>).await?;
         check_response_status(response, "Graph API").await
     }
 
-    pub async fn put_bytes_range(
-        &self,
-        url: &str,
-        data: &[u8],
-        start: usize,
-        end: usize,
-        total: usize,
-    ) -> Result<Response, String> {
-        let response = self
-            .inner
-            .net
-            .put(url)
-            .without_bearer_auth()
-            .header("Content-Range", &format!("bytes {start}-{end}/{total}"))
-            .header("Content-Length", &data.len().to_string())
-            .body(Bytes::copy_from_slice(data))
-            .send()
-            .await
-            .map_err(|error| net_error("Graph upload", error))?;
-
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            let status = response.status();
-            let body = response_body_string(response);
-            Err(format!("Graph upload error {status}: {body}"))
-        }
-    }
-
-    pub async fn post_batch(
+    pub(crate) async fn post_batch(
         &self,
         batch: &crate::types::BatchRequest,
     ) -> Result<crate::types::BatchResponse, String> {
@@ -259,10 +168,6 @@ impl GraphClient {
 
     fn api_url(&self, path: &str) -> String {
         build_url(&self.inner.api_base, path)
-    }
-
-    fn api_beta_url(&self, path: &str) -> String {
-        build_url(&self.inner.api_beta_base, path)
     }
 
     async fn request<T: DeserializeOwned, B: Serialize>(
@@ -342,16 +247,6 @@ async fn parse_json_response<T: DeserializeOwned>(
 
     serde_json::from_slice(response.body.as_ref())
         .map_err(|e| format!("{service} JSON parse failed: {e}"))
-}
-
-async fn parse_bytes_response(response: Response, service: &str) -> Result<Vec<u8>, String> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response_body_string(response);
-        return Err(format!("{service} error {status}: {body}"));
-    }
-
-    Ok(response.body.to_vec())
 }
 
 async fn check_response_status(response: Response, service: &str) -> Result<(), String> {

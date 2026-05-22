@@ -13,31 +13,26 @@ const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone)]
-pub struct PushEndpoint {
-    pub webhook_url: String,
+pub(crate) struct PushEndpoint {
+    pub(crate) webhook_url: String,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct GraphSubscriptionGroup {
-    pub subscriptions: Vec<GraphSubscriptionState>,
-    pub scopes: Vec<CursorScope>,
+    pub(crate) subscriptions: Vec<GraphSubscriptionState>,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct GraphSubscriptionState {
-    pub server_id: String,
-    pub resource: String,
-    pub client_state: String,
-    pub expires_at: String,
+    pub(crate) server_id: String,
+    pub(crate) expires_at: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EwsSubscriptionState {
-    pub ews_subscription_id: Option<String>,
-    pub watermark: Option<String>,
-    pub scopes: Vec<CursorScope>,
+    pub(crate) ews_subscription_id: Option<String>,
+    pub(crate) watermark: Option<String>,
+    pub(crate) scopes: Vec<CursorScope>,
 }
 
 pub(crate) async fn push_subscribe(
@@ -75,28 +70,22 @@ async fn subscribe_graph(
     }
 
     let mut subscriptions = Vec::new();
-    let mut all_scopes = Vec::new();
-    for (resource, resource_scopes) in grouped {
+    for (resource, _) in grouped {
         let response = create_subscription(&account.client, &resource, &endpoint.webhook_url, None)
             .await
             .map_err(Error::Transport)?;
-        all_scopes.extend(resource_scopes);
         subscriptions.push(GraphSubscriptionState {
             server_id: response.id,
-            resource,
-            client_state: response.client_state.unwrap_or_default(),
             expires_at: response.expiration_date_time,
         });
     }
 
     let handle = new_handle()?;
-    account.graph_subscriptions.write().await.insert(
-        handle.clone(),
-        GraphSubscriptionGroup {
-            subscriptions,
-            scopes: all_scopes,
-        },
-    );
+    account
+        .graph_subscriptions
+        .write()
+        .await
+        .insert(handle.clone(), GraphSubscriptionGroup { subscriptions });
     let _ = account.push_tx.send(WatchEvent::Reconnected);
     ensure_graph_worker(account).await;
     Ok(handle)

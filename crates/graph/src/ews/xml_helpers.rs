@@ -20,43 +20,13 @@ pub(super) fn build_soap_envelope(body_xml: &str) -> String {
     )
 }
 
-// XML helpers.
-
-pub(super) fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 /// Strip namespace prefixes from element names for easier matching.
 /// e.g. "t:FolderId" -> "FolderId", "soap:Fault" -> "Fault"
-pub(super) fn strip_ns(name: &str) -> &str {
+fn strip_ns(name: &str) -> &str {
     match name.find(':') {
         Some(i) => &name[i + 1..],
         None => name,
     }
-}
-
-/// Well-known distinguished folder IDs that EWS treats specially.
-pub(super) fn is_distinguished_folder_id(id: &str) -> bool {
-    matches!(
-        id,
-        "publicfoldersroot"
-            | "inbox"
-            | "drafts"
-            | "sentitems"
-            | "deleteditems"
-            | "junkemail"
-            | "outbox"
-            | "calendar"
-            | "contacts"
-            | "tasks"
-            | "notes"
-            | "root"
-            | "msgfolderroot"
-    )
 }
 
 // SOAP fault check.
@@ -121,7 +91,7 @@ pub(super) fn check_soap_fault(xml: &str) -> Result<(), String> {
 // quick-xml 0.36+ emits Event::GeneralRef separately from Event::Text, so
 // every parser that accumulates body text needs to fold these back in or
 // `&lt;` and friends silently vanish.
-pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
+fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
     let Ok(name) = std::str::from_utf8(e.as_ref()) else {
         return;
     };
@@ -137,15 +107,4 @@ pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
     } else if let Some(s) = resolve_xml_entity(name) {
         buf.push_str(s);
     }
-}
-
-// Attribute extraction.
-
-pub(super) fn extract_attribute(e: &quick_xml::events::BytesStart, attr_name: &str) -> String {
-    for attr in e.attributes().flatten() {
-        if String::from_utf8_lossy(attr.key.as_ref()) == attr_name {
-            return String::from_utf8_lossy(&attr.value).to_string();
-        }
-    }
-    String::new()
 }

@@ -14,7 +14,6 @@ mod scopes;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bifrost_types::{
@@ -30,29 +29,21 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use self::cursor::{GraphCursorKind, GraphCursorPayload, GraphPageMarker};
-pub use self::ews_stream::{
-    EwsStreamingEventType, EwsStreamingNotification, EwsStreamingSubscription,
-    build_get_streaming_events_request, build_subscribe_request, parse_streaming_notifications,
-    parse_subscribe_response,
-};
-pub use self::push::PushEndpoint;
+// pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
 pub use crate::client::GraphClient;
 
-use self::push::{EwsSubscriptionState, GraphSubscriptionGroup};
+use self::push::{EwsSubscriptionState, GraphSubscriptionGroup, PushEndpoint};
 use self::scopes::{CursorIndex, FolderTree};
-
-const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum PushMode {
+pub(crate) enum PushMode {
     GraphSubscriptions,
     EwsStreaming,
 }
 
 #[derive(Clone)]
-pub struct GraphAccount {
+pub(crate) struct GraphAccount {
     pub(crate) client: GraphClient,
     pub(crate) capabilities: AccountCapabilities,
     pub(crate) push_endpoint: Option<PushEndpoint>,
@@ -66,13 +57,11 @@ pub struct GraphAccount {
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
     pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) shutdown: CancellationToken,
-    pub(crate) priority: Arc<AtomicU8>,
-    pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) etag_index: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl GraphAccount {
-    pub fn new(
+    pub(crate) fn new(
         client: GraphClient,
         push_mode: PushMode,
         push_endpoint: Option<PushEndpoint>,
@@ -91,8 +80,6 @@ impl GraphAccount {
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: Arc::new(Mutex::new(None)),
             shutdown: CancellationToken::new(),
-            priority: Arc::new(AtomicU8::new(priority_to_u8(Priority::Normal))),
-            bandwidth_cap: Arc::new(AtomicU64::new(UNLIMITED_BANDWIDTH)),
             etag_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -103,6 +90,7 @@ impl GraphAccount {
     }
 }
 
+// pub: sync-engine consumers register this factory so reopen can mint fresh Graph accounts.
 pub struct GraphAccountFactory {
     client: GraphClient,
     push_mode: PushMode,
@@ -110,6 +98,7 @@ pub struct GraphAccountFactory {
 }
 
 impl GraphAccountFactory {
+    // pub: ergonomic factory construction from an already configured GraphClient.
     pub fn new(client: GraphClient) -> Self {
         Self {
             client,
@@ -118,6 +107,7 @@ impl GraphAccountFactory {
         }
     }
 
+    // pub: webhook-mode consumers provide the public Graph subscription callback URL here.
     pub fn with_push_endpoint(mut self, webhook_url: impl Into<String>) -> Self {
         self.push_endpoint = Some(PushEndpoint {
             webhook_url: webhook_url.into(),
@@ -126,6 +116,7 @@ impl GraphAccountFactory {
         self
     }
 
+    // pub: consumers without a reachable webhook endpoint can select in-process EWS streaming.
     pub fn with_ews_streaming(mut self) -> Self {
         self.push_endpoint = None;
         self.push_mode = PushMode::EwsStreaming;
@@ -161,13 +152,11 @@ impl Account for GraphAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        self.priority
-            .store(priority_to_u8(priority), Ordering::Release);
+        self.client.account_net().set_priority(priority);
     }
 
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.bandwidth_cap
-            .store(bps.unwrap_or(UNLIMITED_BANDWIDTH), Ordering::Release);
+        self.client.account_net().set_bandwidth_cap(bps);
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -299,14 +288,4 @@ where
     F: Future<Output = Vec<SyncEvent<T>>> + Send + 'static,
 {
     Box::pin(stream::once(future).flat_map(stream::iter))
-}
-
-fn priority_to_u8(priority: Priority) -> u8 {
-    match priority {
-        Priority::Foreground => 0,
-        Priority::Normal => 1,
-        Priority::Background => 2,
-        Priority::Bulk => 3,
-        _ => 1,
-    }
 }

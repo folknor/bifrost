@@ -39,11 +39,6 @@ impl FolderTree {
             self.parents.insert(id, parent);
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn parent_of(&self, folder_id: &str) -> Option<String> {
-        self.parents.get(folder_id).cloned().flatten()
-    }
 }
 
 pub(crate) async fn discover_cursor_scope_events(
@@ -141,14 +136,6 @@ mod tests {
     use bifrost_types::FolderId;
 
     use super::*;
-
-    #[test]
-    fn folder_tree_returns_parent_folder() {
-        let mut tree = FolderTree::default();
-        tree.replace_mail_folders(vec![("child".to_string(), Some("parent".to_string()))]);
-        assert_eq!(tree.parent_of("child").as_deref(), Some("parent"));
-        assert!(tree.parent_of("parent").is_none());
-    }
 
     #[test]
     fn scope_batch_has_final_boundary() {

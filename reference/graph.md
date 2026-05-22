@@ -96,8 +96,8 @@ plus the first `inventory_stream` page. The factory returns
 - An `etag_index: Arc<RwLock<HashMap<String, String>>>` of
   per-object change keys harvested from inventory, changes, and
   get responses; this powers `If-Match` on mutations.
-- `Atomic` priority and bandwidth-cap slots driven by
-  `set_priority` / `set_bandwidth_cap`.
+- `set_priority` and `set_bandwidth_cap` delegate to the
+  underlying `AccountNet`; the transport owns the canonical knobs.
 
 Reopen is delegated to the engine: when the account is dropped
 or `close()` returns, the engine calls

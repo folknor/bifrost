@@ -11,25 +11,27 @@ pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum GraphCursorKind {
-    MessagesDelta { folder_id: String },
-    EventsDelta { calendar_id: String },
-    ContactsDelta { folder_id: String },
+pub(crate) enum GraphCursorKind {
+    Messages { folder_id: String },
+    Events { calendar_id: String },
+    Contacts { folder_id: String },
 }
 
+// Graph delta cursors need their nextLink plus last id inside the shared opaque progress bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphPageMarker {
-    pub next_link: String,
-    pub last_seen_id: Option<String>,
+pub(crate) struct GraphPageMarker {
+    pub(crate) next_link: String,
+    pub(crate) last_seen_id: Option<String>,
 }
 
+// Graph deltaLink payloads are protocol-specific and intentionally live inside OpaqueChangeState.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GraphCursorPayload {
-    pub kind: GraphCursorKind,
-    pub delta_link: String,
-    pub issued_at_unix_secs: u64,
+pub(crate) struct GraphCursorPayload {
+    pub(crate) kind: GraphCursorKind,
+    pub(crate) delta_link: String,
+    pub(crate) issued_at_unix_secs: u64,
     #[serde(default)]
-    pub advanced_through: Option<GraphPageMarker>,
+    pub(crate) advanced_through: Option<GraphPageMarker>,
 }
 
 impl GraphCursorPayload {
@@ -56,13 +58,13 @@ impl GraphCursorPayload {
 pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, Error> {
     match scope {
         CursorScope::FolderType { folder, ty } => match ty {
-            ObjectType::Email => Ok(GraphCursorKind::MessagesDelta {
+            ObjectType::Email => Ok(GraphCursorKind::Messages {
                 folder_id: folder.0.clone(),
             }),
-            ObjectType::Event | ObjectType::CalendarEvent => Ok(GraphCursorKind::EventsDelta {
+            ObjectType::Event | ObjectType::CalendarEvent => Ok(GraphCursorKind::Events {
                 calendar_id: folder.0.clone(),
             }),
-            ObjectType::Contact => Ok(GraphCursorKind::ContactsDelta {
+            ObjectType::Contact => Ok(GraphCursorKind::Contacts {
                 folder_id: folder.0.clone(),
             }),
             _ => Err(Error::Unsupported),
@@ -73,15 +75,15 @@ pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, Err
 
 pub(crate) fn scope_for_kind(kind: &GraphCursorKind) -> CursorScope {
     match kind {
-        GraphCursorKind::MessagesDelta { folder_id } => CursorScope::FolderType {
+        GraphCursorKind::Messages { folder_id } => CursorScope::FolderType {
             folder: FolderId(folder_id.clone()),
             ty: ObjectType::Email,
         },
-        GraphCursorKind::EventsDelta { calendar_id } => CursorScope::FolderType {
+        GraphCursorKind::Events { calendar_id } => CursorScope::FolderType {
             folder: FolderId(calendar_id.clone()),
             ty: ObjectType::Event,
         },
-        GraphCursorKind::ContactsDelta { folder_id } => CursorScope::FolderType {
+        GraphCursorKind::Contacts { folder_id } => CursorScope::FolderType {
             folder: FolderId(folder_id.clone()),
             ty: ObjectType::Contact,
         },

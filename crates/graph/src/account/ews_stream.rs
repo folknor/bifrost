@@ -13,7 +13,7 @@ use super::GraphAccount;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum EwsStreamingEventType {
+pub(crate) enum EwsStreamingEventType {
     NewMail,
     Created,
     Deleted,
@@ -23,20 +23,20 @@ pub enum EwsStreamingEventType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EwsStreamingNotification {
-    pub subscription_id: Option<String>,
-    pub watermark: Option<String>,
-    pub event_type: EwsStreamingEventType,
-    pub item_id: Option<String>,
-    pub item_change_key: Option<String>,
-    pub parent_folder_id: Option<String>,
-    pub parent_folder_change_key: Option<String>,
+pub(crate) struct EwsStreamingNotification {
+    pub(crate) subscription_id: Option<String>,
+    pub(crate) watermark: Option<String>,
+    pub(crate) event_type: EwsStreamingEventType,
+    pub(crate) item_id: Option<String>,
+    pub(crate) item_change_key: Option<String>,
+    pub(crate) parent_folder_id: Option<String>,
+    pub(crate) parent_folder_change_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EwsStreamingSubscription {
-    pub subscription_id: String,
-    pub watermark: Option<String>,
+pub(crate) struct EwsStreamingSubscription {
+    pub(crate) subscription_id: String,
+    pub(crate) watermark: Option<String>,
 }
 
 #[derive(Default)]
@@ -93,7 +93,9 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
     }
 }
 
-pub fn parse_streaming_notifications(xml: &str) -> Result<Vec<EwsStreamingNotification>, String> {
+pub(crate) fn parse_streaming_notifications(
+    xml: &str,
+) -> Result<Vec<EwsStreamingNotification>, String> {
     let mut reader = Reader::from_str(xml);
     let mut notifications = Vec::new();
     let mut current = NotificationBuilder::default();
@@ -177,7 +179,7 @@ pub fn parse_streaming_notifications(xml: &str) -> Result<Vec<EwsStreamingNotifi
     Ok(notifications)
 }
 
-pub fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubscription>, String> {
+pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubscription>, String> {
     let mut reader = Reader::from_str(xml);
     let mut current_tag = String::new();
     let mut buf = String::new();
@@ -226,7 +228,7 @@ pub fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubscriptio
     Ok(subscriptions)
 }
 
-pub fn build_subscribe_request(scopes: &[CursorScope], watermark: Option<&str>) -> String {
+pub(crate) fn build_subscribe_request(scopes: &[CursorScope], watermark: Option<&str>) -> String {
     let mut folder_ids = String::new();
     for scope in scopes {
         if let CursorScope::FolderType { folder, .. } = scope {
@@ -255,7 +257,10 @@ pub fn build_subscribe_request(scopes: &[CursorScope], watermark: Option<&str>) 
     )
 }
 
-pub fn build_get_streaming_events_request(subscription_id: &str, timeout_minutes: u32) -> String {
+pub(crate) fn build_get_streaming_events_request(
+    subscription_id: &str,
+    timeout_minutes: u32,
+) -> String {
     format!(
         r#"<m:GetStreamingEvents>
   <m:SubscriptionIds>
@@ -275,7 +280,7 @@ async fn subscribe(
 ) -> Result<EwsStreamingSubscription, String> {
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
-    let xml = ews.execute(&body, None).await?;
+    let xml = ews.execute(&body).await?;
     parse_subscribe_response(&xml)?
         .into_iter()
         .next()
@@ -293,7 +298,7 @@ async fn run_get_events_loop(
             return StreamLoopExit::Shutdown;
         }
         let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&body, None).await {
+        match ews.execute(&body).await {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {
