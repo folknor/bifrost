@@ -18,6 +18,8 @@ use crate::{
     },
 };
 
+const JMAP_WS_SUBPROTOCOL: &str = "jmap";
+
 #[derive(Debug, Serialize)]
 struct WebSocketRequest {
     #[serde(rename = "@type")]
@@ -172,12 +174,15 @@ impl Client {
             builder = builder.connector(connector);
         }
 
-        let (stream, _) = builder.connect().await?;
+        let (stream, response) = builder.connect().await?;
+        validate_ws_subprotocol(&response)?;
         let (tx, mut rx) = stream.split();
 
         *self.ws.lock().await = WsStream { tx, req_id: 0 }.into();
 
         Ok(Box::pin(async_stream::stream! {
+            let mut saw_close = false;
+
             while let Some(message) = rx.next().await {
                 match message {
                     Ok(message) if message.is_text() => {
@@ -208,9 +213,19 @@ impl Client {
                             Err(err) => yield Err(err.into()),
                         }
                     }
+                    Ok(message) if message.is_binary() => {
+                        yield Err(crate::Error::NotParsable("binary WebSocket message".to_string()));
+                    }
+                    Ok(message) if message.is_close() => {
+                        saw_close = true;
+                    }
                     Ok(_) => (),
                     Err(err) => yield Err(err.into()),
                 }
+            }
+
+            if saw_close {
+                yield Err(crate::Error::WebSocketClosed);
             }
         }))
     }
@@ -296,6 +311,25 @@ impl Client {
     }
 }
 
+fn validate_ws_subprotocol(response: &http::Response<()>) -> crate::Result<()> {
+    let Some(protocol) = response.headers().get(header::SEC_WEBSOCKET_PROTOCOL) else {
+        return Err(crate::Error::from_subprotocol(
+            "server did not accept the jmap WebSocket subprotocol",
+        ));
+    };
+    let protocol = protocol.to_str().map_err(|e| {
+        crate::Error::from_subprotocol(format!("invalid Sec-WebSocket-Protocol header: {e}"))
+    })?;
+
+    if protocol.trim() == JMAP_WS_SUBPROTOCOL {
+        return Ok(());
+    }
+
+    Err(crate::Error::from_subprotocol(format!(
+        "server accepted WebSocket subprotocol {protocol:?}, expected {JMAP_WS_SUBPROTOCOL:?}"
+    )))
+}
+
 impl From<WebSocketError> for ProblemDetails {
     fn from(problem: WebSocketError) -> Self {
         ProblemDetails::new(
@@ -306,5 +340,48 @@ impl From<WebSocketError> for ProblemDetails {
             problem.limit,
             problem.request_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(protocol: Option<HeaderValue>) -> http::Response<()> {
+        let mut response = http::Response::new(());
+        if let Some(protocol) = protocol {
+            response
+                .headers_mut()
+                .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+        }
+        response
+    }
+
+    #[test]
+    fn accepts_jmap_subprotocol() {
+        let response = response(Some(HeaderValue::from_static("jmap")));
+
+        validate_ws_subprotocol(&response).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_subprotocol() {
+        let err = validate_ws_subprotocol(&response(None)).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_subprotocol() {
+        let response = response(Some(HeaderValue::from_static("other")));
+        let err = validate_ws_subprotocol(&response).unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(_))
+        ));
     }
 }

@@ -89,7 +89,7 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 
 Structured variants. No `Error::Internal(String)`:
 
-- `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `WebSocketNotConnected`.
+- `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `WebSocketClosed`, `WebSocketNotConnected`.
 - `Transport(TransportError)` - wraps transport errors, auto-parses ProblemDetails from body.
 - `Method(MethodError)` - JMAP method-level errors.
 - No `From<reqwest::Error>` - reqwest errors converted to TransportError at point of use.
@@ -197,7 +197,7 @@ Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)
 
 ### Push and reconnect
 
-Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. The task connects to the JMAP WebSocket endpoint (`Client::connect_ws`, `dep:tokio-tungstenite/native-tls`), re-applies the union of currently subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` notifications as `WatchEvent::Invalidated { hint: InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::SpecificCursorScope(...) } }`. Per-message disconnects (and stream-level errors) emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
+Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. The task connects to the JMAP WebSocket endpoint (`Client::connect_ws`, `dep:tokio-websockets/native-tls`), validates that the server accepted `Sec-WebSocket-Protocol: jmap`, re-applies the union of currently subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` notifications as `WatchEvent::Invalidated { hint: InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::SpecificCursorScope(...) } }`. Per-message disconnects (and stream-level errors) emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
 
 `ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff. Each successful reconnect resets `backoff` to `initial`; failures double `backoff` (saturating) up to `max`.
 
@@ -235,7 +235,8 @@ Per-id outcomes flow from `SetResponse::updated` / `destroyed`. A `MutationOutco
   - `notJSON` / `notRequest` -> `Fatal`.
   - HTTP status fallback: 401/403 -> `AuthLost`, 429 -> `Retry { after: 30s }`, 5xx -> `Retry { after: 30s }`, other -> `Fatal`.
 - `Error::Transport(_)` -> `Retry { after: 5s }`.
-- `Error::WebSocket(_)` / `Error::WebSocketNotConnected` -> `Retry { after: 5s }`.
+- `Error::WebSocket(_)` / `Error::WebSocketClosed` / `Error::WebSocketNotConnected` -> `Retry { after: 5s }`.
+- `Error::WebSocketSetup(Tls)` -> `Retry { after: 5s }`, `InvalidHeader` -> `AuthLost`, `Subprotocol` -> `CapabilityChanged { delta: default }`.
 - `Error::NoPrimaryAccount { .. }` -> `RestartAccount`.
 - Parse / set / shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`) -> `Fatal`.
 

@@ -175,6 +175,18 @@ pub struct CalendarAlert {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[cfg(feature = "websockets")]
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum WebSocketSetupError {
+    /// The client could not construct a valid WebSocket request header.
+    InvalidHeader(String),
+    /// The TLS connector could not be built before opening the socket.
+    Tls(String),
+    /// The server did not negotiate the JMAP WebSocket subprotocol.
+    Subprotocol(String),
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -208,9 +220,12 @@ pub enum Error {
     /// WebSocket transport error.
     WebSocket(tokio_websockets::Error),
     #[cfg(feature = "websockets")]
+    /// WebSocket peer closed the connection.
+    WebSocketClosed,
+    #[cfg(feature = "websockets")]
     /// WebSocket handshake or TLS setup failed before the connection
     /// was established.
-    WebSocketSetup(String),
+    WebSocketSetup(WebSocketSetupError),
     #[cfg(feature = "websockets")]
     /// WebSocket connection not established.
     WebSocketNotConnected,
@@ -263,11 +278,28 @@ impl From<tokio_websockets::Error> for Error {
 #[cfg(feature = "websockets")]
 impl Error {
     pub(crate) fn from_invalid_header(e: http::header::InvalidHeaderValue) -> Self {
-        Error::WebSocketSetup(format!("invalid WebSocket header value: {e}"))
+        Error::WebSocketSetup(WebSocketSetupError::InvalidHeader(e.to_string()))
     }
 
     pub(crate) fn from_tls(e: native_tls::Error) -> Self {
-        Error::WebSocketSetup(format!("TLS connector build failed: {e}"))
+        Error::WebSocketSetup(WebSocketSetupError::Tls(e.to_string()))
+    }
+
+    pub(crate) fn from_subprotocol(message: impl Into<String>) -> Self {
+        Error::WebSocketSetup(WebSocketSetupError::Subprotocol(message.into()))
+    }
+}
+
+#[cfg(feature = "websockets")]
+impl Display for WebSocketSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebSocketSetupError::InvalidHeader(msg) => {
+                write!(f, "invalid WebSocket header value: {msg}")
+            }
+            WebSocketSetupError::Tls(msg) => write!(f, "TLS connector build failed: {msg}"),
+            WebSocketSetupError::Subprotocol(msg) => write!(f, "{msg}"),
+        }
     }
 }
 
@@ -290,6 +322,8 @@ impl Display for Error {
             ),
             #[cfg(feature = "websockets")]
             Error::WebSocket(e) => write!(f, "WebSocket error: {e}"),
+            #[cfg(feature = "websockets")]
+            Error::WebSocketClosed => write!(f, "WebSocket connection closed"),
             #[cfg(feature = "websockets")]
             Error::WebSocketSetup(msg) => write!(f, "WebSocket setup failed: {msg}"),
             #[cfg(feature = "websockets")]

@@ -121,10 +121,22 @@ pub(crate) fn to_recovery(
             after: Duration::from_secs(5),
         },
         crate::Error::NoPrimaryAccount { .. } => RecoveryClass::RestartAccount,
-        crate::Error::WebSocket(_) | crate::Error::WebSocketNotConnected => RecoveryClass::Retry {
-            after: Duration::from_secs(5),
-        },
-        crate::Error::WebSocketSetup(_) => RecoveryClass::Fatal,
+        crate::Error::WebSocket(_)
+        | crate::Error::WebSocketClosed
+        | crate::Error::WebSocketNotConnected
+        | crate::Error::WebSocketSetup(crate::WebSocketSetupError::Tls(_)) => {
+            RecoveryClass::Retry {
+                after: Duration::from_secs(5),
+            }
+        }
+        crate::Error::WebSocketSetup(crate::WebSocketSetupError::InvalidHeader(_)) => {
+            RecoveryClass::AuthLost
+        }
+        crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(_)) => {
+            RecoveryClass::CapabilityChanged {
+                delta: bifrost_types::CapabilityDelta::default(),
+            }
+        }
         crate::Error::Parse(_)
         | crate::Error::Set(_)
         | crate::Error::CallNotFound(_)
@@ -147,6 +159,12 @@ pub(crate) fn to_account_error(err: crate::Error) -> Error {
         }
         crate::Error::NoPrimaryAccount { capability } => {
             Error::Auth(format!("no primary account for capability {capability}"))
+        }
+        crate::Error::WebSocketSetup(crate::WebSocketSetupError::InvalidHeader(message)) => {
+            Error::Auth(format!("invalid WebSocket authorization header: {message}"))
+        }
+        crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(_)) => {
+            Error::Unsupported
         }
         other => Error::Transport(other.to_string()),
     }
@@ -207,5 +225,40 @@ mod tests {
             recovery,
             RecoveryClass::Retry { after } if after == Duration::from_secs(30)
         ));
+    }
+
+    #[test]
+    fn websocket_tls_setup_is_retry() {
+        let err = crate::Error::WebSocketSetup(crate::WebSocketSetupError::Tls(
+            "temporary TLS setup failure".to_string(),
+        ));
+
+        assert!(matches!(
+            to_recovery(&err, None),
+            RecoveryClass::Retry { after } if after == Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn websocket_invalid_header_is_auth_lost() {
+        let err = crate::Error::WebSocketSetup(crate::WebSocketSetupError::InvalidHeader(
+            "failed to build header".to_string(),
+        ));
+
+        assert!(matches!(to_recovery(&err, None), RecoveryClass::AuthLost));
+        assert!(matches!(to_account_error(err), Error::Auth(_)));
+    }
+
+    #[test]
+    fn websocket_subprotocol_is_capability_changed() {
+        let err = crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(
+            "server did not accept jmap".to_string(),
+        ));
+
+        assert!(matches!(
+            to_recovery(&err, None),
+            RecoveryClass::CapabilityChanged { .. }
+        ));
+        assert!(matches!(to_account_error(err), Error::Unsupported));
     }
 }
