@@ -118,14 +118,21 @@ remain alongside them.
   traits, `bifrost-net`, or `bifrost-types` for items that can
   be made private, deleted outright, or collapsed into a single
   way of doing things. Full spec under **Phase 3.5** below.
-- **Phase 4: Error model convergence.** Reconcile the
-  per-crate error stories (rich `Response`-carrying variants in
-  `bifrost-smtp`, separate models in `bifrost-jmap` and
-  `bifrost-imap`) into a shared shape that gives ratatoskr a
-  unified error-handling pattern. The open question framing
-  lives in `plans/error-model-convergence.md`; that doc needs
-  to be expanded into an agent brief (decision + file
-  ownership + exit criteria) before launch.
+- **Phase 3.6: PIM unification.** Extend `bifrost-types::Account`
+  into the single cross-provider PIM surface (send, search,
+  drafts, folder/label CRUD, identities, vacation, contacts,
+  calendar) so ratatoskr has zero per-provider match arms left.
+  Protocol crates collapse to `pub(crate)` implementation detail
+  except their factory and config types - `Account` becomes the
+  only bifrost public API. Full spec in `plans/unification.md`;
+  absorbs the previously-deferred Phase 4 (error model
+  convergence) as Stage 1 Wave 5.
+- **Phase 4: Error model convergence.** Absorbed into Phase 3.6
+  Stage 1 Wave 5. The open-question framing in
+  `plans/error-model-convergence.md` is now resolved by the
+  one-API-surface non-negotiable in `plans/unification.md`: all
+  `Account` methods return `Result<_, AccountError>` and
+  per-protocol error types become `pub(crate)`. No separate phase.
 
 ## Reference material
 

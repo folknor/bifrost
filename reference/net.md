@@ -4,7 +4,8 @@ Current architecture of the shared HTTP transport crate.
 
 Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry
 budget, per-host rate limiting, per-account bandwidth metering,
-native-tls, W3C `traceparent` injection. Used by `bifrost-jmap`,
+native-tls, W3C `traceparent` injection, URL component-encoding
+helpers shared by the HTTP protocol crates. Used by `bifrost-jmap`,
 `bifrost-gmail`, `bifrost-graph`. Not used by `bifrost-imap` or
 `bifrost-smtp` (those carry their own TCP/TLS stacks); IMAP/SMTP
 report bytes-in/out through `MeterSink` for unified bandwidth
@@ -24,6 +25,14 @@ let account = net.attach_account(account_id, spec);     // per-account
 - `AccountNet` is account-scoped: token source, default
   `RetryPolicy`, `AtomicU8` priority, `AtomicU64` bandwidth cap.
   `Clone` is one `Arc` bump; protocol crates clone per spawned task.
+- `Net::shared_default()` returns a process-wide `OnceLock<Net>`
+  built from `NetConfig::default()`. The default registration target
+  for protocol crates whose ergonomic constructors need a `Net`
+  without forcing the caller to thread one through; multiple clients
+  in the same process share the connection pool, governor, and
+  bandwidth meter. Applications that need a custom `NetConfig` still
+  call `Net::new` and hand the result to the protocol clients
+  explicitly.
 
 `Net::detach_account` is symmetric: it forgets the bandwidth
 counters and decrements the governor's per-host attach count for
@@ -51,6 +60,22 @@ fresh wire request: governor debit + outbound metering + body send
 + inbound metering. Buffered (`send`) and streaming
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
+
+`AccountNet` exposes `get`, `post`, `put`, `patch`, `delete` - one
+constructor per HTTP method routing into the same `RequestBuilder`.
+Builder setters of note beyond the example: `body(Bytes)` for raw
+payloads (used when `json()` is not the right encoding) and
+`without_bearer_auth()` for the pre-authenticated-URL and
+Basic-auth flows (Gmail upload URLs, JMAP Basic), which still want
+the shared retry / rate-limit / metering pipeline. The token-source
+short-circuit at `request.rs:375-390` skips `Authorization: Bearer`
+injection when `bearer_auth` is false; caller-provided headers go
+through unchanged.
+
+`Response` and `StreamingResponse` are `#[non_exhaustive]` structs
+with `status()` and `headers()` accessors; `StreamingResponse.body`
+is the `ByteStream` returned by `wrap_metered`, so every chunk
+feeds the per-account meter and the bandwidth-cap throttle.
 
 ### Retry decision (RetryPolicy)
 
@@ -117,16 +142,32 @@ and surfaces only length + expiry.
 - Tokens with an issuer-supplied `expires_at`: refresh 60 s before
   the deadline.
 - Tokens without `expires_at` (opaque, no TTL hint): refresh when
-  the cached token is older than the refresher's `max_age` (default
-  55 min via `DEFAULT_TOKEN_MAX_AGE`, plumbed through
-  `NetConfig::token_max_age` and `OAuthRefresher::with_max_age`).
-  The previous behaviour treated such tokens as fresh indefinitely
-  and waited for a server 401; the max-age fallback closes that
-  latency leak.
+  the cached token is older than the refresher's `max_age`. Default
+  is `DEFAULT_TOKEN_MAX_AGE` (55 min, leaving a 5 min margin under
+  the typical 60 min issuer TTL). Callers configure the value at
+  construction via `NetConfig::token_max_age`;
+  `Net::attach_account` reads it and wires it into the per-account
+  refresher with `OAuthRefresher::with_max_age`, so production
+  callers do not touch the builder directly. The previous behaviour
+  treated opaque tokens as fresh indefinitely and waited for a
+  server 401; the max-age fallback closes that latency leak.
 
 **Do not nest `OAuthRefresher`s.** Wrapping one refresher around
 another causes the outer's `force_refresh` to bypass the inner's
 single-flight. Compose against the raw `TokenSource` instead.
+
+### `StaticTokenSource`
+
+In-memory `TokenSource` for callers that hand bifrost already-minted
+access tokens and rotate them out-of-band (e.g. an external auth
+service pushes a fresh token periodically). Backed by
+`Arc<RwLock<AccessToken>>`; `set(AccessToken)` replaces the cached
+token under the write lock, `token()` snapshots the current value,
+and the trait's `refresh()` is the same as `current()` because there
+is no refresh material inside bifrost-net for this shape. The
+refresher above wraps a `StaticTokenSource` just like any other
+provider; rotation just means the next `current()` reads the
+swapped-in token.
 
 ## Rate-limit governor (`RateLimitGovernor`)
 
@@ -225,6 +266,17 @@ known total, which silently admitted truncated bodies.
 `native-tls` only. No `rustls` dep anywhere. `NetConfig` accepts a
 `Vec<native_tls::Certificate>` for additional root certs and a
 `dangerous_accept_invalid_certs` flag for self-signed fixtures.
+`NetConfig::with_root_cert(cert)` is a builder helper that pushes
+one `native_tls::Certificate` onto `root_certs` and returns `self`
+so callers can chain.
+
+`NetConfig::follow_redirects` (default `true`) toggles the
+underlying `reqwest::redirect::Policy`. When set to `false`,
+`Net::new` installs `redirect::Policy::none()` so the HTTP client
+does not chase 3xx responses; protocols that need a tighter redirect
+policy (JMAP strips bearer credentials across cross-host hops
+itself, for example) disable this and walk the chain in their own
+code.
 
 `Net::new` returns `Result<Net, Error::NetSetup>` on bad TLS
 config; consumer-supplied data is a runtime condition, not a
@@ -244,8 +296,11 @@ Full trace propagation (reading trace_id from the current
 variants:
 
 - `Network { message, source }` - transport-level failures (DNS,
-  TCP reset, TLS).
+  TCP reset, generic transport).
 - `Timeout` - per-request deadline.
+- `Tls { message }` - TLS handshake or certificate validation
+  failure. Kept distinct from `Network` so consumers can present
+  trust-store-specific guidance without sniffing error strings.
 - `Status { code, body, headers }` - terminal non-retryable HTTP
   status. `body` is capped at 4 KB via `cap_status_body` with a
   truncation marker.
@@ -255,10 +310,14 @@ variants:
   repeated 401).
 - `RefreshFailed { source: Arc<Error> }` - transient refresh
   failure preserving the original.
+- `Cancelled` - request cancelled before completion.
 - `CostExceedsBurst { cost, burst }` - rate-limit configuration
   bug.
 - `EncodeBody { message, source }` - `RequestBuilder::json`
   serialization failure; surfaced lazily on the next `send`.
+- `InvalidHeader { message, source }` - `RequestBuilder::header`
+  rejected the header name or value; deferred to `send` the same
+  way `EncodeBody` is, so the fluent setter stays chainable.
 - `RangeNotHonored { message }` - server returned non-206 or
   mismatched `Content-Range` to a Range request.
 - `NetSetup { message, source }` - `Net::new` construction
@@ -267,20 +326,36 @@ variants:
 `Status`/`Response` carry `reqwest::StatusCode` and `HeaderMap`
 straight through. Documented coupling cost; acceptable for v1.
 
+## URL helpers
+
+`url::encode_component(value: &str) -> String` percent-encodes one
+URL path or query component, preserving RFC 3986 unreserved
+characters and escaping everything else (space, `"`, `#`, `$`, `%`,
+`&`, `'`, `(`, `)`, `*`, `+`, `,`, `/`, `:`, `;`, `=`, `?`, `@`,
+`[`, `]`, plus all `CONTROLS`). Backed by `percent-encoding`'s
+`utf8_percent_encode`. The HTTP protocol crates (gmail, graph) call
+this on every dynamic segment they splice into a URL so callers do
+not have to remember which escape set the API expects; pulling it
+into `bifrost-net` keeps the set defined exactly once for the
+whole workspace.
+
 ## File map
 
 ```
 crates/net/src/
-  lib.rs          // re-exports; AccountId/Priority/ByteRange from
-                  // bifrost-types
-  config.rs       // NetConfig
-  net.rs          // Net + AccountNet; attach/detach; download_stream
+  lib.rs          // re-exports; AccountFuture/AccountId/Priority/
+                  // ByteRange from bifrost-types
+  config.rs       // NetConfig + with_root_cert
+  net.rs          // Net + AccountNet; shared_default; attach/detach;
+                  // download_stream
   request.rs      // RequestBuilder + Response/StreamingResponse;
                   // retry loop
-  auth.rs         // TokenSource + OAuthRefresher state machine
+  auth.rs         // TokenSource + OAuthRefresher state machine +
+                  // StaticTokenSource
   retry.rs        // RetryPolicy
   rate.rs         // RateLimitGovernor + HostBucket
   bandwidth.rs    // BandwidthMeter + AccountMeter + MeterSink
   error.rs        // Error + cap_status_body
   trace.rs        // traceparent injection (current: uuid trace id)
+  url.rs          // encode_component for URL path/query segments
 ```
