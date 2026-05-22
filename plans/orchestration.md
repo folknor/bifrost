@@ -126,9 +126,9 @@ remain alongside them.
   except their factory and config types - `Account` becomes the
   only bifrost public API. Full spec in `plans/unification.md`;
   absorbs the previously-deferred Phase 4 (error model
-  convergence) as Stage 1 Wave 5.
+  convergence) as Stage 1 Wave 4.
 - **Phase 4: Error model convergence.** Absorbed into Phase 3.6
-  Stage 1 Wave 5. The open-question framing in
+  Stage 1 Wave 4. The open-question framing in
   `plans/error-model-convergence.md` is now resolved by the
   one-API-surface non-negotiable in `plans/unification.md`: all
   `Account` methods return `Result<_, AccountError>` and

@@ -2,7 +2,7 @@
 
 This document is **Phase 3.6** in the bifrost sequence (see
 `plans/orchestration.md`). It supersedes the previously-deferred
-Phase 4 (error model convergence) by absorbing it as Stage 1 Wave 5.
+Phase 4 (error model convergence) by absorbing it as Stage 1 Wave 4.
 Internal stage and wave labels below (S1 through S5) are local to
 this document.
 
@@ -77,12 +77,17 @@ wins.
   bifrost picks a primitive that exposes the wire shape and lets
   consumers branch. It does not pretend to unify what is not
   unifiable.
-- **Typed escape hatch.** A primitive `execute_raw(ProviderRequest)
-  -> ProviderResponse` exists for genuinely-unmodelled wire-level
-  calls. The request/response types are protocol-tagged sum types,
-  not unstructured bytes. Consumers reach for it rarely; its
-  existence prevents the "we need a second API" pressure from ever
-  arising.
+- **No escape hatch.** `Account` is the complete API for every
+  provider. If a wire-level operation is not modelled by a typed
+  primitive, that is a gap to close by adding the primitive - not
+  to paper over with a generic `execute_raw`. Escape hatches
+  contradict the one-complete-API premise and accumulate as the
+  thing people use to bypass the design. The genuinely-divergent
+  cases each have a better typed answer: Sieve scripts via
+  `FilterScript { language, body }`, Gmail-specific search
+  operators via `SearchRequest.provider_query: Option<String>` at
+  the primitive level, Graph extended properties via
+  `set_extended_property`.
 
 ## Scope of the unification
 
@@ -126,7 +131,7 @@ The engine's read-back-after-retry guard applies to every mutation.
 
 | Method | Notes |
 |---|---|
-| `search(SearchRequest)` -> `Page<ThreadId>` | Structured filter. The `SearchRequest` AST is the canonical intersection of provider operators; unmodelled operators go via `execute_raw`. JMAP `Email/query`; IMAP `UID SEARCH`; Gmail query strings; Graph OData. |
+| `search(SearchRequest)` -> `Page<ThreadId>` | Structured filter. The `SearchRequest` AST is the canonical intersection of provider operators; provider-specific operators are reached via the typed `SearchRequest.provider_query: Option<String>` field at the primitive level. JMAP `Email/query`; IMAP `UID SEARCH`; Gmail query strings; Graph OData. |
 | `search_messages(SearchRequest)` -> `Page<MessageId>` | Same AST, message-shaped results. |
 
 #### Container CRUD primitives
@@ -160,12 +165,6 @@ labels-everywhere UI ignore `kind` and read `role`.
 |---|---|
 | `thread_hydrate(ThreadId)` -> `ThreadHydration` | All messages in the thread with metadata. JMAP `Thread/get` then `Email/get`; IMAP `THREAD REFERENCES` + per-message FETCH; Gmail `users.threads.get`; Graph conversation API. |
 | `message_hydrate(MessageId, projection: HydrationProjection)` -> `Message` | Single-message fetch. `projection` selects headers-only / preview / full. |
-
-#### Escape hatch
-
-| Method | Notes |
-|---|---|
-| `execute_raw(ProviderRequest)` -> `ProviderResponse` | Typed sum type per protocol; lets consumers reach the wire for genuinely-unmodelled operations (Sieve script upload, Gmail-specific search operators, Graph extended-property queries that don't fit `set_extended_property`, etc.). Returns the provider's native response shape with the recovery taxonomy applied to errors. |
 
 ### Conveniences (Layer 2, ratatoskr policy, default impls)
 
@@ -263,8 +262,6 @@ Trait shape rules:
   wrong for that provider.
 - `AccountCapabilities` advertises per-operation support. Ratatoskr
   reads capabilities to disable UI affordances per account.
-- `execute_raw` is a primitive; the request/response sum types live
-  in `bifrost-types` and have one variant per protocol.
 - Trait is `#[non_exhaustive]` and dyn-safe.
 
 ## Stages
@@ -272,54 +269,65 @@ Trait shape rules:
 ### Stage 1: Unified action surface for mail
 
 Goal: every operation in the primitive and convenience tables above
-exists on `Account`. Ratatoskr's action service has zero per-provider
-match arms for mail operations after this stage. Absorbs the
-previously-deferred Phase 4 (error model convergence) as Wave 5.
+exists on `Account` with real per-protocol implementations.
+Absorbs the previously-deferred Phase 4 (error model convergence)
+as Wave 4. Ratatoskr's adoption of the new API is a downstream
+concern handled in ratatoskr's own plan, not gating bifrost.
 
 #### Sequencing
 
-Five waves; each blocks on the prior.
+Four waves; each blocks on the prior.
 
 - **Wave 1: trait surface (S1-W1).** Single agent extends
   `bifrost-types::Account` with all primitives (no default impls)
   and all conveniences (default impls in terms of primitives).
   Grows `AccountCapabilities`. Adds request/response/identity
-  types. `bifrost-sync` updated to compile.
+  types. Implements the resolved Stage 1 infrastructure decisions:
+  `AccountFactory::open` takes engine `AccountId`, the redirect
+  loop with RFC 7231 method rewriting lands in `bifrost-net`, and
+  the `MeterSink` adapter shape is finalized for raw-socket
+  transports. `bifrost-sync` updated to compile against the new
+  trait shape (every new method is `Err(Unsupported)` until W2).
 - **Wave 2: protocol impls (S1-W2).** Four agents in parallel,
-  one per protocol crate. Each implements every primitive.
-  Conveniences inherit the default impl unless the default is
-  wrong (e.g. Gmail's `mark_replied` is a no-op rather than the
-  default keyword-set).
-- **Wave 3: ratatoskr migration (S1-W3).** Single ratatoskr-side
-  agent removes per-provider mail dispatch in the action service
-  and `provider-sync` crate, replacing each match arm with a
-  single `account.method(...)` call. Removes per-provider files
-  that no longer have callers.
-- **Wave 4: protocol crate contraction (S1-W4).** Four agents in
+  one per protocol crate. Each implements every primitive,
+  consumes the new `AccountId`-receiving `open` signature, and
+  for IMAP drives the new `MeterSink` adapter. Conveniences
+  inherit the default impl unless the default is wrong (e.g.
+  Gmail's `mark_replied` is a no-op rather than the default
+  keyword-set). JMAP's manual redirect loop in
+  `transport_reqwest.rs` is deleted in this wave because
+  `bifrost-net` now owns that primitive.
+- **Wave 3: protocol crate contraction (S1-W3).** Four agents in
   parallel. Each makes everything in its protocol crate
   `pub(crate)` except the factory and its config types. Examples
   that demonstrated the raw client API are deleted; new examples
-  consume `Account`.
-- **Wave 5: error model convergence (S1-W5).** Single agent. Folds
-  `plans/error-model-convergence.md` into this phase: all
-  `Account` methods return `Result<_, AccountError>`. Per-protocol
-  error types become `pub(crate)`, converted at the boundary.
+  consume `Account`. This is the final `pub` audit for the
+  protocol crates after the trait surface has been implemented
+  end-to-end.
+- **Wave 4: error model convergence (S1-W4).** Single agent. Folds
+  `plans/error-model-convergence.md` into Stage 1: all `Account`
+  methods return `Result<_, AccountError>`, per-protocol error
+  types become `pub(crate)` and convert at the boundary, the
+  shared HTTP error -> `RecoveryClass` adapter lands in
+  `bifrost-net`, and `bifrost-types::Error` gets whatever
+  duplication shape (derive `Clone`, `Arc`-wrap non-Clone
+  payloads, or an explicit `duplicate()` method) the reshape
+  settles on - resolving the Gmail `account_error_from_template`
+  workaround.
 
 #### File ownership
 
 Per AGENTS.md coordination rules:
 
 - **S1-W1**: `crates/types/src/`, `crates/types/Cargo.toml`,
-  `crates/sync/src/`.
+  `crates/sync/src/`, `crates/net/src/`, `crates/net/Cargo.toml`.
 - **S1-W2-jmap, -imap, -gmail, -graph**: `crates/<protocol>/src/`
   and `crates/<protocol>/Cargo.toml` per protocol.
-- **S1-W3**: ratatoskr-side, out of this orchestrator's direct
-  scope. Bifrost orchestrator signals "wave 2 merged" and
-  ratatoskr migration begins.
-- **S1-W4**: same per-protocol ownership as wave 2.
-- **S1-W5**: `crates/types/src/error.rs` plus a sweep of every
-  protocol crate's error module. Single agent because changes
-  must land coherently across all four crates.
+- **S1-W3**: same per-protocol ownership as wave 2.
+- **S1-W4**: `crates/types/src/error.rs`, `crates/net/src/` (for
+  the recovery adapter), plus a sweep of every protocol crate's
+  error module. Single agent because changes must land coherently
+  across all four protocol crates and the two shared crates.
 
 #### Exit criteria
 
@@ -331,13 +339,18 @@ Stage 1 is done when all of these hold:
   operation.
 - Every convenience exists with a default impl. Protocol crates
   override conveniences where the default produces wrong behaviour.
-- `AccountCapabilities` advertises per-method support; ratatoskr
-  reads it to disable UI.
-- Ratatoskr has zero per-provider match arms for mail operations.
+- `AccountCapabilities` advertises per-method support.
+- `AccountFactory::open` takes the engine `AccountId` and every
+  protocol impl consumes it.
+- `bifrost-net` owns the method-aware redirect loop; no protocol
+  crate carries its own.
+- IMAP drives `MeterSink` for bandwidth metering.
 - All protocol crates are `pub(crate)` except their factory and
   config types. The factory plus `Arc<dyn Account>` is the only
-  way ratatoskr (or any other consumer) talks to a provider.
-- All `Account` methods return `Result<_, AccountError>`.
+  way any consumer talks to a provider.
+- All `Account` methods return `Result<_, AccountError>`; the
+  shared HTTP error -> `RecoveryClass` adapter lives in
+  `bifrost-net`.
 - Examples in each crate consume `Account`, not raw clients.
 - `brokkr check` is clean workspace-wide.
 
@@ -345,92 +358,145 @@ Stage 1 is done when all of these hold:
 
 Adds `filters_*` primitives plus the `FilterRule` / `FilterScript`
 shapes. No conveniences - filter rules are too divergent for a
-ratatoskr-canonical wrapper. Same wave structure as Stage 1.
+ratatoskr-canonical wrapper. Three waves: trait surface (W1),
+protocol impls (W2), protocol crate contraction (W3). No error
+convergence wave - that landed in S1-W4 and applies workspace-wide.
 
 ### Stage 3: Contacts
 
 Adds address-book and contact-card primitives, plus conveniences for
-ratatoskr's contact-list UI. Per-protocol implementations:
+ratatoskr's contact-list UI.
 
-- JMAP: native via the contacts draft already in bifrost-jmap.
-- Graph: native `me/contacts`.
-- Gmail: requires Google People API. Decision point: rename
-  `bifrost-gmail` to `bifrost-google` if it covers Gmail + People
-  + Calendar, or split into a separate crate.
-- IMAP: no native contacts. CardDAV via a new `bifrost-carddav`
-  crate; the IMAP account's contacts primitives dispatch to a
-  CardDAV client if the account was configured with CardDAV
-  credentials, else return `Unsupported`.
+**First action (W1 prep):** rename `bifrost-gmail` to `bifrost-google`
+(the crate stops being mail-only here), and create the `bifrost-carddav`
+skeleton crate. Workspace `Cargo.toml`, dependent crates, and reference
+docs updated to match. Lands as the leading patch of W1 rather than its
+own wave - too small to warrant separate sequencing.
 
-Same wave structure.
+Then the standard wave structure:
+
+- **W1: trait surface.** Contacts primitives in `bifrost-types::Account`
+  (`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
+  `contact_update`, `contact_delete`, `contact_search`), plus conveniences.
+  `AccountCapabilities` grows the contacts-support flags.
+- **W2: protocol impls** (four agents in parallel):
+  - JMAP: native via the JMAP contacts draft already wired into
+    bifrost-jmap.
+  - Google (formerly bifrost-gmail): adds Google People API support
+    alongside the existing Gmail mail code.
+  - Graph: native `me/contacts`.
+  - IMAP-via-CardDAV: the new `bifrost-carddav` crate implements the
+    CardDAV protocol client; the IMAP `Account` impl pulls it in as a
+    dependency and dispatches contacts primitives through it when the
+    account is configured with CardDAV credentials, returning
+    `Unsupported` otherwise. `bifrost-carddav` also ships its own
+    `CardDavAccountFactory` for DAV-only consumers (Radicale, Apple
+    iCloud Calendar standalone, etc.) - same one-API premise as the
+    other protocol crates. The initial implementation of
+    `bifrost-carddav` is sourced from ratatoskr's existing CardDAV
+    code; this is a one-time code transfer happening inside the W2
+    bifrost-carddav agent, not a separate wave.
+- **W3: protocol crate contraction.** Same as Stage 1 W3, now
+  including the two newly-touched crates (`bifrost-google`,
+  `bifrost-carddav`).
 
 ### Stage 4: Calendar
 
 Calendar primitives + conveniences for ratatoskr's calendar UI.
-Recurrence canonicalised to RFC 5545. JSCalendar / iCalendar /
-Google translation happens inside protocol impls. IMAP -> CalDAV
-via `bifrost-caldav`, same pattern as Stage 3.
+Recurrence canonicalised to RFC 5545 (RRULE + RDATE + EXDATE +
+recurrence-id overrides). JSCalendar / iCalendar / Google translation
+happens inside protocol impls.
 
-Same wave structure.
+**First action (W1 prep):** create the `bifrost-caldav` skeleton crate.
+Workspace `Cargo.toml` and reference docs updated. Same shape as Stage 3's
+prep, leading patch of W1.
 
-### Stage 5: Final ratatoskr migration and audit
+Then the standard wave structure:
 
-By Stage 4 ratatoskr should be calling `Account` for every PIM
-operation. Stage 5 is cleanup:
-
-- Ratatoskr's `crates/provider-sync/*` is deleted.
-- Ratatoskr's per-provider action-service files are deleted.
-  Action service becomes a thin orchestrator over `Arc<dyn Account>`.
-- Ratatoskr keeps: app-level DB schema, action-service
-  orchestration (local DB write before bifrost call, reconcile
-  after), label-group concept, universal-folders aggregation,
-  smart-folder operators.
-- Final `pub` audit per protocol crate. The only public items are
-  the factory and its config types.
-
-This stage is mostly ratatoskr-side; the bifrost-side work is the
-final `pub` audit (one agent per crate).
+- **W1: trait surface.** Calendar primitives (`calendars_list`,
+  `events_in_range`, `event_get`, `event_create`, `event_update`,
+  `event_delete`, `event_rsvp`, `event_search`), plus conveniences.
+- **W2: protocol impls** (four agents in parallel):
+  - JMAP: native via the JMAP calendar draft already wired into
+    bifrost-jmap.
+  - Google: adds Google Calendar API support alongside the existing
+    Gmail + People code.
+  - Graph: native `me/events`.
+  - IMAP-via-CalDAV: `bifrost-caldav` implements the CalDAV protocol
+    client; same composition pattern as `bifrost-carddav` in Stage 3.
+    `CalDavAccountFactory` is published for DAV-only consumers. The
+    initial implementation is sourced from ratatoskr's existing
+    CalDAV code, same one-time code transfer pattern as Stage 3.
+- **W3: protocol crate contraction.** Same as Stage 1 W3, plus
+  `bifrost-caldav`.
 
 ## Decision points the user needs to resolve before launch
 
-1. **bifrost-gmail rename to bifrost-google.** If the crate covers
-   Gmail + People + Calendar, the name should change. Decision:
-   rename or keep `bifrost-gmail` as-is.
+1. **bifrost-gmail rename to bifrost-google.** **Resolved:**
+   rename. The crate covers Gmail + People (Stage 3) + Calendar
+   (Stage 4); "Gmail" becomes misleading once People/Calendar
+   land. Pre-1.0, single PR, no real cost. Different hosts
+   (`gmail.googleapis.com`, `people.googleapis.com`,
+   `calendar.googleapis.com`) reinforce that "Google" is the
+   honest scope. Rename lands as the first action of Stage 3 -
+   matching the moment the crate's content stops being mail-only.
 2. **bifrost-carddav / bifrost-caldav as separate crates, or
-   embedded in bifrost-imap.** Recommendation: separate crates.
-   CardDAV/CalDAV are not IMAP; the only thing they share is "users
-   often configure them alongside an IMAP mail account."
+   embedded in bifrost-imap.** **Resolved:** separate crates,
+   migrated out of ratatoskr where the implementations currently
+   live. Same pattern bifrost-graph and bifrost-gmail followed -
+   protocol code moves to bifrost, app-level concerns stay in
+   ratatoskr. CardDAV/CalDAV are WebDAV-based (HTTP/XML), not
+   IMAP-based (line protocol, raw TCP/TLS); embedding them in
+   bifrost-imap would put two unrelated transport stacks under
+   one identity. Each new crate gets its own AccountFactory;
+   DAV-only consumers (Apple iCloud Calendar standalone,
+   Radicale, etc.) use them directly, while IMAP-shaped mail
+   accounts with DAV co-configured use ImapAccountFactory which
+   composes the DAV clients internally for contacts/calendar
+   primitives - same shape as bifrost-imap composing bifrost-smtp
+   for send today. Lands in Stages 3 and 4.
 3. **Per-account vs per-host rate buckets in `bifrost-net`.**
-   Carryover from Phase 3.1, narrowed by the Phase 3.5 audits:
-   the per-host bucket carryover reproduces in Gmail and Graph
-   (`Net::shared_default()` shares one `www.googleapis.com` /
-   `graph.microsoft.com` bucket across accounts, but the actual
-   quota is per-user) and does *not* reproduce in JMAP (which
-   builds a per-client Net and registers no host rate bucket) or
-   IMAP (no HTTP). Stage 1 forces a decision because the new
-   operations hit the same hosts as sync. Recommendation:
-   per-account bucket layer below per-host, scoped to the HTTP
-   protocol crates only.
+   **Resolved:** no prescriptive per-account bucket layer. The
+   rate-limit subject is the authenticated principal (OAuth
+   subject / Basic Auth user), not a bifrost `Account` - a
+   shared mailbox spends the acting principal's quota, not the
+   mailbox's; three E3/E5 accounts on the same `@domain.com`
+   are three separate principals with separate per-user quotas;
+   Gmail delegated access spends the acting principal's quota.
+   "Per-account" is the wrong bucket key, and we do not reliably
+   know any provider's actual limits. Keep the per-host token
+   bucket as a coarse safety net and let `bifrost-net`'s
+   `Retry-After` honor (landed in P2-A5) drive the actual
+   backoff. If bulk-backfill 429 storms become a problem, the
+   backfill orchestrator throttles itself based on observed 429
+   rates - a sync-engine concern, not a transport concern.
 4. **`AccountFactory::open` should receive the engine account id.**
-   JMAP currently attaches `bifrost-net` with placeholder
-   `AccountId("jmap")`; Gmail and Graph have analogous shapes.
-   Per-account metering and per-account bucket layering (point 3)
-   are both blocked on this API contract change. Either extend
-   `AccountFactory::open` to take an engine-minted `AccountId`, or
-   add a shared account-net injection path the engine can wire.
-   Lands in S1-W1.
-5. **Manual redirect loop migration to bifrost-net.** Carryover
-   from Phase 3.1. S1-W1 is the right time to move the redirect
-   loop into `bifrost-net` with proper RFC 7231 method rewriting
-   and trusted-host allowlist support. JMAP is the only current
-   caller; Stage 1's HTTP-protocol convergence makes it shared.
+   **Resolved:** extend the trait method signature. JMAP currently
+   attaches `bifrost-net` with placeholder `AccountId("jmap")`;
+   Gmail and Graph have analogous shapes. Every factory needs the
+   real id for at least one of: `bifrost-net` attach (JMAP, Gmail,
+   Graph), `MeterSink` bandwidth metering (IMAP, SMTP - per the
+   Phase 3.5 IMAP finding), trace/log correlation, error/recovery
+   correlation. No factory benefits from ignoring it. Lands in
+   S1-W1.
+5. **Manual redirect loop migration to bifrost-net.** **Resolved:**
+   move into `bifrost-net`. RFC 7231 §6.4 method rewriting
+   (301/302/303 convert POST -> GET and drop body; 307/308
+   preserve method and body), `Authorization` stripping on
+   cross-host hops, trusted-host allowlist with redirects to
+   non-allowlisted hosts rejected, works for both buffered and
+   streaming responses. JMAP's manual loop in
+   `crates/jmap/src/transport_reqwest.rs` is deleted at the
+   same time. Lands in S1-W1.
 6. **`bifrost-types::Error` should derive `Clone`** (or otherwise
-   support cheap duplication). Gmail's Phase 3.5 audit flagged a
-   local `account_error_from_template` workaround that exists
-   solely because `Error` cannot be cloned, so per-id mutation
-   failures need a hand-rolled duplicator. Derive `Clone` (or
-   model the cloneable shape explicitly) and the local helper
-   goes away.
+   support cheap duplication). **Deferred to S1-W4.** Gmail's
+   `account_error_from_template` workaround exists because
+   `Error` cannot be cloned, but the error model is going to be
+   reshaped dramatically in the error-convergence wave anyway -
+   structured Graph errors, shared HTTP -> recovery adapter,
+   unified taxonomy across all four protocols. Decision about
+   cloneability rolls into that broader work rather than getting
+   locked in against today's shape.
 7. **Shared HTTP error -> recovery taxonomy adapter.** Graph still
    classifies recoveries by substring-matching HTTP text in
    `recovery_for_graph_error`, and `GraphClient` returns
@@ -438,7 +504,7 @@ final `pub` audit (one agent per crate).
    `bifrost_net::Error -> RecoveryClass` adapter that preserves
    `Retry-After` would let all three HTTP protocol crates (JMAP,
    Gmail, Graph) delete their local substring classifiers. Lands
-   in S1-W5 (error model convergence).
+   in S1-W4 (error model convergence).
 8. **Per-protocol bandwidth metering.** IMAP stores
    `set_bandwidth_cap()` but does not enforce it or report bytes
    through `bifrost_net::MeterSink`. The HTTP protocol crates feed
@@ -447,21 +513,28 @@ final `pub` audit (one agent per crate).
    adapter that both raw-socket transports can drive, or accept
    that bandwidth caps apply only to HTTP-shaped accounts. Lands
    in S1-W1 or S1-W2 depending on which option.
-9. **`MutationConcurrency` capability shape.** IMAP opportunistically
-   uses `STORE UNCHANGEDSINCE` (the modseq cache may be cold-
-   startable), so it advertises `MutationConcurrency::None`. A
-   richer variant - e.g. `OpportunisticStateBased` - would let
-   the engine rely on the optimistic-concurrency check when the
-   cache is warm without assuming it is always wired. Genuine
-   modeling decision: add the variant and refine the engine's
-   read-back guard accordingly, or leave the IMAP situation as-is.
-10. **`execute_raw` request/response shape.** Per-protocol typed
-    sum type vs serde-json blobs vs serialised wire bytes.
-    Recommendation: typed sum types per protocol (`JmapRequest`,
-    `GraphRequest`, `ImapCommand`, `GmailRequest`) with matching
-    response types. Costs more upfront; pays off in consumer
-    ergonomics and keeps the recovery taxonomy applicable to
-    errors.
+9. **`MutationConcurrency` capability shape.** **Resolved:** leave
+   as `None`; do not add `OpportunisticStateBased`. The current
+   behavior is already correct - IMAP opportunistically uses
+   `STORE UNCHANGEDSINCE` when the modseq cache is warm, and the
+   engine's read-back guard provides the lost-update safety net
+   regardless. A richer variant would either require new engine
+   complexity to know whether the per-mutation optimistic check
+   ran (significant cost for a small per-mutation latency win) or
+   be purely informational (no behavioral difference). Capability
+   shape is additive: if behavioral pressure ever justifies the
+   variant, it lands then alongside the engine code that takes
+   advantage of it. Today's `None` posture forecloses nothing.
+10. **`execute_raw` escape hatch.** **Resolved: not adding one.**
+    `Account` is the complete API for every provider; an
+    unmodelled wire-level operation is a gap to close by adding
+    a typed primitive. Bifrost already implements 5 more JMAP
+    RFCs than Stalwart's client library and is the most
+    featureful Graph client outside Microsoft - there is no
+    real category of "unmodelled wire operation" left. Where
+    primitive-level escapes are useful (provider-specific
+    search operators), they live on the typed request structs
+    as optional fields, not as a generic raw-call surface.
 
 ### Captured-but-not-decisions
 
@@ -476,7 +549,7 @@ but are worth recording so Stage 1 agents do not rediscover them:
   `reference/smtp.md` were updated** during the Phase 3.5
   commits to match the new visibility and shape. Stage 1 work
   that touches these surfaces should refresh them again at the
-  end of each wave rather than batch the doc churn for Stage 5.
+  end of each wave rather than batch the doc churn.
 
 ## Coordination rules
 
