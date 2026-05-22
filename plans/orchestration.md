@@ -112,17 +112,6 @@ remain alongside them.
   assertion in `bifrost-sync`, and write `reference/{jmap,imap,
   gmail,graph}.md` to describe the account-layer code. Full
   spec under **Phase 3** below.
-- **Phase 3.1: Dependency and shared-crate-wiring audit.** The
-  structural shoehorn left `bifrost-jmap`, `bifrost-gmail`, and
-  `bifrost-graph` each maintaining their own HTTP client,
-  bearer-token storage, and URL-encoding path instead of
-  routing through `bifrost-net`. Workspace dependency pins are
-  also inconsistent (per-crate `async-stream` / `thiserror` /
-  `futures-util`, `log` in gmail / graph while everyone else
-  uses `tracing`). Full spec in
-  `plans/dependency-audit.md`. Runs before Phase 3.5; the
-  structural fix dissolves most of Phase 3.5's
-  `Shared -> protocol duplication` bucket.
 - **Phase 3.5: Post-shoehorn surface audit.** Trait shoehorns
   leave dead and duplicated code in their wake. Audit each
   crate that was modified to host the `Account` / `AccountFactory`
@@ -301,29 +290,22 @@ Phase 3 is done when all of these hold:
 
 ## Phase 3.1
 
-Dependency and shared-crate-wiring audit. The big-ticket finding
-is that `bifrost-net` was shoehorned into the workspace but never
-adopted by `bifrost-jmap`, `bifrost-gmail`, or `bifrost-graph`:
-each of those still maintains its own `reqwest::Client`, its own
-bearer-token storage (plain `String`, not `Zeroizing<String>`),
-and its own URL-encoding path. Five smaller findings sit around
-that core: per-crate `async-stream` / `thiserror` / `futures-util`
-pins that should be workspace-pinned, `log` in gmail / graph
-while everyone else is on `tracing` (events silently dropped if
-the downstream installs only `tracing-subscriber`), the
-abandoned `urlencoding` crate that should be replaced with
-`percent-encoding`, and a handful of cosmetic odds and ends.
-
-Full spec, per-finding methodology, file ownership, suggested
-order of operations, and exit criteria live in
-`plans/dependency-audit.md`.
-
-Sequencing: Phase 3.1 runs before Phase 3.5. The structural fix
-(routing the three HTTP-based crates through `bifrost-net`)
-dissolves most of Phase 3.5's `Shared -> protocol duplication`
-bucket and the secret-handling half of Phase 3.5's two-ways
-audit, so doing the smaller surface-level work first would just
-create rebase churn.
+Done. Landed at commit `0fa66dd`. `bifrost-jmap`, `bifrost-gmail`,
+and `bifrost-graph` now route every HTTP call through
+`bifrost-net`; default constructors register against
+`Net::shared_default()` (a `OnceLock<Net>` singleton) with
+unique `AccountId` suffixes so multiple clients in one process
+share the connection pool, governor, and bandwidth meter. OAuth
+bearer storage is now `bifrost-net::AccessToken` end to end, and
+`StaticTokenSource` is sync-mutable so token rotation propagates
+to both the HTTP pipeline and the JMAP WebSocket path. JMAP's
+`follow_redirects(trusted_hosts)` allowlist is preserved via a
+manual redirect loop that strips `Authorization` on cross-host
+hops; `NetConfig.follow_redirects` is the underlying knob.
+Workspace pin housekeeping (`async-stream`, `thiserror`,
+`getrandom::std`, `futures` umbrella) and the `log` → `tracing`
+migration in gmail / graph also landed. Two follow-ups carried
+into Phase 3.5; see below.
 
 ## Phase 3.5
 
@@ -352,6 +334,32 @@ debris:
    underlying `Client` or driver). Some of those equivalents are
    still useful for non-engine consumers. Some are not. Decide
    per case; eliminate the dead ones.
+
+### Carryovers from Phase 3.1
+
+Two items deferred when Phase 3.1 landed; fold them into the
+relevant 3.5 audit pass rather than re-opening 3.1:
+
+- **JMAP manual redirect loop is not RFC-7231 method-aware.**
+  `crates/jmap/src/transport_reqwest.rs` replays method and body
+  across every redirect hop. RFC 7231 §6.4 says 301/302/303
+  should convert POST to GET and drop the body; only 307/308
+  preserve them. Harmless today because the JMAP endpoints we
+  hit are POST for the API and GET for session / blob / SSE, but
+  needs tightening if redirect handling grows into a shared
+  primitive in `bifrost-net`. Most natural fix: move the
+  redirect loop into `bifrost-net` with proper method-rewriting
+  and have JMAP configure it via a per-account policy.
+- **Per-host rate buckets serve a process-wide pool.** With
+  `Net::shared_default()`, every Gmail account in the same
+  process shares one `www.googleapis.com` token bucket and every
+  Graph account shares one `graph.microsoft.com` bucket. Gmail's
+  actual quota is per-user, so multi-account ratatoskr workloads
+  may under-provision themselves against the real API ceiling.
+  Decision point during 3.5: either keep per-host (and let
+  consumers wire their own `Net` per account via
+  `with_account_net`), or add a per-account bucket layer below
+  the per-host one.
 
 ### Methodology
 
