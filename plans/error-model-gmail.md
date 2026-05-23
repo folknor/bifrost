@@ -402,11 +402,24 @@ bifrost_net::into_account_error(
     bifrost_net::NetErrorContext {
         provider: Some(Provider::Gmail),
         protocol: Protocol::Gmail,
-        operation: Some(ctx.operation),
+        operation: ctx.operation, // non-optional on both sides
         scope: ctx.scope.clone(),
     },
 )
 ```
+
+Gmail-specific classification on preserved net bodies. When the net
+error is `Error::RateLimited { final_response, .. }` or
+`Error::RetryBudgetExhausted { final_response: Some(r), .. }`,
+delegate first, then ALSO parse `final_response.body` for the
+Gmail JSON error reason (`rateLimitExceeded`, `userRateLimitExceeded`,
+`dailyLimitExceeded`, `quotaExceeded`, etc.) and re-build the
+`AccountError` with the structured `GmailSignal` if found. Without
+this step, the protocol crate loses the reason-string discrimination
+that drives the per-quota throttle-scope decisions and the
+quota-vs-rate distinction. The body is JSON, capped at
+`STATUS_BODY_CAP`. If parsing fails, keep the net-derived
+classification.
 
 Do this only for transport-like net errors. For
 `bifrost_net::Error::Status`, parse the Gmail JSON body first and run

@@ -452,11 +452,24 @@ bifrost_net::into_account_error(
     bifrost_net::NetErrorContext {
         provider: Some(Provider::Microsoft),
         protocol: ctx.protocol,
-        operation: Some(ctx.operation),
+        operation: ctx.operation, // non-optional on both sides
         scope: ctx.scope.clone(),
     },
 )
 ```
+
+Graph-specific classification on preserved net bodies. When the net
+error is `Error::RateLimited { final_response, .. }` or
+`Error::RetryBudgetExhausted { final_response: Some(r), .. }`,
+delegate first, then ALSO parse `final_response.body` for the
+Graph `error.code` JSON envelope and re-build the `AccountError`
+with the structured code if found. Without this step, the protocol
+crate loses the `error.code` discrimination that drives most of the
+Graph mapping table (e.g. distinguishing `ApplicationThrottled`
+from a generic 429). The body is JSON, capped at `STATUS_BODY_CAP`,
+and structured per Graph error response conventions. If parsing
+fails, keep the net-derived `Server(RateLimited)` / generic
+`Server(_)` classification.
 
 Do this only for transport-like net errors. For
 `bifrost_net::Error::Status`, parse the Graph or EWS body first and

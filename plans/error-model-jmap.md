@@ -202,7 +202,7 @@ Add in `sync/error.rs`:
 #[derive(Clone, Debug)]
 pub(crate) struct JmapErrorContext {
     pub(crate) provider: Option<Provider>,
-    pub(crate) operation: Option<AccountOperation>,
+    pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
 }
 
@@ -211,6 +211,14 @@ pub(crate) fn into_account_error(
     ctx: JmapErrorContext,
 ) -> AccountError;
 ```
+
+`operation` is non-optional. The central recovery mapper defaults
+missing operation to idempotent-true
+(`crates/types/src/error/recovery.rs:181-183`), which on a
+`Network { InFlight }` for a `Send` would silently retry and
+double-send. Forcing every JMAP call site to supply its target
+operation closes the trap at this boundary; this mirrors
+`bifrost_net::NetErrorContext` (Phase 2.1 net plan).
 
 Helper constructors are encouraged:
 
@@ -226,9 +234,9 @@ impl JmapErrorContext {
 
 Every builder path must attach:
 
-- `.protocol(Protocol::Jmap)`
+- `.protocol(Protocol::Jmap)` — always
+- `.operation(ctx.operation)` — always
 - `.provider(provider)` only when `ctx.provider` is `Some`
-- `.operation(operation)` when `ctx.operation` is `Some`
 - `.scope(scope)` when `ctx.scope` is `Some`
 
 Do not infer `Provider` from the URL. Generic JMAP hosts should leave
@@ -247,7 +255,7 @@ bifrost_net::into_account_error(
     bifrost_net::NetErrorContext {
         provider: ctx.provider,
         protocol: Protocol::Jmap,
-        operation: ctx.operation,
+        operation: ctx.operation, // non-optional on both sides
         scope: ctx.scope,
     },
 )
@@ -357,10 +365,17 @@ directly:
 
 - `Status { code, headers, .. }`: copy status, request-id and trace
   headers, and parse `Retry-After` if present.
-- `RateLimited { retry_after }`: copy the retry delay and set throttle
-  scope from JMAP context.
-- `RetryBudgetExhausted { last_status, retry_after_history }`: copy
-  the last status and the final retry-after duration when present.
+- `RateLimited { retry_after, final_response }`: copy the retry delay
+  and throttle scope from JMAP context; pull `request_id` / `trace_id`
+  from `final_response.headers` and support-only body text from
+  `final_response.body` (capped at `STATUS_BODY_CAP`). Do not match
+  the legacy `{ retry_after }`-only shape.
+- `RetryBudgetExhausted { final_response, retry_after_history }`:
+  `final_response` is `Option<FinalResponse>`; on `Some`, run the
+  same headers/body extraction as `Status` (the status moved from
+  the top-level `last_status` into `final_response.status`). On
+  `None` (defensive arm) classify as transport with
+  `Attempt(InFlight)`.
 - Other net errors: keep the problem body as the semantic source and
   add the net error text as support-only diagnostic text.
 
@@ -481,25 +496,48 @@ Map non-wire crate errors without old `bifrost_types::Error`:
 | `InvalidUrl` before request dispatch | `Request(Malformed)` | `Request(InvalidArgument { field: Some("url") })` |
 | `InvalidUrl` for URL templates from session | `Protocol(ContractViolation)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
 | `NoPrimaryAccount` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
-| `WebSocketClosed` after established session | `Transport(Network)` | `Transport(Network)` + `Attempt(Acknowledged)` |
+| `WebSocketClosed` after established session | `Protocol(PartialResponse)` | `Wire(MalformedResponse { protocol: Jmap, detail })` + `Attempt(Acknowledged)` |
 | `WebSocketClosed` during handshake | `Transport(Network)` | `Transport(Network)` + `Attempt(Unsent)` |
 | `WebSocketNotConnected` | `Unsupported(PushSubscribe)` or `Unsupported(PushUnsubscribe)` | `Request(Unsupported { operation })` |
 | `WebSocketSetup(Tls)` | `Transport(Tls)` | `Transport(Tls)` + `Attempt(Unsent)` |
 | `WebSocketSetup(InvalidHeader)` | `Request(Malformed)` | `Request(InvalidArgument { field: Some("authorization") })` |
 | `WebSocketSetup(Subprotocol)` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
-| `WebSocket(_)` mid-message after handshake completed | `Transport(Network)` | `Transport(Network)` + `Attempt(Acknowledged)` |
+| `WebSocket(_)` mid-message after handshake completed | `Protocol(PartialResponse)` | `Wire(MalformedResponse { protocol: Jmap, detail })` + `Attempt(Acknowledged)` |
 | `WebSocket(_)` before handshake completed | `Transport(Network)` | `Transport(Network)` + `Attempt(Unsent)` |
 
-WebSocket lifecycle rule: the handshake completes when the server's
-`101 Switching Protocols` response is received. Any disconnect AFTER
-that point has bytes acknowledged by the server (the upgrade itself
-is the acknowledgement); classify as `Acknowledged`. Any disconnect
-BEFORE that point (TCP refused, TLS handshake failure, HTTP upgrade
-rejected) classifies as `Unsent`. The previous blanket `InFlight`
-classification was wrong: `InFlight` means "bytes crossed the
-boundary but no terminal acknowledgement arrived," but a successful
-WebSocket upgrade IS a terminal acknowledgement — every subsequent
-disconnect is on a session the server already acknowledged.
+WebSocket lifecycle rule. The HTTP upgrade completes when the server's
+`101 Switching Protocols` response is received. The two phases require
+different kinds, not just different attempt states:
+
+- **Before handshake** (TCP refused, TLS handshake failure, HTTP
+  upgrade rejected): no acknowledged response, no session. Classify
+  as `Transport(Network)` (or `Transport(Tls)` for handshake-time TLS)
+  with `Attempt(Unsent)`. Matches the rule "handshake failure is
+  always Unsent."
+- **After handshake** (post-`101` session interrupted, mid-message
+  disconnect, ping timeout, server-initiated close): the upgrade was
+  acknowledged, but the long-lived stream was interrupted. Classify
+  as `Protocol(PartialResponse)` with
+  `Wire(MalformedResponse { protocol: Jmap, detail })` and
+  `Attempt(Acknowledged)`. Do NOT classify as `Transport(_)` with
+  `Acknowledged` — that combination triggers the
+  `bifrost-types::error::recovery::derive` runtime assertion
+  (`recovery.rs:187-190`: `Transport(_)` errors cannot have
+  `Acknowledged` transmission state). The defensive route mirrors
+  net's `Network { Acknowledged }` and `Tls { Acknowledged }`
+  treatment: once response headers / upgrade have been acknowledged,
+  subsequent stream failures are protocol-class, not transport-class.
+
+Recovery derivation for the `Protocol(PartialResponse)` rows: the
+central mapper uses operation idempotency. `PushSubscribe` is
+non-idempotent (per `scope.rs:163-182`), so a mid-session close on a
+subscribe call returns `Reconcile { PartialCompletionSignal,
+[CheckTarget, DedupeByClientId] }` — the engine probes inventory or
+re-subscribes after checking that the subscription is gone.
+`PushStream` is idempotent, so a stream interruption returns
+`Retry { SameRequest, Transport }` — the engine reconnects the
+stream. Both behaviors are correct for "we don't have a transport
+problem, the long-lived stream just ended."
 
 For `InvalidUrl`, prefer adding distinct variants or constructors so
 the conversion can tell local caller-built URL failures from provider
