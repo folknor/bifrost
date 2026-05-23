@@ -295,7 +295,7 @@ pub struct CapabilityKey(pub String);
 pub struct CapabilityValue(pub String);
 
 /// One named capability transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityChange {
     pub key: CapabilityKey,
     pub from: CapabilityValue,
@@ -305,7 +305,7 @@ pub struct CapabilityChange {
 /// Delta between two `AccountCapabilities` snapshots. Carried on
 /// `RecoveryClass::CapabilityChanged` so the engine can reason about
 /// what changed without re-reading the full snapshot.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityDelta {
     pub added: Vec<CapabilityKey>,
     pub removed: Vec<CapabilityKey>,

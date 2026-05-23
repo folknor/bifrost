@@ -221,8 +221,6 @@ parallel agents make sense). Per AGENTS.md:
   non-negotiable; centralized patches to wire enums are the only
   exception.
 - Required reading for every agent:
-  - `CLAUDE.md`
-  - `AGENTS.md`
   - `plans/error-model-convergence.md`
   - `plans/error-model-<crate>.md` (the agent's specific plan)
   - `reference/<crate>.md` (the crate's reference doc — kept in

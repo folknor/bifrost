@@ -260,6 +260,11 @@ server.rate-limited
 server.quota-exhausted
 server.error
 syncstate.cursor-invalid
+syncstate.strategy-failure
+syncstate.scope-capability-lost
+syncstate.schema-incompatible
+syncstate.capability-changed
+syncstate.operator-override-needed
 concurrency.conflict
 request.malformed
 request.batch-input-invalid
@@ -498,7 +503,7 @@ cover only safe-retry cases:
   (`TransmissionState::Acknowledged`, structured 4xx, structured
   method error) → `Retry::SameRequest`.
 - Non-idempotent operation + `TransmissionState::InFlight` (transport
-  dropped without acknowledgement) → `Reconcile { TransportDropAfterSend, actions: [CheckTarget, DedupeByClientId] }`.
+  dropped without acknowledgement) → `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }`.
 - Provider returned partial-completion signal on non-idempotent op →
   `Reconcile { PartialCompletionSignal, actions: [CheckTarget, DedupeByClientId] }`.
 - Etag/state mismatch → `Retry::AfterStateRefresh`.
@@ -1188,9 +1193,9 @@ Network drop mid-stream during `Send`:
   `chain[1]`: `Attempt { transmission_state: InFlight }`
 - derived `recovery`: `Reconcile(ReconcileAdvice { reason:
   TransportDropAfterSend, guidance: ReconcileGuidance { actions:
-  vec![CheckTarget, DedupeByClientId] } })` (send is non-idempotent
+  vec![CheckTarget] } })` (send is non-idempotent
   and bytes left the socket without acknowledgement; the consumer
-  must probe Sent and dedupe by client id before retrying)
+  must probe the target before deciding whether to retry)
 - derived `message_key`: `"transport.network"`
 - derived `suggested_remediation`: `None` (consumer reconciles; no
   canonical product action)

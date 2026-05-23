@@ -60,7 +60,20 @@ pub use cursor::{
 };
 
 // Error + recovery vocabulary.
-pub use error::{Error, Fatal, RecoveryClass, StrategyDowngrade, Warning, WarningKind};
+pub use error::{
+    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
+    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchInputInvalidItem,
+    BatchInputInvalidReason, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome, BatchSuccess,
+    BatchUncertain, Cause, CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText,
+    EngineDirective, EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal,
+    ImapResponseCode, ItemOutcome, JmapMethod, MailboxUnavailableKind, MutationSuccess, Protocol,
+    ProtocolErrorKind, Provider, ReconcileAction, ReconcileAdvice, ReconcileGuidance,
+    ReconcileReason, RecoveryClass, RemediationAction, RequestCause, RequestErrorKind,
+    ResourceKind, RetryAdvice, RetryDisposition, RetryReason, ServerCause, ServerErrorKind,
+    StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
+    SupportExportMinimal, SyncStateErrorKind, TelemetryView, ThrottleScope, TransmissionState,
+    TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind, WireCause,
+};
 
 // Stream-event types.
 pub use events::{

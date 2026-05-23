@@ -19,3 +19,4 @@ futures = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
+serde = { workspace = true }
