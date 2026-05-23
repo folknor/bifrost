@@ -45,6 +45,10 @@ are explicit.
 
 ### Phase 1: types foundation
 
+**Status:** landed in commit `ac47289`. The workspace is now in the
+intentional broken-branch state described below. Subsequent phases
+build on top; do not re-implement the types module.
+
 **Goal:** land the new `bifrost-types::error` module from the
 convergence plan, plus the matching `lib.rs` re-export update and
 the deletion of the old `error.rs`. Nothing else.

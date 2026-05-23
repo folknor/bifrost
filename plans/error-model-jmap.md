@@ -1,158 +1,709 @@
 # Error model: bifrost-jmap implementation plan
 
-**Scaffold.** Fill in the details by reading `reference/jmap.md` and
-the `crates/jmap/` source. Sections marked `<TODO>` are placeholders.
+This is Phase 2.2 of `plans/error-model-roadmap.md`, one of the five
+consumer-crate patches authored after `bifrost-net`.
 
-This is **Phase 2.2** of `plans/error-model-roadmap.md`, one of the
-five consumer crates that migrate in parallel after `bifrost-net`.
+Phase 2 is still on the intentionally broken feature branch. Author
+the JMAP patch and tests, but do not run `brokkr`, `cargo`, or
+`./diff_test.sh` from the crate agent.
+
+## Required reading
+
+- `CLAUDE.md`
+- `plans/error-model-roadmap.md`
+- `plans/error-model-convergence.md`
+- `plans/error-model-net.md`
+- `reference/jmap.md`
+- `crates/types/src/error/` (the landed Phase 1 API)
 
 ## Scope
 
-`bifrost-jmap` implements RFC 8620 / 8621 / etc. JMAP. It dispatches
-through `bifrost-net` for HTTP and emits its own structured errors
-for JMAP method errors (`stateMismatch`, `forbidden`, parse failures,
-etc.).
+Own only `crates/jmap/` files. Do not edit `crates/types/` even if a
+new `JmapMethod` wire variant would be useful. If the existing
+`JmapMethod` enum is insufficient, report the required variants to the
+orchestrator under the roadmap's wire-enum escape hatch.
 
-What changes:
+This phase rewrites JMAP error construction and removes the crate-local
+recovery mapping. Phase 3 may still perform final trait-surface
+reconciliation across all crates (`SyncEvent::Fatal` rename,
+`MutationResult` to `ItemOutcome`, and `Account` signature updates).
 
-- Every site that currently constructs an `Error` value (per the old
-  `bifrost-types::Error`) switches to constructing an `AccountError`
-  via `AccountErrorBuilder`.
-- The JMAP method-error vocabulary maps cleanly into
-  `AccountErrorKind` + `Cause::Wire(WireCause::Jmap(JmapMethod {
-  kind: ... }))`.
-- Any `to_recovery`, `recovery_for_*`, or `fatal_for_*` helpers
-  delete; recovery derives centrally.
-- Provider / protocol identifiers are stamped on every `AccountError`
-  via the builder's `.provider(Provider::Fastmail | ...)` and
-  `.protocol(Protocol::Jmap)`.
+## Current state
 
-## Dependencies
+Important files:
 
-- Phase 1 (`plans/error-model-types.md`).
-- Phase 2.1 (`plans/error-model-net.md`) — JMAP routes HTTP through
-  `bifrost-net`, so net's `into_account_error` and `AttemptCause`
-  emission must be in place before JMAP can produce well-formed
-  errors for the transport layer.
+- `crates/jmap/src/lib.rs`
+  - crate-private `Error` enum.
+  - `From<TransportError>` auto-parses RFC 7807 problem details.
+  - `From<serde_json::Error>` currently flattens all JSON failures to
+    `Error::Parse`, losing whether the failure was outbound request
+    encoding or inbound response decoding.
+- `crates/jmap/src/core/error.rs`
+  - `ProblemDetails`, `JMAPError`, `ProblemType`,
+    `MethodError`, `MethodErrorType`.
+- `crates/jmap/src/core/set.rs`
+  - `SetError` and `SetErrorType` for per-object set failures.
+- `crates/jmap/src/core/transport.rs`
+  - `TransportError`, currently only message/body/source.
+- `crates/jmap/src/transport_reqwest.rs`
+  - converts `bifrost_net::Error` into `TransportError`.
+- `crates/jmap/src/client.rs`
+  - request send, session fetch, session refresh.
+- `crates/jmap/src/client_ws.rs`
+  - WebSocket setup, message parsing, request-error problem details.
+- `crates/jmap/src/sync/error.rs`
+  - old `to_recovery`, `to_account_error`,
+    `fatal_from_account_error`, and `fatal_from_jmap`.
+- `crates/jmap/src/sync/*`
+  - many `map_err(super::error::to_account_error)` and
+    `fatal_from_jmap` call sites that must pass operation and scope
+    context.
 
 ## Files to modify
 
-`<TODO>` — discover by reading `crates/jmap/src/`. Likely candidates
-based on `reference/jmap.md`:
+- `crates/jmap/src/lib.rs`
+  - Adjust `Error` variants as described below.
+- `crates/jmap/src/core/error.rs`
+  - Add accessors needed by the mapper if missing.
+- `crates/jmap/src/core/transport.rs`
+  - Preserve the original `bifrost_net::Error` when the default
+    transport produced one.
+- `crates/jmap/src/core/request.rs`
+  - Map request serialization failures to an outbound-encode error.
+- `crates/jmap/src/core/response.rs`
+  - Preserve method-error metadata already parsed there.
+- `crates/jmap/src/core/set.rs`
+  - Add cheap accessors / conversion helpers for `SetErrorType`.
+- `crates/jmap/src/transport_reqwest.rs`
+  - Preserve net error evidence and response body at the same time.
+- `crates/jmap/src/client.rs`
+  - Split request encode, session decode, and response decode errors.
+- `crates/jmap/src/client_ws.rs`
+  - Map WebSocket setup and message decode errors into the new
+    conversion boundary.
+- `crates/jmap/src/sync/error.rs`
+  - Replace the old recovery helpers with the builder-based
+    conversion boundary.
+- `crates/jmap/src/sync/*.rs`
+  - Pass `JmapErrorContext` at all crate-error conversion sites.
+- `crates/jmap/src/sync/tests` or inline `sync/error.rs` tests
+  - Add small deterministic classification tests.
 
-- the internal error type module (probably `error.rs`)
-- the method-error parser (where JMAP method-level error
-  responses become structured types)
-- the dispatch surface (request → response, possibly in a module
-  named `transport.rs` or `client.rs`)
-- the `Account` impl module (likely under `src/sync/` per
-  `reference/jmap.md`)
-- the WebSocket push handler
-- the mutation pipeline (where idempotency and retry decisions
-  currently get made)
+## Functions to delete
 
-## Files to delete
+No whole-file deletion is expected. The following functions in
+`crates/jmap/src/sync/error.rs` must be removed in the same commit
+that lands `into_account_error`:
 
-`<TODO>` — discover. The convergence plan calls out:
+- `to_recovery`
+- `to_account_error`
+- `fatal_from_account_error`
+- `fatal_from_jmap`
 
-- JMAP-specific `to_recovery` helpers if any exist.
-- Any string-based error classification.
+Keep `is_state_mismatch` only if the mutation retry pipeline still
+needs the predicate. It must inspect `MethodErrorType::StateMismatch`
+directly and must not construct recovery advice.
 
-## Translation surface
+The exit-criteria audit must grep `crates/jmap/` for these four
+identifiers and confirm zero hits.
+
+## Internal error-shape changes
+
+### Preserve net evidence
+
+`TransportError` must retain the original net error:
 
 ```rust
+pub(crate) struct TransportError {
+    pub(crate) message: String,
+    pub(crate) body: Option<Bytes>,
+    pub(crate) net: Option<bifrost_net::Error>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+```
+
+`transport_reqwest::transport_error_from_net` should set `net:
+Some(error)`. For `bifrost_net::Error::Status`, clone the `Bytes`
+body before moving the error into the field so `ProblemDetails`
+parsing still works.
+
+Custom transports can keep using `TransportError::new`,
+`with_source`, and `with_body`; those constructors set `net: None`.
+
+### Preserve problem transport metadata
+
+`Error::Problem(Box<ProblemDetails>)` loses the HTTP transport
+evidence. Replace it with:
+
+```rust
+Problem {
+    details: Box<ProblemDetails>,
+    transport: Option<TransportError>,
+}
+```
+
+`From<TransportError> for Error`:
+
+- if `body` parses as `ProblemDetails`, return
+  `Error::Problem { details, transport: Some(error) }`.
+- otherwise return `Error::Transport(error)`.
+
+`From<ProblemDetails> for Error` for WebSocket request errors returns
+`Error::Problem { details, transport: None }`.
+
+### Split JSON encode and decode
+
+Current `Error::Parse(serde_json::Error)` is ambiguous. Add:
+
+```rust
+RequestEncode(serde_json::Error),
+ResponseDecode(serde_json::Error),
+```
+
+Then update:
+
+- `Request::call` and `Client::send_request` request serialization:
+  `RequestEncode`.
+- `ClientBuilder::connect`, `Client::send_request`,
+  `Client::refresh_session`, and WebSocket response decoding:
+  `ResponseDecode`.
+
+Remove the broad `From<serde_json::Error> for Error` if possible. If
+keeping it is necessary for localized call-site churn, it must map to
+`ResponseDecode` and the plan's tests must cover the explicit
+outbound-encode sites.
+
+## Kind/cause shape conventions
+
+Two landed-API quirks the agent must keep straight when reading the
+tables below:
+
+- `ServerErrorKind::Error { status: Option<u16> }` (kind side; the
+  field is `Option`) vs `ServerCause::Error { status: u16 }` (cause
+  side; the field is bare). When the table writes `Server(Error {
+  status })` for a row, the kind column means `Some(status)`; the
+  cause column means the bare `u16`. Do not "fix" one column to match
+  the other.
+- `AccessErrorKind::PermissionDenied` (kind side; no payload) vs
+  `AccessCause::PermissionDenied { resource: Option<ResourceKind> }`
+  (cause side; carries optional resource). The `resource` value lives
+  only on the cause, not the kind.
+
+Every kind/cause pair below must satisfy
+`recovery::kind_matches_cause` (asserted at runtime in
+`AccountErrorBuilder::build`). Adding rows requires checking the
+matrix in `crates/types/src/error/recovery.rs`.
+
+## JMAP conversion boundary
+
+Add in `sync/error.rs`:
+
+```rust
+#[derive(Clone, Debug)]
+pub(crate) struct JmapErrorContext {
+    pub(crate) provider: Option<Provider>,
+    pub(crate) operation: Option<AccountOperation>,
+    pub(crate) scope: Option<ErrorScope>,
+}
+
 pub(crate) fn into_account_error(
-    error: jmap::Error,
+    error: crate::Error,
     ctx: JmapErrorContext,
 ) -> AccountError;
 ```
 
-Where `JmapErrorContext` carries operation, scope, and any
-JMAP-specific correlation IDs.
+Helper constructors are encouraged:
 
-Implementation:
+```rust
+impl JmapErrorContext {
+    pub(crate) fn new(operation: AccountOperation) -> Self;
+    pub(crate) fn with_scope(self, scope: ErrorScope) -> Self;
+    pub(crate) fn cursor(operation: AccountOperation, scope: CursorScope) -> Self;
+    pub(crate) fn message(operation: AccountOperation, id: impl Into<String>) -> Self;
+    pub(crate) fn mailbox(operation: AccountOperation, id: impl Into<String>) -> Self;
+}
+```
 
-1. If the error is purely transport-level: delegate to
-   `bifrost_net::into_account_error` with a `NetErrorContext`
-   constructed from `JmapErrorContext`.
-2. If the error is a JMAP method-level error: classify by method
-   error code:
-   - `stateMismatch` → `kind: ConcurrencyConflict`,
-     `chain: [State(ConcurrencyConflict), Wire(JmapMethod {
-     kind: StateMismatch })]`.
-   - `forbidden` → `kind: Authorization(...)` matching the specific
-     forbidden context (cross-reference JMAP RFC 8620 §3.6).
-   - `accountNotFound` / `accountNotSupportedByMethod` →
-     `kind: Unsupported(operation)`.
-   - `unknownMethod` → `kind: Unsupported(operation)`.
-   - `invalidArguments` / `invalidResultReference` →
-     `kind: Request(Malformed)`.
-   - `serverFail` / `serverPartialFail` / `serverUnavailable` →
-     `kind: Server(...)`. `serverPartialFail` is the
-     `Reconcile(PartialCompletionSignal)` case.
-   - `requestTooLarge` → `kind: Request(Malformed)`.
-   - Cancelled / quota — match per JMAP RFC.
-3. Use the builder with operation, scope, provider, protocol set.
-4. Method-error responses are always `Acknowledged` from the
-   transport perspective (the server returned a response), but the
-   `AttemptCause` is pushed by `bifrost-net` when the HTTP layer
-   succeeded; JMAP doesn't need to re-emit it.
+Every builder path must attach:
 
-## Notable concerns
+- `.protocol(Protocol::Jmap)`
+- `.provider(provider)` only when `ctx.provider` is `Some`
+- `.operation(operation)` when `ctx.operation` is `Some`
+- `.scope(scope)` when `ctx.scope` is `Some`
 
-- **JMAP capabilities.** Per `reference/jmap.md`, JMAP supports RFC
-  8620 / 8621 / 8887 / 9404 / 9425 / 9610 / 9670 and several drafts.
-  Each capability set adds method errors. The classification has to
-  cover every method-error code that the JMAP server can return for
-  any advertised capability.
-- **WebSocket push.** RFC 8887 WebSocket push has its own error
-  signaling (close frames, ping timeouts). These map to
-  `Cause::Transport(...)` with appropriate `TransmissionState`, and
-  the `AccountErrorKind` depends on whether the disconnect is
-  recoverable (transient) or permanent (auth lost).
-- **Mutation pipeline.** Per `reference/jmap.md`, mutations go
-  through `Email/set` with `ifInState`. State-mismatch returns
-  `Retry { AfterStateRefresh, reason: ConcurrencyConflict }`. The
-  pipeline must consume the new `RecoveryClass` shape.
+Do not infer `Provider` from the URL. Generic JMAP hosts should leave
+`provider` as `None` unless the factory later gains an explicit
+provider setting.
+
+## Transport conversion
+
+For `Error::Transport(transport)`:
+
+- If `transport.net` is `Some(net_error)`, delegate to:
+
+```rust
+bifrost_net::into_account_error(
+    net_error,
+    bifrost_net::NetErrorContext {
+        provider: ctx.provider,
+        protocol: Protocol::Jmap,
+        operation: ctx.operation,
+        scope: ctx.scope,
+    },
+)
+```
+
+- If `transport.net` is `None`, build:
+  - `AccountErrorKind::Transport(TransportErrorKind::Network)`
+  - `Cause::Transport(TransportCause { kind: Network, message })`
+  - no `AttemptCause`, because custom transports did not provide
+    side-effect evidence.
+
+## Method-error mapping
+
+JMAP method errors are parsed successful JMAP responses, so they have
+crossed the HTTP side-effect boundary. Push
+`Cause::Attempt(AttemptCause { transmission_state:
+TransmissionState::Acknowledged })` for every `Error::Method` path.
+
+The outermost cause must match the kind. Push the JMAP wire cause after
+the semantic cause:
+
+```rust
+builder.push_cause(Cause::Wire(WireCause::Jmap(...)))
+```
+
+| MethodErrorType | AccountErrorKind | outer cause |
+|---|---|---|
+| `ServerUnavailable` | `Server(Unavailable)` | `Server(Unavailable { retry_after: None })` |
+| `ServerFail` | `Server(Unavailable)` | `Server(Unavailable { retry_after: None })` |
+| `ServerPartialFail` | `Protocol(PartialResponse)` | `Wire(Jmap(ServerPartialFail))` |
+| `UnknownMethod` | `Unsupported(operation)` | `Request(Unsupported { operation })` |
+| `InvalidArguments` | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `InvalidResultReference` | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `Forbidden` | `Authorization(PermissionDenied)` | `Access(PermissionDenied { resource })` |
+| `AccountNotFound` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `FromAccountNotFound` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `AccountNotSupportedByMethod` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `FromAccountNotSupportedByMethod` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `AccountReadOnly` | `Authorization(PermissionDenied)` | `Access(PermissionDenied { resource })` |
+| `RequestTooLarge` | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `CannotCalculateChanges` | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
+| `StateMismatch` | `ConcurrencyConflict` | `State(ConcurrencyConflict)` |
+| `AlreadyExists` | `ConcurrencyConflict` | `State(ConcurrencyConflict)` |
+| `AnchorNotFound` | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
+| `UnsupportedSort` | `Unsupported(operation)` | `Request(Unsupported { operation })` |
+| `UnsupportedFilter` | `Unsupported(operation)` | `Request(Unsupported { operation })` |
+| `TooManyChanges` | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
+| `Other` | `Protocol(Unknown)` | `Wire(Jmap(Unknown { code }))` — see note |
+
+For `Unsupported(operation)`, if `ctx.operation` is `None`, use
+`AccountOperation::Discover` only as a defensive fallback and add
+support-only diagnostic text explaining that operation context was
+missing. The audit should find no normal path that needs the fallback.
+
+`MethodErrorType::Other` today is a unit variant constructed via
+`#[serde(other)]`, which DISCARDS the wire-supplied type string. Do
+not synthesize a placeholder code (e.g. `"other"`) — that pollutes
+`AccountError::native_code()` and the telemetry view with a value the
+server never sent. Pick one of:
+
+1. Update `crates/jmap/src/core/error.rs` so `MethodErrorType::Other`
+   carries the captured string (use a custom `Deserialize` impl with
+   a typed-variants-first match and a final string fallback; serde's
+   `#[serde(other)]` does not capture the unknown value). Then map to
+   `Wire(Jmap(Unknown { code }))`.
+2. If (1) is rejected as out-of-scope, OMIT the `Wire(Jmap(_))` cause
+   for the `Other` row and let `Protocol(Unknown)` stand on its own
+   with `Wire(MalformedResponse)` if any provider text is available.
+
+Recommendation: (1). The change is local to `core/error.rs` and
+preserves diagnostic value; the alternative leaves a permanent gap in
+JMAP wire forensics.
+
+`Forbidden` and `AccountReadOnly` should use
+`AccessCause::PermissionDenied { resource }`, where `resource` is
+derived from `ctx.scope` when possible.
+
+`CannotCalculateChanges`, `AnchorNotFound`, and `TooManyChanges` need
+cursor scope for precise recovery. If `ctx.scope` is not an
+`ErrorScope::Cursor`, the central mapper will restart the account.
+That is acceptable only as a fallback; call sites in changes/query
+streams must pass cursor scope.
+
+`State(CapabilityChanged { delta })` rationale: the four
+`AccountNotFound` / `AccountNotSupportedByMethod` / `FromAccountNotFound`
+/ `FromAccountNotSupportedByMethod` rows and the `UnknownCapability`
+problem-type row all map to `SyncState(CapabilityChanged)` with
+`delta: CapabilityDelta::default()`. The JMAP crate does not compute
+a real delta — only the engine, comparing two `Capabilities` values
+across an `Account` reopen, can. Convergence §"Open decisions"
+flags `CapabilityChanged { delta }` as a candidate for removal if no
+producer ever computes a real delta. Until that decision lands in
+`bifrost-types`, JMAP populates `delta: default()` and the engine's
+`EngineDirective::CapabilityChanged { delta }` handler treats a
+default delta as "reopen and resync capabilities" (per sync.md). If
+Phase 1 later replaces `CapabilityChanged` with `RestartAccount`, the
+JMAP rows fall back to that variant by the same central mapping; no
+JMAP code change is required.
+
+## Problem-details mapping
+
+`Error::Problem { details, transport }` can come from an HTTP
+problem-details response or from a WebSocket `RequestError`.
+
+If `transport.net` is present, inspect the preserved net error
+directly:
+
+- `Status { code, headers, .. }`: copy status, request-id and trace
+  headers, and parse `Retry-After` if present.
+- `RateLimited { retry_after }`: copy the retry delay and set throttle
+  scope from JMAP context.
+- `RetryBudgetExhausted { last_status, retry_after_history }`: copy
+  the last status and the final retry-after duration when present.
+- Other net errors: keep the problem body as the semantic source and
+  add the net error text as support-only diagnostic text.
+
+Do not delegate the entire problem to net, because JMAP problem type
+is more precise than generic HTTP status.
+
+Always push `Cause::Attempt(Acknowledged)` for problem details that
+came from HTTP or WebSocket server response evidence.
+
+| ProblemType | status | AccountErrorKind | outer cause |
+|---|---|---|---|
+| `JMAP(Limit)` | any | `Server(RateLimited)` | `Server(RateLimited { retry_after: None })` |
+| `JMAP(UnknownCapability)` | any | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `JMAP(NotJSON)` | any | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `JMAP(NotRequest)` | any | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `Other(_)` | 400 or 422 | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `Other(_)` | 401 | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` |
+| `Other(_)` | 403 | `Authorization(PermissionDenied)` | `Access(PermissionDenied { resource })` |
+| `Other(_)` | 404 with resource scope | `NotFound(resource)` | `Request(NotFound { what, id })` |
+| `Other(_)` | 409 | `ConcurrencyConflict` | `State(ConcurrencyConflict)` |
+| `Other(_)` | 410 with cursor scope | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
+| `Other(_)` | 429 | `Server(RateLimited)` | `Server(RateLimited { retry_after })` |
+| `Other(_)` | 500..=599 | `Server(Unavailable)` | `Server(Unavailable { retry_after })` |
+| `Other(_)` | other | `Server(Error { status: Some(status) })` | `Server(Error { status })` |
+| `Other(_)` | none | `Protocol(Unknown)` | `Wire(Jmap(Unknown { code }))` |
+
+Attach `ProblemDetails::request_id()` with `.request_id(...)`.
+Attach `title`, `detail`, and `limit` as support-only
+`DiagnosticText`. The problem type itself is the JMAP wire cause:
+
+- `UnknownCapability` -> `JmapMethod::UnknownCapability`
+- `NotJSON` -> `JmapMethod::NotJson`
+- `NotRequest` -> `JmapMethod::NotRequest`
+- `Limit` -> `JmapMethod::Limit`
+- `Other(code)` -> `JmapMethod::Unknown { code }`
+
+For JMAP limit errors, set `ThrottleScope::Account`. Generic JMAP
+does not provide a more precise fleet-wide throttle domain.
+
+## Set-error mapping
+
+`SetError` is per-object evidence. Do not flatten it through
+`SetError::to_string_error()` and then through a generic
+`crate::Error::Set`.
+
+Add a helper:
+
+```rust
+pub(crate) fn set_error_to_account_error(
+    error: SetError<String>,
+    ctx: JmapErrorContext,
+    item_scope: Option<ErrorScope>,
+) -> AccountError;
+```
+
+If `item_scope` is present, prefer it over `ctx.scope` for not-found
+and permission resource classification.
+
+Push `Attempt(Acknowledged)` and `Wire(Jmap(Unknown { code }))` for
+the set-error string unless the orchestrator adds named `JmapMethod`
+variants for set errors.
+
+| SetErrorType | AccountErrorKind |
+|---|---|
+| `Forbidden`, `ForbiddenFrom`, `ForbiddenMailFrom`, `ForbiddenToSend` | `Authorization(PermissionDenied)` |
+| `OverQuota` | `Server(QuotaExhausted)` |
+| `RateLimit` | `Server(RateLimited)` |
+| `NotFound`, `BlobNotFound` | `NotFound(resource)` when item scope has a resource, otherwise `Server(Error { status: None })` |
+| `AlreadyExists` | `ConcurrencyConflict` |
+| `TooLarge`, `TooManyKeywords`, `TooManyMailboxes`, `TooManyRecipients` | `Request(Malformed)` |
+| `InvalidPatch`, `InvalidProperties`, `InvalidEmail`, `InvalidRecipients`, `NoRecipients`, `InvalidScript` | `Request(Malformed)` |
+| `WillDestroy`, `Singleton`, `ScriptIsActive`, `CannotUnsend`, `MailboxHasChild`, `MailboxHasEmail` | `Server(Error { status: None })` |
+| `Other` | `Protocol(Unknown)` |
+
+NotFound absorption policy:
+
+- Bulk flag, bulk move source missing, and bulk destroy per-item
+  `notFound` must become a success-lane `MutationSuccess::Skipped`
+  in the final streaming model.
+- Single-object hydrate/get paths surface `NotFound`.
+- Container delete failures such as `mailboxHasEmail` are not
+  absorbed.
+
+Phase 2 vs Phase 3 split for the bulk-streaming signature: JMAP's
+existing `MutationOutcome::Failed(Error::ConcurrencyConflict)` pattern
+must be replaced by `ItemOutcome<MutationSuccess>`. Phase 2 authors
+the per-item classification helper:
+
+```rust
+pub(crate) fn classify_set_item(
+    set_error: SetError<String>,
+    ctx: JmapErrorContext,
+    item_scope: Option<ErrorScope>,
+) -> ItemOutcome<MutationSuccess>;
+```
+
+which returns `Succeeded(BatchSuccess { item, output: Skipped })` for
+absorbed notFound and `Failed(BatchFailure { item, error })` for real
+failures. The Phase 2 commit wires this helper into existing
+mutation pipeline call sites that today produce
+`MutationOutcome::Failed`. The Phase 3 commit changes the `Account`
+trait signature itself; JMAP's helper does not move.
+
+This is in scope for Phase 2.2 (JMAP), not deferred to Phase 3.
+
+## Local JMAP errors
+
+Map non-wire crate errors without old `bifrost_types::Error`:
+
+| crate error | AccountErrorKind | outer cause |
+|---|---|---|
+| `RequestEncode` | `Request(Malformed)` | `Request(Malformed { detail })` |
+| `ResponseDecode` | `Protocol(ParseFailed)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
+| `CallNotFound` | `Protocol(MissingField)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
+| `IdNotFound` with item scope | `NotFound(resource)` | `Request(NotFound { what, id })` |
+| `IdNotFound` without item scope | `Protocol(MissingField)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
+| `NotParsable` | `Protocol(ParseFailed)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
+| `InvalidUrl` before request dispatch | `Request(Malformed)` | `Request(InvalidArgument { field: Some("url") })` |
+| `InvalidUrl` for URL templates from session | `Protocol(ContractViolation)` | `Wire(MalformedResponse { protocol: Jmap, detail })` |
+| `NoPrimaryAccount` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `WebSocketClosed` after established session | `Transport(Network)` | `Transport(Network)` + `Attempt(Acknowledged)` |
+| `WebSocketClosed` during handshake | `Transport(Network)` | `Transport(Network)` + `Attempt(Unsent)` |
+| `WebSocketNotConnected` | `Unsupported(PushSubscribe)` or `Unsupported(PushUnsubscribe)` | `Request(Unsupported { operation })` |
+| `WebSocketSetup(Tls)` | `Transport(Tls)` | `Transport(Tls)` + `Attempt(Unsent)` |
+| `WebSocketSetup(InvalidHeader)` | `Request(Malformed)` | `Request(InvalidArgument { field: Some("authorization") })` |
+| `WebSocketSetup(Subprotocol)` | `SyncState(CapabilityChanged)` | `State(CapabilityChanged { delta: default })` |
+| `WebSocket(_)` mid-message after handshake completed | `Transport(Network)` | `Transport(Network)` + `Attempt(Acknowledged)` |
+| `WebSocket(_)` before handshake completed | `Transport(Network)` | `Transport(Network)` + `Attempt(Unsent)` |
+
+WebSocket lifecycle rule: the handshake completes when the server's
+`101 Switching Protocols` response is received. Any disconnect AFTER
+that point has bytes acknowledged by the server (the upgrade itself
+is the acknowledgement); classify as `Acknowledged`. Any disconnect
+BEFORE that point (TCP refused, TLS handshake failure, HTTP upgrade
+rejected) classifies as `Unsent`. The previous blanket `InFlight`
+classification was wrong: `InFlight` means "bytes crossed the
+boundary but no terminal acknowledgement arrived," but a successful
+WebSocket upgrade IS a terminal acknowledgement — every subsequent
+disconnect is on a session the server already acknowledged.
+
+For `InvalidUrl`, prefer adding distinct variants or constructors so
+the conversion can tell local caller-built URL failures from provider
+session URL-template failures. If the implementation keeps one
+variant, map to `Protocol(ContractViolation)` only when the failing
+path parsed a URL template received from the session object.
+
+## Account-operation context
+
+Every `map_err(super::error::to_account_error)` site must become
+`map_err(|err| super::error::into_account_error(err, ctx))` with a
+real operation. Use this table:
+
+| module / function | AccountOperation | scope |
+|---|---|---|
+| factory connect/session/primary accounts | `Discover` | `Account` |
+| factory initial state probes | `EstablishCursor` | cursor scope being seeded |
+| `discover::memberships` | `DiscoverMemberships` | `Account` |
+| `discover::scope_lifecycle` | `ScopeLifecycle` | `Cursor(Mailbox)` where possible |
+| inventory email/mailbox/thread/query | `SyncInventory` | `Cursor(scope)` |
+| inventory partition page | `SyncInventory` | `Cursor(scope)` |
+| changes email/mailbox/thread/query | `SyncChanges` | `Cursor(scope)` |
+| hydrate stream | `Hydrate` | message scope when an id is known |
+| blob open | `OpenBlob` | `Message` only if handle has message context, otherwise `Account` |
+| blob range unsupported/local range | `OpenBlobRange` | `Account` |
+| push subscribe | `PushSubscribe` | `Cursor(scope)` when one scope, otherwise `Account` |
+| push unsubscribe | `PushUnsubscribe` | `Account` |
+| close/disabling push | `Close` | `Account` |
+| bulk flags | `UpdateFlags` | per item `Message` for item errors, otherwise `Account` |
+| bulk move | `BulkMove` | per item `Message` for item errors, otherwise destination mailbox |
+| bulk destroy | `BulkDestroy` | per item `Message` |
+| add/remove container | `AddToContainer` / `RemoveFromContainer` | target message or thread |
+| set keyword | `SetKeyword` | target message or thread |
+| set read state | `SetIsRead` | target message or thread |
+| send message | `Send` | `Account` |
+| attachment upload | `AttachmentUpload` | `Account` |
+| draft create/update/discard/send | matching draft operation | `Account` |
+| search/search_messages | `Search` / `SearchMessages` | `Account` |
+| containers list/create/rename/move/delete | matching container operation | mailbox scope when id known |
+| identities list/update | `IdentitiesList` / `IdentityUpdate` | `Account` |
+| vacation get/set | `VacationGet` / `VacationSet` | `Account` |
+| quota get | `QuotaGet` | `Account` |
+| thread/message hydrate | `HydrateThread` / `HydrateMessage` | thread or message scope |
+| move_thread/delete_thread | `BulkMove` / `BulkDestroy` | thread scope |
+
+Unsupported convenience methods in `account.rs` must construct
+`AccountErrorKind::Unsupported(operation)` through the builder rather
+than returning the removed old `Error::Unsupported`.
+
+## Stream termination helpers
+
+Replace fatal helpers with AccountError helpers:
+
+- `unsupported_error(operation, scope, message) -> AccountError`
+- `local_cursor_error(err, scope, operation) -> AccountError`
+- `terminated_from_jmap(err, ctx) -> SyncEvent<T>` or the temporary
+  Phase 2 equivalent agreed with the orchestrator.
+
+Do not construct `RecoveryClass` in JMAP. The only recovery-related
+code that may remain is predicate logic such as
+`is_state_mismatch(&crate::Error)`.
+
+When Phase 3 renames stream termination, each helper should collapse
+to:
+
+```rust
+SyncEvent::Terminated(account_error)
+```
+
+### WebSocket push reader task
+
+`crates/jmap/src/client_ws.rs` runs a reader task that emits events
+on a broadcast channel rather than at a method call site. Errors
+inside that loop (decode failure, server-initiated close after
+session establishment, ping timeout) terminate the push stream, not
+a method call. Phase 2 wires them as follows:
+
+- The reader's error path constructs an `AccountError` via the
+  `JmapErrorContext` with `operation = PushStream`, `scope = Account`,
+  using the tables above.
+- The reader emits the error onto the push stream as the Phase 2
+  temporary equivalent of `SyncEvent::Terminated(AccountError)` (the
+  exact wrapper type is the same one Phase 2.3 sync renames in
+  Phase 3; JMAP's reader uses the local stand-in that Phase 3 will
+  rewrite to `SyncEvent::Terminated`).
+- After the error event, the reader task exits. Engine receives the
+  terminated event and decides whether to call `push_subscribe`
+  again — JMAP does not retry inside the reader.
+
+Disconnect-during-handshake errors (before the `101 Switching
+Protocols` response) emit on the `push_subscribe()` call return path,
+not on the broadcast channel — the subscribe future has not yet
+yielded a stream when handshake fails.
 
 ## Tests
 
-Per project rules. ~15-20 tests:
+Add small unit tests under `sync/error.rs` or a focused sync test
+module. Construct synthetic `crate::Error` values directly. No live
+JMAP server and no mock server.
 
-- One test per documented JMAP method-error code: input the
-  error response, assert the produced `AccountError` has the
-  expected kind + recovery + message_key.
-- WebSocket close-frame classification.
-- `stateMismatch` produces `Retry(AfterStateRefresh)`.
-- `serverPartialFail` produces `Reconcile(PartialCompletionSignal)`.
+Cover at least:
 
-No live JMAP server.
+- `state_mismatch_maps_to_concurrency_conflict`
+  - kind `ConcurrencyConflict`
+  - recovery retry disposition `AfterStateRefresh`
+  - wire cause `Jmap(StateMismatch)`.
+- `cannot_calculate_changes_restarts_scope`
+  - context cursor scope
+  - kind `SyncState(CursorInvalid)`
+  - recovery requires engine action.
+- `cannot_calculate_changes_without_scope_restarts_account`
+  - same error without cursor scope
+  - recovery requires engine action.
+- `server_partial_fail_reconciles_for_send`
+  - operation `Send`
+  - kind `Protocol(PartialResponse)`
+  - recovery requires reconciliation.
+- `server_partial_fail_retries_for_idempotent_update`
+  - operation `UpdateFlags`
+  - recovery is retryable.
+- `forbidden_maps_to_no_permission`
+  - kind `Authorization(PermissionDenied)`
+  - recovery terminal `NoPermission`.
+- `unknown_method_maps_to_unsupported_operation`
+  - kind `Unsupported(operation)`.
+- `jmap_limit_problem_maps_rate_limited`
+  - kind `Server(RateLimited)`
+  - throttle scope `Account`.
+- `problem_status_401_maps_auth_lost`
+  - status 401
+  - kind `Authentication(ReauthorizationRequired)`.
+- `problem_not_json_maps_request_malformed`
+  - JMAP notJSON
+  - kind `Request(Malformed)`.
+- `net_transport_delegates_with_context`
+  - synthetic preserved net `Network { InFlight }`
+  - operation `Send`
+  - recovery requires reconciliation.
+- `response_decode_maps_protocol_parse_failed`
+  - kind `Protocol(ParseFailed)`.
+- `set_not_found_with_message_scope_maps_not_found`
+  - kind `NotFound(Message)`.
+- `set_rate_limit_maps_rate_limited`
+  - kind `Server(RateLimited)`.
+- `websocket_subprotocol_maps_capability_changed`
+  - kind `SyncState(CapabilityChanged)`.
+
+Do not run these tests in Phase 2. They execute after Phase 3 restores
+workspace compilation.
 
 ## Exit criteria
 
-- Every JMAP method-error code has a defined `AccountErrorKind`
-  classification.
-- `into_account_error` exists and routes all internal jmap errors
-  through `AccountErrorBuilder`.
-- WebSocket push emits structured `AccountError` on disconnect with
-  the appropriate `TransmissionState`.
-- Mutation pipeline consumes new `RecoveryClass` helpers.
-- Old recovery helpers removed.
-- Patches against this crate match this plan's exit criteria.
-  Compilation and per-crate tests are not run at this phase;
-  Phase 3 (workspace integration) is where `brokkr check` runs
-  and tests execute.
+- `JmapErrorContext` and `into_account_error` exist.
+- Every `crate::Error` variant is mapped to `AccountError`.
+- Every `MethodErrorType` variant is mapped.
+- Every `JMAPError` problem type is mapped.
+- Every `SetErrorType` variant is mapped or explicitly routed through
+  `Protocol(Unknown)`.
+- The default reqwest transport preserves `bifrost_net::Error` so
+  pure transport failures delegate to `bifrost_net::into_account_error`.
+- JMAP method errors and problem details push `Attempt(Acknowledged)`.
+- No JMAP code constructs `RecoveryClass`, `RetryAdvice`, or old
+  `Fatal` structs directly.
+- `to_recovery`, `to_account_error`, and old fatal helper logic are
+  gone.
+- Unsupported operations use `AccountErrorBuilder` with
+  `AccountErrorKind::Unsupported(operation)`.
+- Operation and scope context is attached at conversion call sites.
+- Response decode, request encode, and URL-template failures are not
+  collapsed into one generic parse bucket.
+- Every kind/cause pair produced by `into_account_error` satisfies
+  `recovery::kind_matches_cause`.
+- WebSocket reader-task errors emit through the same per-context
+  `into_account_error` path as call-site errors, with the correct
+  handshake-vs-post-handshake `AttemptCause` distinction.
+- `classify_set_item` returns `ItemOutcome<MutationSuccess>` and is
+  wired into every existing `MutationOutcome::Failed(...)` call site.
+- Synthetic classification tests are authored.
+- No `brokkr`, `cargo`, or `./diff_test.sh` command is run by the
+  crate agent for this phase.
 
-## Discovery items for the agent
+## Audit checklist
 
-`<TODO>`:
+Domain-specific verification:
 
-1. Current internal `jmap::Error` shape and where it's defined.
-2. The exact method-error vocabulary used by the parser.
-3. Where the WebSocket push handler lives and how it currently
-   surfaces disconnects.
-4. Whether the mutation pipeline currently has its own
-   `RecoveryClass`-shaped reasoning (it does, per the convergence
-   plan's mention of `recovery_for_*` helpers).
-5. The set of `JmapMethod` variants that `WireCause::Jmap` will need
-   to wrap.
+- Inspect `sync/error.rs` and confirm all classification tables above
+  are represented.
+- Inspect `transport_reqwest.rs` and confirm net error evidence is not
+  discarded.
+- Inspect `core/request.rs` and `client.rs` and confirm encode and
+  decode failures are distinct.
+- Inspect set-error handling and confirm per-item set failures do not
+  pass through a string-only error path.
+
+Cross-cutting reconciliation:
+
+- Confirm every builder path calls `.protocol(Protocol::Jmap)`.
+- Confirm operation context is attached before `.build()`.
+- Confirm cursor error paths pass `ErrorScope::Cursor`.
+- Confirm no `RecoveryClass` construction remains in JMAP.
+- Confirm no edits outside `crates/jmap/`.
+
+Editorial normalization:
+
+- Do not update `reference/jmap.md` until the implementation is real.
+- Keep this plan focused on current gaps. Remove resolved audit notes
+  instead of preserving history.

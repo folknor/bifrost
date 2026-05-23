@@ -1066,13 +1066,19 @@ pub enum ServerCause {
 #[derive(Clone, Debug)]
 pub enum StateCause {
     CursorInvalid,
+    StrategyFailure { downgrade: StrategyDowngrade },
+    ScopeCapabilityLost,
+    SchemaIncompatible,
     CapabilityChanged { delta: CapabilityDelta },
+    OperatorOverrideNeeded { reason: String },
     ConcurrencyConflict,
 }
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum RequestCause {
+    Malformed { detail: DiagnosticText },
+    BatchInputInvalid { items: Vec<BatchInputInvalidItem> },
     Unsupported { operation: AccountOperation },
     InvalidArgument { field: Option<&'static str>, message: Option<DiagnosticText> },
     NotFound { what: ResourceKind, id: Option<String> },
@@ -1081,22 +1087,46 @@ pub enum RequestCause {
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum WireCause {
-    JmapMethod { kind: JmapMethodErrorKind },
-    ImapNo { code: Option<ImapResponseCode>, text: Option<DiagnosticText> },
-    GraphSignal { kind: GraphErrorSignal },
-    SmtpReply { code: u16, enhanced: Option<EnhancedStatusCode>, text: Option<DiagnosticText> },
+    Graph(GraphSignal),
+    Jmap(JmapMethod),
+    Imap(ImapResponseCode),
+    Smtp(EnhancedStatusCode),
+    Gmail(GmailSignal),
     MalformedResponse { protocol: Protocol, detail: Option<DiagnosticText> },
 }
 ```
+
+`StateCause` covers every `SyncStateErrorKind` so the central recovery
+mapping can read the engine directive payload (strategy downgrade,
+operator reason, capability delta) directly off the chain. `RequestCause`
+folds the local-validation variants (`Malformed`, `BatchInputInvalid`)
+into the same enum as the request-shape variants (`Unsupported`,
+`InvalidArgument`, `NotFound`).
+
+`WireCause` uses tuple variants over the provider-native enums rather
+than named struct fields; SMTP wire text lives inside `EnhancedStatusCode`
+itself, and IMAP wire text lives inside the `ImapResponseCode::Unknown`
+variant. Both as `DiagnosticText`, so the visibility discipline survives.
 
 Provider-native enums must include typed unknown variants instead of a
 catch-all public `Other`:
 
 ```rust
-pub enum GraphErrorSignal {
+pub enum GraphSignal {
     Gone,
     InvalidAuthenticationToken,
-    ErrorAccessDenied,
+    AccessDenied,
+    Forbidden,
+    AccessRestricted,
+    ConditionalAccessBlocked,
+    AdminConsentRequired,
+    MailboxNotEnabledForRestApi,
+    MailboxStoreUnavailable,
+    ResyncRequired,
+    TooManyRequests,
+    GenericFileError,
+    PreconditionFailed,
+    NotFound,
     Unknown { code: String },
 }
 ```
@@ -1172,7 +1202,7 @@ Graph 410 on a delta token:
 - derived `recovery`: `Engine(RestartScope(scope))`
 - derived `message_key`: `"syncstate.cursor-invalid"`
 - `chain[0]`: `State(CursorInvalid)`
-- `chain[1]`: `Wire(GraphSignal { kind: Gone })`
+- `chain[1]`: `Wire(Graph(GraphSignal::Gone))`
 - `chain[2]`: `Server(Error { status: 410 })`
 
 JMAP `stateMismatch` during a flag update:
@@ -1183,7 +1213,7 @@ JMAP `stateMismatch` during a flag update:
   min_delay: None, reason: ConcurrencyConflict, .. }`
 - derived `message_key`: `"concurrency.conflict"`
 - `chain[0]`: `State(ConcurrencyConflict)`
-- `chain[1]`: `Wire(JmapMethod { kind: StateMismatch })`
+- `chain[1]`: `Wire(Jmap(JmapMethod::StateMismatch))`
 
 Network drop mid-stream during `Send`:
 
