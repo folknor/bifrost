@@ -18,6 +18,30 @@ consumer surface. The contract:
   reconciliation get a separate top-level `Reconcile(ReconcileAdvice)`
   variant. There is no `DoNotRetry` disposition — the previous
   contradictory shape (`Retry { DoNotRetry }`) is gone.
+- Engine-control directives (`RestartScope`, `RestartAccount`,
+  `DowngradeStrategy`, `DowngradeCapabilityForScope`,
+  `SchemaIncompatible`, `CapabilityChanged`, `OperatorOverrideRequired`)
+  live in a nested `EngineDirective` enum under
+  `RecoveryClass::Engine(...)`. They share the carrier with errors
+  but are categorized as "engine takes a directed action," not as
+  retry, reconcile, or terminal. Four mutually exclusive helpers:
+  `is_retryable`, `requires_reconciliation`, `requires_engine_action`,
+  `is_terminal`.
+- Streaming bulk operations return per-item
+  `ItemOutcome<T>` envelopes with the same three lanes as Vec-batch.
+  Streaming invariants are explicit: every pulled item produces
+  exactly one outcome, locally-invalid items emit `Failed` rather
+  than poisoning the stream, early termination via
+  `SyncEvent::Terminated(AccountError)` covers only already-pulled
+  items.
+- `MutationSuccess::{Applied, Skipped}` folds the read-back guard's
+  "already-in-state" outcome into success; no fourth batch lane.
+- `Warning` is explicitly outside the error model but shares the
+  `DiagnosticText` visibility discipline.
+- `SyncEvent::Fatal(Fatal)` renamed to
+  `SyncEvent::Terminated(AccountError)`. The new-model `Fatal` is a
+  separate newtype from `bifrost-types::recovery` that collapses
+  terminal `RecoveryClass` values at the engine boundary.
 - `TransmissionState` (`Unsent` / `InFlight` / `Acknowledged`) lives
   on `TransportCause` and drives `Reconcile` classification for
   non-idempotent operations whose request was in flight when the
@@ -279,8 +303,7 @@ constructs a `RecoveryClass` value. Protocol-specific `to_recovery`,
 pub enum RecoveryClass {
     Retry(RetryAdvice),
     Reconcile(ReconcileAdvice),
-    RestartScope(CursorScope),
-    RestartAccount,
+    Engine(EngineDirective),
     AuthLost,
     NeedsAdminConsent { needed: &'static str },
     NeedsPolicyChange,
@@ -290,6 +313,38 @@ pub enum RecoveryClass {
     ProviderContractViolation,
     ProviderRefused,
     UnknownPermanent,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EngineDirective {
+    /// Restart this one scope from scratch (UIDVALIDITY change,
+    /// modseq reset, delta-token rejected).
+    RestartScope(CursorScope),
+
+    /// Restart the entire account (Gmail stale historyId beyond
+    /// recovery, opaque global state loss).
+    RestartAccount,
+
+    /// Downgrade the cursor strategy and restart the scope
+    /// (QRESYNC -> CONDSTORE, CONDSTORE -> Basic).
+    DowngradeStrategy(StrategyDowngrade),
+
+    /// Drop a capability for a specific scope and replay (Gmail
+    /// folder reports modseq=0 on subsequent open).
+    DowngradeCapabilityForScope(CursorScope),
+
+    /// Cursor envelope older than the engine can migrate; clear
+    /// cursor state and re-establish from inventory.
+    SchemaIncompatible,
+
+    /// Account capabilities changed mid-session. Reopen the account
+    /// and restart streams.
+    CapabilityChanged { delta: CapabilityDelta },
+
+    /// Persistent strategy failure pattern; consumer should consider
+    /// a runtime configuration override.
+    OperatorOverrideRequired { reason: String },
 }
 
 #[non_exhaustive]
@@ -377,16 +432,20 @@ pub enum ThrottleScope {
 }
 
 impl RecoveryClass {
-    /// True for `Retry`, `RestartScope`, `RestartAccount`. The
-    /// engine may proceed automatically.
+    /// True for `Retry` only. Engine resends the same operation per
+    /// `RetryAdvice`.
     pub fn is_retryable(&self) -> bool;
 
-    /// True for `Reconcile` only. The caller must probe state
-    /// before deciding what to do next.
+    /// True for `Reconcile` only. Caller probes state before
+    /// deciding what to do next.
     pub fn requires_reconciliation(&self) -> bool;
 
+    /// True for `Engine` only. Engine takes the directed action
+    /// (restart, downgrade, schema clear, etc.).
+    pub fn requires_engine_action(&self) -> bool;
+
     /// True for every other variant. No further automatic action.
-    /// The three helpers are mutually exclusive and exhaustive.
+    /// The four helpers are mutually exclusive and exhaustive.
     pub fn is_terminal(&self) -> bool;
 }
 ```
@@ -403,10 +462,25 @@ machinery, modulo the rest of `RetryAdvice`.
 go check before deciding what to do next." It is not retry. A consumer
 seeing `Reconcile(advice)` must perform the indicated reconciliation
 (probe inventory, check Sent, dedupe by `BatchItemId` /
-client-message-id) before either retrying or surfacing failure. The
-`is_terminal()` and `requires_reconciliation()` helpers let consumer
-code branch on the high-level outcome without enumerating every
-variant.
+client-message-id) before either retrying or surfacing failure.
+
+`Engine(EngineDirective)` carries instructions to the sync engine
+that are neither retry nor reconcile: restart this scope, restart
+the account, downgrade the strategy, drop a per-scope capability,
+clear cursor state, react to a capability delta, escalate to
+operator override. These are engine-control flow, not error recovery
+per se, but they share a carrier because they arrive through the
+same `Result` and `SyncEvent::Terminated` channels and the engine
+needs a single dispatch surface for "what happens next." Future-
+returning methods (`establish_initial_cursor`, `push_subscribe`)
+emit them through the same `RecoveryClass` field they emit auth
+losses through; nothing about engine directives requires a streaming
+context.
+
+The four helpers (`is_retryable`, `requires_reconciliation`,
+`requires_engine_action`, `is_terminal`) are mutually exclusive
+and exhaustive. Consumer code can branch on the high-level outcome
+without enumerating every variant.
 
 `Retry` is a hint, not a schedule. The library surfaces `min_delay`
 as a floor and `not_before` as a provider-supplied wall-clock hint
@@ -460,9 +534,13 @@ distinct product meaning. Consumers route them to different surfaces:
 - `UnknownPermanent` → classification gap. Treated as a library bug;
   surfaces in telemetry so the gap can be closed in a later release.
 
-`RecoveryClass::is_terminal()` returns true for everything except
-`Retry`, `RestartScope`, and `RestartAccount`. `Fatal` collapses any
-terminal disposition at the engine boundary:
+`RecoveryClass::is_terminal()` returns true for the terminal
+variants only — `AuthLost`, `NeedsAdminConsent`, `NeedsPolicyChange`,
+`NoPermission`, `Unsupported`, `ClientBug`, `ProviderContractViolation`,
+`ProviderRefused`, `UnknownPermanent`. `Retry`, `Reconcile`, and
+`Engine` are not terminal because each implies a defined next step
+(retry, reconcile, engine action). `Fatal` collapses any terminal
+disposition at the engine boundary:
 
 ```rust
 pub struct Fatal(pub AccountError);
@@ -505,8 +583,13 @@ classification purposes.
 | `Server(Error { status: 5xx })`, `tx_state: InFlight`, `!op.idem` | `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }` |
 | `Server(Error { status: 4xx })` (unclassified) | `ProviderRefused` |
 | `Server(Error { status: other permanent })` | `ProviderRefused` |
-| `SyncState(CursorInvalid)` with `scope` | `RestartScope(scope)` |
-| `SyncState(CursorInvalid)` without `scope` | `RestartAccount` |
+| `SyncState(CursorInvalid)` with `scope` | `Engine(RestartScope(scope))` |
+| `SyncState(CursorInvalid)` without `scope` | `Engine(RestartAccount)` |
+| `SyncState(StrategyFailure)` | `Engine(DowngradeStrategy(downgrade))` |
+| `SyncState(ScopeCapabilityLost)` | `Engine(DowngradeCapabilityForScope(scope))` |
+| `SyncState(SchemaIncompatible)` | `Engine(SchemaIncompatible)` |
+| `SyncState(CapabilityDelta { delta })` | `Engine(CapabilityChanged { delta })` |
+| `SyncState(OperatorOverrideNeeded { reason })` | `Engine(OperatorOverrideRequired { reason })` |
 | `ConcurrencyConflict` | `Retry { disposition: AfterStateRefresh, min_delay: None, reason: ConcurrencyConflict, .. }` |
 | `Request(Malformed)` | `ClientBug` |
 | `Request(BatchInputInvalid)` | `ClientBug` |
@@ -1019,7 +1102,7 @@ Graph 410 on a delta token:
 
 - `kind`: `SyncState(CursorInvalid)`
 - `scope`: `ErrorScope::Cursor(scope)`
-- derived `recovery`: `RestartScope(scope)`
+- derived `recovery`: `Engine(RestartScope(scope))`
 - derived `message_key`: `"syncstate.cursor-invalid"`
 - `chain[0]`: `State(CursorInvalid)`
 - `chain[1]`: `Wire(GraphSignal { kind: Gone })`
@@ -1109,7 +1192,7 @@ Enforced by `AccountErrorBuilder::build`, not by code review:
   genuinely unclassified provider responses. Otherwise it must be
   paired with a higher-level cause.
 - `CursorInvalid` should carry `ErrorScope::Cursor`; missing cursor
-  scope falls back to `RestartAccount`.
+  scope falls back to `Engine(RestartAccount)`.
 - Free-form text must use `DiagnosticText`. Sensitive material is
   redacted at the producer; the redacted placeholder is tagged
   `SupportOnly`.
@@ -1132,6 +1215,163 @@ Token source failures still map into `AccountError`:
   `AuthLost`.
 - admin or tenant policy failures map to `AccessCause`, not generic auth
   loss.
+
+## Streaming results
+
+Bulk operations (`bulk_set_flags`, `bulk_move`, `bulk_destroy`,
+inventory streams, change streams) take streaming input and emit
+streaming output. The streaming primitive is load-bearing: it is how
+the engine backpressures arbitrarily-large mutation passes without
+buffering the entire result in memory. Vec-based `BatchOutcome` and
+its Vec-batch invariants apply to genuinely-blocking batch
+operations (multi-recipient SMTP send, JMAP `Email/set` batch that
+resolves in one wire roundtrip); they do not apply to streaming
+operations.
+
+Streaming bulk operations return per-item outcomes wrapped in
+`SyncEvent` envelopes:
+
+```rust
+pub enum ItemOutcome<T> {
+    Succeeded(BatchSuccess<T>),
+    Failed(BatchFailure),
+    Uncertain(BatchUncertain),
+}
+```
+
+Bulk methods return `AccountStream<SyncEvent<ItemOutcome<T>>>`, or
+the existing `SyncEvent::Batch<ItemOutcome<T>>` envelope where the
+protocol crate groups outcomes by wire-level chunk. `BatchSuccess`,
+`BatchFailure`, and `BatchUncertain` are the same types Vec-batch
+uses; each carries `BatchItemId`. There is no fourth lane.
+
+`MutationSuccess` is the success payload for streaming bulk mutation:
+
+```rust
+#[non_exhaustive]
+pub enum MutationSuccess {
+    /// Server applied the mutation.
+    Applied,
+    /// Read-back guard determined the target was already in the
+    /// requested state; no write was attempted.
+    Skipped,
+}
+```
+
+`Skipped` is a successful final state from the caller's perspective.
+Folding it into `Succeeded` rather than a fourth lane keeps the
+lane model uniform — the lanes describe how the item left the
+side-effect boundary, not whether the server wrote bytes.
+
+### Streaming invariants
+
+Streaming bulk operations uphold four invariants:
+
+1. **Every item pulled from the input stream produces exactly one
+   `ItemOutcome<T>`.** No item that the library accepted is silently
+   dropped. Classification by where it failed:
+   - locally invalid before any wire attempt →
+     `Failed(BatchFailure { item, error: Request(BatchInputInvalid) })`,
+   - transmitted and rejected → `Failed(...)` with the wire error,
+   - transmitted and committed (or no-op via the read-back guard) →
+     `Succeeded(BatchSuccess { item, output: MutationSuccess::Applied | Skipped })`,
+   - transmitted with unknown final state → `Uncertain(...)`.
+2. **Locally invalid items do not poison the stream.** The output
+   stream continues past locally-invalid items with subsequent items
+   from the input. Vec-batch can preflight the whole input before
+   transmission and abort with outer `Err(BatchInputInvalid)`;
+   streaming cannot know the full input upfront without destroying
+   the streaming contract, so per-item local validation failures
+   belong in the item outcome lane.
+3. **Early termination covers only already-pulled items.** If the
+   output stream ends with `SyncEvent::Terminated(AccountError)`
+   before draining the input, only items already pulled from the
+   input stream are covered by the exact-once outcome guarantee.
+   Items not yet pulled remain unattempted. The consumer can detect
+   "what was attempted" by comparing pulled count to outcome count.
+4. **Stream-level errors that prevent any further attempts surface
+   as `SyncEvent::Terminated(AccountError)`.** They do not appear in
+   any per-item outcome lane. Per-item lanes are reserved for items
+   the library actually pulled from the input.
+
+### How streaming and Vec-batch differ
+
+| Concern | Vec-batch | Streaming-batch |
+|---|---|---|
+| Input shape | `Vec<BatchItem<I>>` | `AccountStream<I>` |
+| Output shape | `Result<BatchOutcome<T>, AccountError>` | `AccountStream<SyncEvent<ItemOutcome<T>>>` |
+| Preflight invalidity | Outer `Err(BatchInputInvalid)` aborts whole batch | Per-item `Failed(BatchInputInvalid)`; stream continues |
+| Backpressure | None; whole input buffered | Engine backpressures the input stream |
+| Use case | Multi-recipient send, single-roundtrip batch | Bulk flag/move/destroy over arbitrary target sets |
+
+The shape difference is deliberate. Streaming preserves the engine's
+ability to drive multi-million-item mutation passes; Vec-batch
+preserves the all-or-nothing preflight discipline for operations that
+the consumer expects to validate atomically.
+
+## Warnings
+
+Warnings are observability events that flow alongside the data
+stream. They are **not** part of the error model:
+
+- Warnings do not flow through `AccountError`.
+- Warnings do not carry `RecoveryClass`.
+- Warnings do not abort streams. They are advisory; the stream
+  continues normally.
+
+Examples: protocol strategy downgrades (QRESYNC → CONDSTORE),
+throttling notifications, read-back skip counts, clock-skew
+detection, blob-type fallback notices.
+
+```rust
+#[non_exhaustive]
+pub struct Warning {
+    pub kind: WarningKind,
+    pub message: DiagnosticText,
+    pub next_action: Option<DiagnosticText>,
+    pub protocol_detail: Option<DiagnosticText>,
+    pub retry_count: u32,
+}
+```
+
+Warnings share the `DiagnosticText` visibility discipline used by
+`AccountError`. The free-text fields are `DiagnosticText`, not raw
+`String`, so the same `UserSafe` / `SupportOnly` tagging applies.
+Without this discipline, warnings would become the leak path for
+raw provider strings into UI, logs, and telemetry — defeating the
+visibility model `AccountError` enforces. Producers tag warning
+text the same way they tag diagnostic text.
+
+`WarningKind` enumerates the named warning categories
+(`StrategyDowngraded`, `OperatorAttentionNeeded`, `Throttled`,
+`ClockSkew`, `BlobNotByteStream`, `ReadbackSkipped`, etc.) and is
+the stable surface for analytics; consumers do not match on the
+diagnostic text.
+
+## Stream termination
+
+`SyncEvent::Fatal(Fatal { recovery, message, source })` is renamed
+to `SyncEvent::Terminated(AccountError)`. The old name conflicted
+with `Fatal(AccountError)` from `bifrost-types::recovery`, which has
+a different meaning (engine-boundary collapse of any terminal
+`RecoveryClass`). The two concepts:
+
+- `SyncEvent::Terminated(AccountError)` — this stream ends here.
+  The carried `AccountError` describes why. Engine reads
+  `error.recovery()` to decide what to do next: retry the stream
+  (`Retry`), reconcile (`Reconcile`), follow an `EngineDirective`,
+  or stop (terminal variants).
+- `Fatal(AccountError)` — newtype from
+  `bifrost-types::recovery::Fatal` that collapses any
+  `AccountError` whose `RecoveryClass` is terminal. The engine
+  uses `Fatal::try_from(&error)` at boundaries where it specifically
+  needs the terminal-only subset (operator notification queues,
+  permanent-failure dashboards). Construction fails for non-terminal
+  errors; this is the type-system guarantee that
+  "the engine has nothing more to try."
+
+Stream termination is the event; `Fatal` is the boundary check.
+Conflating them under one name in the previous design was a bug.
 
 ## NotFound semantics
 
@@ -1353,9 +1593,10 @@ flatten exactly the information the consumer needs. The only
 acceptable signature for a multi-target `Account` method is
 `Result<BatchOutcome<T>, AccountError>`.
 
-`BatchOutcome` is `#[non_exhaustive]` so additional lanes can be
-added without a breaking change; the three lanes here are the floor,
-not the ceiling.
+`BatchOutcome` is `#[non_exhaustive]` to admit future *batch-level
+metadata* (timing, batch id echo, totals); the three outcome lanes
+are final. Adding a fourth lane is a major-version breaking change,
+not a smooth extension.
 
 ## What this deliberately does not do
 
@@ -1376,12 +1617,12 @@ not the ceiling.
 
 ## Open decisions
 
-`RecoveryClass::CapabilityChanged { delta: CapabilityDelta }` currently
-has no known useful producers if every site passes
-`CapabilityDelta::default()`. Recommendation: remove it from recovery
-and keep `StateCause::CapabilityChanged { delta }` only if producers
-compute a real delta. Otherwise, map capability shifts to
-`RestartAccount`.
+`EngineDirective::CapabilityChanged { delta: CapabilityDelta }`
+currently has no known useful producers if every site passes
+`CapabilityDelta::default()`. Recommendation: remove it from the
+directive enum and keep `StateCause::CapabilityChanged { delta }`
+only if producers compute a real delta. Otherwise, map capability
+shifts to `EngineDirective::RestartAccount`.
 
 The exact `AccountOperation`, `ErrorScope`, `ResourceKind`, `Provider`,
 and `Protocol` variant lists should be aligned with the final shared
@@ -1424,6 +1665,13 @@ Exit:
   `ProviderContractViolation`, `ProviderRefused`, and
   `UnknownPermanent` terminal cases. `Fatal` collapses these at the
   engine boundary via `TryFrom`.
+- Engine-control directives (`RestartScope`, `RestartAccount`,
+  `DowngradeStrategy`, `DowngradeCapabilityForScope`,
+  `SchemaIncompatible`, `CapabilityChanged`, `OperatorOverrideRequired`)
+  live in `EngineDirective` under `RecoveryClass::Engine(...)`.
+- `RecoveryClass` exposes four mutually exclusive helpers:
+  `is_retryable`, `requires_reconciliation`, `requires_engine_action`,
+  `is_terminal`.
 - `RetryAdvice` carries only safe-retry dispositions: `SameRequest`,
   `AfterStateRefresh`, `AfterAuthRefresh`. Cases that previously
   produced `Retry { DoNotRetry }` reclassify to terminal variants;
@@ -1461,12 +1709,26 @@ Exit:
 - Protocol-specific recovery and fatal constructors are gone.
 - All factories take `Arc<dyn TokenSource>` at construction;
   per-factory `set_access_token` is gone.
-- Multi-target `Account` methods return
+- Multi-target Vec-batch `Account` methods return
   `Result<BatchOutcome<T>, AccountError>`. `Err` is reserved for
   non-transmitted batches; `Ok(BatchOutcome)` accounts for every
   submitted item exactly once across `succeeded`, `failed`, and
   `uncertain`. `BatchItemId` is caller-correlated. Collapsing
   per-item outcomes into a single `AccountError` is forbidden.
+- Streaming bulk `Account` methods return
+  `AccountStream<SyncEvent<ItemOutcome<T>>>` (optionally wrapped in
+  `SyncEvent::Batch`). Every pulled item produces exactly one
+  `ItemOutcome`; locally-invalid items emit `Failed` rather than
+  poisoning the stream; early termination via
+  `SyncEvent::Terminated(AccountError)` covers only already-pulled
+  items.
+- `MutationSuccess::{Applied, Skipped}` carries the read-back
+  guard's "already-in-state" outcome inside the success lane.
+- `SyncEvent::Fatal` is renamed to `SyncEvent::Terminated(AccountError)`.
+  The `Fatal` newtype from `bifrost-types::recovery` remains for the
+  engine-boundary terminal-only collapse.
+- `Warning` uses `DiagnosticText` for all free-form text fields and
+  is documented as outside the error model.
 - NotFound absorption policy is documented per operation and the
   protocol crates implement it.
 - `brokkr check` is clean workspace-wide.
