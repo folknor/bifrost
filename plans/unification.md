@@ -349,7 +349,11 @@ Four waves; each blocks on the prior.
   duplication shape (derive `Clone`, `Arc`-wrap non-Clone
   payloads, or an explicit `duplicate()` method) the reshape
   settles on - resolving the Gmail `account_error_from_template`
-  workaround.
+  workaround. Also folds in the S1-W3 carryover on token-rotation
+  asymmetry across the four factory shapes (see the
+  captured-but-not-decisions block below) since the convergence
+  sweep is the next time a single agent touches every credentials
+  module.
 
 #### File ownership
 
@@ -627,6 +631,32 @@ agents do not re-open them:
   sessions would relax this.
 - **Graph `draft_update` does not replace attachments.** Same
   upload-session limitation.
+
+S1-W3 audit surfaced this finding, which the W3 visibility
+contraction made visible but does not itself address. Recorded
+here so the S1-W4 (error convergence) agent picks it up - the
+W4 sweep is the next time a single agent touches all four
+factory / credentials modules together:
+
+- **Token rotation is unevenly exposed across the four protocol
+  factories.** JMAP routes rotation through
+  `JmapCredentials::set_access_token` (the consumer keeps the
+  credentials handle, all factory clones share its
+  `StaticTokenSource`). Graph routes through
+  `GraphClient::set_access_token` (the consumer keeps a `Clone`
+  of the client). Gmail's `GmailAccountFactory::from_access_token`
+  takes an owned `String` into a now-`pub(crate)`
+  `GmailClient`, leaving the consumer no public path to rotate
+  after construction. IMAP's opaque `Credentials` likewise has no
+  rotation method. S1-W4 should land on one shape across the four
+  factories - either every factory exposes a `set_access_token`
+  (mirroring JMAP / Graph) or every factory accepts a
+  `bifrost_net::StaticTokenSource` / `Arc<dyn TokenSource>` at
+  construction so the consumer owns the rotation handle
+  externally. The latter is more aligned with the
+  `Account`-is-the-only-API non-negotiable: it pushes the
+  rotation concern entirely into `bifrost-net`'s token-source
+  surface, which `bifrost-net` already owns.
 
 ## Coordination rules
 
