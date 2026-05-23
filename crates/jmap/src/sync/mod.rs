@@ -15,6 +15,7 @@ mod factory;
 mod hydrate;
 mod inventory;
 mod mutation;
+mod pim;
 mod push;
 mod state;
 

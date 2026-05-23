@@ -144,6 +144,23 @@ pub(crate) struct ListThreadsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ListMessagesResponse {
+    #[serde(default)]
+    pub messages: Vec<GmailMessageStub>,
+    pub next_page_token: Option<String>,
+    pub result_size_estimate: Option<i64>,
+}
+
+// pub: returned by GmailClient message listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailMessageStub {
+    pub id: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ListLabelsResponse {
     #[serde(default)]
     pub labels: Vec<GmailLabel>,
@@ -200,6 +217,7 @@ pub struct GmailSendAs {
     pub treat_as_alias: Option<bool>,
     pub verification_status: Option<String>,
     pub signature: Option<String>,
+    pub reply_to_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,4 +235,26 @@ pub struct GmailProfile {
     pub messages_total: Option<i64>,
     pub threads_total: Option<i64>,
     pub history_id: String,
+}
+
+// pub: returned by Gmail vacation settings methods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GmailVacationSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_auto_reply: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_plain_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restrict_to_contacts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restrict_to_domain: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_time: Option<String>,
 }

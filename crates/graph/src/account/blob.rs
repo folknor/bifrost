@@ -171,9 +171,10 @@ async fn fetch_blob_stream(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
         account.client.api_base()
     );
-    account
-        .client
-        .account_net()
+    let account_net = account.client.account_net().ok_or_else(|| {
+        BlobFetchError::Failed("Graph client is not attached to an account".to_string())
+    })?;
+    account_net
         .download_stream(&url, range)
         .await
         .map_err(BlobFetchError::from)

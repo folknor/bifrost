@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, PushCapability, QuotaSignal, RateLimitClass,
+    MutationConcurrency, MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal,
+    RateLimitClass, StarredFlagShape,
 };
 
 use super::PushMode;
@@ -30,6 +31,42 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
         requires_uidvalidity_recheck: false,
         historyid_expires_after: None,
         delta_token_expires_after: None,
+        pim_methods: PimMethodSupport {
+            add_to_container: true,
+            remove_from_container: false,
+            set_keyword: false,
+            set_label_membership: false,
+            set_category: true,
+            set_extended_property: true,
+            set_is_read: true,
+            send_message: true,
+            attachment_upload: false,
+            draft_create: true,
+            draft_update: true,
+            draft_discard: true,
+            draft_send: true,
+            search: true,
+            search_messages: true,
+            containers_list: true,
+            container_create: true,
+            container_rename: true,
+            container_move: true,
+            container_delete: true,
+            identities_list: true,
+            identity_update: false,
+            vacation_get: true,
+            vacation_set: true,
+            quota_get: false,
+            thread_hydrate: true,
+            message_hydrate: true,
+        },
+        conveniences: bifrost_types::ConvenienceShape {
+            starred: StarredFlagShape::Category,
+            replied_via_keyword: false,
+            replied_via_extended_property: true,
+            forwarded_via_keyword: false,
+            forwarded_via_extended_property: true,
+        },
     }
 }
 
@@ -78,6 +115,22 @@ mod tests {
     fn mutation_replay_safety_is_none() {
         let caps = build_capabilities(PushMode::GraphSubscriptions);
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+    }
+
+    #[test]
+    fn pim_method_support_matches_graph_surface() {
+        let caps = build_capabilities(PushMode::GraphSubscriptions);
+        assert!(caps.pim_methods.add_to_container);
+        assert!(!caps.pim_methods.remove_from_container);
+        assert!(caps.pim_methods.set_category);
+        assert!(caps.pim_methods.set_extended_property);
+        assert!(caps.pim_methods.send_message);
+        assert!(!caps.pim_methods.attachment_upload);
+        assert!(caps.pim_methods.vacation_get);
+        assert!(!caps.pim_methods.quota_get);
+        assert_eq!(caps.conveniences.starred, StarredFlagShape::Category);
+        assert!(caps.conveniences.replied_via_extended_property);
+        assert!(caps.conveniences.forwarded_via_extended_property);
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod ews_stream;
 mod get;
 mod inventory;
 mod mutate;
+mod pim;
 mod push;
 mod push_stream;
 mod scopes;
@@ -19,9 +20,10 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountFactory, AccountFuture, AccountStream, BlobHandle,
     ByteRange, Change, ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
-    Error, HydratedObject, IdempotencyKey, InventoryEntry, MembershipScope, MutationResult,
-    ObjectId, Priority, Projection, ScopeLifecycle, SubscriptionHandle, SyncEvent, SyncStrategy,
-    WatchEvent,
+    DraftHandle, DraftPatch, Error, HydratedObject, HydrationProjection, IdempotencyKey,
+    InventoryEntry, MembershipScope, Message, MutationResult, MutationTarget, ObjectId, Page,
+    Priority, Projection, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -125,11 +127,15 @@ impl GraphAccountFactory {
 }
 
 impl AccountFactory for GraphAccountFactory {
-    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
+    fn open(
+        &self,
+        account_id: bifrost_types::AccountId,
+    ) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
         let client = self.client.clone();
         let push_mode = self.push_mode;
         let push_endpoint = self.push_endpoint.clone();
         Box::pin(async move {
+            client.attach_account(account_id);
             client.get_profile().await.map_err(Error::Auth)?;
             let account = GraphAccount::new(client.clone(), push_mode, push_endpoint);
             let folders = client
@@ -152,11 +158,15 @@ impl Account for GraphAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        self.client.account_net().set_priority(priority);
+        if let Some(account_net) = self.client.account_net() {
+            account_net.set_priority(priority);
+        }
     }
 
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.client.account_net().set_bandwidth_cap(bps);
+        if let Some(account_net) = self.client.account_net() {
+            account_net.set_bandwidth_cap(bps);
+        }
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -268,6 +278,232 @@ impl Account for GraphAccount {
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>> {
         mutate::bulk_destroy_stream(self.clone(), targets, key)
+    }
+
+    fn add_to_container(
+        &self,
+        target: MutationTarget,
+        container: bifrost_types::ContainerId,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::add_to_container(account, target, container).await })
+    }
+
+    fn remove_from_container(
+        &self,
+        _target: MutationTarget,
+        _container: bifrost_types::ContainerId,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn set_keyword(
+        &self,
+        _target: MutationTarget,
+        _keyword: String,
+        _value: bool,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn set_label_membership(
+        &self,
+        _target: MutationTarget,
+        _label: bifrost_types::ContainerId,
+        _value: bool,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn set_category(
+        &self,
+        target: MutationTarget,
+        category: String,
+        value: bool,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::set_category(account, target, category, value).await })
+    }
+
+    fn set_extended_property(
+        &self,
+        target: MutationTarget,
+        property_id: String,
+        value: Option<String>,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(
+            async move { pim::set_extended_property(account, target, property_id, value).await },
+        )
+    }
+
+    fn set_is_read(
+        &self,
+        target: MutationTarget,
+        is_read: bool,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::set_is_read(account, target, is_read).await })
+    }
+
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::send_message(account, request).await })
+    }
+
+    fn attachment_upload(
+        &self,
+        _bytes: AccountStream<Result<Bytes, Error>>,
+        _mime: String,
+    ) -> AccountFuture<Result<bifrost_types::AttachmentHandle, Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::draft_create(account, patch).await })
+    }
+
+    fn draft_update(
+        &self,
+        draft: DraftHandle,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::draft_update(account, draft, patch).await })
+    }
+
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::draft_discard(account, draft).await })
+    }
+
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::draft_send(account, draft).await })
+    }
+
+    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::search(account, request).await })
+    }
+
+    fn search_messages(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ObjectId>, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::search_messages(account, request).await })
+    }
+
+    fn containers_list(&self) -> AccountFuture<Result<Vec<bifrost_types::Container>, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::containers_list(account).await })
+    }
+
+    fn container_create(
+        &self,
+        kind: bifrost_types::ContainerKind,
+        name: String,
+        parent: Option<bifrost_types::ContainerId>,
+    ) -> AccountFuture<Result<bifrost_types::ContainerId, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::container_create(account, kind, name, parent).await })
+    }
+
+    fn container_rename(
+        &self,
+        container: bifrost_types::ContainerId,
+        name: String,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::container_rename(account, container, name).await })
+    }
+
+    fn container_move(
+        &self,
+        container: bifrost_types::ContainerId,
+        new_parent: Option<bifrost_types::ContainerId>,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::container_move(account, container, new_parent).await })
+    }
+
+    fn container_delete(
+        &self,
+        container: bifrost_types::ContainerId,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::container_delete(account, container).await })
+    }
+
+    fn identities_list(&self) -> AccountFuture<Result<Vec<bifrost_types::Identity>, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::identities_list(account).await })
+    }
+
+    fn identity_update(
+        &self,
+        _identity: bifrost_types::IdentityId,
+        _patch: bifrost_types::IdentityPatch,
+    ) -> AccountFuture<Result<(), Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::vacation_get(account).await })
+    }
+
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::vacation_set(account, config).await })
+    }
+
+    fn quota_get(&self) -> AccountFuture<Result<Option<bifrost_types::QuotaInfo>, Error>> {
+        Box::pin(async { Err(Error::Unsupported) })
+    }
+
+    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::thread_hydrate(account, thread).await })
+    }
+
+    fn message_hydrate(
+        &self,
+        message: ObjectId,
+        projection: HydrationProjection,
+    ) -> AccountFuture<Result<Message, Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::message_hydrate(account, message, projection).await })
+    }
+
+    fn move_thread(
+        &self,
+        thread: ThreadId,
+        target: bifrost_types::ContainerId,
+        _source: Option<bifrost_types::ContainerId>,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::move_thread(account, thread, target).await })
+    }
+
+    // `apply_label` and `remove_label` rely on the trait's default
+    // dispatch in `bifrost_types::Account`. The default routes
+    // `(Label, Graph)` and `(Folder, Graph)` provenance through
+    // `set_category`, `(Folder, non-Graph)` through
+    // `add_to_container` / `remove_from_container`, and the remaining
+    // shapes through `set_keyword` / `set_label_membership` - which
+    // surface `Unsupported` on Graph if the consumer hands us a
+    // cross-account label object. No override needed here.
+
+    fn delete_thread(
+        &self,
+        thread: ThreadId,
+        current: Option<bifrost_types::ContainerId>,
+    ) -> AccountFuture<Result<(), Error>> {
+        let account = self.clone();
+        Box::pin(async move { pim::delete_thread(account, thread, current).await })
     }
 
     fn close(&self) -> AccountFuture<Result<(), Error>> {

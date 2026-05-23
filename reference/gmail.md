@@ -28,6 +28,10 @@ that route through `messages.batchModify` / `batchDelete`.
 - `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`,
   `PubSubControl`, renewer task.
 - `mutation.rs` - `bulk_set_flags`, `bulk_move`, `bulk_destroy`.
+- `pim.rs` - Phase 3.6 unified PIM primitives: message and
+  thread label mutations, MIME send and drafts, search translation,
+  container CRUD, identities, vacation responder, and typed
+  message/thread hydration.
 - `flags.rs` - Gmail-label-to-IMAP-flag canonicalization and the
   reverse `LabelPatch` translation used by mutations.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
@@ -37,7 +41,9 @@ that route through `messages.batchModify` / `batchDelete`.
 ## GmailAccount / GmailAccountFactory
 
 `GmailAccountFactory` carries an `Arc<GmailClient>` and an
-optional `PubSubConfig`. `open()` does one `users.getProfile`
+optional `PubSubConfig`. `open(account_id)` first asks the client
+for an account-scoped clone attached to `bifrost-net` under the
+engine supplied `AccountId`, then does one `users.getProfile`
 round-trip, parses `profile.historyId` into a `u64`, and stores
 the resulting `GmailChangeState` as `seed_state`. The opened
 `GmailAccount` retains:
@@ -58,10 +64,19 @@ the resulting `GmailChangeState` as `seed_state`. The opened
 - `set_priority` and `set_bandwidth_cap` delegate to the
   underlying `AccountNet`; the transport owns the canonical knobs.
 
-`AccountFactory::open` returns `Arc<dyn Account>`. `reopen`
-flows from the engine: the engine drops the previous `Arc` and
-calls the factory again. The factory holds the credentials and
-client, so the new `GmailAccount` carries a fresh
+Clients constructed through the default token constructors retain
+their parent `Net`, so `open(account_id)` mints a fresh
+`AccountNet` under the engine id on every reopen. Clients built
+via `GmailClient::with_account_net` have no parent `Net`; the
+factory calls `AccountNet::retag(account_id)` on the pre-attached
+handle so per-account metering and host bookkeeping move under
+the engine id without losing in-flight clones.
+
+`AccountFactory::open(account_id)` returns `Arc<dyn Account>`.
+`reopen` flows from the engine: the engine drops the previous
+`Arc` and calls the factory again with the same `AccountId`. The
+factory holds the credentials and client, so the new `GmailAccount`
+carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile
 at open time.
 
@@ -114,6 +129,98 @@ on the same cancellation token.
   `SyncStrategy::ServerCursor` to `SyncStrategy::None` and
   `freshness` to `None`, prompting the engine to re-establish.
 - `delta_token_expires_after: None`. Gmail has no delta token.
+- `pim_methods`:
+  - Supported: `add_to_container`, `remove_from_container`,
+    `set_label_membership`, `set_is_read`, `send_message`,
+    `draft_create`, `draft_update`, `draft_discard`, `draft_send`,
+    `search`, `search_messages`, `containers_list`,
+    `container_create`, `container_rename`, `container_delete`,
+    `identities_list`, `identity_update`, `vacation_get`,
+    `vacation_set`, `thread_hydrate`, `message_hydrate`.
+  - Unsupported: `set_keyword`, `set_category`,
+    `set_extended_property`, `attachment_upload`,
+    `container_move`, `quota_get`.
+- `conveniences.starred: LabelMembership`. The default
+  `set_starred` convenience dispatches to Gmail's `STARRED` label.
+  Replied and forwarded convenience flags are false because Gmail
+  derives that state from messages rather than exposing a writeable
+  flag.
+
+## PIM primitives and conveniences
+
+`pim.rs` implements the S1-W2 Gmail shape for the unified Account
+trait.
+
+Mail mutation primitives use Gmail label modification:
+
+- `add_to_container` and `remove_from_container` dispatch to
+  `users.messages.modify` or `users.threads.modify` depending on
+  `MutationTarget`.
+- `set_label_membership` is the same add/remove label operation.
+- `set_is_read` flips Gmail's `UNREAD` label with inverted polarity.
+- `set_keyword`, `set_category`, and `set_extended_property` return
+  `AccountError::Unsupported`.
+- The explicit Archive container is synthetic. Adding a target to
+  Archive removes `INBOX`; removing from Archive is a no-op because
+  archive is the absence of the Inbox label, not a native label.
+
+Composition primitives build RFC 5322 MIME locally and send the
+base64url raw message through Gmail:
+
+- `send_message` calls `users.messages.send`. Inline attachments are
+  encoded into the MIME tree. Pre-uploaded attachment handles are
+  unsupported because Gmail has no separate upload primitive for
+  message attachments.
+- `draft_create`, `draft_update`, `draft_discard`, and `draft_send`
+  call Gmail drafts endpoints. `draft_update` fetches the current
+  draft in `full` format, projects editable headers/body/attachments
+  into the shared draft document, applies the partial patch, then
+  replaces the draft with a new raw MIME body.
+- `attachment_upload` returns `Unsupported`.
+
+Search translates the shared `SearchRequest` AST into Gmail query
+strings and uses `users.threads.list` for thread-shaped search and
+`users.messages.list` for message-shaped search. `provider_query` is
+appended verbatim so consumers can use Gmail-specific operators such
+as `larger:5M`.
+
+Container CRUD treats Gmail labels as `ContainerKind::Label` and
+returns native Gmail label ids. System labels `INBOX`, `SENT`,
+`DRAFT`, `TRASH`, and `SPAM` map to the matching `FolderRole`.
+Archive is surfaced as a synthetic label-shaped container with
+native id `archive` and `FolderRole::Archive`. Creating, renaming,
+and deleting labels call Gmail label endpoints. Moving containers is
+unsupported because Gmail labels are flat.
+
+Settings primitives map to Gmail settings endpoints:
+
+- `identities_list` and `identity_update` use
+  `users.settings.sendAs`.
+- `vacation_get` and `vacation_set` use
+  `users.settings.vacation`.
+- `quota_get` returns `Unsupported`; the Gmail API profile exposes
+  message counts but not storage quota bytes.
+
+Hydration primitives use Gmail's `full` and `metadata` message
+formats. `thread_hydrate` calls `users.threads.get` and projects
+each message. `message_hydrate` chooses the cheapest Gmail format for
+the requested `HydrationProjection`, parses common address and
+threading headers, maps label ids to containers and canonical flags,
+and surfaces attachment blob handles for `FullWithBlobs`.
+
+The Gmail overrides for multi-call conveniences are:
+
+- `move_thread` adds the target container first, then removes the
+  source container when supplied. The implementation lives in the
+  crate so it can own a cloned client inside the boxed future.
+- `delete_thread` moves to `TRASH` unless the caller says the thread
+  is already in Trash, in which case it calls `users.threads.delete`
+  for permanent deletion.
+
+Other conveniences inherit the trait default. `set_starred` routes
+through `set_label_membership` because capabilities advertise
+`LabelMembership`. `apply_label` and `remove_label` use the default
+provenance dispatch for Gmail label ids.
 
 ## Cursor envelope
 
@@ -375,3 +482,11 @@ the wire.
   inside this crate. The Account layer owns the watch lifecycle
   and the `WatchEvent::Reconnected` / `Disconnected` signal;
   it does not decode incoming Pub/Sub envelopes.
+- Gmail has no independent attachment upload primitive for messages;
+  callers send inline attachment bytes in `SendRequest` /
+  `DraftPatch`.
+- Gmail labels are flat; `container_move` is unsupported.
+- Gmail profile data does not expose storage quota bytes;
+  `quota_get` is unsupported.
+- Replied and forwarded state are not writeable Gmail flags through
+  this API. The corresponding convenience dispatch flags are false.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_types::{Account, AccountFactory, AccountFuture, Error as AccountError};
+use bifrost_types::{Account, AccountFactory, AccountFuture, AccountId, Error as AccountError};
 
 use crate::connection::ImapConfig;
 use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};
@@ -20,6 +20,8 @@ pub struct ImapAccountConfig {
     pub flag_sync_interval: Duration,
     pub deletion_check_interval: Duration,
     pub mutation_batch_size: usize,
+    pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+    pub meter_sink: Option<Arc<dyn bifrost_net::MeterSink>>,
 }
 
 impl ImapAccountConfig {
@@ -34,7 +36,19 @@ impl ImapAccountConfig {
             flag_sync_interval: Duration::from_secs(300),
             deletion_check_interval: Duration::from_secs(600),
             mutation_batch_size: 1024,
+            bandwidth_meter: None,
+            meter_sink: None,
         }
+    }
+
+    pub fn with_bandwidth_meter(mut self, meter: Arc<bifrost_net::BandwidthMeter>) -> Self {
+        self.bandwidth_meter = Some(meter);
+        self
+    }
+
+    pub fn with_meter_sink(mut self, sink: Arc<dyn bifrost_net::MeterSink>) -> Self {
+        self.meter_sink = Some(sink);
+        self
     }
 }
 
@@ -51,12 +65,21 @@ impl ImapAccountFactory {
 }
 
 impl AccountFactory for ImapAccountFactory {
-    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
         let cfg = Arc::clone(&self.cfg);
         Box::pin(async move {
+            let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(
+                super::UNLIMITED_BANDWIDTH,
+            ));
+            let meter = meter_handle(&cfg, account_id);
             let (conn, _auth) = cfg
                 .imap
-                .connect_authenticated(&cfg.credentials, &cfg.auth_policy)
+                .connect_authenticated_metered(
+                    &cfg.credentials,
+                    &cfg.auth_policy,
+                    meter.clone(),
+                    Some(Arc::clone(&bandwidth_cap)),
+                )
                 .await
                 .map_err(account_error)?;
 
@@ -72,15 +95,43 @@ impl AccountFactory for ImapAccountFactory {
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
                 .map_err(account_error)?;
+            let caps = capabilities::build_capabilities(&profile, &folders);
             let registry = Arc::new(FolderRegistry::from_list(folders));
-            let caps = capabilities::build_capabilities(&profile);
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
-            let pool = Arc::new(Pool::new(Arc::clone(&cfg), conn, data_cap));
-            let account =
-                ImapAccount::new(cfg, caps, pool, registry, qresync.enabled, qresync.warning);
+            let pool = Arc::new(Pool::new(
+                Arc::clone(&cfg),
+                conn,
+                data_cap,
+                meter,
+                Arc::clone(&bandwidth_cap),
+            ));
+            let account = ImapAccount::new(
+                cfg,
+                caps,
+                pool,
+                registry,
+                qresync.enabled,
+                qresync.warning,
+                bandwidth_cap,
+            );
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
     }
+}
+
+fn meter_handle(
+    cfg: &ImapAccountConfig,
+    account_id: AccountId,
+) -> Option<bifrost_net::MeterSinkHandle> {
+    if let Some(meter) = &cfg.bandwidth_meter {
+        return Some(bifrost_net::MeterSinkHandle::from_meter(
+            Arc::clone(meter),
+            account_id,
+        ));
+    }
+    cfg.meter_sink
+        .as_ref()
+        .map(|sink| bifrost_net::MeterSinkHandle::new(Arc::clone(sink), account_id))
 }
 
 struct QresyncNegotiation {
@@ -151,7 +202,7 @@ fn server_id_disables_qresync(server_id: &[(String, Option<String>)]) -> bool {
     })
 }
 
-async fn list_folders(
+pub(crate) async fn list_folders(
     conn: &crate::ImapConnection,
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,

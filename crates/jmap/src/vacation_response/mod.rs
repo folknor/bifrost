@@ -7,6 +7,7 @@ use crate::core::set::skip_if_empty_str;
 use crate::core::set::skip_if_zero_date;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 mod marker {
     pub enum VacationResponse {}
@@ -100,6 +101,10 @@ pub struct VacationResponsePatch {
     #[serde(rename = "htmlBody")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) html_body: Option<String>,
+
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) patch: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]

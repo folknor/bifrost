@@ -578,6 +578,17 @@ pub(crate) async fn send_streaming_inner(
                                 strip_body_headers(&mut headers);
                             }
                             auth_for_next_hop = step.keep_auth && auth_for_next_hop;
+                            // Strip caller-set `Authorization` headers
+                            // too on cross-host hops, not just the
+                            // token-source-derived bearer. Otherwise
+                            // JMAP Basic-auth (or any caller that
+                            // builds its own Authorization header)
+                            // leaks credentials across a host
+                            // boundary even when the bearer-injection
+                            // path is suppressed.
+                            if !step.keep_auth {
+                                headers.remove(AUTHORIZATION);
+                            }
                             host = host_from_url(&url);
                             cost_units = recompute_cost_units(
                                 account.net().governor(),

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_net::{AccessToken, StaticTokenSource};
-use bifrost_types::{Account, AccountFactory, AccountFuture, CursorScope, Error, ObjectType};
+use bifrost_types::{
+    Account, AccountFactory, AccountFuture, AccountId, CursorScope, Error, ObjectType,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, Credentials};
@@ -92,17 +94,27 @@ impl JmapAccountFactoryBuilder {
 }
 
 impl AccountFactory for JmapAccountFactory {
-    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
         let config = self.config.clone();
         Box::pin(async move {
-            let client = connect(config.clone())
+            let client = connect(config.clone(), account_id)
                 .await
                 .map_err(super::error::to_account_error)?;
             let mail = client
                 .primary_account::<capability::Mail>()
                 .map_err(super::error::to_account_error)?;
+            let submission = client.primary_account::<capability::Submission>().ok();
+            let vacation = client
+                .primary_account::<capability::VacationResponseCap>()
+                .ok();
+            let quota = client.primary_account::<capability::Quota>().ok();
             let session = client.session();
-            let (caps, limits) = capabilities::build(&session)?;
+            let support = capabilities::PimSupport {
+                submission: submission.is_some(),
+                vacation: vacation.is_some(),
+                quota: quota.is_some(),
+            };
+            let (caps, limits) = capabilities::build(&session, support)?;
 
             let email_state = mutation::probe_email_state(&mail)
                 .await
@@ -148,6 +160,9 @@ impl AccountFactory for JmapAccountFactory {
             let account = JmapAccount::new(
                 client,
                 mail,
+                submission,
+                vacation,
+                quota,
                 caps,
                 limits,
                 seed_states,
@@ -164,9 +179,13 @@ impl AccountFactory for JmapAccountFactory {
     }
 }
 
-async fn connect(config: JmapAccountFactoryBuilder) -> crate::Result<Client> {
+async fn connect(
+    config: JmapAccountFactoryBuilder,
+    account_id: AccountId,
+) -> crate::Result<Client> {
     let mut builder = Client::new()
         .credentials(config.credentials.into_client_credentials())
+        .net_account_id(account_id)
         .accept_invalid_certs(config.accept_invalid_certs);
     if let Some(timeout) = config.timeout {
         builder = builder.timeout(timeout);

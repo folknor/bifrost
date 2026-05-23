@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -21,6 +22,8 @@ struct PoolInner {
     permits: Arc<Semaphore>,
     idle: Mutex<Vec<PoolMember>>,
     config: Arc<ImapAccountConfig>,
+    meter: Option<bifrost_net::MeterSinkHandle>,
+    bandwidth_cap: Arc<AtomicU64>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -29,6 +32,8 @@ impl Pool {
         config: Arc<ImapAccountConfig>,
         primed: ImapConnection,
         data_cap: usize,
+        meter: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_cap: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Arc::new(PoolInner {
@@ -38,6 +43,8 @@ impl Pool {
                     selected: None,
                 }]),
                 config,
+                meter,
+                bandwidth_cap,
                 closed: std::sync::atomic::AtomicBool::new(false),
             }),
         }
@@ -68,9 +75,11 @@ impl Pool {
                     .inner
                     .config
                     .imap
-                    .connect_authenticated(
+                    .connect_authenticated_metered(
                         &self.inner.config.credentials,
                         &self.inner.config.auth_policy,
+                        self.inner.meter.clone(),
+                        Some(Arc::clone(&self.inner.bandwidth_cap)),
                     )
                     .await?;
                 PoolMember {
@@ -94,9 +103,11 @@ impl Pool {
             .inner
             .config
             .imap
-            .connect_authenticated(
+            .connect_authenticated_metered(
                 &self.inner.config.credentials,
                 &self.inner.config.auth_policy,
+                self.inner.meter.clone(),
+                Some(Arc::clone(&self.inner.bandwidth_cap)),
             )
             .await?;
         Ok(conn)

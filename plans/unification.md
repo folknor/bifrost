@@ -278,33 +278,45 @@ concern handled in ratatoskr's own plan, not gating bifrost.
 
 Four waves; each blocks on the prior.
 
-- **Wave 1: trait surface (S1-W1).** Single agent extends
-  `bifrost-types::Account` with all primitives (no default impls)
-  and all conveniences (default impls in terms of primitives).
-  Grows `AccountCapabilities`. Adds request/response/identity
-  types. Implements the resolved Stage 1 infrastructure decisions:
-  `AccountFactory::open` takes engine `AccountId`, the redirect
-  loop with RFC 7231 method rewriting lands in `bifrost-net`, and
-  the `MeterSink` adapter shape is finalized for raw-socket
-  transports. `bifrost-sync` updated to compile against the new
-  trait shape (every new method is `Err(Unsupported)` until W2).
-- **Wave 2: protocol impls (S1-W2).** Four agents in parallel,
-  one per protocol crate. Each implements every primitive,
-  consumes the new `AccountId`-receiving `open` signature, and
-  for IMAP drives the new `MeterSink` adapter. Conveniences
-  inherit the default impl unless the default is wrong (e.g.
-  Gmail's `mark_replied` is a no-op rather than the default
-  keyword-set). JMAP's manual redirect loop in
-  `transport_reqwest.rs` is deleted in this wave because
-  `bifrost-net` now owns that primitive.
-- **Wave 3: protocol crate contraction (S1-W3).** Four agents in
+- **Wave 1: trait surface (S1-W1)**. **Merged.** Trait carries
+  27 primitives and 8 conveniences in `crates/types/src/account.rs`;
+  `AccountCapabilities` grew `PimMethodSupport` and
+  `ConvenienceShape`; `AccountFactory::open(AccountId)` is the
+  factory signature; `bifrost-net` owns the method-aware redirect
+  loop (`redirect.rs`) and the raw-socket `MeterSinkHandle`
+  (`bandwidth.rs`); `crates/sync/src/` compiles against the new
+  trait shape. `crates/sync/tests/cross_crate_conformance.rs` was
+  stubbed back to dyn-safety only during W1 and restored in W2.
+- **Wave 2: protocol impls (S1-W2)**. **Merged.** Four agents in
+  parallel, one per protocol crate. Each landed a `pim.rs`
+  implementing all 27 primitives (real wire calls for the
+  protocol's supported set, `Err(Unsupported)` for the rest),
+  declared `PimMethodSupport` + `ConvenienceShape` flags, overrode
+  conveniences only where the default was wrong, and consumed the
+  `AccountId`-receiving `open` signature. IMAP drove the
+  `MeterSinkHandle` through `connection/{wire,lifecycle,pool}` and
+  the STARTTLS / COMPRESS swap path in `connection/driver/upgrade`.
+  JMAP deleted its manual redirect loop from
+  `transport_reqwest.rs`. Audit follow-ups merged in the same wave:
+  cross-crate conformance test restored against all four factories;
+  Graph `apply_label` / `remove_label` overrides dropped in favor
+  of the trait default after `(Label, Graph)` was added to
+  `dispatch_label` so non-Graph provenance still routes correctly;
+  Graph `set_extended_property(_, _, None)` clears via batched
+  `DELETE` on `singleValueExtendedProperties` instead of returning
+  `Unsupported`; `bifrost-net::AccountNet::retag` lets factories
+  re-mint pre-attached `AccountNet` handles under the engine id;
+  cross-host redirect strip widened to remove caller-set
+  `Authorization` headers (covers JMAP Basic-auth, not just
+  bearer-injection).
+- **Wave 3: protocol crate contraction (S1-W3)**. Four agents in
   parallel. Each makes everything in its protocol crate
   `pub(crate)` except the factory and its config types. Examples
   that demonstrated the raw client API are deleted; new examples
   consume `Account`. This is the final `pub` audit for the
   protocol crates after the trait surface has been implemented
   end-to-end.
-- **Wave 4: error model convergence (S1-W4).** Single agent. Folds
+- **Wave 4: error model convergence (S1-W4)**. Single agent. Folds
   `plans/error-model-convergence.md` into Stage 1: all `Account`
   methods return `Result<_, AccountError>`, per-protocol error
   types become `pub(crate)` and convert at the boundary, the
@@ -550,6 +562,47 @@ but are worth recording so Stage 1 agents do not rediscover them:
   commits to match the new visibility and shape. Stage 1 work
   that touches these surfaces should refresh them again at the
   end of each wave rather than batch the doc churn.
+
+S1-W2 agents surfaced these protocol-side known limitations,
+already documented in the matching `reference/*.md`. Recorded here
+so S1-W3 (`pub(crate)` contraction) and S1-W4 (error convergence)
+agents do not re-open them:
+
+- **IMAP `send_message` is unsupported until the IMAP factory has
+  an SMTP transport handle to call.** `bifrost-smtp` exists; the
+  composition pattern is `ImapAccountFactory` carrying an
+  `Option<SmtpClient>` plumbed in by the consumer. Not a Stage 1
+  goal; tracked for Stage 2 or later.
+- **IMAP `draft_update` needs MIME parse + merge to do partial
+  updates correctly.** Stage 1 advertises `draft_update: false` for
+  IMAP. Closing the gap is a draft-model primitive beyond the
+  current scope.
+- **IMAP `identity_update` and vacation responder are external
+  config or Sieve-shaped**, not exposed in Stage 1. Sieve script
+  primitive lives in Stage 2 (server-side filter rules); identity
+  storage is a consumer responsibility today.
+- **IMAP `container_delete` refuses non-empty mailboxes** with
+  `AccountError::Other` rather than moving contents to Trash. The
+  trait contract permits either; the IMAP impl picks "fail loudly"
+  because move-to-Trash semantics differ across servers. Document
+  in `reference/imap.md`; not a defect.
+- **IMAP `quota_get` reports only the STORAGE resource** from
+  `GETQUOTAROOT`. Other resources (MESSAGE, MAILBOX, etc.) are
+  silently dropped. Trait surface returns a single `QuotaInfo`;
+  multi-resource quota would need a richer return type.
+- **Graph send/draft return the draft id** because the Graph send
+  actions answer 202 Accepted with no body. Final Sent Items id
+  is rediscovered through sync or search. Documented in
+  `reference/graph.md`.
+- **Graph `send_message` / `draft_create` / `draft_update` accept
+  inline attachments embedded in the request but reject
+  pre-uploaded `AttachmentHandle`s** (which can only come from a
+  successful `attachment_upload`, itself unsupported on Graph).
+  Capability flags advertise the no-pre-uploaded-attachment shape
+  as supported; a future `attachment_upload` for Graph upload
+  sessions would relax this.
+- **Graph `draft_update` does not replace attachments.** Same
+  upload-session limitation.
 
 ## Coordination rules
 

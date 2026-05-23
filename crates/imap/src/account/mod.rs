@@ -8,10 +8,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bifrost_types::{
-    Account, AccountFuture, AccountStream, BlobHandle, ByteRange, Change, ChangeCursor,
-    CursorDescriptor, CursorEstablishment, CursorScope, Error as AccountError, HydratedObject,
-    IdempotencyKey, InventoryEntry, MembershipScope, MutationResult, Priority, Projection,
-    SubscriptionHandle, SyncEvent, WatchEvent,
+    Account, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Change,
+    ChangeCursor, Container, ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment,
+    CursorScope, DraftHandle, DraftPatch, Error as AccountError, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    MembershipScope, Message, MutationResult, MutationTarget, ObjectId, Page, Priority, Projection,
+    QuotaInfo, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, ThreadHydration,
+    ThreadId, VacationConfig, WatchEvent,
 };
 use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -29,6 +32,7 @@ mod folder_registry;
 mod get;
 mod inventory;
 mod mutate;
+mod pim;
 mod pool;
 mod push;
 mod scopes;
@@ -37,8 +41,8 @@ mod scopes;
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
 
 pub(crate) use envelope::{
-    DecodedObjectId, FolderCursor, decode_blob_id, decode_cursor, decode_object_id, encode_cursor,
-    encode_object_id,
+    DecodedObjectId, FolderCursor, decode_blob_id, decode_cursor, decode_object_id,
+    decode_thread_id, encode_cursor, encode_object_id, encode_thread_id,
 };
 pub(crate) use folder_registry::{CompactUidSet, FolderRegistry};
 pub(crate) use pool::{Pool, PooledConn};
@@ -64,7 +68,7 @@ pub(crate) struct ImapAccountInner {
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) priority: AtomicU8,
-    pub(crate) bandwidth_cap: AtomicU64,
+    pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) push: push::PushState,
 }
 
@@ -76,6 +80,7 @@ impl ImapAccount {
         folders: Arc<FolderRegistry>,
         qresync_enabled: bool,
         qresync_negotiation_warning: Option<String>,
+        bandwidth_cap: Arc<AtomicU64>,
     ) -> Self {
         Self {
             inner: Arc::new(ImapAccountInner {
@@ -89,7 +94,7 @@ impl ImapAccount {
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
-                bandwidth_cap: AtomicU64::new(UNLIMITED_BANDWIDTH),
+                bandwidth_cap,
                 push: push::PushState::new(),
             }),
         }
@@ -236,8 +241,18 @@ impl Account for ImapAccount {
 
     // Account: records the engine bandwidth cap until IMAP byte-metering is wired.
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.bandwidth_cap
-            .store(bps.unwrap_or(UNLIMITED_BANDWIDTH), Ordering::Release);
+        let raw = match bps {
+            None => UNLIMITED_BANDWIDTH,
+            Some(0) => {
+                tracing::warn!(
+                    target: "bifrost_imap::bandwidth",
+                    "set_bandwidth_cap(Some(0)) clamped to 1 B/s; use None for unlimited",
+                );
+                1
+            }
+            Some(n) => n,
+        };
+        self.bandwidth_cap.store(raw, Ordering::Release);
     }
 
     // Account: describes opaque engine cursors; direct users inspect SyncSelectResult.
@@ -349,6 +364,201 @@ impl Account for ImapAccount {
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<MutationResult>> {
         mutate::bulk_destroy(self.clone(), targets, key)
+    }
+
+    fn add_to_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::add_to_container(self.clone(), target, container)
+    }
+
+    fn remove_from_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::remove_from_container(self.clone(), target, container)
+    }
+
+    fn set_keyword(
+        &self,
+        target: MutationTarget,
+        keyword: String,
+        value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_keyword(self.clone(), target, keyword, value)
+    }
+
+    fn set_label_membership(
+        &self,
+        _target: MutationTarget,
+        _label: ContainerId,
+        _value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::unsupported_unit()
+    }
+
+    fn set_category(
+        &self,
+        _target: MutationTarget,
+        _category: String,
+        _value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::unsupported_unit()
+    }
+
+    fn set_extended_property(
+        &self,
+        _target: MutationTarget,
+        _property_id: String,
+        _value: Option<String>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::unsupported_unit()
+    }
+
+    fn set_is_read(
+        &self,
+        target: MutationTarget,
+        is_read: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_is_read(self.clone(), target, is_read)
+    }
+
+    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::unsupported_object()
+    }
+
+    fn attachment_upload(
+        &self,
+        _bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
+        _mime: String,
+    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+        pim::unsupported_attachment()
+    }
+
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+        pim::draft_create(self.clone(), patch)
+    }
+
+    fn draft_update(
+        &self,
+        _draft: DraftHandle,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::unsupported_unit()
+    }
+
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
+        pim::draft_discard(self.clone(), draft)
+    }
+
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::unsupported_object()
+    }
+
+    fn search(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
+        pim::search(self.clone(), request)
+    }
+
+    fn search_messages(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
+        pim::search_messages(self.clone(), request)
+    }
+
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+        pim::containers_list(self.clone())
+    }
+
+    fn container_create(
+        &self,
+        kind: ContainerKind,
+        name: String,
+        parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+        pim::container_create(self.clone(), kind, name, parent)
+    }
+
+    fn container_rename(
+        &self,
+        container: ContainerId,
+        name: String,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_rename(self.clone(), container, name)
+    }
+
+    fn container_move(
+        &self,
+        container: ContainerId,
+        new_parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_move(self.clone(), container, new_parent)
+    }
+
+    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_delete(self.clone(), container)
+    }
+
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
+        pim::identities_list()
+    }
+
+    fn identity_update(
+        &self,
+        identity: IdentityId,
+        patch: IdentityPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::identity_update(identity, patch)
+    }
+
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
+        pim::vacation_get()
+    }
+
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
+        pim::vacation_set(config)
+    }
+
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
+        pim::quota_get(self.clone())
+    }
+
+    fn thread_hydrate(
+        &self,
+        thread: ThreadId,
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
+        pim::thread_hydrate(self.clone(), thread)
+    }
+
+    fn message_hydrate(
+        &self,
+        message: ObjectId,
+        projection: HydrationProjection,
+    ) -> AccountFuture<Result<Message, AccountError>> {
+        pim::message_hydrate(self.clone(), message, projection)
+    }
+
+    fn move_thread(
+        &self,
+        thread: ThreadId,
+        target: ContainerId,
+        source: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::move_thread(self.clone(), thread, target, source)
+    }
+
+    fn delete_thread(
+        &self,
+        thread: ThreadId,
+        current: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::delete_thread(self.clone(), thread, current)
     }
 
     // Account: closes the pool; direct users close a single connection with logout().

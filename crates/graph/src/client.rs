@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use bifrost_net::{
     AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy,
@@ -21,9 +20,11 @@ pub struct GraphClient {
 }
 
 struct ClientInner {
-    net: AccountNet,
+    net: Option<Net>,
+    account_net: RwLock<Option<AccountNet>>,
     api_base: String,
     api_beta_base: String,
+    rate_limit_host: String,
     token_source: StaticTokenSource,
     mailbox_id: Option<String>,
     semaphore: Arc<Semaphore>,
@@ -49,9 +50,22 @@ impl GraphClient {
         api_beta_base: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Self {
+        let api_base = trim_base(api_base.into());
+        let api_beta_base = trim_base(api_beta_base.into());
+        let rate_limit_host = host_from_api_base(&api_base);
         let token_source = StaticTokenSource::new(access_token, None);
-        let net = default_account_net("graph", "graph.microsoft.com", token_source.clone());
-        Self::with_account_net(net, api_base, api_beta_base, token_source)
+        Self {
+            inner: Arc::new(ClientInner {
+                net: Some(Net::shared_default()),
+                account_net: RwLock::new(None),
+                api_base,
+                api_beta_base,
+                rate_limit_host,
+                token_source,
+                mailbox_id: None,
+                semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+            }),
+        }
     }
 
     // pub: custom Net injection lets consumers opt out of Net::shared_default host buckets.
@@ -63,9 +77,11 @@ impl GraphClient {
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
-                net,
+                net: None,
+                account_net: RwLock::new(Some(net)),
                 api_base: trim_base(api_base.into()),
                 api_beta_base: trim_base(api_beta_base.into()),
+                rate_limit_host: "graph.microsoft.com".to_string(),
                 token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
@@ -73,8 +89,55 @@ impl GraphClient {
         }
     }
 
-    pub(crate) fn account_net(&self) -> &AccountNet {
-        &self.inner.net
+    pub(crate) fn attach_account(&self, account_id: AccountId) {
+        if let Some(net) = self.inner.net.as_ref() {
+            let token_source: Arc<dyn TokenSource> = Arc::new(self.inner.token_source.clone());
+            let account_net = net.attach_account(
+                account_id,
+                AccountSpec {
+                    hosts: vec![RateLimit {
+                        host: self.inner.rate_limit_host.clone(),
+                        quota_per_second: 10.0,
+                        cost_default: 1,
+                        burst: 10,
+                    }],
+                    token_source,
+                    default_retry: RetryPolicy::default(),
+                },
+            );
+            if let Ok(mut slot) = self.inner.account_net.write() {
+                *slot = Some(account_net);
+            }
+            return;
+        }
+        // No parent `Net`: the consumer constructed us via
+        // `with_account_net`. Retag the existing `AccountNet` so
+        // per-account metering and host bookkeeping move under the
+        // engine id; in-flight requests on the old handle continue.
+        let existing = self
+            .inner
+            .account_net
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(existing) = existing else {
+            return;
+        };
+        if existing.account() == &account_id {
+            return;
+        }
+        let retagged = existing.retag(account_id);
+        if let Ok(mut slot) = self.inner.account_net.write() {
+            *slot = Some(retagged);
+        }
+    }
+
+    pub(crate) fn account_net(&self) -> Option<AccountNet> {
+        self.inner
+            .account_net
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     pub(crate) fn api_base(&self) -> &str {
@@ -110,8 +173,10 @@ impl GraphClient {
         Self {
             inner: Arc::new(ClientInner {
                 net: self.inner.net.clone(),
+                account_net: RwLock::new(self.account_net()),
                 api_base: self.inner.api_base.clone(),
                 api_beta_base: self.inner.api_beta_base.clone(),
+                rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: self.inner.token_source.clone(),
                 mailbox_id: Some(mailbox_id.into()),
                 semaphore: Arc::clone(&self.inner.semaphore),
@@ -145,6 +210,12 @@ impl GraphClient {
     ) -> Result<T, String> {
         let url = self.api_url(path);
         self.request(&url, "POST", Some(body)).await
+    }
+
+    pub(crate) async fn post_empty(&self, path: &str) -> Result<(), String> {
+        let url = self.api_url(path);
+        let response = self.execute(&url, "POST", None::<&()>).await?;
+        check_response_status(response, "Graph API").await
     }
 
     pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
@@ -192,12 +263,15 @@ impl GraphClient {
             .acquire()
             .await
             .map_err(|_| "Graph request semaphore closed".to_string())?;
+        let account_net = self
+            .account_net()
+            .ok_or_else(|| "Graph client is not attached to an account".to_string())?;
 
         let mut builder = match method {
-            "GET" => self.inner.net.get(url),
-            "POST" => self.inner.net.post(url),
-            "PATCH" => self.inner.net.patch(url),
-            "DELETE" => self.inner.net.delete(url),
+            "GET" => account_net.get(url),
+            "POST" => account_net.post(url),
+            "PATCH" => account_net.patch(url),
+            "DELETE" => account_net.delete(url),
             _ => return Err(format!("Unsupported HTTP method: {method}")),
         };
 
@@ -216,6 +290,13 @@ impl GraphClient {
 
 fn trim_base(base: String) -> String {
     base.trim_end_matches('/').to_string()
+}
+
+fn host_from_api_base(api_base: &str) -> String {
+    reqwest::Url::parse(api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "graph.microsoft.com".to_string())
 }
 
 fn derive_beta_base(api_base: &str) -> Option<String> {
@@ -283,30 +364,6 @@ fn net_error(service: &str, err: bifrost_net::Error) -> String {
     }
 }
 
-fn default_account_net(
-    account: impl Into<String>,
-    host: impl Into<String>,
-    token_source: StaticTokenSource,
-) -> AccountNet {
-    static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    let net = Net::shared_default();
-    let token_source: Arc<dyn TokenSource> = Arc::new(token_source);
-    net.attach_account(
-        AccountId(format!("{}-{id}", account.into())),
-        AccountSpec {
-            hosts: vec![RateLimit {
-                host: host.into(),
-                quota_per_second: 10.0,
-                cost_default: 1,
-                burst: 10,
-            }],
-            token_source,
-            default_retry: RetryPolicy::default(),
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +400,16 @@ mod tests {
         assert_eq!(scoped.api_path_prefix(), "/users/shared%40example.com");
         assert_eq!(scoped.mailbox_id(), Some("shared@example.com"));
         assert!(scoped.is_shared_mailbox());
+    }
+
+    #[test]
+    fn attach_account_uses_engine_account_id() {
+        let client = GraphClient::new("token");
+        client.attach_account(AccountId("engine-account".to_string()));
+        let account_net = client.account_net().expect("account net attached");
+        assert_eq!(
+            account_net.account(),
+            &AccountId("engine-account".to_string())
+        );
     }
 }

@@ -13,6 +13,7 @@ pub(crate) struct ODataCollection<T> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphMailFolder {
     pub(crate) id: String,
+    pub(crate) display_name: Option<String>,
     pub(crate) child_folder_count: Option<i32>,
     pub(crate) parent_folder_id: Option<String>,
 }

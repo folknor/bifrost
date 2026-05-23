@@ -41,6 +41,19 @@ drop when the attach count reaches zero, so five Gmail accounts
 sharing one host bucket survive any one detach but the bucket is
 reclaimed when the last account detaches.
 
+`AccountNet::retag(new_id)` re-mints the handle under a different
+engine `AccountId`. Used by protocol-crate factories whose
+`open(account_id)` needs to honor an engine-minted id when the
+consumer built the `AccountNet` ahead of time via
+`*Client::with_account_net` and the parent `Net` is no longer
+reachable through the client. The meter registers `new_id`,
+`Net`'s per-account host map moves under `new_id` (so a later
+`detach_account(new_id)` is symmetric), and the new handle inherits
+token source, retry policy, priority, and bandwidth cap from the
+old. Governor refcounts are per-host and not touched. The old
+handle keeps working for in-flight clones; it just no longer owns
+the host registrations.
+
 ## Request flow
 
 ```rust
@@ -306,11 +319,16 @@ empty means every host is acceptable; populated means only matching
 hosts are admitted (case-insensitive host comparison per RFC 3986
 §3.2.2) and `Error::RedirectRejected` is returned otherwise.
 `Authorization` headers are stripped on every cross-host hop
-regardless of allowlist membership, so a bearer token never travels
-to a host the original request did not target. `max_hops` (default
-10) caps the chain; `Error::RedirectLoop` surfaces past it. Each
-redirect hop resets the retry counter to 0 - hops are fresh logical
-requests, not retries.
+regardless of allowlist membership, covering both the
+token-source-derived bearer the pipeline injects in `build_reqwest`
+and any caller-set `Authorization` header sitting in the request's
+`HeaderMap` (JMAP Basic-auth, custom HMAC schemes, etc.). The strip
+runs in the redirect loop after `classify_redirect` flags
+`keep_auth: false`, so a credential never travels to a host the
+original request did not target. `max_hops` (default 10) caps the
+chain; `Error::RedirectLoop` surfaces past it. Each redirect hop
+resets the retry counter to 0 - hops are fresh logical requests,
+not retries.
 
 `FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
 to the caller exactly as it did before the loop landed. The

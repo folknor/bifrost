@@ -40,3 +40,12 @@ macro_rules! vacation_setters {
 
 vacation_setters!(VacationResponseCreate);
 vacation_setters!(VacationResponsePatch);
+
+impl VacationResponsePatch {
+    pub(crate) fn null_property(&mut self, property: impl Into<String>) -> &mut Self {
+        self.patch
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(property.into(), serde_json::Value::Null);
+        self
+    }
+}

@@ -20,6 +20,7 @@ pub struct GmailClient {
 
 struct ClientInner {
     net: AccountNet,
+    parent_net: Option<Net>,
     api_base: String,
     token_source: StaticTokenSource,
 }
@@ -33,8 +34,14 @@ impl GmailClient {
     // pub: tests and private deployments can point the direct facade at an alternate API base.
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
         let token_source = StaticTokenSource::new(access_token, None);
-        let net = default_account_net("gmail", "www.googleapis.com", token_source.clone());
-        Self::with_account_net(net, api_base, token_source)
+        let parent_net = Net::shared_default();
+        let net = default_account_net(
+            &parent_net,
+            AccountId("gmail-direct".to_string()),
+            "www.googleapis.com",
+            token_source.clone(),
+        );
+        Self::with_parent_net(net, Some(parent_net), api_base, token_source)
     }
 
     // pub: consumers that need a custom NetConfig can supply the shared AccountNet.
@@ -43,13 +50,54 @@ impl GmailClient {
         api_base: impl Into<String>,
         token_source: StaticTokenSource,
     ) -> Self {
+        Self::with_parent_net(net, None, api_base, token_source)
+    }
+
+    fn with_parent_net(
+        net: AccountNet,
+        parent_net: Option<Net>,
+        api_base: impl Into<String>,
+        token_source: StaticTokenSource,
+    ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 net,
+                parent_net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
                 token_source,
             }),
         }
+    }
+
+    pub(crate) fn for_account(&self, account_id: AccountId) -> Self {
+        if let Some(parent_net) = &self.inner.parent_net {
+            let net = default_account_net(
+                parent_net,
+                account_id,
+                "www.googleapis.com",
+                self.inner.token_source.clone(),
+            );
+            return Self::with_parent_net(
+                net,
+                Some(parent_net.clone()),
+                self.inner.api_base.clone(),
+                self.inner.token_source.clone(),
+            );
+        }
+
+        if self.inner.net.account() == &account_id {
+            return self.clone();
+        }
+        // `with_account_net`-built handles do not carry their own
+        // parent `Net`; retag the existing `AccountNet` so per-account
+        // metering and host bookkeeping move under the engine id.
+        let net = self.inner.net.retag(account_id);
+        Self::with_parent_net(
+            net,
+            None,
+            self.inner.api_base.clone(),
+            self.inner.token_source.clone(),
+        )
     }
 
     // pub: advanced callers can share the Gmail HTTP pipeline instead of building their own.
@@ -238,16 +286,14 @@ fn response_body_string(response: Response) -> String {
 }
 
 fn default_account_net(
-    account: impl Into<String>,
+    net: &Net,
+    account: AccountId,
     host: impl Into<String>,
     token_source: StaticTokenSource,
 ) -> AccountNet {
-    static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
-    let net = Net::shared_default();
     let token_source: Arc<dyn TokenSource> = Arc::new(token_source);
     net.attach_account(
-        AccountId(format!("{}-{id}", account.into())),
+        uniquify_account_id(account),
         AccountSpec {
             hosts: vec![RateLimit {
                 host: host.into(),
@@ -259,6 +305,15 @@ fn default_account_net(
             default_retry: RetryPolicy::default(),
         },
     )
+}
+
+fn uniquify_account_id(account: AccountId) -> AccountId {
+    if account.0 == "gmail-direct" {
+        static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
+        return AccountId(format!("gmail-direct-{id}"));
+    }
+    account
 }
 
 #[cfg(test)]

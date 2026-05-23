@@ -9,6 +9,12 @@ push with a renewal health worker, and an EWS streaming
 notifications fallback for tenants where webhooks are not
 reachable.
 
+The same `Account` impl now owns Graph's Stage 1 PIM action
+surface: message moves and flag/category writes, send/draft
+lifecycle, search, folder CRUD, identities, out-of-office settings,
+and one-shot message/thread hydration. Unsupported Graph gaps are
+advertised explicitly through `pim_methods`.
+
 Graph's change-tracking primitive is per-collection: messages
 deltas are per `mailFolders/{id}/messages`, events deltas are per
 `calendars/{id}`, contacts deltas are per `contactFolders/{id}`.
@@ -51,6 +57,10 @@ concurrency.
 - `mutate.rs` - `bulk_set_flags` / `bulk_move` / `bulk_destroy`
   over `$batch` with `If-Match` and a `Retry-After`-aware
   throttle path.
+- `pim.rs` - Stage 1 PIM primitives and Graph-specific
+  conveniences: message move / read / category / extended-property
+  writes, send/drafts, search, mail folder CRUD, identity snapshot,
+  automatic replies, and typed hydration.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
   attachments (`/messages/{id}/attachments/{aid}/$value`),
   including the reference-attachment short-circuit.
@@ -68,10 +78,12 @@ and stores the webhook URL; `with_ews_streaming()` selects
 factory shape is webhook-mode without an endpoint, in which case
 `push_subscribe` returns `Error::MissingCoreCapability`.
 
-`AccountFactory::open` performs a `users/me`-shaped profile
-fetch (`get_profile`) to validate the access token, constructs a
-`GraphAccount`, then runs `list_mail_folders_recursive` to seed
-the in-memory `FolderTree`. The factory does not pre-seed
+`AccountFactory::open(account_id)` first attaches the `GraphClient`
+to `bifrost-net` under the engine-provided `AccountId`, then
+performs a `users/me`-shaped profile fetch (`get_profile`) to
+validate the access token, constructs a `GraphAccount`, and runs
+`list_mail_folders_recursive` to seed the in-memory `FolderTree`.
+The factory does not pre-seed
 cursors; cursors are minted lazily from `establish_initial_cursor`
 plus the first `inventory_stream` page. The factory returns
 `Arc<dyn Account>`.
@@ -156,6 +168,19 @@ that selects against the same shutdown token.
 - `delta_token_expires_after: None`. Microsoft documents no fixed
   delta-token lifetime; expiry is handled reactively when the
   next call returns 410 Gone or a 400 InvalidDeltaToken.
+- `pim_methods`: true for `add_to_container`, `set_category`,
+  `set_extended_property`, `set_is_read`, send/draft lifecycle,
+  search, mail folder CRUD, `identities_list`, vacation get/set,
+  and typed thread/message hydration. False for
+  `remove_from_container`, `set_keyword`, `set_label_membership`,
+  standalone `attachment_upload`, `identity_update`, and
+  `quota_get`.
+- `conveniences`: `starred = Category`, implemented by treating the
+  reserved `$flagged` category input as Graph `flag.flagStatus`.
+  Replied and forwarded conveniences dispatch to
+  `set_extended_property` with `PidTagLastVerbExecuted`
+  (`Integer 0x1081`) values 102 and 104. Keyword-backed replied /
+  forwarded flags are false.
 
 ## Cursor envelope
 
@@ -407,6 +432,70 @@ not forwarded on the wire (Graph has no documented client
 idempotency token), matching the
 `MutationReplaySafety::None` capability.
 
+## PIM primitives
+
+Mail mutation primitives live in `pim.rs` and use per-message Graph
+operations, fanning out a `MutationTarget::Thread` by querying
+`/messages?$filter=conversationId eq ...`. `add_to_container` is
+Graph's `POST /messages/{id}/move`; Graph has no symmetric
+remove-from-folder operation, so `remove_from_container` is
+unsupported. `set_is_read` patches `isRead`. `set_category` patches
+`categories[]`, except the reserved `$flagged` / `flagged` /
+`starred` inputs patch `flag.flagStatus`. `set_extended_property`
+patches `singleValueExtendedProperties` when the value is `Some`;
+the clear path (`value: None`) issues a batched
+`DELETE /messages/{id}/singleValueExtendedProperties/<prop-id>` and
+tolerates 404 so partial / never-set states resolve to `Ok`. The
+convenience alias `PR_LAST_VERB_EXECUTED` maps to `Integer 0x1081`.
+These writes send `If-Match` when Graph exposes `changeKey`.
+
+Send and draft lifecycle use draft-backed Graph mail APIs so the
+trait can return an object id: create a draft with `POST /messages`,
+send it with `POST /messages/{id}/send`, and return the draft id.
+`send_message` follows that same path. Inline file attachments are
+encoded into Graph `fileAttachment` JSON. Standalone
+`attachment_upload` is unsupported because Graph upload sessions are
+message/draft scoped, not account scoped. `draft_update` patches the
+draft's mutable message fields; attachment replacement in updates is
+unsupported.
+
+Search uses `/messages` with `$filter`, `$search`, `$top`, and
+Graph's `@odata.nextLink` as the opaque page cursor. Message search
+returns native message ids. Thread search deduplicates
+`conversationId` values from the same result page.
+
+Container CRUD maps to mail folders only. `containers_list` returns
+native Graph folder ids with `Provenance { provider: Graph, kind:
+Folder, native }`, refreshes the in-memory folder tree, and maps
+well-known folders by fetching `inbox`, `sentItems`, `drafts`,
+`deletedItems`, `junkEmail`, and `archive`. User folders remain
+role-less. Create / rename / move / delete call the corresponding
+`mailFolders` endpoints; root moves use the `msgfolderroot`
+well-known destination.
+
+Settings support is intentionally narrow. `identities_list` returns
+the primary `me` profile as one default identity. Graph does not
+expose a writable send-as/signature surface here, so
+`identity_update` is unsupported. Vacation get/set maps to
+`mailboxSettings.automaticRepliesSetting`. `quota_get` is
+unsupported because the mail API does not expose a stable mailbox
+quota resource.
+
+Typed hydration is separate from the sync engine's `get_stream`.
+`message_hydrate` fetches a single message at the requested
+projection and maps Graph recipients, body, flags, parent folder,
+thread id, headers, and attachment handles into
+`bifrost_types::Message`. `thread_hydrate` queries all messages in a
+conversation and returns them sorted by message date.
+
+`move_thread` overrides the default to call Graph move directly
+(move already removes the source folder). `delete_thread` resolves
+Trash through `deletedItems`; a current Trash source destroys
+messages, else they move to Trash. `apply_label` / `remove_label`
+inherit the trait default, which routes Graph provenance to
+`set_category` and `(Folder, non-Graph)` to `add_to_container` /
+`remove_from_container`; everything else surfaces as `Unsupported`.
+
 ## Blobs
 
 `open_blob` decodes the `BlobHandle::id` (a JSON
@@ -507,8 +596,19 @@ referenceAttachment in a mixed batch.
   the API surface but not transmitted; the engine's read-back
   guard is the only lost-update protection beyond the
   `If-Match` etag gate.
-- `recovery_for_graph_error` is a substring-matching classifier
-  because the underlying `GraphClient` returns `Result<T, String>`
-  end-to-end. Reconciling onto a structured `status: u16` error
-  type is Phase 4 (error model convergence) work, not a local
-  follow-up.
+- `remove_from_container`, keyword writes, Gmail-style label
+  membership, standalone `attachment_upload`, `identity_update`, and
+  `quota_get` are unsupported and flagged false in `pim_methods`.
+- `send_message` / `draft_send` return the draft id because the
+  send actions answer `202 Accepted` with no body. Callers needing
+  the final Sent Items id rediscover it through sync or search.
+- `draft_update` does not replace attachments; Graph attachment
+  upload sessions need a larger primitive than Stage 1 exposes.
+- `send_message` / `draft_create` / `draft_update` accept inline
+  attachments embedded in the request (base64 `fileAttachment` via
+  `graph_attachment_from_inline`) but reject pre-uploaded
+  `AttachmentHandle`s with `Unsupported`, mirroring
+  `attachment_upload` itself.
+- `recovery_for_graph_error` is substring-based because
+  `GraphClient` returns `Result<T, String>`; structured-error
+  convergence is S1-W4 (error model) work.

@@ -2,12 +2,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_net::Response;
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, Net, NetConfig, Priority, RateLimit, RetryPolicy,
+    AccountId, AccountNet, AccountSpec, FollowRedirects, Net, NetConfig, Priority, RateLimit,
+    RedirectPolicy, RetryPolicy,
 };
 use bytes::Bytes;
-use reqwest::Url;
 use reqwest::header;
 
 use crate::client::Authorization;
@@ -23,22 +22,23 @@ pub struct ReqwestTransport {
     headers: header::HeaderMap,
     authorization: Authorization,
     timeout: Duration,
-    trusted_hosts: Arc<HashSet<String>>,
 }
 
 impl ReqwestTransport {
     pub(crate) fn new(
         headers: header::HeaderMap,
         authorization: Authorization,
+        account_id: AccountId,
         timeout: Duration,
         accept_invalid_certs: bool,
         trusted_hosts: Arc<HashSet<String>>,
     ) -> Result<Self, TransportError> {
+        let redirect_policy = redirect_policy_from_trusted_hosts(&trusted_hosts);
         let config = NetConfig {
             connect_timeout: timeout,
             dangerous_accept_invalid_certs: accept_invalid_certs,
             user_agent: concat!("bifrost-jmap/", env!("CARGO_PKG_VERSION")).to_string(),
-            follow_redirects: false,
+            follow_redirects: FollowRedirects::Enabled(redirect_policy),
             ..NetConfig::default()
         };
         let net = Net::new(config)
@@ -46,7 +46,7 @@ impl ReqwestTransport {
         let token_source: Arc<dyn bifrost_net::TokenSource> =
             Arc::new(authorization.account_token_source());
         let net = net.attach_account(
-            AccountId("jmap".to_string()),
+            account_id,
             AccountSpec {
                 hosts: Vec::<RateLimit>::new(),
                 token_source,
@@ -59,7 +59,6 @@ impl ReqwestTransport {
             headers,
             authorization,
             timeout,
-            trusted_hosts,
         })
     }
 
@@ -78,47 +77,8 @@ impl ReqwestTransport {
         body: Option<Bytes>,
         content_type: Option<&str>,
     ) -> Result<Bytes, TransportError> {
-        let mut current_url = url.to_string();
-        let original_host = host_of(url)?;
-        for redirect_count in 0..=5 {
-            let include_auth = host_of(&current_url)? == original_host;
-            let response = self
-                .send_once(
-                    method,
-                    &current_url,
-                    body.clone(),
-                    content_type,
-                    include_auth,
-                )
-                .await?;
-            if !response.status.is_redirection() {
-                return Self::handle_response(response.status, response.body);
-            }
-
-            if redirect_count == 5 {
-                return Err(TransportError::new("Too many redirects."));
-            }
-
-            let location = response
-                .headers
-                .get(header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| {
-                    TransportError::new(format!(
-                        "Redirect from {current_url} omitted Location header"
-                    ))
-                })?;
-            let next = redirect_url(&current_url, location)?;
-            let next_host = next.host_str().unwrap_or("");
-            if !self.trusted_hosts.contains(next_host) {
-                return Err(TransportError::new(format!(
-                    "Aborting redirect to unknown host '{next_host}'."
-                )));
-            }
-            current_url = next.to_string();
-        }
-
-        Err(TransportError::new("Too many redirects."))
+        let response = self.send_once(method, url, body, content_type).await?;
+        Self::handle_response(response.status, response.body)
     }
 
     async fn send_once(
@@ -127,8 +87,7 @@ impl ReqwestTransport {
         url: &str,
         body: Option<Bytes>,
         content_type: Option<&str>,
-        include_auth: bool,
-    ) -> Result<Response, TransportError> {
+    ) -> Result<bifrost_net::Response, TransportError> {
         let mut request = match method {
             "GET" => self.net.get(url),
             "POST" => self.net.post(url),
@@ -145,9 +104,7 @@ impl ReqwestTransport {
             })?;
             request = request.header(name.as_str(), value);
         }
-        if !include_auth {
-            request = request.without_bearer_auth();
-        } else if self.authorization.uses_bearer_pipeline() {
+        if self.authorization.uses_bearer_pipeline() {
             // AccountNet injects the bearer token from its
             // StaticTokenSource.
         } else {
@@ -216,75 +173,42 @@ impl SseTransport for ReqwestTransport {
         url: &str,
         last_event_id: Option<&str>,
     ) -> Result<Self::ByteStream, TransportError> {
-        let mut current_url = url.to_string();
-        let original_host = host_of(url)?;
-        for redirect_count in 0..=5 {
-            let include_auth = host_of(&current_url)? == original_host;
-            let mut request = self
-                .net
-                .get(&current_url)
-                .header(header::ACCEPT.as_str(), "text/event-stream")
-                .timeout(self.timeout);
-            for (name, value) in &self.headers {
-                let value = value.to_str().map_err(|e| {
-                    TransportError::with_source(
-                        format!("Invalid default header value for {name}"),
-                        e,
-                    )
-                })?;
-                request = request.header(name.as_str(), value);
-            }
-            if !include_auth {
-                request = request.without_bearer_auth();
-            } else if self.authorization.uses_bearer_pipeline() {
-            } else {
-                let value = self.authorization.header_value();
-                request = request
-                    .without_bearer_auth()
-                    .header(header::AUTHORIZATION.as_str(), &value);
-            }
-            if let Some(id) = last_event_id {
-                request = request.header("Last-Event-ID", id);
-            }
-            let response = request
-                .send_streaming()
-                .await
-                .map_err(transport_error_from_net)?;
-
-            if response.status().is_success() {
-                return Ok(ReqwestByteStream {
-                    inner: response.body,
-                });
-            }
-            if !response.status().is_redirection() {
-                return Err(TransportError::new(format!(
-                    "SSE: HTTP {}",
-                    response.status()
-                )));
-            }
-            if redirect_count == 5 {
-                return Err(TransportError::new("Too many redirects."));
-            }
-            let location = response
-                .headers
-                .get(header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .ok_or_else(|| {
-                    TransportError::new(format!(
-                        "Redirect from {current_url} omitted Location header"
-                    ))
-                })?;
-            let next = redirect_url(&current_url, location)?;
-            let next_host = next.host_str().unwrap_or("");
-            if !self.trusted_hosts.contains(next_host) {
-                return Err(TransportError::new(format!(
-                    "Aborting redirect to unknown host '{next_host}'."
-                )));
-            }
-            current_url = next.to_string();
+        let mut request = self
+            .net
+            .get(url)
+            .header(header::ACCEPT.as_str(), "text/event-stream")
+            .timeout(self.timeout);
+        for (name, value) in &self.headers {
+            let value = value.to_str().map_err(|e| {
+                TransportError::with_source(format!("Invalid default header value for {name}"), e)
+            })?;
+            request = request.header(name.as_str(), value);
         }
+        if self.authorization.uses_bearer_pipeline() {
+        } else {
+            let value = self.authorization.header_value();
+            request = request
+                .without_bearer_auth()
+                .header(header::AUTHORIZATION.as_str(), &value);
+        }
+        if let Some(id) = last_event_id {
+            request = request.header("Last-Event-ID", id);
+        }
+        let response = request
+            .send_streaming()
+            .await
+            .map_err(transport_error_from_net)?;
 
-        Err(TransportError::new("Too many redirects."))
+        if response.status().is_success() {
+            Ok(ReqwestByteStream {
+                inner: response.body,
+            })
+        } else {
+            Err(TransportError::new(format!(
+                "SSE: HTTP {}",
+                response.status()
+            )))
+        }
     }
 }
 
@@ -321,24 +245,14 @@ fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
     }
 }
 
-fn host_of(url: &str) -> Result<String, TransportError> {
-    let url = Url::parse(url).map_err(|error| {
-        TransportError::with_source(format!("Invalid URL for redirect policy: {url}"), error)
-    })?;
-    Ok(url.host_str().unwrap_or("").to_string())
-}
-
-fn redirect_url(current_url: &str, location: &str) -> Result<Url, TransportError> {
-    let current = Url::parse(current_url).map_err(|error| {
-        TransportError::with_source(
-            format!("Invalid current URL for redirect: {current_url}"),
-            error,
-        )
-    })?;
-    current.join(location).map_err(|error| {
-        TransportError::with_source(
-            format!("Invalid redirect Location header: {location}"),
-            error,
-        )
-    })
+fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> RedirectPolicy {
+    let mut policy = RedirectPolicy::with_hops(5);
+    if trusted_hosts.is_empty() {
+        policy = policy.trust_host("__bifrost_jmap_no_cross_host_redirects__");
+    } else {
+        for host in trusted_hosts {
+            policy = policy.trust_host(host);
+        }
+    }
+    policy
 }

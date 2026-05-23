@@ -121,6 +121,20 @@ impl ImapConfig {
             .await?;
         Ok((conn, outcome))
     }
+
+    pub(crate) async fn connect_authenticated_metered(
+        &self,
+        credentials: &crate::types::Credentials,
+        policy: &crate::types::AuthPolicy,
+        meter_sink: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_cap: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<(ImapConnection, crate::types::AuthOutcome), Error> {
+        let conn = ImapConnection::connect_config_metered(self, meter_sink, bandwidth_cap).await?;
+        let outcome = conn
+            .authenticate_best(credentials, policy, self.command_timeout)
+            .await?;
+        Ok((conn, outcome))
+    }
 }
 
 impl std::fmt::Debug for ImapConfig {
@@ -145,21 +159,34 @@ impl ImapConnection {
     ///
     /// Direct API counterpart to the Account factory's pool dial path.
     pub async fn connect_config(config: &ImapConfig) -> Result<Self, Error> {
+        Self::connect_config_metered(config, None, None).await
+    }
+
+    pub(crate) async fn connect_config_metered(
+        config: &ImapConfig,
+        meter_sink: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_cap: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<Self, Error> {
         let conn = if let Some(connector) = &config.tls_connector {
-            Self::connect_with_tls_connector(
+            Self::connect_with_tls_connector_metered(
                 &config.host,
                 config.port,
                 config.tls_mode,
                 connector.clone(),
                 config.connect_timeout,
+                meter_sink,
+                bandwidth_cap,
             )
             .await?
         } else {
-            Self::connect(
+            Self::connect_with_tls_connector_metered(
                 &config.host,
                 config.port,
                 config.tls_mode,
+                build_default_tls_connector()?,
                 config.connect_timeout,
+                meter_sink,
+                bandwidth_cap,
             )
             .await?
         };

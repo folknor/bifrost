@@ -5,6 +5,7 @@ use super::{
 use crate::core::id::BlobId;
 use crate::core::{request::ResultReference, set::from_timestamp};
 use crate::mailbox::MailboxId;
+use serde::Serialize;
 use std::collections::HashMap;
 
 impl EmailCreate {
@@ -232,6 +233,24 @@ impl EmailPatch {
 
     pub fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
         self.subject = Some(subject.into());
+        self
+    }
+
+    pub(crate) fn raw_property<T: Serialize>(
+        &mut self,
+        property: impl Into<String>,
+        value: &T,
+    ) -> serde_json::Result<&mut Self> {
+        self.patch
+            .get_or_insert_with(HashMap::new)
+            .insert(property.into(), serde_json::to_value(value)?);
+        Ok(self)
+    }
+
+    pub(crate) fn null_property(&mut self, property: impl Into<String>) -> &mut Self {
+        self.patch
+            .get_or_insert_with(HashMap::new)
+            .insert(property.into(), serde_json::Value::Null);
         self
     }
 }

@@ -2,6 +2,7 @@ use super::{
     Address, EmailSubmissionCreate, EmailSubmissionPatch, EmailSubmissionSet, Envelope,
     SetArguments, UndoStatus,
 };
+use crate::core::request::ResultReference;
 use crate::email::{EmailId, EmailPatch};
 use crate::identity::IdentityId;
 use std::collections::HashMap;
@@ -14,6 +15,13 @@ impl EmailSubmissionCreate {
 
     pub fn email_id(&mut self, email_id: impl Into<EmailId>) -> &mut Self {
         self.email_id = Some(email_id.into());
+        self.email_id_ref = None;
+        self
+    }
+
+    pub fn email_id_ref(&mut self, reference: ResultReference) -> &mut Self {
+        self.email_id = None;
+        self.email_id_ref = Some(reference);
         self
     }
 

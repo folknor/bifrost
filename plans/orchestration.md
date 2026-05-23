@@ -126,7 +126,8 @@ remain alongside them.
   except their factory and config types - `Account` becomes the
   only bifrost public API. Full spec in `plans/unification.md`;
   absorbs the previously-deferred Phase 4 (error model
-  convergence) as Stage 1 Wave 4.
+  convergence) as Stage 1 Wave 4. **Stage 1 W1 + W2 merged**; W3
+  (`pub(crate)` contraction) and W4 (error convergence) remain.
 - **Phase 4: Error model convergence.** Absorbed into Phase 3.6
   Stage 1 Wave 4. The open-question framing in
   `plans/error-model-convergence.md` is now resolved by the

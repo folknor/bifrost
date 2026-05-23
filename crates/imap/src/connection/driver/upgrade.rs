@@ -84,7 +84,9 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     // before TLS was established.
     // No .await between this check and the mem::replace below.
     if !wire_reader.buffer_is_empty() {
-        *wire_reader = super::super::wire::WireReader::new(ImapStream::Poisoned);
+        let metering = wire_reader.metering();
+        *wire_reader =
+            super::super::wire::WireReader::with_metering(ImapStream::Poisoned, metering);
         state.apply_infrastructure_failure();
         return Err(Error::Protocol(
             "STARTTLS: unexpected bytes in buffer at upgrade boundary \
@@ -96,9 +98,10 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     // Step 3: Atomic swap. Replace the reader with one on a Poisoned
     // stream. The old reader is consumed, its buffer is dropped, and
     // we get the old stream back (I10).
+    let metering = wire_reader.metering();
     let old_reader = std::mem::replace(
         wire_reader,
-        super::super::wire::WireReader::new(ImapStream::Poisoned),
+        super::super::wire::WireReader::with_metering(ImapStream::Poisoned, metering.clone()),
     );
     let old_stream = old_reader.into_stream();
     let Some(tcp) = old_stream.into_tcp() else {
@@ -127,7 +130,8 @@ pub(in crate::connection) async fn run_starttls_upgrade(
     // Step 5: Install a fresh WireReader on the new TLS stream.
     // The reader has a fresh empty buffer; the old buffer was
     // dropped with old_reader in Step 3 (I10).
-    *wire_reader = super::super::wire::WireReader::new(ImapStream::Tls(tls_stream));
+    *wire_reader =
+        super::super::wire::WireReader::with_metering(ImapStream::Tls(tls_stream), metering);
 
     // Step 6: Re-read capabilities after TLS upgrade (RFC 3501 Section6.2.1).
     state.apply_capability_fetch(Vec::new());
@@ -185,9 +189,10 @@ async fn run_compress_upgrade(
     let remaining = wire_reader.take_buffer();
 
     // Step 3: Atomic swap with Poisoned sentinel.
+    let metering = wire_reader.metering();
     let old_reader = std::mem::replace(
         wire_reader,
-        super::super::wire::WireReader::new(ImapStream::Poisoned),
+        super::super::wire::WireReader::with_metering(ImapStream::Poisoned, metering.clone()),
     );
     let old_stream = old_reader.into_stream();
 
@@ -226,7 +231,8 @@ async fn run_compress_upgrade(
     if !remaining.is_empty() {
         compressed.raw_read_buf.extend_from_slice(&remaining);
     }
-    *wire_reader = super::super::wire::WireReader::new(ImapStream::Compressed(compressed));
+    *wire_reader =
+        super::super::wire::WireReader::with_metering(ImapStream::Compressed(compressed), metering);
 
     debug!("COMPRESS=DEFLATE activated (RFC 4978)");
     Ok(())

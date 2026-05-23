@@ -624,9 +624,10 @@ pub trait AccountFactory: Send + Sync + 'static {
 /// `Provenance::kind` (Folder | Label) is the load-bearing signal:
 /// a label-kind id under Gmail's provider is a label-membership
 /// flip; under JMAP / IMAP it is a keyword flip; under Graph it is
-/// a category. Folder-kind ids are container-membership flips
-/// (Graph maps to categories when the consumer wants the same
-/// behaviour with a category id).
+/// a category (Graph categories are the closest analog to labels,
+/// and Graph cannot express IMAP keywords). Folder-kind ids are
+/// container-membership flips for everyone except Graph, which
+/// uses categories for its folder-shaped labels too.
 fn dispatch_label<T: Account + ?Sized>(
     receiver: &T,
     target: MutationTarget,
@@ -637,6 +638,9 @@ fn dispatch_label<T: Account + ?Sized>(
     match (label.provenance.kind, label.provenance.provider) {
         (ContainerKind::Label, ProtocolKind::Gmail) => {
             receiver.set_label_membership(target, label.id, value)
+        }
+        (ContainerKind::Label, ProtocolKind::Graph) => {
+            receiver.set_category(target, label.provenance.native, value)
         }
         (ContainerKind::Label, _) => receiver.set_keyword(target, label.provenance.native, value),
         (ContainerKind::Folder, ProtocolKind::Graph) => {

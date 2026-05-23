@@ -504,6 +504,56 @@ impl AccountNet {
     pub(crate) fn net(&self) -> &Net {
         &self.inner.net
     }
+
+    /// Re-mint this `AccountNet` under a new engine `AccountId`.
+    ///
+    /// The returned handle shares the same parent `Net`, token
+    /// source, default retry policy, priority hint, and bandwidth
+    /// cap. Used by protocol-crate factories that need to honor
+    /// `AccountFactory::open(account_id)` when the caller built the
+    /// `AccountNet` via `Net::attach_account` ahead of time
+    /// (`*Client::with_account_net`) and the engine-minted id arrives
+    /// only at open time. Idempotent: `retag(self.account())` is a
+    /// cheap rebuild that re-registers the same id on the meter.
+    ///
+    /// Bookkeeping:
+    ///
+    /// - The bandwidth meter registers the new id so per-account
+    ///   counters exist before any request lands.
+    /// - The per-account host registrations in `Net` move from the
+    ///   old id to the new id so `Net::detach_account(new_id)`
+    ///   unregisters host buckets symmetrically when the engine
+    ///   eventually drops the account. Governor refcounts are
+    ///   per-host and unchanged by the rename.
+    /// - The old `AccountNet` clone the caller holds keeps working
+    ///   for in-flight requests but no longer owns the host
+    ///   registrations; dropping it and calling `detach_account` on
+    ///   the old id is a no-op afterwards. The new handle is the
+    ///   one engine code should propagate forward.
+    #[must_use]
+    pub fn retag(&self, new_id: AccountId) -> AccountNet {
+        let net_inner = &self.inner.net.inner;
+        net_inner.meter.register_account(new_id.clone());
+        if new_id != self.inner.account {
+            let mut map = net_inner
+                .account_hosts
+                .lock()
+                .expect("net account_hosts lock poisoned");
+            if let Some(hosts) = map.remove(&self.inner.account) {
+                map.insert(new_id.clone(), hosts);
+            }
+        }
+        AccountNet {
+            inner: Arc::new(AccountNetInner {
+                net: self.inner.net.clone(),
+                account: new_id,
+                token_source: Arc::clone(&self.inner.token_source),
+                default_retry: self.inner.default_retry.clone(),
+                priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
+                bandwidth_cap: AtomicU64::new(self.inner.bandwidth_cap.load(Ordering::Relaxed)),
+            }),
+        }
+    }
 }
 
 /// Caller-supplied spec describing how `Net::attach_account` should

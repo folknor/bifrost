@@ -57,7 +57,11 @@ enum StreamLoopExit {
 }
 
 pub(crate) async fn run_streaming_worker(account: GraphAccount) {
-    let ews = EwsClient::new(account.client.account_net().clone());
+    let Some(account_net) = account.client.account_net() else {
+        tracing::warn!("[Graph EWS] Streaming worker started before account attach");
+        return;
+    };
+    let ews = EwsClient::new(account_net);
     let mut disconnected = false;
 
     loop {

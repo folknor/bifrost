@@ -6,6 +6,11 @@
 //! itself is only called by the connection constructor and the stream
 //! upgrade handler.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use bifrost_net::MeterSinkHandle;
 use bytes::BytesMut;
 use tracing::{trace, warn};
 
@@ -24,6 +29,7 @@ use super::ImapStream;
 pub(crate) struct WireReader {
     stream: ImapStream,
     buf: BytesMut,
+    metering: WireMetering,
 }
 
 impl WireReader {
@@ -31,11 +37,37 @@ impl WireReader {
     /// parse buffer (RFC 3501 Section2.2.2  -  responses are line-oriented, so
     /// 8 KiB covers the vast majority of single-response reads without
     /// reallocation).
+    #[cfg(test)]
     pub(super) fn new(stream: ImapStream) -> Self {
         Self {
             stream,
             buf: BytesMut::with_capacity(8 * 1024),
+            metering: WireMetering::disabled(),
         }
+    }
+
+    pub(super) fn new_metered(
+        stream: ImapStream,
+        sink: Option<MeterSinkHandle>,
+        bandwidth_cap: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::with_capacity(8 * 1024),
+            metering: WireMetering::new(sink, bandwidth_cap),
+        }
+    }
+
+    pub(super) fn with_metering(stream: ImapStream, metering: WireMetering) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::with_capacity(8 * 1024),
+            metering,
+        }
+    }
+
+    pub(super) fn metering(&self) -> WireMetering {
+        self.metering.clone()
     }
 
     /// Read and parse a single IMAP response from the wire.
@@ -62,6 +94,7 @@ impl WireReader {
             if n == 0 {
                 return Err(Error::Closed);
             }
+            self.metering.record_in(n).await;
         }
     }
 
@@ -79,14 +112,17 @@ impl WireReader {
             if n == 0 {
                 return Err(Error::Closed);
             }
+            self.metering.record_in(n).await;
         }
     }
 
     /// Write raw bytes to the wire. Used by command encoders.
     /// Does not read. Does not parse. Does not mutate buf.
     pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.metering.throttle_out(bytes.len()).await;
         self.stream.write_all(bytes).await?;
         self.stream.flush().await?;
+        self.metering.record_out(bytes.len());
         Ok(())
     }
 
@@ -207,6 +243,120 @@ impl WireReader {
                 warn!("response parse error: {e}");
                 Err(Error::Parse(format!("response parse error: {e}")))
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct WireMetering {
+    sink: Option<MeterSinkHandle>,
+    bandwidth_cap: Option<Arc<AtomicU64>>,
+    in_bucket: ByteBucket,
+    out_bucket: ByteBucket,
+}
+
+impl WireMetering {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self::new(None, None)
+    }
+
+    fn new(sink: Option<MeterSinkHandle>, bandwidth_cap: Option<Arc<AtomicU64>>) -> Self {
+        let initial_cap = bandwidth_cap
+            .as_ref()
+            .and_then(|cap| bandwidth_cap_from_raw(cap.load(Ordering::Relaxed)));
+        Self {
+            sink,
+            bandwidth_cap,
+            in_bucket: ByteBucket::new(initial_cap),
+            out_bucket: ByteBucket::new(initial_cap),
+        }
+    }
+
+    async fn record_in(&self, n: usize) {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        if let Some(sink) = &self.sink {
+            sink.record_bytes_in(n);
+        }
+        if self.bandwidth_cap.is_some() {
+            self.in_bucket.consume(n, self.cap_now()).await;
+        }
+    }
+
+    async fn throttle_out(&self, n: usize) {
+        if self.bandwidth_cap.is_some() {
+            let n = u64::try_from(n).unwrap_or(u64::MAX);
+            self.out_bucket.consume(n, self.cap_now()).await;
+        }
+    }
+
+    fn record_out(&self, n: usize) {
+        if let Some(sink) = &self.sink {
+            sink.record_bytes_out(u64::try_from(n).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn cap_now(&self) -> Option<u64> {
+        self.bandwidth_cap
+            .as_ref()
+            .and_then(|cap| bandwidth_cap_from_raw(cap.load(Ordering::Relaxed)))
+    }
+}
+
+fn bandwidth_cap_from_raw(raw: u64) -> Option<u64> {
+    (raw != u64::MAX).then_some(raw.max(1))
+}
+
+#[derive(Clone)]
+struct ByteBucket {
+    state: Arc<Mutex<ByteBucketState>>,
+}
+
+struct ByteBucketState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl ByteBucket {
+    fn new(cap: Option<u64>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ByteBucketState {
+                tokens: cap.map_or(0.0, |cap| cap as f64),
+                last_refill: Instant::now(),
+            })),
+        }
+    }
+
+    async fn consume(&self, n: u64, cap: Option<u64>) {
+        let Some(cap) = cap else { return };
+        if cap == 0 || n == 0 {
+            return;
+        }
+        let cap_f = cap as f64;
+        let want = n as f64;
+        if n > cap {
+            let secs = (want / cap_f).min(60.0);
+            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+            let mut state = self.state.lock().expect("byte bucket lock poisoned");
+            state.tokens = 0.0;
+            state.last_refill = Instant::now();
+            return;
+        }
+        loop {
+            let wait = {
+                let mut state = self.state.lock().expect("byte bucket lock poisoned");
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * cap_f).min(cap_f);
+                state.last_refill = now;
+                if state.tokens >= want {
+                    state.tokens -= want;
+                    return;
+                }
+                let deficit = want - state.tokens;
+                Duration::from_secs_f64((deficit / cap_f).min(60.0))
+            };
+            tokio::time::sleep(wait).await;
         }
     }
 }

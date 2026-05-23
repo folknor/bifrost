@@ -1,6 +1,6 @@
 use bifrost_types::{
     BlobId, ChangeCursor, CursorScope, Error as AccountError, ObjectId, OpaqueChangeState,
-    ProtocolKind,
+    ProtocolKind, ThreadId,
 };
 
 use crate::types::MailboxName;
@@ -264,6 +264,13 @@ pub(crate) struct DecodedBlobId {
     pub(crate) section: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedThreadId {
+    pub(crate) folder: MailboxName,
+    pub(crate) uidvalidity: u32,
+    pub(crate) uids: Vec<u32>,
+}
+
 pub(crate) fn encode_object_id(folder: &MailboxName, uidvalidity: u32, uid: u32) -> ObjectId {
     ObjectId(format!(
         "imap1:{}:{}:{}:{}",
@@ -321,6 +328,48 @@ pub(crate) fn decode_blob_id(id: &BlobId) -> Result<DecodedBlobId, AccountError>
         uidvalidity,
         uid,
         section,
+    })
+}
+
+pub(crate) fn encode_thread_id(folder: &MailboxName, uidvalidity: u32, uids: &[u32]) -> ThreadId {
+    let mut uids = uids.to_vec();
+    uids.sort_unstable();
+    uids.dedup();
+    let uid_list = uids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    ThreadId(format!(
+        "imapthread1:{}:{}:{}:{}",
+        folder.as_str().len(),
+        folder.as_str(),
+        uidvalidity,
+        uid_list
+    ))
+}
+
+pub(crate) fn decode_thread_id(id: &ThreadId) -> Result<DecodedThreadId, AccountError> {
+    let (folder, rest) = decode_len_prefixed("imapthread1", &id.0)?;
+    let mut parts = rest.splitn(2, ':');
+    let uidvalidity = parse_u32(parts.next())?;
+    let uid_part = parts
+        .next()
+        .ok_or_else(|| AccountError::Other("missing IMAP thread uid set".into()))?;
+    let mut uids = Vec::new();
+    for uid in uid_part.split(',').filter(|part| !part.is_empty()) {
+        uids.push(
+            uid.parse::<u32>()
+                .map_err(|_| AccountError::Other("invalid IMAP thread uid".into()))?,
+        );
+    }
+    if uids.is_empty() {
+        return Err(AccountError::Other("empty IMAP thread uid set".into()));
+    }
+    Ok(DecodedThreadId {
+        folder,
+        uidvalidity,
+        uids,
     })
 }
 
@@ -469,5 +518,15 @@ mod tests {
         let decoded = decode_blob_id(&blob).expect("blob id");
         assert_eq!(decoded.folder, folder);
         assert_eq!(decoded.section.as_deref(), Some("2.1"));
+    }
+
+    #[test]
+    fn thread_id_tolerates_colons_in_folder_names() {
+        let folder = MailboxName::new("Work:Clients").expect("valid folder");
+        let id = encode_thread_id(&folder, 10, &[3, 1, 3]);
+        let decoded = decode_thread_id(&id).expect("thread id");
+        assert_eq!(decoded.folder, folder);
+        assert_eq!(decoded.uidvalidity, 10);
+        assert_eq!(decoded.uids, vec![1, 3]);
     }
 }

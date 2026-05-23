@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, Error,
-    MutationCapabilities, MutationConcurrency, MutationReplaySafety, PushCapability, QuotaSignal,
-    RateLimitClass,
+    AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
+    Error, MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
 use crate::core::session::Session;
@@ -14,7 +14,17 @@ pub(crate) struct CoreLimits {
     pub(crate) max_objects_in_set: usize,
 }
 
-pub(crate) fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimits), Error> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PimSupport {
+    pub(crate) submission: bool,
+    pub(crate) vacation: bool,
+    pub(crate) quota: bool,
+}
+
+pub(crate) fn build(
+    session: &Session,
+    support: PimSupport,
+) -> Result<(AccountCapabilities, CoreLimits), Error> {
     let core = session
         .core_capabilities()
         .ok_or(Error::MissingCoreCapability)?;
@@ -57,6 +67,42 @@ pub(crate) fn build(session: &Session) -> Result<(AccountCapabilities, CoreLimit
         requires_uidvalidity_recheck: false,
         historyid_expires_after: None,
         delta_token_expires_after: None,
+        pim_methods: PimMethodSupport {
+            add_to_container: true,
+            remove_from_container: true,
+            set_keyword: true,
+            set_label_membership: false,
+            set_category: false,
+            set_extended_property: false,
+            set_is_read: true,
+            send_message: support.submission,
+            attachment_upload: true,
+            draft_create: true,
+            draft_update: true,
+            draft_discard: true,
+            draft_send: support.submission,
+            search: true,
+            search_messages: true,
+            containers_list: true,
+            container_create: true,
+            container_rename: true,
+            container_move: true,
+            container_delete: true,
+            identities_list: support.submission,
+            identity_update: support.submission,
+            vacation_get: support.vacation,
+            vacation_set: support.vacation,
+            quota_get: support.quota,
+            thread_hydrate: true,
+            message_hydrate: true,
+        },
+        conveniences: ConvenienceShape {
+            starred: StarredFlagShape::Keyword,
+            replied_via_keyword: true,
+            replied_via_extended_property: false,
+            forwarded_via_keyword: true,
+            forwarded_via_extended_property: false,
+        },
     };
 
     let limits = CoreLimits {
@@ -107,13 +153,27 @@ mod tests {
             }"#,
         );
 
-        let (caps, limits) = build(&session).unwrap();
+        let (caps, limits) = build(
+            &session,
+            PimSupport {
+                submission: true,
+                vacation: true,
+                quota: true,
+            },
+        )
+        .unwrap();
         assert_eq!(caps.cursor_freshness, CursorFreshness::ServerIssued);
         assert_eq!(caps.push, PushCapability::InProcess);
         assert_eq!(caps.blob_range, BlobRangeSupport::No);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::StateBased);
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.batching_policy.max_items, 500);
+        assert!(caps.pim_methods.add_to_container);
+        assert!(caps.pim_methods.send_message);
+        assert!(!caps.pim_methods.set_label_membership);
+        assert_eq!(caps.conveniences.starred, StarredFlagShape::Keyword);
+        assert!(caps.conveniences.replied_via_keyword);
+        assert!(caps.conveniences.forwarded_via_keyword);
         assert_eq!(limits.max_objects_in_get, 256);
         assert_eq!(limits.max_objects_in_set, 700);
     }

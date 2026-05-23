@@ -4,8 +4,9 @@ use crate::Result;
 use crate::client::GmailClient;
 use crate::types::{
     GmailAttachmentData, GmailDraft, GmailDraftStub, GmailHistoryResponse, GmailLabel,
-    GmailMessage, GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, ListDraftsResponse,
-    ListLabelsResponse, ListSendAsResponse, ListThreadsResponse,
+    GmailMessage, GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings,
+    ListDraftsResponse, ListLabelsResponse, ListMessagesResponse, ListSendAsResponse,
+    ListThreadsResponse,
 };
 
 impl GmailClient {
@@ -90,6 +91,41 @@ impl GmailClient {
 
         let resp: ListThreadsResponse = self.get(&format!("/threads{qs}")).await?;
         Ok((resp.threads, resp.next_page_token))
+    }
+
+    // pub: direct callers need message-shaped search and listing.
+    pub async fn list_messages(
+        &self,
+        query: Option<&str>,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+    ) -> Result<(
+        Vec<crate::types::GmailMessageStub>,
+        Option<String>,
+        Option<i64>,
+    )> {
+        let mut params = Vec::new();
+        if let Some(q) = query {
+            params.push(format!("q={}", bifrost_net::url::encode_component(q)));
+        }
+        if let Some(max) = max_results {
+            params.push(format!("maxResults={max}"));
+        }
+        if let Some(pt) = page_token {
+            params.push(format!("pageToken={pt}"));
+        }
+        let qs = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+
+        let resp: ListMessagesResponse = self.get(&format!("/messages{qs}")).await?;
+        Ok((
+            resp.messages,
+            resp.next_page_token,
+            resp.result_size_estimate,
+        ))
     }
 
     // pub: direct callers need thread hydration; Account sync is message-oriented.
@@ -194,6 +230,12 @@ impl GmailClient {
         self.post("/drafts", &json!({ "message": message })).await
     }
 
+    // pub: direct callers can fetch a draft in a chosen Gmail message projection.
+    pub async fn get_draft(&self, draft_id: &str, format: &str) -> Result<GmailDraft> {
+        self.get(&format!("/drafts/{draft_id}?format={format}"))
+            .await
+    }
+
     // pub: draft update is outside the Account sync trait.
     pub async fn update_draft(
         &self,
@@ -215,6 +257,11 @@ impl GmailClient {
     // pub: draft deletion is outside the Account sync trait.
     pub async fn delete_draft(&self, draft_id: &str) -> Result<()> {
         self.delete(&format!("/drafts/{draft_id}")).await
+    }
+
+    // pub: direct callers can send an existing Gmail draft.
+    pub async fn send_draft(&self, draft_id: &str) -> Result<GmailMessage> {
+        self.post("/drafts/send", &json!({ "id": draft_id })).await
     }
 
     // pub: draft listing is outside the Account sync trait.
@@ -257,5 +304,29 @@ impl GmailClient {
             &json!({ "signature": signature_html }),
         )
         .await
+    }
+
+    // pub: direct callers can patch editable send-as fields.
+    pub async fn patch_send_as(
+        &self,
+        send_as_email: &str,
+        body: &serde_json::Value,
+    ) -> Result<GmailSendAs> {
+        let encoded = bifrost_net::url::encode_component(send_as_email);
+        self.patch(&format!("/settings/sendAs/{encoded}"), body)
+            .await
+    }
+
+    // pub: direct callers can read Gmail vacation responder settings.
+    pub async fn get_vacation(&self) -> Result<GmailVacationSettings> {
+        self.get("/settings/vacation").await
+    }
+
+    // pub: direct callers can replace Gmail vacation responder settings.
+    pub async fn update_vacation(
+        &self,
+        settings: &GmailVacationSettings,
+    ) -> Result<GmailVacationSettings> {
+        self.put("/settings/vacation", settings).await
     }
 }

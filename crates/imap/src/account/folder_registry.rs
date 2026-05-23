@@ -97,6 +97,8 @@ pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
 pub(crate) struct FolderEntry {
     pub(crate) name: MailboxName,
     pub(crate) selectable: bool,
+    pub(crate) delimiter: Option<char>,
+    pub(crate) attributes: Vec<MailboxAttribute>,
     cursor: RwLock<Option<FolderCursor>>,
     modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
@@ -119,6 +121,8 @@ impl FolderEntry {
         Self {
             name: info.name,
             selectable,
+            delimiter: info.delimiter,
+            attributes: info.attributes,
             cursor: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),

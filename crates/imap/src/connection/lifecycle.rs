@@ -36,6 +36,27 @@ impl ImapConnection {
         tls_connector: native_tls::TlsConnector,
         timeout: Duration,
     ) -> Result<Self, Error> {
+        Self::connect_with_tls_connector_metered(
+            host,
+            port,
+            tls_mode,
+            tls_connector,
+            timeout,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_tls_connector_metered(
+        host: &str,
+        port: u16,
+        tls_mode: TlsMode,
+        tls_connector: native_tls::TlsConnector,
+        timeout: Duration,
+        meter_sink: Option<bifrost_net::MeterSinkHandle>,
+        bandwidth_cap: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Result<Self, Error> {
         use super::dispatch::CapabilityConsumer;
         use super::driver;
 
@@ -63,7 +84,7 @@ impl ImapConnection {
         // The WireReader and ProtocolState live on the stack here. After
         // the greeting and capability fetch they are moved into the
         // driver task, which owns them for the rest of the connection.
-        let mut wire_reader = wire::WireReader::new(stream);
+        let mut wire_reader = wire::WireReader::new_metered(stream, meter_sink, bandwidth_cap);
         let mut proto_state = state::ProtocolState::new();
         let mut tag_gen = tag::TagGenerator::new();
 

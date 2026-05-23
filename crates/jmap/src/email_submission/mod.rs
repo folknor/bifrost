@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 
+use crate::core::request::ResultReference;
 use crate::email::{EmailId, EmailPatch};
 use crate::identity::IdentityId;
 use crate::thread::ThreadId;
@@ -85,6 +86,10 @@ pub struct EmailSubmissionCreate {
     #[serde(rename = "emailId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) email_id: Option<EmailId>,
+
+    #[serde(rename = "#emailId")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) email_id_ref: Option<ResultReference>,
 
     #[serde(rename = "envelope")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,6 +241,7 @@ impl crate::core::SetCreate for EmailSubmissionCreate {
             _create_id: create_id,
             identity_id: None,
             email_id: None,
+            email_id_ref: None,
             envelope: None,
             undo_status: None,
         }

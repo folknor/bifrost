@@ -5,20 +5,24 @@ mod cursor;
 mod flags;
 mod inventory;
 mod mutation;
+mod pim;
 mod push;
 mod recovery;
 mod scopes;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountFactory, AccountFuture, AccountStream, BlobHandle,
-    ByteRange, Change, ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
-    Error as AccountError, FlagOp, HydratedObject, IdempotencyKey, InventoryEntry, MembershipScope,
-    MutationResult, ObjectId, OpaqueChangeState, Priority, Projection, ScopeLifecycle,
-    SubscriptionHandle, SyncEvent, SyncStrategy, WatchEvent,
+    Account, AccountCapabilities, AccountFactory, AccountFuture, AccountId, AccountStream,
+    AttachmentHandle, BlobHandle, ByteRange, Change, ChangeCursor, Container, ContainerId,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, Error as AccountError, FlagOp, HydratedObject, HydrationProjection, IdempotencyKey,
+    Identity, IdentityId, IdentityPatch, InventoryEntry, MembershipScope, Message, MutationResult,
+    MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo,
+    ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -35,8 +39,6 @@ use self::cursor::{
 };
 use self::push::PubSubControl;
 use self::scopes::{ScopeCache, ScopeSnapshot};
-
-const UNLIMITED_BANDWIDTH: u64 = u64::MAX;
 
 // pub: the sync engine's cross-crate conformance test and downstream engines register this factory.
 pub struct GmailAccountFactory {
@@ -75,8 +77,8 @@ impl GmailAccountFactory {
 }
 
 impl AccountFactory for GmailAccountFactory {
-    fn open(&self) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
-        let client = Arc::clone(&self.client);
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+        let client = Arc::new(self.client.for_account(account_id));
         let pubsub = self.pubsub.clone();
         Box::pin(async move {
             let account = GmailAccount::open(client, pubsub).await?;
@@ -94,8 +96,6 @@ struct GmailAccount {
     scope_cache: ScopeCache,
     shutdown: CancellationToken,
     closed: AtomicBool,
-    priority: AtomicU8,
-    bandwidth_cap: AtomicU64,
 }
 
 impl GmailAccount {
@@ -123,8 +123,6 @@ impl GmailAccount {
             scope_cache: Arc::new(std::sync::RwLock::new(ScopeSnapshot::empty())),
             shutdown: CancellationToken::new(),
             closed: AtomicBool::new(false),
-            priority: AtomicU8::new(priority_to_u8(Priority::Normal)),
-            bandwidth_cap: AtomicU64::new(UNLIMITED_BANDWIDTH),
         }))
     }
 }
@@ -135,13 +133,11 @@ impl Account for GmailAccount {
     }
 
     fn set_priority(&self, priority: Priority) {
-        self.priority
-            .store(priority_to_u8(priority), Ordering::Release);
+        self.client.account_net().set_priority(priority);
     }
 
     fn set_bandwidth_cap(&self, bps: Option<u64>) {
-        self.bandwidth_cap
-            .store(bps.unwrap_or(UNLIMITED_BANDWIDTH), Ordering::Release);
+        self.client.account_net().set_bandwidth_cap(bps);
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -295,6 +291,223 @@ impl Account for GmailAccount {
         )
     }
 
+    fn add_to_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::add_to_container(Arc::clone(&self.client), target, container)
+    }
+
+    fn remove_from_container(
+        &self,
+        target: MutationTarget,
+        container: ContainerId,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::remove_from_container(Arc::clone(&self.client), target, container)
+    }
+
+    fn set_keyword(
+        &self,
+        _target: MutationTarget,
+        _keyword: String,
+        _value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(AccountError::Unsupported) })
+    }
+
+    fn set_label_membership(
+        &self,
+        target: MutationTarget,
+        label: ContainerId,
+        value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_label_membership(Arc::clone(&self.client), target, label, value)
+    }
+
+    fn set_category(
+        &self,
+        _target: MutationTarget,
+        _category: String,
+        _value: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(AccountError::Unsupported) })
+    }
+
+    fn set_extended_property(
+        &self,
+        _target: MutationTarget,
+        _property_id: String,
+        _value: Option<String>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(AccountError::Unsupported) })
+    }
+
+    fn set_is_read(
+        &self,
+        target: MutationTarget,
+        is_read: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_is_read(Arc::clone(&self.client), target, is_read)
+    }
+
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::send_message(
+            Arc::clone(&self.client),
+            self.profile.email_address.clone(),
+            request,
+        )
+    }
+
+    fn attachment_upload(
+        &self,
+        bytes: AccountStream<Result<Bytes, AccountError>>,
+        mime: String,
+    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+        pim::attachment_upload(bytes, mime)
+    }
+
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
+        pim::draft_create(
+            Arc::clone(&self.client),
+            self.profile.email_address.clone(),
+            patch,
+        )
+    }
+
+    fn draft_update(
+        &self,
+        draft: DraftHandle,
+        patch: DraftPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::draft_update(
+            Arc::clone(&self.client),
+            self.profile.email_address.clone(),
+            draft,
+            patch,
+        )
+    }
+
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
+        pim::draft_discard(Arc::clone(&self.client), draft)
+    }
+
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::draft_send(Arc::clone(&self.client), draft)
+    }
+
+    fn search(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
+        pim::search(Arc::clone(&self.client), request)
+    }
+
+    fn search_messages(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
+        pim::search_messages(Arc::clone(&self.client), request)
+    }
+
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+        pim::containers_list(Arc::clone(&self.client), Arc::clone(&self.scope_cache))
+    }
+
+    fn container_create(
+        &self,
+        kind: ContainerKind,
+        name: String,
+        parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+        pim::container_create(Arc::clone(&self.client), kind, name, parent)
+    }
+
+    fn container_rename(
+        &self,
+        container: ContainerId,
+        name: String,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_rename(Arc::clone(&self.client), container, name)
+    }
+
+    fn container_move(
+        &self,
+        container: ContainerId,
+        new_parent: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_move(container, new_parent)
+    }
+
+    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
+        pim::container_delete(Arc::clone(&self.client), container)
+    }
+
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
+        pim::identities_list(Arc::clone(&self.client))
+    }
+
+    fn identity_update(
+        &self,
+        identity: IdentityId,
+        patch: IdentityPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::identity_update(Arc::clone(&self.client), identity, patch)
+    }
+
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
+        pim::vacation_get(Arc::clone(&self.client))
+    }
+
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
+        pim::vacation_set(Arc::clone(&self.client), config)
+    }
+
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
+        pim::quota_get()
+    }
+
+    fn thread_hydrate(
+        &self,
+        thread: ThreadId,
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
+        pim::thread_hydrate(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            thread,
+        )
+    }
+
+    fn message_hydrate(
+        &self,
+        message: ObjectId,
+        projection: HydrationProjection,
+    ) -> AccountFuture<Result<Message, AccountError>> {
+        pim::message_hydrate(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            message,
+            projection,
+        )
+    }
+
+    fn move_thread(
+        &self,
+        thread: ThreadId,
+        target: ContainerId,
+        source: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::move_thread(Arc::clone(&self.client), thread, target, source)
+    }
+
+    fn delete_thread(
+        &self,
+        thread: ThreadId,
+        current: Option<ContainerId>,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::delete_thread(Arc::clone(&self.client), thread, current)
+    }
+
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Box::pin(async { Ok(()) });
@@ -305,15 +518,5 @@ impl Account for GmailAccount {
             pubsub.abort_renewer().await;
             Ok(())
         })
-    }
-}
-
-fn priority_to_u8(priority: Priority) -> u8 {
-    match priority {
-        Priority::Foreground => 0,
-        Priority::Normal => 1,
-        Priority::Background => 2,
-        Priority::Bulk => 3,
-        _ => 1,
     }
 }

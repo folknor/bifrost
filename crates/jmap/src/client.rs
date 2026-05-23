@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use bifrost_net::{AccessToken, StaticTokenSource};
+use bifrost_net::{AccessToken, AccountId as NetAccountId, StaticTokenSource};
 use reqwest::header;
 
 use crate::{
@@ -129,6 +129,7 @@ impl<T: HttpTransport> Deref for Client<T> {
 
 pub struct ClientBuilder {
     credentials: Option<Credentials>,
+    net_account_id: NetAccountId,
     trusted_hosts: HashSet<String>,
     forwarded_for: Option<String>,
     accept_invalid_certs: bool,
@@ -145,6 +146,7 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             credentials: None,
+            net_account_id: NetAccountId("jmap".to_string()),
             trusted_hosts: HashSet::new(),
             timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS),
             forwarded_for: None,
@@ -154,6 +156,11 @@ impl ClientBuilder {
 
     pub fn credentials(mut self, credentials: impl Into<Credentials>) -> Self {
         self.credentials = Some(credentials.into());
+        self
+    }
+
+    pub fn net_account_id(mut self, account_id: NetAccountId) -> Self {
+        self.net_account_id = account_id;
         self
     }
 
@@ -209,6 +216,7 @@ impl ClientBuilder {
         let transport = ReqwestTransport::new(
             headers.clone(),
             authorization.clone(),
+            self.net_account_id,
             self.timeout,
             self.accept_invalid_certs,
             Arc::clone(&trusted_hosts),

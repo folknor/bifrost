@@ -86,15 +86,16 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 ## Account layer
 
-The shared `bifrost_types::Account` implementation lives under `crates/imap/src/account/`. `ImapAccount` and `ImapAccountFactory` open a connection pool, list folders, build capabilities, and back the trait methods.
+The shared `bifrost_types::Account` implementation lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into optional raw-socket bandwidth metering. `ImapAccount` backs both the sync methods and the Stage 1 PIM primitives.
 
 Submodules:
 
-- `factory.rs` - `ImapAccountConfig`, `ID` probe, QRESYNC negotiation, initial folder LIST.
-- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest.
-- `folder_registry.rs` - mailbox map plus per-folder cursor cache and per-folder MODSEQ cache (`record_modseq`, `modseq`, `clear_modseqs`). Cache is keyed by `(folder, uidvalidity, uid)` and clears on UIDVALIDITY change, delete, or rename.
+- `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter` / `MeterSink` wiring, `ID` probe, QRESYNC negotiation, initial folder LIST.
+- `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured.
+- `folder_registry.rs` - mailbox map plus per-folder cursor cache and per-folder MODSEQ cache (`record_modseq`, `modseq`, `clear_modseqs`). Cache is keyed by `(folder, uidvalidity, uid)`, stores LIST delimiter / attributes for PIM containers, and clears on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync / Condstore / Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group.
+- `pim.rs` - Stage 1 mail action surface: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, and IMAP-specific thread move/delete conveniences.
 
 ### CONDSTORE / QRESYNC strategy
 
@@ -126,6 +127,29 @@ Runtime downgrades:
 - `bulk_destroy` partial-failure accounting separates conflicts (UNCHANGEDSINCE rejected) from expunge failures; expunge failures only apply to the UIDs being expunged in that round, not the whole batch.
 
 Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is opportunistic - cold cache means unprotected STORE - so promoting to `StateBased` would let the engine assume UNCHANGEDSINCE is always wired up when it is not. The engine's read-back-after-retry path remains the lost-update safety net.
+
+### PIM primitives
+
+`capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time. IMAP advertises real support for:
+
+- Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE.
+- Keywords: `set_keyword` via UID STORE, with the convenience keywords `$flagged`, `$answered`, and `$seen` mapped to `\Flagged`, `\Answered`, and `\Seen`. `$forwarded` remains an IMAP keyword.
+- Read state: `set_is_read` via `\Seen`.
+- Search messages: UID SEARCH across selectable folders, with `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only when `THREAD=REFERENCES` is available and returns synthetic IMAP thread ids containing folder, UIDVALIDITY, and member UIDs.
+- Containers: LIST-backed folder enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE. DELETE first checks `STATUS MESSAGES` and refuses non-empty mailboxes.
+- Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised.
+- Hydration: one-shot message FETCH and synthetic thread hydration.
+- Draft create/discard: APPEND to the Drafts folder with `\Draft` when Drafts and UIDPLUS are present; discard deletes the draft object id.
+
+Unsupported PIM methods return `Error::Unsupported` and have false capability flags: SMTP send, attachment upload, draft update/send, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
+
+`ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread` and `delete_thread` override the trait defaults: they use the crate's cloneable account handle to do add-then-remove, and delete moves to the Trash role unless the current container is already Trash, in which case it expunges the thread from that mailbox.
+
+Containers use native mailbox paths as primitive ids and provenance-native ids. `containers_list` maps SPECIAL-USE attributes to `FolderRole` (`\Sent`, `\Drafts`, `\Archive`, `\Trash`, `\Junk`, and custom `\Inbox`) and falls back to name-based INBOX / Sent / Drafts / Archive / Trash / Spam detection for servers without SPECIAL-USE.
+
+### Bandwidth metering
+
+`ImapAccountConfig` can carry either a process `BandwidthMeter` or a generic `MeterSink`. The factory builds a `MeterSinkHandle` with the real engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read and written on every connection-level read/write path. The shared bandwidth-cap atomic is read per chunk; inbound and outbound I/O use byte buckets so `set_bandwidth_cap(None)` is unlimited and `Some(0)` is clamped to 1 B/s with a warning.
 
 ### Folder lifecycle
 
@@ -167,6 +191,7 @@ crates/imap/src/
 │   ├── inventory.rs       - inventory + initial cursor establishment
 │   ├── mod.rs             - ImapAccount trait impl, helpers
 │   ├── mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
+│   ├── pim.rs             - unified PIM primitives + conveniences
 │   ├── pool.rs            - per-folder connection checkout
 │   ├── push.rs            - IDLE-driven WatchEvents
 │   └── scopes.rs          - folder discovery, lifecycle stream
