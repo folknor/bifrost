@@ -837,6 +837,12 @@ pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
 #[cfg(test)]
 mod tests {
     use super::content_range_matches;
+    use super::{AccountId, AccountSpec, Net};
+    use crate::StaticTokenSource;
+    use crate::config::NetConfig;
+    use crate::rate::RateLimit;
+    use crate::retry::RetryPolicy;
+    use std::sync::Arc;
 
     #[test]
     fn content_range_rejects_inverted_response_range() {
@@ -852,5 +858,73 @@ mod tests {
     #[test]
     fn content_range_accepts_valid_open_ended_tail() {
         assert!(content_range_matches("bytes=10-", "bytes 10-99/100"));
+    }
+
+    fn build_net() -> Net {
+        Net::new(NetConfig::default()).expect("default NetConfig should build")
+    }
+
+    fn build_spec(host: &str) -> AccountSpec {
+        AccountSpec {
+            hosts: vec![RateLimit {
+                host: host.to_string(),
+                quota_per_second: 1.0,
+                cost_default: 1,
+                burst: 1,
+            }],
+            token_source: Arc::new(StaticTokenSource::new("test-token", None)),
+            default_retry: RetryPolicy::default(),
+        }
+    }
+
+    fn account_hosts_snapshot(net: &Net, id: &AccountId) -> Option<Vec<String>> {
+        let map = net
+            .inner
+            .account_hosts
+            .lock()
+            .expect("net account_hosts lock poisoned");
+        map.get(id).cloned()
+    }
+
+    #[test]
+    fn retag_moves_host_registrations_and_registers_meter() {
+        let net = build_net();
+        let old = AccountId("old".to_string());
+        let new = AccountId("new".to_string());
+        let original = net.attach_account(old.clone(), build_spec("retag.example"));
+        assert_eq!(original.account(), &old);
+        let hosts_before = account_hosts_snapshot(&net, &old).expect("old id has hosts");
+        assert_eq!(hosts_before, vec!["retag.example".to_string()]);
+
+        let retagged = original.retag(new.clone());
+
+        assert_eq!(retagged.account(), &new);
+        assert!(
+            account_hosts_snapshot(&net, &old).is_none(),
+            "old id should no longer hold host registrations after retag",
+        );
+        let hosts_after = account_hosts_snapshot(&net, &new).expect("new id has hosts");
+        assert_eq!(
+            hosts_after, hosts_before,
+            "retag moves the same host list under the new id",
+        );
+        // Meter has counters under the new id: `account` builds an
+        // AccountMeter that reads the registered AccountCounters, so a
+        // never-recorded counter returns 0 bps without panicking.
+        assert_eq!(net.meter().account(new).observed_bps(), 0);
+    }
+
+    #[test]
+    fn retag_with_same_id_is_idempotent() {
+        let net = build_net();
+        let id = AccountId("stable".to_string());
+        let original = net.attach_account(id.clone(), build_spec("retag.example"));
+        let _retagged = original.retag(id.clone());
+        let hosts = account_hosts_snapshot(&net, &id).expect("id still has hosts");
+        assert_eq!(
+            hosts,
+            vec!["retag.example".to_string()],
+            "retag with same id must not drop the host registration",
+        );
     }
 }

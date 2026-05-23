@@ -760,7 +760,17 @@ pub(crate) fn delete_thread(
 ) -> AccountFuture<Result<(), Error>> {
     Box::pin(async move {
         let trash = role_mailbox(&mail, FolderRole::Trash).await?;
-        if current.as_ref().is_some_and(|id| id.0 == trash.as_str()) {
+        // JMAP mailbox ids are server-issued opaque strings and RFC
+        // 8620 leaves case-sensitivity to the server, but two
+        // mailboxes that differ only in case is a pathological shape
+        // we are happy to misclassify in favor of defensiveness:
+        // case-insensitive compare here means a caller who normalized
+        // the id elsewhere in their stack still resolves a "thread is
+        // already in Trash" branch correctly.
+        let already_in_trash = current
+            .as_ref()
+            .is_some_and(|id| id.0.eq_ignore_ascii_case(trash.as_str()));
+        if already_in_trash {
             let ids = resolve_target(&mail, MutationTarget::Thread(thread)).await?;
             destroy_emails(&mail, &email_state, ids).await
         } else {
