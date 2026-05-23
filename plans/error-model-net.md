@@ -146,8 +146,10 @@ No live HTTP. Construct synthetic `net::Error` values directly.
 - `Retry-After` and `throttle_scope` populated where the wire
   protocol provides them.
 - Old recovery / classification helpers removed.
-- `cargo check -p bifrost-net` clean.
-- Per-crate tests pass.
+- Patches against this crate match `plans/error-model-net.md`'s
+  exit criteria. Compilation and per-crate tests are not run at
+  this phase; Phase 3 (workspace integration) is where `brokkr
+  check` runs and tests execute.
 
 ## Discovery items for the agent
 

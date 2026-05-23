@@ -128,8 +128,10 @@ No live IMAP server. Construct synthetic response objects.
 - `AttemptCause` is emitted by the driver-task model with correct
   `TransmissionState`.
 - Old recovery helpers removed.
-- `cargo check -p bifrost-imap` clean.
-- Per-crate tests pass.
+- Patches against this crate match this plan's exit criteria.
+  Compilation and per-crate tests are not run at this phase;
+  Phase 3 (workspace integration) is where `brokkr check` runs
+  and tests execute.
 
 ## Discovery items for the agent
 

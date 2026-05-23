@@ -1,10 +1,21 @@
 # Error model: bifrost-types implementation plan
 
-This is Phase 1 of `plans/error-model-roadmap.md`. It covers every
-change in the `bifrost-types` crate that the convergence plan
-demands. After this phase lands on the feature branch, the workspace
-will not compile until Phase 2 migrates the consumer crates — that is
-the intentional state of the branch.
+This is Phase 1 of `plans/error-model-roadmap.md`. It covers the
+**additive** part of the `bifrost-types` change: a new `error/`
+module containing the entire new error model, plus deletion of the
+old `error.rs` and the matching `lib.rs` re-export update. It does
+not touch the trait surface (`account.rs`, the trait imports and
+trait method declarations), the event surface (`events.rs`), or the
+mutation surface (`mutation.rs`). Those changes belong to Phase 3
+(workspace integration), where every crate's surface migrates in
+the same commit and compilation comes back.
+
+Phase 1 leaves `bifrost-types` in a deliberately broken state: the
+new types are present, the old `Error` type is gone, and
+`account.rs`, `events.rs`, and `mutation.rs` still reference the
+removed types. This is intentional per the roadmap's "broken
+intermediate states are acceptable" framing. Phase 1 validates by
+patch audit, not by compilation.
 
 The convergence plan
 (`plans/error-model-convergence.md`) is the authoritative source for
@@ -38,7 +49,8 @@ files:
 - `crates/types/src/account.rs:127-143` — default impl of
   `inventory_partition_stream` constructs
   `SyncEvent::Fatal(Fatal { recovery: RecoveryClass::Fatal, ... })`.
-  This is the one in-crate emission site that Phase 1 owns.
+  This emission site is left as-is by Phase 1 and rewritten in
+  Phase 3 alongside the rest of `account.rs`.
 - `crates/types/src/capabilities.rs:296-313` —
   `CapabilityChange`, `CapabilityDelta`, `CapabilityKey`,
   `CapabilityValue`. Already public; the new
@@ -57,56 +69,48 @@ files:
 
 What this phase changes in `bifrost-types`:
 
-- Replaces `Error` (per-operation enum at `error.rs:27-79`) with the
-  opaque `AccountError`.
-- Replaces `RecoveryClass` (at `error.rs:89-121`) with the new
-  enum whose terminal variants are decomposed and whose engine-
-  control variants live nested under `EngineDirective`.
-- Replaces `Fatal` (the struct at `error.rs:136-140`) with the
-  `Fatal(AccountError)` newtype in the new recovery module.
-- Updates `Warning` (at `error.rs:144-150`) to use `DiagnosticText`
-  for free-form fields.
-- Reshapes `MutationOutcome` (at `mutation.rs:163-171`) into
-  `MutationSuccess { Applied, Skipped }`. The streaming bulk surface
-  uses `ItemOutcome<MutationSuccess>` instead of `MutationResult`.
-- Renames `SyncEvent::Fatal(Fatal)` (at `events.rs:154`) to
-  `SyncEvent::Terminated(AccountError)`.
-- Introduces `AccountErrorBuilder` as the only construction path.
-- Introduces the central recovery mapping in
-  `bifrost-types::recovery::derive`.
-- Introduces `message_key` derivation.
-- Introduces the diagnostic accessor surface (`TelemetryView`,
-  `SupportExportMinimal`, `SupportExportConsented`,
-  `SupportExportInternal`).
-- Introduces the batch surface (`BatchItem`, `BatchOutcome`,
-  `BatchItemOutcome`, `BatchSuccess`, `BatchFailure`,
-  `BatchUncertain`, `BatchItemId`).
-- Introduces the cause chain (`Cause`, `CauseChain`, `AttemptCause`,
-  `TransmissionState`, all `*Cause` types, all subkind enums).
+- Deletes `crates/types/src/error.rs` (the old `Error`,
+  `RecoveryClass`, `Fatal`, `Warning`, `WarningKind`,
+  `StrategyDowngrade`).
+- Creates the new `crates/types/src/error/` module with the entire
+  new error model: `AccountError` (opaque), `AccountErrorBuilder`,
+  `RecoveryClass` with nested `EngineDirective`, `RetryAdvice`,
+  `ReconcileAdvice`, all subkind enums, all `*Cause` types
+  including `AttemptCause` and `TransmissionState`, the
+  diagnostic accessor surface (`TelemetryView`, support exports,
+  `DiagnosticInfo`, `DiagnosticText`), the Vec-batch surface
+  (`BatchItem`, `BatchOutcome`, `BatchItemOutcome`,
+  `BatchSuccess`, `BatchFailure`, `BatchUncertain`,
+  `BatchItemId`), the streaming surface (`ItemOutcome`,
+  `MutationSuccess`), `Warning` rebuilt around `DiagnosticText`,
+  the `Fatal` newtype with `TryFrom<AccountError>`, the central
+  recovery mapping (`recovery::derive`, `recovery::suggest`),
+  `message_key::derive`, and all wire enums.
+- Updates `crates/types/src/lib.rs` to remove the old re-exports
+  and add the new ones.
 
 What this phase does **not** change:
 
-- `Account` trait method signatures (`crates/types/src/account.rs:63-595`).
-  Phase 3 owns trait surface migration. After Phase 1, the trait's
-  `use crate::error::{Error, Fatal, RecoveryClass}` import at line
-  34 is broken; `cargo check -p bifrost-types` will refuse to build
-  unless the trait is updated. **Resolution:** Phase 1 updates the
-  trait imports in place (changing `Result<_, Error>` to
-  `Result<_, AccountError>` is the smallest change that lets the
-  crate compile), even though the convergence plan classifies trait
-  signature changes as Phase 3. The alternative — leaving the trait
-  broken until Phase 3 — means `bifrost-types` itself fails to
-  compile after Phase 1, which violates the Phase 1 exit criterion
-  ("`cargo check -p bifrost-types` clean"). The Phase 3 invasiveness
-  (`Result<(), Error>` → `Result<(), AccountError>` ripple across
-  every consumer impl) still happens in Phase 3; Phase 1 only
-  changes the trait's *declarations*. Same-named, different-type:
-  consumer impls break, types crate compiles.
-- `Control` trait at `events.rs:289-300` — same treatment as
-  `Account`: imports updated, declarations switch to `AccountError`,
-  consumer impls in `bifrost-sync` break until Phase 2.3.
-- Inventory streaming, change streaming, push subscription types
-  beyond the `SyncEvent::Fatal` → `SyncEvent::Terminated` rename.
+- `crates/types/src/account.rs`. The trait's
+  `use crate::error::{Error, Fatal, RecoveryClass}` import and
+  every `Result<_, Error>` return type are left as-is. They are
+  broken (referencing removed types) after Phase 1. Repaired in
+  Phase 3.
+- `crates/types/src/events.rs`. `SyncEvent::Fatal(Fatal)`,
+  the `Control` trait's `Error` returns, and the
+  `use crate::error::{Error, Fatal, Warning}` import are left
+  as-is. The `SyncEvent::Fatal` → `SyncEvent::Terminated(AccountError)`
+  rename is a surface change owned by Phase 3. Sync consumes the
+  rename but does not own it.
+- `crates/types/src/mutation.rs`. `MutationResult`,
+  `MutationOutcome::Failed(Error)`, and the
+  `use crate::error::Error` import are left as-is. The
+  reshape into `ItemOutcome<MutationSuccess>` is a Phase 3
+  surface change.
+- Any other crate. Phase 1 is bifrost-types only.
+
+This phase deliberately leaves the crate in a non-compiling state.
+Validation is by patch audit, not by `brokkr check`.
 
 ## Module layout
 
@@ -117,8 +121,7 @@ threshold.
 
 ```
 crates/types/src/
-├── account.rs            // modified: imports + trait signature
-│                         //   declarations (Result<_, AccountError>)
+├── account.rs            // UNCHANGED by Phase 1 (broken; Phase 3 fixes)
 ├── blob.rs               // unchanged
 ├── capabilities.rs       // unchanged
 ├── compose.rs            // unchanged
@@ -167,22 +170,19 @@ crates/types/src/
 │   ├── warning.rs        // Warning, WarningKind
 │   └── message_key.rs    // derive_message_key(&AccountErrorKind)
 │                         //   -> &'static str
-├── events.rs             // modified: SyncEvent::Fatal renamed,
-│                         //   Control trait signatures updated
+├── events.rs             // UNCHANGED by Phase 1 (broken; Phase 3 fixes)
 ├── hydration.rs          // unchanged
 ├── ids.rs                // unchanged
-├── lib.rs                // modified: re-exports
-├── mutation.rs           // modified: MutationOutcome reshape,
-│                         //   MutationResult removed, Error import
-│                         //   removed
+├── lib.rs                // modified: re-exports (only file edit
+│                         //   outside error/ in this phase)
+├── mutation.rs           // UNCHANGED by Phase 1 (broken; Phase 3 fixes)
 ├── page.rs               // unchanged
 ├── search.rs             // unchanged
 └── settings.rs           // unchanged
 ```
 
-15 files total: 9 new (under `error/`), 4 modified (`account.rs`,
-`events.rs`, `lib.rs`, `mutation.rs`), 1 deleted (`error.rs`).
-Eleven files untouched.
+12 new files (under `error/`), 1 modified (`lib.rs`), 1 deleted
+(`error.rs`). All other files untouched.
 
 ## Files to create
 
@@ -193,8 +193,10 @@ In dependency order (each file depends on types defined above it):
    beyond existing types (`CursorScope` from `cursor.rs`).
 2. `crates/types/src/error/kind.rs` — `AccountErrorKind` and all
    subkind enums. Depends on `scope.rs` (for `AccountOperation` in
-   `Unsupported(AccountOperation)`) and on `BatchItemId` from
-   `batch.rs` — but only via `cause.rs`, not directly.
+   `Unsupported(AccountOperation)`). `RequestErrorKind` carries no
+   payload (the `BatchInputInvalidItem` list lives in
+   `RequestCause::BatchInputInvalid`), so there is no
+   `BatchItemId` dependency.
 3. `crates/types/src/error/cause.rs` — all `*Cause` types,
    `Cause`, `CauseChain`. Depends on `kind.rs` and `scope.rs`. The
    `WireCause` enum's per-protocol variants (`GraphSignal`,
@@ -286,105 +288,41 @@ pub use error::warning::{Warning, WarningKind};
 ```
 
 Line 84 (`pub use mutation::{... MutationOutcome, MutationResult ...}`)
-updates to remove `MutationOutcome` and `MutationResult` from the
-re-export list.
+is **not modified** by Phase 1. `mutation.rs` still contains
+`MutationResult` and `MutationOutcome` (those are Phase 3
+deletions); leaving the re-export keeps `lib.rs` consistent with
+`mutation.rs` as it stands. Phase 3 removes both the types and
+the re-export in the same commit.
 
 `pub mod error;` at line 23 stays (the module is still called
 `error`; the file becomes a directory).
 
-### `crates/types/src/account.rs`
-
-Line 34 (`use crate::error::{Error, Fatal, RecoveryClass};`) replaces with:
-
-```rust
-use crate::error::{AccountError, Fatal, RecoveryClass};
-```
-
-Every `Result<_, Error>` in trait method declarations (lines 107,
-161, 164, 232, 242, 252, 261, 270, 279, 287, 296, 307, 310, 318,
-321, 326, 335, 341, 348, 360, 367, 375, 380, 387, 395, 398, 401,
-404, 413, 420, 462, 472, 482, 488, 508, 521, 530, 546, 551, 567,
-584, 595, 617) replaces with `Result<_, AccountError>`. ~45 sites.
-
-`crates/types/src/account.rs:41` import of `MutationResult` from
-`mutation.rs` updates to import `ItemOutcome` and `MutationSuccess`
-from `error::stream`.
-
-Lines 194-214 (`bulk_set_flags`, `bulk_move`, `bulk_destroy`
-signatures returning `AccountStream<SyncEvent<MutationResult>>`)
-update to `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`.
-
-Lines 127-143 (default impl of `inventory_partition_stream`)
-updates to construct an `AccountError` via the new builder and
-emit `SyncEvent::Terminated(account_error)`:
-
-```rust
-SyncEvent::Terminated(
-    AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(AccountOperation::SyncInventory),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::user_safe(
-                "inventory partition is not supported by this account",
-            ),
-        }),
-    )
-    .operation(AccountOperation::SyncInventory)
-    .scope(ErrorScope::Cursor(scope.clone()))
-    .build(),
-),
-```
-
-Default impls returning `Err(Error::Unsupported)` (lines 463, 521,
-546, 567, 585 — the `Unsupported` short-circuits in conveniences)
-update to:
-
-```rust
-Box::pin(async {
-    Err(AccountErrorBuilder::new(
-        AccountErrorKind::Unsupported(/* the appropriate op */),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::user_safe("convenience not supported"),
-        }),
-    )
-    .build())
-})
-```
-
-These default-impl conversion sites are the test surface for the
-builder during Phase 1.
-
-### `crates/types/src/events.rs`
-
-Line 12 (`use crate::error::{Error, Fatal, Warning};`) replaces with:
-
-```rust
-use crate::error::{AccountError, Warning};
-```
-
-Line 154 (`Fatal(Fatal)`) renames to
-`Terminated(AccountError)`.
-
-Lines 292 and 295 (`Control::pause` and `Control::checkpoint_now`
-returning `Result<Checkpoint, Error>`) replace with
-`Result<Checkpoint, AccountError>`.
-
-### `crates/types/src/mutation.rs`
-
-Line 12 (`use crate::error::Error;`) removed.
-
-Lines 155-171 (`MutationResult`, `MutationOutcome`) deleted or
-reshaped: `MutationResult` removed entirely; `MutationOutcome`
-removed. The new shape (`ItemOutcome<T>`, `MutationSuccess`) lives
-in `error/stream.rs`.
-
-If anything in `mutation.rs` still needs to express "per-item
-outcome" inside the `IdempotencyKey` / `FlagOp` infrastructure
-(it does not, based on the current shape), it imports the new
-types from `error::stream`.
-
 ## Files to delete
 
 - `crates/types/src/error.rs` (replaced by `error/` module).
+
+## Out of scope for Phase 1
+
+Phase 3 owns the following surface migrations. They appear here
+only so the next agent knows what is *not* being touched in this
+phase:
+
+- `crates/types/src/account.rs`: trait imports, the ~45
+  `Result<_, Error>` return-type sites, `bulk_set_flags` /
+  `bulk_move` / `bulk_destroy` signatures
+  (`AccountStream<SyncEvent<MutationResult>>` →
+  `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`), the
+  default impl of `inventory_partition_stream` constructing
+  `SyncEvent::Fatal(Fatal { ... })` at lines 127-143, and the
+  `Err(Error::Unsupported)` short-circuits in the convenience
+  default impls.
+- `crates/types/src/events.rs`: the
+  `use crate::error::{Error, Fatal, Warning}` import, the
+  `Fatal(Fatal)` variant on `SyncEvent` at line 154 (renamed to
+  `Terminated(AccountError)` in Phase 3), the `Control` trait's
+  `Result<Checkpoint, Error>` returns.
+- `crates/types/src/mutation.rs`: the `use crate::error::Error`
+  import, `MutationResult` and `MutationOutcome` removal.
 
 ## Type definitions
 
@@ -412,10 +350,21 @@ pub struct AccountError {
 All fields private. Accessors per the convergence plan §Public shape.
 
 `StdError` impl: `source()` returns the outermost `Cause` cast to
-`&dyn StdError`. Each `Cause` variant's own `source()` returns its
-embedded system error (`io::Error`, `rustls::Error`, etc.) where
-one exists; it does NOT traverse the typed chain. The convergence
-plan documents this limit honestly.
+`&dyn StdError`. Each `Cause` variant's own `source()` returns
+`None`. The current cause-type definitions do not store an
+`Arc<dyn StdError + Send + Sync>` for an embedded system error;
+threading one through would require Clone-via-Arc on every cause
+variant and serialization carve-outs for `serde::Serialize` on
+the support exports — not worth the complexity for the marginal
+benefit of one extra level of standard-walker visibility.
+
+The wire-level text (the formatted message that the underlying
+system error would have produced) is captured as `DiagnosticText`
+on `TransportCause::message` (and equivalents); support exports
+surface it via `support_internal()`. Standard ecosystem walkers
+(`anyhow`, `tracing`) see one typed cause level via
+`AccountError::source()`; the typed chain is reached only through
+`AccountError::chain().iter()`.
 
 `Display`: short form using `message_key` + kind discriminant
 (e.g. `"server.rate-limited (Server(RateLimited))"`). Intended for
@@ -480,18 +429,14 @@ pub(crate) fn derive(
 
 ### `BatchOutcome::iter()` ordering
 
-`iter()` yields items in submission order. Implementation: each
-`BatchSuccess` / `BatchFailure` / `BatchUncertain` carries a
-private `submission_index: u32` field set by the protocol crate at
-emission time. `BatchOutcome` stores a `Vec<BatchItemOutcomeOwned>`
-in submission order internally; the lane `Vec` fields are derived
-views (or built once at construction with index-mapped clones).
+`iter()` yields items in submission order. The lane `Vec`
+accessors yield items in submission order within each lane.
 
-For Phase 1, define `BatchItemOutcomeOwned` as a `pub(crate)`
-internal enum and let `BatchItemOutcome<'a, T>` (the public
-borrowed view) implement `From<&'a BatchItemOutcomeOwned>`. Lane
-field iteration uses the owned form; `iter()` walks the submission-
-order vec.
+Representation is the implementing agent's call. The plan
+specifies the invariant; how `BatchOutcome` threads submission
+order through the public `succeeded` / `failed` / `uncertain`
+fields plus the `iter()` method is implementation detail to be
+worked out against the type system.
 
 ### `WireCause`
 
@@ -511,10 +456,19 @@ pub enum WireCause {
 
 The protocol-native enum types live in `bifrost-types`
 (`error/cause.rs`) because the cause chain is part of the public
-API. Each per-protocol enum is `#[non_exhaustive]`. Phase 1 ships
-them as minimal vocabularies (the variants implied by the
-convergence plan's recovery table); protocol crates extend the
-vocabularies during Phase 2 by adding variants (non-breaking).
+API. Each per-protocol enum is `#[non_exhaustive]`.
+
+**Ownership: Phase 1 ships every wire enum as complete as we can
+make it.** The convergence plan's recovery table implies a
+specific vocabulary per protocol; Phase 1 ships those variants
+plus any additional variants documented in the per-crate
+scaffolds. Protocol crates in Phase 2 cannot edit
+`bifrost-types/src/error/cause.rs` — that violates crate
+ownership boundaries. If a Phase 2 agent needs a new wire-enum
+variant, the orchestrator patches `bifrost-types` centrally and
+re-runs the affected agent. Crate-ownership rules are
+non-negotiable; centralized patches to wire enums are the escape
+hatch.
 
 ### `Fatal` newtype
 
@@ -549,15 +503,18 @@ pub struct Warning {
 
 `WarningKind` retains the existing categories (`StrategyDowngraded`,
 `OperatorAttentionNeeded`, `Throttled`, `ClockSkew`,
-`BlobNotByteStream`, `ReadbackSkipped`, `Other`). The `Other(String)`
-variant becomes `Other(DiagnosticText)`.
+`BlobNotByteStream`, `ReadbackSkipped`, `Other`). `Other` carries
+no payload — putting free text inside the kind is the same
+anti-pattern that `RequestErrorKind::BatchInputInvalid` already
+avoids. The detail belongs in `Warning.protocol_detail`, which is
+a `DiagnosticText` and inherits the visibility discipline.
 
 Existing `Warning` fields `message: String`, `next_action: Option<String>`,
 `protocol_detail: Option<String>` all upgrade to `DiagnosticText`.
 
 ### `EngineDirective::CapabilityChanged`
 
-Reuses the existing `capabilities::CapabilityDelta` verbatim:
+Reuses the existing `capabilities::CapabilityDelta`:
 
 ```rust
 use crate::capabilities::CapabilityDelta;
@@ -565,7 +522,15 @@ use crate::capabilities::CapabilityDelta;
 EngineDirective::CapabilityChanged { delta: CapabilityDelta }
 ```
 
-No changes to `capabilities.rs`.
+**Phase 1 modifies `capabilities.rs`** to add `PartialEq, Eq`
+derives to `CapabilityKey`, `CapabilityValue`, `CapabilityChange`,
+and `CapabilityDelta`. The new `RecoveryClass` and `EngineDirective`
+derive `PartialEq, Eq` (the recovery mapping tests need it for
+assertions), and that propagates: every type they transitively
+contain must also derive both. `CapabilityKey(String)` and
+`CapabilityValue(String)` derive trivially; `CapabilityChange` and
+`CapabilityDelta` follow. This is the only non-`error/` Phase 1
+edit besides `lib.rs`.
 
 ### `StrategyDowngrade`
 
@@ -576,86 +541,78 @@ re-export from the new location.
 
 ## Test plan
 
-Per `CLAUDE.md` testing rules: small technical tests, no live
-servers, no mock servers. Target ~95-100 tests, all sub-second.
+Tests cannot run in Phase 1: the crate does not compile (the
+trait, event, and mutation surfaces still reference removed
+types). Phase 3 is the earliest point the workspace compiles and
+the test suite runs.
 
-**Recovery mapping tests** (`error/recovery.rs` test module):
-- Every row in the convergence plan's mapping table becomes at
-  least one test. Construct an input `(kind, scope, operation,
-  chain, ...)` and assert the produced `RecoveryClass`.
-- ~40-50 tests.
+The tests themselves are written in Phase 1 alongside the types —
+they live in `#[cfg(test)]` modules inside each `error/*.rs`
+file. They simply don't execute until integration. Per
+`CLAUDE.md`: small technical tests, no live servers, no mock
+servers. Targets:
 
-**Message-key tests** (`error/message_key.rs` test module):
-- One test per documented key.
-- ~30 tests.
+- Recovery mapping (`error/recovery.rs`): one test per
+  convergence-plan mapping-table row. ~40-50 tests.
+- Message-key (`error/message_key.rs`): one test per documented
+  key. ~30 tests.
+- Builder invariants (`error/builder.rs`): chain non-empty,
+  `kind_matches_cause` panic in debug, `throttle_scope`
+  restricted to rate-limit / quota, `idempotency_override`
+  precedence, `retry_not_before` propagation. ~10 tests.
+- Diagnostic accessors (`error/account_error.rs`):
+  `user_safe_text` yields only `UserSafe`, `telemetry_fields`
+  carries no free-form text, `support_internal` includes
+  serialized chain, `serde::Serialize` round-trips. ~6 tests.
+- Batch shape (`error/batch.rs`): `iter()` yields submission
+  order, lane `Vec` accessors preserve submission order within
+  lane, `validate_batch_input` rejects empty and duplicate
+  `BatchItemId`. ~5 tests.
+- Cause chain (`error/cause.rs`): `StdError::source()` returns
+  outermost cause, `CauseChain::iter()` yields outer-to-inner,
+  `Cause::Attempt` carries `TransmissionState`, embedded
+  `StdError::source()` works. ~4 tests.
 
-**Builder invariant tests** (`error/builder.rs` test module):
-- Chain non-empty (by construction).
-- `kind_matches_cause` panic in debug builds on mismatch.
-- `throttle_scope` set only for `RateLimited` / `QuotaExhausted`.
-- `idempotency_override` applied before operation default.
-- `retry_not_before` populated for relevant reasons.
-- ~10 tests.
-
-**Diagnostic accessor tests** (`error/account_error.rs` test
-module):
-- `user_safe_text()` yields only `UserSafe` items.
-- `telemetry_fields()` carries no free-form text.
-- `support_minimal()` is structurally identical to
-  `telemetry_fields()`.
-- `support_internal()` includes serialized chain.
-- `serde::Serialize` round-trips for each export tier.
-- ~6 tests.
-
-**Batch shape tests** (`error/batch.rs` test module):
-- `BatchOutcome::iter()` yields submission order.
-- Lane `Vec` accessors preserve submission order within lane.
-- `BatchItemId` empty rejected by `validate_batch_input`.
-- `BatchItemId` duplicate rejected by `validate_batch_input`.
-- `BatchItemOutcome` exhaustiveness (closed enum check).
-- ~5 tests.
-
-**Cause chain tests** (`error/cause.rs` test module):
-- `StdError::source()` returns outermost cause.
-- `CauseChain::iter()` yields outer-to-inner.
-- `Cause::Attempt` carries `TransmissionState`.
-- Each variant's embedded `StdError::source()` works.
-- ~4 tests.
+Total: ~95-100 deterministic tests. All execute after Phase 3.
 
 ## Exit criteria
+
+Phase 1 validates by patch audit, not by `brokkr check` or
+`brokkr test`. The workspace does not compile after this phase,
+by design.
+
+Patch-audit criteria:
 
 - `crates/types/src/error/` directory exists with the file
   structure above (or a defensible variation).
 - `crates/types/src/error.rs` deleted.
 - Every public type from `plans/error-model-convergence.md` is
-  present and exported from `lib.rs`.
+  present in the new module.
+- `crates/types/src/lib.rs` re-exports point to the new module;
+  old re-exports of `Error`, `Fatal`, `RecoveryClass`,
+  `StrategyDowngrade`, `Warning`, `WarningKind`,
+  `MutationResult`, `MutationOutcome` removed.
 - `AccountError` is opaque (no `pub` fields).
 - `AccountErrorBuilder::build` is the only public construction
   path for `AccountError`.
-- Central recovery mapping (`recovery::derive`) implemented;
-  every mapping-table row unit-tested.
-- `message_key::derive` implemented; every documented key
-  unit-tested.
-- Old `Error` enum, old `RecoveryClass`, old `Fatal` struct
-  REMOVED.
-- `MutationResult` and `MutationOutcome` removed from
-  `mutation.rs`; `ItemOutcome<MutationSuccess>` defined in
-  `error/stream.rs`.
-- `Warning` uses `DiagnosticText` for all free-form fields.
-- `WarningKind::Other(String)` → `Other(DiagnosticText)`.
-- `SyncEvent::Fatal(Fatal)` renamed to
-  `SyncEvent::Terminated(AccountError)`.
+- `recovery::derive` implemented with every mapping-table row
+  covered (test in `#[cfg(test)]`; executes in Phase 3).
+- `message_key::derive` implemented with every documented key
+  covered (test in `#[cfg(test)]`; executes in Phase 3).
 - `Fatal` newtype defined with `TryFrom<AccountError>`.
-- `Control` trait signatures updated to `AccountError`.
-- `Account` trait signatures updated to `AccountError`
-  (declarations only; consumer impls in protocol crates break
-  until Phase 2).
-- Default impl of `inventory_partition_stream` and the
-  `Unsupported`-short-circuit conveniences updated to construct
-  `AccountError` via the builder.
-- `cargo check -p bifrost-types` clean.
-- `cargo test -p bifrost-types` passes (~95-100 tests).
-- Workspace `brokkr check` fails only at consumer crate
-  references — no other regressions.
+- `Warning` uses `DiagnosticText` for all free-form fields;
+  `WarningKind::Other` carries no payload.
+- All wire enums (`GraphSignal`, `JmapMethod`, `ImapResponseCode`,
+  `EnhancedStatusCode`, `GmailSignal`) shipped in `error/cause.rs`
+  with their initial vocabularies.
+- `crates/types/src/account.rs`, `events.rs`, `mutation.rs`
+  UNCHANGED by this phase.
+- `crates/types/src/capabilities.rs` modified: `CapabilityKey`,
+  `CapabilityValue`, `CapabilityChange`, `CapabilityDelta` now
+  derive `PartialEq, Eq` (required for `RecoveryClass` /
+  `EngineDirective` derives to propagate).
 - No transitional shims, no compatibility aliases, no
   `#[deprecated]` markers on removed types.
+
+Phase 3 picks up validation: at the end of Phase 3, `brokkr check`
+runs clean and the ~95-100 tests written in Phase 1 execute green.

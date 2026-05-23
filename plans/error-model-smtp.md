@@ -141,8 +141,10 @@ No live SMTP server. Construct synthetic server response streams.
   recipients.
 - Locally-invalid input rejected as `Err(BatchInputInvalid)`.
 - Old recovery helpers removed.
-- `cargo check -p bifrost-smtp` clean.
-- Per-crate tests pass.
+- Patches against this crate match this plan's exit criteria.
+  Compilation and per-crate tests are not run at this phase;
+  Phase 3 (workspace integration) is where `brokkr check` runs
+  and tests execute.
 
 ## Discovery items for the agent
 

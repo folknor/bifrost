@@ -45,46 +45,61 @@ are explicit.
 
 ### Phase 1: types foundation
 
-**Goal:** land all `bifrost-types` changes from the convergence plan.
+**Goal:** land the new `bifrost-types::error` module from the
+convergence plan, plus the matching `lib.rs` re-export update and
+the deletion of the old `error.rs`. Nothing else.
+
 Single agent (the main conversation), single commit on the feature
-branch. After this commit, `bifrost-types` compiles in isolation and
-its tests pass; consumer crates fail to compile because they still
-reference removed types. That is intentional.
+branch. After this commit, `bifrost-types` does **not** compile —
+`account.rs`, `events.rs`, and `mutation.rs` still reference the
+removed `Error`, `Fatal`, `RecoveryClass`, `Warning`, `Warning`,
+`MutationResult`, and `MutationOutcome` types. That is intentional;
+those surface migrations belong to Phase 3 (workspace integration),
+where the entire workspace migrates in one coordinated commit and
+compilation comes back.
 
 **Plan:** `plans/error-model-types.md`.
 
-**Validation gate:**
+**Validation:** patch audit, not compilation. Per the types plan's
+exit criteria:
 
-- `cargo check -p bifrost-types` clean.
-- `cargo test -p bifrost-types` passes — recovery mapping table fully
-  covered by unit tests, message_key derivation covered, builder
-  invariants covered, diagnostic accessors covered.
-- `brokkr check --all` will fail at consumer crates. The failures
-  must be exactly the kinds Phase 2 addresses (references to removed
-  types). No other regressions.
+- The new `error/` module exists with the documented file layout.
+- Every public type from the convergence plan is present.
+- `lib.rs` re-exports updated.
+- `account.rs`, `events.rs`, `mutation.rs` not touched.
+- No transitional shims or compatibility aliases.
 
-### Phase 2: wire / protocol crate rewrite
+`brokkr check` is not run at this phase boundary — the workspace
+will not compile until Phase 3.
 
-**Goal:** per-crate consumer migration. Each consumer crate's
-internal error types and `into_account_error`-equivalent translation
-boundary are rewritten against the new builder. Old helpers
-(`recovery_for_*`, `fatal_for_*`, Graph substring matching, Gmail
-`account_error_from_template`) deleted in the same commits.
+### Phase 2: per-crate patch authorship
+
+**Goal:** rewrite each consumer crate's internal error types and
+`into_account_error`-equivalent translation boundary against the
+new builder. Old helpers (`recovery_for_*`, `fatal_for_*`, Graph
+substring matching, Gmail `account_error_from_template`) deleted
+in the same commits.
 
 **Orchestration:** multi-agent per the project pattern
-(AGENTS.md). Strict file ownership by crate. No agent touches files
-outside its crate. The orchestrator (the main conversation)
-validates between agents and merges results.
+(AGENTS.md). Strict file ownership by crate. No agent touches
+files outside its crate. The orchestrator validates between agents
+and merges results.
 
-**Ordering within Phase 2:**
+**Compilation is not a gate at this phase.** Each protocol crate's
+patches reference `bifrost-types` types whose own crate does not
+compile (per Phase 1). Phase 2 commits land in the broken-branch
+state alongside Phase 1's. Validation is by patch audit against
+each per-crate plan's exit criteria.
+
+**Sub-phase ordering within Phase 2:**
 
 1. `bifrost-net` lands first.
    - Plan: `plans/error-model-net.md`.
    - Reason: it sets the `AttemptCause` emission convention that
-     `bifrost-jmap`, `bifrost-gmail`, and `bifrost-graph` rely on
-     for transmission-state evidence. Consumer crates that route
-     HTTP through `bifrost-net` cannot complete until net's
-     `NetErrorContext` / `into_account_error` is rewritten.
+     `bifrost-jmap`, `bifrost-gmail`, and `bifrost-graph` rely
+     on for transmission-state evidence. Agents writing those
+     crates need to know what `bifrost-net`'s translation surface
+     looks like even though they cannot compile against it yet.
    - Single agent, single commit.
 
 2. The five consumer crates land in parallel agents:
@@ -99,60 +114,80 @@ validates between agents and merges results.
    principle land before it, but for orchestration simplicity all
    five run after net.
 
-3. `bifrost-sync` lands last.
+3. `bifrost-sync` lands last in Phase 2.
    - Plan: `plans/error-model-sync.md`.
    - Reason: sync consumes `RecoveryClass` and `SyncEvent`; its
-     migration depends on consumer crates emitting stable
-     `AccountError` shapes. Sync also owns the `SyncEvent::Fatal` →
-     `SyncEvent::Terminated(AccountError)` rename, which touches
-     every consumer crate's emission path.
+     own rewrite depends on the convergence plan's final shape
+     being clear. Sync does **not** own any rename inside
+     `bifrost-types`; the `SyncEvent::Fatal` →
+     `SyncEvent::Terminated(AccountError)` rename happens in
+     Phase 3 inside `bifrost-types/events.rs`. Sync's Phase 2
+     work is updating its own engine code to consume the new
+     `RecoveryClass` shape and dispatching `EngineDirective`.
    - Single agent, single commit.
 
-**Validation gate:**
+**Validation:** patch audit per crate against the relevant
+`plans/error-model-<crate>.md`. No `brokkr check`, no `brokkr
+test` at this phase. The workspace remains broken throughout
+Phase 2.
 
-- After `bifrost-net` lands: `cargo check -p bifrost-net` clean.
-- After each consumer crate lands: `cargo check -p <crate>` clean.
-- After `bifrost-sync` lands: `cargo check -p bifrost-sync` clean,
-  workspace `brokkr check` clean.
-- 3-pass audit per the project convention (see Audit protocol below).
+### Phase 3: workspace integration
 
-### Phase 3: trait surface migration
+**Goal:** restore compilation across the workspace. This is the
+phase that performs every surface migration Phase 1 and Phase 2
+left dangling, in one coordinated commit:
 
-**Goal:** apply the contract changes that touch the `Account` trait
-signatures themselves:
+In `bifrost-types`:
+- `account.rs`: trait imports updated, every `Result<_, Error>`
+  return-type site updated to `Result<_, AccountError>` (~45
+  sites), `bulk_set_flags` / `bulk_move` / `bulk_destroy`
+  signatures updated to
+  `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`, the
+  default impl of `inventory_partition_stream` and the
+  `Unsupported`-short-circuit conveniences updated to construct
+  `AccountError` via the builder.
+- `events.rs`: `SyncEvent::Fatal(Fatal)` renamed to
+  `SyncEvent::Terminated(AccountError)`. `Control` trait's
+  `Result<Checkpoint, Error>` returns updated.
+- `mutation.rs`: `MutationResult` and `MutationOutcome` deleted.
+  `use crate::error::Error` import removed.
 
-- Every method return type `Result<_, Error>` → `Result<_, AccountError>`.
-  This is mechanical but ripples through every consumer impl and
-  every sync engine call site.
-- Multi-target Vec-batch methods (if any) adopt
-  `Result<BatchOutcome<T>, AccountError>` with `Vec<BatchItem<I>>`
-  inputs. SMTP multi-recipient send is the canonical site;
-  identification of any others is a Phase 3 sub-task.
-- Streaming bulk methods (`bulk_set_flags`, `bulk_move`,
-  `bulk_destroy`) migrate from
-  `AccountStream<SyncEvent<MutationResult>>` to
-  `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>` (or the
-  wrapped `SyncEvent::Batch<ItemOutcome<MutationSuccess>>` shape).
-  Per-item ID becomes `BatchItemId`; `MutationOutcome::Skipped`
-  folds into `MutationSuccess::Skipped`.
-- `Warning` adoption of `DiagnosticText` for free-form fields.
+In every protocol crate (`bifrost-net`, `bifrost-jmap`,
+`bifrost-imap`, `bifrost-smtp`, `bifrost-gmail`, `bifrost-graph`):
+- `Account` trait impl signatures updated to match the new
+  trait declarations.
+- Any `SyncEvent::Fatal` emission sites updated to
+  `SyncEvent::Terminated(AccountError)`.
+- `MutationResult` references migrated to
+  `ItemOutcome<MutationSuccess>`.
 
-**Orchestration:** single agent. Trait signature changes are tightly
-coupled across every consumer impl; the project rule that "agents do
-not work on diverged snapshots" applies hard here. One agent owns
-the whole surface for one commit.
+In `bifrost-sync`:
+- Engine consumers updated to `RecoveryClass` four-helper API.
+- `SyncEvent::Fatal` match arms updated to
+  `SyncEvent::Terminated(AccountError)`.
+- `EngineDirective` dispatch wired.
 
-**Validation gate:**
+**Orchestration:** single agent. The integration touches every
+crate; the project rule "agents do not work on diverged snapshots"
+applies hard. One agent owns the whole integration commit.
+
+**Validation:** this is the phase where compilation comes back.
 
 - `brokkr check` clean workspace-wide.
+- The ~95-100 tests written in Phase 1 now execute. They may need
+  minor module-path or import-path repair if Phase 3's
+  integration touches `error/` module organization (it should
+  not, but in practice integration sometimes surfaces module-path
+  adjustments). Phase 3's job includes fixing those tests; they
+  must be all-green by the phase exit gate.
 - All `Account` methods return `Result<_, AccountError>`.
-- No `Result<(), AccountError>` or `Result<Vec<T>, AccountError>` on
-  any multi-target method.
+- No `Result<(), AccountError>` or `Result<Vec<T>, AccountError>`
+  on any multi-target method.
 - Streaming bulk methods emit `ItemOutcome<T>` per-item; no items
   silently drop.
 - `Warning` fields use `DiagnosticText`.
-- `SyncEvent::Terminated(AccountError)` is the rename target; no
-  `SyncEvent::Fatal` remaining.
+- `SyncEvent::Terminated(AccountError)` is the only stream
+  termination event; no `SyncEvent::Fatal` remaining.
 
 ### Phase 4: merge to main
 
@@ -177,6 +212,14 @@ parallel agents make sense). Per AGENTS.md:
 - Agents must NOT run `cargo` or `brokkr`. The orchestrator (the
   main conversation) validates between agents. This prevents three
   agents from triggering simultaneous test runs.
+- **Wire-enum escape hatch:** Phase 2 agents may not edit
+  `crates/types/src/error/cause.rs` even if their crate needs a
+  new `GraphSignal` / `JmapMethod` / `ImapResponseCode` /
+  `EnhancedStatusCode` / `GmailSignal` variant. The orchestrator
+  patches `bifrost-types` centrally on the agent's behalf and
+  re-runs the affected agent. Crate-ownership rules are
+  non-negotiable; centralized patches to wire enums are the only
+  exception.
 - Required reading for every agent:
   - `CLAUDE.md`
   - `AGENTS.md`
@@ -216,12 +259,16 @@ struck through).
 
 | Phase | Gate | Method |
 |---|---|---|
-| 1 | bifrost-types compiles + tests pass | `cargo check -p bifrost-types && cargo test -p bifrost-types` |
-| 2.1 | bifrost-net compiles | `cargo check -p bifrost-net` |
-| 2.2 | each consumer crate compiles | `cargo check -p <crate>` per crate |
-| 2.3 | bifrost-sync compiles, workspace clean | `brokkr check` |
-| 3 | trait surface migrated, workspace clean | `brokkr check --all` |
+| 1 | new error module landed, audit clean | patch audit against `plans/error-model-types.md` exit criteria |
+| 2.1 | bifrost-net translation surface authored | patch audit against `plans/error-model-net.md` |
+| 2.2 | each consumer crate translation authored | patch audit against `plans/error-model-<crate>.md` |
+| 2.3 | bifrost-sync engine adaption authored | patch audit against `plans/error-model-sync.md` |
+| 3 | workspace integration complete, compiles, tests pass | `brokkr check` workspace-wide; the Phase 1 tests now execute |
 | 4 | feature branch merged | `git merge --squash` to main |
+
+Phases 1 and 2 do not run `brokkr`. The workspace is broken
+throughout. Phase 3 is the first phase that runs `brokkr check`,
+and it is also the first phase where it passes.
 
 ## Rollback
 
@@ -246,7 +293,7 @@ Each phase adds tests in proportion to the surface it changes:
 - Phase 2: per-crate translation tests — given a wire-level error,
   the protocol crate produces the expected `AccountErrorKind` and
   `RecoveryClass`. Roughly 10-20 per crate.
-- Phase 3: trait signature changes are caught by `cargo check`;
+- Phase 3: trait signature changes are caught by `brokkr check`;
   ItemOutcome streaming semantics get ~5 tests per bulk method.
 
 No live-server tests. No end-to-end tests. No mock servers.

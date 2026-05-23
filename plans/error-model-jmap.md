@@ -138,8 +138,10 @@ No live JMAP server.
   the appropriate `TransmissionState`.
 - Mutation pipeline consumes new `RecoveryClass` helpers.
 - Old recovery helpers removed.
-- `cargo check -p bifrost-jmap` clean.
-- Per-crate tests pass.
+- Patches against this crate match this plan's exit criteria.
+  Compilation and per-crate tests are not run at this phase;
+  Phase 3 (workspace integration) is where `brokkr check` runs
+  and tests execute.
 
 ## Discovery items for the agent
 

@@ -161,9 +161,11 @@ No live Graph. Construct synthetic Graph error response payloads.
 - Delta-token rejection emits the correct `EngineDirective`.
 - Webhook renewal failure emits structured `AccountError`.
 - EWS fallback path emits structured `AccountError`.
-- `cargo check -p bifrost-graph` clean (or noted as
-  not-yet-implemented if the crate is still planned).
-- Per-crate tests pass.
+- Patches against this crate match this plan's exit criteria
+  (or noted as not-yet-implemented if the crate is still
+  planned). Compilation and per-crate tests are not run at this
+  phase; Phase 3 (workspace integration) is where `brokkr check`
+  runs and tests execute.
 
 ## Discovery items for the agent
 

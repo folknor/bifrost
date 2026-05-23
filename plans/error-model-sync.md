@@ -4,10 +4,12 @@
 the `crates/sync/` source. Sections marked `<TODO>` are placeholders.
 
 This is **Phase 2.3** of `plans/error-model-roadmap.md`, landing
-last in Phase 2 because it consumes `RecoveryClass` from all five
-protocol crates and owns the `SyncEvent::Fatal` →
-`SyncEvent::Terminated(AccountError)` rename that ripples through
-their emission paths.
+last in Phase 2 because it depends on the final shape of
+`RecoveryClass` and `EngineDirective`. Sync does **not** own the
+`SyncEvent::Fatal` → `SyncEvent::Terminated(AccountError)` rename;
+that is a `bifrost-types::events.rs` shape change owned by Phase 3
+(workspace integration). Sync consumes the rename in Phase 3 along
+with the rest of the workspace.
 
 ## Scope
 
@@ -25,9 +27,12 @@ What changes:
   surface for engine-control directives that previously lived as
   top-level `RecoveryClass` variants (`RestartScope`,
   `RestartAccount`, `DowngradeStrategy`, etc.).
-- Stream termination event renames: `SyncEvent::Fatal(Fatal)` →
-  `SyncEvent::Terminated(AccountError)`. The carried payload is
-  now the full `AccountError`, not the old `Fatal` struct.
+- Stream consumers update to match arm on
+  `SyncEvent::Terminated(AccountError)` instead of
+  `SyncEvent::Fatal(Fatal)`. The carried payload is now the full
+  `AccountError`. The rename itself happens in `bifrost-types`
+  during Phase 3; sync's part is updating its match sites to use
+  the renamed variant.
 - `Fatal::try_from(&account_error)` is the boundary check for
   "engine has nothing more to try" code paths.
 - Mutation pipeline consumes `Retry(AfterStateRefresh)` for
@@ -134,14 +139,13 @@ Every stream the engine consumes can emit
 ## Notable concerns
 
 - **Pre-1.0 trait stability.** Per `CLAUDE.md`, all crates are
-  pre-1.0. `bifrost-sync` consumes the `Account` trait directly;
-  Phase 3 will change trait signatures. Phase 2.3 (this plan)
-  updates the engine to work with the *current* trait signatures
-  still returning the old `Error` type — wait, no, the convergence
-  plan rejects transitional types. Resolution:
-  Phase 2.3 lands together with Phase 3's trait-signature change
-  if it can't be done independently. **Re-evaluate during
-  implementation whether Phase 2.3 and Phase 3 should merge.**
+  pre-1.0. `bifrost-sync` consumes the `Account` trait directly.
+  Phase 3 owns the trait signature migration in `bifrost-types`
+  and the matching impl-signature updates in every protocol
+  crate, sync included. Phase 2.3 (this plan) authors sync's
+  rewritten engine code against the new `RecoveryClass` /
+  `EngineDirective` shape; the compilation against new trait
+  signatures comes back in Phase 3.
 - **Stream termination paths.** Per `reference/sync.md`, multiple
   streams can terminate independently per account / per scope. The
   rename affects every `match` arm against `SyncEvent::Fatal` —
@@ -191,9 +195,10 @@ assert engine state transitions.
 - `Fatal::try_from` used at every "operator notification" boundary.
 - Mutation pipeline rebuilt around the new `RecoveryClass`.
 - Old hand-rolled `RecoveryClass` → engine-action mapping deleted.
-- `cargo check -p bifrost-sync` clean.
-- Workspace `brokkr check` clean (this is Phase 2's final gate).
-- Per-crate tests pass.
+- Patches against this crate match this plan's exit criteria.
+  Compilation and per-crate tests are not run at this phase;
+  Phase 3 (workspace integration) is where `brokkr check` runs
+  workspace-wide and tests execute.
 
 ## Discovery items for the agent
 
@@ -210,5 +215,3 @@ assert engine state transitions.
    classification).
 5. Whether `bifrost-sync` references any provider-specific
    `WireCause` variants (it should not; this is a smell).
-6. Whether Phase 2.3 can land independently of Phase 3's trait
-   surface changes, or whether they must merge.

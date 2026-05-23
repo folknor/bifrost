@@ -686,18 +686,69 @@ pub enum ErrorScope {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountOperation {
+    // Discovery and cursor establishment
     Discover,
+    EstablishCursor,
+    DiscoverCursorScopes,
+    DiscoverMemberships,
+    ScopeLifecycle,
+
+    // Sync streams
     SyncInventory,
     SyncChanges,
+
+    // Hydration
     Hydrate,
-    Watch,
-    RenewWatch,
-    Send,
+    HydrateThread,
+    HydrateMessage,
+    OpenBlob,
+    OpenBlobRange,
+
+    // Push
+    PushSubscribe,
+    PushUnsubscribe,
+    PushStream,
+
+    // Mutation primitives
     UpdateFlags,
-    MoveMessage,
-    DeleteMessage,
-    ChangeLabel,
-    EditFolder,
+    BulkMove,
+    BulkDestroy,
+    AddToContainer,
+    RemoveFromContainer,
+    SetKeyword,
+    SetLabelMembership,
+    SetCategory,
+    SetExtendedProperty,
+    SetIsRead,
+
+    // Composition
+    Send,
+    AttachmentUpload,
+    DraftCreate,
+    DraftUpdate,
+    DraftDiscard,
+    DraftSend,
+
+    // Search
+    Search,
+    SearchMessages,
+
+    // Containers
+    ContainersList,
+    ContainerCreate,
+    ContainerRename,
+    ContainerMove,
+    ContainerDelete,
+
+    // Settings
+    IdentitiesList,
+    IdentityUpdate,
+    VacationGet,
+    VacationSet,
+    QuotaGet,
+
+    // Lifecycle
+    Close,
     Expunge,
 }
 
@@ -712,11 +763,17 @@ scope is broader (`Account`, `CalendarCollection`, `ContactCollection`).
 A `Mailbox` scope without an id is not expressible; consumers never
 have to handle `Some/None` in match arms.
 
-Operations are split finely enough that idempotency is a property of
-the variant, not a hedged hint. `UpdateFlags` (set/clear converges),
-`DeleteMessage` (gone is gone), `ChangeLabel` (set/clear converges),
-and `Expunge` are idempotent. `Send`, `MoveMessage`, and `EditFolder`
-are not. `is_idempotent()` does not lie; the central recovery mapping
+Operations are split finely enough that idempotency is a property
+of the variant, not a hedged hint. Idempotent: `UpdateFlags`,
+`BulkDestroy`, `SetKeyword`, `SetLabelMembership`, `SetCategory`,
+`SetExtendedProperty`, `SetIsRead`, `Expunge`, every read-only
+operation (`Hydrate`, `Search`, `ContainersList`, etc.), and the
+discard/getter family (`DraftDiscard`, `VacationGet`, `QuotaGet`).
+Not idempotent: `Send`, `BulkMove`, `AddToContainer`,
+`RemoveFromContainer`, `AttachmentUpload`, `DraftCreate`,
+`DraftUpdate`, `DraftSend`, `ContainerCreate`, `ContainerRename`,
+`ContainerMove`, `ContainerDelete`, `IdentityUpdate`, `VacationSet`.
+`is_idempotent()` does not lie; the central recovery mapping
 relies on this distinction to pick the right `RetryDisposition`.
 
 Support logs and UI copy should not have to infer the operation from
@@ -896,14 +953,19 @@ The recovery mapping treats absence and `Unsent` identically for
 classification, but support exports keep the distinction visible.
 
 `Cause` and every variant implement `StdError`. `AccountError::source()`
-returns the outermost `Cause`. Each variant's own `source()` exposes
-its embedded system error (e.g., `io::Error`, `rustls::Error`) where
-one exists, but does **not** traverse the typed `CauseChain` — that
-requires `AccountError::chain().iter()`. Standard walkers
-(`anyhow`, `tracing`'s error layers, `eyre`) see one level of typed
-cause plus any embedded system error; the full typed chain is
-structured access only. This is a deliberate limit: the Vec-backed
-`CauseChain` is not a linked list and we do not pretend otherwise.
+returns the outermost `Cause`. Each variant's own `source()` returns
+`None`: cause types do not store boxed `dyn StdError` embedded
+sources, because doing so would require Clone-via-Arc on every
+variant and serialization carve-outs on the support exports. The
+text content the underlying system error would have produced is
+captured as `DiagnosticText` on `TransportCause::message` (and
+equivalents); support exports surface it through
+`support_internal()`. Standard walkers (`anyhow`, `tracing`'s
+error layers, `eyre`) see exactly one level of typed cause via
+`AccountError::source()`; the full typed chain is reached only
+through `AccountError::chain().iter()`. This is a deliberate
+limit: the Vec-backed `CauseChain` is not a linked list and we
+do not pretend otherwise.
 
 `WireCause` carries provider-native provenance so support code can
 diagnose without string parsing. It should normally be paired with a
