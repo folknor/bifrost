@@ -14,6 +14,7 @@ use std::time::Duration;
 use bifrost_net::auth::{AccessToken, OAuthRefresher, TokenSource};
 use bifrost_net::error::Error;
 use bifrost_types::AccountFuture;
+use bifrost_types::TransmissionState;
 
 /// `TokenSource` that counts `refresh()` invocations and sleeps for
 /// a small fake duration to widen the race window. `current()` falls
@@ -60,6 +61,7 @@ impl TokenSource for CountingSource {
                 // on the wrapped source across waiters.
                 Err(Error::Network {
                     message: "fake transient failure".to_owned(),
+                    transmission_state: TransmissionState::Unsent,
                     source: None,
                 })
             } else {
@@ -111,7 +113,7 @@ async fn single_flight_failure_shares_one_arc_across_waiters() {
     for h in handles {
         let res = h.await.expect("task panicked");
         match res {
-            Err(Error::RefreshFailed { source }) => shared_arcs.push(source),
+            Err(Error::RefreshFailed { source, .. }) => shared_arcs.push(source),
             Err(other) => panic!("expected RefreshFailed, got {other:?}"),
             Ok(_) => panic!("expected failure"),
         }

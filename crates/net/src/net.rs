@@ -13,13 +13,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
+use bifrost_types::TransmissionState;
 use futures::StreamExt;
 use reqwest::header::RANGE;
 
 use crate::auth::{OAuthRefresher, TokenSource};
 use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
-use crate::error::Error;
+use crate::error::{Error, RangeFailureKind};
 use crate::rate::{RateLimit, RateLimitGovernor};
 use crate::request::{ByteStream, InternalStreaming, RequestBuilder, send_streaming_inner};
 use crate::retry::RetryPolicy;
@@ -62,11 +63,12 @@ impl Net {
     /// settings. Native-tls only.
     ///
     /// # Errors
-    /// Returns `Error::NetSetup` if `native_tls` rejects a supplied
-    /// root certificate, if `reqwest::Certificate::from_der` rejects
-    /// the DER re-encoding, or if `reqwest::ClientBuilder::build`
-    /// itself fails. `NetConfig` is consumer-supplied (the engine reads
-    /// the trust store from disk), so these are runtime conditions.
+    /// Returns `Error::InvalidRequest` if `native_tls` rejects a
+    /// supplied root certificate, if `reqwest::Certificate::from_der`
+    /// rejects the DER re-encoding, or if `reqwest::ClientBuilder::build`
+    /// itself fails. The same `NetConfig` would fail again, so these
+    /// are local configuration failures rather than retryable
+    /// transport setup failures.
     // `Error` is a wide enum (boxed `dyn Error`, `Bytes`, `HeaderMap`)
     // and a one-shot constructor returning it trips
     // `result_large_err`. Boxing the `Err` here would force the rest
@@ -97,21 +99,21 @@ impl Net {
             // DER round-trip; both backends share the same DER format
             // so this is lossless under normal conditions. A failure
             // here means the caller handed us a corrupt cert.
-            let der = cert.to_der().map_err(|e| Error::NetSetup {
-                message: format!("native_tls certificate failed to encode as DER: {e}"),
-                source: Some(Box::new(e)),
+            let der = cert.to_der().map_err(|e| Error::InvalidRequest {
+                field: "root_certs",
+                detail: format!("native_tls certificate failed to encode as DER: {e}"),
             })?;
             let reqwest_cert =
-                reqwest::Certificate::from_der(&der).map_err(|e| Error::NetSetup {
-                    message: format!("reqwest rejected DER certificate: {e}"),
-                    source: Some(Box::new(e)),
+                reqwest::Certificate::from_der(&der).map_err(|e| Error::InvalidRequest {
+                    field: "root_certs",
+                    detail: format!("reqwest rejected DER certificate: {e}"),
                 })?;
             builder = builder.add_root_certificate(reqwest_cert);
         }
 
-        let client = builder.build().map_err(|e| Error::NetSetup {
-            message: format!("reqwest client build failed: {e}"),
-            source: Some(Box::new(e)),
+        let client = builder.build().map_err(|e| Error::InvalidRequest {
+            field: "client_config",
+            detail: format!("reqwest client build failed: {e}"),
         })?;
 
         Ok(Self {
@@ -383,6 +385,7 @@ impl AccountNet {
         if let Some(want) = want_range.as_deref() {
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(Error::RangeNotHonored {
+                    kind: RangeFailureKind::ResponseNotPartial,
                     message: format!(
                         "expected 206 Partial Content for Range request {want}, got {status}"
                     ),
@@ -390,6 +393,7 @@ impl AccountNet {
             }
             let Some(got_hv) = headers.get(reqwest::header::CONTENT_RANGE) else {
                 return Err(Error::RangeNotHonored {
+                    kind: RangeFailureKind::MissingContentRange,
                     message: format!(
                         "206 response for Range request {want} omitted Content-Range header"
                     ),
@@ -398,6 +402,7 @@ impl AccountNet {
             let got = got_hv.to_str().unwrap_or("");
             if !content_range_matches(want, got) {
                 return Err(Error::RangeNotHonored {
+                    kind: RangeFailureKind::ContentRangeMismatch,
                     message: format!("content-range mismatch: requested {want}, got {got}"),
                 });
             }
@@ -580,15 +585,14 @@ pub struct AccountSpec {
 ///
 /// A `length = Some(0)` request is rejected upstream by
 /// `AccountNet::download_stream`; the encoder treats `Some(0)` as a
-/// programmer error and returns `Error::RangeNotHonored` (the closest
-/// existing variant; no separate `RangeInvalid` because callers map
-/// both to the same recovery class).
+/// local invalid range and returns `Error::RangeNotHonored` with
+/// `RangeFailureKind::LocalInvalid`.
 ///
 /// `start + length` is checked for `u64` overflow. Previously the
 /// saturating math would silently emit `bytes=start-u64::MAX`, which
 /// servers either reject or fulfil with the full tail of the resource
 /// (silent semantics drift). We surface
-/// `Error::RangeNotHonored { message: "range overflow" }` instead so
+/// `Error::RangeNotHonored { kind: LocalInvalid, .. }` instead so
 /// callers see the configuration bug immediately.
 // `Error` is intentionally wide (Bytes + HeaderMap), so a Result-wrapping
 // constructor trips `result_large_err`. The alternative (boxing) would
@@ -599,11 +603,13 @@ pub(crate) fn encode_range(range: ByteRange) -> Result<String, Error> {
     match range.length {
         None => Ok(format!("bytes={}-", range.start)),
         Some(0) => Err(Error::RangeNotHonored {
+            kind: RangeFailureKind::LocalInvalid,
             message: "zero-length range".to_owned(),
         }),
         Some(n) => {
             let Some(end_plus_one) = range.start.checked_add(n) else {
                 return Err(Error::RangeNotHonored {
+                    kind: RangeFailureKind::LocalInvalid,
                     message: format!(
                         "range overflow: start {} + length {n} exceeds u64::MAX",
                         range.start,
@@ -827,9 +833,18 @@ impl ByteBucket {
 /// adapter without pulling the `Net` types in.
 pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
     use futures::TryStreamExt;
-    let stream = response.bytes_stream().map_err(|e| Error::Network {
-        message: format!("response body chunk error: {e}"),
-        source: Some(Box::new(e)),
+    let stream = response.bytes_stream().map_err(|e| {
+        if e.is_timeout() {
+            Error::Timeout {
+                transmission_state: TransmissionState::Acknowledged,
+            }
+        } else {
+            Error::Network {
+                message: format!("response body chunk error: {e}"),
+                transmission_state: TransmissionState::Acknowledged,
+                source: Some(Box::new(e)),
+            }
+        }
     });
     Box::pin(stream)
 }

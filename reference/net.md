@@ -99,9 +99,10 @@ feeds the per-account meter and the bandwidth-cap throttle.
   exposed.
 - 4xx not in `policy.statuses`, not 401 -> terminal
   `Error::Status`.
-- 401 -> force refresh once; second 401 -> `Error::AuthLost`. The
-  401-recovery budget is **separate** from the network retry
-  budget: a 401 retry no longer burns one of the `max_attempts`
+- 401 -> force refresh once; second 401 -> `Error::AuthLost` with
+  `transmission_state: Some(Acknowledged)` and preserved 401 response
+  evidence. The 401-recovery budget is **separate** from the network
+  retry budget: a 401 retry no longer burns one of the `max_attempts`
   network attempts.
 - 5xx or in `policy.statuses` -> retry with backoff. Honor
   `Retry-After` (delta-seconds + RFC 9110 HTTP-date via
@@ -122,7 +123,7 @@ feeds the per-account meter and the bandwidth-cap throttle.
 
 Token-source failures returned from `current()` are passed through
 to the caller unchanged: `Error::AuthLost` for true auth failures,
-`Error::RefreshFailed { source }` for transient
+`Error::RefreshFailed { retry_after, source }` for transient
 `Network`/`Timeout`/etc. failures (preserving the inner classification
 for retry-vs-give-up decisions).
 
@@ -143,9 +144,11 @@ driver transitions to `Fresh { token, refreshed_at }`. On failure
 the driver fans `Arc<Error>` clones to every waiter (because
 `Error` is not `Clone`).
 
-`Error::RefreshFailed { source: Arc<Error> }` preserves
+`Error::RefreshFailed { retry_after, source: Arc<Error> }` preserves
 transient-vs-permanent: `Network`/`Timeout` survive as themselves;
 true auth failures (token-endpoint 401/403) map to `AuthLost`.
+OAuth 429/503 `Retry-After` hints are projected to the wrapper's
+absolute deadline.
 
 `AccessToken` wraps `Zeroizing<String>`; `Debug` redacts the bytes
 and surfaces only length + expiry.
@@ -275,11 +278,12 @@ known total, which silently admitted truncated bodies.
 - `ByteRange { length: Some(0), .. }` short-circuits in
   `download_stream` to an empty `ByteStream` without touching the
   network or the meter. The encoder also rejects `Some(0)` as
-  `Error::RangeNotHonored { message: "zero-length range" }` so
-  hand-rolled callers see the error path.
+  `Error::RangeNotHonored { kind: LocalInvalid, message:
+  "zero-length range" }` so hand-rolled callers see the error path.
 - `start + length` overflow is rejected up front by `encode_range`
-  with `Error::RangeNotHonored { message: "range overflow: ..." }`
-  rather than silently emitting `bytes=N-u64::MAX`.
+  with `Error::RangeNotHonored { kind: LocalInvalid, message:
+  "range overflow: ..." }` rather than silently emitting
+  `bytes=N-u64::MAX`.
 
 ## TLS
 
@@ -336,9 +340,12 @@ to the caller exactly as it did before the loop landed. The
 `NetConfig::with_redirect_policy(RedirectPolicy)` builder helpers
 let callers configure the policy without naming the outer enum.
 
-`Net::new` returns `Result<Net, Error::NetSetup>` on bad TLS
-config; consumer-supplied data is a runtime condition, not a
-programmer error.
+`Net::new` returns `Error::InvalidRequest` for bad TLS / client
+configuration data: corrupt native-tls root cert DER, reqwest
+rejection of the re-encoded DER, or client-builder failure. These
+route to the account error model as `Request(Malformed)`, not as a
+retryable transport setup failure. `Error::NetSetup` remains only as
+a legacy representable variant.
 
 ## traceparent
 
@@ -353,21 +360,36 @@ Full trace propagation (reading trace_id from the current
 `Error` is `#[non_exhaustive]` and `thiserror`-derived. Notable
 variants:
 
-- `Network { message, source }` - transport-level failures (DNS,
-  TCP reset, generic transport).
-- `Timeout` - per-request deadline.
-- `Tls { message }` - TLS handshake or certificate validation
-  failure. Kept distinct from `Network` so consumers can present
-  trust-store-specific guidance without sniffing error strings.
+- `Network { message, transmission_state, source }` - transport-level
+  failures (DNS, TCP reset, generic transport). `transmission_state`
+  is `Unsent`, `InFlight`, or `Acknowledged`; acknowledged network
+  body failures convert to `Protocol(PartialResponse)`, never
+  `Transport(_)`.
+- `Timeout { transmission_state }` - per-request deadline, with the
+  same transmission-state evidence.
+- `Tls { message, transmission_state }` - TLS handshake or certificate
+  validation failure. Handshake failures are `Unsent`; synthetic
+  acknowledged TLS values are defensively converted as partial
+  responses.
 - `Status { code, body, headers }` - terminal non-retryable HTTP
   status. `body` is capped at 4 KB via `cap_status_body` with a
   truncation marker.
-- `RetryBudgetExhausted { last_status, retry_after_history }`.
-- `RateLimited { retry_after }` - 429 past the retry budget.
-- `AuthLost` - irrecoverable token failure (refresh-token revoked,
-  repeated 401).
-- `RefreshFailed { source: Arc<Error> }` - transient refresh
-  failure preserving the original.
+- `RetryBudgetExhausted { final_response, retry_after_history }` -
+  retry budget exhausted. `final_response` preserves the last status,
+  headers, and capped body when a response was received.
+- `RateLimited { retry_after, final_response }` - 429 past the retry
+  budget with preserved response evidence.
+- `AuthLost { transmission_state, final_response }` - irrecoverable
+  token failure. Local token-source loss has no final response;
+  repeated target 401 after forced refresh preserves the 401 status,
+  headers, and capped body with `transmission_state:
+  Some(Acknowledged)`. Token-endpoint 401/403 during refresh also
+  preserves its response evidence, but leaves `transmission_state`
+  unset because it is not evidence for the target request.
+- `RefreshFailed { retry_after, source: Arc<Error> }` - transient
+  refresh failure preserving the original. OAuth `Retry-After`
+  deadlines are stored on the wrapper for the account-error
+  conversion.
 - `Cancelled` - request cancelled before completion.
 - `CostExceedsBurst { cost, burst }` - rate-limit configuration
   bug.
@@ -376,17 +398,42 @@ variants:
 - `InvalidHeader { message, source }` - `RequestBuilder::header`
   rejected the header name or value; deferred to `send` the same
   way `EncodeBody` is, so the fluent setter stays chainable.
-- `RangeNotHonored { message }` - server returned non-206 or
-  mismatched `Content-Range` to a Range request.
+- `InvalidRequest { field, detail }` - pre-wire local request or
+  client configuration failure.
+- `RangeNotHonored { kind, message }` - local invalid range input or
+  a response that did not honor the requested range.
 - `RedirectRejected { message }` - 3xx target host fell outside
   the configured `RedirectPolicy::trusted_hosts` allowlist.
+- `MalformedRedirect { kind, message }` - acknowledged 3xx response
+  with missing, non-UTF-8, or unresolvable `Location`.
 - `RedirectLoop { hops }` - redirect chain exceeded
   `RedirectPolicy::max_hops`.
 - `NetSetup { message, source }` - `Net::new` construction
-  failure.
+  failure retained as a legacy representable variant, no longer
+  constructed by current `Net::new` paths.
 
 `Status`/`Response` carry `reqwest::StatusCode` and `HeaderMap`
 straight through. Documented coupling cost; acceptable for v1.
+
+`account_error.rs` exposes:
+
+```rust
+pub struct NetErrorContext {
+    pub provider: Option<Provider>,
+    pub protocol: Protocol,
+    pub operation: AccountOperation,
+    pub scope: Option<ErrorScope>,
+}
+
+pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError;
+```
+
+`operation` is required so in-flight non-idempotent failures cannot
+fall through the central recovery mapper as retry-safe. The
+conversion attaches `Cause::Attempt` when target-attempt evidence
+exists, preserves request / trace ids and capped body text from
+`Status`, `RateLimited`, and status-backed `RetryBudgetExhausted`,
+and leaves provider JSON interpretation to JMAP, Gmail, and Graph.
 
 ## URL helpers
 
@@ -415,6 +462,7 @@ crates/net/src/
   redirect.rs     // FollowRedirects + RedirectPolicy + classify_redirect
                   // (RFC 7231 §6.4 method rewriting, trusted-host
                   //  allowlist, Authorization stripping)
+  account_error.rs // context-aware conversion to bifrost-types AccountError
   auth.rs         // TokenSource + OAuthRefresher state machine +
                   // StaticTokenSource
   retry.rs        // RetryPolicy

@@ -31,7 +31,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, LOCATION},
 };
 
-use crate::error::Error;
+use crate::error::{Error, MalformedRedirectKind};
 
 /// Top-level redirect policy. Stored on `NetConfig::follow_redirects`.
 #[derive(Clone, Debug)]
@@ -166,7 +166,7 @@ pub struct RedirectStep {
 ///
 /// Errors:
 ///
-/// - `Error::Network` when `Location` is missing or unparseable.
+/// - `Error::MalformedRedirect` when `Location` is missing or unparseable.
 /// - `Error::RedirectRejected` when the target host is outside the
 ///   trusted-host allowlist.
 ///
@@ -195,9 +195,9 @@ pub(crate) fn classify_redirect(
         return Ok(RedirectAction::PassThrough);
     }
     let Some(location) = headers.get(LOCATION) else {
-        return Err(Error::Network {
+        return Err(Error::MalformedRedirect {
+            kind: MalformedRedirectKind::MissingLocation,
             message: format!("HTTP {status} redirect missing Location header"),
-            source: None,
         });
     };
     let location_str = location_to_str(location)?;
@@ -240,9 +240,9 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
     value
         .to_str()
         .map(str::to_owned)
-        .map_err(|e| Error::Network {
+        .map_err(|e| Error::MalformedRedirect {
+            kind: MalformedRedirectKind::InvalidLocationEncoding,
             message: format!("Location header was not valid UTF-8: {e}"),
-            source: Some(Box::new(e)),
         })
 }
 
@@ -250,9 +250,9 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
 /// relative paths the same way `reqwest::redirect` does internally.
 #[allow(clippy::result_large_err)]
 fn resolve_location(base: &reqwest::Url, location: &str) -> Result<reqwest::Url, Error> {
-    base.join(location).map_err(|e| Error::Network {
+    base.join(location).map_err(|e| Error::MalformedRedirect {
+        kind: MalformedRedirectKind::UnresolvableLocation,
         message: format!("Location {location:?} could not be resolved against base: {e}"),
-        source: Some(Box::new(e)),
     })
 }
 
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_location_is_a_network_error() {
+    fn missing_location_is_a_malformed_redirect_error() {
         let policy = RedirectPolicy::default();
         let h = HeaderMap::new();
         let err = classify_redirect(
@@ -387,6 +387,12 @@ mod tests {
             &h,
         )
         .expect_err("302 without Location is an error");
-        assert!(matches!(err, Error::Network { .. }));
+        assert!(matches!(
+            err,
+            Error::MalformedRedirect {
+                kind: MalformedRedirectKind::MissingLocation,
+                ..
+            }
+        ));
     }
 }

@@ -5,9 +5,11 @@
 //! Everything routes through this wrapper so the underlying HTTP
 //! stack can be swapped without touching call sites.
 
+use std::error::Error as StdError;
 use std::pin::Pin;
 use std::time::Duration;
 
+use bifrost_types::TransmissionState;
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::{
@@ -17,7 +19,7 @@ use reqwest::{
 use serde::Serialize;
 
 use crate::auth::AccessToken;
-use crate::error::Error;
+use crate::error::{Error, FinalResponse, STATUS_BODY_CAP};
 use crate::net::{AccountNet, into_byte_stream, wrap_metered};
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
@@ -432,26 +434,18 @@ pub(crate) async fn send_streaming_inner(
                 if let Some(ref h) = host {
                     account.net().governor().refund(h, cost_units);
                 }
-                if e.is_timeout() {
-                    if policy.network_errors && attempt < policy.max_attempts {
-                        let delay = backoff_for(&policy, attempt);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(Error::Timeout);
+                if e.is_builder() {
+                    return Err(Error::InvalidRequest {
+                        field: "request",
+                        detail: format!("{e}"),
+                    });
                 }
-                // Connect, body, decode failures are network-level.
-                // Retry per policy if `network_errors` is set.
-                let msg = format!("{e}");
                 if policy.network_errors && attempt < policy.max_attempts {
                     let delay = backoff_for(&policy, attempt);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                return Err(Error::Network {
-                    message: msg,
-                    source: Some(Box::new(e)),
-                });
+                return Err(send_error_to_error(e));
             }
         };
 
@@ -472,8 +466,11 @@ pub(crate) async fn send_streaming_inner(
         // recovery does not eat into the network attempts left.
         if auth_for_next_hop && status == StatusCode::UNAUTHORIZED {
             if auth_retries >= MAX_AUTH_RETRIES {
-                drop(response);
-                return Err(Error::AuthLost);
+                let final_response = final_response_from_response(response).await;
+                return Err(Error::AuthLost {
+                    transmission_state: Some(TransmissionState::Acknowledged),
+                    final_response: Some(final_response),
+                });
             }
             auth_retries = auth_retries.saturating_add(1);
             drop(response);
@@ -533,10 +530,11 @@ pub(crate) async fn send_streaming_inner(
                 }
                 Some(policy) => {
                     drop(response);
-                    let parsed_url = reqwest::Url::parse(&url).map_err(|e| Error::Network {
-                        message: format!("could not re-parse request URL for redirect: {e}"),
-                        source: Some(Box::new(e)),
-                    })?;
+                    let parsed_url =
+                        reqwest::Url::parse(&url).map_err(|e| Error::InvalidRequest {
+                            field: "url",
+                            detail: format!("could not re-parse request URL for redirect: {e}"),
+                        })?;
                     match classify_redirect(policy, &method, &parsed_url, status, &resp_headers)? {
                         RedirectAction::PassThrough => {
                             // Build an empty byte stream so downstream
@@ -639,16 +637,16 @@ pub(crate) async fn send_streaming_inner(
                 if let Some(ra) = final_retry_after {
                     retry_after_history.push(ra);
                 }
-                // Drop the response body so the connection can return
-                // to the pool. The body content is not surfaced in
-                // either `RateLimited` or `RetryBudgetExhausted`.
-                drop(response);
+                let final_response = final_response_from_response(response).await;
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     let last = retry_after_history.last().copied();
-                    return Err(Error::RateLimited { retry_after: last });
+                    return Err(Error::RateLimited {
+                        retry_after: last,
+                        final_response,
+                    });
                 }
                 return Err(Error::RetryBudgetExhausted {
-                    last_status: Some(status),
+                    final_response: Some(final_response),
                     retry_after_history,
                 });
             }
@@ -731,6 +729,92 @@ fn build_reqwest(
     req
 }
 
+fn send_error_to_error(e: reqwest::Error) -> Error {
+    let message = format!("{e}");
+    if e.is_builder() {
+        // Kept defensive for future callers of this helper; the
+        // current send loop shortcuts builder errors before retry
+        // policy handling.
+        return Error::InvalidRequest {
+            field: "request",
+            detail: message,
+        };
+    }
+    if native_tls_error_in_source_chain(&e) {
+        return Error::Tls {
+            message,
+            transmission_state: TransmissionState::Unsent,
+        };
+    }
+    if e.is_timeout() && e.is_connect() {
+        return Error::Timeout {
+            transmission_state: TransmissionState::Unsent,
+        };
+    }
+    if e.is_timeout() {
+        return Error::Timeout {
+            transmission_state: TransmissionState::InFlight,
+        };
+    }
+    if e.is_connect() {
+        return Error::Network {
+            message,
+            transmission_state: TransmissionState::Unsent,
+            source: Some(Box::new(e)),
+        };
+    }
+    Error::Network {
+        message,
+        transmission_state: TransmissionState::InFlight,
+        source: Some(Box::new(e)),
+    }
+}
+
+fn native_tls_error_in_source_chain(e: &reqwest::Error) -> bool {
+    let mut current: Option<&(dyn StdError + 'static)> = Some(e);
+    while let Some(err) = current {
+        if err.downcast_ref::<native_tls::Error>().is_some() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+async fn final_response_from_response(response: reqwest::Response) -> FinalResponse {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = read_capped_response_body(response).await;
+    FinalResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
+async fn read_capped_response_body(response: reqwest::Response) -> Bytes {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        if buf.len() <= STATUS_BODY_CAP {
+            let remaining = STATUS_BODY_CAP + 1 - buf.len();
+            if chunk.len() > remaining {
+                buf.extend_from_slice(&chunk[..remaining]);
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        } else {
+            break;
+        }
+    }
+    crate::error::cap_status_body(Bytes::from(buf))
+}
+
 /// Extract host string from a URL. Returns `None` if the URL is not
 /// parseable; the rate-limit governor then no-ops for this request.
 fn host_from_url(url: &str) -> Option<String> {
@@ -794,7 +878,7 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
 
 /// Parse a `Retry-After` header. Either delta-seconds (an integer) or
 /// an HTTP-date per RFC 9110 section 10.2.3.
-fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+pub(crate) fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
     let v = value?.to_str().ok()?.trim();
     if let Ok(secs) = v.parse::<u64>() {
         return Some(Duration::from_secs(secs));

@@ -14,8 +14,9 @@
 //! these in opaque newtypes if the surface fans out further.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use bifrost_types::TransmissionState;
 use bytes::Bytes;
 use reqwest::{StatusCode, header::HeaderMap};
 use thiserror::Error;
@@ -26,11 +27,38 @@ use thiserror::Error;
 /// kept alive until the protocol crate dropped the error. 4 KB is large
 /// enough to fit a typical JSON error envelope plus stack hint while
 /// keeping the error allocation small.
-const STATUS_BODY_CAP: usize = 4096;
+pub(crate) const STATUS_BODY_CAP: usize = 4096;
 /// Marker appended when `Error::Status::body` was truncated. Callers
 /// that pattern-match the body for diagnostics can detect truncation
 /// without an extra field on the variant.
 const STATUS_BODY_TRUNCATED_MARKER: &[u8] = b" ... (truncated)";
+
+/// Final HTTP response evidence preserved for retry-budget,
+/// rate-limit, and repeated-auth failures. `body` is capped with the
+/// same policy as `Error::Status`.
+#[derive(Clone, Debug)]
+pub struct FinalResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RangeFailureKind {
+    LocalInvalid,
+    ResponseNotPartial,
+    MissingContentRange,
+    ContentRangeMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MalformedRedirectKind {
+    MissingLocation,
+    InvalidLocationEncoding,
+    UnresolvableLocation,
+}
 
 /// Truncate a response body to at most `STATUS_BODY_CAP` bytes,
 /// appending a visible marker when truncation occurred. Used by the
@@ -62,6 +90,8 @@ pub enum Error {
     Network {
         /// Human-readable description of the underlying failure.
         message: String,
+        /// Whether bytes crossed the target request boundary.
+        transmission_state: TransmissionState,
         /// Boxed underlying error. Optional because some call sites
         /// synthesize a `Network` error without a backing source.
         #[source]
@@ -70,7 +100,10 @@ pub enum Error {
 
     /// Per-request timeout elapsed.
     #[error("request timed out")]
-    Timeout,
+    Timeout {
+        /// Whether bytes crossed the target request boundary.
+        transmission_state: TransmissionState,
+    },
 
     /// TLS handshake or certificate validation failure. Kept distinct
     /// from `Network` so consumers can present trust-store-specific
@@ -79,6 +112,8 @@ pub enum Error {
     Tls {
         /// Description of the TLS failure.
         message: String,
+        /// Whether bytes crossed the target request boundary.
+        transmission_state: TransmissionState,
     },
 
     /// Server returned a non-success status code outside the retry
@@ -95,15 +130,13 @@ pub enum Error {
         headers: HeaderMap,
     },
 
-    /// Retry budget exhausted. The final attempt's status code (if
-    /// any) and the `Retry-After` history are surfaced so the
-    /// protocol crate can map this to `RecoveryClass::Retry { after }`
-    /// or `RecoveryClass::OperatorOverrideRequired { reason }` as
-    /// appropriate.
+    /// Retry budget exhausted. The final response is preserved when
+    /// one was received so protocol crates keep status, headers, and
+    /// capped body evidence after the retry loop gives up.
     #[error("retry budget exhausted")]
     RetryBudgetExhausted {
-        /// Status code of the final attempt, if there was one.
-        last_status: Option<StatusCode>,
+        /// Preserved final response when one was received.
+        final_response: Option<FinalResponse>,
         /// `Retry-After` durations honored across attempts, in order.
         retry_after_history: Vec<Duration>,
     },
@@ -112,13 +145,20 @@ pub enum Error {
     /// forced refresh and retry. The protocol crate maps this to a
     /// terminal-auth recovery class.
     #[error("auth lost")]
-    AuthLost,
+    AuthLost {
+        /// Attempt state for the target request, when there was one.
+        transmission_state: Option<TransmissionState>,
+        /// Final 401 response evidence for repeated target failures.
+        final_response: Option<FinalResponse>,
+    },
 
     /// Server returned 429 and the retry budget was exhausted.
     #[error("rate limited")]
     RateLimited {
         /// Server-supplied retry hint from `Retry-After`, if present.
         retry_after: Option<Duration>,
+        /// Preserved 429 response evidence.
+        final_response: FinalResponse,
     },
 
     /// Request was cancelled before completion.
@@ -164,6 +204,16 @@ pub enum Error {
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
 
+    /// Local request construction failed before the request crossed
+    /// the wire boundary.
+    #[error("invalid request {field}: {detail}")]
+    InvalidRequest {
+        /// Stable producer field name.
+        field: &'static str,
+        /// Human-readable detail for support diagnostics.
+        detail: String,
+    },
+
     /// OAuth refresh attempt failed for a reason other than the refresh
     /// token being rejected. The original error is preserved behind an
     /// `Arc` so multiple waiters on a single-flight refresh can share
@@ -173,6 +223,9 @@ pub enum Error {
     /// permanent distinction.
     #[error("OAuth refresh failed: {source}")]
     RefreshFailed {
+        /// Provider-supplied retry deadline parsed by the auth layer,
+        /// when the token endpoint returned a `Retry-After` hint.
+        retry_after: Option<SystemTime>,
         /// Underlying error from the token source. Shared with any
         /// concurrent waiters that were single-flighted onto the same
         /// refresh attempt.
@@ -186,13 +239,15 @@ pub enum Error {
     /// caller does not assemble a misaligned blob.
     #[error("range not honored: {message}")]
     RangeNotHonored {
+        /// Whether the failure is local input or response evidence.
+        kind: RangeFailureKind,
         /// Description of the mismatch.
         message: String,
     },
 
-    /// Constructing `Net` failed during TLS or HTTP-client setup. The
-    /// `NetConfig` is consumer-supplied so the failure is a runtime
-    /// condition rather than a programmer error.
+    /// Legacy setup failure variant retained for representability.
+    /// Current `Net::new` configuration failures use
+    /// `InvalidRequest` instead.
     #[error("Net construction failed: {message}")]
     NetSetup {
         /// Description of the setup failure.
@@ -209,6 +264,15 @@ pub enum Error {
     #[error("redirect rejected: {message}")]
     RedirectRejected {
         /// Description of why the redirect was rejected.
+        message: String,
+    },
+
+    /// Server returned a malformed redirect response.
+    #[error("malformed redirect: {message}")]
+    MalformedRedirect {
+        /// Malformed redirect category.
+        kind: MalformedRedirectKind,
+        /// Description of the malformed redirect.
         message: String,
     },
 

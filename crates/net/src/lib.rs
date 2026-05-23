@@ -14,6 +14,7 @@
 //! `RequestBuilder`, `Response`, `StreamingResponse`, `Error`) is
 //! frozen for Phase 2 consumers and matches the Phase 1 skeleton.
 
+pub mod account_error;
 pub mod auth;
 pub mod bandwidth;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod retry;
 pub(crate) mod trace;
 pub mod url;
 
+pub use account_error::{NetErrorContext, into_account_error};
 pub use auth::{AccessToken, OAuthRefresher, RefreshState, StaticTokenSource, TokenSource};
 pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // Shared identity / priority / byte-range / future-alias types live
@@ -34,7 +36,7 @@ pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // imports from downstream code.
 pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority};
 pub use config::NetConfig;
-pub use error::Error;
+pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind};
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};

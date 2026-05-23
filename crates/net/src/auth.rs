@@ -9,13 +9,15 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bifrost_types::AccountFuture;
+use reqwest::header::RETRY_AFTER;
 use tokio::sync::{Mutex, oneshot};
 use zeroize::Zeroizing;
 
-use crate::error::Error;
+use crate::error::{Error, FinalResponse};
+use crate::request::parse_retry_after;
 
 /// Default age at which a token without an `expires_at` is treated as
 /// stale enough to refresh. Typical OAuth access tokens have a 60-min
@@ -405,7 +407,10 @@ async fn wait_for_refresh(
         // The driver task dropped without sending. Treat as a terminal
         // refresh failure; the state will already have been reset only
         // if the driver reached `drive_refresh`.
-        Err(_) => Err(Error::AuthLost),
+        Err(_) => Err(Error::AuthLost {
+            transmission_state: None,
+            final_response: None,
+        }),
     }
 }
 
@@ -444,21 +449,64 @@ fn needs_refresh(token: &AccessToken, refreshed_at: Instant, max_age: Duration) 
 /// Every other failure (`Network`, `Timeout`, `Tls`, etc.) is
 /// transient from the consumer's point of view; collapsing them into
 /// `AuthLost` would discard the retry-vs-give-up distinction the
-/// engine needs. We preserve them inside `RefreshFailed { source }`
-/// so the caller can either pattern-match on the inner variant for a
-/// retry decision or treat the wrapper as a single "refresh failed"
-/// class.
+/// engine needs. We preserve them inside
+/// `RefreshFailed { retry_after, source }` so the caller can either
+/// pattern-match on the inner variant for a retry decision or treat
+/// the wrapper as a single "refresh failed" class.
 fn arc_err_to_error(err: Arc<Error>) -> Error {
-    match &*err {
-        Error::AuthLost => Error::AuthLost,
-        Error::Status { code, .. }
-            if *code == reqwest::StatusCode::UNAUTHORIZED
-                || *code == reqwest::StatusCode::FORBIDDEN =>
-        {
-            Error::AuthLost
-        }
-        _ => Error::RefreshFailed { source: err },
+    if let Error::AuthLost { final_response, .. } = err.as_ref() {
+        return Error::AuthLost {
+            transmission_state: None,
+            final_response: final_response.clone(),
+        };
     }
+    if let Error::Status {
+        code,
+        body,
+        headers,
+    } = err.as_ref()
+        && (*code == reqwest::StatusCode::UNAUTHORIZED || *code == reqwest::StatusCode::FORBIDDEN)
+    {
+        return Error::AuthLost {
+            transmission_state: None,
+            final_response: Some(FinalResponse {
+                status: *code,
+                headers: headers.clone(),
+                body: body.clone(),
+            }),
+        };
+    }
+    Error::RefreshFailed {
+        retry_after: retry_after_deadline(err.as_ref()),
+        source: err,
+    }
+}
+
+fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
+    let duration = match err {
+        Error::RateLimited {
+            retry_after,
+            final_response,
+        } => (*retry_after).or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER))),
+        Error::Status { code, headers, .. }
+            if *code == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || *code == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
+        {
+            parse_retry_after(headers.get(RETRY_AFTER))
+        }
+        Error::RetryBudgetExhausted {
+            final_response: Some(final_response),
+            retry_after_history,
+        } if final_response.status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || final_response.status == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
+        {
+            parse_retry_after(final_response.headers.get(RETRY_AFTER))
+                .or_else(|| retry_after_history.last().copied())
+        }
+        Error::RefreshFailed { retry_after, .. } => return *retry_after,
+        _ => None,
+    }?;
+    SystemTime::now().checked_add(duration)
 }
 
 /// Internal state of `OAuthRefresher`. Wrapped in a `Mutex` so the
@@ -495,4 +543,63 @@ pub enum RefreshState {
         /// future directly.
         waiters: Vec<oneshot::Sender<Result<AccessToken, Arc<Error>>>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+
+    #[test]
+    fn retry_after_deadline_parses_status_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        let before = SystemTime::now();
+        let deadline = retry_after_deadline(&Error::Status {
+            code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: Bytes::new(),
+            headers,
+        })
+        .expect("retry-after deadline should parse");
+        let after = SystemTime::now();
+
+        let lower = before
+            .checked_add(Duration::from_secs(30))
+            .expect("test lower bound in range");
+        let upper = after
+            .checked_add(Duration::from_secs(30))
+            .expect("test upper bound in range");
+        assert!(deadline >= lower);
+        assert!(deadline <= upper);
+    }
+
+    #[test]
+    fn token_endpoint_unauthorized_preserves_response_evidence() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static(r#"Bearer error="invalid_grant""#),
+        );
+        let projected = arc_err_to_error(Arc::new(Error::Status {
+            code: reqwest::StatusCode::UNAUTHORIZED,
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+            headers,
+        }));
+
+        let Error::AuthLost {
+            transmission_state,
+            final_response: Some(final_response),
+        } = projected
+        else {
+            panic!("expected auth-lost with final response");
+        };
+        assert_eq!(transmission_state, None);
+        assert_eq!(final_response.status, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(final_response.headers.contains_key(WWW_AUTHENTICATE));
+        assert_eq!(
+            final_response.body,
+            Bytes::from_static(br#"{"error":"invalid_grant"}"#)
+        );
+    }
 }
