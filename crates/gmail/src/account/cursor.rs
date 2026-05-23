@@ -11,9 +11,9 @@ const GMAIL_SCHEMA_VERSION: u8 = 1;
 // account identity; bifrost-types supplies only the opaque envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GmailChangeState {
-    pub history_id: u64,
-    pub profile_email: String,
-    pub schema_version: u8,
+    pub(crate) history_id: u64,
+    pub(crate) profile_email: String,
+    pub(crate) schema_version: u8,
 }
 
 impl GmailChangeState {

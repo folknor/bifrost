@@ -9,6 +9,7 @@ use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfi
 use super::{ImapAccount, Pool, account_error, capabilities, folder_registry::FolderRegistry};
 
 /// Configuration used by `ImapAccountFactory`.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct ImapAccountConfig {
     pub imap: ImapConfig,

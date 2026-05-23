@@ -12,7 +12,7 @@ use crate::core::id::{AccountId, BlobId};
 
 /// Request for `Blob/upload` - create blobs via JMAP method call.
 #[derive(Debug, Clone, Serialize)]
-pub struct BlobUploadRequest {
+pub(crate) struct BlobUploadRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -23,13 +23,13 @@ pub struct BlobUploadRequest {
 
 /// A single blob creation entry.
 #[derive(Debug, Clone, Serialize)]
-pub struct BlobUploadCreate {
+pub(crate) struct BlobUploadCreate {
     #[serde(rename = "data")]
-    pub data: Vec<DataSource>,
+    pub(crate) data: Vec<DataSource>,
 
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub type_: Option<String>,
+    pub(crate) type_: Option<String>,
 }
 
 /// Data source for blob assembly (RFC 9404 §4.1 DataSourceObject).
@@ -39,7 +39,7 @@ pub struct BlobUploadCreate {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum DataSource {
+pub(crate) enum DataSource {
     /// Reference an existing blob by ID, with optional byte range.
     Blob(DataSourceBlob),
     /// Inline text data.
@@ -50,37 +50,37 @@ pub enum DataSource {
 
 /// Reference another blob (with optional range) as a data source.
 #[derive(Debug, Clone, Serialize)]
-pub struct DataSourceBlob {
+pub(crate) struct DataSourceBlob {
     #[serde(rename = "blobId")]
-    pub blob_id: BlobId,
+    pub(crate) blob_id: BlobId,
 
     #[serde(rename = "offset")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
+    pub(crate) offset: Option<u64>,
 
     #[serde(rename = "length")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub length: Option<u64>,
+    pub(crate) length: Option<u64>,
 }
 
 /// Inline text data source.
 #[derive(Debug, Clone, Serialize)]
-pub struct DataSourceText {
+pub(crate) struct DataSourceText {
     #[serde(rename = "data:asText")]
-    pub value: String,
+    pub(crate) value: String,
 }
 
 /// Inline base64-encoded binary data source.
 #[derive(Debug, Clone, Serialize)]
-pub struct DataSourceBase64 {
+pub(crate) struct DataSourceBase64 {
     #[serde(rename = "data:asBase64")]
-    pub value: String,
+    pub(crate) value: String,
 }
 
 /// Response for `Blob/upload`. Created/notCreated maps are keyed by
 /// the consumer-provided create-id (e.g. "b1"), not real blob IDs.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobUploadResponse {
+pub(crate) struct BlobUploadResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -93,15 +93,15 @@ pub struct BlobUploadResponse {
 
 /// Result of a successfully created blob.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobUploadCreated {
+pub(crate) struct BlobUploadCreated {
     #[serde(rename = "id")]
-    pub id: BlobId,
+    pub(crate) id: BlobId,
 
     #[serde(rename = "type")]
-    pub type_: Option<String>,
+    pub(crate) type_: Option<String>,
 
     #[serde(rename = "size")]
-    pub size: Option<u64>,
+    pub(crate) size: Option<u64>,
 }
 
 impl crate::core::method::JmapMethod for BlobUploadRequest {
@@ -141,7 +141,7 @@ impl Default for BlobUploadRequest {
 }
 
 impl BlobUploadRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BlobUploadRequest {
             account_id: AccountId::new(""),
             create: HashMap::new(),
@@ -149,7 +149,7 @@ impl BlobUploadRequest {
     }
 
     /// Add a blob creation entry from inline text. Returns the create id.
-    pub fn create_from_text(
+    pub(crate) fn create_from_text(
         &mut self,
         text: impl Into<String>,
         type_: Option<impl Into<String>>,
@@ -166,7 +166,7 @@ impl BlobUploadRequest {
     }
 
     /// Add a blob creation entry from inline base64 data. Returns the create id.
-    pub fn create_from_base64(
+    pub(crate) fn create_from_base64(
         &mut self,
         base64: impl Into<String>,
         type_: Option<impl Into<String>>,
@@ -186,7 +186,7 @@ impl BlobUploadRequest {
 
     /// Add a blob creation entry from a reference to an existing blob.
     /// Returns the create id.
-    pub fn create_from_blob(
+    pub(crate) fn create_from_blob(
         &mut self,
         blob_id: impl Into<BlobId>,
         offset: Option<u64>,
@@ -210,7 +210,7 @@ impl BlobUploadRequest {
 
     /// Add a blob creation entry with arbitrary data sources (concatenated
     /// in order). Returns the create id.
-    pub fn create_with_sources(
+    pub(crate) fn create_with_sources(
         &mut self,
         data: Vec<DataSource>,
         type_: Option<impl Into<String>>,
@@ -228,12 +228,12 @@ impl BlobUploadRequest {
 }
 
 impl BlobUploadResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
     /// Look up a successful or failed create by its create-id (e.g. "b1").
-    pub fn created(&mut self, id: &str) -> crate::Result<BlobUploadCreated> {
+    pub(crate) fn created(&mut self, id: &str) -> crate::Result<BlobUploadCreated> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_created.as_ref().and_then(|r| r.get(id)) {
@@ -248,7 +248,7 @@ impl BlobUploadResponse {
     /// Iterate the create-ids of successful uploads (consumer-provided
     /// "b1"/"b2"/..., not real blob IDs - real IDs live on each
     /// `BlobUploadCreated.id`).
-    pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
 }
@@ -261,7 +261,7 @@ impl BlobUploadResponse {
 /// names like `"data:asText"`, `"data:asBase64"`, `"digest:sha-256"`,
 /// and `"size"`. The `offset` and `length` apply to all requested blobs.
 #[derive(Debug, Clone, Serialize)]
-pub struct BlobGetRequest {
+pub(crate) struct BlobGetRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -283,7 +283,7 @@ pub struct BlobGetRequest {
 
 /// Response for `Blob/get`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobGetResponse {
+pub(crate) struct BlobGetResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -301,40 +301,40 @@ pub struct BlobGetResponse {
 /// `serde(flatten)`. Use the typed accessor methods to read common
 /// fields, or access the `properties` map directly for digest values.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobGetResult {
+pub(crate) struct BlobGetResult {
     #[serde(rename = "id")]
-    pub id: BlobId,
+    pub(crate) id: BlobId,
 
     #[serde(rename = "size")]
-    pub size: Option<u64>,
+    pub(crate) size: Option<u64>,
 
     #[serde(rename = "isEncodingProblem")]
-    pub is_encoding_problem: Option<bool>,
+    pub(crate) is_encoding_problem: Option<bool>,
 
     #[serde(rename = "isTruncated")]
-    pub is_truncated: Option<bool>,
+    pub(crate) is_truncated: Option<bool>,
 
     /// All dynamic properties including `data:asText`, `data:asBase64`,
     /// and `digest:<algorithm>` values.
     #[serde(flatten)]
-    pub properties: HashMap<String, serde_json::Value>,
+    pub(crate) properties: HashMap<String, serde_json::Value>,
 }
 
 impl BlobGetResult {
     /// Get the blob data as text (`data:asText` property).
-    pub fn data_as_text(&self) -> Option<&str> {
+    pub(crate) fn data_as_text(&self) -> Option<&str> {
         self.properties.get("data:asText")?.as_str()
     }
 
     /// Get the blob data as base64 (`data:asBase64` property).
-    pub fn data_as_base64(&self) -> Option<&str> {
+    pub(crate) fn data_as_base64(&self) -> Option<&str> {
         self.properties.get("data:asBase64")?.as_str()
     }
 
     /// Get a computed digest value by algorithm name.
     ///
     /// For example, `digest("sha-256")` reads the `digest:sha-256` property.
-    pub fn digest(&self, algorithm: &str) -> Option<&str> {
+    pub(crate) fn digest(&self, algorithm: &str) -> Option<&str> {
         self.properties
             .get(&format!("digest:{algorithm}"))?
             .as_str()
@@ -348,7 +348,7 @@ impl Default for BlobGetRequest {
 }
 
 impl BlobGetRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BlobGetRequest {
             account_id: AccountId::new(""),
             ids: Vec::new(),
@@ -360,7 +360,7 @@ impl BlobGetRequest {
 
     /// Add blob IDs to retrieve.
     #[must_use]
-    pub fn ids<U, V>(mut self, ids: U) -> Self
+    pub(crate) fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<BlobId>,
@@ -374,7 +374,7 @@ impl BlobGetRequest {
     /// `"data:asBase64"`, `"data"` (auto-detect), `"digest:sha"`,
     /// `"digest:sha-256"`, `"digest:sha-512"`, `"size"`.
     #[must_use]
-    pub fn properties<U, V>(mut self, properties: U) -> Self
+    pub(crate) fn properties<U, V>(mut self, properties: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -390,33 +390,33 @@ impl BlobGetRequest {
 
     /// Set the byte offset for all requested blobs.
     #[must_use]
-    pub fn offset(mut self, offset: u64) -> Self {
+    pub(crate) fn offset(mut self, offset: u64) -> Self {
         self.offset = Some(offset);
         self
     }
 
     /// Set the byte length for all requested blobs.
     #[must_use]
-    pub fn length(mut self, length: u64) -> Self {
+    pub(crate) fn length(mut self, length: u64) -> Self {
         self.length = Some(length);
         self
     }
 }
 
 impl BlobGetResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn list(&self) -> &[BlobGetResult] {
+    pub(crate) fn list(&self) -> &[BlobGetResult] {
         &self.list
     }
 
-    pub fn into_list(self) -> Vec<BlobGetResult> {
+    pub(crate) fn into_list(self) -> Vec<BlobGetResult> {
         self.list
     }
 
-    pub fn not_found(&self) -> Option<&[BlobId]> {
+    pub(crate) fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }
@@ -432,7 +432,7 @@ impl BlobGetResponse {
 /// the `lookup_blob_with_capabilities` helper which handles this
 /// automatically for known types.
 #[derive(Debug, Clone, Serialize)]
-pub struct BlobLookupRequest {
+pub(crate) struct BlobLookupRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -445,7 +445,7 @@ pub struct BlobLookupRequest {
 
 /// Response for `Blob/lookup`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobLookupResponse {
+pub(crate) struct BlobLookupResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -458,13 +458,13 @@ pub struct BlobLookupResponse {
 
 /// Result for a single blob lookup entry.
 #[derive(Debug, Clone, Deserialize)]
-pub struct BlobLookupResult {
+pub(crate) struct BlobLookupResult {
     #[serde(rename = "id")]
-    pub id: BlobId,
+    pub(crate) id: BlobId,
 
     /// Map of type name → list of object IDs that reference this blob.
     #[serde(rename = "matchedIds")]
-    pub matched_ids: HashMap<String, Vec<String>>,
+    pub(crate) matched_ids: HashMap<String, Vec<String>>,
 }
 
 impl Default for BlobLookupRequest {
@@ -474,7 +474,7 @@ impl Default for BlobLookupRequest {
 }
 
 impl BlobLookupRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BlobLookupRequest {
             account_id: AccountId::new(""),
             type_names: Vec::new(),
@@ -487,7 +487,7 @@ impl BlobLookupRequest {
     /// The caller must ensure the corresponding capabilities are added
     /// to the request's `using` array.
     #[must_use]
-    pub fn type_names<U, V>(mut self, type_names: U) -> Self
+    pub(crate) fn type_names<U, V>(mut self, type_names: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<String>,
@@ -501,7 +501,7 @@ impl BlobLookupRequest {
 
     /// Set the blob IDs to look up.
     #[must_use]
-    pub fn ids<U, V>(mut self, ids: U) -> Self
+    pub(crate) fn ids<U, V>(mut self, ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<BlobId>,
@@ -512,19 +512,19 @@ impl BlobLookupRequest {
 }
 
 impl BlobLookupResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn list(&self) -> &[BlobLookupResult] {
+    pub(crate) fn list(&self) -> &[BlobLookupResult] {
         &self.list
     }
 
-    pub fn into_list(self) -> Vec<BlobLookupResult> {
+    pub(crate) fn into_list(self) -> Vec<BlobLookupResult> {
         self.list
     }
 
-    pub fn not_found(&self) -> Option<&[BlobId]> {
+    pub(crate) fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }

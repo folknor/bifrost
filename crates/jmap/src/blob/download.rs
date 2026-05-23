@@ -37,7 +37,7 @@ impl<Tr: HttpTransport> Client<Tr> {
     /// `name` and `content_type` are percent-encoded for path-segment
     /// safety - a content type like `"image/png"` won't be misread as
     /// a directory boundary.
-    pub async fn download(&self, blob: &BlobRef) -> crate::Result<bytes::Bytes> {
+    pub(crate) async fn download(&self, blob: &BlobRef) -> crate::Result<bytes::Bytes> {
         let mut download_url = String::with_capacity(self.session().download_url().len() + 64);
 
         for part in self.download_url() {

@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-gmail"
-description = "Gmail API client for Rust"
+description = "Gmail Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

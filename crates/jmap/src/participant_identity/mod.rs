@@ -1,5 +1,9 @@
-pub mod get;
-pub mod set;
+// Stage 4 (calendar conveniences) will wire these RFC types into the
+// Account impl; until then the module is fully built but unused.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -9,27 +13,30 @@ use std::collections::HashMap;
 use crate::core::set::skip_if_empty_map;
 
 mod marker {
-    pub enum ParticipantIdentity {}
+    pub(crate) enum ParticipantIdentity {}
 }
 /// Strongly-typed ParticipantIdentity ID.
-pub type ParticipantIdentityId = crate::core::id::Id<marker::ParticipantIdentity>;
+pub(crate) type ParticipantIdentityId = crate::core::id::Id<marker::ParticipantIdentity>;
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct ParticipantIdentitySetArguments {
+pub(crate) struct ParticipantIdentitySetArguments {
     #[serde(rename = "onSuccessSetIsDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_success_set_is_default: Option<ParticipantIdentityId>,
+    pub(crate) on_success_set_is_default: Option<ParticipantIdentityId>,
 }
 
 impl ParticipantIdentitySetArguments {
-    pub fn on_success_set_is_default(&mut self, id: impl Into<ParticipantIdentityId>) -> &mut Self {
+    pub(crate) fn on_success_set_is_default(
+        &mut self,
+        id: impl Into<ParticipantIdentityId>,
+    ) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParticipantIdentity {
+pub(crate) struct ParticipantIdentity {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<ParticipantIdentityId>,
@@ -48,7 +55,7 @@ pub struct ParticipantIdentity {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ParticipantIdentityCreate {
+pub(crate) struct ParticipantIdentityCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -62,7 +69,7 @@ pub struct ParticipantIdentityCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct ParticipantIdentityPatch {
+pub(crate) struct ParticipantIdentityPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -74,7 +81,7 @@ pub struct ParticipantIdentityPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]
@@ -153,7 +160,10 @@ crate::define_changes_method!(
 
 impl ParticipantIdentitySet {
     #[must_use]
-    pub fn on_success_set_is_default(mut self, id: impl Into<ParticipantIdentityId>) -> Self {
+    pub(crate) fn on_success_set_is_default(
+        mut self,
+        id: impl Into<ParticipantIdentityId>,
+    ) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

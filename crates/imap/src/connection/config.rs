@@ -2,23 +2,23 @@
 use super::*;
 
 /// Connection configuration for [`ImapConnection`].
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct ImapConfig {
     /// Server hostname.
-    pub host: String,
+    pub(crate) host: String,
     /// Server port.
-    pub port: u16,
+    pub(crate) port: u16,
     /// TLS policy.
-    pub tls_mode: TlsMode,
+    pub(crate) tls_mode: TlsMode,
     /// Timeout for connect and initial greeting/capability negotiation.
-    pub connect_timeout: Duration,
-    /// Timeout used by [`connect_authenticated`](Self::connect_authenticated)
-    /// for the automatic authentication exchange.
-    pub command_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
+    /// Timeout used for IMAP commands during account open and runtime calls.
+    pub(crate) command_timeout: Duration,
     /// Optional TCP keepalive configuration.
-    pub keepalive: Option<TcpKeepalive>,
+    pub(crate) keepalive: Option<TcpKeepalive>,
     /// Optional custom native-tls connector.
-    pub tls_connector: Option<native_tls::TlsConnector>,
+    pub(crate) tls_connector: Option<native_tls::TlsConnector>,
 }
 
 impl ImapConfig {
@@ -62,12 +62,6 @@ impl ImapConfig {
         self
     }
 
-    /// Override the TLS mode.
-    pub fn with_tls_mode(mut self, tls_mode: TlsMode) -> Self {
-        self.tls_mode = tls_mode;
-        self
-    }
-
     /// Override the connect timeout.
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
@@ -77,12 +71,6 @@ impl ImapConfig {
     /// Override the default command timeout.
     pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout;
-        self
-    }
-
-    /// Enable TCP keepalive with the supplied settings.
-    pub fn with_keepalive(mut self, keepalive: TcpKeepalive) -> Self {
-        self.keepalive = Some(keepalive);
         self
     }
 
@@ -96,30 +84,6 @@ impl ImapConfig {
     pub fn with_tls_connector(mut self, connector: native_tls::TlsConnector) -> Self {
         self.tls_connector = Some(connector);
         self
-    }
-
-    /// Connect using this configuration.
-    ///
-    /// Direct API counterpart to `ImapAccountFactory`: use this when the
-    /// caller owns command scheduling instead of bifrost-sync.
-    pub async fn connect(&self) -> Result<ImapConnection, Error> {
-        ImapConnection::connect_config(self).await
-    }
-
-    /// Connect and authenticate using automatic mechanism selection.
-    ///
-    /// Direct API counterpart to `ImapAccountFactory::open`: returns the
-    /// raw connection and auth outcome instead of an engine trait object.
-    pub async fn connect_authenticated(
-        &self,
-        credentials: &crate::types::Credentials,
-        policy: &crate::types::AuthPolicy,
-    ) -> Result<(ImapConnection, crate::types::AuthOutcome), Error> {
-        let conn = self.connect().await?;
-        let outcome = conn
-            .authenticate_best(credentials, policy, self.command_timeout)
-            .await?;
-        Ok((conn, outcome))
     }
 
     pub(crate) async fn connect_authenticated_metered(
@@ -155,13 +119,6 @@ impl std::fmt::Debug for ImapConfig {
 }
 
 impl ImapConnection {
-    /// Connect using a configuration object.
-    ///
-    /// Direct API counterpart to the Account factory's pool dial path.
-    pub async fn connect_config(config: &ImapConfig) -> Result<Self, Error> {
-        Self::connect_config_metered(config, None, None).await
-    }
-
     pub(crate) async fn connect_config_metered(
         config: &ImapConfig,
         meter_sink: Option<bifrost_net::MeterSinkHandle>,

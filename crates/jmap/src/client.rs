@@ -27,7 +27,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 10 * 1000;
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Credentials {
+pub(crate) enum Credentials {
     Basic(String),
     Bearer(StaticTokenSource),
 }
@@ -80,7 +80,7 @@ impl Authorization {
 
 /// Internal shared state of a [`Client`]. Stored behind an `Arc` so the
 /// client itself is cheap to clone and pass around.
-pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
+pub(crate) struct ClientInner<T: HttpTransport = ReqwestTransport> {
     transport: T,
     session: std::sync::Mutex<Arc<Session>>,
     session_url: String,
@@ -108,7 +108,7 @@ pub struct ClientInner<T: HttpTransport = ReqwestTransport> {
 /// (when enabled) WebSocket connection. There is no public lifetime
 /// parameter, so `Client` can be stored in long-lived structs and moved
 /// across tasks freely.
-pub struct Client<T: HttpTransport = ReqwestTransport> {
+pub(crate) struct Client<T: HttpTransport = ReqwestTransport> {
     inner: Arc<ClientInner<T>>,
 }
 
@@ -127,7 +127,7 @@ impl<T: HttpTransport> Deref for Client<T> {
     }
 }
 
-pub struct ClientBuilder {
+pub(crate) struct ClientBuilder {
     credentials: Option<Credentials>,
     net_account_id: NetAccountId,
     trusted_hosts: HashSet<String>,
@@ -143,7 +143,7 @@ impl Default for ClientBuilder {
 }
 
 impl ClientBuilder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             credentials: None,
             net_account_id: NetAccountId("jmap".to_string()),
@@ -154,27 +154,27 @@ impl ClientBuilder {
         }
     }
 
-    pub fn credentials(mut self, credentials: impl Into<Credentials>) -> Self {
+    pub(crate) fn credentials(mut self, credentials: impl Into<Credentials>) -> Self {
         self.credentials = Some(credentials.into());
         self
     }
 
-    pub fn net_account_id(mut self, account_id: NetAccountId) -> Self {
+    pub(crate) fn net_account_id(mut self, account_id: NetAccountId) -> Self {
         self.net_account_id = account_id;
         self
     }
 
-    pub fn accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
+    pub(crate) fn accept_invalid_certs(mut self, accept_invalid_certs: bool) -> Self {
         self.accept_invalid_certs = accept_invalid_certs;
         self
     }
 
-    pub fn timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn follow_redirects(
+    pub(crate) fn follow_redirects(
         mut self,
         trusted_hosts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
@@ -183,7 +183,7 @@ impl ClientBuilder {
         self
     }
 
-    pub fn forwarded_for(mut self, ip: IpAddr) -> Self {
+    pub(crate) fn forwarded_for(mut self, ip: IpAddr) -> Self {
         self.forwarded_for = Some(match ip {
             IpAddr::V4(addr) => format!("for={addr}"),
             IpAddr::V6(addr) => format!("for=\"{addr}\""),
@@ -191,7 +191,7 @@ impl ClientBuilder {
         self
     }
 
-    pub async fn connect(self, url: &str) -> crate::Result<Client> {
+    pub(crate) async fn connect(self, url: &str) -> crate::Result<Client> {
         let credentials = self.credentials.ok_or_else(|| {
             crate::core::transport::TransportError::new(
                 "Missing credentials - call .credentials() before .connect()",
@@ -260,19 +260,19 @@ impl ClientBuilder {
 }
 
 /// Default client using reqwest. Use `Client::new()` / `ClientBuilder` to construct.
-pub type DefaultClient = Client<ReqwestTransport>;
+pub(crate) type DefaultClient = Client<ReqwestTransport>;
 
 impl Client {
     /// Create a new client builder (uses reqwest transport by default).
     #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> ClientBuilder {
+    pub(crate) fn new() -> ClientBuilder {
         ClientBuilder::new()
     }
 }
 
 impl<T: HttpTransport> Client<T> {
     /// Create a client with a custom transport and pre-fetched session.
-    pub fn with_transport(transport: T, session: Session) -> crate::Result<Self> {
+    pub(crate) fn with_transport(transport: T, session: Session) -> crate::Result<Self> {
         let default_account_id = session
             .primary_accounts()
             .next()
@@ -301,15 +301,15 @@ impl<T: HttpTransport> Client<T> {
         })
     }
 
-    pub fn build(&self) -> Request<'_, T> {
+    pub(crate) fn build(&self) -> Request<'_, T> {
         Request::new(self)
     }
 
-    pub fn timeout(&self) -> Duration {
+    pub(crate) fn timeout(&self) -> Duration {
         self.inner.timeout
     }
 
-    pub fn session(&self) -> Arc<Session> {
+    pub(crate) fn session(&self) -> Arc<Session> {
         self.inner
             .session
             .lock()
@@ -317,11 +317,11 @@ impl<T: HttpTransport> Client<T> {
             .clone()
     }
 
-    pub fn session_url(&self) -> &str {
+    pub(crate) fn session_url(&self) -> &str {
         &self.inner.session_url
     }
 
-    pub fn default_account_id(&self) -> &crate::core::id::AccountId {
+    pub(crate) fn default_account_id(&self) -> &crate::core::id::AccountId {
         &self.inner.default_account_id
     }
 
@@ -338,7 +338,7 @@ impl<T: HttpTransport> Client<T> {
     }
 
     /// Send a JMAP request and get a typed Response.
-    pub async fn send_request(
+    pub(crate) async fn send_request(
         &self,
         request: &request::Request<'_, T>,
     ) -> crate::Result<response::Response> {
@@ -359,7 +359,7 @@ impl<T: HttpTransport> Client<T> {
         Ok(response)
     }
 
-    pub async fn refresh_session(&self) -> crate::Result<()> {
+    pub(crate) async fn refresh_session(&self) -> crate::Result<()> {
         let bytes = self
             .inner
             .transport
@@ -374,25 +374,25 @@ impl<T: HttpTransport> Client<T> {
         Ok(())
     }
 
-    pub fn is_session_updated(&self) -> bool {
+    pub(crate) fn is_session_updated(&self) -> bool {
         self.inner.session_updated.load(Ordering::Acquire)
     }
 
     /// Access the underlying transport.
-    pub fn transport(&self) -> &T {
+    pub(crate) fn transport(&self) -> &T {
         &self.inner.transport
     }
 
     /// Returns the `Authorization` header value used by this client.
     #[cfg(feature = "websockets")]
-    pub fn authorization(&self) -> String {
+    pub(crate) fn authorization(&self) -> String {
         self.inner.authorization.header_value()
     }
 
     /// Replace the bearer token used by the default HTTP and
     /// WebSocket transports. Returns `false` for Basic-auth clients.
     #[cfg(feature = "websockets")]
-    pub fn set_access_token(&self, token: impl Into<String>) -> bool {
+    pub(crate) fn set_access_token(&self, token: impl Into<String>) -> bool {
         self.inner
             .authorization
             .set_bearer_token(AccessToken::new(token, None))
@@ -400,16 +400,16 @@ impl<T: HttpTransport> Client<T> {
 }
 
 impl Credentials {
-    pub fn basic(username: &str, password: &str) -> Self {
+    pub(crate) fn basic(username: &str, password: &str) -> Self {
         use base64::{Engine, engine::general_purpose::STANDARD};
         Credentials::Basic(STANDARD.encode(format!("{username}:{password}")))
     }
 
-    pub fn bearer(token: impl Into<String>) -> Self {
+    pub(crate) fn bearer(token: impl Into<String>) -> Self {
         Credentials::Bearer(StaticTokenSource::new(token, None))
     }
 
-    pub fn bearer_source(source: StaticTokenSource) -> Self {
+    pub(crate) fn bearer_source(source: StaticTokenSource) -> Self {
         Credentials::Bearer(source)
     }
 }

@@ -17,14 +17,14 @@ use super::{Object, SetCreate, request::ResultReference};
 /// cannot be created or updated) can declare uninhabited or unit-like
 /// `Create`/`Patch` types and have `create()`/`update()` simply not
 /// resolve.
-pub trait SetObject: Object {
+pub(crate) trait SetObject: Object {
     type Create: Serialize + Send;
     type Patch: Serialize + Send;
     type SetArguments: Default + Serialize + Send;
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SetRequest<O: SetObject> {
+pub(crate) struct SetRequest<O: SetObject> {
     #[serde(rename = "accountId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     account_id: Option<AccountId>,
@@ -52,7 +52,7 @@ pub struct SetRequest<O: SetObject> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SetResponse<O: SetObject> {
+pub(crate) struct SetResponse<O: SetObject> {
     #[serde(rename = "accountId")]
     account_id: Option<AccountId>,
 
@@ -89,7 +89,7 @@ pub struct SetResponse<O: SetObject> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
-pub struct SetError<U>
+pub(crate) struct SetError<U>
 where
     U: Display,
 {
@@ -101,7 +101,7 @@ where
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum SetErrorType {
+pub(crate) enum SetErrorType {
     #[serde(rename = "forbidden")]
     Forbidden,
     #[serde(rename = "overQuota")]
@@ -161,7 +161,7 @@ impl<O: SetObject> SetRequest<O> {
     /// unset (or `None` for non-account-scoped objects); it is filled
     /// in by [`crate::core::request::Request::call`] when the method
     /// is added to a request batch.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             account_id: if O::requires_account_id() {
                 Some(AccountId::new(""))
@@ -177,19 +177,19 @@ impl<O: SetObject> SetRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         if O::requires_account_id() {
             self.account_id = Some(account_id.into());
         }
         self
     }
 
-    pub fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
 
-    pub fn destroy<U, V>(&mut self, ids: U) -> &mut Self
+    pub(crate) fn destroy<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<O::Id>,
@@ -201,13 +201,13 @@ impl<O: SetObject> SetRequest<O> {
         self
     }
 
-    pub fn destroy_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn destroy_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.destroy_ref = reference.into();
         self.destroy = None;
         self
     }
 
-    pub fn arguments(&mut self) -> &mut O::SetArguments {
+    pub(crate) fn arguments(&mut self) -> &mut O::SetArguments {
         &mut self.arguments
     }
 }
@@ -217,7 +217,7 @@ where
     O::Create: SetCreate,
 {
     /// Get or insert a fresh create entry with auto-assigned `cN` id.
-    pub fn create(&mut self) -> &mut O::Create {
+    pub(crate) fn create(&mut self) -> &mut O::Create {
         let create_id = self
             .create
             .as_ref()
@@ -229,7 +229,7 @@ where
             .or_insert_with(|| O::Create::new(Some(create_id)))
     }
 
-    pub fn create_with_id(&mut self, create_id: impl Into<String>) -> &mut O::Create {
+    pub(crate) fn create_with_id(&mut self, create_id: impl Into<String>) -> &mut O::Create {
         let create_id = create_id.into();
         self.create
             .get_or_insert_with(HashMap::new)
@@ -237,7 +237,7 @@ where
             .or_insert_with(|| O::Create::new(None))
     }
 
-    pub fn create_item(&mut self, item: O::Create) -> String {
+    pub(crate) fn create_item(&mut self, item: O::Create) -> String {
         let create_id = self
             .create
             .as_ref()
@@ -249,7 +249,7 @@ where
         create_id_str
     }
 
-    pub fn update_item(&mut self, id: impl Into<O::Id>, item: O::Patch) {
+    pub(crate) fn update_item(&mut self, id: impl Into<O::Id>, item: O::Patch) {
         self.update
             .get_or_insert_with(HashMap::new)
             .insert(id.into(), item);
@@ -260,7 +260,7 @@ impl<O: SetObject> SetRequest<O>
 where
     O::Patch: Default,
 {
-    pub fn update(&mut self, id: impl Into<O::Id>) -> &mut O::Patch {
+    pub(crate) fn update(&mut self, id: impl Into<O::Id>) -> &mut O::Patch {
         let id: O::Id = id.into();
         self.update
             .get_or_insert_with(HashMap::new)
@@ -276,24 +276,24 @@ impl<O: SetObject> Default for SetRequest<O> {
 }
 
 impl<O: SetObject> SetResponse<O> {
-    pub fn account_id(&self) -> Option<&AccountId> {
+    pub(crate) fn account_id(&self) -> Option<&AccountId> {
         self.account_id.as_ref()
     }
 
-    pub fn old_state(&self) -> Option<&str> {
+    pub(crate) fn old_state(&self) -> Option<&str> {
         self.old_state.as_deref()
     }
 
-    pub fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &str {
         self.new_state.as_deref().unwrap_or("")
     }
 
-    pub fn into_new_state(self) -> String {
+    pub(crate) fn into_new_state(self) -> String {
         self.new_state.unwrap_or_default()
     }
 
     /// Look up a successful or failed create by its create-id (e.g. "c1").
-    pub fn created(&mut self, id: &str) -> crate::Result<O> {
+    pub(crate) fn created(&mut self, id: &str) -> crate::Result<O> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
@@ -303,7 +303,7 @@ impl<O: SetObject> SetResponse<O> {
         }
     }
 
-    pub fn updated(&mut self, id: &O::Id) -> crate::Result<Option<O>> {
+    pub(crate) fn updated(&mut self, id: &O::Id) -> crate::Result<Option<O>> {
         if let Some(result) = self.updated.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_updated.as_mut().and_then(|r| r.remove(id)) {
@@ -313,7 +313,7 @@ impl<O: SetObject> SetResponse<O> {
         }
     }
 
-    pub fn destroyed(&mut self, id: &O::Id) -> crate::Result<()> {
+    pub(crate) fn destroyed(&mut self, id: &O::Id) -> crate::Result<()> {
         if self
             .destroyed
             .as_ref()
@@ -330,52 +330,52 @@ impl<O: SetObject> SetResponse<O> {
     /// Iterate the create-ids of successful creates. Create-ids are
     /// the "c1"/"c2"/... identifiers the consumer passed in, not real
     /// server IDs - real IDs live on each `O` value.
-    pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
 
-    pub fn updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
+    pub(crate) fn updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.updated.as_ref().map(|map| map.keys())
     }
 
-    pub fn into_updated_ids(self) -> Option<Vec<O::Id>> {
+    pub(crate) fn into_updated_ids(self) -> Option<Vec<O::Id>> {
         self.updated.map(|map| map.into_keys().collect())
     }
 
-    pub fn destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
+    pub(crate) fn destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.destroyed.as_ref().map(|list| list.iter())
     }
 
-    pub fn into_destroyed_ids(self) -> Option<Vec<O::Id>> {
+    pub(crate) fn into_destroyed_ids(self) -> Option<Vec<O::Id>> {
         self.destroyed
     }
 
     /// Iterate failed-create create-ids (consumer-provided, not real IDs).
-    pub fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.not_created.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
+    pub(crate) fn not_updated_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.not_updated.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
+    pub(crate) fn not_destroyed_ids(&self) -> Option<impl Iterator<Item = &O::Id>> {
         self.not_destroyed.as_ref().map(|map| map.keys())
     }
 
-    pub fn has_updated(&self) -> bool {
+    pub(crate) fn has_updated(&self) -> bool {
         self.updated.as_ref().is_some_and(|m| !m.is_empty())
     }
 
-    pub fn has_created(&self) -> bool {
+    pub(crate) fn has_created(&self) -> bool {
         self.created.as_ref().is_some_and(|m| !m.is_empty())
     }
 
-    pub fn has_destroyed(&self) -> bool {
+    pub(crate) fn has_destroyed(&self) -> bool {
         self.destroyed.as_ref().is_some_and(|m| !m.is_empty())
     }
 
-    pub fn unwrap_update_errors(&self) -> crate::Result<()> {
+    pub(crate) fn unwrap_update_errors(&self) -> crate::Result<()> {
         if let Some(errors) = &self.not_updated
             && let Some(err) = errors.values().next()
         {
@@ -384,7 +384,7 @@ impl<O: SetObject> SetResponse<O> {
         Ok(())
     }
 
-    pub fn unwrap_create_errors(&self) -> crate::Result<()> {
+    pub(crate) fn unwrap_create_errors(&self) -> crate::Result<()> {
         if let Some(errors) = &self.not_created
             && let Some(err) = errors.values().next()
         {
@@ -395,19 +395,19 @@ impl<O: SetObject> SetResponse<O> {
 }
 
 impl<U: Display> SetError<U> {
-    pub fn error_type(&self) -> &SetErrorType {
+    pub(crate) fn error_type(&self) -> &SetErrorType {
         &self.type_
     }
 
-    pub fn description(&self) -> Option<&str> {
+    pub(crate) fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
 
-    pub fn properties(&self) -> Option<&[U]> {
+    pub(crate) fn properties(&self) -> Option<&[U]> {
         self.properties.as_deref()
     }
 
-    pub fn to_string_error(&self) -> SetError<String> {
+    pub(crate) fn to_string_error(&self) -> SetError<String> {
         SetError {
             type_: self.type_.clone(),
             description: self.description.clone(),
@@ -473,22 +473,22 @@ impl Display for SetErrorType {
     }
 }
 
-pub fn from_timestamp(timestamp: i64) -> DateTime<Utc> {
+pub(crate) fn from_timestamp(timestamp: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(timestamp, 0).unwrap_or_default()
 }
 
-pub fn skip_if_empty_str(string: &Option<String>) -> bool {
+pub(crate) fn skip_if_empty_str(string: &Option<String>) -> bool {
     matches!(string, Some(string) if string.is_empty())
 }
 
-pub fn skip_if_zero_date(date: &Option<DateTime<Utc>>) -> bool {
+pub(crate) fn skip_if_zero_date(date: &Option<DateTime<Utc>>) -> bool {
     matches!(date, Some(date) if date.timestamp() == 0)
 }
 
-pub fn skip_if_empty_list<O>(list: &Option<Vec<O>>) -> bool {
+pub(crate) fn skip_if_empty_list<O>(list: &Option<Vec<O>>) -> bool {
     matches!(list, Some(list) if list.is_empty() )
 }
 
-pub fn skip_if_empty_map<K, V>(list: &Option<HashMap<K, V>>) -> bool {
+pub(crate) fn skip_if_empty_map<K, V>(list: &Option<HashMap<K, V>>) -> bool {
     matches!(list, Some(list) if list.is_empty() )
 }

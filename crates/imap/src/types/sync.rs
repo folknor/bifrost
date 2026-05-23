@@ -181,7 +181,8 @@ pub struct SyncFetchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Seq, Uid};
+    use crate::types::Uid;
+    use crate::types::ids::Seq;
 
     #[test]
     fn qresync_params_preserve_seq_match_data() {

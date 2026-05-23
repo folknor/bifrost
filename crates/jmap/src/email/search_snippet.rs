@@ -4,7 +4,7 @@ use super::EmailId;
 use crate::core::{id::AccountId, query::Filter, request::ResultReference};
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct SearchSnippet {
+pub(crate) struct SearchSnippet {
     #[serde(rename = "emailId")]
     email_id: EmailId,
     subject: Option<String>,
@@ -12,7 +12,7 @@ pub struct SearchSnippet {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SearchSnippetGetRequest {
+pub(crate) struct SearchSnippetGetRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -30,7 +30,7 @@ pub struct SearchSnippetGetRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SearchSnippetGetResponse {
+pub(crate) struct SearchSnippetGetResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -58,7 +58,7 @@ impl Default for SearchSnippetGetRequest {
 }
 
 impl SearchSnippetGetRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SearchSnippetGetRequest {
             account_id: AccountId::new(""),
             filter: None,
@@ -68,13 +68,13 @@ impl SearchSnippetGetRequest {
     }
 
     #[must_use]
-    pub fn filter(mut self, filter: impl Into<Filter<super::query::Filter>>) -> Self {
+    pub(crate) fn filter(mut self, filter: impl Into<Filter<super::query::Filter>>) -> Self {
         self.filter = Some(filter.into());
         self
     }
 
     #[must_use]
-    pub fn email_id(mut self, email_id: impl Into<EmailId>) -> Self {
+    pub(crate) fn email_id(mut self, email_id: impl Into<EmailId>) -> Self {
         self.email_ids
             .get_or_insert_with(Vec::new)
             .push(email_id.into());
@@ -82,7 +82,10 @@ impl SearchSnippetGetRequest {
     }
 
     #[must_use]
-    pub fn email_ids(mut self, email_ids: impl IntoIterator<Item = impl Into<EmailId>>) -> Self {
+    pub(crate) fn email_ids(
+        mut self,
+        email_ids: impl IntoIterator<Item = impl Into<EmailId>>,
+    ) -> Self {
         self.email_ids
             .get_or_insert_with(Vec::new)
             .extend(email_ids.into_iter().map(std::convert::Into::into));
@@ -90,7 +93,7 @@ impl SearchSnippetGetRequest {
     }
 
     #[must_use]
-    pub fn email_ids_ref(mut self, reference: ResultReference) -> Self {
+    pub(crate) fn email_ids_ref(mut self, reference: ResultReference) -> Self {
         self.email_ids_ref = reference.into();
         self.email_ids = None;
         self
@@ -98,33 +101,33 @@ impl SearchSnippetGetRequest {
 }
 
 impl SearchSnippet {
-    pub fn email_id(&self) -> &EmailId {
+    pub(crate) fn email_id(&self) -> &EmailId {
         &self.email_id
     }
 
-    pub fn subject(&self) -> Option<&str> {
+    pub(crate) fn subject(&self) -> Option<&str> {
         self.subject.as_deref()
     }
 
-    pub fn preview(&self) -> Option<&str> {
+    pub(crate) fn preview(&self) -> Option<&str> {
         self.preview.as_deref()
     }
 }
 
 impl SearchSnippetGetResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn snippet(&self, id: &EmailId) -> Option<&SearchSnippet> {
+    pub(crate) fn snippet(&self, id: &EmailId) -> Option<&SearchSnippet> {
         self.list.iter().find(|snippet| &snippet.email_id == id)
     }
 
-    pub fn list(&self) -> &[SearchSnippet] {
+    pub(crate) fn list(&self) -> &[SearchSnippet] {
         &self.list
     }
 
-    pub fn not_found(&self) -> Option<&[EmailId]> {
+    pub(crate) fn not_found(&self) -> Option<&[EmailId]> {
         self.not_found.as_deref()
     }
 }

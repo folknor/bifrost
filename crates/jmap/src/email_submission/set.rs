@@ -8,24 +8,24 @@ use crate::identity::IdentityId;
 use std::collections::HashMap;
 
 impl EmailSubmissionCreate {
-    pub fn identity_id(&mut self, identity_id: impl Into<IdentityId>) -> &mut Self {
+    pub(crate) fn identity_id(&mut self, identity_id: impl Into<IdentityId>) -> &mut Self {
         self.identity_id = Some(identity_id.into());
         self
     }
 
-    pub fn email_id(&mut self, email_id: impl Into<EmailId>) -> &mut Self {
+    pub(crate) fn email_id(&mut self, email_id: impl Into<EmailId>) -> &mut Self {
         self.email_id = Some(email_id.into());
         self.email_id_ref = None;
         self
     }
 
-    pub fn email_id_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn email_id_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.email_id = None;
         self.email_id_ref = Some(reference);
         self
     }
 
-    pub fn envelope<S, T, U>(&mut self, mail_from: S, rcpt_to: T) -> &mut Self
+    pub(crate) fn envelope<S, T, U>(&mut self, mail_from: S, rcpt_to: T) -> &mut Self
     where
         S: Into<Address>,
         T: IntoIterator<Item = U>,
@@ -35,21 +35,21 @@ impl EmailSubmissionCreate {
         self
     }
 
-    pub fn undo_status(&mut self, undo_status: UndoStatus) -> &mut Self {
+    pub(crate) fn undo_status(&mut self, undo_status: UndoStatus) -> &mut Self {
         self.undo_status = Some(undo_status);
         self
     }
 }
 
 impl EmailSubmissionPatch {
-    pub fn undo_status(&mut self, undo_status: UndoStatus) -> &mut Self {
+    pub(crate) fn undo_status(&mut self, undo_status: UndoStatus) -> &mut Self {
         self.undo_status = Some(undo_status);
         self
     }
 }
 
 impl Envelope {
-    pub fn new<S, T, U>(mail_from: S, rcpt_to: T) -> Envelope
+    pub(crate) fn new<S, T, U>(mail_from: S, rcpt_to: T) -> Envelope
     where
         S: Into<Address>,
         T: IntoIterator<Item = U>,
@@ -63,14 +63,14 @@ impl Envelope {
 }
 
 impl Address {
-    pub fn new(email: impl Into<String>) -> Address {
+    pub(crate) fn new(email: impl Into<String>) -> Address {
         Address {
             email: email.into(),
             parameters: None,
         }
     }
 
-    pub fn with_parameter(
+    pub(crate) fn with_parameter(
         mut self,
         parameter: impl Into<String>,
         value: Option<impl Into<String>>,
@@ -103,11 +103,14 @@ impl From<&str> for Address {
 impl SetArguments {
     /// Reference an EmailSubmission by create-id ("c0"); the `#` prefix
     /// is added automatically per RFC 8621.
-    pub fn on_success_update_email(&mut self, create_id: impl Into<String>) -> &mut EmailPatch {
+    pub(crate) fn on_success_update_email(
+        &mut self,
+        create_id: impl Into<String>,
+    ) -> &mut EmailPatch {
         self.on_success_update_email_(format!("#{}", create_id.into()))
     }
 
-    pub fn on_success_update_email_id(
+    pub(crate) fn on_success_update_email_id(
         &mut self,
         id: impl Into<super::EmailSubmissionId>,
     ) -> &mut EmailPatch {
@@ -128,14 +131,14 @@ impl SetArguments {
 
     /// Reference an EmailSubmission by create-id ("c0"); the `#` prefix
     /// is added automatically.
-    pub fn on_success_destroy_email(&mut self, create_id: impl Into<String>) -> &mut Self {
+    pub(crate) fn on_success_destroy_email(&mut self, create_id: impl Into<String>) -> &mut Self {
         self.on_success_destroy_email
             .get_or_insert_with(Vec::new)
             .push(format!("#{}", create_id.into()));
         self
     }
 
-    pub fn on_success_destroy_email_id(
+    pub(crate) fn on_success_destroy_email_id(
         &mut self,
         id: impl Into<super::EmailSubmissionId>,
     ) -> &mut Self {
@@ -147,11 +150,14 @@ impl SetArguments {
 }
 
 impl EmailSubmissionSet {
-    pub fn on_success_update_email(&mut self, create_id: impl Into<String>) -> &mut EmailPatch {
+    pub(crate) fn on_success_update_email(
+        &mut self,
+        create_id: impl Into<String>,
+    ) -> &mut EmailPatch {
         self.arguments().on_success_update_email(create_id)
     }
 
-    pub fn on_success_update_email_id(
+    pub(crate) fn on_success_update_email_id(
         &mut self,
         id: impl Into<super::EmailSubmissionId>,
     ) -> &mut EmailPatch {
@@ -159,13 +165,16 @@ impl EmailSubmissionSet {
     }
 
     #[must_use]
-    pub fn on_success_destroy_email(mut self, create_id: impl Into<String>) -> Self {
+    pub(crate) fn on_success_destroy_email(mut self, create_id: impl Into<String>) -> Self {
         self.arguments().on_success_destroy_email(create_id);
         self
     }
 
     #[must_use]
-    pub fn on_success_destroy_email_id(mut self, id: impl Into<super::EmailSubmissionId>) -> Self {
+    pub(crate) fn on_success_destroy_email_id(
+        mut self,
+        id: impl Into<super::EmailSubmissionId>,
+    ) -> Self {
         self.arguments().on_success_destroy_email_id(id);
         self
     }

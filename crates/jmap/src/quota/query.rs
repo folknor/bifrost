@@ -7,7 +7,7 @@ use super::Quota;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     Name {
         #[serde(rename = "name")]
         value: String,
@@ -29,7 +29,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "name")]
     Name,
     #[serde(rename = "used")]
@@ -37,25 +37,25 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn name(value: impl Into<String>) -> Self {
+    pub(crate) fn name(value: impl Into<String>) -> Self {
         Filter::Name {
             value: value.into(),
         }
     }
 
-    pub fn scope(value: impl Into<String>) -> Self {
+    pub(crate) fn scope(value: impl Into<String>) -> Self {
         Filter::Scope {
             value: value.into(),
         }
     }
 
-    pub fn resource_type(value: impl Into<String>) -> Self {
+    pub(crate) fn resource_type(value: impl Into<String>) -> Self {
         Filter::ResourceType {
             value: value.into(),
         }
     }
 
-    pub fn type_(value: impl Into<String>) -> Self {
+    pub(crate) fn type_(value: impl Into<String>) -> Self {
         Filter::Type {
             value: value.into(),
         }
@@ -63,11 +63,11 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn name() -> query::Comparator<Comparator> {
+    pub(crate) fn name() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Name)
     }
 
-    pub fn used() -> query::Comparator<Comparator> {
+    pub(crate) fn used() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Used)
     }
 }

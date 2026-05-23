@@ -19,8 +19,8 @@ pub(crate) const SCOPE_CACHE_STALE_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeSnapshot {
-    pub labels: Vec<GmailLabel>,
-    pub fetched_at: Instant,
+    pub(crate) labels: Vec<GmailLabel>,
+    pub(crate) fetched_at: Instant,
 }
 
 impl ScopeSnapshot {

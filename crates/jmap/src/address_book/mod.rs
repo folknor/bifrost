@@ -1,5 +1,5 @@
-pub mod get;
-pub mod set;
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -10,14 +10,14 @@ use crate::core::field::Field;
 use crate::core::set::skip_if_empty_str;
 
 mod marker {
-    pub enum AddressBook {}
+    pub(crate) enum AddressBook {}
 }
 /// Strongly-typed AddressBook ID.
-pub type AddressBookId = crate::core::id::Id<marker::AddressBook>;
+pub(crate) type AddressBookId = crate::core::id::Id<marker::AddressBook>;
 
 /// Server-returned AddressBook (RFC 8887).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddressBook {
+pub(crate) struct AddressBook {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<AddressBookId>,
@@ -54,7 +54,7 @@ pub struct AddressBook {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AddressBookCreate {
+pub(crate) struct AddressBookCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -80,7 +80,7 @@ pub struct AddressBookCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct AddressBookPatch {
+pub(crate) struct AddressBookPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -103,42 +103,42 @@ pub struct AddressBookPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddressBookRights {
+pub(crate) struct AddressBookRights {
     #[serde(rename = "mayRead")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_read: Option<bool>,
+    pub(crate) may_read: Option<bool>,
 
     #[serde(rename = "mayWrite")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_write: Option<bool>,
+    pub(crate) may_write: Option<bool>,
 
     #[serde(rename = "mayShare")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_share: Option<bool>,
+    pub(crate) may_share: Option<bool>,
 
     #[serde(rename = "mayDelete")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_delete: Option<bool>,
+    pub(crate) may_delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct AddressBookSetArguments {
+pub(crate) struct AddressBookSetArguments {
     #[serde(rename = "onDestroyRemoveContents")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_destroy_remove_contents: Option<bool>,
+    pub(crate) on_destroy_remove_contents: Option<bool>,
 
     #[serde(rename = "onSuccessSetIsDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_success_set_is_default: Option<String>,
+    pub(crate) on_success_set_is_default: Option<String>,
 }
 
 impl AddressBookSetArguments {
-    pub fn on_destroy_remove_contents(&mut self, remove: bool) -> &mut Self {
+    pub(crate) fn on_destroy_remove_contents(&mut self, remove: bool) -> &mut Self {
         self.on_destroy_remove_contents = Some(remove);
         self
     }
 
-    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+    pub(crate) fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
     }
@@ -146,7 +146,7 @@ impl AddressBookSetArguments {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]
@@ -240,13 +240,13 @@ crate::define_changes_method!(
 
 impl AddressBookSet {
     #[must_use]
-    pub fn on_destroy_remove_contents(mut self, remove: bool) -> Self {
+    pub(crate) fn on_destroy_remove_contents(mut self, remove: bool) -> Self {
         self.arguments().on_destroy_remove_contents(remove);
         self
     }
 
     #[must_use]
-    pub fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
+    pub(crate) fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

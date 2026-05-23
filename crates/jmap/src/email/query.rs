@@ -13,7 +13,7 @@ use super::{Email, EmailId, QueryArguments};
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     InMailbox {
         #[serde(rename = "inMailbox")]
         value: MailboxId,
@@ -117,7 +117,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "receivedAt")]
     ReceivedAt,
     #[serde(rename = "size")]
@@ -143,13 +143,13 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn in_mailbox(value: impl Into<MailboxId>) -> Self {
+    pub(crate) fn in_mailbox(value: impl Into<MailboxId>) -> Self {
         Filter::InMailbox {
             value: value.into(),
         }
     }
 
-    pub fn in_mailbox_other_than<U, V>(value: U) -> Self
+    pub(crate) fn in_mailbox_other_than<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<MailboxId>,
@@ -159,103 +159,103 @@ impl Filter {
         }
     }
 
-    pub fn before(value: i64) -> Self {
+    pub(crate) fn before(value: i64) -> Self {
         Filter::Before {
             value: from_timestamp(value),
         }
     }
 
-    pub fn after(value: i64) -> Self {
+    pub(crate) fn after(value: i64) -> Self {
         Filter::After {
             value: from_timestamp(value),
         }
     }
 
-    pub fn min_size(value: u32) -> Self {
+    pub(crate) fn min_size(value: u32) -> Self {
         Filter::MinSize { value }
     }
 
-    pub fn max_size(value: u32) -> Self {
+    pub(crate) fn max_size(value: u32) -> Self {
         Filter::MaxSize { value }
     }
 
-    pub fn all_in_thread_have_keyword(value: impl Into<String>) -> Self {
+    pub(crate) fn all_in_thread_have_keyword(value: impl Into<String>) -> Self {
         Filter::AllInThreadHaveKeyword {
             value: value.into(),
         }
     }
 
-    pub fn some_in_thread_have_keyword(value: impl Into<String>) -> Self {
+    pub(crate) fn some_in_thread_have_keyword(value: impl Into<String>) -> Self {
         Filter::SomeInThreadHaveKeyword {
             value: value.into(),
         }
     }
 
-    pub fn none_in_thread_have_keyword(value: impl Into<String>) -> Self {
+    pub(crate) fn none_in_thread_have_keyword(value: impl Into<String>) -> Self {
         Filter::NoneInThreadHaveKeyword {
             value: value.into(),
         }
     }
 
-    pub fn has_keyword(value: impl Into<String>) -> Self {
+    pub(crate) fn has_keyword(value: impl Into<String>) -> Self {
         Filter::HasKeyword {
             value: value.into(),
         }
     }
 
-    pub fn not_keyword(value: impl Into<String>) -> Self {
+    pub(crate) fn not_keyword(value: impl Into<String>) -> Self {
         Filter::NotKeyword {
             value: value.into(),
         }
     }
 
-    pub fn has_attachment(value: bool) -> Self {
+    pub(crate) fn has_attachment(value: bool) -> Self {
         Filter::HasAttachment { value }
     }
 
-    pub fn text(value: impl Into<String>) -> Self {
+    pub(crate) fn text(value: impl Into<String>) -> Self {
         Filter::Text {
             value: value.into(),
         }
     }
 
-    pub fn from(value: impl Into<String>) -> Self {
+    pub(crate) fn from(value: impl Into<String>) -> Self {
         Filter::From {
             value: value.into(),
         }
     }
 
-    pub fn to(value: impl Into<String>) -> Self {
+    pub(crate) fn to(value: impl Into<String>) -> Self {
         Filter::To {
             value: value.into(),
         }
     }
 
-    pub fn cc(value: impl Into<String>) -> Self {
+    pub(crate) fn cc(value: impl Into<String>) -> Self {
         Filter::Cc {
             value: value.into(),
         }
     }
 
-    pub fn bcc(value: impl Into<String>) -> Self {
+    pub(crate) fn bcc(value: impl Into<String>) -> Self {
         Filter::Bcc {
             value: value.into(),
         }
     }
 
-    pub fn subject(value: impl Into<String>) -> Self {
+    pub(crate) fn subject(value: impl Into<String>) -> Self {
         Filter::Subject {
             value: value.into(),
         }
     }
 
-    pub fn body(value: impl Into<String>) -> Self {
+    pub(crate) fn body(value: impl Into<String>) -> Self {
         Filter::Body {
             value: value.into(),
         }
     }
 
-    pub fn header(header: impl Into<String>, v: Option<impl Into<String>>) -> Self {
+    pub(crate) fn header(header: impl Into<String>, v: Option<impl Into<String>>) -> Self {
         let mut value = Vec::with_capacity(2);
         value.push(header.into());
         if let Some(v) = v {
@@ -265,7 +265,7 @@ impl Filter {
     }
 
     // Stalwart JMAP specific
-    pub fn id<U, V>(value: U) -> Self
+    pub(crate) fn id<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<EmailId>,
@@ -275,19 +275,19 @@ impl Filter {
         }
     }
 
-    pub fn sent_before(value: i64) -> Self {
+    pub(crate) fn sent_before(value: i64) -> Self {
         Filter::SentBefore {
             value: from_timestamp(value),
         }
     }
 
-    pub fn sent_after(value: i64) -> Self {
+    pub(crate) fn sent_after(value: i64) -> Self {
         Filter::SentAfter {
             value: from_timestamp(value),
         }
     }
 
-    pub fn in_thread(value: impl Into<ThreadId>) -> Self {
+    pub(crate) fn in_thread(value: impl Into<ThreadId>) -> Self {
         Filter::InThread {
             value: value.into(),
         }
@@ -295,47 +295,49 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn received_at() -> query::Comparator<Comparator> {
+    pub(crate) fn received_at() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::ReceivedAt)
     }
 
-    pub fn size() -> query::Comparator<Comparator> {
+    pub(crate) fn size() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Size)
     }
 
-    pub fn from() -> query::Comparator<Comparator> {
+    pub(crate) fn from() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::From)
     }
 
-    pub fn to() -> query::Comparator<Comparator> {
+    pub(crate) fn to() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::To)
     }
 
-    pub fn cc() -> query::Comparator<Comparator> {
+    pub(crate) fn cc() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Cc)
     }
 
-    pub fn subject() -> query::Comparator<Comparator> {
+    pub(crate) fn subject() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Subject)
     }
 
-    pub fn sent_at() -> query::Comparator<Comparator> {
+    pub(crate) fn sent_at() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::SentAt)
     }
 
-    pub fn has_keyword(keyword: impl Into<String>) -> query::Comparator<Comparator> {
+    pub(crate) fn has_keyword(keyword: impl Into<String>) -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::HasKeyword {
             keyword: keyword.into(),
         })
     }
 
-    pub fn all_in_thread_have_keyword(keyword: impl Into<String>) -> query::Comparator<Comparator> {
+    pub(crate) fn all_in_thread_have_keyword(
+        keyword: impl Into<String>,
+    ) -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::AllInThreadHaveKeyword {
             keyword: keyword.into(),
         })
     }
 
-    pub fn some_in_thread_have_keyword(
+    pub(crate) fn some_in_thread_have_keyword(
         keyword: impl Into<String>,
     ) -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::SomeInThreadHaveKeyword {

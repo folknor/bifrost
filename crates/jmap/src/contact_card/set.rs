@@ -6,13 +6,13 @@ use crate::address_book::AddressBookId;
 macro_rules! cc_setters {
     ($t:ty) => {
         impl $t {
-            pub fn uid(&mut self, uid: impl Into<String>) -> &mut Self {
+            pub(crate) fn uid(&mut self, uid: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("uid".into(), serde_json::Value::String(uid.into()));
                 self
             }
 
-            pub fn address_book_ids<U, V>(&mut self, address_book_ids: U) -> &mut Self
+            pub(crate) fn address_book_ids<U, V>(&mut self, address_book_ids: U) -> &mut Self
             where
                 U: IntoIterator<Item = V>,
                 V: Into<AddressBookId>,
@@ -26,7 +26,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn address_book_id(
+            pub(crate) fn address_book_id(
                 &mut self,
                 address_book_id: impl Into<AddressBookId>,
                 set: bool,
@@ -48,19 +48,22 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn kind(&mut self, kind: impl Into<String>) -> &mut Self {
+            pub(crate) fn kind(&mut self, kind: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("kind".into(), serde_json::Value::String(kind.into()));
                 self
             }
 
-            pub fn name(&mut self, name: serde_json::Map<String, serde_json::Value>) -> &mut Self {
+            pub(crate) fn name(
+                &mut self,
+                name: serde_json::Map<String, serde_json::Value>,
+            ) -> &mut Self {
                 self.properties
                     .insert("name".into(), serde_json::Value::Object(name));
                 self
             }
 
-            pub fn nicknames(
+            pub(crate) fn nicknames(
                 &mut self,
                 nicknames: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -69,7 +72,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn emails(
+            pub(crate) fn emails(
                 &mut self,
                 emails: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -78,7 +81,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn phones(
+            pub(crate) fn phones(
                 &mut self,
                 phones: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -87,7 +90,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn addresses(
+            pub(crate) fn addresses(
                 &mut self,
                 addresses: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -96,7 +99,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn organizations(
+            pub(crate) fn organizations(
                 &mut self,
                 organizations: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -107,7 +110,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn online_services(
+            pub(crate) fn online_services(
                 &mut self,
                 online_services: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -118,7 +121,7 @@ macro_rules! cc_setters {
                 self
             }
 
-            pub fn notes(
+            pub(crate) fn notes(
                 &mut self,
                 notes: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {

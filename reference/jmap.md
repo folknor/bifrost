@@ -1,13 +1,34 @@
 # bifrost-jmap reference
 
-Current architecture of the JMAP client crate. Examples live in `crates/jmap/examples/`.
+Current architecture of the JMAP implementation crate. The only
+external surface is `bifrost_jmap::sync` with the account factory and
+its config types. The protocol client, typed wire objects, transport,
+method macros, error type, and helper facade are internal to the crate.
+Examples live in `crates/jmap/examples/` and demonstrate the
+`AccountFactory` / `Account` surface only.
 
-## Trait-based method dispatch
+## Public surface
+
+With the `sync` feature enabled, consumers may use:
+
+- `sync::JmapAccountFactory` - registered as `Arc<dyn AccountFactory>`.
+- `sync::JmapAccountFactoryBuilder` - open-time factory builder.
+- `sync::JmapCredentials` - Basic or bearer credentials passed to the
+  factory.
+- `sync::ReconnectPolicy` - WebSocket reconnect backoff config.
+
+Everything else in `crates/jmap/src/` is `pub(crate)` or narrower.
+There are no public raw JMAP client APIs, public method macros, public
+wire model modules, or public transport types. Consumers reach JMAP by
+constructing the factory, opening an `Arc<dyn Account>`, and calling
+methods from `bifrost-types::Account`.
+
+## Internal method dispatch
 
 Every JMAP method is a self-describing struct implementing `JmapMethod`:
 
 ```rust
-pub trait JmapMethod: Serialize + Send {
+pub(crate) trait JmapMethod: Serialize + Send {
     const NAME: &'static str;       // "Email/get"
     type Cap: Capability;           // capability::Mail
     type Response: DeserializeOwned; // GetResponse<Email<Get>>
@@ -16,7 +37,11 @@ pub trait JmapMethod: Serialize + Send {
 
 Adding a new method: define a struct, use `define_get_method!` / `define_set_method!` etc. Zero central files touched.
 
-## Request/Response flow
+The method-generation macros are crate-private. They are re-exported
+inside the crate root only so sibling modules can keep the existing
+`crate::define_*` call sites without exporting macro names to consumers.
+
+## Internal request/response flow
 
 ```rust
 let mut request = client.build();
@@ -27,14 +52,14 @@ let result = response.get(&handle)?;  // compile-time safe extraction
 
 `CallHandle<M>` validates call_id and method name. `Response::get()` returns `Error::Method` for JMAP method-level errors.
 
-## Transport abstraction
+## Internal transport abstraction
 
 `Client<T: HttpTransport = ReqwestTransport>` is generic over transport.
 
 - `HttpTransport` - api_request, upload, download, get_session (returns `Bytes`).
 - `SseTransport` - open_sse (EventSource, with `last_event_id` support).
 - `ReqwestTransport` - default implementation with a pooled reqwest::Client.
-- `Client::with_transport(transport, session)` - custom transport injection.
+- `Client::with_transport(transport, session)` - crate-internal custom transport injection.
 - WebSocket remains reqwest-specific (documented).
 
 All convenience helpers are `impl<Tr: HttpTransport> Client<Tr>` so custom transports get the full API.
@@ -59,7 +84,7 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 - `Field<T>` - three-state nullable: `Omitted` / `Null` / `Value(T)`. Use instead of `Option<Option<T>>`.
 - `Id<T>` - phantom-typed string ID: `AccountId`, `BlobId`, `State`. Available for incremental adoption.
-- `Account<'a, Tr>` - account-scoped view of Client. Use `account.build()` for scoped requests.
+- `Account<Tr>` - internal account-scoped view of `Client`. Use `account.build()` for scoped requests inside the crate.
 - `Capability` trait - typed URIs with associated `Config` type.
 - `TransportError` - crate-owned, `#[non_exhaustive]`, carries response body (`Bytes`) for ProblemDetails parsing.
 
@@ -79,7 +104,7 @@ Every JMAP object type under `crates/jmap/src/<type>/`:
 
 Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 
-- Module declarations in `lib.rs`.
+- Internal module declarations in `lib.rs`.
 - DataType enum variants (with `#[serde(other)]` catch-all).
 - Capabilities enum variants + session accessors + deserializer arms.
 - PushObject/PushNotification variants.
@@ -87,7 +112,8 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 
 ## Error model
 
-Structured variants. No `Error::Internal(String)`:
+The crate-internal JMAP error type uses structured variants. No
+`Error::Internal(String)`:
 
 - `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`, `WebSocketClosed`, `WebSocketNotConnected`.
 - `Transport(TransportError)` - wraps transport errors, auto-parses ProblemDetails from body.
@@ -115,7 +141,7 @@ Cursors are encoded as protocol-tagged opaque bytes via a hand-rolled length-pre
 
 ```
 crates/jmap/src/sync/
-  mod.rs           - module re-exports (JmapAccountFactory,
+  mod.rs           - public keep-list re-exports (JmapAccountFactory,
                      JmapAccountFactoryBuilder, JmapCredentials, ReconnectPolicy)
   account.rs       - pub(crate) JmapAccount struct + impl Account
   factory.rs       - JmapAccountFactory + builder + JmapCredentials

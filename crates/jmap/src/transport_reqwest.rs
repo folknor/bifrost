@@ -17,7 +17,7 @@ use futures::Stream;
 ///
 /// Routes through the shared HTTP pipeline for retry, metering, and
 /// token handling.
-pub struct ReqwestTransport {
+pub(crate) struct ReqwestTransport {
     net: AccountNet,
     headers: header::HeaderMap,
     authorization: Authorization,
@@ -213,7 +213,12 @@ impl SseTransport for ReqwestTransport {
 }
 
 /// Adapter that converts reqwest's `Bytes` stream into `Vec<u8>` chunks.
-pub struct ReqwestByteStream {
+///
+/// Constructed only by the `SseTransport::open_sse` impl, which the
+/// Account impl does not currently drive; kept so the trait surface
+/// stays complete.
+#[allow(dead_code)]
+pub(crate) struct ReqwestByteStream {
     inner: bifrost_net::ByteStream,
 }
 

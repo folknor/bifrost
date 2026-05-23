@@ -309,13 +309,37 @@ Four waves; each blocks on the prior.
   cross-host redirect strip widened to remove caller-set
   `Authorization` headers (covers JMAP Basic-auth, not just
   bearer-injection).
-- **Wave 3: protocol crate contraction (S1-W3)**. Four agents in
-  parallel. Each makes everything in its protocol crate
-  `pub(crate)` except the factory and its config types. Examples
-  that demonstrated the raw client API are deleted; new examples
-  consume `Account`. This is the final `pub` audit for the
-  protocol crates after the trait surface has been implemented
-  end-to-end.
+- **Wave 3: protocol crate contraction (S1-W3)**. **Merged.** Four
+  agents in parallel landed the `pub(crate)` contraction across the
+  four protocol crates: only `JmapAccountFactory` /
+  `JmapAccountFactoryBuilder` / `JmapCredentials` / `ReconnectPolicy`
+  remain pub on `bifrost-jmap` (under `sync::`); `ImapAccountFactory`
+  / `ImapAccountConfig` / `ImapConfig` / `Credentials` / `AuthPolicy`
+  on `bifrost-imap`; `GmailAccountFactory` / `PubSubConfig` on
+  `bifrost-gmail`; `GraphAccountFactory` / `GraphClient` on
+  `bifrost-graph`. Raw protocol surfaces were demoted: JMAP deleted
+  the `mail` convenience facade and stopped `#[macro_export]`ing its
+  method/object macros; IMAP removed `ImapConfig::connect`,
+  `connect_authenticated`, `ImapConnection::connect_config`, and the
+  `IntoSecretString` helper, and made `Credentials` an opaque
+  wrapper; Gmail dropped `with_account_net`, token get/set, the
+  `*_absolute` request helpers, and several unused DTOs; Graph kept
+  the `GraphClient` constructor / token-rotation / shared-mailbox
+  surface (necessary for consumers that mutate the access token
+  out-of-band) but `pub(crate)`'d everything else. Each crate
+  shipped an `Account`-consuming example
+  (`crates/{jmap,imap,gmail,graph}/examples/`) and refreshed its
+  `reference/*.md`. Orchestrator post-pass folded in the resulting
+  dead-code surface (`#![allow(dead_code)]` at the JMAP / IMAP
+  crate roots and per-module annotations on the JMAP RFC trees
+  that future stages will wire up), removed the empty
+  `crates/imap/examples/src/bin/` leftover, deduplicated the gmail
+  / graph example binary names, fixed an `UnfoldTuple` private-in-
+  public escape, trimmed the unused `crate::types::*` re-exports
+  in `bifrost-imap`, deleted the dead `Error::EmptyResponse` JMAP
+  variant, and updated crate descriptions and `lib.rs` doc strings
+  to match the contracted surface. `brokkr check --all` is clean
+  (0 errors, 0 warnings).
 - **Wave 4: error model convergence (S1-W4)**. Single agent. Folds
   `plans/error-model-convergence.md` into Stage 1: all `Account`
   methods return `Result<_, AccountError>`, per-protocol error

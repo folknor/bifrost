@@ -4,12 +4,12 @@ use super::Object;
 use super::id::AccountId;
 use super::request::ResultReference;
 
-pub trait GetObject: Object {
+pub(crate) trait GetObject: Object {
     type GetArguments: Default + Serialize;
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GetRequest<O: GetObject> {
+pub(crate) struct GetRequest<O: GetObject> {
     #[serde(rename = "accountId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     account_id: Option<AccountId>,
@@ -35,7 +35,7 @@ pub struct GetRequest<O: GetObject> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct GetResponse<O: Object> {
+pub(crate) struct GetResponse<O: Object> {
     #[serde(rename = "accountId")]
     account_id: Option<AccountId>,
 
@@ -48,7 +48,7 @@ pub struct GetResponse<O: Object> {
 }
 
 impl<O: GetObject> GetRequest<O> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         GetRequest {
             account_id: if O::requires_account_id() {
                 Some(AccountId::new(""))
@@ -63,14 +63,14 @@ impl<O: GetObject> GetRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         if O::requires_account_id() {
             self.account_id = Some(account_id.into());
         }
         self
     }
 
-    pub fn ids<U, V>(&mut self, ids: U) -> &mut Self
+    pub(crate) fn ids<U, V>(&mut self, ids: U) -> &mut Self
     where
         U: IntoIterator<Item = V>,
         V: Into<O::Id>,
@@ -80,25 +80,28 @@ impl<O: GetObject> GetRequest<O> {
         self
     }
 
-    pub fn ids_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn ids_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.ids_ref = reference.into();
         self.ids = None;
         self
     }
 
-    pub fn properties(&mut self, properties: impl IntoIterator<Item = O::Property>) -> &mut Self {
+    pub(crate) fn properties(
+        &mut self,
+        properties: impl IntoIterator<Item = O::Property>,
+    ) -> &mut Self {
         self.properties = Some(properties.into_iter().collect());
         self.properties_ref = None;
         self
     }
 
-    pub fn properties_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn properties_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.properties_ref = Some(reference);
         self.properties = None;
         self
     }
 
-    pub fn arguments(&mut self) -> &mut O::GetArguments {
+    pub(crate) fn arguments(&mut self) -> &mut O::GetArguments {
         &mut self.arguments
     }
 }
@@ -110,35 +113,35 @@ impl<O: GetObject> Default for GetRequest<O> {
 }
 
 impl<O: Object> GetResponse<O> {
-    pub fn account_id(&self) -> Option<&AccountId> {
+    pub(crate) fn account_id(&self) -> Option<&AccountId> {
         self.account_id.as_ref()
     }
 
-    pub fn state(&self) -> &str {
+    pub(crate) fn state(&self) -> &str {
         &self.state
     }
 
-    pub fn into_state(self) -> String {
+    pub(crate) fn into_state(self) -> String {
         self.state
     }
 
-    pub fn list(&self) -> &[O] {
+    pub(crate) fn list(&self) -> &[O] {
         &self.list
     }
 
-    pub fn not_found(&self) -> &[O::Id] {
+    pub(crate) fn not_found(&self) -> &[O::Id] {
         &self.not_found
     }
 
-    pub fn into_list(self) -> Vec<O> {
+    pub(crate) fn into_list(self) -> Vec<O> {
         self.list
     }
 
-    pub fn pop(&mut self) -> Option<O> {
+    pub(crate) fn pop(&mut self) -> Option<O> {
         self.list.pop()
     }
 
-    pub fn into_not_found(self) -> Vec<O::Id> {
+    pub(crate) fn into_not_found(self) -> Vec<O::Id> {
         self.not_found
     }
 }

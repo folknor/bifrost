@@ -7,7 +7,7 @@ use crate::principal::PrincipalId;
 ///
 /// Given a principal and time range, returns free/busy availability.
 #[derive(Debug, Clone, Serialize)]
-pub struct PrincipalGetAvailabilityRequest {
+pub(crate) struct PrincipalGetAvailabilityRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -27,7 +27,7 @@ pub struct PrincipalGetAvailabilityRequest {
 
 /// Response for `Principal/getAvailability`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct PrincipalGetAvailabilityResponse {
+pub(crate) struct PrincipalGetAvailabilityResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -37,20 +37,20 @@ pub struct PrincipalGetAvailabilityResponse {
 
 /// A single availability entry (busy period).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AvailabilityEntry {
+pub(crate) struct AvailabilityEntry {
     #[serde(rename = "utcStart")]
-    pub utc_start: String,
+    pub(crate) utc_start: String,
 
     #[serde(rename = "utcEnd")]
-    pub utc_end: String,
+    pub(crate) utc_end: String,
 
     #[serde(rename = "busyStatus")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub busy_status: Option<String>,
+    pub(crate) busy_status: Option<String>,
 
     #[serde(rename = "event")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event: Option<serde_json::Value>,
+    pub(crate) event: Option<serde_json::Value>,
 }
 
 impl crate::core::method::JmapMethod for PrincipalGetAvailabilityRequest {
@@ -64,7 +64,7 @@ impl crate::core::method::JmapMethod for PrincipalGetAvailabilityRequest {
 }
 
 impl PrincipalGetAvailabilityRequest {
-    pub fn new(
+    pub(crate) fn new(
         id: impl Into<PrincipalId>,
         utc_start: impl Into<String>,
         utc_end: impl Into<String>,
@@ -79,22 +79,22 @@ impl PrincipalGetAvailabilityRequest {
     }
 
     #[must_use]
-    pub fn show_details(mut self, show: bool) -> Self {
+    pub(crate) fn show_details(mut self, show: bool) -> Self {
         self.show_details = Some(show);
         self
     }
 }
 
 impl PrincipalGetAvailabilityResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn list(&self) -> &[AvailabilityEntry] {
+    pub(crate) fn list(&self) -> &[AvailabilityEntry] {
         &self.list
     }
 
-    pub fn into_list(self) -> Vec<AvailabilityEntry> {
+    pub(crate) fn into_list(self) -> Vec<AvailabilityEntry> {
         self.list
     }
 }

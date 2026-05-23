@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 impl EmailCreate {
-    pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
+    pub(crate) fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
@@ -19,13 +19,13 @@ impl EmailCreate {
         self
     }
 
-    pub fn mailbox_ids_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn mailbox_ids_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.mailbox_ids_ref = reference.into();
         self.mailbox_ids = None;
         self
     }
 
-    pub fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
+    pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -34,7 +34,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn message_id<T, U>(&mut self, message_id: T) -> &mut Self
+    pub(crate) fn message_id<T, U>(&mut self, message_id: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -48,7 +48,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn in_reply_to<T, U>(&mut self, in_reply_to: T) -> &mut Self
+    pub(crate) fn in_reply_to<T, U>(&mut self, in_reply_to: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -62,7 +62,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn references<T, U>(&mut self, references: T) -> &mut Self
+    pub(crate) fn references<T, U>(&mut self, references: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -76,7 +76,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn sender<T, U>(&mut self, sender: T) -> &mut Self
+    pub(crate) fn sender<T, U>(&mut self, sender: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -85,7 +85,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn from<T, U>(&mut self, from: T) -> &mut Self
+    pub(crate) fn from<T, U>(&mut self, from: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -94,7 +94,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn to<T, U>(&mut self, to: T) -> &mut Self
+    pub(crate) fn to<T, U>(&mut self, to: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -103,7 +103,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn cc<T, U>(&mut self, cc: T) -> &mut Self
+    pub(crate) fn cc<T, U>(&mut self, cc: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -112,7 +112,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn bcc<T, U>(&mut self, bcc: T) -> &mut Self
+    pub(crate) fn bcc<T, U>(&mut self, bcc: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -121,7 +121,7 @@ impl EmailCreate {
         self
     }
 
-    pub fn reply_to<T, U>(&mut self, reply_to: T) -> &mut Self
+    pub(crate) fn reply_to<T, U>(&mut self, reply_to: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<EmailAddress>,
@@ -130,55 +130,59 @@ impl EmailCreate {
         self
     }
 
-    pub fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
+    pub(crate) fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
         self.subject = Some(subject.into());
         self
     }
 
-    pub fn sent_at(&mut self, sent_at: i64) -> &mut Self {
+    pub(crate) fn sent_at(&mut self, sent_at: i64) -> &mut Self {
         self.sent_at = Some(from_timestamp(sent_at));
         self
     }
 
-    pub fn body_structure(&mut self, body_structure: EmailBodyPart) -> &mut Self {
+    pub(crate) fn body_structure(&mut self, body_structure: EmailBodyPart) -> &mut Self {
         self.body_structure = Some(body_structure.into());
         self
     }
 
-    pub fn body_value(&mut self, id: String, body_value: impl Into<EmailBodyValue>) -> &mut Self {
+    pub(crate) fn body_value(
+        &mut self,
+        id: String,
+        body_value: impl Into<EmailBodyValue>,
+    ) -> &mut Self {
         self.body_values
             .get_or_insert_with(HashMap::new)
             .insert(id, body_value.into());
         self
     }
 
-    pub fn text_body(&mut self, text_body: impl Into<EmailBodyPart>) -> &mut Self {
+    pub(crate) fn text_body(&mut self, text_body: impl Into<EmailBodyPart>) -> &mut Self {
         self.text_body
             .get_or_insert_with(Vec::new)
             .push(text_body.into());
         self
     }
 
-    pub fn html_body(&mut self, html_body: impl Into<EmailBodyPart>) -> &mut Self {
+    pub(crate) fn html_body(&mut self, html_body: impl Into<EmailBodyPart>) -> &mut Self {
         self.html_body
             .get_or_insert_with(Vec::new)
             .push(html_body.into());
         self
     }
 
-    pub fn attachment(&mut self, attachment: impl Into<EmailBodyPart>) -> &mut Self {
+    pub(crate) fn attachment(&mut self, attachment: impl Into<EmailBodyPart>) -> &mut Self {
         self.attachments
             .get_or_insert_with(Vec::new)
             .push(attachment.into());
         self
     }
 
-    pub fn header(&mut self, header: Header, value: impl Into<HeaderValue>) -> &mut Self {
+    pub(crate) fn header(&mut self, header: Header, value: impl Into<HeaderValue>) -> &mut Self {
         self.headers.insert(header, Some(value.into()));
         self
     }
 
-    pub fn received_at(&mut self, received_at: i64) -> &mut Self {
+    pub(crate) fn received_at(&mut self, received_at: i64) -> &mut Self {
         self.received_at = Some(from_timestamp(received_at));
         self
     }
@@ -186,7 +190,7 @@ impl EmailCreate {
 
 impl EmailPatch {
     /// Set/clear a single mailbox membership via dotted-path patch.
-    pub fn mailbox_id(&mut self, mailbox_id: &MailboxId, set: bool) -> &mut Self {
+    pub(crate) fn mailbox_id(&mut self, mailbox_id: &MailboxId, set: bool) -> &mut Self {
         self.mailbox_ids = None;
         self.patch.get_or_insert_with(HashMap::new).insert(
             format!("mailboxIds/{mailbox_id}"),
@@ -199,7 +203,7 @@ impl EmailPatch {
         self
     }
 
-    pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
+    pub(crate) fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
@@ -209,7 +213,7 @@ impl EmailPatch {
     }
 
     /// Set/clear a single keyword via dotted-path patch.
-    pub fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
+    pub(crate) fn keyword(&mut self, keyword: &str, set: bool) -> &mut Self {
         self.keywords = None;
         self.patch.get_or_insert_with(HashMap::new).insert(
             format!("keywords/{keyword}"),
@@ -222,7 +226,7 @@ impl EmailPatch {
         self
     }
 
-    pub fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
+    pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -231,7 +235,7 @@ impl EmailPatch {
         self
     }
 
-    pub fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
+    pub(crate) fn subject(&mut self, subject: impl Into<String>) -> &mut Self {
         self.subject = Some(subject.into());
         self
     }
@@ -256,36 +260,36 @@ impl EmailPatch {
 }
 
 impl EmailBodyPart {
-    pub fn new() -> EmailBodyPart {
+    pub(crate) fn new() -> EmailBodyPart {
         EmailBodyPart::default()
     }
 
-    pub fn with_part_id(mut self, part_id: impl Into<String>) -> Self {
+    pub(crate) fn with_part_id(mut self, part_id: impl Into<String>) -> Self {
         self.part_id = Some(part_id.into());
         self
     }
 
-    pub fn with_blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
+    pub(crate) fn with_blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
         self.blob_id = Some(blob_id.into());
         self
     }
 
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+    pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+    pub(crate) fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
         self.type_ = Some(content_type.into());
         self
     }
 
-    pub fn with_content_id(mut self, content_id: impl Into<String>) -> Self {
+    pub(crate) fn with_content_id(mut self, content_id: impl Into<String>) -> Self {
         self.cid = Some(content_id.into());
         self
     }
 
-    pub fn with_content_language<T, U>(mut self, content_language: T) -> Self
+    pub(crate) fn with_content_language<T, U>(mut self, content_language: T) -> Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -299,12 +303,12 @@ impl EmailBodyPart {
         self
     }
 
-    pub fn with_content_location(mut self, content_location: impl Into<String>) -> Self {
+    pub(crate) fn with_content_location(mut self, content_location: impl Into<String>) -> Self {
         self.location = Some(content_location.into());
         self
     }
 
-    pub fn with_sub_part(mut self, sub_part: EmailBodyPart) -> Self {
+    pub(crate) fn with_sub_part(mut self, sub_part: EmailBodyPart) -> Self {
         self.sub_parts.get_or_insert_with(Vec::new).push(sub_part);
         self
     }
@@ -331,11 +335,11 @@ impl From<&str> for EmailBodyValue {
 }
 
 impl EmailAddress {
-    pub fn new(email: String) -> EmailAddress {
+    pub(crate) fn new(email: String) -> EmailAddress {
         EmailAddress { name: None, email }
     }
 
-    pub fn with_name(mut self, name: String) -> Self {
+    pub(crate) fn with_name(mut self, name: String) -> Self {
         self.name = Some(name);
         self
     }
@@ -375,19 +379,19 @@ impl From<(&str, &str)> for EmailAddress {
 }
 
 impl EmailAddressGroup {
-    pub fn new() -> EmailAddressGroup {
+    pub(crate) fn new() -> EmailAddressGroup {
         EmailAddressGroup {
             name: None,
             addresses: Vec::new(),
         }
     }
 
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+    pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn with_address(mut self, address: impl Into<EmailAddress>) -> Self {
+    pub(crate) fn with_address(mut self, address: impl Into<EmailAddress>) -> Self {
         self.addresses.push(address.into());
         self
     }
@@ -400,7 +404,7 @@ impl Default for EmailAddressGroup {
 }
 
 impl EmailHeader {
-    pub fn new(name: String, value: String) -> EmailHeader {
+    pub(crate) fn new(name: String, value: String) -> EmailHeader {
         EmailHeader { name, value }
     }
 }

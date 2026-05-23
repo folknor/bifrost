@@ -4,14 +4,12 @@ use std::fmt::{self, Display, Formatter};
 const MAX_BODY_EXCERPT_CHARS: usize = 4096;
 
 /// Result type for Gmail client operations.
-// pub: direct Gmail REST callers use the crate-specific error alias.
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Base64 alphabet used by a failed Gmail body decoder.
-// pub: surfaced by Error::Base64 for direct REST callers.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Base64Encoding {
+pub(crate) enum Base64Encoding {
     /// RFC 4648 URL-safe alphabet without padding, as used by Gmail bodies.
     UrlSafeNoPad,
 }
@@ -25,10 +23,9 @@ impl Display for Base64Encoding {
 }
 
 /// Error type for Gmail API operations.
-// pub: direct Gmail REST callers need protocol-specific transport, auth, quota, and decode detail.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Error {
+pub(crate) enum Error {
     /// Network, TLS, timeout, or response-body read failure.
     Transport {
         /// Human-readable transport failure.
@@ -119,21 +116,6 @@ impl Error {
         Self::Base64 {
             encoding: Base64Encoding::UrlSafeNoPad,
             source,
-        }
-    }
-
-    /// Whether this failure is worth retrying without changing credentials.
-    pub fn is_retryable(&self) -> bool {
-        match self {
-            Self::Transport { retryable, .. } => *retryable,
-            Self::HttpStatus { status, .. } | Self::QuotaExhausted { status, .. } => {
-                *status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-            }
-            Self::Auth { .. }
-            | Self::Json(_)
-            | Self::Base64 { .. }
-            | Self::MalformedPayload(_)
-            | Self::InvalidInput(_) => false,
         }
     }
 }
@@ -325,6 +307,5 @@ mod tests {
         );
 
         assert!(matches!(err, Error::QuotaExhausted { .. }));
-        assert!(err.is_retryable());
     }
 }

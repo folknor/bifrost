@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-jmap"
-description = "JMAP client for Rust"
+description = "JMAP Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -62,21 +62,5 @@ sync = [
 debug = []
 
 [[example]]
-name = "mailboxes"
-required-features = ["mail"]
-
-[[example]]
-name = "messages"
-required-features = ["mail"]
-
-[[example]]
-name = "eventsource"
-required-features = ["mail"]
-
-[[example]]
-name = "result_reference"
-required-features = ["mail"]
-
-[[example]]
-name = "websocket"
-required-features = ["websockets"]
+name = "account"
+required-features = ["sync"]

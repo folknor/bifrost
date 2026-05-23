@@ -386,8 +386,6 @@ pub(crate) fn vacation_set(
             response_subject: config.subject,
             response_body_plain_text: config.body_text,
             response_body_html: config.body_html,
-            restrict_to_contacts: None,
-            restrict_to_domain: None,
             start_time: config.starts_at.map(system_time_to_millis_string),
             end_time: config.ends_at.map(system_time_to_millis_string),
         };
@@ -1208,13 +1206,6 @@ mod tests {
             id: LABEL_INBOX.to_string(),
             name: "Inbox".to_string(),
             label_type: Some("system".to_string()),
-            message_list_visibility: None,
-            label_list_visibility: None,
-            messages_total: None,
-            messages_unread: None,
-            threads_total: None,
-            threads_unread: None,
-            color: None,
         };
         let container = container_from_label(&label);
         assert_eq!(container.role, Some(FolderRole::Inbox));

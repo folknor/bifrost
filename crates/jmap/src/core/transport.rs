@@ -7,10 +7,10 @@ use bytes::Bytes;
 // types: crate-owned so custom transports can still carry response bodies for ProblemDetails.
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct TransportError {
-    pub message: String,
+pub(crate) struct TransportError {
+    pub(crate) message: String,
     /// HTTP response body, if available (for parsing ProblemDetails).
-    pub body: Option<Bytes>,
+    pub(crate) body: Option<Bytes>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -29,7 +29,7 @@ impl std::error::Error for TransportError {
 }
 
 impl TransportError {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             body: None,
@@ -37,7 +37,7 @@ impl TransportError {
         }
     }
 
-    pub fn with_source(
+    pub(crate) fn with_source(
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
@@ -48,7 +48,7 @@ impl TransportError {
         }
     }
 
-    pub fn with_body(message: impl Into<String>, body: impl Into<Bytes>) -> Self {
+    pub(crate) fn with_body(message: impl Into<String>, body: impl Into<Bytes>) -> Self {
         Self {
             message: message.into(),
             body: Some(body.into()),
@@ -61,7 +61,7 @@ impl TransportError {
 ///
 /// Implement this trait to use a custom HTTP client. The default
 /// implementation uses `reqwest`.
-pub trait HttpTransport: Send + Sync + 'static {
+pub(crate) trait HttpTransport: Send + Sync + 'static {
     /// Send a JMAP API request (POST with JSON body).
     fn api_request(
         &self,
@@ -88,7 +88,7 @@ pub trait HttpTransport: Send + Sync + 'static {
 ///
 /// Implement this to provide EventSource support with a custom HTTP client.
 /// The default implementation uses reqwest's byte streaming.
-pub trait SseTransport: Send + Sync + 'static {
+pub(crate) trait SseTransport: Send + Sync + 'static {
     /// The byte stream type returned by the SSE connection.
     type ByteStream: futures::Stream<Item = Result<Vec<u8>, TransportError>> + Send + Unpin;
 

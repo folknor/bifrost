@@ -14,7 +14,7 @@ use crate::{
 /// structs, cloned freely, and moved across tasks.
 ///
 /// ```ignore
-/// use bifrost_jmap::core::capability;
+/// use crate::core::capability;
 ///
 /// let mail_account = client.primary_account::<capability::Mail>()?;
 /// let mut request = mail_account.build();
@@ -25,7 +25,7 @@ use crate::{
 /// §2). Use [`Client::primary_account`] with a capability marker to
 /// pick the correct one rather than assuming
 /// [`Client::default_account_id`] applies to every capability.
-pub struct Account<Tr: HttpTransport> {
+pub(crate) struct Account<Tr: HttpTransport> {
     client: Client<Tr>,
     account_id: AccountId,
 }
@@ -43,7 +43,7 @@ impl<Tr: HttpTransport> Account<Tr> {
     /// Construct an `Account` directly. The account ID is not validated
     /// against the session; prefer [`Client::primary_account`] for
     /// capability-aware selection.
-    pub fn new(client: Client<Tr>, account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn new(client: Client<Tr>, account_id: impl Into<AccountId>) -> Self {
         Self {
             client,
             account_id: account_id.into(),
@@ -51,22 +51,22 @@ impl<Tr: HttpTransport> Account<Tr> {
     }
 
     /// The account ID.
-    pub fn id(&self) -> &AccountId {
+    pub(crate) fn id(&self) -> &AccountId {
         &self.account_id
     }
 
     /// The account ID as a string slice.
-    pub fn id_str(&self) -> &str {
+    pub(crate) fn id_str(&self) -> &str {
         self.account_id.as_str()
     }
 
     /// Access the underlying client.
-    pub fn client(&self) -> &Client<Tr> {
+    pub(crate) fn client(&self) -> &Client<Tr> {
         &self.client
     }
 
     /// Build a request batch scoped to this account.
-    pub fn build(&self) -> crate::core::request::Request<'_, Tr> {
+    pub(crate) fn build(&self) -> crate::core::request::Request<'_, Tr> {
         self.client
             .build()
             .account_id(self.account_id.as_str().to_string())
@@ -87,7 +87,7 @@ impl<Tr: HttpTransport> Account<Tr> {
     ///
     /// [`Request`]: crate::core::request::Request
     /// [`Request::call`]: crate::core::request::Request::call
-    pub async fn call<M: JmapMethod>(&self, method: M) -> crate::Result<M::Response> {
+    pub(crate) async fn call<M: JmapMethod>(&self, method: M) -> crate::Result<M::Response> {
         let mut request = self.build();
         let handle = request.call(method)?;
         request.send_single(&handle).await
@@ -108,12 +108,12 @@ impl<Tr: HttpTransport> Client<Tr> {
     /// not list a primary account for `C::URI`.
     ///
     /// ```ignore
-    /// use bifrost_jmap::core::capability;
+    /// use crate::core::capability;
     ///
     /// let mail = client.primary_account::<capability::Mail>()?;
     /// let cal  = client.primary_account::<capability::Calendars>()?;
     /// ```
-    pub fn primary_account<C: Capability>(&self) -> crate::Result<Account<Tr>> {
+    pub(crate) fn primary_account<C: Capability>(&self) -> crate::Result<Account<Tr>> {
         let session = self.session();
         let account_id = session
             .primary_accounts()

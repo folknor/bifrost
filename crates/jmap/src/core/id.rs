@@ -11,14 +11,14 @@ use serde::{Deserialize, Serialize};
 /// marker name.
 ///
 /// ```ignore
-/// let email_id: bifrost_jmap::email::EmailId = "msg-123".into();
-/// let mailbox_id: bifrost_jmap::mailbox::MailboxId = "mbox-1".into();
+/// let email_id: crate::email::EmailId = "msg-123".into();
+/// let mailbox_id: crate::mailbox::MailboxId = "mbox-1".into();
 /// // email_id == mailbox_id  // compile error - different types
 /// ```
 // types: separate from bifrost-types IDs because JMAP wire models need per-object phantom typing.
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);
+pub(crate) struct Id<T: ?Sized>(String, #[serde(skip)] std::marker::PhantomData<T>);
 
 // Manual Clone / PartialEq / Eq / Hash impls: the derived forms each
 // require `T: Trait`, but `T` is a phantom marker (often an
@@ -46,15 +46,15 @@ impl<T: ?Sized> std::hash::Hash for Id<T> {
 }
 
 impl<T: ?Sized> Id<T> {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
         Id(id.into(), std::marker::PhantomData)
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub fn into_string(self) -> String {
+    pub(crate) fn into_string(self) -> String {
         self.0
     }
 }
@@ -107,18 +107,18 @@ impl<T: ?Sized> From<Id<T>> for String {
 /// `MailboxId`, etc.) live in their own modules under the same
 /// "marker private, typedef public" pattern.
 mod marker {
-    pub enum Account {}
-    pub enum Blob {}
-    pub enum State {}
+    pub(crate) enum Account {}
+    pub(crate) enum Blob {}
+    pub(crate) enum State {}
 }
 
-pub type AccountId = Id<marker::Account>;
-pub type BlobId = Id<marker::Blob>;
-pub type State = Id<marker::State>;
+pub(crate) type AccountId = Id<marker::Account>;
+pub(crate) type BlobId = Id<marker::Blob>;
+pub(crate) type State = Id<marker::State>;
 
 /// `serde(skip_serializing_if)` predicate for `Option<Id<T>>` fields
 /// that treat an empty string the same as `None`. Mirrors the semantics
 /// of `skip_if_empty_str` for the typed-id storage migration.
-pub fn skip_if_empty_id<T: ?Sized>(id: &Option<Id<T>>) -> bool {
+pub(crate) fn skip_if_empty_id<T: ?Sized>(id: &Option<Id<T>>) -> bool {
     matches!(id, Some(id) if id.as_str().is_empty())
 }

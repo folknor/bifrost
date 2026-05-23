@@ -3,13 +3,13 @@ use crate::core::{
     session::URLParser,
 };
 
-pub mod copy;
-pub mod download;
-pub mod manage;
-pub mod upload;
+pub(crate) mod copy;
+pub(crate) mod download;
+pub(crate) mod manage;
+pub(crate) mod upload;
 
 #[non_exhaustive]
-pub enum URLParameter {
+pub(crate) enum URLParameter {
     AccountId,
     BlobId,
     Name,
@@ -48,23 +48,23 @@ impl URLParser for URLParameter {
 /// `BlobRef` so consumers do not reconstruct one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct BlobRef {
+pub(crate) struct BlobRef {
     /// The account that owns this blob.
-    pub account_id: AccountId,
+    pub(crate) account_id: AccountId,
     /// The blob's server-assigned ID.
-    pub blob_id: BlobId,
+    pub(crate) blob_id: BlobId,
     /// Suggested filename for `Content-Disposition`. `None` falls back
     /// to a neutral default at download time.
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
     /// Suggested MIME type for `Content-Type`. `None` falls back to
     /// `application/octet-stream` at download time.
-    pub content_type: Option<String>,
+    pub(crate) content_type: Option<String>,
 }
 
 impl BlobRef {
     /// Construct a `BlobRef` from an account + blob ID, with no
     /// name or content type hints.
-    pub fn new(account_id: AccountId, blob_id: BlobId) -> Self {
+    pub(crate) fn new(account_id: AccountId, blob_id: BlobId) -> Self {
         Self {
             account_id,
             blob_id,
@@ -75,14 +75,14 @@ impl BlobRef {
 
     /// Set the suggested filename hint.
     #[must_use]
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+    pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
     /// Set the suggested MIME type hint.
     #[must_use]
-    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+    pub(crate) fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
         self.content_type = Some(content_type.into());
         self
     }

@@ -7,7 +7,7 @@ use super::CalendarEventNotification;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     Type {
         #[serde(rename = "type")]
         value: String,
@@ -21,19 +21,21 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "created")]
     Created,
 }
 
 impl Filter {
-    pub fn type_(value: impl Into<String>) -> Self {
+    pub(crate) fn type_(value: impl Into<String>) -> Self {
         Filter::Type {
             value: value.into(),
         }
     }
 
-    pub fn calendar_event_id(value: impl Into<crate::calendar_event::CalendarEventId>) -> Self {
+    pub(crate) fn calendar_event_id(
+        value: impl Into<crate::calendar_event::CalendarEventId>,
+    ) -> Self {
         Filter::CalendarEventId {
             value: value.into(),
         }
@@ -41,7 +43,7 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn created() -> query::Comparator<Comparator> {
+    pub(crate) fn created() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Created)
     }
 }

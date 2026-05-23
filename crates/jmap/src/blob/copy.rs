@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CopyBlobRequest {
+pub(crate) struct CopyBlobRequest {
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
     #[serde(rename = "accountId")]
@@ -20,7 +20,7 @@ pub struct CopyBlobRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CopyBlobResponse {
+pub(crate) struct CopyBlobResponse {
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
     #[serde(rename = "accountId")]
@@ -48,7 +48,7 @@ impl CopyBlobRequest {
     /// added to a request batch (the destination is the account that
     /// owns the request). The source `fromAccountId` is the only
     /// account argument here, since it is genuinely a per-call value.
-    pub fn new(from_account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn new(from_account_id: impl Into<AccountId>) -> Self {
         CopyBlobRequest {
             from_account_id: from_account_id.into(),
             account_id: AccountId::new(""),
@@ -57,22 +57,22 @@ impl CopyBlobRequest {
     }
 
     #[must_use]
-    pub fn blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
+    pub(crate) fn blob_id(mut self, blob_id: impl Into<BlobId>) -> Self {
         self.blob_ids.push(blob_id.into());
         self
     }
 }
 
 impl CopyBlobResponse {
-    pub fn from_account_id(&self) -> &AccountId {
+    pub(crate) fn from_account_id(&self) -> &AccountId {
         &self.from_account_id
     }
 
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn copied(&mut self, id: &BlobId) -> crate::Result<BlobId> {
+    pub(crate) fn copied(&mut self, id: &BlobId) -> crate::Result<BlobId> {
         if let Some(result) = self.copied.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_copied.as_mut().and_then(|r| r.remove(id)) {
@@ -82,15 +82,15 @@ impl CopyBlobResponse {
         }
     }
 
-    pub fn copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
+    pub(crate) fn copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
         self.copied.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
+    pub(crate) fn not_copied_ids(&self) -> Option<impl Iterator<Item = &BlobId>> {
         self.not_copied.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_copied_reason(&self, id: &BlobId) -> Option<&SetError<String>> {
+    pub(crate) fn not_copied_reason(&self, id: &BlobId) -> Option<&SetError<String>> {
         self.not_copied.as_ref().and_then(|map| map.get(id))
     }
 }

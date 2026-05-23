@@ -1,8 +1,12 @@
 //! JMAP ShareNotification (RFC 9670). Destroy-only.
 
-pub mod get;
-pub mod query;
-pub mod set;
+// No Account method consumes ShareNotification today; the RFC types
+// are kept built and covered by tests for a future sharing-aware stage.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -10,13 +14,13 @@ use std::fmt::Display;
 use serde::{Deserialize, Serialize};
 
 mod marker {
-    pub enum ShareNotification {}
+    pub(crate) enum ShareNotification {}
 }
 /// Strongly-typed ShareNotification ID.
-pub type ShareNotificationId = crate::core::id::Id<marker::ShareNotification>;
+pub(crate) type ShareNotificationId = crate::core::id::Id<marker::ShareNotification>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShareNotification {
+pub(crate) struct ShareNotification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<ShareNotificationId>,
 
@@ -58,16 +62,16 @@ pub struct ShareNotification {
 /// `SetRequest::create()` will not resolve because this type does not
 /// impl `SetCreate`.
 #[derive(Debug, Clone, Serialize)]
-pub enum ShareNotificationCreate {}
+pub(crate) enum ShareNotificationCreate {}
 
 /// Uninhabitable Patch-shape: ShareNotifications cannot be updated.
 /// `SetRequest::update()` will not resolve because this type does not
 /// impl `Default`.
 #[derive(Debug, Clone, Serialize)]
-pub enum ShareNotificationPatch {}
+pub(crate) enum ShareNotificationPatch {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangedBy {
+pub(crate) struct ChangedBy {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 
@@ -80,22 +84,22 @@ pub struct ChangedBy {
 }
 
 impl ChangedBy {
-    pub fn name(&self) -> Option<&str> {
+    pub(crate) fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
-    pub fn email(&self) -> Option<&str> {
+    pub(crate) fn email(&self) -> Option<&str> {
         self.email.as_deref()
     }
 
-    pub fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+    pub(crate) fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
         self.principal_id.as_ref()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "created")]

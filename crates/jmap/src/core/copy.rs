@@ -7,7 +7,7 @@ use super::id::AccountId;
 use super::set::{SetError, SetObject};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CopyRequest<O: SetObject> {
+pub(crate) struct CopyRequest<O: SetObject> {
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
 
@@ -35,7 +35,7 @@ pub struct CopyRequest<O: SetObject> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CopyResponse<O: SetObject> {
+pub(crate) struct CopyResponse<O: SetObject> {
     #[serde(rename = "fromAccountId")]
     from_account_id: AccountId,
 
@@ -58,7 +58,7 @@ pub struct CopyResponse<O: SetObject> {
 }
 
 impl<O: SetObject> CopyRequest<O> {
-    pub fn new(from_account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn new(from_account_id: impl Into<AccountId>) -> Self {
         CopyRequest {
             from_account_id: from_account_id.into(),
             if_from_in_state: None,
@@ -70,27 +70,30 @@ impl<O: SetObject> CopyRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
 
-    pub fn if_from_in_state(&mut self, if_from_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_from_in_state(&mut self, if_from_in_state: impl Into<String>) -> &mut Self {
         self.if_from_in_state = Some(if_from_in_state.into());
         self
     }
 
-    pub fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
+    pub(crate) fn if_in_state(&mut self, if_in_state: impl Into<String>) -> &mut Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
 
-    pub fn on_success_destroy_original(&mut self, on_success_destroy_original: bool) -> &mut Self {
+    pub(crate) fn on_success_destroy_original(
+        &mut self,
+        on_success_destroy_original: bool,
+    ) -> &mut Self {
         self.on_success_destroy_original = on_success_destroy_original;
         self
     }
 
-    pub fn destroy_from_if_in_state(
+    pub(crate) fn destroy_from_if_in_state(
         &mut self,
         destroy_from_if_in_state: impl Into<String>,
     ) -> &mut Self {
@@ -103,7 +106,7 @@ impl<O: SetObject> CopyRequest<O>
 where
     O::Create: crate::core::SetCreate,
 {
-    pub fn create(&mut self, id: impl Into<String>) -> &mut O::Create {
+    pub(crate) fn create(&mut self, id: impl Into<String>) -> &mut O::Create {
         use crate::core::SetCreate;
         let id = id.into();
         self.create.insert(id.clone(), O::Create::new(None));
@@ -112,23 +115,23 @@ where
 }
 
 impl<O: SetObject> CopyResponse<O> {
-    pub fn from_account_id(&self) -> &AccountId {
+    pub(crate) fn from_account_id(&self) -> &AccountId {
         &self.from_account_id
     }
 
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn old_state(&self) -> Option<&str> {
+    pub(crate) fn old_state(&self) -> Option<&str> {
         self.old_state.as_deref()
     }
 
-    pub fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &str {
         &self.new_state
     }
 
-    pub fn created(&mut self, id: &str) -> crate::Result<O> {
+    pub(crate) fn created(&mut self, id: &str) -> crate::Result<O> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
@@ -138,15 +141,15 @@ impl<O: SetObject> CopyResponse<O> {
         }
     }
 
-    pub fn into_created(self) -> Option<Vec<O>> {
+    pub(crate) fn into_created(self) -> Option<Vec<O>> {
         self.created.map(|map| map.into_values().collect())
     }
 
-    pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.not_created.as_ref().map(|map| map.keys())
     }
 }

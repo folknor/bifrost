@@ -1,49 +1,58 @@
 #![forbid(unsafe_code)]
-#![doc = "JMAP client for Rust."]
+#![doc = "JMAP Account implementation for bifrost."]
+// The crate hosts the full JMAP RFC type surface (mail, calendars,
+// contacts, principal, sieve, sharing, push) so the Account impl can
+// draw on whichever pieces a given stage needs. The Account impl
+// today wires a subset; the rest stays built and ready. `wrong_self_convention`
+// is allowed because JMAP RFC field names (`fromDate`, `isEnabled`,
+// `toDate`) become builder methods that mutate `self`.
+#![allow(dead_code)]
+#![allow(clippy::wrong_self_convention)]
+// JMAP RFC vocabulary uses bare acronyms (JMAP, ACL, DKIM) and
+// enum families with shared prefixes (AddressType::As*); both
+// shapes are RFC-imposed and won't be renamed.
+#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::enum_variant_names)]
 
-pub mod account;
+pub(crate) mod account;
 #[cfg(feature = "contacts")]
-pub mod address_book;
-pub mod blob;
+pub(crate) mod address_book;
+pub(crate) mod blob;
 #[cfg(feature = "calendars")]
-pub mod calendar;
+pub(crate) mod calendar;
 #[cfg(feature = "calendars")]
-pub mod calendar_event;
+pub(crate) mod calendar_event;
 #[cfg(feature = "calendars")]
-pub mod calendar_event_notification;
-pub mod client;
+pub(crate) mod calendar_event_notification;
+pub(crate) mod client;
 #[cfg(feature = "contacts")]
-pub mod contact_card;
-pub mod core;
+pub(crate) mod contact_card;
+pub(crate) mod core;
 #[cfg(feature = "mail")]
-pub mod email;
+pub(crate) mod email;
 #[cfg(feature = "mail")]
-pub mod email_submission;
-pub mod event_source;
+pub(crate) mod email_submission;
+pub(crate) mod event_source;
 #[cfg(feature = "mail")]
-pub mod identity;
+pub(crate) mod identity;
 #[cfg(feature = "mail")]
-pub mod mail;
-#[cfg(feature = "mail")]
-pub mod mailbox;
+pub(crate) mod mailbox;
 #[cfg(feature = "calendars")]
-pub mod participant_identity;
-pub mod principal;
-pub mod push_subscription;
+pub(crate) mod participant_identity;
+pub(crate) mod principal;
+pub(crate) mod push_subscription;
 #[cfg(feature = "quota")]
-pub mod quota;
-pub mod share_notification;
+pub(crate) mod quota;
+pub(crate) mod share_notification;
 #[cfg(feature = "mail")]
-pub mod sieve;
+pub(crate) mod sieve;
 #[cfg(feature = "sync")]
 pub mod sync;
 #[cfg(feature = "mail")]
-pub mod thread;
-pub mod transport_reqwest;
+pub(crate) mod thread;
+pub(crate) mod transport_reqwest;
 #[cfg(feature = "mail")]
-pub mod vacation_response;
-
-pub use bytes::Bytes;
+pub(crate) mod vacation_response;
 
 use crate::core::error::MethodError;
 use crate::core::error::ProblemDetails;
@@ -53,11 +62,19 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 #[cfg(feature = "websockets")]
-pub mod client_ws;
+pub(crate) mod client_ws;
+
+pub(crate) use crate::core::{
+    __json_object_serde, json_object_struct,
+    method::{
+        define_changes_method, define_copy_method, define_get_method, define_open_property_enum,
+        define_parse_method, define_query_changes_method, define_query_method, define_set_method,
+    },
+};
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Clone)]
 #[non_exhaustive]
-pub enum DataType {
+pub(crate) enum DataType {
     // Core (always available)
     #[serde(rename = "Core")]
     Core,
@@ -141,7 +158,7 @@ pub enum DataType {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "@type")]
 #[non_exhaustive]
-pub enum PushObject {
+pub(crate) enum PushObject {
     StateChange {
         changed: HashMap<String, HashMap<DataType, String>>,
     },
@@ -161,24 +178,24 @@ pub enum PushObject {
 #[cfg(feature = "calendars")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct CalendarAlert {
+pub(crate) struct CalendarAlert {
     #[serde(rename = "accountId")]
-    pub account_id: String,
+    pub(crate) account_id: String,
     #[serde(rename = "calendarEventId")]
-    pub calendar_event_id: String,
-    pub uid: String,
+    pub(crate) calendar_event_id: String,
+    pub(crate) uid: String,
     #[serde(rename = "recurrenceId")]
-    pub recurrence_id: Option<String>,
+    pub(crate) recurrence_id: Option<String>,
     #[serde(rename = "alertId")]
-    pub alert_id: String,
+    pub(crate) alert_id: String,
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(feature = "websockets")]
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum WebSocketSetupError {
+pub(crate) enum WebSocketSetupError {
     /// The client could not construct a valid WebSocket request header.
     InvalidHeader(String),
     /// The TLS connector could not be built before opening the socket.
@@ -189,7 +206,7 @@ pub enum WebSocketSetupError {
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Error {
+pub(crate) enum Error {
     /// Transport-level failure (network, TLS, timeout).
     Transport(core::transport::TransportError),
     /// JSON deserialization failure.
@@ -204,8 +221,6 @@ pub enum Error {
     CallNotFound(String),
     /// Requested object ID not found in set/copy/parse response.
     IdNotFound(String),
-    /// Server returned an empty method response array.
-    EmptyResponse,
     /// Not parsable as the expected format.
     NotParsable(String),
     /// URL template parsing failure.
@@ -313,7 +328,6 @@ impl Display for Error {
             Error::Set(e) => write!(f, "Set error: {e}"),
             Error::CallNotFound(id) => write!(f, "Call {id} not found in response"),
             Error::IdNotFound(id) => write!(f, "Id {id} not found"),
-            Error::EmptyResponse => write!(f, "Server returned no results"),
             Error::NotParsable(id) => write!(f, "{id} is not parsable"),
             Error::InvalidUrl(msg) => write!(f, "Invalid URL: {msg}"),
             Error::NoPrimaryAccount { capability } => write!(

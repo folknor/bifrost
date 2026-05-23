@@ -45,7 +45,7 @@ mod sort_thread;
 pub(super) mod state;
 mod stream;
 mod tag;
-pub mod typed_event;
+pub(crate) mod typed_event;
 mod uid_ops;
 pub(super) mod wire;
 
@@ -63,9 +63,8 @@ use stream::{CompressedStream, ImapStream, InnerStream};
 mod tests;
 
 /// TLS policy for an IMAP connection.
-// pub: callers choose the direct connection security mode in ImapConfig.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TlsMode {
+pub(crate) enum TlsMode {
     /// Connect directly over TLS.
     Implicit,
     /// Connect in cleartext, then upgrade via STARTTLS.
@@ -85,19 +84,18 @@ impl TlsMode {
 }
 
 /// TCP keepalive configuration for the underlying socket.
-// pub: callers tune direct socket keepalive through ImapConfig.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TcpKeepalive {
+pub(crate) struct TcpKeepalive {
     /// Time before the first keepalive probe.
-    pub time: Duration,
+    pub(crate) time: Duration,
     /// Interval between subsequent probes.
-    pub interval: Duration,
+    pub(crate) interval: Duration,
 }
 
 impl TcpKeepalive {
     /// Create a TCP keepalive configuration with the given time and interval.
-    pub fn new(time: Duration, interval: Duration) -> Self {
+    pub(crate) fn new(time: Duration, interval: Duration) -> Self {
         Self { time, interval }
     }
 }
@@ -106,10 +104,9 @@ impl TcpKeepalive {
 ///
 /// Tracks the current protocol state of the connection. State transitions
 /// are managed automatically by `ImapConnection` methods.
-// pub: direct clients inspect state before selecting command paths.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SessionState {
+pub(crate) enum SessionState {
     /// Not Authenticated  -  client must authenticate (RFC 3501 Section 3.1).
     NotAuthenticated,
     /// Authenticated  -  client may select a mailbox (RFC 3501 Section 3.2).
@@ -121,10 +118,9 @@ pub enum SessionState {
 }
 
 /// Event received during an IDLE session (RFC 2177).
-// pub: direct IDLE users receive this lower-level event shape.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum IdleEvent {
+pub(crate) enum IdleEvent {
     /// New message(s) arrived  -  `* <n> EXISTS` (RFC 3501 Section 7.3.1).
     Exists(u32),
     /// Message expunged  -  `* <n> EXPUNGE` (RFC 3501 Section 7.4.1).
@@ -275,19 +271,18 @@ pub enum IdleEvent {
 ///
 /// Contains both the matching sequence numbers/UIDs and the optional
 /// highest mod-sequence value (RFC 7162 Section 3.1.5).
-// pub: direct SEARCH APIs return this protocol-native result.
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct SearchResult {
+pub(crate) struct SearchResult {
     /// Matching message sequence numbers (SEARCH) or UIDs (UID SEARCH).
-    pub ids: Vec<u32>,
+    pub(crate) ids: Vec<u32>,
     /// Highest mod-sequence of matching messages, if MODSEQ was used
     /// in the search criteria (RFC 7162 Section 3.1.5).
-    pub mod_seq: Option<u64>,
+    pub(crate) mod_seq: Option<u64>,
     /// `true` when ESEARCH UID range expansion was capped at the internal
     /// safety limit and the returned `ids` do not faithfully represent the
     /// full server response (RFC 4731 Section 3, RFC 3501 Section 6.4.4).
-    pub truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,8 +303,7 @@ pub struct SearchResult {
 /// [`Error::Protocol`] if not. For example, [`uid_fetch()`](Self::uid_fetch)
 /// requires the Selected state and will fail if called before
 /// [`select()`](Self::select).
-// pub: this remains the raw IMAP command API; Account wraps it for engine-managed sync.
-pub struct ImapConnection {
+pub(crate) struct ImapConnection {
     /// Channel for submitting commands to the driver task.
     cmd_tx: tokio::sync::mpsc::Sender<driver::DriverCommand>,
     /// Watch receiver for observing connection state snapshots.

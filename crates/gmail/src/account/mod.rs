@@ -30,7 +30,6 @@ use tokio_util::sync::CancellationToken;
 use crate::client::GmailClient;
 use crate::types::GmailProfile;
 
-// pub: downstream consumers configure Gmail Pub/Sub before registering the factory.
 pub use push::PubSubConfig;
 
 use self::capabilities::gmail_capabilities;
@@ -40,36 +39,34 @@ use self::cursor::{
 use self::push::PubSubControl;
 use self::scopes::{ScopeCache, ScopeSnapshot};
 
-// pub: the sync engine's cross-crate conformance test and downstream engines register this factory.
+/// Factory for opening Gmail accounts through the shared `Account` API.
 pub struct GmailAccountFactory {
     client: Arc<GmailClient>,
     pubsub: Option<PubSubConfig>,
 }
 
 impl GmailAccountFactory {
-    // pub: direct callers with a preconfigured GmailClient can still register an AccountFactory.
-    #[must_use]
-    pub fn new(client: GmailClient) -> Self {
+    fn from_client(client: GmailClient) -> Self {
         Self {
             client: Arc::new(client),
             pubsub: None,
         }
     }
 
-    // pub: ergonomic AccountFactory construction for callers that already hold a bearer token.
+    /// Construct a Gmail factory from a bearer access token.
     #[must_use]
     pub fn from_access_token(access_token: impl Into<String>) -> Self {
-        Self::new(GmailClient::new(access_token))
+        Self::from_client(GmailClient::new(access_token))
     }
 
-    // pub: Gmail Pub/Sub subscription ownership is configured on the factory before open.
+    /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {
         self.pubsub = Some(config);
         self
     }
 
-    // pub: common Pub/Sub setup needs only a topic and no label filter.
+    /// Configure an account-wide Gmail Cloud Pub/Sub watch topic.
     #[must_use]
     pub fn with_pubsub_topic(self, topic: impl Into<String>) -> Self {
         self.with_pubsub_config(PubSubConfig::new(topic))

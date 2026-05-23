@@ -4,7 +4,7 @@ use crate::core::id::{AccountId, BlobId};
 use crate::core::set::SetError;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SieveScriptValidateRequest {
+pub(crate) struct SieveScriptValidateRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -13,7 +13,7 @@ pub struct SieveScriptValidateRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SieveScriptValidateResponse {
+pub(crate) struct SieveScriptValidateResponse {
     error: Option<SetError<String>>,
 }
 
@@ -28,7 +28,7 @@ impl crate::core::method::JmapMethod for SieveScriptValidateRequest {
 }
 
 impl SieveScriptValidateRequest {
-    pub fn new(blob_id: impl Into<BlobId>) -> Self {
+    pub(crate) fn new(blob_id: impl Into<BlobId>) -> Self {
         SieveScriptValidateRequest {
             account_id: AccountId::new(""),
             blob_id: blob_id.into(),
@@ -37,7 +37,7 @@ impl SieveScriptValidateRequest {
 }
 
 impl SieveScriptValidateResponse {
-    pub fn unwrap_error(self) -> crate::Result<()> {
+    pub(crate) fn unwrap_error(self) -> crate::Result<()> {
         match self.error {
             Some(err) => Err(err.into()),
             None => Ok(()),

@@ -25,11 +25,11 @@ impl ImapConnection {
         use crate::error::{
             AuthMechanismRejection, AuthMechanismRejectionReason, AuthPolicyFailure,
         };
-        use crate::types::{AuthMechanism, AuthOutcome, Credentials};
+        use crate::types::{AuthMechanism, AuthOutcome, CredentialsKind};
 
         let profile = self.server_profile();
-        match credentials {
-            Credentials::OAuth2 {
+        match credentials.kind() {
+            CredentialsKind::OAuth2 {
                 identity,
                 access_token,
             } => {
@@ -51,7 +51,7 @@ impl ImapConnection {
                     mechanism: AuthMechanism::XOAuth2,
                 })
             }
-            Credentials::Password { username, password } => {
+            CredentialsKind::Password { username, password } => {
                 let mut rejected = Vec::new();
                 for mechanism in [
                     AuthMechanism::ScramSha256,

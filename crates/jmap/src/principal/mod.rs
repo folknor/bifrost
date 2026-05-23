@@ -1,7 +1,12 @@
-pub mod availability;
-pub mod get;
-pub mod query;
-pub mod set;
+// The Account impl only uses `PrincipalId` and `ACL` from this module;
+// the full RFC 8621 §6 surface is retained for completeness and for the
+// JMAP Principal/* methods a future stage may expose.
+#![allow(dead_code)]
+
+pub(crate) mod availability;
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use crate::core::set::{skip_if_empty_list, skip_if_empty_map, skip_if_empty_str};
 use serde::{Deserialize, Serialize};
@@ -9,13 +14,13 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 mod marker {
-    pub enum Principal {}
+    pub(crate) enum Principal {}
 }
 /// Strongly-typed Principal ID.
-pub type PrincipalId = crate::core::id::Id<marker::Principal>;
+pub(crate) type PrincipalId = crate::core::id::Id<marker::Principal>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Principal {
+pub(crate) struct Principal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<PrincipalId>,
 
@@ -64,7 +69,7 @@ pub struct Principal {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PrincipalCreate {
+pub(crate) struct PrincipalCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -113,7 +118,7 @@ pub struct PrincipalCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct PrincipalPatch {
+pub(crate) struct PrincipalPatch {
     #[serde(rename = "type")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ptype: Option<Type>,
@@ -163,7 +168,7 @@ pub struct PrincipalPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalAccount {
+pub(crate) struct PrincipalAccount {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -183,7 +188,7 @@ pub struct PrincipalAccount {
 }
 
 impl PrincipalAccount {
-    pub fn new(name: impl Into<String>, is_personal: bool, is_read_only: bool) -> Self {
+    pub(crate) fn new(name: impl Into<String>, is_personal: bool, is_read_only: bool) -> Self {
         PrincipalAccount {
             name: Some(name.into()),
             is_personal,
@@ -192,31 +197,35 @@ impl PrincipalAccount {
         }
     }
 
-    pub fn account_capability(mut self, uri: impl Into<String>, config: serde_json::Value) -> Self {
+    pub(crate) fn account_capability(
+        mut self,
+        uri: impl Into<String>,
+        config: serde_json::Value,
+    ) -> Self {
         self.account_capabilities.insert(uri.into(), config);
         self
     }
 
-    pub fn name(&self) -> Option<&str> {
+    pub(crate) fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
-    pub fn is_personal(&self) -> bool {
+    pub(crate) fn is_personal(&self) -> bool {
         self.is_personal
     }
 
-    pub fn is_read_only(&self) -> bool {
+    pub(crate) fn is_read_only(&self) -> bool {
         self.is_read_only
     }
 
-    pub fn account_capabilities(&self) -> &HashMap<String, serde_json::Value> {
+    pub(crate) fn account_capabilities(&self) -> &HashMap<String, serde_json::Value> {
         &self.account_capabilities
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id = 0,
     #[serde(rename = "type")]
@@ -251,7 +260,7 @@ pub enum Property {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum ACL {
+pub(crate) enum ACL {
     #[serde(rename = "mayRename")]
     Rename = 1,
     #[serde(rename = "mayDelete")]
@@ -276,7 +285,7 @@ pub enum ACL {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum Type {
+pub(crate) enum Type {
     #[serde(rename = "individual")]
     Individual,
     #[serde(rename = "group")]
@@ -294,7 +303,7 @@ pub enum Type {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DKIM {
+pub(crate) struct DKIM {
     #[serde(rename = "dkimSelector")]
     dkim_selector: Option<String>,
     #[serde(rename = "dkimExpiration")]
@@ -302,18 +311,21 @@ pub struct DKIM {
 }
 
 impl DKIM {
-    pub fn new(dkim_selector: Option<impl Into<String>>, dkim_expiration: Option<i64>) -> DKIM {
+    pub(crate) fn new(
+        dkim_selector: Option<impl Into<String>>,
+        dkim_expiration: Option<i64>,
+    ) -> DKIM {
         DKIM {
             dkim_selector: dkim_selector.map(Into::into),
             dkim_expiration,
         }
     }
 
-    pub fn selector(&self) -> Option<&str> {
+    pub(crate) fn selector(&self) -> Option<&str> {
         self.dkim_selector.as_deref()
     }
 
-    pub fn expiration(&self) -> Option<i64> {
+    pub(crate) fn expiration(&self) -> Option<i64> {
         self.dkim_expiration
     }
 }

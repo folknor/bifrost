@@ -22,40 +22,37 @@ pub(crate) mod notify;
 mod profile;
 pub(crate) mod response;
 pub(crate) mod rfc2231;
-pub mod search;
+pub(crate) mod search;
 mod secret;
 mod sync;
 mod uid_range;
 pub(crate) mod validated;
 
-pub use address::Address;
-pub use auth::{AuthMechanism, AuthOutcome, AuthPolicy, Credentials};
-pub use body::{BodyStructure, ContentDisposition};
-pub use envelope::{Envelope, EnvelopeAddress};
-pub use events::EventImpact;
+pub(crate) use address::Address;
+pub(crate) use auth::{AuthMechanism, AuthOutcome, CredentialsKind};
+pub use auth::{AuthPolicy, Credentials};
+pub(crate) use body::BodyStructure;
+pub(crate) use envelope::{Envelope, EnvelopeAddress};
+pub(crate) use events::EventImpact;
 pub(crate) use fetch::format_fetch_attrs;
-pub use fetch::{
-    AppendMessage, BinarySection, BodySection, FetchAttr, FetchResponse, StoreOperation,
-    StoreResult,
+pub(crate) use fetch::{AppendMessage, FetchAttr, FetchResponse, StoreOperation, StoreResult};
+pub(crate) use flag::Flag;
+pub(crate) use ids::{ModSeq, SeqSet, Uid, UidSet, UidValidity};
+pub(crate) use mailbox::{
+    MailboxAttribute, MailboxInfo, SelectedMailbox, StatusItem, StatusResult,
 };
-pub use flag::Flag;
-pub use ids::{GmailMessageId, GmailThreadId, ModSeq, Seq, SeqSet, Uid, UidSet, UidValidity};
-pub use mailbox::{
-    MailboxAttribute, MailboxInfo, SelectedMailbox, SpecialUse, StatusItem, StatusResult,
+pub(crate) use notify::{MailboxFilter, NotifyEvent, NotifySetParams};
+pub(crate) use profile::ServerProfile;
+pub(crate) use response::{
+    AclEntry, Capability, CopyResult, EsearchResponse, ExpungeResult, ListRightsResponse,
+    MetadataEntry, MetadataResult, MoveResult, NamespaceDescriptor, NamespaceResponse,
+    QresyncParams, QuotaResource, QuotaRootResponse, Response, ResponseCode, SelectOptions,
+    TaggedResponse, ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
 };
-pub use notify::{MailboxFilter, NotifyEvent, NotifyEventGroup, NotifySetParams};
-pub use profile::{AppendLimitPolicy, ServerProfile};
-pub use response::{
-    AclEntry, Capability, ContinuationRequest, CopyResult, EsearchResponse, ExpungeResult,
-    GreetingResponse, GreetingStatus, ListRightsResponse, MetadataEntry, MetadataResult,
-    MoveResult, NamespaceDescriptor, NamespaceResponse, QresyncParams, QuotaResource,
-    QuotaRootResponse, Response, ResponseCode, SelectOptions, StatusKind, TaggedResponse,
-    ThreadNode, UidRange, UntaggedResponse, UntaggedStatus,
-};
-pub use search::SearchCriteria;
-pub use secret::{IntoSecretString, SecretString};
-pub use sync::{SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult};
-pub use validated::{ImapAtom, MailboxName, ObjectId, SequenceSet, ValidationError};
+pub(crate) use search::SearchCriteria;
+pub(crate) use secret::SecretString;
+pub(crate) use sync::{SyncFetchRequest, SyncFetchResult, SyncSelectOptions, SyncSelectResult};
+pub(crate) use validated::{MailboxName, SequenceSet, ValidationError};
 
 // Re-export command types for internal use only.
 pub(crate) use command::{Command, CommandKind};

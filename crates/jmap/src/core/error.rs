@@ -5,7 +5,7 @@ use serde::Deserialize;
 // types: protocol-specific RFC 7807 body kept so JMAP error mapping can inspect type and limit.
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
-pub struct ProblemDetails {
+pub(crate) struct ProblemDetails {
     #[serde(rename = "type")]
     p_type: ProblemType,
     status: Option<u32>,
@@ -17,7 +17,7 @@ pub struct ProblemDetails {
 
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
-pub enum JMAPError {
+pub(crate) enum JMAPError {
     #[serde(rename = "urn:ietf:params:jmap:error:unknownCapability")]
     UnknownCapability,
     #[serde(rename = "urn:ietf:params:jmap:error:notJSON")]
@@ -31,21 +31,21 @@ pub enum JMAPError {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum ProblemType {
+pub(crate) enum ProblemType {
     JMAP(JMAPError),
     Other(String),
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct MethodError {
+pub(crate) struct MethodError {
     #[serde(rename = "type")]
     p_type: MethodErrorType,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum MethodErrorType {
+pub(crate) enum MethodErrorType {
     #[serde(rename = "serverUnavailable")]
     ServerUnavailable,
     #[serde(rename = "serverFail")]
@@ -91,7 +91,7 @@ pub enum MethodErrorType {
 }
 
 impl ProblemDetails {
-    pub fn new(
+    pub(crate) fn new(
         p_type: ProblemType,
         status: Option<u32>,
         title: Option<String>,
@@ -109,33 +109,33 @@ impl ProblemDetails {
         }
     }
 
-    pub fn error(&self) -> &ProblemType {
+    pub(crate) fn error(&self) -> &ProblemType {
         &self.p_type
     }
 
-    pub fn status(&self) -> Option<u32> {
+    pub(crate) fn status(&self) -> Option<u32> {
         self.status
     }
 
-    pub fn title(&self) -> Option<&str> {
+    pub(crate) fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 
-    pub fn detail(&self) -> Option<&str> {
+    pub(crate) fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
 
-    pub fn limit(&self) -> Option<&str> {
+    pub(crate) fn limit(&self) -> Option<&str> {
         self.limit.as_deref()
     }
 
-    pub fn request_id(&self) -> Option<&str> {
+    pub(crate) fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
     }
 }
 
 impl MethodError {
-    pub fn error_type(&self) -> &MethodErrorType {
+    pub(crate) fn error_type(&self) -> &MethodErrorType {
         &self.p_type
     }
 }

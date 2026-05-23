@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
+pub(crate) struct Session {
     #[serde(rename = "capabilities")]
     #[serde(deserialize_with = "deserialize_capabilities_map")]
     capabilities: HashMap<String, Capabilities>,
@@ -36,7 +36,7 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Account {
+pub(crate) struct Account {
     #[serde(rename = "name")]
     name: String,
 
@@ -56,7 +56,7 @@ pub struct Account {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Capabilities {
+pub(crate) enum Capabilities {
     Core(CoreCapabilities),
     #[cfg(feature = "mail")]
     Mail(MailCapabilities),
@@ -133,7 +133,7 @@ where
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CoreCapabilities {
+pub(crate) struct CoreCapabilities {
     #[serde(rename = "maxSizeUpload")]
     max_size_upload: usize,
 
@@ -160,7 +160,7 @@ pub struct CoreCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebSocketCapabilities {
+pub(crate) struct WebSocketCapabilities {
     #[serde(rename = "url")]
     url: String,
     #[serde(rename = "supportsPush")]
@@ -169,7 +169,7 @@ pub struct WebSocketCapabilities {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SieveCapabilities {
+pub(crate) struct SieveCapabilities {
     #[serde(rename = "implementation")]
     implementation: Option<String>,
     #[serde(rename = "maxSizeScriptName")]
@@ -192,11 +192,11 @@ pub struct SieveCapabilities {
 ///
 /// Empty capability object per spec - presence indicates quota support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuotaCapabilities {}
+pub(crate) struct QuotaCapabilities {}
 
 /// Capabilities for `urn:ietf:params:jmap:blob` (RFC 9404).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlobCapabilities {
+pub(crate) struct BlobCapabilities {
     #[serde(rename = "maxSizeBlobSet")]
     #[serde(default)]
     max_size_blob_set: Option<u64>,
@@ -212,7 +212,7 @@ pub struct BlobCapabilities {
 
 /// Capabilities for `urn:ietf:params:jmap:calendars`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarsCapabilities {
+pub(crate) struct CalendarsCapabilities {
     #[serde(rename = "mayCreateCalendar")]
     #[serde(default)]
     may_create_calendar: bool,
@@ -224,7 +224,7 @@ pub struct CalendarsCapabilities {
 
 /// Capabilities for `urn:ietf:params:jmap:contacts`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContactsCapabilities {
+pub(crate) struct ContactsCapabilities {
     #[serde(rename = "mayCreateAddressBook")]
     #[serde(default)]
     may_create_address_book: bool,
@@ -236,7 +236,7 @@ pub struct ContactsCapabilities {
 
 /// Capabilities for `urn:ietf:params:jmap:principals`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalsCapabilities {
+pub(crate) struct PrincipalsCapabilities {
     #[serde(rename = "currentUserPrincipalId")]
     #[serde(default)]
     current_user_principal_id: Option<crate::principal::PrincipalId>,
@@ -249,7 +249,7 @@ pub struct PrincipalsCapabilities {
 macro_rules! session_cap_accessor {
     ($(#[$meta:meta])* $method:ident, $cap_marker:ty, $variant:ident, $return_type:ty) => {
         $(#[$meta])*
-        pub fn $method(&self) -> Option<&$return_type> {
+        pub(crate) fn $method(&self) -> Option<&$return_type> {
             self.capabilities
                 .get(<$cap_marker as crate::core::capability::Capability>::URI)
                 .and_then(|v| match v {
@@ -261,15 +261,15 @@ macro_rules! session_cap_accessor {
 }
 
 impl Session {
-    pub fn capabilities(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn capabilities(&self) -> impl Iterator<Item = &String> {
         self.capabilities.keys()
     }
 
-    pub fn capability(&self, capability: impl AsRef<str>) -> Option<&Capabilities> {
+    pub(crate) fn capability(&self, capability: impl AsRef<str>) -> Option<&Capabilities> {
         self.capabilities.get(capability.as_ref())
     }
 
-    pub fn has_capability(&self, capability: impl AsRef<str>) -> bool {
+    pub(crate) fn has_capability(&self, capability: impl AsRef<str>) -> bool {
         self.capabilities.contains_key(capability.as_ref())
     }
 
@@ -278,12 +278,12 @@ impl Session {
     /// Returns `None` if the server does not advertise the capability.
     ///
     /// ```ignore
-    /// use bifrost_jmap::core::capability::{Capability, Mail};
+    /// use crate::core::capability::{Capability, Mail};
     /// if let Some(mail) = session.capability_config::<Mail>() {
     ///     println!("max mailbox depth: {}", mail.max_mailbox_depth());
     /// }
     /// ```
-    pub fn capability_config<C: super::capability::Capability>(&self) -> Option<C::Config> {
+    pub(crate) fn capability_config<C: super::capability::Capability>(&self) -> Option<C::Config> {
         let cap = self.capabilities.get(C::URI)?;
         // Serialize the enum variant to Value, then deserialize into Config.
         // This is a one-time cost per access (session parsing is infrequent).
@@ -365,169 +365,169 @@ impl Session {
         PrincipalsOwnerCapabilities
     );
 
-    pub fn accounts(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn accounts(&self) -> impl Iterator<Item = &String> {
         self.accounts.keys()
     }
 
-    pub fn account(&self, account: &str) -> Option<&Account> {
+    pub(crate) fn account(&self, account: &str) -> Option<&Account> {
         self.accounts.get(account)
     }
 
-    pub fn primary_accounts(&self) -> impl Iterator<Item = (&String, &String)> {
+    pub(crate) fn primary_accounts(&self) -> impl Iterator<Item = (&String, &String)> {
         self.primary_accounts.iter()
     }
 
-    pub fn username(&self) -> &str {
+    pub(crate) fn username(&self) -> &str {
         &self.username
     }
 
-    pub fn api_url(&self) -> &str {
+    pub(crate) fn api_url(&self) -> &str {
         &self.api_url
     }
 
-    pub fn download_url(&self) -> &str {
+    pub(crate) fn download_url(&self) -> &str {
         &self.download_url
     }
 
-    pub fn upload_url(&self) -> &str {
+    pub(crate) fn upload_url(&self) -> &str {
         &self.upload_url
     }
 
-    pub fn event_source_url(&self) -> &str {
+    pub(crate) fn event_source_url(&self) -> &str {
         &self.event_source_url
     }
 
-    pub fn state(&self) -> &str {
+    pub(crate) fn state(&self) -> &str {
         &self.state
     }
 }
 
 impl Account {
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn is_personal(&self) -> bool {
+    pub(crate) fn is_personal(&self) -> bool {
         self.is_personal
     }
 
-    pub fn is_read_only(&self) -> bool {
+    pub(crate) fn is_read_only(&self) -> bool {
         self.is_read_only
     }
 
-    pub fn capabilities(&self) -> impl Iterator<Item = &String> {
+    pub(crate) fn capabilities(&self) -> impl Iterator<Item = &String> {
         self.account_capabilities.keys()
     }
 
-    pub fn capability(&self, capability: &str) -> Option<&Capabilities> {
+    pub(crate) fn capability(&self, capability: &str) -> Option<&Capabilities> {
         self.account_capabilities.get(capability)
     }
 }
 
 impl CoreCapabilities {
-    pub fn max_size_upload(&self) -> usize {
+    pub(crate) fn max_size_upload(&self) -> usize {
         self.max_size_upload
     }
 
-    pub fn max_concurrent_upload(&self) -> usize {
+    pub(crate) fn max_concurrent_upload(&self) -> usize {
         self.max_concurrent_upload
     }
 
-    pub fn max_size_request(&self) -> usize {
+    pub(crate) fn max_size_request(&self) -> usize {
         self.max_size_request
     }
 
-    pub fn max_concurrent_requests(&self) -> usize {
+    pub(crate) fn max_concurrent_requests(&self) -> usize {
         self.max_concurrent_requests
     }
 
-    pub fn max_calls_in_request(&self) -> usize {
+    pub(crate) fn max_calls_in_request(&self) -> usize {
         self.max_calls_in_request
     }
 
-    pub fn max_objects_in_get(&self) -> usize {
+    pub(crate) fn max_objects_in_get(&self) -> usize {
         self.max_objects_in_get
     }
 
-    pub fn max_objects_in_set(&self) -> usize {
+    pub(crate) fn max_objects_in_set(&self) -> usize {
         self.max_objects_in_set
     }
 
-    pub fn collation_algorithms(&self) -> &[String] {
+    pub(crate) fn collation_algorithms(&self) -> &[String] {
         &self.collation_algorithms
     }
 }
 
 impl WebSocketCapabilities {
-    pub fn url(&self) -> &str {
+    pub(crate) fn url(&self) -> &str {
         &self.url
     }
 
-    pub fn supports_push(&self) -> bool {
+    pub(crate) fn supports_push(&self) -> bool {
         self.supports_push
     }
 }
 
 impl SieveCapabilities {
-    pub fn max_script_name_size(&self) -> usize {
+    pub(crate) fn max_script_name_size(&self) -> usize {
         self.max_script_name.unwrap_or(512)
     }
 
-    pub fn max_script_size(&self) -> Option<usize> {
+    pub(crate) fn max_script_size(&self) -> Option<usize> {
         self.max_script_size
     }
 
-    pub fn max_number_scripts(&self) -> Option<usize> {
+    pub(crate) fn max_number_scripts(&self) -> Option<usize> {
         self.max_scripts
     }
 
-    pub fn max_number_redirects(&self) -> Option<usize> {
+    pub(crate) fn max_number_redirects(&self) -> Option<usize> {
         self.max_redirects
     }
 
-    pub fn sieve_extensions(&self) -> &[String] {
+    pub(crate) fn sieve_extensions(&self) -> &[String] {
         &self.extensions
     }
 
-    pub fn notification_methods(&self) -> Option<&[String]> {
+    pub(crate) fn notification_methods(&self) -> Option<&[String]> {
         self.notification_methods.as_deref()
     }
 
-    pub fn external_lists(&self) -> Option<&[String]> {
+    pub(crate) fn external_lists(&self) -> Option<&[String]> {
         self.ext_lists.as_deref()
     }
 }
 
 impl BlobCapabilities {
-    pub fn max_size_blob_set(&self) -> Option<u64> {
+    pub(crate) fn max_size_blob_set(&self) -> Option<u64> {
         self.max_size_blob_set
     }
 
-    pub fn supported_digest_algorithms(&self) -> &[String] {
+    pub(crate) fn supported_digest_algorithms(&self) -> &[String] {
         &self.supported_digest_algorithms
     }
 
-    pub fn supported_type_names(&self) -> &[String] {
+    pub(crate) fn supported_type_names(&self) -> &[String] {
         &self.supported_type_names
     }
 }
 
 impl CalendarsCapabilities {
-    pub fn may_create_calendar(&self) -> bool {
+    pub(crate) fn may_create_calendar(&self) -> bool {
         self.may_create_calendar
     }
 
-    pub fn max_calendars_per_event(&self) -> Option<usize> {
+    pub(crate) fn max_calendars_per_event(&self) -> Option<usize> {
         self.max_calendars_per_event
     }
 }
 
 impl ContactsCapabilities {
-    pub fn may_create_address_book(&self) -> bool {
+    pub(crate) fn may_create_address_book(&self) -> bool {
         self.may_create_address_book
     }
 
-    pub fn max_address_books_per_card(&self) -> Option<usize> {
+    pub(crate) fn max_address_books_per_card(&self) -> Option<usize> {
         self.max_address_books_per_card
     }
 }
@@ -536,7 +536,7 @@ impl ContactsCapabilities {
 ///
 /// Account-level capability indicating the owner of the account's data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalsOwnerCapabilities {
+pub(crate) struct PrincipalsOwnerCapabilities {
     #[serde(rename = "accountIdForPrincipal")]
     #[serde(default)]
     account_id_for_principal: Option<crate::core::id::AccountId>,
@@ -547,37 +547,37 @@ pub struct PrincipalsOwnerCapabilities {
 }
 
 impl PrincipalsOwnerCapabilities {
-    pub fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
+    pub(crate) fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
         self.account_id_for_principal.as_ref()
     }
 
-    pub fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+    pub(crate) fn principal_id(&self) -> Option<&crate::principal::PrincipalId> {
         self.principal_id.as_ref()
     }
 }
 
 impl PrincipalsCapabilities {
-    pub fn current_user_principal_id(&self) -> Option<&crate::principal::PrincipalId> {
+    pub(crate) fn current_user_principal_id(&self) -> Option<&crate::principal::PrincipalId> {
         self.current_user_principal_id.as_ref()
     }
 
-    pub fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
+    pub(crate) fn account_id_for_principal(&self) -> Option<&crate::core::id::AccountId> {
         self.account_id_for_principal.as_ref()
     }
 }
 
-pub trait URLParser: Sized {
+pub(crate) trait URLParser: Sized {
     fn parse(value: &str) -> Option<Self>;
 }
 
 #[non_exhaustive]
-pub enum URLPart<T: URLParser> {
+pub(crate) enum URLPart<T: URLParser> {
     Value(String),
     Parameter(T),
 }
 
 impl<T: URLParser> URLPart<T> {
-    pub fn parse(url: &str) -> crate::Result<Vec<URLPart<T>>> {
+    pub(crate) fn parse(url: &str) -> crate::Result<Vec<URLPart<T>>> {
         let mut parts = Vec::new();
         let mut buf = String::with_capacity(url.len());
         let mut in_parameter = false;

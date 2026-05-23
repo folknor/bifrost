@@ -1,10 +1,12 @@
 # bifrost-gmail reference
 
 Current architecture of the Gmail Account-layer code under
-`crates/gmail/src/account/`. The crate hosts a `GmailClient` for
-the Gmail REST API plus an `Account` / `AccountFactory` pair that
-sits on top of it, driving history-id-based sync, Cloud Pub/Sub
-push, and Gmail-specific flag canonicalization.
+`crates/gmail/src/account/`. The public crate surface is
+`bifrost_gmail::account::{GmailAccountFactory, PubSubConfig}`;
+everything else is crate-private implementation detail behind
+`Account` / `AccountFactory`. Internally, a `GmailClient` wraps the
+Gmail REST API and drives history-id-based sync, Cloud Pub/Sub push,
+and Gmail-specific flag canonicalization.
 
 Gmail has no UID model and no mailbox-scoped server state. A
 single `historyId` walks the account-wide change log, and labels
@@ -15,9 +17,17 @@ that route through `messages.batchModify` / `batchDelete`.
 
 ## Module layout
 
+Public modules:
+
+- `account` - public `GmailAccountFactory` and `PubSubConfig`; the
+  opened account itself is returned as `Arc<dyn Account>`.
+
+Internal modules:
+
 `crates/gmail/src/account/`:
 
-- `mod.rs` - `pub(crate) GmailAccount`, public `GmailAccountFactory`, `impl Account`.
+- `mod.rs` - crate-private `GmailAccount`, public
+  `GmailAccountFactory`, `impl Account`.
 - `capabilities.rs` - `AccountCapabilities` builder.
 - `cursor.rs` - `GmailChangeState`, envelope encode/decode,
   `cursor_from_state`.
@@ -40,15 +50,22 @@ that route through `messages.batchModify` / `batchDelete`.
 
 ## GmailAccount / GmailAccountFactory
 
-`GmailAccountFactory` carries an `Arc<GmailClient>` and an
-optional `PubSubConfig`. `open(account_id)` first asks the client
-for an account-scoped clone attached to `bifrost-net` under the
-engine supplied `AccountId`, then does one `users.getProfile`
-round-trip, parses `profile.historyId` into a `u64`, and stores
-the resulting `GmailChangeState` as `seed_state`. The opened
-`GmailAccount` retains:
+Consumers construct `GmailAccountFactory` with
+`from_access_token(token)`, then optionally attach a
+`PubSubConfig` with `with_pubsub_config` or `with_pubsub_topic`.
+The factory is the only public Gmail entry point; the raw
+`GmailClient`, Gmail wire DTOs, and crate-local `Error` are
+`pub(crate)`.
 
-- `client: Arc<GmailClient>`.
+`GmailAccountFactory` carries an internal `Arc<GmailClient>` and an
+optional `PubSubConfig`. `open(account_id)` first asks the client for
+an account-scoped clone attached to `bifrost-net` under the engine
+supplied `AccountId`, then does one `users.getProfile` round-trip,
+parses `profile.historyId` into a `u64`, and stores the resulting
+`GmailChangeState` as `seed_state`. The opened `GmailAccount`
+retains:
+
+- `client: Arc<GmailClient>` (crate-private REST wrapper).
 - `capabilities: AccountCapabilities` snapshotted at open.
 - `profile: GmailProfile` for `email_address` and history-id
   identity checks downstream.
@@ -64,13 +81,11 @@ the resulting `GmailChangeState` as `seed_state`. The opened
 - `set_priority` and `set_bandwidth_cap` delegate to the
   underlying `AccountNet`; the transport owns the canonical knobs.
 
-Clients constructed through the default token constructors retain
-their parent `Net`, so `open(account_id)` mints a fresh
-`AccountNet` under the engine id on every reopen. Clients built
-via `GmailClient::with_account_net` have no parent `Net`; the
-factory calls `AccountNet::retag(account_id)` on the pre-attached
-handle so per-account metering and host bookkeeping move under
-the engine id without losing in-flight clones.
+Clients constructed through `from_access_token` retain their parent
+`Net`, so `open(account_id)` mints a fresh `AccountNet` under the
+engine id on every reopen. There is no public custom-`Net`
+constructor in this crate after S1-W3; callers that need Gmail access
+use the factory and the shared `Account` trait.
 
 `AccountFactory::open(account_id)` returns `Arc<dyn Account>`.
 `reopen` flows from the engine: the engine drops the previous

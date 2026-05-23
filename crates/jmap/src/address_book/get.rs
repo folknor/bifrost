@@ -5,47 +5,47 @@ use crate::core::field::Field;
 use super::{AddressBook, AddressBookId, AddressBookRights};
 
 impl AddressBook {
-    pub fn id(&self) -> Option<&AddressBookId> {
+    pub(crate) fn id(&self) -> Option<&AddressBookId> {
         self.id.as_ref()
     }
 
-    pub fn take_id(&mut self) -> AddressBookId {
+    pub(crate) fn take_id(&mut self) -> AddressBookId {
         self.id.take().unwrap_or_else(|| AddressBookId::new(""))
     }
 
-    pub fn name(&self) -> Option<&str> {
+    pub(crate) fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
 
-    pub fn description(&self) -> Option<&str> {
+    pub(crate) fn description(&self) -> Option<&str> {
         self.description.as_value().map(String::as_str)
     }
 
-    pub fn description_field(&self) -> &Field<String> {
+    pub(crate) fn description_field(&self) -> &Field<String> {
         &self.description
     }
 
-    pub fn sort_order(&self) -> Option<u32> {
+    pub(crate) fn sort_order(&self) -> Option<u32> {
         self.sort_order
     }
 
-    pub fn is_default(&self) -> Option<bool> {
+    pub(crate) fn is_default(&self) -> Option<bool> {
         self.is_default
     }
 
-    pub fn is_subscribed(&self) -> Option<bool> {
+    pub(crate) fn is_subscribed(&self) -> Option<bool> {
         self.is_subscribed
     }
 
-    pub fn share_with(&self) -> Option<&HashMap<String, AddressBookRights>> {
+    pub(crate) fn share_with(&self) -> Option<&HashMap<String, AddressBookRights>> {
         self.share_with.as_value()
     }
 
-    pub fn share_with_field(&self) -> &Field<HashMap<String, AddressBookRights>> {
+    pub(crate) fn share_with_field(&self) -> &Field<HashMap<String, AddressBookRights>> {
         &self.share_with
     }
 
-    pub fn my_rights(&self) -> Option<&AddressBookRights> {
+    pub(crate) fn my_rights(&self) -> Option<&AddressBookRights> {
         self.my_rights.as_ref()
     }
 }

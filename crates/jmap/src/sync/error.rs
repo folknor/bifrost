@@ -141,7 +141,6 @@ pub(crate) fn to_recovery(
         | crate::Error::Set(_)
         | crate::Error::CallNotFound(_)
         | crate::Error::IdNotFound(_)
-        | crate::Error::EmptyResponse
         | crate::Error::NotParsable(_)
         | crate::Error::InvalidUrl(_) => RecoveryClass::Fatal,
     }

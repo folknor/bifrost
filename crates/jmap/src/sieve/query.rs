@@ -7,7 +7,7 @@ use super::SieveScript;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     Name {
         #[serde(rename = "name")]
         value: String,
@@ -21,7 +21,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "name")]
     Name,
     #[serde(rename = "isActive")]
@@ -29,23 +29,23 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn name(value: impl Into<String>) -> Self {
+    pub(crate) fn name(value: impl Into<String>) -> Self {
         Filter::Name {
             value: value.into(),
         }
     }
 
-    pub fn is_active(value: bool) -> Self {
+    pub(crate) fn is_active(value: bool) -> Self {
         Filter::IsActive { value }
     }
 }
 
 impl Comparator {
-    pub fn name() -> query::Comparator<Comparator> {
+    pub(crate) fn name() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Name)
     }
 
-    pub fn is_active() -> query::Comparator<Comparator> {
+    pub(crate) fn is_active() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::IsActive)
     }
 }

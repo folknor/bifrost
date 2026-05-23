@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Serializes as: omitted → absent, null → JSON null, value → JSON value.
 /// Deserializes from: absent → Omitted, null → Null, value → Value(T).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub enum Field<T> {
+pub(crate) enum Field<T> {
     /// Property not included / not requested.
     #[default]
     Omitted,
@@ -23,17 +23,17 @@ pub enum Field<T> {
 
 impl<T> Field<T> {
     /// Returns `true` if the field is `Omitted`.
-    pub fn is_omitted(&self) -> bool {
+    pub(crate) fn is_omitted(&self) -> bool {
         matches!(self, Field::Omitted)
     }
 
     /// Returns `true` if the field is `Null`.
-    pub fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         matches!(self, Field::Null)
     }
 
     /// Returns the contained value, or `None` if `Omitted` or `Null`.
-    pub fn as_value(&self) -> Option<&T> {
+    pub(crate) fn as_value(&self) -> Option<&T> {
         match self {
             Field::Value(v) => Some(v),
             _ => None,
@@ -42,7 +42,7 @@ impl<T> Field<T> {
 
     /// Converts to `Option<Option<&T>>` for backward compatibility.
     /// `Omitted` → `None`, `Null` → `Some(None)`, `Value` → `Some(Some(&v))`.
-    pub fn as_option(&self) -> Option<Option<&T>> {
+    pub(crate) fn as_option(&self) -> Option<Option<&T>> {
         match self {
             Field::Omitted => None,
             Field::Null => Some(None),
@@ -50,7 +50,7 @@ impl<T> Field<T> {
         }
     }
 
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Field<U> {
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> Field<U> {
         match self {
             Field::Omitted => Field::Omitted,
             Field::Null => Field::Null,
@@ -90,6 +90,6 @@ impl<T> Field<T> {
 }
 
 /// Helper for skip_serializing_if on Field<T>
-pub fn field_is_omitted<T>(field: &Field<T>) -> bool {
+pub(crate) fn field_is_omitted<T>(field: &Field<T>) -> bool {
     field.is_omitted()
 }

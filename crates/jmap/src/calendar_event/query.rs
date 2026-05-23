@@ -8,7 +8,7 @@ use crate::calendar::CalendarId;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     /// Filter by calendar ID (singular). Used by Stalwart.
     InCalendar {
         #[serde(rename = "inCalendar")]
@@ -60,7 +60,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "start")]
     Start,
     #[serde(rename = "uid")]
@@ -75,14 +75,14 @@ pub enum Comparator {
 
 impl Filter {
     /// Filter by a single calendar ID. Used by Stalwart.
-    pub fn in_calendar(value: impl Into<CalendarId>) -> Self {
+    pub(crate) fn in_calendar(value: impl Into<CalendarId>) -> Self {
         Filter::InCalendar {
             value: value.into(),
         }
     }
 
     /// Filter by multiple calendar IDs (spec draft).
-    pub fn in_calendars<U, V>(value: U) -> Self
+    pub(crate) fn in_calendars<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<CalendarId>,
@@ -92,55 +92,55 @@ impl Filter {
         }
     }
 
-    pub fn uid(value: impl Into<String>) -> Self {
+    pub(crate) fn uid(value: impl Into<String>) -> Self {
         Filter::Uid {
             value: value.into(),
         }
     }
 
-    pub fn after(value: impl Into<String>) -> Self {
+    pub(crate) fn after(value: impl Into<String>) -> Self {
         Filter::After {
             value: value.into(),
         }
     }
 
-    pub fn before(value: impl Into<String>) -> Self {
+    pub(crate) fn before(value: impl Into<String>) -> Self {
         Filter::Before {
             value: value.into(),
         }
     }
 
-    pub fn text(value: impl Into<String>) -> Self {
+    pub(crate) fn text(value: impl Into<String>) -> Self {
         Filter::Text {
             value: value.into(),
         }
     }
 
-    pub fn title(value: impl Into<String>) -> Self {
+    pub(crate) fn title(value: impl Into<String>) -> Self {
         Filter::Title {
             value: value.into(),
         }
     }
 
-    pub fn description(value: impl Into<String>) -> Self {
+    pub(crate) fn description(value: impl Into<String>) -> Self {
         Filter::Description {
             value: value.into(),
         }
     }
 
-    pub fn location(value: impl Into<String>) -> Self {
+    pub(crate) fn location(value: impl Into<String>) -> Self {
         Filter::Location {
             value: value.into(),
         }
     }
 
-    pub fn owner(value: impl Into<String>) -> Self {
+    pub(crate) fn owner(value: impl Into<String>) -> Self {
         Filter::Owner {
             value: value.into(),
         }
     }
 
-    pub fn attendee(value: impl Into<String>) -> Self {
+    pub(crate) fn attendee(value: impl Into<String>) -> Self {
         Filter::Attendee {
             value: value.into(),
         }
@@ -148,23 +148,23 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn start() -> query::Comparator<Comparator> {
+    pub(crate) fn start() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Start)
     }
 
-    pub fn uid() -> query::Comparator<Comparator> {
+    pub(crate) fn uid() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Uid)
     }
 
-    pub fn recurrence_id() -> query::Comparator<Comparator> {
+    pub(crate) fn recurrence_id() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::RecurrenceId)
     }
 
-    pub fn created() -> query::Comparator<Comparator> {
+    pub(crate) fn created() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Created)
     }
 
-    pub fn updated() -> query::Comparator<Comparator> {
+    pub(crate) fn updated() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Updated)
     }
 }

@@ -1,5 +1,10 @@
-pub mod get;
-pub mod set;
+// The Account impl uses the WebSocket push path instead of the JMAP
+// PushSubscription/* RFC 8620 §7.2 surface; the types stay for the
+// HTTP-push consumer a future stage may want.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -10,13 +15,13 @@ use crate::DataType;
 use crate::core::set::skip_if_empty_list;
 
 mod marker {
-    pub enum PushSubscription {}
+    pub(crate) enum PushSubscription {}
 }
 /// Strongly-typed PushSubscription ID.
-pub type PushSubscriptionId = crate::core::id::Id<marker::PushSubscription>;
+pub(crate) type PushSubscriptionId = crate::core::id::Id<marker::PushSubscription>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushSubscription {
+pub(crate) struct PushSubscription {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<PushSubscriptionId>,
@@ -47,7 +52,7 @@ pub struct PushSubscription {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PushSubscriptionCreate {
+pub(crate) struct PushSubscriptionCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -77,7 +82,7 @@ pub struct PushSubscriptionCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct PushSubscriptionPatch {
+pub(crate) struct PushSubscriptionPatch {
     #[serde(rename = "verificationCode")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) verification_code: Option<String>,
@@ -93,7 +98,7 @@ pub struct PushSubscriptionPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "deviceClientId")]
@@ -125,7 +130,7 @@ impl Display for Property {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Keys {
+pub(crate) struct Keys {
     p256dh: String,
     auth: String,
 }

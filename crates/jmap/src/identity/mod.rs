@@ -1,5 +1,10 @@
-pub mod get;
-pub mod set;
+// The Account impl wires identities_list / identity_update; the
+// IdentityChanges shape and a few patch helpers (`bcc`, etc.) are
+// kept built for completeness.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -8,14 +13,14 @@ use crate::email::EmailAddress;
 use serde::{Deserialize, Serialize};
 
 mod marker {
-    pub enum Identity {}
+    pub(crate) enum Identity {}
 }
 /// Strongly-typed Identity ID.
-pub type IdentityId = crate::core::id::Id<marker::Identity>;
+pub(crate) type IdentityId = crate::core::id::Id<marker::Identity>;
 
 /// Server-returned Identity object (RFC 8621 §6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Identity {
+pub(crate) struct Identity {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<IdentityId>,
@@ -50,7 +55,7 @@ pub struct Identity {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct IdentityCreate {
+pub(crate) struct IdentityCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -80,7 +85,7 @@ pub struct IdentityCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct IdentityPatch {
+pub(crate) struct IdentityPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -104,7 +109,7 @@ pub struct IdentityPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]

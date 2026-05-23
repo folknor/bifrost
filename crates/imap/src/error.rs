@@ -12,7 +12,7 @@ use crate::types::{AuthMechanism, ResponseCode};
 // protocol-specific: direct IMAP APIs preserve response codes beyond bifrost_types::Error.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum Error {
+pub(crate) enum Error {
     /// Underlying I/O error, including TLS transport errors (RFC 3501 Section 2.1).
     ///
     /// Wrapped in [`Arc`] so that `Error` can implement `Clone`.
@@ -268,7 +268,7 @@ impl Error {
     }
 
     /// Return the broad policy category for this error.
-    pub fn category(&self) -> ErrorCategory {
+    pub(crate) fn category(&self) -> ErrorCategory {
         match self {
             Self::Io(_) => ErrorCategory::Transport,
             Self::Closed | Self::DriverGone | Self::DriverPanicked(_) => ErrorCategory::Connection,
@@ -292,7 +292,7 @@ impl Error {
     }
 
     /// Suggested high-level recovery action.
-    pub fn recovery(&self) -> Recovery {
+    pub(crate) fn recovery(&self) -> Recovery {
         match self.category() {
             ErrorCategory::Connection => Recovery::Reconnect,
             ErrorCategory::Transport => Recovery::Reconnect,
@@ -318,7 +318,7 @@ impl Error {
     /// The current parser stores the single response code attached to a
     /// status response. If a future parser preserves multiple codes, this
     /// accessor should grow alongside the stored representation.
-    pub fn response_code(&self) -> Option<&ResponseCode> {
+    pub(crate) fn response_code(&self) -> Option<&ResponseCode> {
         match self {
             Self::Auth { code, .. }
             | Self::No { code, .. }
@@ -333,7 +333,7 @@ impl Error {
 // protocol-specific: direct IMAP callers classify RFC 5530 response codes locally.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorCategory {
+pub(crate) enum ErrorCategory {
     Connection,
     Transport,
     Timeout,
@@ -356,15 +356,15 @@ pub enum ErrorCategory {
 /// Structured reason automatic authentication could not select a mechanism.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthPolicyFailure {
+pub(crate) struct AuthPolicyFailure {
     /// Mechanisms or commands the server offered for the supplied credential type.
-    pub offered: Vec<String>,
+    pub(crate) offered: Vec<String>,
     /// Offered mechanisms rejected by local policy.
-    pub rejected: Vec<AuthMechanismRejection>,
+    pub(crate) rejected: Vec<AuthMechanismRejection>,
 }
 
 impl AuthPolicyFailure {
-    pub fn new(offered: Vec<String>, rejected: Vec<AuthMechanismRejection>) -> Self {
+    pub(crate) fn new(offered: Vec<String>, rejected: Vec<AuthMechanismRejection>) -> Self {
         Self { offered, rejected }
     }
 }
@@ -399,15 +399,18 @@ impl std::fmt::Display for AuthPolicyFailure {
 /// Offered authentication mechanism rejected by local policy.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthMechanismRejection {
+pub(crate) struct AuthMechanismRejection {
     /// Mechanism or legacy command rejected by policy.
-    pub mechanism: AuthMechanism,
+    pub(crate) mechanism: AuthMechanism,
     /// Why the mechanism was rejected.
-    pub reason: AuthMechanismRejectionReason,
+    pub(crate) reason: AuthMechanismRejectionReason,
 }
 
 impl AuthMechanismRejection {
-    pub const fn new(mechanism: AuthMechanism, reason: AuthMechanismRejectionReason) -> Self {
+    pub(crate) const fn new(
+        mechanism: AuthMechanism,
+        reason: AuthMechanismRejectionReason,
+    ) -> Self {
         Self { mechanism, reason }
     }
 }
@@ -415,7 +418,7 @@ impl AuthMechanismRejection {
 /// Local policy reason for rejecting an offered authentication mechanism.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AuthMechanismRejectionReason {
+pub(crate) enum AuthMechanismRejectionReason {
     /// Mechanism is disabled by local policy.
     DisabledByPolicy,
     /// Mechanism would expose credentials or bearer tokens without TLS.
@@ -482,7 +485,7 @@ impl ErrorCategory {
 // protocol-specific: mapped into bifrost_types::RecoveryClass only at the Account boundary.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Recovery {
+pub(crate) enum Recovery {
     /// The same request may be retried, but reconnecting may also be needed.
     RetryOrReconnect,
     /// Drop the connection and establish a new one.

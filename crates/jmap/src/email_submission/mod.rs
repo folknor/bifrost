@@ -1,6 +1,11 @@
-pub mod get;
-pub mod query;
-pub mod set;
+// The Account impl drives EmailSubmission/set via the send_message
+// path; Get / Changes / Query / QueryChanges and most query AST
+// variants are unused today but kept for completeness.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,13 +18,13 @@ use crate::identity::IdentityId;
 use crate::thread::ThreadId;
 
 mod marker {
-    pub enum EmailSubmission {}
+    pub(crate) enum EmailSubmission {}
 }
 /// Strongly-typed EmailSubmission ID.
-pub type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>;
+pub(crate) type EmailSubmissionId = crate::core::id::Id<marker::EmailSubmission>;
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct SetArguments {
+pub(crate) struct SetArguments {
     /// Patches to apply to the referenced email on successful submit,
     /// keyed by `EmailSubmission` create-id (e.g. "c0") or by real
     /// `EmailSubmission` id with `#` prefix per RFC 8621.
@@ -32,7 +37,7 @@ pub struct SetArguments {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailSubmission {
+pub(crate) struct EmailSubmission {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<EmailSubmissionId>,
@@ -75,7 +80,7 @@ pub struct EmailSubmission {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct EmailSubmissionCreate {
+pub(crate) struct EmailSubmissionCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -101,14 +106,14 @@ pub struct EmailSubmissionCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct EmailSubmissionPatch {
+pub(crate) struct EmailSubmissionPatch {
     #[serde(rename = "undoStatus")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) undo_status: Option<UndoStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Envelope {
+pub(crate) struct Envelope {
     #[serde(rename = "mailFrom")]
     pub(super) mail_from: Address,
 
@@ -117,14 +122,14 @@ pub struct Envelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Address {
+pub(crate) struct Address {
     pub(super) email: String,
     pub(super) parameters: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum UndoStatus {
+pub(crate) enum UndoStatus {
     #[serde(rename = "pending")]
     Pending,
     #[serde(rename = "final")]
@@ -134,7 +139,7 @@ pub enum UndoStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeliveryStatus {
+pub(crate) struct DeliveryStatus {
     #[serde(rename = "smtpReply")]
     smtp_reply: String,
 
@@ -147,7 +152,7 @@ pub struct DeliveryStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Delivered {
+pub(crate) enum Delivered {
     #[serde(rename = "queued")]
     Queued,
     #[serde(rename = "yes")]
@@ -160,7 +165,7 @@ pub enum Delivered {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Displayed {
+pub(crate) enum Displayed {
     #[serde(rename = "unknown")]
     Unknown,
     #[serde(rename = "yes")]
@@ -169,7 +174,7 @@ pub enum Displayed {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "identityId")]

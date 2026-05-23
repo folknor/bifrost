@@ -2,7 +2,7 @@ const MAX_EVENT_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub enum EventType {
+pub(crate) enum EventType {
     Ping,
     #[default]
     State,
@@ -11,10 +11,10 @@ pub enum EventType {
 }
 
 #[derive(Default, Debug)]
-pub struct Event {
-    pub event: EventType,
-    pub id: Vec<u8>,
-    pub data: Vec<u8>,
+pub(crate) struct Event {
+    pub(crate) event: EventType,
+    pub(crate) id: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -27,7 +27,7 @@ enum EventParserState {
 }
 
 #[derive(Default, Debug)]
-pub struct EventParser {
+pub(crate) struct EventParser {
     state: EventParserState,
     field: Vec<u8>,
     value: Vec<u8>,
@@ -37,11 +37,11 @@ pub struct EventParser {
 }
 
 impl EventParser {
-    pub fn push_bytes(&mut self, bytes: Vec<u8>) {
+    pub(crate) fn push_bytes(&mut self, bytes: Vec<u8>) {
         self.bytes = Some(bytes);
     }
 
-    pub fn needs_bytes(&self) -> bool {
+    pub(crate) fn needs_bytes(&self) -> bool {
         self.bytes.is_none()
     }
 }

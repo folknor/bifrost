@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 use super::Object;
 use super::id::AccountId;
 
-pub trait QueryObject: Object {
+pub(crate) trait QueryObject: Object {
     type QueryArguments: Default + Serialize;
     type Filter: Serialize;
     type Sort: Serialize;
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct QueryRequest<O: QueryObject> {
+pub(crate) struct QueryRequest<O: QueryObject> {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -49,20 +49,20 @@ pub struct QueryRequest<O: QueryObject> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter<T> {
+pub(crate) enum Filter<T> {
     FilterOperator(FilterOperator<T>),
     FilterCondition(T),
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FilterOperator<T> {
+pub(crate) struct FilterOperator<T> {
     operator: Operator,
     conditions: Vec<Filter<T>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Operator {
+pub(crate) enum Operator {
     #[serde(rename = "AND")]
     And,
     #[serde(rename = "OR")]
@@ -72,7 +72,7 @@ pub enum Operator {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Comparator<A> {
+pub(crate) struct Comparator<A> {
     #[serde(rename = "isAscending")]
     is_ascending: bool,
 
@@ -84,7 +84,7 @@ pub struct Comparator<A> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct QueryResponse<O: Object> {
+pub(crate) struct QueryResponse<O: Object> {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -112,7 +112,7 @@ impl<O: QueryObject> QueryRequest<O> {
     /// left empty; it is filled in by
     /// [`crate::core::request::Request::call`] when the method is
     /// added to a request batch.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         QueryRequest {
             account_id: AccountId::new(""),
             filter: None,
@@ -126,47 +126,50 @@ impl<O: QueryObject> QueryRequest<O> {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
 
-    pub fn filter(&mut self, filter: impl Into<Filter<O::Filter>>) -> &mut Self {
+    pub(crate) fn filter(&mut self, filter: impl Into<Filter<O::Filter>>) -> &mut Self {
         self.filter = Some(filter.into());
         self
     }
 
-    pub fn sort(&mut self, sort: impl IntoIterator<Item = Comparator<O::Sort>>) -> &mut Self {
+    pub(crate) fn sort(
+        &mut self,
+        sort: impl IntoIterator<Item = Comparator<O::Sort>>,
+    ) -> &mut Self {
         self.sort = Some(sort.into_iter().collect());
         self
     }
 
-    pub fn position(&mut self, position: i32) -> &mut Self {
+    pub(crate) fn position(&mut self, position: i32) -> &mut Self {
         self.position = position.into();
         self
     }
 
-    pub fn anchor(&mut self, anchor: impl Into<String>) -> &mut Self {
+    pub(crate) fn anchor(&mut self, anchor: impl Into<String>) -> &mut Self {
         self.anchor = Some(anchor.into());
         self
     }
 
-    pub fn anchor_offset(&mut self, anchor_offset: i32) -> &mut Self {
+    pub(crate) fn anchor_offset(&mut self, anchor_offset: i32) -> &mut Self {
         self.anchor_offset = anchor_offset.into();
         self
     }
 
-    pub fn limit(&mut self, limit: usize) -> &mut Self {
+    pub(crate) fn limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
         self
     }
 
-    pub fn calculate_total(&mut self, calculate_total: bool) -> &mut Self {
+    pub(crate) fn calculate_total(&mut self, calculate_total: bool) -> &mut Self {
         self.calculate_total = Some(calculate_total);
         self
     }
 
-    pub fn arguments(&mut self) -> &mut O::QueryArguments {
+    pub(crate) fn arguments(&mut self) -> &mut O::QueryArguments {
         &mut self.arguments
     }
 }
@@ -178,49 +181,49 @@ impl<O: QueryObject> Default for QueryRequest<O> {
 }
 
 impl<O: Object> QueryResponse<O> {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn ids(&self) -> &[O::Id] {
+    pub(crate) fn ids(&self) -> &[O::Id] {
         &self.ids
     }
 
-    pub fn id(&self, pos: usize) -> Option<&O::Id> {
+    pub(crate) fn id(&self, pos: usize) -> Option<&O::Id> {
         self.ids.get(pos)
     }
 
-    pub fn into_ids(self) -> Vec<O::Id> {
+    pub(crate) fn into_ids(self) -> Vec<O::Id> {
         self.ids
     }
 
-    pub fn total(&self) -> Option<usize> {
+    pub(crate) fn total(&self) -> Option<usize> {
         self.total
     }
 
-    pub fn limit(&self) -> Option<usize> {
+    pub(crate) fn limit(&self) -> Option<usize> {
         self.limit
     }
 
-    pub fn position(&self) -> i32 {
+    pub(crate) fn position(&self) -> i32 {
         self.position
     }
 
-    pub fn into_query_state(self) -> String {
+    pub(crate) fn into_query_state(self) -> String {
         self.query_state
     }
 
-    pub fn query_state(&self) -> &str {
+    pub(crate) fn query_state(&self) -> &str {
         &self.query_state
     }
 
-    pub fn can_calculate_changes(&self) -> bool {
+    pub(crate) fn can_calculate_changes(&self) -> bool {
         self.can_calculate_changes.unwrap_or(false)
     }
 }
 
 impl<A> Comparator<A> {
-    pub fn new(arguments: A) -> Self {
+    pub(crate) fn new(arguments: A) -> Self {
         Comparator {
             is_ascending: true,
             collation: None,
@@ -228,22 +231,22 @@ impl<A> Comparator<A> {
         }
     }
 
-    pub fn descending(mut self) -> Self {
+    pub(crate) fn descending(mut self) -> Self {
         self.is_ascending = false;
         self
     }
 
-    pub fn ascending(mut self) -> Self {
+    pub(crate) fn ascending(mut self) -> Self {
         self.is_ascending = true;
         self
     }
 
-    pub fn is_ascending(mut self, is_ascending: bool) -> Self {
+    pub(crate) fn is_ascending(mut self, is_ascending: bool) -> Self {
         self.is_ascending = is_ascending;
         self
     }
 
-    pub fn collation(mut self, collation: String) -> Self {
+    pub(crate) fn collation(mut self, collation: String) -> Self {
         self.collation = Some(collation);
         self
     }
@@ -262,14 +265,14 @@ impl<T> From<T> for Filter<T> {
 }
 
 impl<T> Filter<T> {
-    pub fn operator(operator: Operator, conditions: Vec<Filter<T>>) -> Self {
+    pub(crate) fn operator(operator: Operator, conditions: Vec<Filter<T>>) -> Self {
         Filter::FilterOperator(FilterOperator {
             operator,
             conditions,
         })
     }
 
-    pub fn and<U, V>(conditions: U) -> Self
+    pub(crate) fn and<U, V>(conditions: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<Filter<T>>,
@@ -283,7 +286,7 @@ impl<T> Filter<T> {
         })
     }
 
-    pub fn or<U, V>(conditions: U) -> Self
+    pub(crate) fn or<U, V>(conditions: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<Filter<T>>,
@@ -297,7 +300,7 @@ impl<T> Filter<T> {
         })
     }
 
-    pub fn not<U, V>(conditions: U) -> Self
+    pub(crate) fn not<U, V>(conditions: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<Filter<T>>,

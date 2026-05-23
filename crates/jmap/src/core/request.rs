@@ -15,7 +15,7 @@ use super::response::Response;
 ///
 /// The type parameter `M` ties this handle to the method that produced it,
 /// ensuring compile-time safety when extracting the response.
-pub struct CallHandle<M: JmapMethod> {
+pub(crate) struct CallHandle<M: JmapMethod> {
     pub(crate) call_id: String,
     pub(crate) method_name: &'static str,
     pub(crate) _phantom: PhantomData<M>,
@@ -26,7 +26,7 @@ impl<M: JmapMethod> CallHandle<M> {
     ///
     /// Example: `handle.result_reference("/ids")` references the `ids` array
     /// from a query response.
-    pub fn result_reference(&self, path: impl Into<String>) -> ResultReference {
+    pub(crate) fn result_reference(&self, path: impl Into<String>) -> ResultReference {
         ResultReference {
             result_of: self.call_id.clone(),
             name: self.method_name,
@@ -37,7 +37,7 @@ impl<M: JmapMethod> CallHandle<M> {
 
 /// A JMAP result reference (RFC 8620 §3.7).
 #[derive(Debug, Clone, Serialize)]
-pub struct ResultReference {
+pub(crate) struct ResultReference {
     #[serde(rename = "resultOf")]
     pub(crate) result_of: String,
     pub(crate) name: &'static str,
@@ -62,7 +62,7 @@ impl Serialize for RawMethodCall {
 }
 
 /// A JMAP request batch.
-pub struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
+pub(crate) struct Request<'x, T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
     client: &'x Client<T>,
     account_id: AccountId,
     pub(crate) using: Vec<&'static str>,
@@ -84,7 +84,7 @@ impl<T: HttpTransport> Serialize for Request<'_, T> {
 }
 
 impl<'x, T: HttpTransport> Request<'x, T> {
-    pub fn new(client: &'x Client<T>) -> Self {
+    pub(crate) fn new(client: &'x Client<T>) -> Self {
         Request {
             using: vec!["urn:ietf:params:jmap:core"],
             method_calls: Vec::new(),
@@ -94,13 +94,13 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         }
     }
 
-    pub fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {
+    pub(crate) fn account_id(mut self, account_id: impl Into<AccountId>) -> Self {
         self.account_id = account_id.into();
         self
     }
 
     /// The default account ID for this request.
-    pub fn default_account_id(&self) -> &AccountId {
+    pub(crate) fn default_account_id(&self) -> &AccountId {
         &self.account_id
     }
 
@@ -111,7 +111,10 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     /// [`JmapMethod::set_account_id`] just before serialization, so
     /// callers no longer pass `accountId` through every method-struct
     /// constructor.
-    pub fn call<M: JmapMethod>(&mut self, mut method: M) -> Result<CallHandle<M>, crate::Error> {
+    pub(crate) fn call<M: JmapMethod>(
+        &mut self,
+        mut method: M,
+    ) -> Result<CallHandle<M>, crate::Error> {
         let call_id = format!("s{}", self.method_calls.len());
 
         // Auto-add capability
@@ -141,7 +144,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     }
 
     /// Add a capability URI to the `using` array.
-    pub fn add_capability<C: Capability>(&mut self) {
+    pub(crate) fn add_capability<C: Capability>(&mut self) {
         let uri = C::URI;
         if !self.using.contains(&uri) {
             self.using.push(uri);
@@ -149,7 +152,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     }
 
     /// Send the request and get the full response.
-    pub async fn send(self) -> crate::Result<Response> {
+    pub(crate) async fn send(self) -> crate::Result<Response> {
         self.client.send_request(&self).await
     }
 
@@ -157,7 +160,7 @@ impl<'x, T: HttpTransport> Request<'x, T> {
     ///
     /// Validates that the response contains a matching call ID and handles
     /// method errors. Equivalent to `send().await?.get(&handle)?`.
-    pub async fn send_single<M: JmapMethod>(
+    pub(crate) async fn send_single<M: JmapMethod>(
         self,
         handle: &CallHandle<M>,
     ) -> crate::Result<M::Response> {
@@ -190,7 +193,7 @@ type MethodTupleExtractor<R> = Box<dyn FnOnce(Response) -> crate::Result<R> + Se
 
 /// Trait implemented for tuples of `JmapMethod` values, for typed
 /// batch sends. See [`Request::send_methods`].
-pub trait MethodTuple: Sized {
+pub(crate) trait MethodTuple: Sized {
     type Responses;
 
     fn add_to_request<T: HttpTransport>(
@@ -238,7 +241,10 @@ impl<T: HttpTransport> Request<'_, T> {
     /// Send a tuple of methods in one batch and return their typed
     /// responses as a tuple. See the module-level note on result
     /// references.
-    pub async fn send_methods<M: MethodTuple>(mut self, methods: M) -> crate::Result<M::Responses> {
+    pub(crate) async fn send_methods<M: MethodTuple>(
+        mut self,
+        methods: M,
+    ) -> crate::Result<M::Responses> {
         let extract = methods.add_to_request(&mut self)?;
         let response = self.send().await?;
         extract(response)
@@ -247,7 +253,7 @@ impl<T: HttpTransport> Request<'_, T> {
 
 #[cfg(feature = "websockets")]
 impl Request<'_, crate::transport_reqwest::ReqwestTransport> {
-    pub async fn send_ws(self) -> crate::Result<String> {
+    pub(crate) async fn send_ws(self) -> crate::Result<String> {
         self.client.send_ws(self).await
     }
 }

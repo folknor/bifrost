@@ -2,16 +2,20 @@
 
 use std::fmt;
 
-use super::{IntoSecretString, SecretString};
+use super::SecretString;
 
-/// Credentials accepted by [`ImapConnection::authenticate_best`](crate::ImapConnection::authenticate_best).
+/// Credentials accepted by `ImapAccountFactory`.
 ///
-/// These variants model the common single-identity flows. Delegated access
-/// with a distinct SASL authorization identity is not represented here yet;
-/// use explicit mechanism methods if a server-specific flow needs different
-/// authentication and authorization identities.
+/// This models the common single-identity flows. Delegated access with a
+/// distinct SASL authorization identity is not represented here yet.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Eq)]
-pub enum Credentials {
+pub struct Credentials {
+    kind: CredentialsKind,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CredentialsKind {
     /// Username and password credentials.
     Password {
         /// Authentication identity.
@@ -30,31 +34,39 @@ pub enum Credentials {
 
 impl Credentials {
     /// Create username and password credentials.
-    pub fn password(username: impl Into<String>, password: impl IntoSecretString) -> Self {
-        Self::Password {
-            username: username.into(),
-            password: password.into_secret_string(),
+    pub fn password(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            kind: CredentialsKind::Password {
+                username: username.into(),
+                password: SecretString::from(password.into()),
+            },
         }
     }
 
     /// Create OAuth 2.0 bearer-token credentials.
-    pub fn oauth2(identity: impl Into<String>, access_token: impl IntoSecretString) -> Self {
-        Self::OAuth2 {
-            identity: identity.into(),
-            access_token: access_token.into_secret_string(),
+    pub fn oauth2(identity: impl Into<String>, access_token: impl Into<String>) -> Self {
+        Self {
+            kind: CredentialsKind::OAuth2 {
+                identity: identity.into(),
+                access_token: SecretString::from(access_token.into()),
+            },
         }
+    }
+
+    pub(crate) fn kind(&self) -> &CredentialsKind {
+        &self.kind
     }
 }
 
 impl fmt::Debug for Credentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Password { username, .. } => f
+        match &self.kind {
+            CredentialsKind::Password { username, .. } => f
                 .debug_struct("Credentials::Password")
                 .field("username", username)
                 .field("password", &"<redacted>")
                 .finish(),
-            Self::OAuth2 { identity, .. } => f
+            CredentialsKind::OAuth2 { identity, .. } => f
                 .debug_struct("Credentials::OAuth2")
                 .field("identity", identity)
                 .field("access_token", &"<redacted>")
@@ -71,7 +83,7 @@ impl fmt::Debug for Credentials {
 /// not expose that material. `authenticate_best` will therefore not silently
 /// treat a `*-PLUS` advertisement as the non-PLUS SCRAM mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AuthMechanism {
+pub(crate) enum AuthMechanism {
     /// SASL XOAUTH2 bearer-token authentication.
     XOAuth2,
     /// SASL SCRAM-SHA-256.
@@ -88,7 +100,7 @@ pub enum AuthMechanism {
 
 impl AuthMechanism {
     /// Return the advertised SASL mechanism name, or `LOGIN` for the legacy command.
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::XOAuth2 => "XOAUTH2",
             Self::ScramSha256 => "SCRAM-SHA-256",
@@ -153,7 +165,7 @@ impl AuthPolicy {
 /// Result of automatic authentication.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AuthOutcome {
+pub(crate) struct AuthOutcome {
     /// Mechanism used for the successful authentication exchange.
-    pub mechanism: AuthMechanism,
+    pub(crate) mechanism: AuthMechanism,
 }

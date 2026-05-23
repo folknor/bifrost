@@ -15,7 +15,7 @@ use crate::{
 use futures::{Stream, StreamExt};
 
 impl<T: HttpTransport + SseTransport> Client<T> {
-    pub async fn event_source(
+    pub(crate) async fn event_source(
         &self,
         mut types: Option<impl IntoIterator<Item = DataType>>,
         close_after_state: bool,

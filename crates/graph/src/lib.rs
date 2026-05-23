@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-#![doc = "Microsoft Graph client for Rust."]
+#![doc = "Microsoft Graph Account implementation for bifrost."]
 
 // pub: sync-engine conformance and consumers register Graph accounts through this module.
 pub mod account;

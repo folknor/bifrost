@@ -23,10 +23,10 @@ const JMAP_WS_SUBPROTOCOL: &str = "jmap";
 #[derive(Debug, Serialize)]
 struct WebSocketRequest {
     #[serde(rename = "@type")]
-    pub _type: WebSocketRequestType,
+    pub(crate) _type: WebSocketRequestType,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub(crate) id: Option<String>,
 
     using: Vec<&'static str>,
 
@@ -87,13 +87,13 @@ enum WebSocketPushDisableType {
 #[derive(Deserialize, Debug)]
 pub(crate) struct WebSocketPushObject {
     #[serde(flatten)]
-    pub push: PushObject,
+    pub(crate) push: PushObject,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebSocketError {
     #[serde(rename = "requestId")]
-    pub request_id: Option<String>,
+    pub(crate) request_id: Option<String>,
 
     #[serde(rename = "type")]
     p_type: ProblemType,
@@ -115,7 +115,7 @@ enum WebSocketMessage_ {
 
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum WebSocketMessage {
+pub(crate) enum WebSocketMessage {
     Response(Response),
     PushNotification(PushObject),
 }
@@ -126,7 +126,7 @@ pub(crate) struct WsStream {
 }
 
 impl Client {
-    pub async fn connect_ws(
+    pub(crate) async fn connect_ws(
         &self,
     ) -> crate::Result<Pin<Box<impl Stream<Item = crate::Result<WebSocketMessage>> + use<>>>> {
         let session = self.session();
@@ -221,7 +221,7 @@ impl Client {
         }))
     }
 
-    pub async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
+    pub(crate) async fn send_ws(&self, request: Request<'_>) -> crate::Result<String> {
         let mut _ws = self.ws.lock().await;
         let ws = _ws
             .as_mut()
@@ -249,7 +249,7 @@ impl Client {
         Ok(request_id)
     }
 
-    pub async fn enable_push_ws(
+    pub(crate) async fn enable_push_ws(
         &self,
         data_types: Option<impl IntoIterator<Item = DataType>>,
         push_state: Option<impl Into<String>>,
@@ -272,7 +272,7 @@ impl Client {
             .map_err(std::convert::Into::into)
     }
 
-    pub async fn disable_push_ws(&self) -> crate::Result<()> {
+    pub(crate) async fn disable_push_ws(&self) -> crate::Result<()> {
         self.ws
             .lock()
             .await
@@ -289,7 +289,7 @@ impl Client {
             .map_err(std::convert::Into::into)
     }
 
-    pub async fn ws_ping(&self) -> crate::Result<()> {
+    pub(crate) async fn ws_ping(&self) -> crate::Result<()> {
         self.ws
             .lock()
             .await

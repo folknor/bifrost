@@ -1,6 +1,6 @@
 [package]
 name = "bifrost-graph"
-description = "Microsoft Graph client for Rust"
+description = "Microsoft Graph Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

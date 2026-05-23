@@ -7,7 +7,7 @@ use super::{Mailbox, MailboxId, QueryArguments, Role};
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     ParentId {
         #[serde(rename = "parentId")]
         value: Option<MailboxId>,
@@ -33,7 +33,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "name")]
     Name,
     #[serde(rename = "sortOrder")]
@@ -43,19 +43,19 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn parent_id(value: Option<impl Into<MailboxId>>) -> Self {
+    pub(crate) fn parent_id(value: Option<impl Into<MailboxId>>) -> Self {
         Filter::ParentId {
             value: value.map(Into::into),
         }
     }
 
-    pub fn name(value: impl Into<String>) -> Self {
+    pub(crate) fn name(value: impl Into<String>) -> Self {
         Filter::Name {
             value: value.into(),
         }
     }
 
-    pub fn role(value: Role) -> Self {
+    pub(crate) fn role(value: Role) -> Self {
         Filter::Role {
             value: if !matches!(value, Role::None) {
                 value.into()
@@ -65,36 +65,36 @@ impl Filter {
         }
     }
 
-    pub fn has_any_role(value: bool) -> Self {
+    pub(crate) fn has_any_role(value: bool) -> Self {
         Filter::HasAnyRole { value }
     }
 
-    pub fn is_subscribed(value: bool) -> Self {
+    pub(crate) fn is_subscribed(value: bool) -> Self {
         Filter::IsSubscribed { value }
     }
 }
 
 impl Comparator {
-    pub fn name() -> query::Comparator<Comparator> {
+    pub(crate) fn name() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Name)
     }
 
-    pub fn sort_order() -> query::Comparator<Comparator> {
+    pub(crate) fn sort_order() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::SortOrder)
     }
 
-    pub fn parent_id() -> query::Comparator<Comparator> {
+    pub(crate) fn parent_id() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::ParentId)
     }
 }
 
 impl QueryArguments {
-    pub fn sort_as_tree(&mut self, value: bool) -> &mut Self {
+    pub(crate) fn sort_as_tree(&mut self, value: bool) -> &mut Self {
         self.sort_as_tree = value;
         self
     }
 
-    pub fn filter_as_tree(&mut self, value: bool) -> &mut Self {
+    pub(crate) fn filter_as_tree(&mut self, value: bool) -> &mut Self {
         self.filter_as_tree = value;
         self
     }

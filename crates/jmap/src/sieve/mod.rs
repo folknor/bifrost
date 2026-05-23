@@ -1,7 +1,11 @@
-pub mod get;
-pub mod query;
-pub mod set;
-pub mod validate;
+// Stage 2 (server-side filter rules) will wire SieveScript/* into the
+// Account impl; until then the module is fully built but unused.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
+pub(crate) mod validate;
 
 use std::fmt::Display;
 
@@ -10,13 +14,13 @@ use serde::{Deserialize, Serialize};
 use crate::core::id::BlobId;
 
 mod marker {
-    pub enum SieveScript {}
+    pub(crate) enum SieveScript {}
 }
 /// Strongly-typed SieveScript ID.
-pub type SieveScriptId = crate::core::id::Id<marker::SieveScript>;
+pub(crate) type SieveScriptId = crate::core::id::Id<marker::SieveScript>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SieveScript {
+pub(crate) struct SieveScript {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<SieveScriptId>,
@@ -35,7 +39,7 @@ pub struct SieveScript {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SieveScriptCreate {
+pub(crate) struct SieveScriptCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -49,7 +53,7 @@ pub struct SieveScriptCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct SieveScriptPatch {
+pub(crate) struct SieveScriptPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -60,7 +64,7 @@ pub struct SieveScriptPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct SetArguments {
+pub(crate) struct SetArguments {
     #[serde(rename = "onSuccessActivateScript")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_success_activate_script: Option<SieveScriptId>,
@@ -71,7 +75,7 @@ pub struct SetArguments {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]

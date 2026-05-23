@@ -4,28 +4,28 @@ use std::hash::Hash;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-pub mod capability;
-pub mod changes;
-pub mod copy;
-pub mod error;
-pub mod field;
-pub mod get;
-pub mod id;
-pub mod method;
-pub mod parse;
-pub mod query;
-pub mod query_changes;
-pub mod request;
-pub mod response;
-pub mod session;
-pub mod set;
-pub mod transport;
+pub(crate) mod capability;
+pub(crate) mod changes;
+pub(crate) mod copy;
+pub(crate) mod error;
+pub(crate) mod field;
+pub(crate) mod get;
+pub(crate) mod id;
+pub(crate) mod method;
+pub(crate) mod parse;
+pub(crate) mod query;
+pub(crate) mod query_changes;
+pub(crate) mod request;
+pub(crate) mod response;
+pub(crate) mod session;
+pub(crate) mod set;
+pub(crate) mod transport;
 
 #[cfg(test)]
 mod tests;
 
 /// The base trait for a JMAP object's server-returned (Get) shape.
-pub trait Object: Sized {
+pub(crate) trait Object: Sized {
     type Property: Display + Serialize + DeserializeOwned;
     /// The strongly-typed ID for this object (`EmailId`, `MailboxId`,
     /// etc.). Used as the typed key/value type in generic core
@@ -38,7 +38,7 @@ pub trait Object: Sized {
 
 /// The trait implemented by a Create-shape input struct (e.g.
 /// `MailboxCreate`, `EmailCreate`).
-pub trait SetCreate: Sized {
+pub(crate) trait SetCreate: Sized {
     fn create_id(&self) -> Option<String>;
     fn new(create_id: Option<usize>) -> Self;
 }
@@ -50,27 +50,26 @@ pub trait SetCreate: Sized {
 ///
 /// Each type wraps a `serde_json::Map` so vendor extension properties
 /// survive round-trip. Used for CalendarEvent and ContactCard.
-#[macro_export]
 macro_rules! json_object_struct {
     ($name:ident, $create:ident, $patch:ident, $expecting:expr) => {
         #[derive(Debug, Clone)]
-        pub struct $name {
+        pub(crate) struct $name {
             /// The raw properties map. Every key/value from the server
             /// is preserved, including vendor extension properties.
-            pub properties: serde_json::Map<String, serde_json::Value>,
+            pub(crate) properties: serde_json::Map<String, serde_json::Value>,
         }
 
         #[derive(Debug, Clone)]
-        pub struct $create {
+        pub(crate) struct $create {
             pub(super) _create_id: Option<usize>,
-            pub properties: serde_json::Map<String, serde_json::Value>,
+            pub(crate) properties: serde_json::Map<String, serde_json::Value>,
         }
 
         #[derive(Debug, Clone, Default)]
-        pub struct $patch {
+        pub(crate) struct $patch {
             /// Dotted-path patch keys (e.g. `participants/p1/name`) are
             /// permitted by JMAP /set update semantics.
-            pub properties: serde_json::Map<String, serde_json::Value>,
+            pub(crate) properties: serde_json::Map<String, serde_json::Value>,
         }
 
         $crate::__json_object_serde!($name, $expecting, with_deserialize);
@@ -90,7 +89,7 @@ macro_rules! json_object_struct {
         }
 
         impl $create {
-            pub fn set_property(
+            pub(crate) fn set_property(
                 &mut self,
                 name: impl Into<String>,
                 value: serde_json::Value,
@@ -98,13 +97,15 @@ macro_rules! json_object_struct {
                 self.properties.insert(name.into(), value);
                 self
             }
-            pub fn properties_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+            pub(crate) fn properties_mut(
+                &mut self,
+            ) -> &mut serde_json::Map<String, serde_json::Value> {
                 &mut self.properties
             }
         }
 
         impl $patch {
-            pub fn set_property(
+            pub(crate) fn set_property(
                 &mut self,
                 name: impl Into<String>,
                 value: serde_json::Value,
@@ -112,15 +113,15 @@ macro_rules! json_object_struct {
                 self.properties.insert(name.into(), value);
                 self
             }
-            pub fn properties_mut(&mut self) -> &mut serde_json::Map<String, serde_json::Value> {
+            pub(crate) fn properties_mut(
+                &mut self,
+            ) -> &mut serde_json::Map<String, serde_json::Value> {
                 &mut self.properties
             }
         }
     };
 }
 
-#[macro_export]
-#[doc(hidden)]
 macro_rules! __json_object_serde {
     ($name:ident, $expecting:expr, with_deserialize) => {
         impl serde::Serialize for $name {
@@ -172,3 +173,6 @@ macro_rules! __json_object_serde {
         }
     };
 }
+
+pub(crate) use __json_object_serde;
+pub(crate) use json_object_struct;

@@ -2,9 +2,16 @@
 
 Current architecture of the IMAP client crate. Daaki-derived. Tokio + native-tls only.
 
+The public consumer surface is intentionally small after S1-W3:
+`ImapAccountFactory`, `ImapAccountConfig`, `ImapConfig`,
+`Credentials`, and `AuthPolicy`. Consumers construct the factory and
+use it through `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP
+connections, parser types, command types, protocol errors, and sync
+helpers are crate-internal implementation detail.
+
 ## Driver-owned I/O
 
-One tokio task owns the socket, parser state, and a watch channel exposing connection state. `ImapConnection` is a cheap handle around the driver. Public methods take `&self` and talk to the driver over channels.
+One tokio task owns the socket, parser state, and a watch channel exposing connection state. `ImapConnection` is a cheap internal handle around the driver. Connection methods take `&self` and talk to the driver over channels.
 
 The driver model is load-bearing for:
 
@@ -51,9 +58,14 @@ Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming c
 
 ## Auth
 
-`Credentials` is enum: `Password { username, password: SecretString }` or `OAuth2 { identity, access_token: SecretString }`. No `From<(String, String)>`.
+`Credentials` is a public opaque wrapper with `password(username,
+password)` and `oauth2(identity, access_token)` constructors. The
+stored secret material remains in the internal `SecretString` wrapper,
+which zeroizes and redacts under `Debug`; consumers no longer handle
+or import that wrapper directly. No `From<(String, String)>`.
 
-`AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256.
+Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER,
+CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256.
 
 `AuthPolicy` TLS-gates cleartext mechanisms by default. PLAIN and LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated, because a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline. LOGIN-the-IMAP-command is opt-in (`with_login`).
 
@@ -72,9 +84,18 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 
 ## Configuration and connect
 
-`ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext), connect timeout, command timeout, keepalive, and optional native-tls connector. Ports default per mode (993 / 143 / 143).
+`ImapConfig` centralizes TLS mode (Implicit / StartTls / Plaintext),
+connect timeout, command timeout, keepalive, and optional native-tls
+connector. Ports default per mode (993 / 143 / 143). Public
+constructors are `tls`, `starttls`, and `plaintext`; public builders
+cover port, timeouts, keepalive disablement, and custom TLS
+connectors. The raw `connect` / `connect_authenticated` entry points
+were deleted in S1-W3.
 
-`connect_authenticated(credentials, policy)` composes connect + STARTTLS-if-needed + `authenticate_best`. Returns `(ImapConnection, AuthOutcome)`.
+Internally, `connect_authenticated_metered(credentials, policy, meter,
+cap)` composes connect + STARTTLS-if-needed + `authenticate_best` for
+the account factory and pool. It returns `(ImapConnection,
+AuthOutcome)` inside the crate only.
 
 ## Sync helpers
 
@@ -87,6 +108,12 @@ Newtypes with explicit `::new` constructors. No `From<u32>`/`From<u64>` to preve
 ## Account layer
 
 The shared `bifrost_types::Account` implementation lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into optional raw-socket bandwidth metering. `ImapAccount` backs both the sync methods and the Stage 1 PIM primitives.
+
+The public account module re-exports only `ImapAccountFactory` and
+`ImapAccountConfig`, preserving the existing conformance-test path
+`bifrost_imap::account::{...}`. The crate root also re-exports the
+factory and config types directly. `ImapAccount` itself is
+`pub(crate)`.
 
 Submodules:
 
@@ -157,7 +184,11 @@ Containers use native mailbox paths as primitive ids and provenance-native ids. 
 
 ## Error model
 
-`Error` is `#[non_exhaustive]`. Variants include `AuthPolicy(String)`, `FetchLimit { estimated, limit }`, plus protocol/transport/capability variants.
+`Error` is `pub(crate)` and `#[non_exhaustive]`. Variants include
+`AuthPolicy(String)`, `FetchLimit { estimated, limit }`, plus
+protocol/transport/capability variants. The account boundary converts
+protocol errors into `bifrost_types::Error`; consumers do not import
+the IMAP error taxonomy directly.
 
 - `Error::category()` returns `ErrorCategory`: `Auth`, `AuthPolicy`, `Authorization`, `Capability`, `MailboxState`, `Limit`, `ServerRejected`, `Transport`, `Protocol`, `Tls`, etc.
 - `Error::recovery()` returns `Recovery`: `RetryOrReconnect`, `Reconnect`, `Reauthenticate`, `ResyncMailbox`, `Transient`, `DoNotRetry`. Transient RFC 5530 codes (Unavailable, InUse, TempFail, Corruption, ExpungeIssued, NotificationOverflow, Referral) report retry-safe outcomes.
@@ -167,42 +198,42 @@ Containers use native mailbox paths as primitive ids and provenance-native ids. 
 
 ```
 crates/imap/src/
-├── codec/           - parser + encoder (nom 8)
-├── connection/      - driver, auth, lifecycle, dispatch
-│   ├── auth.rs      - PLAIN/LOGIN/XOAUTH2/OAUTHBEARER/CRAM-MD5/SCRAM wire
-│   ├── config.rs    - ImapConfig, connect_authenticated
-│   ├── dispatch.rs  - command dispatch, FETCH consumer
-│   ├── driver/      - driver task
-│   ├── ergonomics.rs - uid_fetch_each, _limited, _full_messages
-│   ├── helpers.rs   - server_profile, drain_events, ...
-│   ├── lifecycle.rs - greeting, STARTTLS, ENABLE
-│   ├── pipeline/    - command pipelining
-│   ├── seq_ops.rs   - sequence-number command surface
-│   └── uid_ops.rs   - UID command surface
-├── account/         - bifrost_types::Account implementation
-│   ├── blob.rs            - open_blob, open_blob_range
-│   ├── capabilities.rs    - AccountCapabilities builder
-│   ├── changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
-│   ├── close.rs           - graceful shutdown
-│   ├── envelope.rs        - FolderCursor encode/decode
-│   ├── factory.rs         - ImapAccountConfig, QRESYNC negotiation
-│   ├── folder_registry.rs - mailbox map, cursor cache, MODSEQ cache
-│   ├── get.rs             - hydration
-│   ├── inventory.rs       - inventory + initial cursor establishment
-│   ├── mod.rs             - ImapAccount trait impl, helpers
-│   ├── mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
-│   ├── pim.rs             - unified PIM primitives + conveniences
-│   ├── pool.rs            - per-folder connection checkout
-│   ├── push.rs            - IDLE-driven WatchEvents
-│   └── scopes.rs          - folder discovery, lifecycle stream
-├── types/           - public types (auth, ids, profile, secret, sync, events)
-└── error.rs         - Error, ErrorCategory, Recovery, ResponseCode
+|-- codec/           - parser + encoder (nom 8)
+|-- connection/      - driver, auth, lifecycle, dispatch
+|   |-- auth.rs      - PLAIN/LOGIN/XOAUTH2/OAUTHBEARER/CRAM-MD5/SCRAM wire
+|   |-- config.rs    - ImapConfig, internal account dial path
+|   |-- dispatch.rs  - command dispatch, FETCH consumer
+|   |-- driver/      - driver task
+|   |-- ergonomics.rs - uid_fetch_each, _limited, _full_messages
+|   |-- helpers.rs   - server_profile, drain_events, ...
+|   |-- lifecycle.rs - greeting, STARTTLS, ENABLE
+|   |-- pipeline/    - command pipelining
+|   |-- seq_ops.rs   - sequence-number command surface
+|   `-- uid_ops.rs   - UID command surface
+|-- account/         - bifrost_types::Account implementation
+|   |-- blob.rs            - open_blob, open_blob_range
+|   |-- capabilities.rs    - AccountCapabilities builder
+|   |-- changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
+|   |-- close.rs           - graceful shutdown
+|   |-- envelope.rs        - FolderCursor encode/decode
+|   |-- factory.rs         - ImapAccountConfig, QRESYNC negotiation
+|   |-- folder_registry.rs - mailbox map, cursor cache, MODSEQ cache
+|   |-- get.rs             - hydration
+|   |-- inventory.rs       - inventory + initial cursor establishment
+|   |-- mod.rs             - ImapAccount trait impl, helpers
+|   |-- mutate.rs          - bulk_set_flags, bulk_move, bulk_destroy
+|   |-- pim.rs             - unified PIM primitives + conveniences
+|   |-- pool.rs            - per-folder connection checkout
+|   |-- push.rs            - IDLE-driven WatchEvents
+|   `-- scopes.rs          - folder discovery, lifecycle stream
+|-- types/           - internal protocol types plus public Credentials / AuthPolicy
+`-- error.rs         - internal Error, ErrorCategory, Recovery
 ```
 
 ## IMAP-specific code style
 
 - Connection methods take `&self`.
-- Every public operation takes an explicit `Duration` or documents the timeout policy.
-- Public enums/structs are `#[non_exhaustive]` unless there is a strong reason not.
+- Internal raw protocol operations take an explicit `Duration` or document the timeout policy.
+- Public enums/structs are limited to the factory/config surface and are `#[non_exhaustive]` unless there is a strong reason not.
 - Credentials and SASL intermediate strings use `Zeroizing` and redact under `Debug`.
 - Malformed SASL mechanism names are rejected before any wire write.

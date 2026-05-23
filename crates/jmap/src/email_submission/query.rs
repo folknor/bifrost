@@ -14,7 +14,7 @@ use super::{EmailSubmission, UndoStatus};
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     IdentityIds {
         #[serde(rename = "identityIds")]
         value: Vec<IdentityId>,
@@ -44,7 +44,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "emailId")]
     EmailId,
     #[serde(rename = "threadId")]
@@ -54,7 +54,7 @@ pub enum Comparator {
 }
 
 impl Filter {
-    pub fn identity_ids<U, V>(value: U) -> Self
+    pub(crate) fn identity_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<IdentityId>,
@@ -64,7 +64,7 @@ impl Filter {
         }
     }
 
-    pub fn email_ids<U, V>(value: U) -> Self
+    pub(crate) fn email_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<EmailId>,
@@ -74,7 +74,7 @@ impl Filter {
         }
     }
 
-    pub fn thread_ids<U, V>(value: U) -> Self
+    pub(crate) fn thread_ids<U, V>(value: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<ThreadId>,
@@ -84,17 +84,17 @@ impl Filter {
         }
     }
 
-    pub fn undo_status(value: UndoStatus) -> Self {
+    pub(crate) fn undo_status(value: UndoStatus) -> Self {
         Filter::UndoStatus { value }
     }
 
-    pub fn before(value: i64) -> Self {
+    pub(crate) fn before(value: i64) -> Self {
         Filter::Before {
             value: from_timestamp(value),
         }
     }
 
-    pub fn after(value: i64) -> Self {
+    pub(crate) fn after(value: i64) -> Self {
         Filter::After {
             value: from_timestamp(value),
         }
@@ -102,15 +102,15 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn email_id() -> query::Comparator<Comparator> {
+    pub(crate) fn email_id() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::EmailId)
     }
 
-    pub fn thread_id() -> query::Comparator<Comparator> {
+    pub(crate) fn thread_id() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::ThreadId)
     }
 
-    pub fn sent_at() -> query::Comparator<Comparator> {
+    pub(crate) fn sent_at() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::SentAt)
     }
 }

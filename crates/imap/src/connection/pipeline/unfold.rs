@@ -14,7 +14,7 @@ use super::PipelineError;
 /// index 0 upward.
 ///
 /// Impls are provided for 0 through 8 commands.
-pub trait UnfoldTuple {
+pub(crate) trait UnfoldTuple {
     /// The flat tuple type produced by unfolding.
     type Output;
 

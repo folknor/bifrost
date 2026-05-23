@@ -6,13 +6,13 @@ use crate::calendar::CalendarId;
 macro_rules! ce_setters {
     ($t:ty) => {
         impl $t {
-            pub fn uid(&mut self, uid: impl Into<String>) -> &mut Self {
+            pub(crate) fn uid(&mut self, uid: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("uid".into(), serde_json::Value::String(uid.into()));
                 self
             }
 
-            pub fn calendar_ids<U, V>(&mut self, calendar_ids: U) -> &mut Self
+            pub(crate) fn calendar_ids<U, V>(&mut self, calendar_ids: U) -> &mut Self
             where
                 U: IntoIterator<Item = V>,
                 V: Into<CalendarId>,
@@ -26,7 +26,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn calendar_id(
+            pub(crate) fn calendar_id(
                 &mut self,
                 calendar_id: impl Into<CalendarId>,
                 set: bool,
@@ -48,13 +48,13 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn title(&mut self, title: impl Into<String>) -> &mut Self {
+            pub(crate) fn title(&mut self, title: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("title".into(), serde_json::Value::String(title.into()));
                 self
             }
 
-            pub fn description(&mut self, description: impl Into<String>) -> &mut Self {
+            pub(crate) fn description(&mut self, description: impl Into<String>) -> &mut Self {
                 self.properties.insert(
                     "description".into(),
                     serde_json::Value::String(description.into()),
@@ -62,7 +62,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn description_content_type(
+            pub(crate) fn description_content_type(
                 &mut self,
                 content_type: impl Into<String>,
             ) -> &mut Self {
@@ -73,13 +73,13 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn start(&mut self, start: impl Into<String>) -> &mut Self {
+            pub(crate) fn start(&mut self, start: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("start".into(), serde_json::Value::String(start.into()));
                 self
             }
 
-            pub fn duration(&mut self, duration: impl Into<String>) -> &mut Self {
+            pub(crate) fn duration(&mut self, duration: impl Into<String>) -> &mut Self {
                 self.properties.insert(
                     "duration".into(),
                     serde_json::Value::String(duration.into()),
@@ -87,7 +87,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn time_zone(&mut self, time_zone: Option<impl Into<String>>) -> &mut Self {
+            pub(crate) fn time_zone(&mut self, time_zone: Option<impl Into<String>>) -> &mut Self {
                 self.properties.insert(
                     "timeZone".into(),
                     match time_zone {
@@ -98,19 +98,19 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn show_without_time(&mut self, show: bool) -> &mut Self {
+            pub(crate) fn show_without_time(&mut self, show: bool) -> &mut Self {
                 self.properties
                     .insert("showWithoutTime".into(), json!(show));
                 self
             }
 
-            pub fn status(&mut self, status: impl Into<String>) -> &mut Self {
+            pub(crate) fn status(&mut self, status: impl Into<String>) -> &mut Self {
                 self.properties
                     .insert("status".into(), serde_json::Value::String(status.into()));
                 self
             }
 
-            pub fn free_busy_status(&mut self, status: impl Into<String>) -> &mut Self {
+            pub(crate) fn free_busy_status(&mut self, status: impl Into<String>) -> &mut Self {
                 self.properties.insert(
                     "freeBusyStatus".into(),
                     serde_json::Value::String(status.into()),
@@ -118,13 +118,13 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn recurrence_rules(&mut self, rules: Vec<serde_json::Value>) -> &mut Self {
+            pub(crate) fn recurrence_rules(&mut self, rules: Vec<serde_json::Value>) -> &mut Self {
                 self.properties
                     .insert("recurrenceRules".into(), serde_json::Value::Array(rules));
                 self
             }
 
-            pub fn recurrence_overrides(
+            pub(crate) fn recurrence_overrides(
                 &mut self,
                 overrides: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -135,7 +135,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn excluded_recurrence_rules(
+            pub(crate) fn excluded_recurrence_rules(
                 &mut self,
                 rules: Vec<serde_json::Value>,
             ) -> &mut Self {
@@ -146,12 +146,12 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn priority(&mut self, priority: u8) -> &mut Self {
+            pub(crate) fn priority(&mut self, priority: u8) -> &mut Self {
                 self.properties.insert("priority".into(), json!(priority));
                 self
             }
 
-            pub fn color(&mut self, color: Option<impl Into<String>>) -> &mut Self {
+            pub(crate) fn color(&mut self, color: Option<impl Into<String>>) -> &mut Self {
                 self.properties.insert(
                     "color".into(),
                     match color {
@@ -162,7 +162,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn locale(&mut self, locale: Option<impl Into<String>>) -> &mut Self {
+            pub(crate) fn locale(&mut self, locale: Option<impl Into<String>>) -> &mut Self {
                 self.properties.insert(
                     "locale".into(),
                     match locale {
@@ -173,7 +173,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn keywords(
+            pub(crate) fn keywords(
                 &mut self,
                 keywords: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -182,7 +182,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn categories(
+            pub(crate) fn categories(
                 &mut self,
                 categories: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -191,7 +191,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn reply_to(
+            pub(crate) fn reply_to(
                 &mut self,
                 reply_to: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -200,7 +200,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn participants(
+            pub(crate) fn participants(
                 &mut self,
                 participants: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -211,13 +211,13 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn use_default_alerts(&mut self, use_default: bool) -> &mut Self {
+            pub(crate) fn use_default_alerts(&mut self, use_default: bool) -> &mut Self {
                 self.properties
                     .insert("useDefaultAlerts".into(), json!(use_default));
                 self
             }
 
-            pub fn alerts(
+            pub(crate) fn alerts(
                 &mut self,
                 alerts: Option<serde_json::Map<String, serde_json::Value>>,
             ) -> &mut Self {
@@ -231,7 +231,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn locations(
+            pub(crate) fn locations(
                 &mut self,
                 locations: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -240,7 +240,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn virtual_locations(
+            pub(crate) fn virtual_locations(
                 &mut self,
                 virtual_locations: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {
@@ -251,7 +251,7 @@ macro_rules! ce_setters {
                 self
             }
 
-            pub fn links(
+            pub(crate) fn links(
                 &mut self,
                 links: serde_json::Map<String, serde_json::Value>,
             ) -> &mut Self {

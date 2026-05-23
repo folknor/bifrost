@@ -1,5 +1,10 @@
-pub mod get;
-pub mod set;
+// The Account impl reads/writes the singleton vacation response; the
+// builder helpers on the get/set request structs not driven by the
+// Account path are retained for symmetry with the rest of the crate.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -10,13 +15,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 mod marker {
-    pub enum VacationResponse {}
+    pub(crate) enum VacationResponse {}
 }
 /// Strongly-typed VacationResponse ID (singleton; spec mandates "singleton").
-pub type VacationResponseId = crate::core::id::Id<marker::VacationResponse>;
+pub(crate) type VacationResponseId = crate::core::id::Id<marker::VacationResponse>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VacationResponse {
+pub(crate) struct VacationResponse {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<VacationResponseId>,
@@ -47,7 +52,7 @@ pub struct VacationResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct VacationResponseCreate {
+pub(crate) struct VacationResponseCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -77,7 +82,7 @@ pub struct VacationResponseCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct VacationResponsePatch {
+pub(crate) struct VacationResponsePatch {
     #[serde(rename = "isEnabled")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) is_enabled: Option<bool>,
@@ -109,7 +114,7 @@ pub struct VacationResponsePatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "isEnabled")]

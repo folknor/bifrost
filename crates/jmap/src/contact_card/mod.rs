@@ -1,15 +1,15 @@
 //! ContactCard wraps a JSContact Card (RFC 9553) object.
 
-pub mod get;
-pub mod parse;
-pub mod query;
-pub mod set;
+pub(crate) mod get;
+pub(crate) mod parse;
+pub(crate) mod query;
+pub(crate) mod set;
 
 mod marker {
-    pub enum ContactCard {}
+    pub(crate) enum ContactCard {}
 }
 /// Strongly-typed ContactCard ID.
-pub type ContactCardId = crate::core::id::Id<marker::ContactCard>;
+pub(crate) type ContactCardId = crate::core::id::Id<marker::ContactCard>;
 
 crate::json_object_struct!(
     ContactCard,
@@ -20,7 +20,7 @@ crate::json_object_struct!(
 
 crate::define_open_property_enum! {
     #[non_exhaustive]
-    pub enum Property {
+    pub(crate) enum Property {
         Id => "id",
         Uid => "uid",
         AddressBookIds => "addressBookIds",

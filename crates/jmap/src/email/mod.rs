@@ -1,9 +1,14 @@
-pub mod get;
-pub mod import;
-pub mod parse;
-pub mod query;
-pub mod search_snippet;
-pub mod set;
+// The Account impl uses a strict subset of the Email/* surface
+// (Set / Get / Query / blob upload); the unused builder helpers,
+// SearchSnippet, and Import paths stay built for completeness.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod import;
+pub(crate) mod parse;
+pub(crate) mod query;
+pub(crate) mod search_snippet;
+pub(crate) mod set;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::Visitor};
@@ -16,13 +21,13 @@ use crate::mailbox::MailboxId;
 use crate::thread::ThreadId;
 
 mod marker {
-    pub enum Email {}
+    pub(crate) enum Email {}
 }
 /// Strongly-typed Email ID.
-pub type EmailId = crate::core::id::Id<marker::Email>;
+pub(crate) type EmailId = crate::core::id::Id<marker::Email>;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Email {
+pub(crate) struct Email {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<EmailId>,
@@ -149,7 +154,7 @@ pub struct Email {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct EmailCreate {
+pub(crate) struct EmailCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -239,7 +244,7 @@ pub struct EmailCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct EmailPatch {
+pub(crate) struct EmailPatch {
     #[serde(rename = "mailboxIds")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mailbox_ids: Option<HashMap<MailboxId, bool>>,
@@ -260,7 +265,7 @@ pub struct EmailPatch {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct EmailBodyPart {
+pub(crate) struct EmailBodyPart {
     #[serde(rename = "partId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) part_id: Option<String>,
@@ -315,7 +320,7 @@ pub struct EmailBodyPart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailBodyValue {
+pub(crate) struct EmailBodyValue {
     #[serde(rename = "value")]
     pub(super) value: String,
 
@@ -329,26 +334,26 @@ pub struct EmailBodyValue {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailAddress {
+pub(crate) struct EmailAddress {
     pub(super) name: Option<String>,
     pub(super) email: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailAddressGroup {
+pub(crate) struct EmailAddressGroup {
     pub(super) name: Option<String>,
     pub(super) addresses: Vec<EmailAddress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmailHeader {
+pub(crate) struct EmailHeader {
     pub(super) name: String,
     pub(super) value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     Id,
     BlobId,
     ThreadId,
@@ -381,7 +386,7 @@ pub enum Property {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum HeaderValue {
+pub(crate) enum HeaderValue {
     AsGroupedAddressesAll(Vec<Vec<EmailAddressGroup>>),
     AsGroupedAddresses(Vec<EmailAddressGroup>),
     AsAddressesAll(Vec<Vec<EmailAddress>>),
@@ -394,15 +399,15 @@ pub enum HeaderValue {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone)]
-pub struct Header {
-    pub name: String,
-    pub form: HeaderForm,
-    pub all: bool,
+pub(crate) struct Header {
+    pub(crate) name: String,
+    pub(crate) form: HeaderForm,
+    pub(crate) all: bool,
 }
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, PartialOrd, Ord)]
 #[non_exhaustive]
-pub enum HeaderForm {
+pub(crate) enum HeaderForm {
     Raw,
     Text,
     Addresses,
@@ -553,7 +558,7 @@ impl<'de> Deserialize<'de> for Header {
 }
 
 impl HeaderForm {
-    pub fn parse(value: &str) -> Option<HeaderForm> {
+    pub(crate) fn parse(value: &str) -> Option<HeaderForm> {
         match value {
             "asText" => Some(HeaderForm::Text),
             "asAddresses" => Some(HeaderForm::Addresses),
@@ -567,49 +572,49 @@ impl HeaderForm {
 }
 
 impl Header {
-    pub fn as_raw(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_raw(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::Raw,
             all,
         }
     }
-    pub fn as_text(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_text(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::Text,
             all,
         }
     }
-    pub fn as_addresses(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_addresses(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::Addresses,
             all,
         }
     }
-    pub fn as_grouped_addresses(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_grouped_addresses(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::GroupedAddresses,
             all,
         }
     }
-    pub fn as_message_ids(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_message_ids(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::MessageIds,
             all,
         }
     }
-    pub fn as_date(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_date(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::Date,
             all,
         }
     }
-    pub fn as_urls(name: impl Into<String>, all: bool) -> Header {
+    pub(crate) fn as_urls(name: impl Into<String>, all: bool) -> Header {
         Header {
             name: name.into(),
             form: HeaderForm::URLs,
@@ -617,7 +622,7 @@ impl Header {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Header> {
+    pub(crate) fn parse(value: &str) -> Option<Header> {
         let mut all = false;
         let mut form = HeaderForm::Raw;
         let mut header = None;
@@ -664,7 +669,7 @@ impl Display for HeaderForm {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum BodyProperty {
+pub(crate) enum BodyProperty {
     PartId,
     BlobId,
     Size,
@@ -760,7 +765,7 @@ impl<'de> Deserialize<'de> for BodyProperty {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct MailCapabilities {
+pub(crate) struct MailCapabilities {
     #[serde(rename = "maxMailboxesPerEmail")]
     max_mailboxes_per_email: Option<usize>,
 
@@ -782,7 +787,7 @@ pub struct MailCapabilities {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SubmissionCapabilities {
+pub(crate) struct SubmissionCapabilities {
     #[serde(rename = "maxDelayedSend")]
     max_delayed_send: usize,
 
@@ -792,14 +797,14 @@ pub struct SubmissionCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct QueryArguments {
+pub(crate) struct QueryArguments {
     #[serde(rename = "collapseThreads")]
     #[serde(skip_serializing_if = "Option::is_none")]
     collapse_threads: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct GetArguments {
+pub(crate) struct GetArguments {
     #[serde(rename = "bodyProperties")]
     #[serde(skip_serializing_if = "Option::is_none")]
     body_properties: Option<Vec<BodyProperty>>,
@@ -822,13 +827,13 @@ pub struct GetArguments {
 }
 
 impl QueryArguments {
-    pub fn collapse_threads(&mut self, collapse_threads: bool) {
+    pub(crate) fn collapse_threads(&mut self, collapse_threads: bool) {
         self.collapse_threads = collapse_threads.into();
     }
 }
 
 impl GetArguments {
-    pub fn body_properties(
+    pub(crate) fn body_properties(
         &mut self,
         body_properties: impl IntoIterator<Item = BodyProperty>,
     ) -> &mut Self {
@@ -836,22 +841,22 @@ impl GetArguments {
         self
     }
 
-    pub fn fetch_text_body_values(&mut self, fetch_text_body_values: bool) -> &mut Self {
+    pub(crate) fn fetch_text_body_values(&mut self, fetch_text_body_values: bool) -> &mut Self {
         self.fetch_text_body_values = fetch_text_body_values.into();
         self
     }
 
-    pub fn fetch_html_body_values(&mut self, fetch_html_body_values: bool) -> &mut Self {
+    pub(crate) fn fetch_html_body_values(&mut self, fetch_html_body_values: bool) -> &mut Self {
         self.fetch_html_body_values = fetch_html_body_values.into();
         self
     }
 
-    pub fn fetch_all_body_values(&mut self, fetch_all_body_values: bool) -> &mut Self {
+    pub(crate) fn fetch_all_body_values(&mut self, fetch_all_body_values: bool) -> &mut Self {
         self.fetch_all_body_values = fetch_all_body_values.into();
         self
     }
 
-    pub fn max_body_value_bytes(&mut self, max_body_value_bytes: usize) -> &mut Self {
+    pub(crate) fn max_body_value_bytes(&mut self, max_body_value_bytes: usize) -> &mut Self {
         self.max_body_value_bytes = max_body_value_bytes.into();
         self
     }
@@ -921,7 +926,7 @@ crate::define_copy_method!(
 
 impl EmailGet {
     #[must_use]
-    pub fn body_properties(
+    pub(crate) fn body_properties(
         mut self,
         body_properties: impl IntoIterator<Item = BodyProperty>,
     ) -> Self {
@@ -930,25 +935,25 @@ impl EmailGet {
     }
 
     #[must_use]
-    pub fn fetch_text_body_values(mut self, v: bool) -> Self {
+    pub(crate) fn fetch_text_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_text_body_values(v);
         self
     }
 
     #[must_use]
-    pub fn fetch_html_body_values(mut self, v: bool) -> Self {
+    pub(crate) fn fetch_html_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_html_body_values(v);
         self
     }
 
     #[must_use]
-    pub fn fetch_all_body_values(mut self, v: bool) -> Self {
+    pub(crate) fn fetch_all_body_values(mut self, v: bool) -> Self {
         self.arguments().fetch_all_body_values(v);
         self
     }
 
     #[must_use]
-    pub fn max_body_value_bytes(mut self, v: usize) -> Self {
+    pub(crate) fn max_body_value_bytes(mut self, v: usize) -> Self {
         self.arguments().max_body_value_bytes(v);
         self
     }
@@ -956,44 +961,44 @@ impl EmailGet {
 
 impl EmailQuery {
     #[must_use]
-    pub fn collapse_threads(mut self, v: bool) -> Self {
+    pub(crate) fn collapse_threads(mut self, v: bool) -> Self {
         self.arguments().collapse_threads(v);
         self
     }
 }
 
 impl MailCapabilities {
-    pub fn max_mailboxes_per_email(&self) -> Option<usize> {
+    pub(crate) fn max_mailboxes_per_email(&self) -> Option<usize> {
         self.max_mailboxes_per_email
     }
 
-    pub fn max_mailbox_depth(&self) -> usize {
+    pub(crate) fn max_mailbox_depth(&self) -> usize {
         self.max_mailbox_depth
     }
 
-    pub fn max_size_mailbox_name(&self) -> usize {
+    pub(crate) fn max_size_mailbox_name(&self) -> usize {
         self.max_size_mailbox_name
     }
 
-    pub fn max_size_attachments_per_email(&self) -> usize {
+    pub(crate) fn max_size_attachments_per_email(&self) -> usize {
         self.max_size_attachments_per_email
     }
 
-    pub fn email_query_sort_options(&self) -> &[String] {
+    pub(crate) fn email_query_sort_options(&self) -> &[String] {
         &self.email_query_sort_options
     }
 
-    pub fn may_create_top_level_mailbox(&self) -> bool {
+    pub(crate) fn may_create_top_level_mailbox(&self) -> bool {
         self.may_create_top_level_mailbox
     }
 }
 
 impl SubmissionCapabilities {
-    pub fn max_delayed_send(&self) -> usize {
+    pub(crate) fn max_delayed_send(&self) -> usize {
         self.max_delayed_send
     }
 
-    pub fn submission_extensions(&self) -> &HashMap<String, Vec<String>> {
+    pub(crate) fn submission_extensions(&self) -> &HashMap<String, Vec<String>> {
         &self.submission_extensions
     }
 }
@@ -1003,86 +1008,86 @@ use std::collections::BTreeMap;
 
 #[cfg(feature = "debug")]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct TestEmail {
+pub(crate) struct TestEmail {
     #[serde(rename = "mailboxIds")]
-    pub mailbox_ids: Option<BTreeMap<String, bool>>,
+    pub(crate) mailbox_ids: Option<BTreeMap<String, bool>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub keywords: Option<BTreeMap<String, bool>>,
+    pub(crate) keywords: Option<BTreeMap<String, bool>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<usize>,
+    pub(crate) size: Option<usize>,
 
     #[serde(rename = "receivedAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub received_at: Option<DateTime<Utc>>,
+    pub(crate) received_at: Option<DateTime<Utc>>,
 
     #[serde(rename = "messageId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<Vec<String>>,
+    pub(crate) message_id: Option<Vec<String>>,
 
     #[serde(rename = "inReplyTo")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub in_reply_to: Option<Vec<String>>,
+    pub(crate) in_reply_to: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub references: Option<Vec<String>>,
+    pub(crate) references: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sender: Option<Vec<EmailAddress>>,
+    pub(crate) sender: Option<Vec<EmailAddress>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<Vec<EmailAddress>>,
+    pub(crate) from: Option<Vec<EmailAddress>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<Vec<EmailAddress>>,
+    pub(crate) to: Option<Vec<EmailAddress>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cc: Option<Vec<EmailAddress>>,
+    pub(crate) cc: Option<Vec<EmailAddress>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bcc: Option<Vec<EmailAddress>>,
+    pub(crate) bcc: Option<Vec<EmailAddress>>,
 
     #[serde(rename = "replyTo")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<Vec<EmailAddress>>,
+    pub(crate) reply_to: Option<Vec<EmailAddress>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<String>,
+    pub(crate) subject: Option<String>,
 
     #[serde(rename = "sentAt")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sent_at: Option<DateTime<Utc>>,
+    pub(crate) sent_at: Option<DateTime<Utc>>,
 
     #[serde(rename = "bodyStructure")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_structure: Option<Box<EmailBodyPart>>,
+    pub(crate) body_structure: Option<Box<EmailBodyPart>>,
 
     #[serde(rename = "bodyValues")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_values: Option<BTreeMap<String, EmailBodyValue>>,
+    pub(crate) body_values: Option<BTreeMap<String, EmailBodyValue>>,
 
     #[serde(rename = "textBody")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub text_body: Option<Vec<EmailBodyPart>>,
+    pub(crate) text_body: Option<Vec<EmailBodyPart>>,
 
     #[serde(rename = "htmlBody")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub html_body: Option<Vec<EmailBodyPart>>,
+    pub(crate) html_body: Option<Vec<EmailBodyPart>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachments: Option<Vec<EmailBodyPart>>,
+    pub(crate) attachments: Option<Vec<EmailBodyPart>>,
 
     #[serde(rename = "hasAttachment")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub has_attachment: Option<bool>,
+    pub(crate) has_attachment: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
+    pub(crate) preview: Option<String>,
 
     #[serde(flatten)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<Header, Option<HeaderValue>>,
+    pub(crate) headers: BTreeMap<Header, Option<HeaderValue>>,
 }
 
 #[cfg(feature = "debug")]

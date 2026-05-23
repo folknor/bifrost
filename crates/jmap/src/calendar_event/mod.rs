@@ -1,17 +1,17 @@
 //! CalendarEvent wraps a JSCalendar Event (RFC 8984) object.
 
-pub mod get;
-pub mod parse;
-pub mod query;
-pub mod set;
+pub(crate) mod get;
+pub(crate) mod parse;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use serde::{Deserialize, Serialize};
 
 mod marker {
-    pub enum CalendarEvent {}
+    pub(crate) enum CalendarEvent {}
 }
 /// Strongly-typed CalendarEvent ID.
-pub type CalendarEventId = crate::core::id::Id<marker::CalendarEvent>;
+pub(crate) type CalendarEventId = crate::core::id::Id<marker::CalendarEvent>;
 
 crate::json_object_struct!(
     CalendarEvent,
@@ -21,31 +21,31 @@ crate::json_object_struct!(
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Alert {
+pub(crate) struct Alert {
     #[serde(rename = "@type")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub type_: Option<String>,
+    pub(crate) type_: Option<String>,
 
     #[serde(rename = "trigger")]
-    pub trigger: AlertTrigger,
+    pub(crate) trigger: AlertTrigger,
 
     #[serde(rename = "action")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<AlertAction>,
+    pub(crate) action: Option<AlertAction>,
 
     #[serde(rename = "acknowledged")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub acknowledged: Option<String>,
+    pub(crate) acknowledged: Option<String>,
 
     #[serde(rename = "relatedTo")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub related_to: Option<serde_json::Map<String, serde_json::Value>>,
+    pub(crate) related_to: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "@type")]
 #[non_exhaustive]
-pub enum AlertTrigger {
+pub(crate) enum AlertTrigger {
     #[serde(rename = "OffsetTrigger")]
     OffsetTrigger {
         #[serde(rename = "offset")]
@@ -66,7 +66,7 @@ pub enum AlertTrigger {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum AlertAction {
+pub(crate) enum AlertAction {
     #[serde(rename = "display")]
     Display,
     #[serde(rename = "email")]
@@ -75,7 +75,7 @@ pub enum AlertAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum RelativeTo {
+pub(crate) enum RelativeTo {
     #[serde(rename = "start")]
     Start,
     #[serde(rename = "end")]
@@ -83,78 +83,78 @@ pub enum RelativeTo {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct GetArguments {
+pub(crate) struct GetArguments {
     #[serde(rename = "recurrenceOverridesBefore")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recurrence_overrides_before: Option<String>,
+    pub(crate) recurrence_overrides_before: Option<String>,
 
     #[serde(rename = "recurrenceOverridesAfter")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recurrence_overrides_after: Option<String>,
+    pub(crate) recurrence_overrides_after: Option<String>,
 
     #[serde(rename = "reduceParticipants")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reduce_participants: Option<bool>,
+    pub(crate) reduce_participants: Option<bool>,
 
     #[serde(rename = "timeZone")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_zone: Option<String>,
+    pub(crate) time_zone: Option<String>,
 }
 
 impl GetArguments {
-    pub fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
+    pub(crate) fn recurrence_overrides_before(&mut self, before: impl Into<String>) -> &mut Self {
         self.recurrence_overrides_before = Some(before.into());
         self
     }
 
-    pub fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
+    pub(crate) fn recurrence_overrides_after(&mut self, after: impl Into<String>) -> &mut Self {
         self.recurrence_overrides_after = Some(after.into());
         self
     }
 
-    pub fn reduce_participants(&mut self, reduce: bool) -> &mut Self {
+    pub(crate) fn reduce_participants(&mut self, reduce: bool) -> &mut Self {
         self.reduce_participants = Some(reduce);
         self
     }
 
-    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+    pub(crate) fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
         self.time_zone = Some(tz.into());
         self
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct SetArguments {
+pub(crate) struct SetArguments {
     #[serde(rename = "sendSchedulingMessages")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub send_scheduling_messages: Option<bool>,
+    pub(crate) send_scheduling_messages: Option<bool>,
 }
 
 impl SetArguments {
-    pub fn send_scheduling_messages(&mut self, send: bool) -> &mut Self {
+    pub(crate) fn send_scheduling_messages(&mut self, send: bool) -> &mut Self {
         self.send_scheduling_messages = Some(send);
         self
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct QueryArguments {
+pub(crate) struct QueryArguments {
     #[serde(rename = "expandRecurrences")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expand_recurrences: Option<bool>,
+    pub(crate) expand_recurrences: Option<bool>,
 
     #[serde(rename = "timeZone")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_zone: Option<String>,
+    pub(crate) time_zone: Option<String>,
 }
 
 impl QueryArguments {
-    pub fn expand_recurrences(&mut self, expand: bool) -> &mut Self {
+    pub(crate) fn expand_recurrences(&mut self, expand: bool) -> &mut Self {
         self.expand_recurrences = Some(expand);
         self
     }
 
-    pub fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
+    pub(crate) fn time_zone(&mut self, tz: impl Into<String>) -> &mut Self {
         self.time_zone = Some(tz.into());
         self
     }
@@ -163,7 +163,7 @@ impl QueryArguments {
 crate::define_open_property_enum! {
     /// Property names for CalendarEvent/get `properties` lists.
     #[non_exhaustive]
-    pub enum Property {
+    pub(crate) enum Property {
         Id => "id",
         Uid => "uid",
         CalendarIds => "calendarIds",
@@ -266,25 +266,25 @@ crate::define_copy_method!(
 
 impl CalendarEventGet {
     #[must_use]
-    pub fn recurrence_overrides_before(mut self, before: impl Into<String>) -> Self {
+    pub(crate) fn recurrence_overrides_before(mut self, before: impl Into<String>) -> Self {
         self.arguments().recurrence_overrides_before(before);
         self
     }
 
     #[must_use]
-    pub fn recurrence_overrides_after(mut self, after: impl Into<String>) -> Self {
+    pub(crate) fn recurrence_overrides_after(mut self, after: impl Into<String>) -> Self {
         self.arguments().recurrence_overrides_after(after);
         self
     }
 
     #[must_use]
-    pub fn reduce_participants(mut self, reduce: bool) -> Self {
+    pub(crate) fn reduce_participants(mut self, reduce: bool) -> Self {
         self.arguments().reduce_participants(reduce);
         self
     }
 
     #[must_use]
-    pub fn time_zone(mut self, tz: impl Into<String>) -> Self {
+    pub(crate) fn time_zone(mut self, tz: impl Into<String>) -> Self {
         self.arguments().time_zone(tz);
         self
     }
@@ -292,7 +292,7 @@ impl CalendarEventGet {
 
 impl CalendarEventSet {
     #[must_use]
-    pub fn send_scheduling_messages(mut self, send: bool) -> Self {
+    pub(crate) fn send_scheduling_messages(mut self, send: bool) -> Self {
         self.arguments().send_scheduling_messages(send);
         self
     }
@@ -300,13 +300,13 @@ impl CalendarEventSet {
 
 impl CalendarEventQuery {
     #[must_use]
-    pub fn expand_recurrences(mut self, expand: bool) -> Self {
+    pub(crate) fn expand_recurrences(mut self, expand: bool) -> Self {
         self.arguments().expand_recurrences(expand);
         self
     }
 
     #[must_use]
-    pub fn time_zone(mut self, tz: impl Into<String>) -> Self {
+    pub(crate) fn time_zone(mut self, tz: impl Into<String>) -> Self {
         self.arguments().time_zone(tz);
         self
     }

@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use super::Object;
 use super::id::AccountId;
 
-pub trait ChangesObject: Object {
+pub(crate) trait ChangesObject: Object {
     type ChangesResponse: DeserializeOwned;
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ChangesRequest {
+pub(crate) struct ChangesRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -24,7 +24,7 @@ pub struct ChangesRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ChangesResponse<O: ChangesObject> {
+pub(crate) struct ChangesResponse<O: ChangesObject> {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -48,7 +48,7 @@ pub struct ChangesResponse<O: ChangesObject> {
 }
 
 impl ChangesRequest {
-    pub fn new(since_state: impl Into<String>) -> Self {
+    pub(crate) fn new(since_state: impl Into<String>) -> Self {
         ChangesRequest {
             account_id: AccountId::new(""),
             since_state: since_state.into(),
@@ -56,71 +56,71 @@ impl ChangesRequest {
         }
     }
 
-    pub fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn account_id(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
 
-    pub fn max_changes(&mut self, max_changes: NonZeroUsize) -> &mut Self {
+    pub(crate) fn max_changes(&mut self, max_changes: NonZeroUsize) -> &mut Self {
         self.max_changes = Some(max_changes);
         self
     }
 }
 
 impl<O: ChangesObject> ChangesResponse<O> {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn into_account_id(self) -> AccountId {
+    pub(crate) fn into_account_id(self) -> AccountId {
         self.account_id
     }
 
-    pub fn old_state(&self) -> &str {
+    pub(crate) fn old_state(&self) -> &str {
         &self.old_state
     }
 
-    pub fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &str {
         &self.new_state
     }
 
-    pub fn into_new_state(self) -> String {
+    pub(crate) fn into_new_state(self) -> String {
         self.new_state
     }
 
-    pub fn has_more_changes(&self) -> bool {
+    pub(crate) fn has_more_changes(&self) -> bool {
         self.has_more_changes
     }
 
-    pub fn created(&self) -> &[O::Id] {
+    pub(crate) fn created(&self) -> &[O::Id] {
         &self.created
     }
 
-    pub fn into_created(self) -> Vec<O::Id> {
+    pub(crate) fn into_created(self) -> Vec<O::Id> {
         self.created
     }
 
-    pub fn updated(&self) -> &[O::Id] {
+    pub(crate) fn updated(&self) -> &[O::Id] {
         &self.updated
     }
 
-    pub fn into_updated(self) -> Vec<O::Id> {
+    pub(crate) fn into_updated(self) -> Vec<O::Id> {
         self.updated
     }
 
-    pub fn destroyed(&self) -> &[O::Id] {
+    pub(crate) fn destroyed(&self) -> &[O::Id] {
         &self.destroyed
     }
 
-    pub fn into_destroyed(self) -> Vec<O::Id> {
+    pub(crate) fn into_destroyed(self) -> Vec<O::Id> {
         self.destroyed
     }
 
-    pub fn arguments(&self) -> &O::ChangesResponse {
+    pub(crate) fn arguments(&self) -> &O::ChangesResponse {
         &self.arguments
     }
 
-    pub fn total_changes(&self) -> usize {
+    pub(crate) fn total_changes(&self) -> usize {
         self.created.len() + self.updated.len() + self.destroyed.len()
     }
 }

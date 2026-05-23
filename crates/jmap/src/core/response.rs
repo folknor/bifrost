@@ -9,7 +9,7 @@ use super::request::CallHandle;
 
 /// A parsed JMAP response with typed method result extraction.
 #[derive(Debug)]
-pub struct Response {
+pub(crate) struct Response {
     raw: Vec<(String, RawCallResult, String)>,
     session_state: String,
     created_ids: Option<HashMap<String, String>>,
@@ -28,7 +28,10 @@ impl Response {
     ///
     /// Compile-time safe: the handle's type parameter ensures the response
     /// is deserialized into the correct type.
-    pub fn get<M: JmapMethod>(&mut self, handle: &CallHandle<M>) -> crate::Result<M::Response> {
+    pub(crate) fn get<M: JmapMethod>(
+        &mut self,
+        handle: &CallHandle<M>,
+    ) -> crate::Result<M::Response> {
         let pos = self
             .raw
             .iter()
@@ -45,11 +48,11 @@ impl Response {
         }
     }
 
-    pub fn session_state(&self) -> &str {
+    pub(crate) fn session_state(&self) -> &str {
         &self.session_state
     }
 
-    pub fn created_ids(&self) -> Option<&HashMap<String, String>> {
+    pub(crate) fn created_ids(&self) -> Option<&HashMap<String, String>> {
         self.created_ids.as_ref()
     }
 }

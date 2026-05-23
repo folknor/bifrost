@@ -3,22 +3,22 @@ use crate::principal::ACL;
 use std::collections::HashMap;
 
 impl MailboxCreate {
-    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+    pub(crate) fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
+    pub(crate) fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
         self.parent_id = parent_id.map(std::convert::Into::into);
         self
     }
 
-    pub fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
+    pub(crate) fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
         self.parent_id = Some(MailboxId::new(format!("#{parent_id_ref}")));
         self
     }
 
-    pub fn role(&mut self, role: Role) -> &mut Self {
+    pub(crate) fn role(&mut self, role: Role) -> &mut Self {
         if !matches!(role, Role::None) {
             self.role = Some(role);
         } else {
@@ -27,17 +27,17 @@ impl MailboxCreate {
         self
     }
 
-    pub fn sort_order(&mut self, sort_order: u32) -> &mut Self {
+    pub(crate) fn sort_order(&mut self, sort_order: u32) -> &mut Self {
         self.sort_order = sort_order.into();
         self
     }
 
-    pub fn is_subscribed(&mut self, is_subscribed: bool) -> &mut Self {
+    pub(crate) fn is_subscribed(&mut self, is_subscribed: bool) -> &mut Self {
         self.is_subscribed = is_subscribed.into();
         self
     }
 
-    pub fn acls<T, U, V>(&mut self, acls: T) -> &mut Self
+    pub(crate) fn acls<T, U, V>(&mut self, acls: T) -> &mut Self
     where
         T: IntoIterator<Item = (U, V)>,
         U: Into<String>,
@@ -53,22 +53,22 @@ impl MailboxCreate {
 }
 
 impl MailboxPatch {
-    pub fn name(&mut self, name: impl Into<String>) -> &mut Self {
+    pub(crate) fn name(&mut self, name: impl Into<String>) -> &mut Self {
         self.name = Some(name.into());
         self
     }
 
-    pub fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
+    pub(crate) fn parent_id(&mut self, parent_id: Option<impl Into<MailboxId>>) -> &mut Self {
         self.parent_id = parent_id.map(std::convert::Into::into);
         self
     }
 
-    pub fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
+    pub(crate) fn parent_id_ref(&mut self, parent_id_ref: &str) -> &mut Self {
         self.parent_id = Some(MailboxId::new(format!("#{parent_id_ref}")));
         self
     }
 
-    pub fn role(&mut self, role: Role) -> &mut Self {
+    pub(crate) fn role(&mut self, role: Role) -> &mut Self {
         if !matches!(role, Role::None) {
             self.role = Some(role);
         } else {
@@ -77,17 +77,17 @@ impl MailboxPatch {
         self
     }
 
-    pub fn sort_order(&mut self, sort_order: u32) -> &mut Self {
+    pub(crate) fn sort_order(&mut self, sort_order: u32) -> &mut Self {
         self.sort_order = sort_order.into();
         self
     }
 
-    pub fn is_subscribed(&mut self, is_subscribed: bool) -> &mut Self {
+    pub(crate) fn is_subscribed(&mut self, is_subscribed: bool) -> &mut Self {
         self.is_subscribed = is_subscribed.into();
         self
     }
 
-    pub fn acls<T, U, V>(&mut self, acls: T) -> &mut Self
+    pub(crate) fn acls<T, U, V>(&mut self, acls: T) -> &mut Self
     where
         T: IntoIterator<Item = (U, V)>,
         U: Into<String>,
@@ -101,7 +101,7 @@ impl MailboxPatch {
         self
     }
 
-    pub fn acl(&mut self, id: &str, acl: impl IntoIterator<Item = ACL>) -> &mut Self {
+    pub(crate) fn acl(&mut self, id: &str, acl: impl IntoIterator<Item = ACL>) -> &mut Self {
         self.acl_patch.get_or_insert_with(HashMap::new).insert(
             format!("shareWith/{id}"),
             ACLPatch::Replace(acl.into_iter().map(|acl| (acl, true)).collect()),
@@ -109,7 +109,7 @@ impl MailboxPatch {
         self
     }
 
-    pub fn acl_set(&mut self, id: &str, acl: ACL, set: bool) -> &mut Self {
+    pub(crate) fn acl_set(&mut self, id: &str, acl: ACL, set: bool) -> &mut Self {
         self.acl_patch
             .get_or_insert_with(HashMap::new)
             .insert(format!("shareWith/{id}/{acl}"), ACLPatch::Set(set));
@@ -117,12 +117,12 @@ impl MailboxPatch {
     }
 }
 
-pub fn role_not_set(role: &Option<Role>) -> bool {
+pub(crate) fn role_not_set(role: &Option<Role>) -> bool {
     matches!(role, Some(Role::None))
 }
 
 impl SetArguments {
-    pub fn on_destroy_remove_emails(&mut self, value: bool) -> &mut Self {
+    pub(crate) fn on_destroy_remove_emails(&mut self, value: bool) -> &mut Self {
         self.on_destroy_remove_emails = value.into();
         self
     }

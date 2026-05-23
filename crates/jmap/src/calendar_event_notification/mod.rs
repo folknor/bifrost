@@ -1,19 +1,20 @@
-pub mod get;
-pub mod query;
-pub mod set;
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
 mod marker {
-    pub enum CalendarEventNotification {}
+    pub(crate) enum CalendarEventNotification {}
 }
 /// Strongly-typed CalendarEventNotification ID.
-pub type CalendarEventNotificationId = crate::core::id::Id<marker::CalendarEventNotification>;
+pub(crate) type CalendarEventNotificationId =
+    crate::core::id::Id<marker::CalendarEventNotification>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarEventNotification {
+pub(crate) struct CalendarEventNotification {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<CalendarEventNotificationId>,
@@ -49,29 +50,29 @@ pub struct CalendarEventNotification {
 
 /// Uninhabitable - notifications are server-generated, only destroy is allowed.
 #[derive(Debug, Clone, Serialize)]
-pub enum CalendarEventNotificationCreate {}
+pub(crate) enum CalendarEventNotificationCreate {}
 
 #[derive(Debug, Clone, Serialize)]
-pub enum CalendarEventNotificationPatch {}
+pub(crate) enum CalendarEventNotificationPatch {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangedBy {
+pub(crate) struct ChangedBy {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub(crate) name: Option<String>,
 
     #[serde(rename = "email")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
+    pub(crate) email: Option<String>,
 
     #[serde(rename = "principalId")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub principal_id: Option<crate::principal::PrincipalId>,
+    pub(crate) principal_id: Option<crate::principal::PrincipalId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum NotificationType {
+pub(crate) enum NotificationType {
     #[serde(rename = "created")]
     Created,
     #[serde(rename = "updated")]
@@ -82,7 +83,7 @@ pub enum NotificationType {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "created")]

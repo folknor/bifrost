@@ -12,21 +12,21 @@ use zeroize::Zeroizing;
 /// any other credential material and avoid formatting or logging them.
 #[repr(transparent)]
 #[derive(Clone, Default, Eq)]
-pub struct SecretString(Zeroizing<String>);
+pub(crate) struct SecretString(Zeroizing<String>);
 
 impl SecretString {
     /// Borrow the unredacted secret as a string slice.
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
     /// Borrow the unredacted secret as bytes.
-    pub fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 
     /// Consume the wrapper and return the zeroizing string.
-    pub fn into_zeroizing(self) -> Zeroizing<String> {
+    pub(crate) fn into_zeroizing(self) -> Zeroizing<String> {
         self.0
     }
 }
@@ -81,35 +81,5 @@ impl PartialEq for SecretString {
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted>")
-    }
-}
-
-/// Converts caller-owned secret material into zeroizing storage.
-pub trait IntoSecretString {
-    /// Move the secret into zeroizing storage.
-    fn into_secret_string(self) -> SecretString;
-}
-
-impl IntoSecretString for String {
-    fn into_secret_string(self) -> SecretString {
-        SecretString::from(self)
-    }
-}
-
-impl IntoSecretString for &str {
-    fn into_secret_string(self) -> SecretString {
-        SecretString::from(self)
-    }
-}
-
-impl IntoSecretString for SecretString {
-    fn into_secret_string(self) -> SecretString {
-        self
-    }
-}
-
-impl IntoSecretString for Zeroizing<String> {
-    fn into_secret_string(self) -> SecretString {
-        SecretString::from(self)
     }
 }

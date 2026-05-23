@@ -34,10 +34,8 @@ use super::driver::ConsumerErased;
 mod error;
 mod unfold;
 
-// pub: Pipeline::execute returns this error to direct pipelining callers.
-pub use error::PipelineError;
-// pub: Pipeline::execute uses this public bound for typed tuple unfolding.
-pub use unfold::UnfoldTuple;
+pub(crate) use error::PipelineError;
+pub(crate) use unfold::UnfoldTuple;
 
 // ---------------------------------------------------------------------------
 // Pipeline builder

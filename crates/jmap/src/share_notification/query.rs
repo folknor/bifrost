@@ -8,7 +8,7 @@ use super::ShareNotification;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     /// Notifications created on or after this UTCDate.
     After {
         #[serde(rename = "after")]
@@ -35,31 +35,31 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "created")]
     Created,
 }
 
 impl Filter {
-    pub fn after(value: impl Into<String>) -> Self {
+    pub(crate) fn after(value: impl Into<String>) -> Self {
         Filter::After {
             value: value.into(),
         }
     }
 
-    pub fn before(value: impl Into<String>) -> Self {
+    pub(crate) fn before(value: impl Into<String>) -> Self {
         Filter::Before {
             value: value.into(),
         }
     }
 
-    pub fn object_type(value: impl Into<String>) -> Self {
+    pub(crate) fn object_type(value: impl Into<String>) -> Self {
         Filter::ObjectType {
             value: value.into(),
         }
     }
 
-    pub fn object_account_id(value: impl Into<crate::core::id::AccountId>) -> Self {
+    pub(crate) fn object_account_id(value: impl Into<crate::core::id::AccountId>) -> Self {
         Filter::ObjectAccountId {
             value: value.into(),
         }
@@ -67,7 +67,7 @@ impl Filter {
 }
 
 impl Comparator {
-    pub fn created() -> query::Comparator<Comparator> {
+    pub(crate) fn created() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Created)
     }
 }

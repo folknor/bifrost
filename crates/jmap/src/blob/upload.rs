@@ -20,7 +20,7 @@ use crate::{
 /// [`Client::upload_to`] is usable when the caller needs the raw
 /// `accountId` echo or `size` field.
 #[derive(Debug, Deserialize)]
-pub struct UploadResponse {
+pub(crate) struct UploadResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -51,7 +51,7 @@ impl<Tr: HttpTransport> Client<Tr> {
     /// Upload `data` to the named account's blob store. Lower-level
     /// counterpart to [`Account::upload`] for callers that need the
     /// raw [`UploadResponse`] (echoing server-reported size, etc.).
-    pub async fn upload_to(
+    pub(crate) async fn upload_to(
         &self,
         account_id: &AccountId,
         data: impl Into<Vec<u8>>,
@@ -95,7 +95,7 @@ impl<Tr: HttpTransport> Account<Tr> {
     /// After the upload the returned `BlobRef` records the binding,
     /// and `Client::download(&blob_ref)` works against any account
     /// the ref points at.
-    pub async fn upload(
+    pub(crate) async fn upload(
         &self,
         data: impl Into<Vec<u8>>,
         content_type: Option<&str>,
@@ -114,23 +114,23 @@ impl<Tr: HttpTransport> Account<Tr> {
 }
 
 impl UploadResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn blob_id(&self) -> &BlobId {
+    pub(crate) fn blob_id(&self) -> &BlobId {
         &self.blob_id
     }
 
-    pub fn content_type(&self) -> &str {
+    pub(crate) fn content_type(&self) -> &str {
         &self.type_
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.size
     }
 
-    pub fn into_blob_id(self) -> BlobId {
+    pub(crate) fn into_blob_id(self) -> BlobId {
         self.blob_id
     }
 }

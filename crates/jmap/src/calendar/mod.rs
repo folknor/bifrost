@@ -1,5 +1,5 @@
-pub mod get;
-pub mod set;
+pub(crate) mod get;
+pub(crate) mod set;
 
 use std::fmt::Display;
 
@@ -11,13 +11,13 @@ use crate::core::field::Field;
 use crate::calendar_event::Alert;
 
 mod marker {
-    pub enum Calendar {}
+    pub(crate) enum Calendar {}
 }
 /// Strongly-typed Calendar ID.
-pub type CalendarId = crate::core::id::Id<marker::Calendar>;
+pub(crate) type CalendarId = crate::core::id::Id<marker::Calendar>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Calendar {
+pub(crate) struct Calendar {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<CalendarId>,
@@ -82,7 +82,7 @@ pub struct Calendar {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CalendarCreate {
+pub(crate) struct CalendarCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -132,7 +132,7 @@ pub struct CalendarCreate {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct CalendarPatch {
+pub(crate) struct CalendarPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -180,7 +180,7 @@ pub struct CalendarPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum IncludeInAvailability {
+pub(crate) enum IncludeInAvailability {
     #[serde(rename = "all")]
     All,
     #[serde(rename = "attending")]
@@ -190,58 +190,58 @@ pub enum IncludeInAvailability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CalendarRights {
+pub(crate) struct CalendarRights {
     #[serde(rename = "mayReadFreeBusy")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_read_free_busy: Option<bool>,
+    pub(crate) may_read_free_busy: Option<bool>,
 
     #[serde(rename = "mayReadItems")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_read_items: Option<bool>,
+    pub(crate) may_read_items: Option<bool>,
 
     #[serde(rename = "mayWriteAll")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_write_all: Option<bool>,
+    pub(crate) may_write_all: Option<bool>,
 
     #[serde(rename = "mayWriteOwn")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_write_own: Option<bool>,
+    pub(crate) may_write_own: Option<bool>,
 
     #[serde(rename = "mayUpdatePrivate")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_update_private: Option<bool>,
+    pub(crate) may_update_private: Option<bool>,
 
     #[serde(rename = "mayRSVP")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_rsvp: Option<bool>,
+    pub(crate) may_rsvp: Option<bool>,
 
     #[serde(rename = "mayShare")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_share: Option<bool>,
+    pub(crate) may_share: Option<bool>,
 
     #[serde(rename = "mayDelete")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub may_delete: Option<bool>,
+    pub(crate) may_delete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct CalendarSetArguments {
+pub(crate) struct CalendarSetArguments {
     #[serde(rename = "onDestroyRemoveEvents")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_destroy_remove_events: Option<bool>,
+    pub(crate) on_destroy_remove_events: Option<bool>,
 
     #[serde(rename = "onSuccessSetIsDefault")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_success_set_is_default: Option<String>,
+    pub(crate) on_success_set_is_default: Option<String>,
 }
 
 impl CalendarSetArguments {
-    pub fn on_destroy_remove_events(&mut self, remove: bool) -> &mut Self {
+    pub(crate) fn on_destroy_remove_events(&mut self, remove: bool) -> &mut Self {
         self.on_destroy_remove_events = Some(remove);
         self
     }
 
-    pub fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
+    pub(crate) fn on_success_set_is_default(&mut self, id: impl Into<String>) -> &mut Self {
         self.on_success_set_is_default = Some(id.into());
         self
     }
@@ -249,7 +249,7 @@ impl CalendarSetArguments {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]
@@ -367,13 +367,13 @@ crate::define_changes_method!(
 
 impl CalendarSet {
     #[must_use]
-    pub fn on_destroy_remove_events(mut self, remove: bool) -> Self {
+    pub(crate) fn on_destroy_remove_events(mut self, remove: bool) -> Self {
         self.arguments().on_destroy_remove_events(remove);
         self
     }
 
     #[must_use]
-    pub fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
+    pub(crate) fn on_success_set_is_default(mut self, id: impl Into<String>) -> Self {
         self.arguments().on_success_set_is_default(id);
         self
     }

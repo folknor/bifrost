@@ -1,13 +1,11 @@
 # bifrost-graph reference
 
 Current architecture of the Graph Account-layer code under
-`crates/graph/src/account/`. The crate hosts a `GraphClient` for
-Microsoft Graph's mail/calendar/contact REST API plus an
-`Account` / `AccountFactory` pair that sits on top of it, driving
-`@odata.deltaLink` delta-token sync, `/subscriptions` webhook
-push with a renewal health worker, and an EWS streaming
-notifications fallback for tenants where webhooks are not
-reachable.
+`crates/graph/src/account/`. The public surface is
+`bifrost_graph::account::{GraphClient, GraphAccountFactory}`:
+`GraphClient` carries credentials / endpoints into the factory,
+and consumers use the returned `Arc<dyn Account>`. Raw Microsoft
+Graph REST helpers and wire types are crate-private.
 
 The same `Account` impl now owns Graph's Stage 1 PIM action
 surface: message moves and flag/category writes, send/draft
@@ -69,6 +67,14 @@ concurrency.
   and per-id warning helpers.
 
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
+
+The `account` module path remains public because the cross-crate
+conformance test and existing consumers construct the factory
+through it; helper modules and `GraphAccount` stay crate-private.
+`GraphClient` is public only as factory input. Its public methods
+configure credentials, API bases, a pre-attached `AccountNet`,
+token rotation, or shared-mailbox scoping; request helpers stay
+`pub(crate)`.
 
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, and
 an optional `PushEndpoint` (the public HTTPS webhook URL).
@@ -567,31 +573,22 @@ referenceAttachment in a mixed batch.
 
 ## Known limitations
 
-- Discovery is mail-only. `discover_cursor_scope_events` only
-  enumerates `mailFolders` and emits
-  `CursorScope::FolderType { ty: ObjectType::Email }` rows.
-  Event and contact cursors are valid if the engine constructs
-  them by hand, but they are not surfaced through the cursor
-  scope discovery API.
-- `scope_lifecycle_stream` is empty. Graph has no folder-lifecycle
-  notification surface and the polling-based scope refresh has
-  not been wired in; folder creates / renames / deletes are
-  observed only at account reopen.
+- Discovery is mail-only. `discover_cursor_scope_events` emits
+  mail-folder Email scopes; event and contact cursors are valid
+  only if the engine constructs them by hand.
+- `scope_lifecycle_stream` is empty. Folder creates / renames /
+  deletes are observed only at account reopen.
 - EWS streaming requires Exchange Web Services to be reachable
-  on the tenant with an access token the server will accept on
-  the EWS endpoint. Tenants that have disabled EWS or that block
-  basic-auth-shaped EWS tokens cannot use the EWS fallback.
+  with a token the EWS endpoint accepts.
 - Webhook mode requires a public HTTPS endpoint at
-  `PushEndpoint::webhook_url`. Without it `push_subscribe`
-  returns `Error::MissingCoreCapability`.
+  `PushEndpoint::webhook_url`; otherwise `push_subscribe` returns
+  `Error::MissingCoreCapability`.
 - Blob range support is per-handle. fileAttachment handles
   advertise `supports_range = true`; itemAttachment and
   referenceAttachment handles do not. The account capability is
   `BlobRangeSupport::Conditional` to reflect this split.
-- Delta-token expiry is reactive. There is no proactive refresh
-  loop; the first request that returns 410 Gone or 400
-  InvalidDeltaToken collapses onto `RestartScope` and the engine
-  rebuilds the cursor through inventory.
+- Delta-token expiry is reactive. 410 Gone or 400
+  InvalidDeltaToken collapses onto `RestartScope`.
 - `MutationReplaySafety::None`. `IdempotencyKey` is accepted on
   the API surface but not transmitted; the engine's read-back
   guard is the only lost-update protection beyond the

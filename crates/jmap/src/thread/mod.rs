@@ -1,17 +1,17 @@
-pub mod get;
+pub(crate) mod get;
 
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
 mod marker {
-    pub enum Thread {}
+    pub(crate) enum Thread {}
 }
 /// Strongly-typed Thread ID.
-pub type ThreadId = crate::core::id::Id<marker::Thread>;
+pub(crate) type ThreadId = crate::core::id::Id<marker::Thread>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Thread {
+pub(crate) struct Thread {
     id: ThreadId,
     #[serde(rename = "emailIds")]
     email_ids: Vec<crate::email::EmailId>,
@@ -19,7 +19,7 @@ pub struct Thread {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "emailIds")]

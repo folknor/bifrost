@@ -15,12 +15,12 @@ use crate::Error;
 // -- Minimal test types --
 
 mod test_marker {
-    pub enum TestObj {}
+    pub(crate) enum TestObj {}
 }
-pub type TestObjId = crate::core::id::Id<test_marker::TestObj>;
+pub(crate) type TestObjId = crate::core::id::Id<test_marker::TestObj>;
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TestObj {
+pub(crate) struct TestObj {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,7 +28,7 @@ pub struct TestObj {
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct TestObjCreate {
+pub(crate) struct TestObjCreate {
     #[serde(skip)]
     _create_id: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,13 +36,13 @@ pub struct TestObjCreate {
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct TestObjPatch {
+pub(crate) struct TestObjPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
-pub enum TestProp {
+pub(crate) enum TestProp {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]

@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 /// Capabilities with session-level configuration should set `Config`
 /// to their configuration struct. Capabilities with no configuration
 /// (empty JSON object) should use `()`.
-pub trait Capability {
+pub(crate) trait Capability {
     const URI: &'static str;
 
     /// Session-level capability configuration type.
@@ -14,13 +14,13 @@ pub trait Capability {
 
 use super::session;
 
-pub struct Core;
+pub(crate) struct Core;
 impl Capability for Core {
     const URI: &'static str = "urn:ietf:params:jmap:core";
     type Config = session::CoreCapabilities;
 }
 
-pub struct Mail;
+pub(crate) struct Mail;
 impl Capability for Mail {
     const URI: &'static str = "urn:ietf:params:jmap:mail";
     #[cfg(feature = "mail")]
@@ -29,7 +29,7 @@ impl Capability for Mail {
     type Config = serde_json::Value;
 }
 
-pub struct Submission;
+pub(crate) struct Submission;
 impl Capability for Submission {
     const URI: &'static str = "urn:ietf:params:jmap:submission";
     #[cfg(feature = "mail")]
@@ -38,13 +38,13 @@ impl Capability for Submission {
     type Config = serde_json::Value;
 }
 
-pub struct VacationResponseCap;
+pub(crate) struct VacationResponseCap;
 impl Capability for VacationResponseCap {
     const URI: &'static str = "urn:ietf:params:jmap:vacationresponse";
     type Config = serde_json::Value;
 }
 
-pub struct Contacts;
+pub(crate) struct Contacts;
 impl Capability for Contacts {
     const URI: &'static str = "urn:ietf:params:jmap:contacts";
     #[cfg(feature = "contacts")]
@@ -53,13 +53,13 @@ impl Capability for Contacts {
     type Config = serde_json::Value;
 }
 
-pub struct ContactsParse;
+pub(crate) struct ContactsParse;
 impl Capability for ContactsParse {
     const URI: &'static str = "urn:ietf:params:jmap:contacts:parse";
     type Config = serde_json::Value;
 }
 
-pub struct Calendars;
+pub(crate) struct Calendars;
 impl Capability for Calendars {
     const URI: &'static str = "urn:ietf:params:jmap:calendars";
     #[cfg(feature = "calendars")]
@@ -68,13 +68,13 @@ impl Capability for Calendars {
     type Config = serde_json::Value;
 }
 
-pub struct CalendarsParse;
+pub(crate) struct CalendarsParse;
 impl Capability for CalendarsParse {
     const URI: &'static str = "urn:ietf:params:jmap:calendars:parse";
     type Config = serde_json::Value;
 }
 
-pub struct Blob;
+pub(crate) struct Blob;
 impl Capability for Blob {
     const URI: &'static str = "urn:ietf:params:jmap:blob";
     #[cfg(feature = "blob")]
@@ -83,7 +83,7 @@ impl Capability for Blob {
     type Config = serde_json::Value;
 }
 
-pub struct Quota;
+pub(crate) struct Quota;
 impl Capability for Quota {
     const URI: &'static str = "urn:ietf:params:jmap:quota";
     #[cfg(feature = "quota")]
@@ -92,13 +92,13 @@ impl Capability for Quota {
     type Config = serde_json::Value;
 }
 
-pub struct WebSocket;
+pub(crate) struct WebSocket;
 impl Capability for WebSocket {
     const URI: &'static str = "urn:ietf:params:jmap:websocket";
     type Config = session::WebSocketCapabilities;
 }
 
-pub struct Sieve;
+pub(crate) struct Sieve;
 impl Capability for Sieve {
     const URI: &'static str = "urn:ietf:params:jmap:sieve";
     #[cfg(feature = "mail")]
@@ -107,13 +107,13 @@ impl Capability for Sieve {
     type Config = serde_json::Value;
 }
 
-pub struct Principals;
+pub(crate) struct Principals;
 impl Capability for Principals {
     const URI: &'static str = "urn:ietf:params:jmap:principals";
     type Config = session::PrincipalsCapabilities;
 }
 
-pub struct PrincipalsOwner;
+pub(crate) struct PrincipalsOwner;
 impl Capability for PrincipalsOwner {
     const URI: &'static str = "urn:ietf:params:jmap:principals:owner";
     type Config = session::PrincipalsOwnerCapabilities;

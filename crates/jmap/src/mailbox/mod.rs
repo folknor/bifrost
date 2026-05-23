@@ -1,6 +1,11 @@
-pub mod get;
-pub mod query;
-pub mod set;
+// The Account impl uses Mailbox/get + Mailbox/set CRUD; Query,
+// QueryChanges, and ACL helpers stay built for the sharing-aware
+// stage that may consume them.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod query;
+pub(crate) mod set;
 
 use crate::core::set::skip_if_empty_map;
 use crate::mailbox::set::role_not_set;
@@ -10,20 +15,20 @@ use std::collections::HashMap;
 use std::fmt::Display;
 
 mod marker {
-    pub enum Mailbox {}
+    pub(crate) enum Mailbox {}
 }
 /// Strongly-typed Mailbox ID.
-pub type MailboxId = crate::core::id::Id<marker::Mailbox>;
+pub(crate) type MailboxId = crate::core::id::Id<marker::Mailbox>;
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct SetArguments {
+pub(crate) struct SetArguments {
     #[serde(rename = "onDestroyRemoveEmails")]
     #[serde(skip_serializing_if = "Option::is_none")]
     on_destroy_remove_emails: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct QueryArguments {
+pub(crate) struct QueryArguments {
     #[serde(rename = "sortAsTree")]
     sort_as_tree: bool,
     #[serde(rename = "filterAsTree")]
@@ -34,7 +39,7 @@ pub struct QueryArguments {
 
 impl MailboxSet {
     #[must_use]
-    pub fn on_destroy_remove_emails(mut self, value: bool) -> Self {
+    pub(crate) fn on_destroy_remove_emails(mut self, value: bool) -> Self {
         self.arguments().on_destroy_remove_emails(value);
         self
     }
@@ -42,27 +47,27 @@ impl MailboxSet {
 
 impl MailboxQuery {
     #[must_use]
-    pub fn sort_as_tree(mut self, value: bool) -> Self {
+    pub(crate) fn sort_as_tree(mut self, value: bool) -> Self {
         self.arguments().sort_as_tree(value);
         self
     }
 
     #[must_use]
-    pub fn filter_as_tree(mut self, value: bool) -> Self {
+    pub(crate) fn filter_as_tree(mut self, value: bool) -> Self {
         self.arguments().filter_as_tree(value);
         self
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
-pub struct ChangesResponse {
+pub(crate) struct ChangesResponse {
     #[serde(rename = "updatedProperties")]
     updated_properties: Option<Vec<Property>>,
 }
 
 /// Server-returned Mailbox object (RFC 8621 §2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mailbox {
+pub(crate) struct Mailbox {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<MailboxId>,
@@ -114,7 +119,7 @@ pub struct Mailbox {
 
 /// Client-sent Mailbox/set `create` payload.
 #[derive(Debug, Clone, Serialize)]
-pub struct MailboxCreate {
+pub(crate) struct MailboxCreate {
     #[serde(skip)]
     pub(super) _create_id: Option<usize>,
 
@@ -145,7 +150,7 @@ pub struct MailboxCreate {
 
 /// Client-sent Mailbox/set `update` patch payload.
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct MailboxPatch {
+pub(crate) struct MailboxPatch {
     #[serde(rename = "name")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) name: Option<String>,
@@ -184,7 +189,7 @@ pub(crate) enum ACLPatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
-pub enum Role {
+pub(crate) enum Role {
     Archive,
     Drafts,
     Important,
@@ -198,7 +203,7 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MailboxRights {
+pub(crate) struct MailboxRights {
     #[serde(rename = "mayReadItems")]
     #[serde(default)]
     pub(super) may_read_items: bool,
@@ -238,7 +243,7 @@ pub struct MailboxRights {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "name")]
@@ -266,7 +271,7 @@ pub enum Property {
 }
 
 impl Property {
-    pub fn is_count(&self) -> bool {
+    pub(crate) fn is_count(&self) -> bool {
         matches!(
             self,
             Property::TotalEmails
@@ -297,7 +302,7 @@ impl Display for Property {
 }
 
 impl ChangesResponse {
-    pub fn updated_properties(&self) -> Option<&[Property]> {
+    pub(crate) fn updated_properties(&self) -> Option<&[Property]> {
         self.updated_properties.as_deref()
     }
 }

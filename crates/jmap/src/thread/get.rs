@@ -1,14 +1,10 @@
 use crate::core::get::GetObject;
 use crate::email::EmailId;
 
-use super::{Thread, ThreadId};
+use super::Thread;
 
 impl Thread {
-    pub fn id(&self) -> &ThreadId {
-        &self.id
-    }
-
-    pub fn email_ids(&self) -> &[EmailId] {
+    pub(crate) fn email_ids(&self) -> &[EmailId] {
         &self.email_ids
     }
 }

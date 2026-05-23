@@ -19,15 +19,15 @@ const FLAG_IMPORTANT: &str = "$Important";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LabelPatch {
-    pub add_label_ids: Vec<String>,
-    pub remove_label_ids: Vec<String>,
-    pub unsupported_flags: Vec<String>,
+    pub(crate) add_label_ids: Vec<String>,
+    pub(crate) remove_label_ids: Vec<String>,
+    pub(crate) unsupported_flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalFlags {
-    pub flags: Vec<String>,
-    pub hash: u64,
+    pub(crate) flags: Vec<String>,
+    pub(crate) hash: u64,
 }
 
 pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> CanonicalFlags {
@@ -227,13 +227,6 @@ mod tests {
             id: "Label_1".to_string(),
             name: "Project".to_string(),
             label_type: Some("user".to_string()),
-            message_list_visibility: None,
-            label_list_visibility: None,
-            messages_total: None,
-            messages_unread: None,
-            threads_total: None,
-            threads_unread: None,
-            color: None,
         }];
         let canonical = canonical_flags(
             &[

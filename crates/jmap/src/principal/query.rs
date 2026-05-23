@@ -8,7 +8,7 @@ use crate::core::id::AccountId;
 #[derive(Serialize, Clone, Debug)]
 #[serde(untagged)]
 #[non_exhaustive]
-pub enum Filter {
+pub(crate) enum Filter {
     /// RFC 9670: Match principals owning the specified accounts.
     /// Placed first because its `accountIds` array value is unambiguous
     /// in serde's untagged trial order (no other variant uses an array).
@@ -57,7 +57,7 @@ pub enum Filter {
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "property")]
 #[non_exhaustive]
-pub enum Comparator {
+pub(crate) enum Comparator {
     #[serde(rename = "type")]
     Type,
     #[serde(rename = "name")]
@@ -68,71 +68,71 @@ pub enum Comparator {
 
 impl Filter {
     /// RFC 9670: Match principals owning the specified accounts.
-    pub fn account_ids(value: impl IntoIterator<Item = impl Into<AccountId>>) -> Self {
+    pub(crate) fn account_ids(value: impl IntoIterator<Item = impl Into<AccountId>>) -> Self {
         Filter::AccountIds {
             value: value.into_iter().map(Into::into).collect(),
         }
     }
 
-    pub fn name(value: impl Into<String>) -> Self {
+    pub(crate) fn name(value: impl Into<String>) -> Self {
         Filter::Name {
             value: value.into(),
         }
     }
 
-    pub fn domain_name(value: impl Into<String>) -> Self {
+    pub(crate) fn domain_name(value: impl Into<String>) -> Self {
         Filter::DomainName {
             value: value.into(),
         }
     }
 
-    pub fn email(value: impl Into<String>) -> Self {
+    pub(crate) fn email(value: impl Into<String>) -> Self {
         Filter::Email {
             value: value.into(),
         }
     }
 
-    pub fn text(value: impl Into<String>) -> Self {
+    pub(crate) fn text(value: impl Into<String>) -> Self {
         Filter::Text {
             value: value.into(),
         }
     }
 
-    pub fn timezone(value: impl Into<String>) -> Self {
+    pub(crate) fn timezone(value: impl Into<String>) -> Self {
         Filter::Timezone {
             value: value.into(),
         }
     }
 
-    pub fn members(value: impl Into<PrincipalId>) -> Self {
+    pub(crate) fn members(value: impl Into<PrincipalId>) -> Self {
         Filter::Members {
             value: value.into(),
         }
     }
 
-    pub fn ptype(value: Type) -> Self {
+    pub(crate) fn ptype(value: Type) -> Self {
         Filter::Type { value }
     }
 
-    pub fn quota_lower_than(value: u32) -> Self {
+    pub(crate) fn quota_lower_than(value: u32) -> Self {
         Filter::QuotaLt { value }
     }
 
-    pub fn quota_greater_than(value: u32) -> Self {
+    pub(crate) fn quota_greater_than(value: u32) -> Self {
         Filter::QuotaGt { value }
     }
 }
 
 impl Comparator {
-    pub fn name() -> query::Comparator<Comparator> {
+    pub(crate) fn name() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Name)
     }
 
-    pub fn email() -> query::Comparator<Comparator> {
+    pub(crate) fn email() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Email)
     }
 
-    pub fn ptype() -> query::Comparator<Comparator> {
+    pub(crate) fn ptype() -> query::Comparator<Comparator> {
         query::Comparator::new(Comparator::Type)
     }
 }

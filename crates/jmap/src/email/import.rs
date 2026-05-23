@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use super::{Email, Property};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct EmailImportRequest {
+pub(crate) struct EmailImportRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -26,7 +26,7 @@ pub struct EmailImportRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct EmailImport {
+pub(crate) struct EmailImport {
     #[serde(skip)]
     create_id: usize,
 
@@ -51,7 +51,7 @@ pub struct EmailImport {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct EmailImportResponse {
+pub(crate) struct EmailImportResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -85,7 +85,7 @@ impl Default for EmailImportRequest {
 }
 
 impl EmailImportRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         EmailImportRequest {
             account_id: AccountId::new(""),
             if_in_state: None,
@@ -96,20 +96,20 @@ impl EmailImportRequest {
     /// Internal account-id setter. Prefer `JmapMethod::set_account_id`
     /// (called automatically by `Request::call`); kept on the struct
     /// for the few call sites that build a request directly.
-    pub fn set_account_id_inplace(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
+    pub(crate) fn set_account_id_inplace(&mut self, account_id: impl Into<AccountId>) -> &mut Self {
         self.account_id = account_id.into();
         self
     }
 
     #[must_use]
-    pub fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
+    pub(crate) fn if_in_state(mut self, if_in_state: impl Into<String>) -> Self {
         self.if_in_state = Some(if_in_state.into());
         self
     }
 
     /// Add an email entry. Stays imperative because the returned
     /// `&mut EmailImport` writes into a HashMap entry.
-    pub fn email(&mut self, blob_id: impl Into<BlobId>) -> &mut EmailImport {
+    pub(crate) fn email(&mut self, blob_id: impl Into<BlobId>) -> &mut EmailImport {
         let create_id = self.emails.len();
         let create_id_str = format!("i{create_id}");
         self.emails.insert(
@@ -132,7 +132,7 @@ impl EmailImport {
         }
     }
 
-    pub fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
+    pub(crate) fn mailbox_ids<T, U>(&mut self, mailbox_ids: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<MailboxId>,
@@ -142,13 +142,13 @@ impl EmailImport {
         self
     }
 
-    pub fn mailbox_ids_ref(&mut self, reference: ResultReference) -> &mut Self {
+    pub(crate) fn mailbox_ids_ref(&mut self, reference: ResultReference) -> &mut Self {
         self.mailbox_ids_ref = reference.into();
         self.mailbox_ids = None;
         self
     }
 
-    pub fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
+    pub(crate) fn keywords<T, U>(&mut self, keywords: T) -> &mut Self
     where
         T: IntoIterator<Item = U>,
         U: Into<String>,
@@ -157,34 +157,34 @@ impl EmailImport {
         self
     }
 
-    pub fn received_at(&mut self, received_at: i64) -> &mut Self {
+    pub(crate) fn received_at(&mut self, received_at: i64) -> &mut Self {
         self.received_at = Some(from_timestamp(received_at));
         self
     }
 
-    pub fn create_id(&self) -> String {
+    pub(crate) fn create_id(&self) -> String {
         format!("i{}", self.create_id)
     }
 }
 
 impl EmailImportResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn old_state(&self) -> Option<&str> {
+    pub(crate) fn old_state(&self) -> Option<&str> {
         self.old_state.as_deref()
     }
 
-    pub fn new_state(&self) -> &str {
+    pub(crate) fn new_state(&self) -> &str {
         &self.new_state
     }
 
-    pub fn into_new_state(self) -> String {
+    pub(crate) fn into_new_state(self) -> String {
         self.new_state
     }
 
-    pub fn created(&mut self, id: &str) -> crate::Result<Email> {
+    pub(crate) fn created(&mut self, id: &str) -> crate::Result<Email> {
         if let Some(result) = self.created.as_mut().and_then(|r| r.remove(id)) {
             Ok(result)
         } else if let Some(error) = self.not_created.as_mut().and_then(|r| r.remove(id)) {
@@ -194,11 +194,11 @@ impl EmailImportResponse {
         }
     }
 
-    pub fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.created.as_ref().map(|map| map.keys())
     }
 
-    pub fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
+    pub(crate) fn not_created_ids(&self) -> Option<impl Iterator<Item = &String>> {
         self.not_created.as_ref().map(|map| map.keys())
     }
 }

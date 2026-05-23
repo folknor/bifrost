@@ -6,7 +6,7 @@ use crate::core::id::{AccountId, BlobId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct EmailParseRequest {
+pub(crate) struct EmailParseRequest {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -39,7 +39,7 @@ pub struct EmailParseRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct EmailParseResponse {
+pub(crate) struct EmailParseResponse {
     #[serde(rename = "accountId")]
     account_id: AccountId,
 
@@ -71,7 +71,7 @@ impl Default for EmailParseRequest {
 }
 
 impl EmailParseRequest {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         EmailParseRequest {
             account_id: AccountId::new(""),
             blob_ids: Vec::new(),
@@ -85,7 +85,7 @@ impl EmailParseRequest {
     }
 
     #[must_use]
-    pub fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
+    pub(crate) fn blob_ids<U, V>(mut self, blob_ids: U) -> Self
     where
         U: IntoIterator<Item = V>,
         V: Into<BlobId>,
@@ -95,13 +95,13 @@ impl EmailParseRequest {
     }
 
     #[must_use]
-    pub fn properties(mut self, properties: impl IntoIterator<Item = Property>) -> Self {
+    pub(crate) fn properties(mut self, properties: impl IntoIterator<Item = Property>) -> Self {
         self.properties = Some(properties.into_iter().collect());
         self
     }
 
     #[must_use]
-    pub fn body_properties(
+    pub(crate) fn body_properties(
         mut self,
         body_properties: impl IntoIterator<Item = BodyProperty>,
     ) -> Self {
@@ -110,36 +110,36 @@ impl EmailParseRequest {
     }
 
     #[must_use]
-    pub fn fetch_text_body_values(mut self, fetch_text_body_values: bool) -> Self {
+    pub(crate) fn fetch_text_body_values(mut self, fetch_text_body_values: bool) -> Self {
         self.fetch_text_body_values = fetch_text_body_values.into();
         self
     }
 
     #[must_use]
-    pub fn fetch_html_body_values(mut self, fetch_html_body_values: bool) -> Self {
+    pub(crate) fn fetch_html_body_values(mut self, fetch_html_body_values: bool) -> Self {
         self.fetch_html_body_values = fetch_html_body_values.into();
         self
     }
 
     #[must_use]
-    pub fn fetch_all_body_values(mut self, fetch_all_body_values: bool) -> Self {
+    pub(crate) fn fetch_all_body_values(mut self, fetch_all_body_values: bool) -> Self {
         self.fetch_all_body_values = fetch_all_body_values.into();
         self
     }
 
     #[must_use]
-    pub fn max_body_value_bytes(mut self, max_body_value_bytes: usize) -> Self {
+    pub(crate) fn max_body_value_bytes(mut self, max_body_value_bytes: usize) -> Self {
         self.max_body_value_bytes = max_body_value_bytes.into();
         self
     }
 }
 
 impl EmailParseResponse {
-    pub fn account_id(&self) -> &AccountId {
+    pub(crate) fn account_id(&self) -> &AccountId {
         &self.account_id
     }
 
-    pub fn parsed(&mut self, blob_id: &BlobId) -> crate::Result<Email> {
+    pub(crate) fn parsed(&mut self, blob_id: &BlobId) -> crate::Result<Email> {
         if let Some(result) = self.parsed.as_mut().and_then(|r| r.remove(blob_id)) {
             Ok(result)
         } else if self
@@ -154,15 +154,15 @@ impl EmailParseResponse {
         }
     }
 
-    pub fn parsed_list(&self) -> Option<impl Iterator<Item = (&BlobId, &Email)>> {
+    pub(crate) fn parsed_list(&self) -> Option<impl Iterator<Item = (&BlobId, &Email)>> {
         self.parsed.as_ref().map(|map| map.iter())
     }
 
-    pub fn not_parsable(&self) -> Option<&[BlobId]> {
+    pub(crate) fn not_parsable(&self) -> Option<&[BlobId]> {
         self.not_parsable.as_deref()
     }
 
-    pub fn not_found(&self) -> Option<&[BlobId]> {
+    pub(crate) fn not_found(&self) -> Option<&[BlobId]> {
         self.not_found.as_deref()
     }
 }

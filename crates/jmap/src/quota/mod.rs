@@ -1,5 +1,9 @@
-pub mod get;
-pub mod query;
+// The Account impl uses `QuotaGet` + a few properties; `QuotaChanges`,
+// `QuotaQuery`, and the query AST are retained for completeness.
+#![allow(dead_code)]
+
+pub(crate) mod get;
+pub(crate) mod query;
 
 use std::fmt::Display;
 
@@ -8,15 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::core::field::Field;
 
 mod marker {
-    pub enum Quota {}
+    pub(crate) enum Quota {}
 }
 /// Strongly-typed Quota ID.
-pub type QuotaId = crate::core::id::Id<marker::Quota>;
+pub(crate) type QuotaId = crate::core::id::Id<marker::Quota>;
 
 /// A quota object representing a storage or count limit (RFC 9425).
 /// Quota is read-only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Quota {
+pub(crate) struct Quota {
     #[serde(rename = "id")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) id: Option<QuotaId>,
@@ -63,7 +67,7 @@ pub struct Quota {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Copy)]
 #[non_exhaustive]
-pub enum Property {
+pub(crate) enum Property {
     #[serde(rename = "id")]
     Id,
     #[serde(rename = "resourceType")]
