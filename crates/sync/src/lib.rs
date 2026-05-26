@@ -27,6 +27,7 @@ pub mod error;
 pub mod multiplexer;
 pub mod mutation;
 pub mod push;
+pub(crate) mod recovery;
 pub mod scheduler;
 pub mod types;
 
@@ -40,9 +41,10 @@ pub use bifrost_types::{Control, Priority};
 // Push surface (sink + watch events).
 pub use bifrost_types::{InvalidationSink, WatchEvent};
 
-// Engine-side errors / fatals / warnings (distinct from
-// bifrost-types::Error which is per-operation).
-pub use error::{Error, Fatal, FatalAction, Warning};
+// Engine-side error and the shared warning vocabulary. Terminal
+// account errors are exposed through `bifrost_types::Fatal`; the
+// engine-local `FatalAction` enum is gone.
+pub use error::{Error, Warning};
 
 // Cursor and checkpoint plumbing.
 pub use cursor::{

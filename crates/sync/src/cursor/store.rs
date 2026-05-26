@@ -67,7 +67,7 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<BackfillCheckpoint>, Error>> + Send + 'a>>;
 
     /// Drop the change cursor for `(account, scope)`. Used by the
-    /// engine's `RecoveryClass::RestartScope` recovery path so the
+    /// engine's `EngineDirective::RestartScope` recovery path so the
     /// next attach / poll re-establishes via inventory. This is
     /// required because a no-op delete silently preserves the stale
     /// durable cursor and makes restart-scope recovery ineffective.

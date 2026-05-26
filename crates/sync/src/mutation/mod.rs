@@ -2,11 +2,12 @@
 //!
 //! The engine wraps each `Account::bulk_*` call with:
 //! - `IdempotencyKey` vending (run_id + monotonic sequence + protocol salt),
-//! - partial-success accumulation (applied / skipped / failed_terminal /
-//!   pending_retry),
-//! - retry on `RecoveryClass::Retry`, sleeping for `after` and
-//!   re-submitting with the same key,
-//! - the read-back guard, which re-fetches each retried batch via
+//! - per-id accumulation through `ItemOutcome<MutationSuccess>` lanes
+//!   (applied / skipped / failed_terminal / pending_retry /
+//!   pending_readback / blocked_by_engine),
+//! - retry on `RecoveryClass::Retry`, sleeping per `RetryAdvice` and
+//!   re-submitting unresolved ids with the same key,
+//! - the read-back guard, which re-fetches each pending-readback id via
 //!   `account.get_stream(_, Projection::FlagsOnly)` and reconciles
 //!   apparent failures against actual server state.
 

@@ -34,7 +34,9 @@ pub struct EngineConfig {
     /// Per-lane cap on the scheduler's `VecDeque`. On overflow the
     /// oldest item is shed and a counter incremented (see `H4`).
     pub lane_capacity: usize,
-    /// Mutation campaign retry cap on `RecoveryClass::Retry`.
+    /// Mutation campaign retry cap. The campaign attempts up to this
+    /// many resubmissions for ids whose per-item `ItemOutcome::Failed`
+    /// carried a retryable `RecoveryClass`.
     pub mutation_max_retries: u32,
 }
 

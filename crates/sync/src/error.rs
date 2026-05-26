@@ -1,22 +1,21 @@
 //! Engine-side error vocabulary.
 //!
-//! Distinct from `bifrost_types::Error` (which is per-operation,
-//! protocol-facing) and `bifrost_types::Fatal` (which is the
-//! stream-terminating recovery signal). `engine::Error` wraps both
-//! plus the engine's own failure modes (account not attached,
-//! checkpoint store rejected the write, shutdown in progress).
+//! Distinct from `bifrost_types::AccountError` (which is the
+//! per-operation, protocol-facing failure type) and from
+//! `bifrost_types::Fatal` (the engine-boundary newtype for terminal
+//! account errors). `engine::Error` wraps an `AccountError` when one
+//! crosses a sync boundary, plus the engine's own failure modes
+//! (account not attached, checkpoint store rejected the write,
+//! shutdown in progress).
 
-use bifrost_types::{
-    AccountId, CapabilityDelta, CursorScope, Fatal as TypesFatal, RecoveryClass, StrategyDowngrade,
-    Warning as TypesWarning,
-};
+use bifrost_types::{AccountError, AccountId};
 
 /// Engine-side failure type.
 ///
 /// Returned from `SyncEngine` orchestration calls (`attach`, `detach`,
-/// `bulk_set_flags`, `checkpoint_now`, etc.). Distinct from the
-/// per-operation `bifrost_types::Error` returned from inside Account
-/// trait calls.
+/// `bulk_set_flags`, `checkpoint_now`, etc.). The `Account` variant
+/// carries the protocol-facing `AccountError` verbatim so callers see
+/// the same recovery and diagnostics the protocol crate produced.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -28,27 +27,27 @@ pub enum Error {
     /// intervening `detach`.
     #[error("account {0:?} is already attached")]
     AccountAlreadyAttached(AccountId),
-    /// `AccountFactory::open` returned an error. Carries the typed
-    /// source so the consumer can match on `Error::Auth` / `Transport`
-    /// / etc. rather than parsing a formatted string.
-    #[error("failed to open account: {0}")]
-    OpenFailed(#[source] bifrost_types::Error),
-    /// `establish_initial_cursor` returned an error while attaching
-    /// the account.
+    /// `AccountFactory::open` returned an error during `attach`. A
+    /// caller seeing this knows the account never reached the running
+    /// state. Recovery paths after attach use `Account` instead.
+    #[error("failed to open account")]
+    OpenFailed(#[source] AccountError),
+    /// `establish_initial_cursor` returned an error.
     #[error("failed to establish initial cursor: {0}")]
     EstablishCursorFailed(String),
-    /// Cursor-establishing inventory ended in `Fatal`; the recovery
-    /// class is preserved so callers can decide whether to retry,
-    /// restart a scope, or surface to the user.
-    #[error("failed to establish initial cursor: {message}; recovery={recovery:?}")]
-    EstablishCursorFatal {
-        message: String,
-        recovery: RecoveryClass,
-    },
+    /// Cursor-establishing inventory ended in a terminal account
+    /// error. The full `AccountError` is preserved so callers can
+    /// inspect recovery, scope, operation, provider, and diagnostics.
+    #[error("cursor establishment terminated")]
+    EstablishCursorTerminated(#[source] AccountError),
     /// Checkpoint persistence failed.
     #[error("checkpoint store rejected the write: {0}")]
     CheckpointStore(String),
     /// Cursor envelope on disk uses a schema this engine cannot read.
+    /// Local-only: when this would cross into recovery dispatch, the
+    /// engine converts it into an `AccountError` with
+    /// `SyncStateErrorKind::SchemaIncompatible` so derivation yields
+    /// `EngineDirective::SchemaIncompatible`.
     #[error("checkpoint envelope schema is incompatible")]
     SchemaIncompatible,
     /// Engine is shutting down; no new work accepted.
@@ -57,103 +56,20 @@ pub enum Error {
     /// Account is paused.
     #[error("account is paused")]
     Paused,
-    /// Generic wrap-around for `bifrost_types::Error`.
-    #[error("account error: {0}")]
-    Account(#[from] bifrost_types::Error),
-    /// Catch-all.
+    /// Account operation surfaced through an engine path that is not
+    /// `attach`. The carried error has its derived `RecoveryClass`
+    /// intact; consumers route through it the same way they route any
+    /// other `AccountError`.
+    #[error("account operation failed")]
+    Account(#[from] AccountError),
+    /// Catch-all for engine-internal errors that have no account
+    /// counterpart (config validation, malformed checkpoint type, etc.).
     #[error("{0}")]
     Other(String),
 }
 
-/// Engine-side mapping of a `RecoveryClass` to a coarse `Fatal`
-/// shape the consumer sees.
-///
-/// The five recovery actions the engine takes are mutually exclusive:
-/// retry, restart-scope, restart-account, downgrade-strategy,
-/// surface-to-consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FatalAction {
-    /// Retry the same stream after a server-supplied delay.
-    Retry,
-    /// Drop the cursor for one scope and re-establish via inventory.
-    RestartScope,
-    /// Reopen the account (factory.open) and restart all streams.
-    RestartAccount,
-    /// Continue the stream with a downgraded protocol strategy.
-    DowngradeStrategy,
-    /// Bubble up to the consumer; engine cannot recover unattended.
-    SurfaceToConsumer,
-}
-
-/// Map a `RecoveryClass` into the engine's coarse `FatalAction`
-/// taxonomy. Lives here (not in `bifrost-types`) because the action
-/// table is engine policy, not protocol contract.
-#[must_use]
-pub fn map_recovery_to_fatal(recovery: &RecoveryClass) -> FatalAction {
-    match recovery {
-        RecoveryClass::Retry { .. } => FatalAction::Retry,
-        RecoveryClass::DowngradeStrategy(_) => FatalAction::DowngradeStrategy,
-        RecoveryClass::DowngradeCapabilityForScope(_) | RecoveryClass::RestartScope(_) => {
-            FatalAction::RestartScope
-        }
-        RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
-            FatalAction::RestartAccount
-        }
-        RecoveryClass::AuthLost
-        | RecoveryClass::SchemaIncompatible
-        | RecoveryClass::OperatorOverrideRequired { .. }
-        | RecoveryClass::Fatal => FatalAction::SurfaceToConsumer,
-        // `RecoveryClass` is `#[non_exhaustive]`; route unknown
-        // variants to the consumer so the engine fails closed rather
-        // than silently swallowing a recovery action it does not
-        // understand.
-        _ => FatalAction::SurfaceToConsumer,
-    }
-}
-
-/// Engine-side wrapper around `bifrost_types::Fatal` carrying the
-/// derived `FatalAction` so consumers don't have to re-derive it.
-#[derive(Debug)]
-pub struct Fatal {
-    pub action: FatalAction,
-    pub inner: TypesFatal,
-}
-
-impl Fatal {
-    #[must_use]
-    pub fn from_types(inner: TypesFatal) -> Self {
-        let action = map_recovery_to_fatal(&inner.recovery);
-        Self { action, inner }
-    }
-}
-
-/// Engine-side wrapper around `bifrost_types::Warning`. Identical
-/// shape today; the type exists so the engine can grow its own
-/// warning kinds without churning `bifrost-types`.
-pub type Warning = TypesWarning;
-
-/// Helpers exposed for tests + multiplexer wiring.
-#[must_use]
-pub fn recovery_targets_scope(recovery: &RecoveryClass) -> Option<&CursorScope> {
-    match recovery {
-        RecoveryClass::DowngradeCapabilityForScope(s) | RecoveryClass::RestartScope(s) => Some(s),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn recovery_targets_downgrade(recovery: &RecoveryClass) -> Option<StrategyDowngrade> {
-    match recovery {
-        RecoveryClass::DowngradeStrategy(d) => Some(*d),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn recovery_targets_capability(recovery: &RecoveryClass) -> Option<&CapabilityDelta> {
-    match recovery {
-        RecoveryClass::CapabilityChanged { delta } => Some(delta),
-        _ => None,
-    }
-}
+/// Re-export of `bifrost_types::Warning`. Engine callers continue to
+/// refer to it as `bifrost_sync::Warning` so a later change to the
+/// engine's warning surface (currently identical to the types surface)
+/// does not churn import paths.
+pub type Warning = bifrost_types::Warning;

@@ -215,7 +215,7 @@ impl BackfillRunner {
                 }
                 SyncEvent::Done(_) => break,
                 SyncEvent::Fatal(f) => {
-                    let message = f.message.clone();
+                    let account_error = f.0.clone();
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
@@ -224,7 +224,7 @@ impl BackfillRunner {
                         };
                         let _ = tx.send(me);
                     }
-                    return Err(Error::Other(format!("backfill inventory fatal: {message}")));
+                    return Err(Error::Account(account_error));
                 }
                 SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
                 _ => {}

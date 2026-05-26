@@ -12,9 +12,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountFactory, AccountId, AccountStream, ChangeCursor,
-    Checkpoint, CursorEstablishment, CursorScope, InvalidationSink, InventoryPartition,
-    InventoryPartitioning, MembershipScope, Priority, SubscriptionHandle, SyncEvent, WatchEvent,
+    Account, AccountCapabilities, AccountError, AccountFactory, AccountId, AccountStream,
+    ChangeCursor, Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective,
+    ErrorScope, InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome,
+    MembershipScope, MutationSuccess, Priority, RecoveryClass, RetryAdvice, SubscriptionHandle,
+    SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -510,8 +512,8 @@ impl SyncEngine {
                     req = reopen_rx.recv() => {
                         let Some(req) = req else { return; };
                         match req {
-                            ReopenRequest::Recovery { scope, recovery } => {
-                                handle_recovery(
+                            ReopenRequest::Recovery { scope, error } => {
+                                handle_account_error(
                                     &reopen_factory,
                                     &reopen_current,
                                     &reopen_cursors,
@@ -520,7 +522,7 @@ impl SyncEngine {
                                     &reopen_aid,
                                     &reopen_control,
                                     scope,
-                                    recovery,
+                                    error,
                                 )
                                 .await;
                             }
@@ -714,11 +716,15 @@ impl SyncEngine {
             .get(account_id)
             .map(|r| Arc::clone(r.value()))
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        // `reopen` is the post-attach swap path. Per the engine error
+        // policy, failures in this path use `Account` (not `OpenFailed`)
+        // so callers know the account was running and the engine is
+        // reporting an in-flight failure.
         let next = slot
             .factory
             .open(account_id.clone())
             .await
-            .map_err(Error::OpenFailed)?;
+            .map_err(Error::Account)?;
         next.as_ref().set_priority(slot.control.priority_snapshot());
         next.as_ref()
             .set_bandwidth_cap(slot.control.bandwidth_cap_snapshot());
@@ -796,6 +802,14 @@ impl SyncEngine {
     /// account, applying the read-back guard to the retry candidates.
     ///
     /// Returns the per-batch counters aggregated across the run.
+    ///
+    /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
+    /// dispatches retries from `AccountError::recovery()`:
+    /// - `Retry::SameRequest` / `AfterAuthRefresh` queue for retry.
+    /// - `Retry::AfterStateRefresh` and `Reconcile` queue for read-back.
+    /// - `Engine(_)` blocks the campaign and signals the engine.
+    /// - terminal recovery lands in `failed_terminal`.
+    /// `ItemOutcome::Uncertain` is always queued for read-back.
     pub async fn bulk_set_flags(
         &self,
         account_id: &AccountId,
@@ -811,26 +825,22 @@ impl SyncEngine {
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
         let max_retries = self.config.mutation_max_retries;
 
-        // Reuse the same idempotency key across retry attempts so the
-        // protocol can dedup; see `IdempotencyVendor` for the
-        // run_id/sequence layout. Each campaign retry comes from a
-        // single `vendor.next(protocol)` call.
         let key = vendor.next(protocol);
 
-        // Per-id final outcome map. Updates as attempts make progress;
-        // the final aggregate counters are computed once at the end,
-        // so a retry that flips a previous-attempt Failed -> Applied
-        // does not double-count.
         let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
         let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
+        let mut readback_ids: Vec<bifrost_types::ObjectId> = Vec::new();
         let mut remaining: Vec<bifrost_types::ObjectId> = targets;
         let mut attempt: u32 = 0;
-        let mut retry_after: Option<Duration> = None;
+        let mut retry_advice: Option<RetryAdvice> = None;
 
         loop {
-            // Sleep before retry if the previous attempt requested it
-            // via `RecoveryClass::Retry`.
-            if let Some(delay) = retry_after.take() {
+            if let Some(advice) = retry_advice.take() {
+                let delay = crate::recovery::retry_delay(
+                    &advice,
+                    std::time::SystemTime::now(),
+                    Duration::from_secs(1),
+                );
                 tokio::time::sleep(delay).await;
             }
 
@@ -838,26 +848,55 @@ impl SyncEngine {
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = account.bulk_set_flags(target_stream, op.clone(), key.clone());
-            let mut fatal_retry: Option<Duration> = None;
             retry_ids.clear();
+            readback_ids.clear();
+            let mut stream_termination_advice: Option<RetryAdvice> = None;
 
             while let Some(event) = stream.next().await {
                 match event {
                     bifrost_types::SyncEvent::Batch(batch) => {
-                        for result in batch.items {
-                            let bucket = classify_mutation_outcome(&result.outcome);
-                            if bucket == MutationBucket::PendingRetry {
-                                retry_ids.push(result.id.clone());
-                            }
-                            outcomes.insert(result.id, bucket);
+                        for item in batch.items {
+                            classify_item_outcome(
+                                item,
+                                &mut outcomes,
+                                &mut retry_ids,
+                                &mut readback_ids,
+                            );
                         }
                     }
                     bifrost_types::SyncEvent::Fatal(f) => {
-                        if let bifrost_types::RecoveryClass::Retry { after } = &f.recovery {
-                            fatal_retry = Some(*after);
-                            break;
+                        // Stream-level terminating event: dispatch via
+                        // `error.recovery()`. Retry / Reconcile let
+                        // the campaign continue; Engine and terminal
+                        // bail.
+                        let recovery = f.0.recovery().clone();
+                        match recovery {
+                            RecoveryClass::Retry(advice) => {
+                                stream_termination_advice = Some(advice);
+                                break;
+                            }
+                            RecoveryClass::Reconcile(_) => {
+                                // Funnel every still-unresolved item
+                                // into the read-back queue.
+                                for id in &remaining {
+                                    if !matches!(
+                                        outcomes.get(id),
+                                        Some(
+                                            MutationBucket::Applied
+                                                | MutationBucket::Skipped
+                                                | MutationBucket::FailedTerminal
+                                        )
+                                    ) {
+                                        readback_ids.push(id.clone());
+                                    }
+                                }
+                                break;
+                            }
+                            RecoveryClass::Engine(_) => {
+                                return Err(Error::Account(f.0.clone()));
+                            }
+                            _ => return Err(Error::Account(f.0.clone())),
                         }
-                        return Err(Error::Other(format!("bulk_set_flags fatal: {}", f.message)));
                     }
                     bifrost_types::SyncEvent::Done(_) => break,
                     bifrost_types::SyncEvent::Progress(_)
@@ -868,50 +907,31 @@ impl SyncEngine {
 
             attempt = attempt.saturating_add(1);
             let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
-            let mut next_remaining: Vec<_> = remaining
+            let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
                 .iter()
-                .filter(|id| {
-                    retry_set.contains(*id)
-                        || (fatal_retry.is_some()
-                            && !matches!(
-                                outcomes.get(*id),
-                                Some(
-                                    MutationBucket::Applied
-                                        | MutationBucket::Skipped
-                                        | MutationBucket::FailedTerminal
-                                )
-                            ))
-                })
+                .filter(|id| retry_set.contains(*id))
                 .cloned()
                 .collect();
             if attempt < max_retries && !next_remaining.is_empty() {
-                retry_after = fatal_retry;
+                retry_advice = stream_termination_advice;
                 std::mem::swap(&mut remaining, &mut next_remaining);
                 continue;
             }
-
-            for id in &remaining {
-                outcomes
-                    .entry(id.clone())
-                    .or_insert(MutationBucket::PendingRetry);
+            // No more attempts. Anything still in `retry_ids` becomes
+            // a pending read-back candidate so the guard can decide
+            // applied vs failed_terminal.
+            for id in retry_set.iter() {
+                readback_ids.push(id.clone());
+                outcomes.insert(id.clone(), MutationBucket::PendingRetry);
             }
             break;
         }
+
         let mut totals = counters_from_outcomes(&outcomes);
-        let pending_ids: Vec<_> = outcomes
-            .iter()
-            .filter_map(|(id, bucket)| {
-                if *bucket == MutationBucket::PendingRetry {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !pending_ids.is_empty() {
+        if !readback_ids.is_empty() {
             let account = slot.current.load_full();
             let outcome =
-                crate::mutation::run_readback_guard(account.as_ref().as_ref(), pending_ids, &op)
+                crate::mutation::run_readback_guard(account.as_ref().as_ref(), readback_ids, &op)
                     .await?;
             totals.pending_retry = totals
                 .pending_retry
@@ -945,10 +965,7 @@ impl SyncEngine {
                 SyncEvent::Batch(batch) => out.extend(batch.items),
                 SyncEvent::Done(_) => break,
                 SyncEvent::Fatal(f) => {
-                    return Err(Error::EstablishCursorFailed(format!(
-                        "discover_cursor_scopes fatal: {}",
-                        f.message
-                    )));
+                    return Err(Error::Account(f.0.clone()));
                 }
                 SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
                 // Future `SyncEvent` variants are ignored here; the
@@ -979,7 +996,7 @@ impl SyncEngine {
         match account
             .establish_initial_cursor(scope.clone())
             .await
-            .map_err(|e| Error::EstablishCursorFailed(format!("{e}")))?
+            .map_err(Error::Account)?
         {
             CursorEstablishment::Ready(cursor) => {
                 self.persist_cursor(account_id, cursor, cursors).await?;
@@ -1327,13 +1344,20 @@ async fn run_deferred_inventory_establishment(
                     "deferred inventory completed without a cursor"
                 );
             }
-            Ok(crate::multiplexer::FusionOutcome::Fatal(recovery)) => {
+            Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
+                // The fusion already broadcast the terminating event;
+                // log the structured account error for telemetry. The
+                // multiplexer poll loop or push reconciler will pick
+                // up the recovery via subsequent change-stream
+                // terminations once a cursor exists.
                 tracing::warn!(
                     target: "bifrost.sync.changes",
                     account = ?account_id,
                     scope = ?scope,
-                    recovery = ?recovery,
-                    "deferred inventory ended in fatal"
+                    kind = ?error.kind(),
+                    message_key = error.message_key(),
+                    recovery = ?error.recovery(),
+                    "deferred inventory terminated"
                 );
             }
             Err(err) => {
@@ -1387,8 +1411,9 @@ async fn link_discovered_memberships(
             SyncEvent::Fatal(f) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    message = %f.message,
-                    "discover_memberships fatal; continuing without index"
+                    kind = ?f.0.kind(),
+                    message_key = f.0.message_key(),
+                    "discover_memberships terminated; continuing without index"
                 );
                 break;
             }
@@ -1447,14 +1472,21 @@ async fn persist_ack_request(
     match &req.checkpoint {
         Checkpoint::Change(c) => store.put_change_cursor(account_id, c.clone()).await,
         Checkpoint::Backfill(b) => store.put_backfill(account_id, b.clone()).await,
-        _ => Err(Error::Other("unknown checkpoint variant in ack".into())),
+        _ => Err(Error::CheckpointStore(
+            "unknown checkpoint variant in ack".into(),
+        )),
     }
 }
 
-/// Dispatch a recovery class. Threads through the engine's reopen +
-/// re-establishment machinery.
+/// Dispatch an `AccountError` to the engine's recovery machinery.
+///
+/// Reads `error.recovery()` and routes Retry / Reconcile / Engine /
+/// terminal verdicts to the appropriate engine path. The `scope`
+/// argument is the worker's convenience-suggested scope: scope-bound
+/// directives use the directive's own scope when present and fall
+/// back to this `scope`; account-wide directives ignore it.
 #[allow(clippy::too_many_arguments)]
-async fn handle_recovery(
+async fn handle_account_error(
     factory: &Arc<dyn AccountFactory>,
     current: &Arc<ArcSwap<Arc<dyn Account>>>,
     cursors: &Arc<CursorRegistry>,
@@ -1462,108 +1494,325 @@ async fn handle_recovery(
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
     account_id: &AccountId,
     control: &SyncControl,
-    scope: CursorScope,
-    recovery: bifrost_types::RecoveryClass,
+    scope: Option<CursorScope>,
+    error: AccountError,
 ) {
-    use bifrost_types::RecoveryClass;
+    let recovery = error.recovery().clone();
     match recovery {
-        RecoveryClass::Retry { after } => {
-            // Sleep; the per-scope poll task will re-enter on its own
-            // cadence regardless. We do not need to do anything else.
-            tokio::time::sleep(after).await;
+        RecoveryClass::Retry(advice) => {
+            // Sleep per advice; the per-scope poll loop and the push
+            // reconciler already handle the retry sleep themselves, so
+            // the reopen listener seeing a Retry verdict here means a
+            // worker chose to delegate. Honor the advice.
+            handle_retry(&advice).await;
         }
-        RecoveryClass::RestartScope(_) | RecoveryClass::DowngradeCapabilityForScope(_) => {
-            // Drop the scope's cursor and the durable cursor, then
-            // re-establish via inventory. The next poll iteration will
-            // see `cursors.snapshot(&scope).is_none()` and exit; we
-            // re-establish here so the broadcast path picks up
-            // immediately on the engine-level reopen sweep.
-            cursors.delete(&scope);
-            if let Err(err) = store.delete_change_cursor(account_id, &scope).await {
-                tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    account = ?account_id,
-                    scope = ?scope,
-                    error = %err,
-                    "RestartScope: delete_change_cursor failed"
-                );
-            }
-            let acc_arc = current.load_full();
-            let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            match run_establish(
-                account_id,
-                acc,
-                scope.clone(),
-                Arc::clone(cursors),
-                Arc::clone(store),
-                changes_tx.clone(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    if let Err(err) = link_discovered_memberships(acc, cursors).await {
-                        tracing::warn!(
-                            target: "bifrost.sync.changes",
-                            account = ?account_id,
-                            scope = ?scope,
-                            error = %err,
-                            "RestartScope: membership refresh failed"
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        account = ?account_id,
-                        scope = ?scope,
-                        error = %err,
-                        "RestartScope: re-establishment failed"
-                    );
-                }
-            }
-        }
-        RecoveryClass::RestartAccount | RecoveryClass::CapabilityChanged { .. } => {
-            match factory.open(account_id.clone()).await {
-                Ok(next) => {
-                    next.as_ref().set_priority(control.priority_snapshot());
-                    next.as_ref()
-                        .set_bandwidth_cap(control.bandwidth_cap_snapshot());
-                    current.store(Arc::new(next));
-                }
-                Err(err) => tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    account = ?account_id,
-                    error = %err,
-                    "RestartAccount: factory.open failed"
-                ),
-            }
-        }
-        RecoveryClass::AuthLost
-        | RecoveryClass::SchemaIncompatible
-        | RecoveryClass::OperatorOverrideRequired { .. }
-        | RecoveryClass::Fatal
-        | RecoveryClass::DowngradeStrategy(_) => {
-            // Engine has no automated recovery; surface via broadcast
-            // so consumers observe the terminal Fatal that was emitted
-            // by the driver. The driver already pushed the Fatal onto
-            // changes_tx; nothing further to do here.
+        RecoveryClass::Reconcile(_advice) => {
+            // The poll loop / push reconciler do the inline reconcile;
+            // if we reach this branch via the reopen listener we trust
+            // their next pass to probe. Log for telemetry only.
             tracing::warn!(
                 target: "bifrost.sync.changes",
                 account = ?account_id,
                 scope = ?scope,
-                "recovery requires consumer action; not auto-handling"
+                kind = ?error.kind(),
+                message_key = error.message_key(),
+                "reconcile recovery reached reopen listener"
             );
         }
-        // Unknown future variant: same surface-only handling.
+        RecoveryClass::Engine(directive) => {
+            handle_engine_directive(
+                factory, current, cursors, store, changes_tx, account_id, control, scope,
+                directive, error,
+            )
+            .await;
+        }
+        // Every terminal recovery: broadcast already carried the
+        // terminating event; the engine has no automated next step.
+        // `Fatal::try_from(error)` would succeed; we keep the original
+        // around in the log for support telemetry.
         _ => {
             tracing::warn!(
                 target: "bifrost.sync.changes",
                 account = ?account_id,
                 scope = ?scope,
-                "unknown RecoveryClass variant; surface-only"
+                kind = ?error.kind(),
+                message_key = error.message_key(),
+                recovery = ?error.recovery(),
+                "terminal recovery; engine takes no automated action"
             );
         }
     }
+}
+
+async fn handle_retry(advice: &RetryAdvice) {
+    let delay = crate::recovery::retry_delay(
+        advice,
+        std::time::SystemTime::now(),
+        std::time::Duration::from_secs(1),
+    );
+    tokio::time::sleep(delay).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_engine_directive(
+    factory: &Arc<dyn AccountFactory>,
+    current: &Arc<ArcSwap<Arc<dyn Account>>>,
+    cursors: &Arc<CursorRegistry>,
+    store: &Arc<DynCheckpointStore>,
+    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    account_id: &AccountId,
+    control: &SyncControl,
+    fallback_scope: Option<CursorScope>,
+    directive: EngineDirective,
+    error: AccountError,
+) {
+    match directive {
+        EngineDirective::RestartScope(directive_scope) => {
+            restart_scope(
+                current,
+                cursors,
+                store,
+                changes_tx,
+                account_id,
+                directive_scope,
+            )
+            .await;
+        }
+        EngineDirective::DowngradeCapabilityForScope(directive_scope) => {
+            // Same cursor-deletion + re-establishment path as
+            // RestartScope. Emit a warning that names the scope so
+            // telemetry can pivot on capability downgrades.
+            broadcast_warning(
+                changes_tx,
+                Some(directive_scope.clone()),
+                bifrost_types::Warning {
+                    kind: bifrost_types::WarningKind::Other,
+                    message: DiagnosticText::user_safe(format!(
+                        "scope capability downgraded: {directive_scope:?}"
+                    )),
+                    next_action: None,
+                    protocol_detail: Some(DiagnosticText::support_only(format!(
+                        "{directive_scope:?}"
+                    ))),
+                    retry_count: 0,
+                },
+            );
+            restart_scope(
+                current,
+                cursors,
+                store,
+                changes_tx,
+                account_id,
+                directive_scope,
+            )
+            .await;
+        }
+        EngineDirective::RestartAccount => {
+            restart_account(factory, current, account_id, control).await;
+        }
+        EngineDirective::CapabilityChanged { delta } => {
+            // Reopen so the protocol can refresh its snapshot, then
+            // emit a warning so telemetry pivots on the delta. The
+            // engine's `AccountSlot.capabilities` is an attach-time
+            // snapshot - production workers do not consult it as the
+            // source of truth, so leaving it stale is intentional.
+            restart_account(factory, current, account_id, control).await;
+            broadcast_warning(
+                changes_tx,
+                fallback_scope.clone(),
+                bifrost_types::Warning {
+                    kind: bifrost_types::WarningKind::Other,
+                    message: DiagnosticText::user_safe("account capabilities changed"),
+                    next_action: None,
+                    protocol_detail: Some(DiagnosticText::support_only(format!("{delta:?}"))),
+                    retry_count: 0,
+                },
+            );
+        }
+        EngineDirective::DowngradeStrategy(downgrade) => {
+            // No sync-owned strategy table. Emit a warning carrying
+            // the downgrade payload in both the human-summary
+            // `message` and the support-only `protocol_detail` so
+            // neither audience loses the evidence. Then reopen so the
+            // protocol crate picks the lower strategy on the next
+            // `establish_initial_cursor`.
+            broadcast_warning(
+                changes_tx,
+                fallback_scope.clone(),
+                bifrost_types::Warning {
+                    kind: bifrost_types::WarningKind::StrategyDowngraded,
+                    message: DiagnosticText::user_safe(format!(
+                        "downgraded sync strategy: {downgrade:?}"
+                    )),
+                    next_action: None,
+                    protocol_detail: Some(DiagnosticText::support_only(format!("{downgrade:?}"))),
+                    retry_count: 0,
+                },
+            );
+            restart_account(factory, current, account_id, control).await;
+            // If the originating error was scoped to a cursor, also
+            // re-establish that scope so the downgrade takes effect
+            // immediately rather than at the next poll.
+            if let Some(ErrorScope::Cursor(scoped)) = error.scope() {
+                restart_scope(
+                    current,
+                    cursors,
+                    store,
+                    changes_tx,
+                    account_id,
+                    scoped.clone(),
+                )
+                .await;
+            }
+        }
+        EngineDirective::SchemaIncompatible => {
+            // Stop trusting durable cursor envelopes. Clear every
+            // in-memory cursor and delete every durable change cursor
+            // we know about, then re-establish each from the current
+            // account handle.
+            let scopes: Vec<CursorScope> = cursors.all_scopes();
+            for s in &scopes {
+                cursors.delete(s);
+                if let Err(err) = store.delete_change_cursor(account_id, s).await {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        scope = ?s,
+                        error = %err,
+                        "SchemaIncompatible: delete_change_cursor failed"
+                    );
+                }
+            }
+            let acc_arc = current.load_full();
+            let acc: &dyn Account = acc_arc.as_ref().as_ref();
+            for s in scopes {
+                if let Err(err) = run_establish(
+                    account_id,
+                    acc,
+                    s.clone(),
+                    Arc::clone(cursors),
+                    Arc::clone(store),
+                    changes_tx.clone(),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        scope = ?s,
+                        error = %err,
+                        "SchemaIncompatible: re-establishment failed"
+                    );
+                }
+            }
+        }
+        EngineDirective::OperatorOverrideRequired { reason } => {
+            // No automatic reopen. Surface the original account error
+            // through the change stream so the consumer can pause /
+            // alert. The driver already pushed the terminating event;
+            // we add an `OperatorAttentionNeeded` warning carrying the
+            // reason for telemetry.
+            broadcast_warning(
+                changes_tx,
+                fallback_scope.clone(),
+                bifrost_types::Warning {
+                    kind: bifrost_types::WarningKind::OperatorAttentionNeeded,
+                    message: DiagnosticText::user_safe(reason.clone()),
+                    next_action: None,
+                    protocol_detail: Some(DiagnosticText::support_only(reason)),
+                    retry_count: 0,
+                },
+            );
+        }
+    }
+}
+
+async fn restart_scope(
+    current: &Arc<ArcSwap<Arc<dyn Account>>>,
+    cursors: &Arc<CursorRegistry>,
+    store: &Arc<DynCheckpointStore>,
+    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    account_id: &AccountId,
+    scope: CursorScope,
+) {
+    cursors.delete(&scope);
+    if let Err(err) = store.delete_change_cursor(account_id, &scope).await {
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?account_id,
+            scope = ?scope,
+            error = %err,
+            "RestartScope: delete_change_cursor failed"
+        );
+    }
+    let acc_arc = current.load_full();
+    let acc: &dyn Account = acc_arc.as_ref().as_ref();
+    match run_establish(
+        account_id,
+        acc,
+        scope.clone(),
+        Arc::clone(cursors),
+        Arc::clone(store),
+        changes_tx.clone(),
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(err) = link_discovered_memberships(acc, cursors).await {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?account_id,
+                    scope = ?scope,
+                    error = %err,
+                    "RestartScope: membership refresh failed"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "bifrost.sync.changes",
+                account = ?account_id,
+                scope = ?scope,
+                error = %err,
+                "RestartScope: re-establishment failed"
+            );
+        }
+    }
+}
+
+async fn restart_account(
+    factory: &Arc<dyn AccountFactory>,
+    current: &Arc<ArcSwap<Arc<dyn Account>>>,
+    account_id: &AccountId,
+    control: &SyncControl,
+) {
+    match factory.open(account_id.clone()).await {
+        Ok(next) => {
+            next.as_ref().set_priority(control.priority_snapshot());
+            next.as_ref()
+                .set_bandwidth_cap(control.bandwidth_cap_snapshot());
+            current.store(Arc::new(next));
+        }
+        Err(err) => tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?account_id,
+            error = %err,
+            "RestartAccount: factory.open failed"
+        ),
+    }
+}
+
+fn broadcast_warning(
+    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    scope: Option<CursorScope>,
+    warning: bifrost_types::Warning,
+) {
+    let me = MultiplexerEvent {
+        scope: scope.unwrap_or(CursorScope::Account),
+        event: Arc::new(SyncEvent::Warning(warning)),
+        checkpoint: None,
+    };
+    let _ = changes_tx.send(me);
 }
 
 /// Re-establish a single scope. Mirrors `SyncEngine::establish_one`
@@ -1584,7 +1833,7 @@ async fn run_establish(
     match account
         .establish_initial_cursor(scope.clone())
         .await
-        .map_err(|e| Error::EstablishCursorFailed(format!("{e}")))?
+        .map_err(Error::Account)?
     {
         CursorEstablishment::Ready(cursor) => {
             store.put_change_cursor(account_id, cursor.clone()).await?;
@@ -1603,11 +1852,8 @@ async fn run_establish(
             {
                 crate::multiplexer::FusionOutcome::Established
                 | crate::multiplexer::FusionOutcome::NoCursor => Ok(()),
-                crate::multiplexer::FusionOutcome::Fatal(recovery) => {
-                    Err(Error::EstablishCursorFatal {
-                        message: "inventory fusion fatal during recovery".into(),
-                        recovery,
-                    })
+                crate::multiplexer::FusionOutcome::Terminated(error) => {
+                    Err(Error::EstablishCursorTerminated(error))
                 }
             }
         }
@@ -1635,35 +1881,81 @@ impl Drop for SyncEngine {
     }
 }
 
-/// Classify a `MutationOutcome` into the counter bucket the engine
-/// reports back to the consumer.
-///
-/// `Failed(Error)` is split: terminal failures (auth lost,
-/// unsupported, cursor/schema mismatch) bypass the read-back guard
-/// and land in `failed_terminal`. Everything else goes through the
-/// retry/read-back path.
+/// Per-id mutation bookkeeping bucket. Reflects the campaign's final
+/// resolution for each id; `PendingRetry` items get the read-back
+/// guard before counters are reported back to the consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationBucket {
     Applied,
     Skipped,
     FailedTerminal,
     PendingRetry,
+    PendingReadback,
+    BlockedByEngine,
 }
 
-fn classify_mutation_outcome(outcome: &bifrost_types::MutationOutcome) -> MutationBucket {
-    match outcome {
-        bifrost_types::MutationOutcome::Applied => MutationBucket::Applied,
-        bifrost_types::MutationOutcome::Skipped => MutationBucket::Skipped,
-        bifrost_types::MutationOutcome::Failed(err) => {
-            if is_terminal_mutation_error(err) {
-                MutationBucket::FailedTerminal
-            } else {
-                MutationBucket::PendingRetry
+/// Classify one `ItemOutcome<MutationSuccess>` and update the
+/// per-id outcome map, retry queue, and read-back queue.
+///
+/// Dispatch rules (per
+/// `plans/error-model-sync.md::Mutation pipeline`):
+/// - `Succeeded(Applied)` -> `Applied`.
+/// - `Succeeded(Skipped)` -> `Skipped`.
+/// - `Failed { error }` dispatches via `error.recovery()`:
+///   - `Retry::SameRequest` / `AfterAuthRefresh` -> retry queue.
+///   - `Retry::AfterStateRefresh` and `Reconcile(_)` -> read-back.
+///   - `Engine(_)` -> `BlockedByEngine`.
+///   - terminal -> `FailedTerminal`.
+/// - `Uncertain { error }` always -> read-back, even if the carried
+///   recovery says retryable; the uncertainty lane exists precisely
+///   to avoid blindly replaying writes whose first attempt may have
+///   landed.
+fn classify_item_outcome(
+    item: ItemOutcome<MutationSuccess>,
+    outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
+    retry_ids: &mut Vec<bifrost_types::ObjectId>,
+    readback_ids: &mut Vec<bifrost_types::ObjectId>,
+) {
+    match item {
+        ItemOutcome::Succeeded(success) => {
+            let id = bifrost_types::ObjectId(success.item.0);
+            let bucket = match success.output {
+                MutationSuccess::Applied => MutationBucket::Applied,
+                MutationSuccess::Skipped => MutationBucket::Skipped,
+            };
+            outcomes.insert(id, bucket);
+        }
+        ItemOutcome::Failed(failure) => {
+            let id = bifrost_types::ObjectId(failure.item.0);
+            match failure.error.recovery() {
+                RecoveryClass::Retry(advice) => match advice.disposition {
+                    bifrost_types::RetryDisposition::AfterStateRefresh => {
+                        readback_ids.push(id.clone());
+                        outcomes.insert(id, MutationBucket::PendingReadback);
+                    }
+                    bifrost_types::RetryDisposition::SameRequest
+                    | bifrost_types::RetryDisposition::AfterAuthRefresh => {
+                        retry_ids.push(id.clone());
+                        outcomes.insert(id, MutationBucket::PendingRetry);
+                    }
+                },
+                RecoveryClass::Reconcile(_) => {
+                    readback_ids.push(id.clone());
+                    outcomes.insert(id, MutationBucket::PendingReadback);
+                }
+                RecoveryClass::Engine(_) => {
+                    outcomes.insert(id, MutationBucket::BlockedByEngine);
+                }
+                _ => {
+                    outcomes.insert(id, MutationBucket::FailedTerminal);
+                }
             }
         }
-        // `MutationOutcome` is `#[non_exhaustive]`; conservatively
-        // surface unknown future variants as terminal failures.
-        _ => MutationBucket::FailedTerminal,
+        ItemOutcome::Uncertain(uncertain) => {
+            let id = bifrost_types::ObjectId(uncertain.item.0);
+            readback_ids.push(id.clone());
+            outcomes.insert(id, MutationBucket::PendingReadback);
+        }
     }
 }
 
@@ -1675,23 +1967,15 @@ fn counters_from_outcomes(
         match bucket {
             MutationBucket::Applied => counters.record_applied(),
             MutationBucket::Skipped => counters.record_skipped(),
-            MutationBucket::FailedTerminal => counters.record_failed(),
-            MutationBucket::PendingRetry => counters.record_pending(),
+            MutationBucket::FailedTerminal | MutationBucket::BlockedByEngine => {
+                counters.record_failed();
+            }
+            MutationBucket::PendingRetry | MutationBucket::PendingReadback => {
+                counters.record_pending();
+            }
         }
     }
     counters
-}
-
-fn is_terminal_mutation_error(err: &bifrost_types::Error) -> bool {
-    matches!(
-        err,
-        bifrost_types::Error::Auth(_)
-            | bifrost_types::Error::Unsupported
-            | bifrost_types::Error::MissingCoreCapability
-            | bifrost_types::Error::CursorProtocolMismatch
-            | bifrost_types::Error::CursorEnvelopeUnknown
-            | bifrost_types::Error::SchemaIncompatible
-    )
 }
 
 #[cfg(test)]

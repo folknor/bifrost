@@ -47,7 +47,7 @@ impl CursorRegistry {
 
     /// Drop the cursor for a scope and any membership index entries
     /// that referenced it. Used by `ScopeLifecycle::Deleted` and by
-    /// the engine's `RecoveryClass::RestartScope` recovery path.
+    /// the engine's `EngineDirective::RestartScope` recovery path.
     pub fn delete(&self, scope: &CursorScope) {
         {
             let mut guard = self.cursors.write().expect("poisoned");

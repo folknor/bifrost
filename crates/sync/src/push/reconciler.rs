@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, AccountId, CursorScope, HintPayload, InvalidationHint, RecoveryClass, WatchEvent,
+    Account, AccountId, CursorScope, DiagnosticText, HintPayload, InvalidationHint, RecoveryClass,
+    WatchEvent,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -60,7 +61,7 @@ impl Reconciler {
             WatchEvent::Disconnected => {
                 let _ = self.changes_tx.send(self.warning_event(
                     "push transport disconnected",
-                    bifrost_types::WarningKind::Other("push:disconnected".into()),
+                    bifrost_types::WarningKind::Other,
                 ));
             }
             WatchEvent::Reconnected => {
@@ -107,22 +108,46 @@ impl Reconciler {
                 | ChangesEvent::Done
                 | ChangesEvent::Stopped
                 | ChangesEvent::Paused => {}
-                ChangesEvent::Fatal(recovery) => {
-                    if let RecoveryClass::Retry { after } = recovery {
-                        tokio::time::sleep(after).await;
-                    } else {
-                        let _ = self
-                            .reopen_tx
-                            .send(ReopenRequest::Recovery {
-                                scope: scope.clone(),
-                                recovery,
-                            })
-                            .await;
+                ChangesEvent::Terminated(error) => {
+                    use crate::recovery::{directive_target_scope, retry_delay};
+                    let recovery = error.recovery().clone();
+                    match recovery {
+                        RecoveryClass::Retry(advice) => {
+                            let delay = retry_delay(
+                                &advice,
+                                std::time::SystemTime::now(),
+                                std::time::Duration::from_secs(1),
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        RecoveryClass::Reconcile(_) => {
+                            // Reconcile on a push-driven read: rerun
+                            // the same hinted scope set once. We are
+                            // already inside that loop, so falling
+                            // through to the next scope (and finishing
+                            // this reconcile pass) is the bounded
+                            // re-run; future hints / polls handle the
+                            // rest.
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                        RecoveryClass::Engine(directive) => {
+                            let directive_scope = directive_target_scope(&directive);
+                            let _ = self
+                                .reopen_tx
+                                .send(ReopenRequest::Recovery {
+                                    scope: directive_scope,
+                                    error,
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                        _ => {
+                            // Terminal: the broadcast already carried
+                            // the terminating event. Bail out of this
+                            // reconcile pass; do not re-dispatch.
+                            return Ok(());
+                        }
                     }
-                    // Fatal already propagated through the broadcast
-                    // by the driver; bail out after handing recovery
-                    // to the slot-level reopen listener.
-                    return Ok(());
                 }
             }
         }
@@ -140,7 +165,7 @@ impl Reconciler {
             .unwrap_or(CursorScope::Account);
         let warning: Warning = Warning {
             kind,
-            message: message.to_string(),
+            message: DiagnosticText::user_safe(message),
             retry_count: 0,
             next_action: None,
             protocol_detail: None,

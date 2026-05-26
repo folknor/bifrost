@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, Change, Checkpoint, CursorScope, InventoryEntry, ObjectChange, ObjectChangeKind,
-    PageBoundary, RecoveryClass, SyncEvent,
+    Account, AccountError, Change, Checkpoint, CursorScope, InventoryEntry, ObjectChange,
+    ObjectChangeKind, PageBoundary, SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
@@ -39,8 +39,10 @@ pub enum FusionOutcome {
     /// Inventory completed without yielding a cursor; the engine emits
     /// a Warning.
     NoCursor,
-    /// Inventory ended in `Fatal`.
-    Fatal(RecoveryClass),
+    /// Inventory terminated with an account error. Carries the full
+    /// `AccountError` so the caller dispatches through
+    /// `error.recovery()`.
+    Terminated(AccountError),
 }
 
 pub struct InventoryFusion {
@@ -91,7 +93,7 @@ impl InventoryFusion {
                     return self.finalize(scope, checkpoint).await;
                 }
                 SyncEvent::Fatal(f) => {
-                    let recovery = f.recovery.clone();
+                    let account_error = f.0.clone();
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
@@ -100,7 +102,7 @@ impl InventoryFusion {
                         };
                         let _ = tx.send(me);
                     }
-                    return Ok(FusionOutcome::Fatal(recovery));
+                    return Ok(FusionOutcome::Terminated(account_error));
                 }
                 SyncEvent::Batch(batch) => {
                     if let Some(tx) = &changes_tx {

@@ -30,7 +30,9 @@
 
 use std::sync::Arc;
 
-use bifrost_types::{Account, AccountId, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent};
+use bifrost_types::{
+    Account, AccountError, AccountId, Change, ChangeCursor, Checkpoint, CursorScope, SyncEvent,
+};
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -55,10 +57,12 @@ pub enum ChangesEvent {
     /// Driver was asked to pause; checkpoint flushed and the driver
     /// parked the stream at a clean boundary.
     Paused,
-    /// Driver saw a `Fatal` and aborted the stream. Carries the
-    /// `RecoveryClass` so the engine dispatches the right recovery
-    /// (Retry / RestartScope / RestartAccount / surface-to-consumer).
-    Fatal(bifrost_types::RecoveryClass),
+    /// Driver saw a terminating stream event and aborted. Carries the
+    /// full `AccountError` so the engine dispatches via the derived
+    /// `RecoveryClass` (Retry / Reconcile / Engine directive /
+    /// terminal). The name reflects that non-terminal recoveries can
+    /// also terminate a stream and resume after dispatch.
+    Terminated(AccountError),
 }
 
 /// Consume a `changes_stream` to completion or to the next boundary
@@ -89,8 +93,14 @@ pub async fn drive_changes_stream(
         }
         let checkpoint = checkpoint_for(&event).cloned();
         let is_done = matches!(&event, SyncEvent::Done(_));
-        let fatal_recovery = if let SyncEvent::Fatal(f) = &event {
-            Some(f.recovery.clone())
+        // Capture the full `AccountError` so the engine has the
+        // derived recovery, scope, operation, provider, protocol, and
+        // diagnostics on hand. Phase 3 renames the variant to
+        // `Terminated`; until then we still match `SyncEvent::Fatal`
+        // (whose payload `Fatal.0` is already the new-model
+        // `AccountError`).
+        let terminated_error = if let SyncEvent::Fatal(f) = &event {
+            Some(f.0.clone())
         } else {
             None
         };
@@ -121,8 +131,8 @@ pub async fn drive_changes_stream(
         if is_done {
             return Ok(ChangesEvent::Done);
         }
-        if let Some(rec) = fatal_recovery {
-            return Ok(ChangesEvent::Fatal(rec));
+        if let Some(err) = terminated_error {
+            return Ok(ChangesEvent::Terminated(err));
         }
     }
     Ok(ChangesEvent::Done)

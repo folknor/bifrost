@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountId, ChangeCursor, Checkpoint, CursorScope, MembershipScope, RecoveryClass,
-    ScopeLifecycle, SyncEvent, WatchEvent,
+    Account, AccountError, AccountId, AccountOperation, ChangeCursor, Checkpoint, CursorScope,
+    MembershipScope, RecoveryClass, ScopeLifecycle, SyncEvent, WatchEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, mpsc};
@@ -67,27 +67,24 @@ pub struct MultiplexerEvent {
 }
 
 /// Reopen request raised by per-scope drivers when a stream ends with
-/// a recoverable Fatal. The engine listens on the receiver and
-/// dispatches the recovery action carried in `RecoveryClass`.
+/// an account-side failure. The engine listens on the receiver and
+/// dispatches according to the carried `AccountError`'s recovery.
 ///
-/// The full `RecoveryClass` is preserved so the engine can:
-/// - `Retry { after }`: sleep then re-poll the same scope.
-/// - `RestartScope` / `DowngradeCapabilityForScope`: drop the scope's
-///   cursor and re-establish via inventory.
-/// - `RestartAccount` / `CapabilityChanged`: `factory.open()` + reseed
-///   the slot's `ArcSwap`.
-/// - `AuthLost` / `Fatal` / `OperatorOverrideRequired`: surface; do
-///   not auto-reopen.
-/// - `DowngradeStrategy` / `SchemaIncompatible`: surface (engine has
-///   no automated path; the protocol crate is expected to apply the
-///   downgrade on the next `establish_initial_cursor`).
+/// `scope` is `Option<CursorScope>`: scope-bound directives
+/// (`Engine(RestartScope)`, `Engine(DowngradeCapabilityForScope)`,
+/// `Engine(DowngradeStrategy)` with `ErrorScope::Cursor`) carry
+/// `Some(scope)`. Account-wide directives (`RestartAccount`,
+/// `SchemaIncompatible`, `CapabilityChanged`, `OperatorOverrideRequired`)
+/// carry `None`. Workers must not paper over an account-wide directive
+/// with the worker's own scope - passing `Some(arbitrary_scope)` would
+/// mask the directive's account-wide intent.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ReopenRequest {
-    /// Recovery class observed at the scope's stream terminus.
+    /// Account error observed at the scope's stream terminus.
     Recovery {
-        scope: CursorScope,
-        recovery: RecoveryClass,
+        scope: Option<CursorScope>,
+        error: AccountError,
     },
 }
 
@@ -215,10 +212,21 @@ impl Multiplexer {
                                     // it first. We raise a Recovery
                                     // request so the engine drives the
                                     // initial cursor establishment.
+                                    // Synthesize a cursor-invalid
+                                    // `AccountError` for this scope so
+                                    // the engine's `handle_account_error`
+                                    // dispatch derives
+                                    // `Engine(RestartScope(scope))`
+                                    // through the same path it uses for
+                                    // every other recovery.
+                                    let error = crate::recovery::restart_scope_error(
+                                        scope.clone(),
+                                        AccountOperation::SyncChanges,
+                                    );
                                     let _ = lifecycle_reopen
                                         .send(ReopenRequest::Recovery {
-                                            scope: scope.clone(),
-                                            recovery: RecoveryClass::RestartScope(scope.clone()),
+                                            scope: Some(scope.clone()),
+                                            error,
                                         })
                                         .await;
                                 }
@@ -250,10 +258,21 @@ impl Multiplexer {
                                     lifecycle_cursors.delete(&scope);
                                 }
                                 if let Some(scope) = membership_to_cursor_scope(&new) {
+                                    // Synthesize a cursor-invalid
+                                    // `AccountError` for this scope so
+                                    // the engine's `handle_account_error`
+                                    // dispatch derives
+                                    // `Engine(RestartScope(scope))`
+                                    // through the same path it uses for
+                                    // every other recovery.
+                                    let error = crate::recovery::restart_scope_error(
+                                        scope.clone(),
+                                        AccountOperation::SyncChanges,
+                                    );
                                     let _ = lifecycle_reopen
                                         .send(ReopenRequest::Recovery {
-                                            scope: scope.clone(),
-                                            recovery: RecoveryClass::RestartScope(scope.clone()),
+                                            scope: Some(scope.clone()),
+                                            error,
                                         })
                                         .await;
                                 }
@@ -581,23 +600,69 @@ async fn handle_drive_outcome(
                 exit: false,
             }
         }
-        Ok(ChangesEvent::Fatal(recovery)) => {
-            if let RecoveryClass::Retry { after } = recovery {
-                tokio::time::sleep(after).await;
-            } else {
-                // Send the full RecoveryClass to the engine so it can
-                // dispatch the right action: RestartScope /
-                // RestartAccount / AuthLost / etc.
-                let _ = reopen_tx
-                    .send(ReopenRequest::Recovery {
-                        scope: scope.clone(),
-                        recovery,
-                    })
-                    .await;
-            }
-            DriveRecovery {
-                advanced: false,
-                exit: false,
+        Ok(ChangesEvent::Terminated(error)) => {
+            use crate::recovery::{directive_target_scope, retry_delay};
+            // Dispatch via `error.recovery()`. Retry and reconcile
+            // keep the poll loop alive; engine directives hand off to
+            // the reopen listener with the full account error;
+            // terminal errors stop the loop (the broadcast already
+            // carried the terminating event).
+            let recovery = error.recovery().clone();
+            match recovery {
+                RecoveryClass::Retry(advice) => {
+                    let delay = retry_delay(
+                        &advice,
+                        std::time::SystemTime::now(),
+                        std::time::Duration::from_secs(1),
+                    );
+                    tokio::time::sleep(delay).await;
+                    DriveRecovery {
+                        advanced: false,
+                        exit: false,
+                    }
+                }
+                RecoveryClass::Reconcile(_) => {
+                    // A read stream's reconcile collapses to "rerun
+                    // this scope soon". Sleep briefly so we do not
+                    // hot-spin, then re-enter the poll loop.
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    DriveRecovery {
+                        advanced: false,
+                        exit: false,
+                    }
+                }
+                RecoveryClass::Engine(directive) => {
+                    let directive_scope = directive_target_scope(&directive);
+                    let _ = reopen_tx
+                        .send(ReopenRequest::Recovery {
+                            scope: directive_scope,
+                            error,
+                        })
+                        .await;
+                    DriveRecovery {
+                        advanced: false,
+                        exit: false,
+                    }
+                }
+                _ => {
+                    // Terminal stream ending: the broadcast already
+                    // carried the terminating event, and no further
+                    // automated action will resume the stream. Exit
+                    // the poll loop so we do not re-poll a terminal
+                    // scope forever.
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?account_id,
+                        scope = ?scope,
+                        kind = ?error.kind(),
+                        message_key = error.message_key(),
+                        "changes stream terminated with terminal recovery"
+                    );
+                    DriveRecovery {
+                        advanced: false,
+                        exit: true,
+                    }
+                }
             }
         }
         Err(err) => {
