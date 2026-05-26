@@ -114,7 +114,14 @@ pub struct BatchUncertain {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BatchItemId(pub String);
 
-pub(crate) fn validate_batch_input<I>(
+/// Pre-flight validation for Vec-batch input. Returns the list of
+/// offending items if any `BatchItemId` is empty or duplicate, or if
+/// the input itself is empty. Protocol crates that build a
+/// `Vec<BatchItem<_>>` interface must call this before any byte
+/// crosses the side-effect boundary so empty/duplicate identifiers
+/// surface as `Err(AccountError { kind: Request(BatchInputInvalid),
+/// .. })` rather than silently splitting the caller's intent.
+pub fn validate_batch_input<I>(
     items: &[BatchItem<I>],
 ) -> Result<(), Vec<BatchInputInvalidItem>> {
     if items.is_empty() {

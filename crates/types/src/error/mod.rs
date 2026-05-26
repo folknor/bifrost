@@ -13,7 +13,7 @@ pub mod warning;
 pub use account_error::AccountError;
 pub use batch::{
     BatchFailure, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome, BatchSuccess,
-    BatchUncertain,
+    BatchUncertain, validate_batch_input,
 };
 pub use builder::AccountErrorBuilder;
 pub use cause::{

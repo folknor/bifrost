@@ -30,38 +30,38 @@ collection. `lib.rs` does the re-export work. The error / recovery
 surface lives entirely in `error.rs` (188 lines). Relevant existing
 files:
 
-- `crates/types/src/error.rs` — `Error`, `Fatal`, `RecoveryClass`
+- `crates/types/src/error.rs` - `Error`, `Fatal`, `RecoveryClass`
   (with `Retry { after: Duration }`, `DowngradeStrategy`,
   `DowngradeCapabilityForScope`, `RestartScope`, `RestartAccount`,
   `AuthLost`, `SchemaIncompatible`, `CapabilityChanged`,
   `OperatorOverrideRequired`, `Fatal`), `StrategyDowngrade`,
   `Warning`, `WarningKind`.
-- `crates/types/src/events.rs:150-156` — `SyncEvent<T>` with
+- `crates/types/src/events.rs:150-156` - `SyncEvent<T>` with
   `Batch / Progress / Warning / Fatal / Done` variants.
   `SyncEvent::Fatal(Fatal)` at line 154 is the rename target.
-- `crates/types/src/events.rs:289-300` — `Control` trait. Two
+- `crates/types/src/events.rs:289-300` - `Control` trait. Two
   method returns use `Error` and must update to `AccountError`.
-- `crates/types/src/mutation.rs:155-171` — `MutationResult` and
+- `crates/types/src/mutation.rs:155-171` - `MutationResult` and
   `MutationOutcome` with `Failed(Error)` arm.
-- `crates/types/src/account.rs:34` — `use crate::error::{Error, Fatal, RecoveryClass}`.
+- `crates/types/src/account.rs:34` - `use crate::error::{Error, Fatal, RecoveryClass}`.
   The `Account` trait at line 63 uses `Result<_, Error>` in
   every method signature.
-- `crates/types/src/account.rs:127-143` — default impl of
+- `crates/types/src/account.rs:127-143` - default impl of
   `inventory_partition_stream` constructs
   `SyncEvent::Fatal(Fatal { recovery: RecoveryClass::Fatal, ... })`.
   This emission site is left as-is by Phase 1 and rewritten in
   Phase 3 alongside the rest of `account.rs`.
-- `crates/types/src/capabilities.rs:296-313` —
+- `crates/types/src/capabilities.rs:296-313` -
   `CapabilityChange`, `CapabilityDelta`, `CapabilityKey`,
   `CapabilityValue`. Already public; the new
   `EngineDirective::CapabilityChanged { delta }` reuses
   `CapabilityDelta` verbatim.
-- `crates/types/src/cursor.rs` — `CursorScope`, `SyncStrategy`,
+- `crates/types/src/cursor.rs` - `CursorScope`, `SyncStrategy`,
   `ChangeCursor`, `CursorEstablishment`. No `Error` references.
   `EngineDirective::DowngradeStrategy(StrategyDowngrade)` reuses
   `StrategyDowngrade` (currently in `error.rs:127-132`); the type
   itself moves to the new recovery module.
-- `crates/types/src/lib.rs:63` —
+- `crates/types/src/lib.rs:63` -
   `pub use error::{Error, Fatal, RecoveryClass, StrategyDowngrade, Warning, WarningKind};`.
   Re-exports change wholesale.
 
@@ -188,40 +188,40 @@ crates/types/src/
 
 In dependency order (each file depends on types defined above it):
 
-1. `crates/types/src/error/scope.rs` — `ErrorScope`,
+1. `crates/types/src/error/scope.rs` - `ErrorScope`,
    `AccountOperation`, `Provider`, `Protocol`. No dependencies
    beyond existing types (`CursorScope` from `cursor.rs`).
-2. `crates/types/src/error/kind.rs` — `AccountErrorKind` and all
+2. `crates/types/src/error/kind.rs` - `AccountErrorKind` and all
    subkind enums. Depends on `scope.rs` (for `AccountOperation` in
    `Unsupported(AccountOperation)`). `RequestErrorKind` carries no
    payload (the `BatchInputInvalidItem` list lives in
    `RequestCause::BatchInputInvalid`), so there is no
    `BatchItemId` dependency.
-3. `crates/types/src/error/cause.rs` — all `*Cause` types,
+3. `crates/types/src/error/cause.rs` - all `*Cause` types,
    `Cause`, `CauseChain`. Depends on `kind.rs` and `scope.rs`. The
    `WireCause` enum's per-protocol variants (`GraphSignal`,
    `JmapMethod`, `ImapResponseCode`, `EnhancedStatusCode`,
    `GmailSignal`) are defined here as `#[non_exhaustive]` enums
    that the protocol crates fill in via their builder calls.
-4. `crates/types/src/error/diagnostic.rs` — `DiagnosticInfo`,
+4. `crates/types/src/error/diagnostic.rs` - `DiagnosticInfo`,
    `DiagnosticText`, `DetailVisibility`, export view types.
    Depends on `kind.rs`, `scope.rs`, `cause.rs`. The
    `TelemetryView::from_account_error` constructor lives elsewhere
    (in `account_error.rs`) because it needs access to
    `AccountError`'s private fields.
-5. `crates/types/src/error/batch.rs` — `BatchItem<I>`,
+5. `crates/types/src/error/batch.rs` - `BatchItem<I>`,
    `BatchOutcome<T>`, `BatchItemOutcome`, `BatchSuccess<T>`,
    `BatchFailure`, `BatchUncertain`, `BatchItemId`. Depends on
    nothing else in error/ except `account_error.rs` (via
-   `BatchFailure.error: AccountError`) — declare with a forward
+   `BatchFailure.error: AccountError`) - declare with a forward
    reference, define after `account_error.rs` lands. Also
    exposes `pub(crate) fn validate_batch_input` for the
    preflight uniqueness / emptiness check.
-6. `crates/types/src/error/stream.rs` — `ItemOutcome<T>`,
+6. `crates/types/src/error/stream.rs` - `ItemOutcome<T>`,
    `MutationSuccess`. Depends on `batch.rs`.
-7. `crates/types/src/error/warning.rs` — `Warning`, `WarningKind`.
+7. `crates/types/src/error/warning.rs` - `Warning`, `WarningKind`.
    Depends on `diagnostic.rs`.
-8. `crates/types/src/error/recovery.rs` — `RecoveryClass`,
+8. `crates/types/src/error/recovery.rs` - `RecoveryClass`,
    `RetryAdvice`, `RetryDisposition`, `RetryReason`,
    `ReconcileAdvice`, `ReconcileReason`, `ReconcileGuidance`,
    `ReconcileAction`, `EngineDirective`, `ThrottleScope`,
@@ -229,17 +229,17 @@ In dependency order (each file depends on types defined above it):
    `StrategyDowngrade`, plus the `derive`, `suggest`, and
    `kind_matches_cause` functions. Depends on `kind.rs`,
    `scope.rs`, `cause.rs`, and `crate::capabilities::CapabilityDelta`.
-9. `crates/types/src/error/account_error.rs` — `AccountError`
+9. `crates/types/src/error/account_error.rs` - `AccountError`
    struct, all accessors, `StdError` impl, `Display` impl,
    `TelemetryView::from_account_error` constructor, the
    support-export constructors. Depends on every module above.
-10. `crates/types/src/error/builder.rs` — `AccountErrorBuilder`
+10. `crates/types/src/error/builder.rs` - `AccountErrorBuilder`
     and `build()`. Depends on `account_error.rs` and
     `recovery.rs::derive` / `suggest`.
-11. `crates/types/src/error/message_key.rs` —
+11. `crates/types/src/error/message_key.rs` -
     `derive_message_key(&AccountErrorKind) -> &'static str`.
     Depends on `kind.rs`.
-12. `crates/types/src/error/mod.rs` — `pub use` re-exports.
+12. `crates/types/src/error/mod.rs` - `pub use` re-exports.
     Last, since it surfaces everything above.
 
 Order 5/6 has a circular reference at the type level
@@ -355,7 +355,7 @@ All fields private. Accessors per the convergence plan §Public shape.
 `Arc<dyn StdError + Send + Sync>` for an embedded system error;
 threading one through would require Clone-via-Arc on every cause
 variant and serialization carve-outs for `serde::Serialize` on
-the support exports — not worth the complexity for the marginal
+the support exports - not worth the complexity for the marginal
 benefit of one extra level of standard-walker visibility.
 
 The wire-level text (the formatted message that the underlying
@@ -382,7 +382,7 @@ log lines, not user display.
 4. Call `recovery::suggest(...)` to produce
    `Option<RemediationAction>`.
 5. Call `message_key::derive(&kind)` to produce `&'static str`
-   (stored on `AccountError` for stable `message_key()` access —
+   (stored on `AccountError` for stable `message_key()` access -
    though since it's a function of `kind`, it's cheap to recompute
    on every call; store on the struct only if profiling shows
    benefit).
@@ -463,7 +463,7 @@ make it.** The convergence plan's recovery table implies a
 specific vocabulary per protocol; Phase 1 ships those variants
 plus any additional variants documented in the per-crate
 scaffolds. Protocol crates in Phase 2 cannot edit
-`bifrost-types/src/error/cause.rs` — that violates crate
+`bifrost-types/src/error/cause.rs` - that violates crate
 ownership boundaries. If a Phase 2 agent needs a new wire-enum
 variant, the orchestrator patches `bifrost-types` centrally and
 re-runs the affected agent. Crate-ownership rules are
@@ -504,7 +504,7 @@ pub struct Warning {
 `WarningKind` retains the existing categories (`StrategyDowngraded`,
 `OperatorAttentionNeeded`, `Throttled`, `ClockSkew`,
 `BlobNotByteStream`, `ReadbackSkipped`, `Other`). `Other` carries
-no payload — putting free text inside the kind is the same
+no payload - putting free text inside the kind is the same
 anti-pattern that `RequestErrorKind::BatchInputInvalid` already
 avoids. The detail belongs in `Warning.protocol_detail`, which is
 a `DiagnosticText` and inherits the visibility discipline.
@@ -546,7 +546,7 @@ trait, event, and mutation surfaces still reference removed
 types). Phase 3 is the earliest point the workspace compiles and
 the test suite runs.
 
-The tests themselves are written in Phase 1 alongside the types —
+The tests themselves are written in Phase 1 alongside the types -
 they live in `#[cfg(test)]` modules inside each `error/*.rs`
 file. They simply don't execute until integration. Per
 `CLAUDE.md`: small technical tests, no live servers, no mock
@@ -616,3 +616,141 @@ Patch-audit criteria:
 
 Phase 3 picks up validation: at the end of Phase 3, `brokkr check`
 runs clean and the ~95-100 tests written in Phase 1 execute green.
+
+## Phase 1 amendment (post-2.2 correctness pass)
+
+Phase 1 landed as commit `ac47289`. The Phase 2.2 audit surfaced
+shape-level corrections that must land **before** Phase 2.3 (sync)
+and Phase 3 (integration) so downstream agents build against the
+correct surface. These ship as a single amendment commit on the
+feature branch.
+
+### Shape corrections (correctness-load-bearing)
+
+1. **`ServerCause::Error::status` becomes `Option<u16>`.**
+   - Schema: `Error { status: Option<u16> }`.
+   - Rationale: HTTP-like providers carry numeric status as `Some(_)`;
+     protocol server failures without numeric status (IMAP `NO`/`BAD`
+     outside any response code) carry `None`. The Phase 2.2 IMAP
+     agent was forced to invent `status: 0` as a sentinel because
+     the field was `u16`, not `Option<u16>` - exactly the bug this
+     amendment closes.
+   - Migration: the central recovery table gains explicit rows for
+     `Server(Error { status: None })` × each `TransmissionState`.
+     See `plans/error-model-convergence.md` recovery table.
+   - Builder method: `pub fn status(self, status: Option<u16>) -> Self;`.
+   - Tests: add `Server(Error { status: None })` derivation test for
+     each transmission state.
+
+2. **`AccountError::into_builder()` added to the `impl AccountError`
+   block.**
+   - Signature: `pub fn into_builder(self) -> AccountErrorBuilder;`.
+   - Rationale: the Phase 2.2 Gmail agent reported a manual
+     five-step clone-walk-rebuild dance for the TRASH-fallback merge
+     pattern (preserve a primary `AccountError`, decorate with
+     secondary evidence). `into_builder` returns a builder
+     pre-populated with the error's kind, scope, operation, provider,
+     protocol, diagnostics, and chain so callers can `push_cause(_)
+     .build()` to add evidence while keeping `build()` as the single
+     invariant funnel.
+   - Explicitly **not** added: a `with_secondary_cause` mutator on
+     `AccountError`. Such a mutator would either bypass `build()`
+     (losing the invariant funnel) or duplicate it (drifting).
+   - Tests: round-trip an `AccountError` through `into_builder()
+     .build()` and assert all observable fields are unchanged; then
+     push an additional `Cause` and assert the chain grows correctly
+     without other field drift.
+
+### Known-vocabulary additions to wire enums
+
+Phase 1 originally shipped wire enums "as complete as we can make
+them" with the escape hatch that the orchestrator centrally patches
+`bifrost-types` if Phase 2 agents need new variants. Phase 2.2
+exercised the escape hatch:
+
+3. **`JmapMethod` gains typed variants for the known `SetErrorType`
+   family.** Routing known JMAP set-error codes through
+   `JmapMethod::Unknown { code }` plus string matching is forbidden
+   per the convergence plan; the following must be named variants:
+   - `Forbidden`
+   - `OverQuota`
+   - `TooLarge`
+   - `RateLimit`
+   - `NotFound`
+   - `InvalidPatch`
+   - `WillDestroy`
+   - `Singleton`
+   - `MailboxHasChild`
+   - `MailboxHasEmail`
+   - `BlobNotFound`
+   - `TooManyKeywords`
+   - `TooManyMailboxes`
+   - `ForbiddenFrom`
+   - `InvalidEmail`
+   - `TooManyRecipients`
+   - `NoRecipients`
+   - `InvalidRecipients`
+   - `ForbiddenMailFrom`
+   - `ForbiddenToSend`
+   - `CannotUnsend`
+   - `AlreadyExists`
+   - `InvalidScript`
+   - `ScriptIsActive`
+   - `InvalidProperties`
+
+   The semantic requirement is the named coverage; if Phase 1's
+   provider-error-code enum is named something other than
+   `JmapMethod`, the variants go there. `Unknown { code }` remains
+   for genuine forward compatibility (codes the spec adds after this
+   amendment).
+
+4. **`GraphSignal` gains `InvalidDeltaToken` and `SyncStateNotFound`.**
+   - `InvalidDeltaToken` (HTTP 400, Graph delta link expired before
+     410 Gone).
+   - `SyncStateNotFound` / `syncStateNotFound` (HTTP 400 from
+     mail/calendar delta endpoints).
+   - Routing these through `GraphSignal::Unknown { code }` plus
+     exact-string match in `is_cursor_invalid_unknown` is forbidden.
+     Graph substring or exact-string recovery must be gone by
+     Phase 3 exit.
+
+### Shared helpers (ergonomics, but unblock multiple crates)
+
+5. **Promote `bifrost_types::error::batch::validate_batch_input` to
+   `pub`.**
+   - Phase 2.2 SMTP duplicated the validator inside the crate because
+     it was `pub(crate)`. Promoting saves the duplication and ensures
+     a single source of truth for empty / duplicate `BatchItemId`
+     rejection.
+
+6. **Promote `bifrost-net::request::parse_retry_after` to `pub`** (or
+   provide a thin `pub` wrapper at the crate root).
+   - Phase 2.2 Gmail inlined a copy of the parser because the net
+     helper was `pub(crate)`. Every protocol crate that reads
+     `Retry-After` will hit the same problem.
+
+### Out of scope for the amendment
+
+- `BatchItemId::new` ergonomic constructor. The field is already
+  `pub String`; the constructor is convenience-only and not
+  correctness-load-bearing.
+- Any new derivation rules in `recovery::derive` beyond the new
+  `Server(Error { status: None })` rows.
+
+### Amendment exit criteria
+
+- `cargo expand` (or equivalent inspection) shows `ServerCause::Error`
+  with `status: Option<u16>`.
+- `cargo expand` shows the new `JmapMethod` and `GraphSignal`
+  variants.
+- `AccountError::into_builder()` exists, returns the builder type,
+  and a round-trip test passes.
+- `validate_batch_input` and `parse_retry_after` are reachable from
+  outside their defining crates.
+- The ~95-100 Phase 1 tests still pass (they execute under
+  `#[cfg(test)]` in `bifrost-types`); existing assertions remain
+  valid against the corrected shapes.
+- No transitional shims; the amendment is a clean shape change.
+
+The amendment lands as one commit on `error-model/main` between
+Phase 2.2 and Phase 2.3 so sync builds against the corrected surface.

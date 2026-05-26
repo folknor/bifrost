@@ -21,9 +21,12 @@ the Gmail patch and deterministic tests, but do not run `brokkr`,
 Landed-API quirks the agent must keep straight:
 
 - `ServerErrorKind::Error { status: Option<u16> }` (kind side) vs
-  `ServerCause::Error { status: u16 }` (cause side). The kind always
-  wraps the code in `Some(_)` in this plan's tables; the cause uses
-  bare `u16`. This is by design; do not "fix" one column.
+  `ServerCause::Error { status: Option<u16> }` (cause side). Both
+  carry `Option<u16>` after the Phase 1 amendment. Gmail responses
+  are HTTP and always have a numeric status, so every Gmail-side
+  construction passes `Some(status)`. The `None` variant exists for
+  protocols that lack numeric status (IMAP) and must not be invented
+  here as a sentinel.
 - `AccessErrorKind::PermissionDenied` (no payload) vs
   `AccessCause::PermissionDenied { resource: Option<ResourceKind> }`
   (carries optional resource).
@@ -603,13 +606,13 @@ Because Gmail history is account-wide, stale history ALWAYS attaches
 recovery mapper derive `Engine(RestartScope(CursorScope::Account))`
 (per convergence's recovery table row `SyncState(CursorInvalid) with
 scope`). The mapper falls back to `Engine(RestartAccount)` only when
-the cursor scope is absent — Gmail's mapper MUST pass the cursor
+the cursor scope is absent - Gmail's mapper MUST pass the cursor
 scope so the engine restarts just the changes stream, not the open
 session, the push subscription, and unrelated streams.
 
 The exception is when the failure indicates the entire Gmail account
 state is unrecoverable (account email no longer matches the cursor
-profile, schema incompatibility) — those map to `SyncState(SchemaIncompatible)`
+profile, schema incompatibility) - those map to `SyncState(SchemaIncompatible)`
 or to a missing-scope `CursorInvalid`, which the mapper routes to
 `Engine(RestartAccount)`. The two routes are distinct on purpose;
 Gmail's mapper never punts to the broader route when the narrower
@@ -941,3 +944,89 @@ Compilation and workspace-wide checks are Phase 3 work. Do not run
     behavior.
 13. Verify send and draft-send use non-idempotent context.
 14. Verify no live-server tests were added.
+
+## Phase 3 correctness blockers (post-2.2 audit)
+
+The Phase 2.2 Gmail commit landed the boundary, mutation pipeline
+rewrite, TRASH-fallback merge helper, and 34 tests. It introduced
+shims and placeholders that are now correctness blockers, not
+follow-up hygiene.
+
+### Stream termination must carry the structured `AccountError`
+
+The 2.2 commit replaced every stream-termination site with a
+`SyncEvent::Done(None)` shim and a `let _account_error = ...;`
+binding that **discards** the computed structured error. This is
+tolerable only on the broken branch; Phase 3 must:
+
+- Switch every termination site to
+  `SyncEvent::Terminated(account_error)`.
+- Delete every `let _account_error` / `let _ = ... account_error`
+  binding. Audit grep `rg '_account_error|_ = .*account_error'
+  crates/gmail/src/` returns zero hits.
+
+A stream that discards its computed error cannot drive engine
+recovery; this is the bug that motivated naming this blocker
+explicitly.
+
+### Operation placeholders in PIM (`account/pim.rs`)
+
+The 2.2 commit's `account_error` shim defaults to
+`AccountOperation::HydrateMessage` for every PIM error regardless
+of call site. Phase 3 must thread the correct operation per call
+site. Mapping:
+
+- Send entry points → `AccountOperation::Send`.
+- Draft create / update / discard / send → `DraftCreate` /
+  `DraftUpdate` / `DraftDiscard` / `DraftSend`.
+- Search and message search → `Search` / `SearchMessages`.
+- Identity list / update → `IdentitiesList` / `IdentityUpdate`.
+- Vacation get / set → `VacationGet` / `VacationSet`.
+- Quota get → `QuotaGet`.
+- Container list / create / rename / move / delete →
+  `ContainersList` / `ContainerCreate` / `ContainerRename` /
+  `ContainerMove` / `ContainerDelete`.
+- Attachment upload → `AttachmentUpload`.
+- Thread / message hydration → `HydrateThread` / `HydrateMessage`.
+- Blob open and ranged open → `OpenBlob` / `OpenBlobRange`.
+- Discover / capability scoping → `Discover` /
+  `DiscoverCursorScopes` / `DiscoverMemberships`.
+
+**Semantic exceptions where `HydrateMessage` is correct**: only
+the actual message hydration entry points in `hydrate.rs` and any
+explicit `hydrate_message` PIM helpers. Every other site must pass
+the precise operation. The audit grep
+`rg 'AccountOperation::HydrateMessage' crates/gmail/src/account/pim.rs`
+must show only the hydration entry points after Phase 3.
+
+**Why this is a correctness blocker**: same as the JMAP equivalent.
+A `Send` (non-idempotent) misclassified as `HydrateMessage`
+(idempotent) causes the central recovery mapping to choose
+`Retry::SameRequest` for an `InFlight` drop where the correct
+answer is `Reconcile`. That is a duplicate-send bug.
+
+### `pim.rs::other_error` placeholder operation
+
+The 2.2 commit's `other_error(op, detail)` helper accepts an
+operation but is called from sites that still default to
+`Discover`. Same blocker as above; same fix.
+
+### TRASH fallback merge migrates to `into_builder()`
+
+The 2.2 commit's `merge_delete_fallback_error` does a manual
+five-step clone-walk-rebuild. Phase 1 amendment adds
+`AccountError::into_builder()`. Phase 3 must:
+
+- Replace the manual dance with
+  `primary.into_builder().push_cause(secondary_cause).build()`.
+- The merge keeps its current semantics (primary error fields
+  preserved, secondary attempt evidence decorated).
+
+### `bulk_set_flags`/`bulk_move`/`bulk_destroy` signature switch
+
+The 2.2 commit rewrote the mutation pipeline to use
+`ItemOutcome<MutationSuccess>` natively, but the `Account` trait
+impl still returns `MutationResult` (referencing the broken
+`bifrost-types::mutation` surface). Phase 3 makes the trait
+signature `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`
+and the Gmail impl's adapter collapses to a direct yield.

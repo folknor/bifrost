@@ -24,10 +24,14 @@ Required reading: `plans/error-model-roadmap.md`,
 Landed-API quirks the agent must keep straight:
 
 - `ServerErrorKind::Error { status: Option<u16> }` (kind side) vs
-  `ServerCause::Error { status: u16 }` (cause side). The kind permits
-  `None`; the cause requires a `u16`. This is by design; do not "fix"
-  one column of the tables below to match the other.
-- `AccountErrorKind::Protocol(ProtocolErrorKind)` — table rows use the
+  `ServerCause::Error { status: Option<u16> }` (cause side). Both
+  carry `Option<u16>` after the Phase 1 amendment. IMAP is the
+  primary motivating case for the `None` variant: tagged `NO`/`BAD`
+  responses without a numeric `[RESPONSE-CODE]` map to
+  `ServerCause::Error { status: None }`. Pre-amendment plan revisions
+  forced a `status: 0` sentinel; that workaround is no longer
+  permitted. Use `None`.
+- `AccountErrorKind::Protocol(ProtocolErrorKind)` - table rows use the
   shorthand `Protocol(Unknown)`, `Protocol(ContractViolation)`,
   `Protocol(ParseFailed)`, `Protocol(PartialResponse)`. These all
   refer to variants of `ProtocolErrorKind`; the shorthand is for
@@ -588,7 +592,7 @@ Special cases:
   data. In single-target hydration paths this is the call-site error
   shape. In bulk hydration/streaming paths (`get_stream`, mutation
   read-back), the per-item lane is `ItemOutcome::Uncertain` carrying
-  this `AccountError` — not the call-site `Reconcile` recovery. The
+  this `AccountError` - not the call-site `Reconcile` recovery. The
   convergence streaming invariants (§"Streaming invariants",
   rules 1 and 4) require per-item Uncertain rather than a global
   reconcile when the protocol crate observed an item-level partial
@@ -845,7 +849,7 @@ Required behavior:
   `AccountOperation::is_idempotent()`. In streaming bulk paths, an
   in-flight transport drop on a non-idempotent operation produces a
   per-item `ItemOutcome::Uncertain` for items that may have been
-  partially committed — not a call-site `Reconcile`. The convergence
+  partially committed - not a call-site `Reconcile`. The convergence
   streaming invariants forbid collapsing per-item ambiguity into a
   single stream-level `Reconcile`.
 - `UpdateFlags` is idempotent enough for retry, matching the current
@@ -871,7 +875,7 @@ existing code structure, the minimum bar is:
   cause (or `Unsent` if wrapped as transport).
 
 Document any narrower attribution gaps in the Phase 2 PR description.
-Do not defer the entire path to Phase 3 — that delays the streaming
+Do not defer the entire path to Phase 3 - that delays the streaming
 ItemOutcome wire-up needed by the engine.
 
 ## QRESYNC and CONDSTORE strategy handling
@@ -911,7 +915,7 @@ Build structured errors:
 - UIDVALIDITY change:
   - kind: `SyncState(CursorInvalid)`
   - cause: `State(CursorInvalid)`
-  - scope: `ErrorScope::Cursor(folder_scope(folder))` — MUST be
+  - scope: `ErrorScope::Cursor(folder_scope(folder))` - MUST be
     `Cursor(_)`, not `Account`. The central recovery mapper derives
     `Engine(RestartScope(scope))` only when the scope is `Cursor(_)`;
     without it, the row falls back to `Engine(RestartAccount)` (per
@@ -921,7 +925,7 @@ Build structured errors:
 - HIGHESTMODSEQ reset:
   - kind: `SyncState(CursorInvalid)`
   - cause: `State(CursorInvalid)`
-  - scope: `ErrorScope::Cursor(folder_scope(folder))` — same scope
+  - scope: `ErrorScope::Cursor(folder_scope(folder))` - same scope
     requirement as above. RestartScope vs RestartAccount derivation
     hinges entirely on the presence of `Cursor(_)`.
   - diagnostic text: previous and current modseq
@@ -1110,7 +1114,7 @@ scope, operation, protocol, and derived recovery.
 ## Exit criteria
 
 - `crates/imap/src/error.rs` no longer defines `ErrorCategory`,
-  `Recovery`, `Error::category`, or `Error::recovery` — these are
+  `Recovery`, `Error::category`, or `Error::recovery` - these are
   removed entirely, not "no longer driving the account-boundary
   mechanism." Grep `crates/imap/` for each of the four identifiers
   and confirm zero hits.
@@ -1172,3 +1176,74 @@ Use this checklist after implementing the IMAP phase:
 12. Verify `NotificationOverflow` still reaches push invalidation.
 13. Verify `crate::Recovery` is not re-exported from the crate root.
 14. Verify tests do not spawn servers or depend on live IMAP accounts.
+
+## Phase 3 correctness blockers (post-2.2 audit)
+
+The Phase 2.2 IMAP commit landed the boundary, structured `Error`
+reshape, and tests but deliberately deferred the wide
+`connection/**` mechanical sweep. The deferred work contains
+correctness items that must be resolved before Phase 3 exit.
+
+### `ServerCause::Error { status: None }` - no `status: 0` sentinel
+
+The 2.2 commit used `ServerCause::Error { status: 0 }` for IMAP `NO`
+without a numeric status because `status` was `u16`. The Phase 1
+amendment widens `status` to `Option<u16>`. Phase 3 must:
+
+- Replace every `status: 0` sentinel under `crates/imap/` with
+  `status: None`.
+- Audit grep `rg 'ServerCause::Error \{ status: 0' crates/imap/`
+  returns zero hits at Phase 3 exit.
+
+### `connection/**` driver: per-site transmission state wiring
+
+The 2.2 commit added `Error::timeout()`, `Error::with_attempt()`,
+and the `attempt: Option<ImapAttempt>` field but did not thread
+them through the driver's command sites. Phase 3 must wire each
+command construction site to attach the correct transmission state:
+
+- **Connect / TLS handshake / pre-greeting timeouts**: `Unsent`.
+- **Greeting `BYE`** (server closes during the untagged greeting):
+  `Unsent` (no command was in flight).
+- **Command timeout during expected continuation/data**: `InFlight`.
+- **`BYE` mid-command** (server closes between command transmission
+  and tagged response): `InFlight`.
+- **Tagged response received** (`OK`/`NO`/`BAD`): `Acknowledged`.
+- **`Closed` due to local stream-send failure on the output channel**:
+  no attempt cause (stop the task, do not synthesize a transport
+  error per audit checklist item 6).
+
+This wiring is what allows recovery to choose `Reconcile` over
+`Retry::SameRequest` for non-idempotent operations like `BulkMove`
+when the connection drops mid-command. Without it, IMAP defaults to
+the safer side only when the central mapping reads absence as
+`Unsent`, which is the wrong classification for in-flight drops.
+
+### Structured replacements for legacy fatal sites
+
+The 2.2 commit provided `error::uidvalidity_changed`,
+`error::modseq_reset`, `error::unsupported` builders but did not
+rewire the call sites. Phase 3 must:
+
+- Switch `account/changes.rs::uidvalidity_changed_fatal` and
+  `modseq_reset_fatal` to the new structured builders. Audit grep
+  `rg 'RecoveryClass::RestartScope' crates/imap/` returns zero hits.
+- Replace `account/blob.rs:40` `SyncEvent::Fatal(Fatal { recovery:
+  RecoveryClass::Fatal, ... })` with a structured `Request(Malformed)`
+  error event via `SyncEvent::Terminated`.
+- Replace `account/envelope.rs` `AccountError::Other(...)` parse
+  failures with structured `Request(Malformed)` errors.
+
+### Misclassification of caller input as `Unsupported`
+
+`account/pim.rs::merge_folder:820` returns
+`AccountError::Unsupported` when a search filter constrains two
+different folders. This is caller input shape, not a missing
+capability. Phase 3 must reclassify it as
+`Request(InvalidArgument { field: Some("folder"), .. })` (the
+caller-provided search filter is structurally invalid because IMAP
+search cannot span two folders in a single SEARCH command).
+`Unsupported(Search)` is a defensible alternative if the project
+prefers to surface it as a missing capability rather than caller-
+side malformation; pick one and pin the test. The current
+`Unsupported` (no operation argument) is the variant that must go.

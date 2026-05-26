@@ -878,7 +878,13 @@ fn backoff_for(policy: &RetryPolicy, attempt: u32) -> Duration {
 
 /// Parse a `Retry-After` header. Either delta-seconds (an integer) or
 /// an HTTP-date per RFC 9110 section 10.2.3.
-pub(crate) fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+///
+/// Public so protocol crates that read `Retry-After` on responses they
+/// handle themselves (without going through `bifrost-net::Error::Status`)
+/// share a single parser. The companion shape on `AccountError` is the
+/// `retry_after` field on `ServerCause::{Unavailable, RateLimited,
+/// QuotaExhausted}` and the `not_before` field on `RetryAdvice`.
+pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
     let v = value?.to_str().ok()?.trim();
     if let Ok(secs) = v.parse::<u64>() {
         return Some(Duration::from_secs(secs));

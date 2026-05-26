@@ -27,10 +27,14 @@ Required reading: `plans/error-model-roadmap.md`,
 Landed-API quirks the agent must keep straight:
 
 - `ServerErrorKind::Error { status: Option<u16> }` (kind side) vs
-  `ServerCause::Error { status: u16 }` (cause side). The kind always
-  wraps the code in `Some(_)` in this plan's tables; the cause uses
-  bare `u16`. This is by design; do not "fix" one column to match the
-  other.
+  `ServerCause::Error { status: Option<u16> }` (cause side). Both
+  carry `Option<u16>` after the Phase 1 amendment. SMTP/LMTP wire
+  replies always carry a 3-digit status, so SMTP-side construction
+  passes `Some(status)`. The `None` variant exists for cases like
+  "transport shutdown before any reply was received"; when SMTP has
+  no terminal reply, it omits the `Server(_)` cause entirely
+  (typically pairing `Transport(_)` with `Attempt(InFlight)`) rather
+  than constructing `Server(Error { status: None })`.
 - `AccessErrorKind::PermissionDenied` (no payload) vs
   `AccessCause::PermissionDenied { resource: Option<ResourceKind> }`
   (carries optional resource).
@@ -324,7 +328,7 @@ pub(crate) struct SmtpErrorContext {
 }
 
 // Use bifrost_types::Protocol::{Smtp, Lmtp} directly. Do not introduce
-// a parallel SmtpProtocol enum — Phase 1's Protocol enum already has
+// a parallel SmtpProtocol enum - Phase 1's Protocol enum already has
 // both variants (crates/types/src/error/scope.rs:198).
 
 pub(crate) fn into_account_error(
@@ -403,7 +407,7 @@ When attempt state exists:
   three known states.
 - For `Transport(_)` errors specifically: emit at most
   `Attempt(Unsent)` or `Attempt(InFlight)`. A `Transport(_)` kind with
-  `Attempt(Acknowledged)` is a contradiction in terms — if a terminal
+  `Attempt(Acknowledged)` is a contradiction in terms - if a terminal
   response arrived, the kind should be `Server(_)`, `Authorization(_)`,
   `Authentication(_)`, etc. (whatever the response classified to), not
   `Transport(_)`. The builder's `kind_matches_cause` invariant does
@@ -528,7 +532,7 @@ failures.
 | `X.3.2` system not accepting network messages | `Server(Unavailable)` | `Server(Unavailable { retry_after: None })` |
 | `X.3.3` system not capable of selected features | `Unsupported(Send)` | `Request(Unsupported { operation: Send })` |
 | `X.3.4` message too big for system | `Request(Malformed)` | `Request(Malformed { detail })` |
-| `X.3.5` system incorrectly configured | `Server(Error { status: Some(code) })` | `ServerCause::Error { status: code }` |
+| `X.3.5` system incorrectly configured | `Server(Error { status: Some(code) })` | `ServerCause::Error { status: Some(code) }` |
 
 ### X.4 network and routing status
 
@@ -648,7 +652,7 @@ Do not change `Transport::send_raw`. Add Account-oriented helpers behind
 
 ### Success-lane payload: `BatchOutcome<()>`
 
-The new helpers return `BatchOutcome<()>` — the success lane carries
+The new helpers return `BatchOutcome<()>` - the success lane carries
 no per-recipient payload. Rationale: LMTP per-recipient 2xx replies
 carry an enhanced status code and acceptance text (e.g. `2.1.5
 destination valid`), and SMTP DATA-final 2xx similarly carries a
@@ -724,7 +728,7 @@ Input validation:
 `pub(crate)` to `bifrost-types`. SMTP duplicates the small validation
 in `crates/smtp/src/transport/smtp/batch.rs` for Phase 2. The
 duplication is a single ~15-line function over a `Vec<BatchItem<I>>`
-that produces `Vec<BatchInputInvalidItem>` — small enough that
+that produces `Vec<BatchInputInvalidItem>` - small enough that
 duplicating it is cheaper than blocking SMTP on a Phase 1 visibility
 change.
 
@@ -741,7 +745,7 @@ reported. Use it for:
 - local message/envelope/batch validation failure
 - pool checkout failure before a connection is available
 - DNS/connect/TLS/greeting/EHLO/AUTH/setup failure
-- `MAIL FROM` rejection (transmitted and acknowledged-negative —
+- `MAIL FROM` rejection (transmitted and acknowledged-negative -
   see rationale below)
 - `MAIL FROM` write/read transport drop before any recipient is
   accepted
@@ -750,7 +754,7 @@ reported. Use it for:
 ("Global post-transmission failures are expanded to item-level
 entries"): `MAIL FROM` is the sender envelope, not a per-recipient
 operation. A server reject of `MAIL FROM` is global to the
-transaction and pre-recipient — no recipient ever had bytes
+transaction and pre-recipient - no recipient ever had bytes
 transmitted for its lane. The convergence invariant 5 covers cases
 where the batch reached recipients and was rejected en bloc (e.g.
 a post-DATA transaction rollback); `MAIL FROM` reject is logically
@@ -1113,7 +1117,7 @@ separately under the `account-error` feature.
   `crates/smtp/`. The existing transport `Error::kind()`,
   `is_transient()`, `is_permanent()`, and class predicates remain as
   the low-level transport API but are not consumed by the new
-  account-error mapper for recovery construction — recovery is
+  account-error mapper for recovery construction - recovery is
   derived centrally by `AccountErrorBuilder`.
 - Every kind/cause pair produced by `into_account_error` and
   `message_error_to_account_error` satisfies
@@ -1149,3 +1153,72 @@ Compilation and workspace-wide checks are Phase 3 work. Do not run
 12. Verify recipient lane order follows input `BatchItem` order.
 13. Verify batch helper does not stringify structured `AccountError`s.
 14. Verify no live-server tests were added.
+
+## Phase 3 correctness blockers (post-2.2 audit)
+
+The Phase 2.2 SMTP commit landed the boundary, `SendProgress` lane
+derivation, classification table, and tests behind the
+`account-error` feature gate. It deliberately deferred the public
+`send_raw_batch_with_options` entry points and the SMTP/LMTP command
+pipeline rewrite. The deferred work is correctness-load-bearing.
+
+### Send/LMTP command pipelines must wire transmission state
+
+SMTP is **not** considered complete until each command phase
+constructs errors with an `AttemptCause` whose `transmission_state`
+reflects the wire-level evidence at that phase:
+
+- **Connect / EHLO/HELO before any command transmitted**: `Unsent`.
+- **MAIL FROM / RCPT TO / DATA initiation transmitted, awaiting
+  reply**: `InFlight` if connection drops before reply.
+- **Reply received (positive, transient, or permanent)**:
+  `Acknowledged`.
+- **DATA body transmitted, awaiting final reply**: `InFlight` if
+  connection drops here. This is the case that drives `Reconcile`
+  for non-idempotent `Send` (transport drop after the message bytes
+  crossed the boundary; provider may or may not have delivered).
+- **Final DATA reply received**: `Acknowledged`.
+- **BDAT chunks**: same model per chunk.
+
+The 2.2 commit provides the `Error::with_attempt`,
+`SmtpTransmissionState`, and `SmtpCommandPhase` types but does not
+thread them through `connection.rs`, `async_connection.rs`, or
+`commands.rs`. Phase 3 must do the threading. Audit grep:
+`rg 'SmtpCommandPhase' crates/smtp/src/transport/` should show
+construction at every command site, not just type definitions.
+
+**Why this is a correctness blocker**: without per-phase transmission
+state, a non-idempotent `Send` that drops between DATA body and
+final reply classifies as either "no attempt" (treated as `Unsent` →
+`Retry::SameRequest`) or as `InFlight`-on-idempotent. The first is
+the double-send bug; the second silently lies to consumers.
+
+### Public batch entry points do not land as `Unsupported` stubs
+
+`send_raw_batch_with_options` (and async/LMTP siblings) must not
+land as stubs returning `Err(Unsupported)` just to satisfy the
+trait shape. The pipeline rewrite that wires `SendProgress` into
+the command sequence lands them once. Until then, downstream
+crates do not gain access to a half-implemented batch API.
+
+### `plans/` pointer in source comment must be removed
+
+The 2.2 commit's `batch.rs::validate_recipients` comment references
+the Phase 3.5 plan path. The Phase 1 amendment promotes
+`bifrost_types::error::batch::validate_batch_input` to `pub`, after
+which the duplication goes away entirely. Phase 3 must:
+
+- Delete the local duplicate validator in `batch.rs`.
+- Call the now-public `validate_batch_input` from `bifrost-types`.
+- The comment that referenced the plan path goes with the deleted
+  duplicate. Audit grep `rg 'plans/' crates/smtp/src/` returns zero
+  hits.
+
+### Crate-private `Protocol { Smtp, Lmtp }` enum collapse
+
+`transport/smtp/mod.rs` declares a crate-private `Protocol` enum
+paralleling `bifrost_types::Protocol`. When `account-error` is no
+longer optional (Phase 3 makes it the default and only build), the
+crate-private enum is deleted and call sites use
+`bifrost_types::Protocol::{Smtp, Lmtp}` directly. Audit grep
+`rg 'enum Protocol' crates/smtp/src/` returns zero hits.

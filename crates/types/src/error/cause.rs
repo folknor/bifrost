@@ -38,6 +38,14 @@ impl CauseChain {
     pub fn iter(&self) -> impl Iterator<Item = &Cause> {
         self.causes.iter()
     }
+
+    /// Consume the chain and return the underlying ordered `Cause` vector.
+    /// Used by `AccountError::into_builder` to round-trip a built error
+    /// back through `AccountErrorBuilder` for decoration.
+    #[must_use]
+    pub(crate) fn into_vec(self) -> Vec<Cause> {
+        self.causes
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +279,7 @@ pub enum ServerCause {
     Unavailable { retry_after: Option<Duration> },
     RateLimited { retry_after: Option<Duration> },
     QuotaExhausted { retry_after: Option<Duration> },
-    Error { status: u16 },
+    Error { status: Option<u16> },
 }
 
 impl ServerCause {
@@ -288,7 +296,7 @@ impl ServerCause {
     #[must_use]
     pub(crate) fn status(&self) -> Option<u16> {
         match self {
-            Self::Error { status } => Some(*status),
+            Self::Error { status } => *status,
             Self::Unavailable { .. } | Self::RateLimited { .. } | Self::QuotaExhausted { .. } => {
                 None
             }
@@ -466,6 +474,8 @@ pub enum GraphSignal {
     MailboxNotEnabledForRestApi,
     MailboxStoreUnavailable,
     ResyncRequired,
+    InvalidDeltaToken,
+    SyncStateNotFound,
     TooManyRequests,
     GenericFileError,
     PreconditionFailed,
@@ -486,6 +496,8 @@ impl GraphSignal {
             Self::MailboxNotEnabledForRestApi => "MailboxNotEnabledForRESTAPI",
             Self::MailboxStoreUnavailable => "MailboxStoreUnavailable",
             Self::ResyncRequired => "ResyncRequired",
+            Self::InvalidDeltaToken => "InvalidDeltaToken",
+            Self::SyncStateNotFound => "SyncStateNotFound",
             Self::TooManyRequests => "TooManyRequests",
             Self::GenericFileError => "GenericFileError",
             Self::PreconditionFailed => "PreconditionFailed",
@@ -498,6 +510,7 @@ impl GraphSignal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum JmapMethod {
+    // Method-level errors (RFC 8620 §3.6.2).
     ServerUnavailable,
     ServerFail,
     ServerPartialFail,
@@ -522,6 +535,33 @@ pub enum JmapMethod {
     NotJson,
     NotRequest,
     Limit,
+    // Set-error vocabulary (RFC 8620 §5.3 / RFC 8621). `Forbidden` and
+    // `AlreadyExists` above are shared with the set-error vocabulary;
+    // the remaining set-error codes are listed here. Protocol crates
+    // pick the variant by wire code, not by JMAP method-vs-set context.
+    OverQuota,
+    TooLarge,
+    RateLimit,
+    NotFound,
+    InvalidPatch,
+    WillDestroy,
+    Singleton,
+    MailboxHasChild,
+    MailboxHasEmail,
+    BlobNotFound,
+    TooManyKeywords,
+    TooManyMailboxes,
+    ForbiddenFrom,
+    InvalidEmail,
+    TooManyRecipients,
+    NoRecipients,
+    InvalidRecipients,
+    ForbiddenMailFrom,
+    ForbiddenToSend,
+    CannotUnsend,
+    InvalidScript,
+    ScriptIsActive,
+    InvalidProperties,
     Unknown { code: String },
 }
 
@@ -552,6 +592,29 @@ impl JmapMethod {
             Self::NotJson => "notJSON",
             Self::NotRequest => "notRequest",
             Self::Limit => "limit",
+            Self::OverQuota => "overQuota",
+            Self::TooLarge => "tooLarge",
+            Self::RateLimit => "rateLimit",
+            Self::NotFound => "notFound",
+            Self::InvalidPatch => "invalidPatch",
+            Self::WillDestroy => "willDestroy",
+            Self::Singleton => "singleton",
+            Self::MailboxHasChild => "mailboxHasChild",
+            Self::MailboxHasEmail => "mailboxHasEmail",
+            Self::BlobNotFound => "blobNotFound",
+            Self::TooManyKeywords => "tooManyKeywords",
+            Self::TooManyMailboxes => "tooManyMailboxes",
+            Self::ForbiddenFrom => "forbiddenFrom",
+            Self::InvalidEmail => "invalidEmail",
+            Self::TooManyRecipients => "tooManyRecipients",
+            Self::NoRecipients => "noRecipients",
+            Self::InvalidRecipients => "invalidRecipients",
+            Self::ForbiddenMailFrom => "forbiddenMailFrom",
+            Self::ForbiddenToSend => "forbiddenToSend",
+            Self::CannotUnsend => "cannotUnsend",
+            Self::InvalidScript => "invalidScript",
+            Self::ScriptIsActive => "scriptIsActive",
+            Self::InvalidProperties => "invalidProperties",
             Self::Unknown { code } => code.as_str(),
         }
     }

@@ -54,7 +54,7 @@ convergence plan, plus the matching `lib.rs` re-export update and
 the deletion of the old `error.rs`. Nothing else.
 
 Single agent (the main conversation), single commit on the feature
-branch. After this commit, `bifrost-types` does **not** compile —
+branch. After this commit, `bifrost-types` does **not** compile -
 `account.rs`, `events.rs`, and `mutation.rs` still reference the
 removed `Error`, `Fatal`, `RecoveryClass`, `Warning`, `Warning`,
 `MutationResult`, and `MutationOutcome` types. That is intentional;
@@ -73,7 +73,7 @@ exit criteria:
 - `account.rs`, `events.rs`, `mutation.rs` not touched.
 - No transitional shims or compatibility aliases.
 
-`brokkr check` is not run at this phase boundary — the workspace
+`brokkr check` is not run at this phase boundary - the workspace
 will not compile until Phase 3.
 
 ### Phase 2: per-crate patch authorship
@@ -193,6 +193,74 @@ applies hard. One agent owns the whole integration commit.
 - `SyncEvent::Terminated(AccountError)` is the only stream
   termination event; no `SyncEvent::Fatal` remaining.
 
+**Phase 3 correctness blockers.** The following gates fail Phase 3
+exit if they remain unresolved. Each is written as a grep-checkable
+assertion against the post-Phase-3 tree; staging during Phase 2 is
+fine, but these items must be green at the Phase 3 gate. A gap in
+any one can cause recovery to choose `Retry::SameRequest` where the
+correct action is `Reconcile`, which is a correctness bug, not
+cleanup. The grep recipes below are the cheap proof that the
+canonicalization actually took.
+
+1. **`TransmissionState` is read only from `AttemptCause`.** Both
+   recipes are zero-hit assertions; no audit-by-inspection step.
+   - Assert: `rg 'TransportCause::transmission_state' crates/` returns
+     zero hits. This is the only old-shape access pattern; legitimate
+     uses of `transmission_state` (the `AttemptCause` field, the
+     `TelemetryView` field, the type definition itself) are not
+     matched.
+   - Assert: `rg 'TransportCause \{[^}]*transmission_state' crates/`
+     returns zero hits. Catches struct-literal constructions of the
+     old shape that the colon-form grep misses.
+2. **`ServerCause::Error` uses `Option<u16>`; no sentinel values.**
+   Both recipes are zero-hit assertions.
+   - Assert: `rg 'ServerCause::Error \{ status: 0[^0-9]' crates/`
+     returns zero hits. Catches the specific sentinel the IMAP Phase
+     2.2 commit invented. `0[^0-9]` avoids matching `0_u16`/`02`/etc
+     when the IMAP boundary moves to `None`.
+   - Assert: `rg 'ServerCause::Error \{ status: [0-9]' crates/`
+     returns zero hits. After the amendment every `ServerCause::Error`
+     must construct with `Some(_)` or `None`; a bare integer literal
+     is the old shape.
+3. **No placeholder `AccountOperation` remains in PIM/account code.**
+   - Assert: every PIM module's translation shim threads the correct
+     operation per call site. The per-crate plans below name the
+     temporary placeholders currently in use (`Discover`,
+     `HydrateMessage`) and the semantic exceptions where they are
+     correct.
+4. **SMTP send/LMTP command paths carry transmission state through
+   recovery.**
+   - Assert: each SMTP command phase (HELO/EHLO, MAIL FROM, RCPT TO,
+     DATA initiation, DATA body, DATA final, RSET, QUIT) constructs
+     errors with an `AttemptCause` whose `transmission_state` reflects
+     the wire-level evidence at that phase.
+   - Assert: `bifrost-smtp` `into_account_error` test cases cover
+     `Send` (non-idempotent) with `InFlight` producing `Reconcile`.
+5. **Known provider codes are typed, not matched as strings through
+   `Unknown { code }`.**
+   - Assert: `rg 'GraphSignal::Unknown' crates/graph/` matches only
+     genuine forward-compatibility paths; no string comparison
+     (`==`, `contains`, `starts_with`) against well-known Microsoft
+     vocabulary remains.
+   - Assert: JMAP `SetErrorType` family routes through typed
+     `JmapMethod` variants, not through `JmapMethod::Unknown { code }`.
+6. **No stream discards a computed `AccountError`.**
+   - Assert: `rg 'let _account_error|let _ = .* AccountError' crates/`
+     returns zero hits in stream-termination paths.
+   - Assert: every stream-termination site emits
+     `SyncEvent::Terminated(AccountError)` carrying the structured
+     error.
+7. **No per-item accounted failure is duplicated as a trailing global
+   termination.**
+   - Assert: per-item `ItemOutcome::Failed`/`Uncertain` lanes in
+     bulk-mutation streams are not followed by a stream-level
+     `SyncEvent::Terminated(_)` covering the same items. Trailing
+     terminations are reserved for stream-level errors that prevent
+     further attempts.
+
+The audit pass at Phase 3 gate must run these greps verbatim and
+report results. A pass-by-inspection claim is not acceptable.
+
 ### Phase 4: merge to main
 
 **Goal:** land the feature branch on `main`.
@@ -211,7 +279,7 @@ parallel agents make sense). Per AGENTS.md:
   ownership is by crate boundary; an agent assigned `bifrost-jmap`
   touches files in `crates/jmap/` only.
 - Agents read their target files first. They do not replace existing
-  code with placeholders or stub it out — they read, then rewrite
+  code with placeholders or stub it out - they read, then rewrite
   in-place.
 - Agents must NOT run `cargo` or `brokkr`. The orchestrator (the
   main conversation) validates between agents. This prevents three
@@ -227,7 +295,7 @@ parallel agents make sense). Per AGENTS.md:
 - Required reading for every agent:
   - `plans/error-model-convergence.md`
   - `plans/error-model-<crate>.md` (the agent's specific plan)
-  - `reference/<crate>.md` (the crate's reference doc — kept in
+  - `reference/<crate>.md` (the crate's reference doc - kept in
     sync with code per project convention)
 - Agents must launch in the foreground (never `run_in_background`)
   so the user can approve tool requests.
@@ -254,7 +322,7 @@ Per AGENTS.md, every phase ends with a 3-pass audit:
 
 Discrepancies discovered during audit go into a per-phase
 `plans/error-model-phase<N>-audit.md` (only current gaps, no
-historical records — resolved items are deleted from the doc, not
+historical records - resolved items are deleted from the doc, not
 struck through).
 
 ## Validation gates summary
@@ -275,8 +343,8 @@ and it is also the first phase where it passes.
 ## Rollback
 
 If Phase 2 hits an unforeseen blocker on one crate, the feature
-branch holds. Phase 1 alone is not useful on `main` — workspace
-broken — so we never merge a partial state. The feature branch can
+branch holds. Phase 1 alone is not useful on `main` - workspace
+broken - so we never merge a partial state. The feature branch can
 be abandoned without affecting `main`.
 
 If Phase 3 reveals that the convergence plan's trait surface choices
@@ -292,7 +360,7 @@ Each phase adds tests in proportion to the surface it changes:
   derivation (~30 tests), builder invariants (~10 tests),
   diagnostic accessors (~5 tests), `BatchOutcome` ordering and
   uniqueness (~5 tests).
-- Phase 2: per-crate translation tests — given a wire-level error,
+- Phase 2: per-crate translation tests - given a wire-level error,
   the protocol crate produces the expected `AccountErrorKind` and
   `RecoveryClass`. Roughly 10-20 per crate.
 - Phase 3: trait signature changes are caught by `brokkr check`;

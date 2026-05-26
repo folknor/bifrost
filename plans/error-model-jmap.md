@@ -178,12 +178,13 @@ outbound-encode sites.
 Two landed-API quirks the agent must keep straight when reading the
 tables below:
 
-- `ServerErrorKind::Error { status: Option<u16> }` (kind side; the
-  field is `Option`) vs `ServerCause::Error { status: u16 }` (cause
-  side; the field is bare). When the table writes `Server(Error {
-  status })` for a row, the kind column means `Some(status)`; the
-  cause column means the bare `u16`. Do not "fix" one column to match
-  the other.
+- `ServerErrorKind::Error { status: Option<u16> }` (kind side) vs
+  `ServerCause::Error { status: Option<u16> }` (cause side). Both
+  carry `Option<u16>` after the Phase 1 amendment. JMAP runs over
+  HTTP and always carries a numeric status, so every JMAP-side
+  construction passes `Some(status)` on both sides. The `None`
+  variant exists for protocols that lack numeric status (IMAP) and
+  must not be invented here as a sentinel.
 - `AccessErrorKind::PermissionDenied` (kind side; no payload) vs
   `AccessCause::PermissionDenied { resource: Option<ResourceKind> }`
   (cause side; carries optional resource). The `resource` value lives
@@ -234,8 +235,8 @@ impl JmapErrorContext {
 
 Every builder path must attach:
 
-- `.protocol(Protocol::Jmap)` — always
-- `.operation(ctx.operation)` — always
+- `.protocol(Protocol::Jmap)` - always
+- `.operation(ctx.operation)` - always
 - `.provider(provider)` only when `ctx.provider` is `Some`
 - `.scope(scope)` when `ctx.scope` is `Some`
 
@@ -303,7 +304,7 @@ builder.push_cause(Cause::Wire(WireCause::Jmap(...)))
 | `UnsupportedSort` | `Unsupported(operation)` | `Request(Unsupported { operation })` |
 | `UnsupportedFilter` | `Unsupported(operation)` | `Request(Unsupported { operation })` |
 | `TooManyChanges` | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
-| `Other` | `Protocol(Unknown)` | `Wire(Jmap(Unknown { code }))` — see note |
+| `Other` | `Protocol(Unknown)` | `Wire(Jmap(Unknown { code }))` - see note |
 
 For `Unsupported(operation)`, if `ctx.operation` is `None`, use
 `AccountOperation::Discover` only as a defensive fallback and add
@@ -312,7 +313,7 @@ missing. The audit should find no normal path that needs the fallback.
 
 `MethodErrorType::Other` today is a unit variant constructed via
 `#[serde(other)]`, which DISCARDS the wire-supplied type string. Do
-not synthesize a placeholder code (e.g. `"other"`) — that pollutes
+not synthesize a placeholder code (e.g. `"other"`) - that pollutes
 `AccountError::native_code()` and the telemetry view with a value the
 server never sent. Pick one of:
 
@@ -344,7 +345,7 @@ streams must pass cursor scope.
 / `FromAccountNotSupportedByMethod` rows and the `UnknownCapability`
 problem-type row all map to `SyncState(CapabilityChanged)` with
 `delta: CapabilityDelta::default()`. The JMAP crate does not compute
-a real delta — only the engine, comparing two `Capabilities` values
+a real delta - only the engine, comparing two `Capabilities` values
 across an `Account` reopen, can. Convergence §"Open decisions"
 flags `CapabilityChanged { delta }` as a candidate for removal if no
 producer ever computes a real delta. Until that decision lands in
@@ -520,7 +521,7 @@ different kinds, not just different attempt states:
   as `Protocol(PartialResponse)` with
   `Wire(MalformedResponse { protocol: Jmap, detail })` and
   `Attempt(Acknowledged)`. Do NOT classify as `Transport(_)` with
-  `Acknowledged` — that combination triggers the
+  `Acknowledged` - that combination triggers the
   `bifrost-types::error::recovery::derive` runtime assertion
   (`recovery.rs:187-190`: `Transport(_)` errors cannot have
   `Acknowledged` transmission state). The defensive route mirrors
@@ -532,10 +533,10 @@ Recovery derivation for the `Protocol(PartialResponse)` rows: the
 central mapper uses operation idempotency. `PushSubscribe` is
 non-idempotent (per `scope.rs:163-182`), so a mid-session close on a
 subscribe call returns `Reconcile { PartialCompletionSignal,
-[CheckTarget, DedupeByClientId] }` — the engine probes inventory or
+[CheckTarget, DedupeByClientId] }` - the engine probes inventory or
 re-subscribes after checking that the subscription is gone.
 `PushStream` is idempotent, so a stream interruption returns
-`Retry { SameRequest, Transport }` — the engine reconnects the
+`Retry { SameRequest, Transport }` - the engine reconnects the
 stream. Both behaviors are correct for "we don't have a transport
 problem, the long-lived stream just ended."
 
@@ -625,11 +626,11 @@ a method call. Phase 2 wires them as follows:
   rewrite to `SyncEvent::Terminated`).
 - After the error event, the reader task exits. Engine receives the
   terminated event and decides whether to call `push_subscribe`
-  again — JMAP does not retry inside the reader.
+  again - JMAP does not retry inside the reader.
 
 Disconnect-during-handshake errors (before the `101 Switching
 Protocols` response) emit on the `push_subscribe()` call return path,
-not on the broadcast channel — the subscribe future has not yet
+not on the broadcast channel - the subscribe future has not yet
 yielded a stream when handshake fails.
 
 ## Tests
@@ -745,3 +746,73 @@ Editorial normalization:
 - Do not update `reference/jmap.md` until the implementation is real.
 - Keep this plan focused on current gaps. Remove resolved audit notes
   instead of preserving history.
+
+## Phase 3 correctness blockers (post-2.2 audit)
+
+The Phase 2.2 JMAP commit landed the translation boundary and tests
+but reported divergences that are now reclassified from "follow-up"
+to "correctness blocker." Each must be resolved before Phase 3
+exit. The grep recipes in `plans/error-model-roadmap.md`'s Phase 3
+correctness gates apply.
+
+### Operation placeholders in PIM (`sync/pim.rs`)
+
+The 2.2 commit bulk-migrated ~50 PIM conversion sites through a
+local `to_acct_err_pim` shim that defaults to
+`AccountOperation::Discover`. Phase 3 must thread the correct
+operation per call site. The mapping is:
+
+- Send entry points → `AccountOperation::Send`.
+- Draft create/update/discard/send → `DraftCreate` / `DraftUpdate` /
+  `DraftDiscard` / `DraftSend` respectively.
+- Search and message search entry points → `Search` / `SearchMessages`.
+- Identity list/update → `IdentitiesList` / `IdentityUpdate`.
+- Vacation get/set → `VacationGet` / `VacationSet`.
+- Quota get → `QuotaGet`.
+- Container list/create/rename/move/delete → `ContainersList` /
+  `ContainerCreate` / `ContainerRename` / `ContainerMove` /
+  `ContainerDelete`.
+- Attachment upload → `AttachmentUpload`.
+
+**Semantic exceptions where `Discover` is correct**: only the
+initial capability/scope discovery call sites in `discover.rs` and
+`scopes.rs`. Every other site must pass the precise operation.
+
+**Why this is a correctness blocker, not hygiene**: misclassifying
+`Send` (non-idempotent) as `Discover` (idempotent) causes the
+central recovery mapping to choose `Retry::SameRequest` for an
+`InFlight` transport drop where the correct answer is `Reconcile`.
+A retry of an in-flight `Send` is a duplicate-message bug.
+
+### Known JMAP set-error vocabulary must use typed variants
+
+After the Phase 1 amendment adds typed `JmapMethod` variants for the
+known `SetErrorType` family, JMAP's `set_error_to_account_error` must
+route each known code through the corresponding typed variant.
+`JmapMethod::Unknown { code }` is reserved for codes the spec adds
+after the amendment. The audit grep
+`rg 'JmapMethod::Unknown' crates/jmap/` must show only the genuine
+forward-compatibility branch.
+
+### `MethodErrorType::Other(String)` confirmation
+
+The 2.2 commit added `MethodErrorType::Other(String)` to capture
+unknown method-error codes (plan option 1). This is correct and
+remains. Phase 3 does not collapse it back.
+
+### Search page-cursor decode confirmation
+
+The 2.2 commit mapped search page-cursor decode failures to
+`SchemaIncompatible` rather than `Request(Malformed)`. This is
+correct (the page cursor is an engine-persisted opaque value) and
+remains.
+
+### Transitional `type Error = AccountError` bridges
+
+Five files (`factory.rs`, `push.rs`, `pim.rs`, `capabilities.rs`,
+one other) carry `type Error = AccountError;` aliases so existing
+`Result<_, Error>` signatures compile against the broken branch.
+Phase 3 deletes all such aliases as part of the `Account` trait
+return-type rewrite. The audit grep
+`rg 'type Error = AccountError' crates/jmap/` must return zero hits
+at Phase 3 exit.

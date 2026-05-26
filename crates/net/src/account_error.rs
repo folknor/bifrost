@@ -380,7 +380,7 @@ fn should_apply_retry_deadline(kind: &AccountErrorKind) -> bool {
 fn server_error(code: u16) -> (AccountErrorKind, Cause, bool) {
     (
         AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
-        Cause::Server(ServerCause::Error { status: code }),
+        Cause::Server(ServerCause::Error { status: Some(code) }),
         false,
     )
 }
@@ -491,7 +491,7 @@ fn response_diagnostics(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> AccountErrorBuilder {
-    builder = builder.status(status.as_u16());
+    builder = builder.status(Some(status.as_u16()));
     if let Some(id) = first_header(headers, REQUEST_ID_HEADERS) {
         builder = builder.request_id(id);
     }
@@ -737,7 +737,7 @@ fn server_cause_from_status(
         408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_after })),
         429 => Some(Cause::Server(ServerCause::RateLimited { retry_after })),
         507 => Some(Cause::Server(ServerCause::QuotaExhausted { retry_after })),
-        500..=599 => Some(Cause::Server(ServerCause::Error { status: code })),
+        500..=599 => Some(Cause::Server(ServerCause::Error { status: Some(code) })),
         _ => None,
     }
 }

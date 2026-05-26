@@ -40,5 +40,5 @@ pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind};
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};
-pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse};
+pub use request::{ByteStream, RequestBuilder, Response, StreamingResponse, parse_retry_after};
 pub use retry::RetryPolicy;

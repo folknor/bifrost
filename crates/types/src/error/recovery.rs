@@ -388,7 +388,10 @@ fn server_kind_matches_cause(kind: ServerErrorKind, cause: &ServerCause) -> bool
             ServerCause::Error {
                 status: cause_status,
             },
-        ) => status.is_none_or(|status| status == *cause_status),
+        ) => match (status, cause_status) {
+            (Some(kind_status), Some(cause_status)) => kind_status == *cause_status,
+            (None, _) | (_, None) => true,
+        },
         _ => false,
     }
 }
@@ -630,7 +633,7 @@ fn server_retry_after(chain: &CauseChain) -> Option<Duration> {
 
 fn server_status(chain: &CauseChain) -> Option<u16> {
     chain.iter().find_map(|cause| match cause {
-        Cause::Server(ServerCause::Error { status }) => Some(*status),
+        Cause::Server(ServerCause::Error { status }) => *status,
         _ => None,
     })
 }
@@ -927,7 +930,7 @@ mod tests {
             &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(503) }),
             None,
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::Server(ServerCause::Error { status: 503 })),
+            &chain(Cause::Server(ServerCause::Error { status: Some(503) })),
             None,
             None,
             None,
@@ -936,7 +939,7 @@ mod tests {
             &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(451) }),
             None,
             Some(AccountOperation::SyncChanges),
-            &chain(Cause::Server(ServerCause::Error { status: 451 })),
+            &chain(Cause::Server(ServerCause::Error { status: Some(451) })),
             None,
             None,
             None,

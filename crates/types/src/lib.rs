@@ -73,6 +73,7 @@ pub use error::{
     StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
     SupportExportMinimal, SyncStateErrorKind, TelemetryView, ThrottleScope, TransmissionState,
     TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind, WireCause,
+    validate_batch_input,
 };
 
 // Stream-event types.

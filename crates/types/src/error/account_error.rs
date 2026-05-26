@@ -138,6 +138,39 @@ impl AccountError {
     pub fn chain(&self) -> &CauseChain {
         &self.chain
     }
+
+    /// Consume this error and return a builder pre-populated with its
+    /// fields and chain.
+    ///
+    /// `into_builder` is for *decoration*, not reclassification: the
+    /// returned builder carries the original `kind` and primary
+    /// `Cause`, and exposes no kind-changing path. `push_cause` only
+    /// appends secondary evidence to the chain. If a caller needs a
+    /// different primary `kind` or a different outermost `Cause`, it
+    /// must construct a fresh builder via `AccountErrorBuilder::new`.
+    ///
+    /// Derived fields (`recovery`, `remediation`, `message_key`) are
+    /// recomputed on `build()`. Builder-only overrides
+    /// (`idempotency_override`, `retry_not_before`, `throttle_scope`)
+    /// are not preserved by the round-trip and must be reapplied if
+    /// the caller needs them.
+    #[must_use]
+    pub fn into_builder(self) -> super::builder::AccountErrorBuilder {
+        let chain = Arc::try_unwrap(self.chain).unwrap_or_else(|arc| (*arc).clone());
+        let diagnostics = Arc::try_unwrap(self.diagnostics).unwrap_or_else(|arc| (*arc).clone());
+        let mut causes = chain.into_vec();
+        let primary_cause = causes.remove(0);
+        super::builder::AccountErrorBuilder::from_rebuild(
+            self.kind,
+            primary_cause,
+            causes,
+            self.scope,
+            self.operation,
+            self.provider,
+            self.protocol,
+            diagnostics,
+        )
+    }
 }
 
 impl fmt::Display for AccountError {
@@ -299,5 +332,45 @@ mod tests {
         assert_eq!(consented.user_safe_text, ["Check the request."]);
         assert_eq!(consented.support_text, ["raw provider body"]);
         assert_eq!(internal.chain.len(), 1);
+    }
+
+    #[test]
+    fn into_builder_round_trips_preserves_observable_fields() {
+        let original = request_error();
+        let kind_before = original.kind().clone();
+        let message_key_before = original.message_key();
+        let chain_len_before = original.chain().iter().count();
+
+        let rebuilt = original.into_builder().build();
+
+        assert_eq!(rebuilt.kind(), &kind_before);
+        assert_eq!(rebuilt.message_key(), message_key_before);
+        assert_eq!(rebuilt.chain().iter().count(), chain_len_before);
+        let text = rebuilt.user_safe_text().collect::<Vec<_>>();
+        assert_eq!(text, ["Check the request."]);
+    }
+
+    #[test]
+    fn into_builder_push_cause_appends_secondary_evidence() {
+        use crate::error::{AttemptCause, Cause, TransmissionState};
+
+        let original = request_error();
+        let chain_len_before = original.chain().iter().count();
+
+        let rebuilt = original
+            .into_builder()
+            .push_cause(Cause::Attempt(AttemptCause {
+                transmission_state: TransmissionState::Unsent,
+            }))
+            .build();
+
+        assert_eq!(rebuilt.chain().iter().count(), chain_len_before + 1);
+        let last_cause_is_attempt = matches!(
+            rebuilt.chain().iter().last(),
+            Some(Cause::Attempt(AttemptCause {
+                transmission_state: TransmissionState::Unsent,
+            }))
+        );
+        assert!(last_cause_is_attempt);
     }
 }

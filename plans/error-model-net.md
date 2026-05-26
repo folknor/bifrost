@@ -149,7 +149,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError;
 `operation` is required because the central recovery mapper defaults
 missing operation to idempotent-true
 (`crates/types/src/error/recovery.rs:181-183`). Without operation
-context, `Network { InFlight }` routes to `Retry { SameRequest }` —
+context, `Network { InFlight }` routes to `Retry { SameRequest }` -
 which on a `Send` is a double-send. Making `operation` non-optional
 forces every net caller to supply the target operation and closes
 the trap at this boundary. Callers that genuinely cannot supply one
@@ -196,7 +196,7 @@ Rules:
   Examples: token source failed before building the target request,
   connect refused, DNS failure, connect timeout, TLS handshake failure
   (whether reqwest reports it via `NetSetup`, `Tls`, or a `Network`
-  send error — handshake completes before any HTTP bytes leave the
+  send error - handshake completes before any HTTP bytes leave the
   socket, so it is always `Unsent`).
 - `InFlight`: request bytes may have crossed the boundary, but no
   terminal response headers arrived. Includes a TLS error raised
@@ -207,7 +207,7 @@ Rules:
 
 These rules are normative. The mapping table below MUST follow them;
 any row that writes `Attempt(state) when known` for a transport-like
-error is shorthand for "compute `state` per the rule above" — never an
+error is shorthand for "compute `state` per the rule above" - never an
 invitation to omit the attempt cause for handshake failures.
 
 Add range evidence instead of string matching:
@@ -275,7 +275,7 @@ InvalidRequest {
 via reqwest's `is_builder()` path (URL parse failure, invalid header
 value built into the request, body builder failure), and also covers
 the URL reparse failure at `request.rs:536` in the redirect path
-(which is a local invariant — the URL parsed once already for the
+(which is a local invariant - the URL parsed once already for the
 original request, so reparse failing is a producer bug, not a network
 failure). The conversion maps these to `Request(Malformed)` with
 `RequestCause::InvalidArgument { field, message }` and no `Attempt`
@@ -306,7 +306,7 @@ must route to `Request(Malformed)` or another non-`Transport` kind.
 If a future `ClientBuilder::build()` source inspection reveals a
 truly transient case (e.g. system-cert store temporarily
 unavailable), that subset may be split off into a `Transport(_)`
-variant — but the default for setup failures is terminal.
+variant - but the default for setup failures is terminal.
 
 Introduce a shared `FinalResponse` struct and extend `RateLimited`,
 `RetryBudgetExhausted`, and `AuthLost` to carry it. Protocol crates
@@ -351,7 +351,7 @@ Invariants made structural by this shape:
 - `RetryBudgetExhausted` carries `Option<FinalResponse>`. The
   defensive arm (no terminal response was ever received) is the
   `None` case. There is no `last_status: Some(_)` shape with
-  missing headers or body — the status now lives inside
+  missing headers or body - the status now lives inside
   `final_response`.
 - `AuthLost` carries `Option<FinalResponse>`. The `Unsent` arm
   (pre-target token refresh failed permanently) has `None`. The
@@ -376,7 +376,7 @@ In `send_streaming_inner`:
   earlier arm short-circuits later ones:
   1. `e.is_builder()` => the error is pre-wire local request
      construction (URL parse, header construction, body builder).
-     Return `Error::InvalidRequest { field, detail }` — never a
+     Return `Error::InvalidRequest { field, detail }` - never a
      `Network` or `Timeout` variant. The conversion classifies these
      as `Request(Malformed)` with no `Attempt` cause.
   2. `native_tls_error_in_source_chain(&e)` => return
@@ -392,7 +392,7 @@ In `send_streaming_inner`:
   from `send().await` if `build_reqwest` constructed a deferred-
   validation builder. Without an explicit builder arm, these would
   fall through to arm 6 and be misclassified as
-  `Network { InFlight }` — wrong on both axes (not a network error,
+  `Network { InFlight }` - wrong on both axes (not a network error,
   and no bytes crossed the boundary).
 
   Arm 2 walks `e.source()` and downcasts to `native_tls::Error` (or
@@ -457,8 +457,8 @@ overflows.
 1. Classify the `Error` into `(AccountErrorKind, primary Cause)`.
 2. Build with `AccountErrorBuilder::new(kind, primary_cause)`.
 3. Attach context:
-   - `.protocol(ctx.protocol)` — always
-   - `.operation(ctx.operation)` — always (the field is
+   - `.protocol(ctx.protocol)` - always
+   - `.operation(ctx.operation)` - always (the field is
      non-optional on `NetErrorContext`)
    - `.provider(provider)` when `ctx.provider` is `Some`
    - `.scope(scope.clone())` when `ctx.scope` is `Some`
@@ -512,7 +512,7 @@ Implementers must expand to the exact Phase 1 cause shapes:
   the underlying `Error::*` variant carries a `detail`/`message`
   string. Empty-string messages are treated as `None`.
 - `Wire(Imap(...))`, `Wire(Smtp(...))`, etc. expand to
-  `WireCause::Imap(...)`, `WireCause::Smtp(...)`, etc. — the
+  `WireCause::Imap(...)`, `WireCause::Smtp(...)`, etc. - the
   `WireCause::` prefix is implicit.
 
 These expansions are not optional. The builder's
@@ -528,14 +528,18 @@ the same conceptual signal:
 - `ServerErrorKind::Error { status: Option<u16> }` (kind side; the
   status is optional because the kind classifies any server-side
   failure, even one without a numeric code).
-- `ServerCause::Error { status: u16 }` (cause side; if there is no
-  status, do not push a `ServerCause::Error` — push a different
-  cause variant instead).
+- `ServerCause::Error { status: Option<u16> }` (cause side; after
+  the Phase 1 amendment, the cause is also `Option<u16>` so the
+  cause-side schema can represent IMAP `NO`/`BAD` without a numeric
+  response code). `bifrost-net` operates over HTTP, so every
+  net-side construction passes `Some(status)`; the `None` variant
+  exists for protocols that lack numeric status (IMAP) and must not
+  be invented in `bifrost-net`.
 
-The table rows reflect this on purpose: the kind column always wraps
-the code in `Some(_)`, the cause column does not. The builder's
-`recovery::kind_matches_cause` invariant accepts both shapes for the
-`Server(_)` family. Do not "fix" one column to match the other.
+The table rows always write `Some(_)` on both kind and cause columns
+for `bifrost-net` because the transport layer always has a numeric
+HTTP status when it constructs `Server(Error)`. Other protocol
+crates may emit `None` per their wire reality.
 
 ### Transport and auth
 
@@ -552,8 +556,8 @@ the code in `Some(_)`, the cause column does not. The builder's
 | `Tls { Acknowledged }` | `Protocol(PartialResponse)` | `Wire(MalformedResponse { protocol, detail })` | `Attempt(Acknowledged)` |
 | `AuthLost { transmission_state: None, final_response: None }` | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` | none |
 | `AuthLost { transmission_state: Some(state), final_response: None }` | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` | `Attempt(state)` |
-| `AuthLost { transmission_state: Some(Acknowledged), final_response: Some(r) }` | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` | `Attempt(Acknowledged)` — `r.headers` populate `request_id` / `trace_id`; `r.body` populates support-only diagnostic text |
-| `RefreshFailed { retry_after, source }` | `Authentication(RefreshTransient)` | `Auth(RefreshTransient)` | none for the target request — if `retry_after` is `Some`, builder calls `.retry_not_before(deadline)` |
+| `AuthLost { transmission_state: Some(Acknowledged), final_response: Some(r) }` | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` | `Attempt(Acknowledged)` - `r.headers` populate `request_id` / `trace_id`; `r.body` populates support-only diagnostic text |
+| `RefreshFailed { retry_after, source }` | `Authentication(RefreshTransient)` | `Auth(RefreshTransient)` | none for the target request - if `retry_after` is `Some`, builder calls `.retry_not_before(deadline)` |
 
 `Tls { Acknowledged }` deserves explicit treatment because
 `into_account_error` is a public total conversion over `Error` and
@@ -562,7 +566,7 @@ say TLS = Unsent (handshake) or InFlight (mid-body) only; if the
 producer somehow constructs `Tls { Acknowledged }` anyway, mapping it
 to `Transport(Tls)` would trigger the `derive()` runtime assertion on
 `Transport(_) + Acknowledged` in `bifrost-types::error::recovery`. The
-defensive route — same as `Network { Acknowledged }` — is to classify
+defensive route - same as `Network { Acknowledged }` - is to classify
 as `Protocol(PartialResponse)` with `Wire(MalformedResponse)` and
 attach support-only diagnostic text noting the unexpected combination.
 This keeps the conversion total and the bifrost-types invariant
@@ -585,7 +589,7 @@ produces `Retry { AfterAuthRefresh }` with no `not_before`
 (`crates/types/src/error/recovery.rs:425`), and the engine
 immediately retries the refresh against an endpoint that just told
 us to wait. Pushing a `ServerCause` support cause is not sufficient
-— `derive_auth` reads only the builder's `retry_not_before`, not
+- `derive_auth` reads only the builder's `retry_not_before`, not
 the chain.
 
 ### Local request and setup errors
@@ -602,7 +606,7 @@ the chain.
 
 `InvalidRequest` covers reqwest `is_builder()` errors from arm 1 of
 the request-send ordering, the URL reparse failure at
-`request.rs:536` (a local invariant — the URL parsed once for the
+`request.rs:536` (a local invariant - the URL parsed once for the
 original request, so reparse failing is a producer bug), and any
 future builder-style construction error. The `field` discriminator
 maps to the `InvalidArgument.field` slot directly.
@@ -667,7 +671,7 @@ evidence they need for `error.code` / reason-string classification.
 
 `RetryBudgetExhausted { final_response: None, .. }` is the defensive
 arm (no terminal response ever received). Classify as
-`Transport(Network)` with `Attempt(InFlight)` — same as the
+`Transport(Network)` with `Attempt(InFlight)` - same as the
 `last_status: None` arm previously, but the missing-status shape is
 now expressed structurally rather than as an
 `Option<StatusCode>` field. See
@@ -683,15 +687,15 @@ now expressed structurally rather than as an
 | 401 | `Authentication(ReauthorizationRequired)` | `Auth(ReauthorizationRequired)` |
 | 403 | `Authorization(PermissionDenied)` | `Access(PermissionDenied { resource })` |
 | 404 with resource scope | `NotFound(resource)` | `Request(NotFound { what: resource, id })` |
-| 404 without resource scope | `Server(Error { status: Some(404) })` | `Server(Error { status: 404 })` |
+| 404 without resource scope | `Server(Error { status: Some(404) })` | `Server(Error { status: Some(404) })` |
 | 409 | `ConcurrencyConflict` | `State(ConcurrencyConflict)` |
 | 410 with `ErrorScope::Cursor` | `SyncState(CursorInvalid)` | `State(CursorInvalid)` |
-| 410 without cursor scope | `Server(Error { status: Some(410) })` | `Server(Error { status: 410 })` |
+| 410 without cursor scope | `Server(Error { status: Some(410) })` | `Server(Error { status: Some(410) })` |
 | 408, 502, 503, 504 | `Server(Unavailable)` | `Server(Unavailable { retry_after })` |
 | 429 | `Server(RateLimited)` | `Server(RateLimited { retry_after })` |
 | 507 | `Server(QuotaExhausted)` | `Server(QuotaExhausted { retry_after })` |
-| other 500..=599 | `Server(Error { status: Some(code) })` | `Server(Error { status: code })` |
-| other status | `Server(Error { status: Some(code) })` | `Server(Error { status: code })` |
+| other 500..=599 | `Server(Error { status: Some(code) })` | `Server(Error { status: Some(code) })` |
+| other status | `Server(Error { status: Some(code) })` | `Server(Error { status: Some(code) })` |
 
 Do not parse provider JSON bodies in this crate. Graph `error.code`,
 Gmail reason strings, and JMAP problem details belong to the protocol

@@ -21,9 +21,12 @@ the Graph patch and deterministic tests, but do not run `brokkr`,
 Landed-API quirks the agent must keep straight:
 
 - `ServerErrorKind::Error { status: Option<u16> }` (kind side) vs
-  `ServerCause::Error { status: u16 }` (cause side). Table rows write
-  `Some(_)` on the kind column and bare `u16` on the cause column.
-  Do not "fix" one to match the other.
+  `ServerCause::Error { status: Option<u16> }` (cause side). Both
+  carry `Option<u16>` after the Phase 1 amendment. Graph and EWS
+  responses are HTTP and always carry a numeric status, so every
+  Graph-side construction passes `Some(status)`. The `None` variant
+  exists for protocols that lack numeric status (IMAP) and must not
+  be invented here as a sentinel.
 - `AccessErrorKind::PermissionDenied` (no payload) vs
   `AccessCause::PermissionDenied { resource: Option<ResourceKind> }`.
 - The landed `AccountOperation` enum (`crates/types/src/error/scope.rs`)
@@ -593,7 +596,7 @@ Use this when no useful Graph code exists.
 | `404` | `NotFound(resource)` | `Request(NotFound { what, id })` | Destroy can still treat already-gone as success. |
 | `409` | `ConcurrencyConflict` | `State(ConcurrencyConflict)` | Use for write conflicts; otherwise `Server(Error)`. |
 | `410` on delta | `SyncState(CursorInvalid)` | `State(CursorInvalid)` | Restart the cursor scope. |
-| `410` elsewhere | `Server(Error { status: Some(410) })` | `Server(Error { status: 410 })` | Provider refused / stale resource. |
+| `410` elsewhere | `Server(Error { status: Some(410) })` | `Server(Error { status: Some(410) })` | Provider refused / stale resource. |
 | `412` | `ConcurrencyConflict` | `State(ConcurrencyConflict)` | `If-Match` mismatch. |
 | `413` | `Request(Malformed)` | `Request(Malformed { detail })` | Request too large. |
 | `415` | `Unsupported(operation)` | `Request(Unsupported { operation })` | Unsupported media/content type. |
@@ -616,7 +619,7 @@ that status.
 Microsoft Graph documents tenant-wide throttling on the `Application`
 and `Mailbox concurrency` resource keys (see Microsoft Learn:
 "Microsoft Graph throttling guidance"). A 429 from Graph cannot be
-distinguished as tenant- vs mailbox-scope from headers alone — the
+distinguished as tenant- vs mailbox-scope from headers alone - the
 response identifies the limit category in body or in
 `Rate-Limit-Reason`, but consumers should still pause at the safest
 scope to avoid cascading throttles across the tenant. Convergence
@@ -627,7 +630,7 @@ reason.
 Initial mapping:
 
 - `ThrottleScope::Tenant` for Graph REST 429 (`TooManyRequests`,
-  `ErrorQuotaExceeded`, unknown 429) — safest scope; tenant-wide
+  `ErrorQuotaExceeded`, unknown 429) - safest scope; tenant-wide
   pause is the documented Microsoft recommendation. Refines to
   `Account` or `Mailbox` only when the response body explicitly
   identifies a per-mailbox or per-account limit.
@@ -709,7 +712,7 @@ Rules:
   carry per-item ItemOutcome values, Phase 2's helper still returns
   the typed `ItemOutcome` value, and the stream call site holds it
   until Phase 3 changes the trait signature. Do NOT terminate the
-  stream on a single missing item — that would coerce per-item
+  stream on a single missing item - that would coerce per-item
   evidence into a stream-level error.
 - `$batch` item non-2xx with Graph error body: parse item body and
   convert with item id scope.
@@ -777,7 +780,7 @@ The original "mark the stream for a trailing rate-limit termination"
 phrasing was an open decision. The commitment is: per-item Failed
 only, no trailing termination. If Graph returns a top-level 429 (the
 entire batch was throttled before any item was processed), that IS a
-stream-level termination — it goes through `into_account_error` at
+stream-level termination - it goes through `into_account_error` at
 the `post_batch` call site as `Reconcile` or `Retry` per the
 convergence mapping table, not through per-item lanes.
 
@@ -817,7 +820,7 @@ Map current local old-error sites explicitly:
 
 | Current condition | Account kind | Notes |
 | --- | --- | --- |
-| unsupported primitive or target shape | `Unsupported(operation)` | Use the concrete landed `AccountOperation` (`UpdateFlags`, `BulkMove`, `BulkDestroy`, `SetIsRead`, `Send`, `DraftCreate`, `ContainersList`, etc.). The landed enum has no `MoveMessage` / `DeleteMessage` — single-target moves/destroys still use `BulkMove` / `BulkDestroy`. |
+| unsupported primitive or target shape | `Unsupported(operation)` | Use the concrete landed `AccountOperation` (`UpdateFlags`, `BulkMove`, `BulkDestroy`, `SetIsRead`, `Send`, `DraftCreate`, `ContainersList`, etc.). The landed enum has no `MoveMessage` / `DeleteMessage` - single-target moves/destroys still use `BulkMove` / `BulkDestroy`. |
 | missing push endpoint for webhook mode | `Unsupported(PushSubscribe)` | Missing configured capability, not transport. |
 | pre-uploaded attachment handle in Graph send/draft | `Unsupported(Send)` or `Unsupported(DraftCreate)` | Keep existing guidance as support-only diagnostic text. |
 | draft update tries to replace attachments | `Unsupported(DraftUpdate)` | Graph upload-session primitive is absent. |
@@ -942,7 +945,7 @@ Rules:
     `ErrorScope::Cursor(scope)` when the failing watermark's scope is
     known. When scope is unknown, attach
     `ErrorScope::Cursor(CursorScope::Account)` so the central mapper
-    derives `Engine(RestartScope(CursorScope::Account))` — do NOT
+    derives `Engine(RestartScope(CursorScope::Account))` - do NOT
     omit cursor scope, which would fall through to
     `Engine(RestartAccount)` and restart the entire account session
     instead of just the EWS streaming scope.
@@ -1147,3 +1150,72 @@ Compilation and workspace-wide checks are Phase 3 work. Do not run
     hatch are listed in the audit if `Unknown { code }` was used for
     stable Microsoft codes.
 17. Verify no live-server tests were added.
+
+## Phase 3 correctness blockers (post-2.2 audit)
+
+The Phase 2.2 Graph commit landed the typed `GraphError`, the
+translation boundary, mutation lane derivation, and 37 tests. It
+deferred the `client.rs` / `ews/client.rs` `Result<T, String>`
+rewrites and noted two stable Microsoft codes that were routed
+through `Unknown { code }` plus exact-string matching. The deferred
+work contains correctness items.
+
+### Typed Microsoft cursor-invalid vocabulary
+
+Phase 1 amendment adds `GraphSignal::InvalidDeltaToken` and
+`GraphSignal::SyncStateNotFound`. After the amendment, Phase 3 must:
+
+- Switch `is_cursor_invalid_unknown` from exact-string matching on
+  `GraphSignal::Unknown { code }` to typed matches against the new
+  named variants.
+- Delete the string-comparison helper. Audit grep:
+  `rg 'is_cursor_invalid_unknown|"InvalidDeltaToken"|"SyncStateNotFound"|"syncStateNotFound"' crates/graph/src/`
+  returns no hits except the typed variant definitions.
+
+### No trailing global termination after per-item failures
+
+`account/mutate.rs:169` currently emits a trailing stream-level
+`SyncEvent::Fatal` after per-item 429 outcomes. The convergence
+plan and roadmap forbid this: per-item 429s are `ItemOutcome::Failed`
+only. Phase 3 must:
+
+- Delete the trailing `SyncEvent::Fatal` emission after per-item
+  outcomes in `account/mutate.rs:169`.
+- Use `mutation_item_outcome` (already provided by the 2.2 commit)
+  for the per-item path; the stream ends naturally when the input
+  is drained.
+- Audit grep: the bulk-mutation stream paths have no `SyncEvent::
+  Terminated(_)` emission immediately after per-item lane outcomes
+  that account for every input item.
+
+### `client.rs` `Result<T, String>` → `Result<T, GraphError>`
+
+Phase 3 must complete the surface migration the 2.2 commit deferred:
+
+- `client.rs::net_error`, `parse_json_response`, and every helper
+  returning `Result<T, String>` switch to `Result<T, GraphError>`.
+- `GraphResponseError::from_response` (already authored in 2.2) is
+  the construction path.
+- Audit grep: `rg 'Result<.*, String>' crates/graph/src/` returns
+  zero hits outside intentionally-local parser helpers (item 1 of
+  the existing audit checklist).
+
+### EWS structured errors
+
+`ews/client.rs::execute` returns `Result<String, String>` and
+string-concatenates `"EWS returned {status}: {body}"`. Phase 3 must
+add a typed `EwsError` enum and a SOAP-fault parser so EWS errors
+flow through the existing `GraphErrorContext::ews()` path with
+structured evidence. Unstructured strings must not drive product
+recovery for EWS any more than for Graph.
+
+### `Warning::message` structured text
+
+`account/error.rs::warning_blob_not_byte_stream` currently
+constructs a `Warning` with a free-text `message: String` field.
+The Phase 1 `Warning` type uses `DiagnosticText`. Phase 3 must:
+
+- Update the warning construction to use `DiagnosticText` with the
+  appropriate visibility tag (`UserSafe` for the user-facing notice).
+- Audit grep: `rg 'Warning \{.*message: ' crates/graph/src/` shows
+  only `DiagnosticText` construction, no naked `String`.

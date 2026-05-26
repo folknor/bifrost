@@ -2,7 +2,7 @@
 
 This document specifies the bifrost error contract. It is the target
 design, not a phased rollout. There is no "this wave" and no "later
-wave" — the shape described here is what consumers can rely on.
+wave" - the shape described here is what consumers can rely on.
 
 Revised after a three-round critique pass focused on the enterprise
 consumer surface. The contract:
@@ -16,7 +16,7 @@ consumer surface. The contract:
 - `Retry` carries only safe-retry dispositions (`SameRequest`,
   `AfterStateRefresh`, `AfterAuthRefresh`); cases requiring
   reconciliation get a separate top-level `Reconcile(ReconcileAdvice)`
-  variant. There is no `DoNotRetry` disposition — the previous
+  variant. There is no `DoNotRetry` disposition - the previous
   contradictory shape (`Retry { DoNotRetry }`) is gone.
 - Engine-control directives (`RestartScope`, `RestartAccount`,
   `DowngradeStrategy`, `DowngradeCapabilityForScope`,
@@ -43,9 +43,13 @@ consumer surface. The contract:
   separate newtype from `bifrost-types::recovery` that collapses
   terminal `RecoveryClass` values at the engine boundary.
 - `TransmissionState` (`Unsent` / `InFlight` / `Acknowledged`) lives
-  on `TransportCause` and drives `Reconcile` classification for
-  non-idempotent operations whose request was in flight when the
-  transport dropped.
+  on `AttemptCause`, which is the single evidence carrier for whether
+  a network attempt happened and how far it got. It drives `Reconcile`
+  classification for non-idempotent operations whose request was in
+  flight when the transport dropped. Absence of `AttemptCause` from
+  the chain means no network attempt was made; recovery classifies
+  absence the same as `Unsent`, but support exports preserve the
+  distinction. `TransportCause` does not carry transmission state.
 - `RetryAdvice` carries `throttle_scope` for rate-limit and quota
   failures so engines can pause at the right granularity (request,
   mailbox, account, tenant, provider).
@@ -142,8 +146,43 @@ impl AccountError {
     pub fn support_internal(&self) -> SupportExportInternal<'_>;
 
     pub fn chain(&self) -> &CauseChain;
+
+    /// Consume this error and return a builder pre-populated with its
+    /// fields and chain. Used by call sites that need to decorate an
+    /// existing error with additional evidence (e.g. fallback paths
+    /// where the primary failure carries the operative diagnostics
+    /// and the fallback attempt adds a secondary `Cause`).
+    ///
+    /// The returned builder is identical to one constructed via
+    /// `AccountErrorBuilder::new(self.kind, primary_cause).` plus the
+    /// accumulated chain, scope, operation, provider, protocol, and
+    /// diagnostic fields. Callers can `push_cause`, adjust diagnostics,
+    /// then `build()` to obtain a new `AccountError` with derived
+    /// fields recomputed. `build()` remains the single invariant funnel;
+    /// there is no mutator that bypasses re-derivation.
+    ///
+    /// `into_builder` is for *decoration*, not reclassification: the
+    /// returned builder carries the original `kind` and primary
+    /// `Cause`, and has no kind-changing path. `push_cause` only
+    /// appends secondary evidence to the chain. If a caller needs a
+    /// different primary `kind` or a different outermost `Cause`, it
+    /// must construct a fresh builder via `AccountErrorBuilder::new`;
+    /// going through `into_builder` first would either silently retain
+    /// the wrong kind/cause pair or require an escape hatch that
+    /// defeats the invariant funnel.
+    pub fn into_builder(self) -> AccountErrorBuilder;
 }
 ```
+
+The canonical pattern for "preserve a primary error and decorate it
+with secondary evidence" is `err.into_builder().push_cause(cause)
+.build()`. Phase 2.2 reports cited a manual five-step
+clone-walk-rebuild dance in the Gmail TRASH-fallback merge; that
+dance is what `into_builder` exists to replace. There is no
+`with_secondary_cause` mutator on `AccountError` itself, because such
+a mutator would either bypass `build()` (losing the invariant funnel)
+or duplicate it (drifting). `into_builder` keeps `build()` as the
+single point where derived fields are computed.
 
 `provider` and `protocol` are top-level because telemetry routing and
 dashboard filters partition on them first. They are still reflected in
@@ -287,7 +326,7 @@ change in the public API.
 The dotted namespace is the documented fallback convention. Consumers
 ship translation catalogs out of cadence with library releases, so
 new keys can land before a catalog has copy for them. Consumers walk
-the dotted segments — `authz.mailbox-not-licensed` falls back to
+the dotted segments - `authz.mailbox-not-licensed` falls back to
 `authz`, which falls back to a root key the consumer owns. The
 library does not ship a fallback chain because the chain depends on
 which keys the consumer has translated; the namespace shape is the
@@ -463,7 +502,7 @@ or escalate to a terminal `RecoveryClass` variant. A `Retry`
 `RecoveryClass` is always a green light for the engine's retry
 machinery, modulo the rest of `RetryAdvice`.
 
-`Reconcile` is the separate verdict for "we don't know what happened —
+`Reconcile` is the separate verdict for "we don't know what happened -
 go check before deciding what to do next." It is not retry. A consumer
 seeing `Reconcile(advice)` must perform the indicated reconciliation
 (probe inventory, check Sent, dedupe by `BatchItemId` /
@@ -518,9 +557,9 @@ than guessing. Consumers and engines use it to decide whether to pause
 the single request, the mailbox, the account, the tenant, or the
 entire provider fleet.
 
-The terminal variants — `AuthLost`, `NeedsAdminConsent`,
+The terminal variants - `AuthLost`, `NeedsAdminConsent`,
 `NeedsPolicyChange`, `NoPermission`, `Unsupported`, `ClientBug`,
-`ProviderContractViolation`, `ProviderRefused`, `UnknownPermanent` —
+`ProviderContractViolation`, `ProviderRefused`, `UnknownPermanent` -
 are all "stop trying" from the engine's perspective but carry
 distinct product meaning. Consumers route them to different surfaces:
 
@@ -540,7 +579,7 @@ distinct product meaning. Consumers route them to different surfaces:
   surfaces in telemetry so the gap can be closed in a later release.
 
 `RecoveryClass::is_terminal()` returns true for the terminal
-variants only — `AuthLost`, `NeedsAdminConsent`, `NeedsPolicyChange`,
+variants only - `AuthLost`, `NeedsAdminConsent`, `NeedsPolicyChange`,
 `NoPermission`, `Unsupported`, `ClientBug`, `ProviderContractViolation`,
 `ProviderRefused`, `UnknownPermanent`. `Retry`, `Reconcile`, and
 `Engine` are not terminal because each implies a defined next step
@@ -583,11 +622,26 @@ classification purposes.
 | `Server(QuotaExhausted)`, `tx_state: Acknowledged` | `Retry { disposition: SameRequest, reason: QuotaExhausted, not_before: retry_after, throttle_scope, .. }` |
 | `Server(QuotaExhausted)`, `tx_state: InFlight`, `op.idem` | `Retry { disposition: SameRequest, reason: QuotaExhausted, throttle_scope, .. }` |
 | `Server(QuotaExhausted)`, `tx_state: InFlight`, `!op.idem` | `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }` |
-| `Server(Error { status: 5xx })`, `tx_state: Acknowledged` | `Retry { disposition: SameRequest, reason: ServerUnavailable, .. }` |
-| `Server(Error { status: 5xx })`, `tx_state: InFlight`, `op.idem` | `Retry { disposition: SameRequest, reason: ServerUnavailable, .. }` |
-| `Server(Error { status: 5xx })`, `tx_state: InFlight`, `!op.idem` | `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }` |
-| `Server(Error { status: 4xx })` (unclassified) | `ProviderRefused` |
-| `Server(Error { status: other permanent })` | `ProviderRefused` |
+| `Server(Error { status: Some(5xx) })`, `tx_state: Acknowledged` | `Retry { disposition: SameRequest, reason: ServerUnavailable, .. }` |
+| `Server(Error { status: Some(5xx) })`, `tx_state: InFlight`, `op.idem` | `Retry { disposition: SameRequest, reason: ServerUnavailable, .. }` |
+| `Server(Error { status: Some(5xx) })`, `tx_state: InFlight`, `!op.idem` | `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }` |
+| `Server(Error { status: Some(4xx) })` (unclassified) | `ProviderRefused` |
+| `Server(Error { status: Some(other permanent) })` | `ProviderRefused` |
+| `Server(Error { status: None })`, `tx_state: Acknowledged` | `ProviderRefused` (server actively responded with an error the protocol carries without a numeric status; e.g. IMAP `NO`/`BAD` without a response code). Protocol crates that have a more specific interpretation must push a more specific `Cause` so the classifier picks it up before this row. |
+| `Server(Error { status: None })`, `tx_state: InFlight`, `op.idem` | `Retry { disposition: SameRequest, reason: ServerUnavailable, .. }` (terminal response never arrived; idempotent retry is safe). |
+| `Server(Error { status: None })`, `tx_state: InFlight`, `!op.idem` | `Reconcile { TransportDropAfterSend, actions: [CheckTarget] }` (non-idempotent op with no terminal response; reconcile before retry). |
+
+`Server(Error { status: None })` represents an **active server failure
+without a numeric status** - the server responded with an error the
+protocol does not carry a number for (IMAP `NO`/`BAD` outside any
+tagged response code). It is **not** the shape for "no terminal
+reply arrived" cases like a TCP drop after SMTP DATA. Drops before
+any terminal reply pair `Transport(_)` with `Attempt(InFlight)` and
+omit `Server(_)` entirely; the `InFlight` rows above exist for cases
+where a server actively responded with an error but the protocol
+crate has reason to model the wire state as in-flight (a malformed
+or partial structured response, etc.) - they are not an invitation
+to fabricate a `Server(Error)` cause for missing replies.
 | `SyncState(CursorInvalid)` with `scope` | `Engine(RestartScope(scope))` |
 | `SyncState(CursorInvalid)` without `scope` | `Engine(RestartAccount)` |
 | `SyncState(StrategyFailure)` | `Engine(DowngradeStrategy(downgrade))` |
@@ -616,7 +670,7 @@ fallback applies only when the protocol crate has not classified the
 specific code; it is not a default for "any 4xx." `ClientBug` is
 reserved for cases where the library or caller demonstrably built an
 invalid request (`Request(Malformed)`, `Request(BatchInputInvalid)`,
-schema violations the library should have caught) — wire 4xx alone
+schema violations the library should have caught) - wire 4xx alone
 is not evidence of that.
 
 The central mapping consults the outermost matching cause for
@@ -639,7 +693,7 @@ classification reduces to "as if `Unsent`." The mapping reads
 ## Remediation
 
 Recovery is engine-facing advice. Remediation is consumer-facing
-product guidance — the action a user, admin, or support team must
+product guidance - the action a user, admin, or support team must
 take. Both are derived from the same `(kind, scope, operation, cause)`
 inputs and by the same builder; the split is conceptual, not
 structural. Consumers read it through
@@ -783,7 +837,7 @@ relies on this distinction to pick the right `RetryDisposition`.
 
 Support logs and UI copy should not have to infer the operation from
 stack location. The exact list can be extended as the `Account` trait
-gains methods, but the granularity floor is per-mutation-shape — never
+gains methods, but the granularity floor is per-mutation-shape - never
 a generic `Mutate` again.
 
 ## Diagnostics
@@ -872,7 +926,7 @@ pub struct SupportExportInternal<'a> {
   `UserSafe`. This is the only public surface that yields strings
   intended for human display.
 - `AccountError::telemetry_fields()` yields a `TelemetryView` of
-  structured fields only — no free-form text. This is the analytics
+  structured fields only - no free-form text. This is the analytics
   payload. Dashboards group on stable enum discriminants and message
   keys; high-cardinality free-form text never appears here.
 - `AccountError::support_minimal()`, `support_consented()`, and
@@ -894,7 +948,7 @@ either safe to show a user or routed only to support exports.
 
 The producer-side contract: protocol crates must tag every
 `DiagnosticText` accurately. `SupportOnly` is the default when in
-doubt. There is no `Sensitive` tier — text that is genuinely
+doubt. There is no `Sensitive` tier - text that is genuinely
 sensitive (credentials, full request bodies with PII) must be
 redacted at the producer; the redacted placeholder is then tagged
 `SupportOnly`.
@@ -946,12 +1000,12 @@ pub enum Cause {
 `Cause::Attempt` carries the transmission-state evidence (see
 [Cause variants](#cause-variants)). It is pushed onto the chain
 whenever the protocol crate has wire-level evidence of a network
-attempt — alongside `Transport(_)` for connection failures, alongside
+attempt - alongside `Transport(_)` for connection failures, alongside
 `Server(_)` for terminal responses (success or error), and on its own
 when the consumer-visible failure came from elsewhere but the network
 attempt is part of the forensic record. Purely local errors
 (`Request(BatchInputInvalid)`, schema validation failures, builder
-preflight checks) have no `Attempt` cause at all — absence means "no
+preflight checks) have no `Attempt` cause at all - absence means "no
 network attempt was made," distinct from `Attempt { Unsent }` which
 means "an attempt was initiated but nothing crossed the boundary."
 The recovery mapping treats absence and `Unsent` identically for
@@ -979,8 +1033,8 @@ higher-level `Cause` and a normalized `AccountErrorKind`.
 `WireCause` is diagnostic-only. Classification logic in the library
 must produce a sufficiently specific `AccountErrorKind` for every
 wire signal the library knows how to interpret. If a consumer ever
-needs to match on `WireCause` variants to make a product decision —
-routing, retry policy, UX copy — that is a library bug, not a
+needs to match on `WireCause` variants to make a product decision -
+routing, retry policy, UX copy - that is a library bug, not a
 consumer responsibility. The fix is a tighter `AccountErrorKind`
 classification in the next release, not a stable contract on
 `WireCause`. Provider-native matching in consumer code is legitimate
@@ -1059,8 +1113,16 @@ pub enum ServerCause {
     Unavailable { retry_after: Option<Duration> },
     RateLimited { retry_after: Option<Duration> },
     QuotaExhausted { retry_after: Option<Duration> },
-    Error { status: u16 },
+    Error { status: Option<u16> },
 }
+
+/// `Error::status` is `Some(_)` for HTTP-like providers (JMAP, Graph,
+/// Gmail) where every server error carries a numeric status. It is
+/// `None` for protocol server failures that have no numeric status
+/// (e.g. IMAP `NO`/`BAD` outside any tagged response, SMTP transport
+/// shutdown without a final reply). The classifier handles both via
+/// the explicit `status: None` recovery row above; protocol crates
+/// must not synthesize sentinel values like `0` to satisfy the type.
 
 #[non_exhaustive]
 #[derive(Clone, Debug)]
@@ -1139,7 +1201,7 @@ strings.
 Each protocol crate exposes one `pub(crate) fn into_account_error`.
 That function is the translation boundary from crate-internal errors
 to the public account surface. It must funnel construction through
-`bifrost_types::AccountErrorBuilder` — there is no other public path
+`bifrost_types::AccountErrorBuilder` - there is no other public path
 to an `AccountError` value.
 
 ```rust
@@ -1157,7 +1219,12 @@ impl AccountErrorBuilder {
 
     pub fn request_id(self, id: impl Into<String>) -> Self;
     pub fn trace_id(self, id: impl Into<String>) -> Self;
-    pub fn status(self, status: u16) -> Self;
+    /// Server-returned numeric status. `None` is permitted and
+    /// represents "server responded with an error this protocol does
+    /// not carry a numeric status for" (IMAP `NO`/`BAD` without a
+    /// response code, etc.). Builders must not synthesize sentinel
+    /// values like `0`; pass `None` instead.
+    pub fn status(self, status: Option<u16>) -> Self;
     pub fn native_code(self, code: impl Into<String>) -> Self;
     pub fn text(self, text: DiagnosticText) -> Self;
 
@@ -1184,7 +1251,12 @@ impl AccountErrorBuilder {
 2. Derives `recovery` from `bifrost-types::recovery` using
    `(kind, scope, operation, primary_cause, retry_not_before,
    throttle_scope, idempotency_override)`. `transmission_state` is
-   read off the primary `TransportCause` when present.
+   read off the outermost `AttemptCause` in the chain when present;
+   absence of `AttemptCause` is treated as `Unsent` for classification
+   but is preserved verbatim in support exports. `TransportCause`
+   itself never carries transmission state; the two causes are pushed
+   side-by-side when a transport failure occurs (`Transport(_)` for
+   the failure type, `Attempt(_)` for the transmission-state evidence).
 3. Derives `suggested_remediation` from the same inputs.
 4. Computes `message_key`.
 5. Wraps `DiagnosticInfo` and `CauseChain` in `Arc`.
@@ -1203,7 +1275,7 @@ Graph 410 on a delta token:
 - derived `message_key`: `"syncstate.cursor-invalid"`
 - `chain[0]`: `State(CursorInvalid)`
 - `chain[1]`: `Wire(Graph(GraphSignal::Gone))`
-- `chain[2]`: `Server(Error { status: 410 })`
+- `chain[2]`: `Server(Error { status: Some(410) })`
 
 JMAP `stateMismatch` during a flag update:
 
@@ -1357,7 +1429,7 @@ pub enum MutationSuccess {
 
 `Skipped` is a successful final state from the caller's perspective.
 Folding it into `Succeeded` rather than a fourth lane keeps the
-lane model uniform — the lanes describe how the item left the
+lane model uniform - the lanes describe how the item left the
 side-effect boundary, not whether the server wrote bytes.
 
 ### Streaming invariants
@@ -1435,7 +1507,7 @@ Warnings share the `DiagnosticText` visibility discipline used by
 `AccountError`. The free-text fields are `DiagnosticText`, not raw
 `String`, so the same `UserSafe` / `SupportOnly` tagging applies.
 Without this discipline, warnings would become the leak path for
-raw provider strings into UI, logs, and telemetry — defeating the
+raw provider strings into UI, logs, and telemetry - defeating the
 visibility model `AccountError` enforces. Producers tag warning
 text the same way they tag diagnostic text.
 
@@ -1453,12 +1525,12 @@ with `Fatal(AccountError)` from `bifrost-types::recovery`, which has
 a different meaning (engine-boundary collapse of any terminal
 `RecoveryClass`). The two concepts:
 
-- `SyncEvent::Terminated(AccountError)` — this stream ends here.
+- `SyncEvent::Terminated(AccountError)` - this stream ends here.
   The carried `AccountError` describes why. Engine reads
   `error.recovery()` to decide what to do next: retry the stream
   (`Retry`), reconcile (`Reconcile`), follow an `EngineDirective`,
   or stop (terminal variants).
-- `Fatal(AccountError)` — newtype from
+- `Fatal(AccountError)` - newtype from
   `bifrost-types::recovery::Fatal` that collapses any
   `AccountError` whose `RecoveryClass` is terminal. The engine
   uses `Fatal::try_from(&error)` at boundaries where it specifically
@@ -1537,7 +1609,7 @@ pub struct BatchUncertain {
     pub error: AccountError, // explains the source of uncertainty
 }
 
-/// Canonical access pattern. NOT `#[non_exhaustive]` — the three
+/// Canonical access pattern. NOT `#[non_exhaustive]` - the three
 /// lanes are the model. Adding a fourth lane is a deliberate
 /// breaking change.
 pub enum BatchItemOutcome<'a, T> {
@@ -1554,7 +1626,7 @@ impl<T> BatchOutcome<T> {
 `BatchItem<I>` is the **required input shape.** Multi-target methods
 do not accept a bare `Vec<I>`; the caller must supply a
 `BatchItemId` with each input. This makes correlation enforceable
-rather than conventional — implementers cannot invent provider-side
+rather than conventional - implementers cannot invent provider-side
 IDs or use sequence indices that diverge under retries.
 
 `BatchItemId` is required to be **non-empty and unique within a
@@ -1568,7 +1640,7 @@ caller-fixable input.
 
 `BatchItemId` is **caller-correlated, not provider-correlated.** The
 caller chooses what it means (recipient address, draft id, hash of
-the input payload, sequence index serialized to string — whatever
+the input payload, sequence index serialized to string - whatever
 maps back to caller-side state). The library echoes it through all
 three outcome lanes verbatim. This works even when the provider
 returns no stable per-item identifier for failures, which is the
@@ -1577,7 +1649,7 @@ common case for mid-batch rejections.
 All three outcome lanes carry `BatchItemId`, so consumer correlation
 is identical regardless of outcome. `T` is free to carry per-item
 success payload (assigned message id, acceptance code, server-side
-metadata) or `()` when there is no useful payload — the lane wrapper
+metadata) or `()` when there is no useful payload - the lane wrapper
 owns identity in all cases.
 
 `BatchItemOutcome<'a, T>` is the canonical access pattern. It is
@@ -1586,7 +1658,7 @@ model, not an extension point. Wildcard arms over `BatchItemOutcome`
 would let stale consumer policy silently apply to a new lane (a fifth
 "pending" or "deferred" status added in v2.0), which on partial-
 success operations is exactly the failure mode the model exists to
-prevent — silently treating uncertain or pending items as successes
+prevent - silently treating uncertain or pending items as successes
 can double-send mail or lose audit signal. If the three-lane model
 ever needs to grow, that is a major-version breaking change and
 every consumer's match arm gets a compile error to update. Smooth
@@ -1595,7 +1667,7 @@ ergonomic "give me all successes" access, but the documented
 canonical iteration is `for outcome in batch.iter()` with exhaustive
 matching.
 
-`BatchOutcome::iter()` yields items in **submission order** — the
+`BatchOutcome::iter()` yields items in **submission order** - the
 order in which `BatchItem`s appeared in the input `Vec`, regardless
 of lane. The protocol crate tracks submission index alongside lane
 assignment. Consumers rendering "recipients in the order I typed
@@ -1607,7 +1679,7 @@ patterns, two orderings, both documented.
 
 `BatchOutcome` itself is `#[non_exhaustive]` only to admit future
 batch-level metadata fields (timing breakdown, server-side batch id,
-totals). It is *not* a license to add outcome lanes — those are the
+totals). It is *not* a license to add outcome lanes - those are the
 domain of `BatchItemOutcome`, which is closed.
 
 ### Boundary invariants
@@ -1643,7 +1715,7 @@ without defensive checks.
    accepting the batch (transaction rollback, post-write quota
    rejection, opaque batch failure with no per-item structure), the
    protocol crate fans the global `AccountError` out to every
-   submitted item — `failed` when the failure is known, `uncertain`
+   submitted item - `failed` when the failure is known, `uncertain`
    when outcome ambiguity is known. Each item carries a clone of the
    global error so the consumer can render and route it per-item
    without losing the underlying signal.
@@ -1668,7 +1740,7 @@ inspecting `RecoveryClass` to infer transmission state. `Err` means
 reconciliation is required." `Ok(BatchOutcome)` means "the request
 crossed the boundary; here is exactly what happened to each item."
 Crossing the boundary does not imply that any item produced a
-successful side effect — a transmitted batch where every recipient
+successful side effect - a transmitted batch where every recipient
 is rejected is `Ok(BatchOutcome { succeeded: vec![], failed: vec![...] })`,
 not `Err`. The hard classification (transmitted vs not, per-item
 outcome vs ambiguous) lives in the protocol crate, which has the
@@ -1678,14 +1750,14 @@ The `uncertain` lane exists for the same reason `RetryDisposition`
 exists at the single-target level: some operations do not cleanly
 fail. SMTP after partial recipient acceptance, Graph batch responses
 truncated by a timeout, a connection drop after some items in a batch
-have been committed by the server — these are not failures, and they
+have been committed by the server - these are not failures, and they
 are not successes. A two-lane shape forces the caller to
 miscategorize them. The `uncertain` lane requires the caller to
 reconcile (probe inventory, check Sent, dedupe by `BatchItemId`)
 before acting on those items.
 
 Reviewers reject any multi-target signature whose return is
-`Result<(), AccountError>` or `Result<Vec<T>, AccountError>` — these
+`Result<(), AccountError>` or `Result<Vec<T>, AccountError>` - these
 flatten exactly the information the consumer needs. The only
 acceptable signature for a multi-target `Account` method is
 `Result<BatchOutcome<T>, AccountError>`.
@@ -1752,7 +1824,7 @@ Exit:
   `support_minimal()`, `support_consented()`, and `support_internal()`
   are the only public diagnostic accessors; `DiagnosticInfo` is not
   part of the consumer surface.
-- `TelemetryView` is structured fields only — no free-form text.
+- `TelemetryView` is structured fields only - no free-form text.
   Support exports are `serde::Serialize` and gated by consent tier.
 - Consumers do not need to inspect `chain` to classify the error.
   `WireCause` is documented as diagnostic-only; classification gaps
@@ -1777,9 +1849,18 @@ Exit:
   `not_before`, `min_delay`, and `throttle_scope`. Mid-stream
   transport drops on non-idempotent operations produce `Reconcile`;
   rate-limit and quota failures carry a `throttle_scope`.
-- `TransmissionState` (`Unsent` / `InFlight` / `Acknowledged`) is a
-  field on `TransportCause` set by the transport layer; recovery
-  derivation reads it directly. No separate builder setter.
+- `TransmissionState` (`Unsent` / `InFlight` / `Acknowledged`) is the
+  sole field on `AttemptCause`, which the transport layer pushes onto
+  the chain whenever a network attempt is made. Recovery derivation
+  reads it from `AttemptCause` only; `TransportCause` never carries
+  transmission state and the codebase has zero references to
+  `TransportCause::transmission_state`. Absence of `AttemptCause`
+  classifies as `Unsent` but is preserved verbatim in support exports.
+  No separate builder setter.
+- `ServerCause::Error { status: Option<u16> }`. `Some(_)` for
+  HTTP-like providers; `None` for protocol server failures without
+  numeric status (IMAP `NO`/`BAD` outside any response code). No
+  sentinel values (no `status: 0`).
 - `AccountOperation` granularity matches per-mutation idempotency
   (`UpdateFlags`, `MoveMessage`, `DeleteMessage`, `ChangeLabel`,
   `EditFolder`, etc.); no generic `Mutate` variant.
@@ -1794,7 +1875,32 @@ Exit:
 - `AccountError`, causes, diagnostics, and recovery payloads derive
   `Clone`.
 - No generic public `Other` or naked `String` escape-hatch variants.
-- Unknown provider codes are typed as `Unknown { code }`.
+- Unknown provider codes are typed as `Unknown { code }` **only for
+  forward compatibility**. Known provider vocabulary must be typed
+  with named variants; routing known codes through `Unknown { code }`
+  plus string matching is forbidden. The Phase 2.2 audit identified
+  the JMAP `SetErrorType` family, `GraphSignal::InvalidDeltaToken`,
+  and `GraphSignal::SyncStateNotFound` as known-vocabulary that must
+  ship as typed variants in the Phase 1 amendment.
+- `AccountError::into_builder()` is the only supported path for
+  decorating an existing error with secondary evidence. `build()`
+  remains the single invariant funnel; no mutator bypasses it.
+- No stream may discard a computed `AccountError`. Stream termination
+  always carries the structured error via
+  `SyncEvent::Terminated(AccountError)`.
+- No per-item accounted failure (item appears in `BatchOutcome` or
+  emits `ItemOutcome::{Failed,Uncertain}`) may also be emitted as a
+  trailing global stream termination. Global termination is reserved
+  for stream-level errors that prevent further attempts.
+- No `AccountOperation` placeholder remains in PIM or `Account` call
+  sites. Each call site passes the operation that matches its
+  side-effect and idempotency; misclassifying a non-idempotent op as
+  idempotent can cause recovery to choose `Retry::SameRequest` where
+  the correct action is `Reconcile`.
+- SMTP and LMTP send pipelines carry `TransmissionState` from each
+  command phase into the `AccountError` via `AttemptCause`. The crate
+  is not considered complete until non-idempotent `Send` can be
+  classified with the correct transmission state.
 - One central recovery mapping exists in `bifrost-types::recovery`,
   consuming `(kind, scope, operation, primary_cause)` plus builder
   overrides; it is the only producer of `RecoveryClass` and

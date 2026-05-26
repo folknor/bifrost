@@ -29,10 +29,10 @@ Landed-API quirks the agent must keep straight:
   `.protocol(...)` on the builder for these).
 - `AccountOperation` has `SyncInventory` and `SyncChanges`; there is no
   plain `Inventory`.
-- `ServerErrorKind::Error { status: Option<u16> }` vs
-  `ServerCause::Error { status: u16 }` — the kind permits `None`, the
-  cause does not. (Sync rarely constructs `Server(_)` itself, but this
-  applies to errors it forwards.)
+- `ServerErrorKind::Error { status: Option<u16> }` and
+  `ServerCause::Error { status: Option<u16> }` - both carry
+  `Option<u16>` after the Phase 1 amendment. Sync rarely constructs
+  `Server(_)` itself; this applies to errors it forwards.
 - Every kind/cause pair the engine constructs must satisfy
   `recovery::kind_matches_cause` (asserted at runtime by
   `AccountErrorBuilder::build`).
@@ -400,7 +400,7 @@ pub enum ReopenRequest {
 `scope` is `Option<CursorScope>`: scope-bound directives carry
 `Some(scope)`, account-wide directives carry `None`. The
 `handle_account_error` dispatcher inspects `error.recovery()` to pick
-the right branch — `scope` is the convenience field for the common
+the right branch - `scope` is the convenience field for the common
 case where the directive's scope is the same as the worker's current
 scope. Workers that send `ReopenRequest::Recovery` for an account-wide
 directive MUST pass `None`; passing `Some(arbitrary_scope)` would mask
@@ -674,7 +674,7 @@ For errors that are sent through `SyncEvent::Terminated` or
     an invalid checkpoint shape. The `Protocol` stamped on the
     resulting `AccountError` is the upstream protocol that produced
     the malformed checkpoint (whichever the offending account
-    advertised) — sync attaches it via `.protocol(upstream_protocol)`
+    advertised) - sync attaches it via `.protocol(upstream_protocol)`
     rather than omitting it, because the diagnostic value of "this
     checkpoint came from a JMAP/IMAP/Graph/Gmail account" is high.
 
@@ -973,7 +973,7 @@ Suggested tests:
     `NoPermission`, `Unsupported`, `ClientBug`,
     `ProviderContractViolation`, `ProviderRefused`,
     `UnknownPermanent`.
-  - Assert `plan_recovery` returns `SurfaceTerminal` for each — none
+  - Assert `plan_recovery` returns `SurfaceTerminal` for each - none
     panic, none route to Retry/Reconcile/Engine.
   - Pins the `.expect("terminal recovery must convert to Fatal")` in
     `plan_recovery` against silent drift if the `Fatal::TryFrom`
@@ -1046,7 +1046,7 @@ Synthetic `Account` implementations and pure helper tests are enough.
   wide directives carry `None`, scope-bound directives carry `Some`.
 - `EngineDirective::DowngradeStrategy(downgrade)` and
   `CapabilityChanged { delta }` dispatch routes the payload into a
-  `Warning::protocol_detail` (and `message` for downgrades) — the
+  `Warning::protocol_detail` (and `message` for downgrades) - the
   audit greps that no payload is silently dropped on the directive
   match arm.
 - Every kind/cause pair the engine constructs satisfies

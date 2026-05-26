@@ -41,6 +41,43 @@ impl AccountErrorBuilder {
         }
     }
 
+    /// Constructor used by `AccountError::into_builder`. Pre-populates
+    /// the chain (split into primary + extras), diagnostics, and the
+    /// top-level fields from an existing built error so the caller can
+    /// `push_cause`, then `build()` to obtain a new `AccountError` with
+    /// derived fields recomputed.
+    ///
+    /// The `idempotency_override`, `retry_not_before`, and
+    /// `throttle_scope` builder overrides are reset on round-trip; the
+    /// derived `recovery` will be recomputed from the chain. Callers
+    /// that want to preserve those overrides must reapply them after
+    /// `into_builder`.
+    #[must_use]
+    pub(crate) fn from_rebuild(
+        kind: AccountErrorKind,
+        primary_cause: Cause,
+        chain_extras: Vec<Cause>,
+        scope: Option<ErrorScope>,
+        operation: Option<AccountOperation>,
+        provider: Option<Provider>,
+        protocol: Option<Protocol>,
+        diagnostics: DiagnosticInfo,
+    ) -> Self {
+        Self {
+            kind,
+            primary_cause,
+            chain_extras,
+            scope,
+            operation,
+            provider,
+            protocol,
+            diagnostics,
+            idempotency_override: None,
+            retry_not_before: None,
+            throttle_scope: None,
+        }
+    }
+
     #[must_use]
     pub fn operation(mut self, op: AccountOperation) -> Self {
         self.operation = Some(op);
@@ -83,9 +120,14 @@ impl AccountErrorBuilder {
         self
     }
 
+    /// Server-returned numeric status. `None` is permitted and represents
+    /// "server responded with an error this protocol does not carry a
+    /// numeric status for" (IMAP `NO`/`BAD` without a response code).
+    /// Builders must not synthesize sentinel values like `0`; pass `None`
+    /// instead.
     #[must_use]
-    pub fn status(mut self, status: u16) -> Self {
-        self.diagnostics.status = Some(status);
+    pub fn status(mut self, status: Option<u16>) -> Self {
+        self.diagnostics.status = status;
         self
     }
 
