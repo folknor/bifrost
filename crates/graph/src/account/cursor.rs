@@ -142,9 +142,7 @@ pub(crate) fn encode_cursor(
     })
 }
 
-pub(crate) fn decode_cursor(
-    cursor: &ChangeCursor,
-) -> Result<GraphCursorPayload, CursorError> {
+pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload, CursorError> {
     if cursor.server_state.protocol != ProtocolKind::Graph {
         return Err(CursorError::ProtocolMismatch);
     }
@@ -155,9 +153,8 @@ pub(crate) fn decode_cursor(
         return Err(CursorError::SchemaIncompatible);
     }
 
-    let mut payload: GraphCursorPayload =
-        serde_json::from_slice(&cursor.server_state.bytes)
-            .map_err(|error| CursorError::Encode(error.to_string()))?;
+    let mut payload: GraphCursorPayload = serde_json::from_slice(&cursor.server_state.bytes)
+        .map_err(|error| CursorError::Encode(error.to_string()))?;
     if let Some(progress) = cursor.advanced_through.as_ref() {
         payload.advanced_through = Some(decode_page_marker(progress)?);
     }
@@ -175,8 +172,7 @@ pub(crate) fn encode_page_marker(
 pub(crate) fn decode_page_marker(
     progress: &OpaqueProgressBytes,
 ) -> Result<GraphPageMarker, CursorError> {
-    serde_json::from_slice(&progress.0)
-        .map_err(|error| CursorError::Encode(error.to_string()))
+    serde_json::from_slice(&progress.0).map_err(|error| CursorError::Encode(error.to_string()))
 }
 
 fn now_unix_secs() -> u64 {
@@ -289,7 +285,10 @@ mod tests {
             envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
         };
 
-        assert!(matches!(decode_cursor(&cursor), Err(CursorError::Encode(_))));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(CursorError::Encode(_))
+        ));
     }
 
     #[test]
@@ -314,7 +313,10 @@ mod tests {
             envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
         };
 
-        assert!(matches!(decode_cursor(&cursor), Err(CursorError::Encode(_))));
+        assert!(matches!(
+            decode_cursor(&cursor),
+            Err(CursorError::Encode(_))
+        ));
     }
 
     #[test]
@@ -323,7 +325,10 @@ mod tests {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Mailbox,
         };
-        assert!(matches!(kind_for_scope(&scope), Err(CursorError::Unsupported)));
+        assert!(matches!(
+            kind_for_scope(&scope),
+            Err(CursorError::Unsupported)
+        ));
     }
 
     #[test]

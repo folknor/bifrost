@@ -9,12 +9,12 @@
 
 use bifrost_types::{
     AccessErrorKind, AccountErrorKind, AccountOperation, AuthErrorKind, Cause, CursorScope,
-    EngineDirective, ErrorScope, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
+    EngineDirective, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
     RequestErrorKind, ResourceKind, ServerErrorKind, StrategyDowngrade, SyncStateErrorKind,
     ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
 };
 
-use super::error::{ImapErrorContext, into_account_error, strategy_failure};
+use super::{ImapErrorContext, into_account_error, strategy_failure};
 use crate::Error;
 use crate::types::{MailboxName, ResponseCode};
 
@@ -420,7 +420,7 @@ fn other_response_code_preserves_payload_in_wire_unknown() {
 
 #[test]
 fn uidvalidity_changed_derives_restart_scope() {
-    let account = super::error::uidvalidity_changed(&mailbox("INBOX"), 1, 2);
+    let account = super::uidvalidity_changed(&mailbox("INBOX"), 1, 2);
     assert!(matches!(
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))
@@ -429,7 +429,7 @@ fn uidvalidity_changed_derives_restart_scope() {
 
 #[test]
 fn modseq_reset_derives_restart_scope() {
-    let account = super::error::modseq_reset(&mailbox("INBOX"), 10, Some(5));
+    let account = super::modseq_reset(&mailbox("INBOX"), 10, Some(5));
     assert!(matches!(
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))

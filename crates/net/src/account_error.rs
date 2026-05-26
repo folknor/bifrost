@@ -79,10 +79,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 let mut builder = base_builder(
                     &ctx,
                     AccountErrorKind::Transport(TransportErrorKind::Network),
-                    Cause::Transport(TransportCause::new(
-                        TransportKind::Network,
-                        detail.clone(),
-                    )),
+                    Cause::Transport(TransportCause::new(TransportKind::Network, detail.clone())),
                 );
                 if let Some(text) = detail {
                     builder = builder.text(text);

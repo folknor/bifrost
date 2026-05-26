@@ -235,7 +235,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "AccountErrorKind must match")]
     fn mismatched_kind_and_cause_panics() {
-        AccountErrorBuilder::new(
+        let _ = AccountErrorBuilder::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Transport(TransportCause {
                 kind: TransportKind::Network,
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "throttle_scope only applies")]
     fn throttle_scope_panics_outside_rate_or_quota() {
-        AccountErrorBuilder::new(
+        let _ = AccountErrorBuilder::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
             Cause::Transport(TransportCause {
                 kind: TransportKind::Network,

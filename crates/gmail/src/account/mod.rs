@@ -22,7 +22,8 @@ use bifrost_types::{
     IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
     MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
     Priority, Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;

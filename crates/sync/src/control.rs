@@ -8,7 +8,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bifrost_types::{AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control, Priority, RequestCause, RequestErrorKind};
+use bifrost_types::{
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control,
+    Priority, RequestCause, RequestErrorKind,
+};
 use tokio::sync::watch;
 
 use crate::cancel::{Boundary, BoundaryRequest};
@@ -143,7 +146,7 @@ impl SyncControl {
                     AccountErrorKind::Request(RequestErrorKind::Malformed),
                     Cause::Request(RequestCause::Malformed {
                         detail: bifrost_types::DiagnosticText::support_only(
-                            "control: checkpoint watch channel closed".into(),
+                            "control: checkpoint watch channel closed",
                         ),
                     }),
                 )

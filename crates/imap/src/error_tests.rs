@@ -193,7 +193,7 @@ fn from_io_error_via_into_yields_io_variant_without_attempt() {
 fn from_validation_error_maps_to_invalid_input() {
     // ValidationError is constructed by failed mailbox-name parsing.
     let validation =
-        crate::types::MailboxName::new("").expect_err("empty mailbox name should fail");
+        crate::types::MailboxName::new("INBOX\r").expect_err("control chars should fail");
     let err: Error = validation.into();
     assert!(matches!(err, Error::InvalidInput(_)));
 }
@@ -209,7 +209,7 @@ fn from_encode_error_validation_maps_to_invalid_input() {
 fn from_encode_error_missing_cap_maps_to_missing_capability() {
     let encode = crate::codec::encode::EncodeError::MissingCapability {
         cmd: "FETCH",
-        cap: "BINARY",
+        cap: "BINARY".to_string(),
     };
     let err: Error = encode.into();
     assert!(matches!(err, Error::MissingCapability(_)));

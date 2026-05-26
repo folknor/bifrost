@@ -99,7 +99,11 @@ impl Account for FlagsAccount {
         &self,
         _scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EstablishCursor)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::EstablishCursor,
+            ))
+        })
     }
 
     fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
@@ -154,7 +158,11 @@ impl Account for FlagsAccount {
         &self,
         _handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushUnsubscribe)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::PushUnsubscribe,
+            ))
+        })
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
@@ -218,7 +226,11 @@ impl Account for FlagsAccount {
         _target: MutationTarget,
         _container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RemoveFromContainer)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::RemoveFromContainer,
+            ))
+        })
     }
 
     fn set_keyword(
@@ -236,7 +248,11 @@ impl Account for FlagsAccount {
         _label: ContainerId,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetLabelMembership)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::SetLabelMembership,
+            ))
+        })
     }
 
     fn set_category(
@@ -269,10 +285,7 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetIsRead)) })
     }
 
-    fn send_message(
-        &self,
-        _request: SendRequest,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Send)) })
     }
 
@@ -281,13 +294,14 @@ impl Account for FlagsAccount {
         _bytes: AccountStream<Result<Bytes, AccountError>>,
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::AttachmentUpload)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::AttachmentUpload,
+            ))
+        })
     }
 
-    fn draft_create(
-        &self,
-        _patch: DraftPatch,
-    ) -> AccountFuture<Result<DraftHandle, AccountError>> {
+    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftCreate)) })
     }
 
@@ -299,17 +313,11 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftUpdate)) })
     }
 
-    fn draft_discard(
-        &self,
-        _draft: DraftHandle,
-    ) -> AccountFuture<Result<(), AccountError>> {
+    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(
-        &self,
-        _draft: DraftHandle,
-    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
     }
 
@@ -337,7 +345,11 @@ impl Account for FlagsAccount {
         _name: String,
         _parent: Option<ContainerId>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerCreate)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::ContainerCreate,
+            ))
+        })
     }
 
     fn container_rename(
@@ -345,7 +357,11 @@ impl Account for FlagsAccount {
         _container: ContainerId,
         _name: String,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerRename)) })
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::ContainerRename,
+            ))
+        })
     }
 
     fn container_move(
@@ -356,11 +372,12 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerMove)) })
     }
 
-    fn container_delete(
-        &self,
-        _container: ContainerId,
-    ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerDelete)) })
+    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::ContainerDelete,
+            ))
+        })
     }
 
     fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
@@ -379,10 +396,7 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationGet)) })
     }
 
-    fn vacation_set(
-        &self,
-        _config: VacationConfig,
-    ) -> AccountFuture<Result<(), AccountError>> {
+    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationSet)) })
     }
 

@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
-    Cause, ChangeCursor, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
+    AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Cause,
+    ChangeCursor, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
     CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
     IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition,
     InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message, MutationSuccess,
@@ -458,7 +458,10 @@ impl Account for JmapAccount {
         pim::draft_send(self.mail.clone(), Arc::clone(&self.email_state), draft)
     }
 
-    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
+    fn search(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
         pim::search(self.mail.clone(), request)
     }
 
@@ -546,7 +549,10 @@ impl Account for JmapAccount {
         pim::quota_get(self.quota.clone())
     }
 
-    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, AccountError>> {
+    fn thread_hydrate(
+        &self,
+        thread: ThreadId,
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
         pim::thread_hydrate(self.mail.clone(), thread)
     }
 

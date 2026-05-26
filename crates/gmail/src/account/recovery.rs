@@ -275,10 +275,10 @@ pub(crate) fn mutation_error(
     let outcomes = ids
         .iter()
         .map(|id| {
-            ItemOutcome::Failed(BatchFailure {
-                item: BatchItemId(id.0.clone()),
-                error: account_error.clone(),
-            })
+            ItemOutcome::Failed(BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                account_error.clone(),
+            ))
         })
         .collect();
     Ok(outcomes)
@@ -289,10 +289,10 @@ pub(crate) fn mutation_error(
 pub(crate) fn applied_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.iter()
         .map(|id| {
-            ItemOutcome::Succeeded(BatchSuccess {
-                item: BatchItemId(id.0.clone()),
-                output: MutationSuccess::Applied,
-            })
+            ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId(id.0.clone()),
+                MutationSuccess::Applied,
+            ))
         })
         .collect()
 }
@@ -302,10 +302,10 @@ pub(crate) fn applied_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSucc
 pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.iter()
         .map(|id| {
-            ItemOutcome::Succeeded(BatchSuccess {
-                item: BatchItemId(id.0.clone()),
-                output: MutationSuccess::Skipped,
-            })
+            ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId(id.0.clone()),
+                MutationSuccess::Skipped,
+            ))
         })
         .collect()
 }
@@ -388,6 +388,7 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
                     AccountErrorKind::Server(ServerErrorKind::Error { .. })
                 )
         }
+        _ => true,
     }
 }
 
@@ -493,7 +494,7 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         .provider(Provider::Gmail)
         .protocol(Protocol::Gmail)
         .operation(ctx.operation)
-        .status(status);
+        .status(Some(status));
 
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
@@ -672,6 +673,7 @@ fn classify_response(
             }
             // Fall through to HTTP status mapping.
         }
+        _ => {}
     }
 
     // HTTP status fallback (used when no recognized Gmail reason
@@ -722,7 +724,9 @@ fn classify_by_status(status: u16, ctx: &GmailErrorContext) -> (AccountErrorKind
             AccountErrorKind::Server(ServerErrorKind::Error {
                 status: Some(other),
             }),
-            Cause::Server(ServerCause::Error { status: other }),
+            Cause::Server(ServerCause::Error {
+                status: Some(other),
+            }),
         ),
     }
 }
@@ -751,6 +755,7 @@ fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection
         | ErrorScope::ContactCollection => None,
+        _ => None,
     });
     (
         AccountErrorKind::NotFound(what),

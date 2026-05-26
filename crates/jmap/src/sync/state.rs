@@ -1,5 +1,5 @@
 use bifrost_types::{
-    ChangeCursor, CursorScope, Error, ObjectType, OpaqueChangeState, ProtocolKind, QueryId,
+    ChangeCursor, CursorScope, ObjectType, OpaqueChangeState, ProtocolKind, QueryId,
 };
 
 pub(crate) const ENVELOPE_VERSION_V1: u32 = 1;
@@ -29,14 +29,23 @@ pub(crate) enum JmapScopeRepr {
     Query(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JmapCursorError {
+    UnsupportedScope,
+    CursorProtocolMismatch,
+    CursorEnvelopeUnknown,
+    SchemaIncompatible,
+    Other(String),
+}
+
 impl JmapScopeRepr {
-    pub(crate) fn from_cursor_scope(scope: &CursorScope) -> Result<Self, Error> {
+    pub(crate) fn from_cursor_scope(scope: &CursorScope) -> Result<Self, JmapCursorError> {
         match scope {
             CursorScope::Type(ObjectType::Email) => Ok(Self::Email),
             CursorScope::Type(ObjectType::Mailbox) => Ok(Self::Mailbox),
             CursorScope::Type(ObjectType::Thread) => Ok(Self::Thread),
             CursorScope::Query(query) => Ok(Self::Query(query.0.clone())),
-            _ => Err(Error::Unsupported),
+            _ => Err(JmapCursorError::UnsupportedScope),
         }
     }
 
@@ -61,19 +70,19 @@ pub(crate) fn encode(state: &JmapCursorState) -> OpaqueChangeState {
 pub(crate) fn encode_for_scope(
     scope: &CursorScope,
     state_string: impl Into<String>,
-) -> Result<OpaqueChangeState, Error> {
+) -> Result<OpaqueChangeState, JmapCursorError> {
     Ok(encode(&JmapCursorState::V1 {
         scope: JmapScopeRepr::from_cursor_scope(scope)?,
         state_string: state_string.into(),
     }))
 }
 
-pub(crate) fn decode(raw: &OpaqueChangeState) -> Result<JmapCursorState, Error> {
+pub(crate) fn decode(raw: &OpaqueChangeState) -> Result<JmapCursorState, JmapCursorError> {
     if raw.protocol != ProtocolKind::Jmap {
-        return Err(Error::CursorProtocolMismatch);
+        return Err(JmapCursorError::CursorProtocolMismatch);
     }
     if raw.envelope_version != ENVELOPE_VERSION_V1 {
-        return Err(Error::CursorEnvelopeUnknown);
+        return Err(JmapCursorError::CursorEnvelopeUnknown);
     }
 
     decode_state(&raw.bytes)
@@ -116,7 +125,7 @@ fn encode_string(value: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(bytes);
 }
 
-fn decode_state(bytes: &[u8]) -> Result<JmapCursorState, Error> {
+fn decode_state(bytes: &[u8]) -> Result<JmapCursorState, JmapCursorError> {
     let mut input = bytes;
     let tag = read_u8(&mut input)?;
     let state = match tag {
@@ -128,44 +137,46 @@ fn decode_state(bytes: &[u8]) -> Result<JmapCursorState, Error> {
                 state_string,
             }
         }
-        _ => return Err(Error::SchemaIncompatible),
+        _ => return Err(JmapCursorError::SchemaIncompatible),
     };
     if !input.is_empty() {
-        return Err(Error::SchemaIncompatible);
+        return Err(JmapCursorError::SchemaIncompatible);
     }
     Ok(state)
 }
 
-fn decode_scope(input: &mut &[u8]) -> Result<JmapScopeRepr, Error> {
+fn decode_scope(input: &mut &[u8]) -> Result<JmapScopeRepr, JmapCursorError> {
     let tag = read_u8(input)?;
     match tag {
         SCOPE_TAG_EMAIL => Ok(JmapScopeRepr::Email),
         SCOPE_TAG_MAILBOX => Ok(JmapScopeRepr::Mailbox),
         SCOPE_TAG_THREAD => Ok(JmapScopeRepr::Thread),
         SCOPE_TAG_QUERY => Ok(JmapScopeRepr::Query(decode_string(input)?)),
-        _ => Err(Error::SchemaIncompatible),
+        _ => Err(JmapCursorError::SchemaIncompatible),
     }
 }
 
-fn decode_string(input: &mut &[u8]) -> Result<String, Error> {
+fn decode_string(input: &mut &[u8]) -> Result<String, JmapCursorError> {
     let len = read_u32_le(input)? as usize;
     if input.len() < len {
-        return Err(Error::SchemaIncompatible);
+        return Err(JmapCursorError::SchemaIncompatible);
     }
     let (bytes, rest) = input.split_at(len);
     *input = rest;
-    String::from_utf8(bytes.to_vec()).map_err(|_| Error::SchemaIncompatible)
+    String::from_utf8(bytes.to_vec()).map_err(|_| JmapCursorError::SchemaIncompatible)
 }
 
-fn read_u8(input: &mut &[u8]) -> Result<u8, Error> {
-    let (first, rest) = input.split_first().ok_or(Error::SchemaIncompatible)?;
+fn read_u8(input: &mut &[u8]) -> Result<u8, JmapCursorError> {
+    let (first, rest) = input
+        .split_first()
+        .ok_or(JmapCursorError::SchemaIncompatible)?;
     *input = rest;
     Ok(*first)
 }
 
-fn read_u32_le(input: &mut &[u8]) -> Result<u32, Error> {
+fn read_u32_le(input: &mut &[u8]) -> Result<u32, JmapCursorError> {
     if input.len() < 4 {
-        return Err(Error::SchemaIncompatible);
+        return Err(JmapCursorError::SchemaIncompatible);
     }
     let (head, rest) = input.split_at(4);
     *input = rest;
@@ -177,7 +188,7 @@ fn read_u32_le(input: &mut &[u8]) -> Result<u32, Error> {
 pub(crate) fn cursor_for_scope(
     scope: CursorScope,
     state_string: impl Into<String>,
-) -> Result<ChangeCursor, Error> {
+) -> Result<ChangeCursor, JmapCursorError> {
     let server_state = encode_for_scope(&scope, state_string)?;
     Ok(ChangeCursor {
         scope,
@@ -187,14 +198,16 @@ pub(crate) fn cursor_for_scope(
     })
 }
 
-pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<(JmapScopeRepr, String), Error> {
+pub(crate) fn decode_cursor(
+    cursor: &ChangeCursor,
+) -> Result<(JmapScopeRepr, String), JmapCursorError> {
     match decode(&cursor.server_state)? {
         JmapCursorState::V1 {
             scope,
             state_string,
         } => {
             if scope.to_cursor_scope() != cursor.scope {
-                return Err(Error::Other(
+                return Err(JmapCursorError::Other(
                     "JMAP cursor payload scope does not match ChangeCursor scope".to_string(),
                 ));
             }
@@ -228,7 +241,10 @@ mod tests {
             bytes: Vec::new(),
         };
 
-        assert!(matches!(decode(&raw), Err(Error::CursorProtocolMismatch)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::CursorProtocolMismatch)
+        ));
     }
 
     #[test]
@@ -239,7 +255,10 @@ mod tests {
         });
         raw.envelope_version = ENVELOPE_VERSION_V1 + 1;
 
-        assert!(matches!(decode(&raw), Err(Error::CursorEnvelopeUnknown)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::CursorEnvelopeUnknown)
+        ));
     }
 
     #[test]
@@ -258,7 +277,10 @@ mod tests {
             envelope_version: ENVELOPE_VERSION_V1,
             bytes: vec![0xff],
         };
-        assert!(matches!(decode(&raw), Err(Error::SchemaIncompatible)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
+        ));
     }
 
     #[test]
@@ -268,7 +290,10 @@ mod tests {
             envelope_version: ENVELOPE_VERSION_V1,
             bytes: vec![STATE_TAG_V1, 0xff, 0, 0, 0, 0],
         };
-        assert!(matches!(decode(&raw), Err(Error::SchemaIncompatible)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
+        ));
     }
 
     #[test]
@@ -284,7 +309,10 @@ mod tests {
             envelope_version: ENVELOPE_VERSION_V1,
             bytes,
         };
-        assert!(matches!(decode(&raw), Err(Error::SchemaIncompatible)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
+        ));
     }
 
     #[test]
@@ -300,7 +328,10 @@ mod tests {
             envelope_version: ENVELOPE_VERSION_V1,
             bytes,
         };
-        assert!(matches!(decode(&raw), Err(Error::SchemaIncompatible)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
+        ));
     }
 
     #[test]
@@ -310,6 +341,9 @@ mod tests {
             envelope_version: ENVELOPE_VERSION_V1,
             bytes: vec![STATE_TAG_V1, SCOPE_TAG_EMAIL, 1, 0, 0, 0, 0xff],
         };
-        assert!(matches!(decode(&raw), Err(Error::SchemaIncompatible)));
+        assert!(matches!(
+            decode(&raw),
+            Err(JmapCursorError::SchemaIncompatible)
+        ));
     }
 }

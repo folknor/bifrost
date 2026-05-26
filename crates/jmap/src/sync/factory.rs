@@ -157,24 +157,24 @@ impl AccountFactory for JmapAccountFactory {
             let mut seed_states = HashMap::new();
             seed_states.insert(
                 CursorScope::Type(ObjectType::Email),
-                state::encode_for_scope(
-                    &CursorScope::Type(ObjectType::Email),
-                    email_state.clone(),
-                )?,
+                state::encode_for_scope(&CursorScope::Type(ObjectType::Email), email_state.clone())
+                    .expect("static email cursor scope is supported"),
             );
             seed_states.insert(
                 CursorScope::Type(ObjectType::Mailbox),
                 state::encode_for_scope(
                     &CursorScope::Type(ObjectType::Mailbox),
                     mailbox_state.clone(),
-                )?,
+                )
+                .expect("static mailbox cursor scope is supported"),
             );
             seed_states.insert(
                 CursorScope::Type(ObjectType::Thread),
                 state::encode_for_scope(
                     &CursorScope::Type(ObjectType::Thread),
                     thread_state.clone(),
-                )?,
+                )
+                .expect("static thread cursor scope is supported"),
             );
 
             let shutdown = CancellationToken::new();

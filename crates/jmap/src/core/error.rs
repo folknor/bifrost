@@ -159,7 +159,7 @@ impl MethodError {
 
 impl Display for MethodError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.p_type {
+        match &self.p_type {
             MethodErrorType::ServerUnavailable => write!(f, "Server unavailable"),
             MethodErrorType::ServerFail => write!(f, "Server fail"),
             MethodErrorType::ServerPartialFail => write!(f, "Server partial fail"),

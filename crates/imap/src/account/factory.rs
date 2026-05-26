@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_types::{Account, AccountFactory, AccountFuture, AccountId, Error as AccountError};
+use bifrost_types::{Account, AccountError, AccountFactory, AccountFuture, AccountId};
 
 use crate::connection::ImapConfig;
 use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};

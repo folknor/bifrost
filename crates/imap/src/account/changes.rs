@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use bifrost_types::{
-    Change, ChangeCursor, Checkpoint, CostClass, CursorDescriptor, AccountError, ObjectChange,
+    AccountError, Change, ChangeCursor, Checkpoint, CostClass, CursorDescriptor, ObjectChange,
     ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent, SyncStrategy, Warning,
     WarningKind,
 };
@@ -229,7 +229,7 @@ async fn run_qresync(
     if !known_uids_complete {
         send_warning(
             &tx,
-            WarningKind::Other("imap_qresync_baseline_seeded".to_string()),
+            WarningKind::Other,
             "QRESYNC cursor did not carry a complete UID baseline; seeding from UID SEARCH ALL",
         )
         .await?;
@@ -445,7 +445,7 @@ async fn run_condstore_with_baseline(
     if !known_uids_complete {
         send_warning(
             &tx,
-            WarningKind::Other("imap_condstore_baseline_seeded".to_string()),
+            WarningKind::Other,
             "CONDSTORE fallback received a partial UID baseline; seeding from UID SEARCH ALL",
         )
         .await?;
@@ -746,7 +746,7 @@ async fn warn_if_uid_count_mismatch<T>(
     }
     send_warning(
         tx,
-        WarningKind::Other("imap_uid_count_mismatch".to_string()),
+        WarningKind::Other,
         &format!(
             "IMAP UID count differs from SELECT EXISTS for {}: SELECT EXISTS {}, UID set {}",
             folder.as_str(),
@@ -762,13 +762,10 @@ async fn send_warning<T>(
     kind: WarningKind,
     message: &str,
 ) -> Result<(), ChangeError> {
-    tx.send(SyncEvent::Warning(Warning {
-        kind,
-        message: message.to_string(),
-        retry_count: 0,
-        next_action: None,
-        protocol_detail: Some("imap".to_string()),
-    }))
+    tx.send(SyncEvent::Warning(
+        Warning::support_only(kind, message)
+            .with_protocol_detail(bifrost_types::DiagnosticText::support_only("imap")),
+    ))
     .await
     .map_err(|_| crate::Error::closed())?;
     Ok(())
@@ -780,13 +777,11 @@ async fn send_strategy_downgrade<T>(
     to: SyncStrategy,
     reason: &str,
 ) -> Result<(), ChangeError> {
-    tx.send(SyncEvent::Warning(Warning {
-        kind: WarningKind::StrategyDowngraded { from, to },
-        message: reason.to_string(),
-        retry_count: 0,
-        next_action: None,
-        protocol_detail: Some("imap".to_string()),
-    }))
+    tx.send(SyncEvent::Warning(
+        Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
+            bifrost_types::DiagnosticText::support_only(format!("{from:?}->{to:?}")),
+        ),
+    ))
     .await
     .map_err(|_| crate::Error::closed())?;
     Ok(())
@@ -828,7 +823,7 @@ mod tests {
         else {
             panic!("expected uidvalidity change");
         };
-        let account_err = super::error::uidvalidity_changed(&folder, expected, actual);
+        let account_err = crate::account::error::uidvalidity_changed(&folder, expected, actual);
         assert!(matches!(
             account_err.recovery(),
             RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
@@ -849,7 +844,7 @@ mod tests {
         else {
             panic!("expected modseq reset");
         };
-        let account_err = super::error::modseq_reset(&folder, previous, current);
+        let account_err = crate::account::error::modseq_reset(&folder, previous, current);
         assert!(matches!(
             account_err.recovery(),
             RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
@@ -870,7 +865,7 @@ mod tests {
         assert!(matches!(
             event,
             SyncEvent::Warning(Warning {
-                kind: WarningKind::Other(_),
+                kind: WarningKind::Other,
                 ..
             })
         ));

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use bifrost_types::WatchEvent;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
     DiagnosticText, ObjectType, Protocol, ProtocolErrorKind, Provider, RequestCause,
     SubscriptionHandle, WireCause,
 };
-use bifrost_types::WatchEvent;
 
 use crate::webhooks::{
     create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
@@ -238,7 +238,10 @@ async fn subscribe_ews(
     Ok(handle)
 }
 
-async fn unsubscribe_ews(account: GraphAccount, handle: SubscriptionHandle) -> Result<(), AccountError> {
+async fn unsubscribe_ews(
+    account: GraphAccount,
+    handle: SubscriptionHandle,
+) -> Result<(), AccountError> {
     account.ews_subscriptions.write().await.remove(&handle);
     Ok(())
 }
@@ -264,7 +267,9 @@ fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<Str
 
 fn new_handle() -> Result<SubscriptionHandle, AccountError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| transport_string_error(AccountOperation::PushSubscribe, error.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|error| {
+        transport_string_error(AccountOperation::PushSubscribe, error.to_string())
+    })?;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;

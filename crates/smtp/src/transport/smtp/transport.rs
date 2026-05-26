@@ -359,10 +359,15 @@ impl SmtpTransport {
             return Err(batch_input_invalid_error(Protocol::Smtp, invalid));
         }
 
-        let batch_recipients: Vec<SmtpBatchRecipient> =
-            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+        let batch_recipients: Vec<SmtpBatchRecipient> = recipients
+            .into_iter()
+            .map(SmtpBatchRecipient::from)
+            .collect();
 
-        let mut conn = self.inner.connection().map_err(|e| batch_level_error(e, ctx.clone()))?;
+        let mut conn = self
+            .inner
+            .connection()
+            .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
         match conn.send_smtp_batch(from, batch_recipients, email, options) {
             Ok(progress) => Ok(progress.resolve()),
@@ -487,10 +492,15 @@ impl LmtpTransport {
             return Err(batch_input_invalid_error(Protocol::Lmtp, invalid));
         }
 
-        let batch_recipients: Vec<SmtpBatchRecipient> =
-            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+        let batch_recipients: Vec<SmtpBatchRecipient> = recipients
+            .into_iter()
+            .map(SmtpBatchRecipient::from)
+            .collect();
 
-        let mut conn = self.inner.connection().map_err(|e| batch_level_error(e, ctx.clone()))?;
+        let mut conn = self
+            .inner
+            .connection()
+            .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
         match conn.send_lmtp_batch(from, batch_recipients, email, options) {
             Ok(progress) => Ok(progress.resolve()),

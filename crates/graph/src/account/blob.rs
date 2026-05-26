@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bifrost_types::{
-    AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch, BlobCapabilities,
-    BlobEncoding, BlobHandle, BlobId, ByteRange, Cause, Checkpoint, DiagnosticText, ErrorScope,
-    ObjectId, PageBoundary, Protocol, ProtocolErrorKind, Provider, RequestCause, SyncEvent,
-    WireCause,
+    AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch,
+    BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange, Cause, Checkpoint,
+    DiagnosticText, ErrorScope, ObjectId, PageBoundary, Protocol, ProtocolErrorKind, Provider,
+    RequestCause, SyncEvent, WireCause,
 };
 
 use super::GraphAccount;
@@ -105,7 +105,7 @@ fn open_blob_inner_stream(
                     AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
                     Cause::Wire(WireCause::MalformedResponse {
                         protocol: Protocol::Graph,
-                        detail: Some(DiagnosticText::support_only(error.to_string())),
+                        detail: Some(DiagnosticText::support_only(error)),
                     }),
                 )
                 .operation(AccountOperation::OpenBlob)
@@ -153,7 +153,7 @@ fn open_blob_inner_stream(
             }
             Err(BlobFetchError::Failed(error)) => {
                 let ctx = GraphErrorContext::graph(op).with_scope(ErrorScope::Account);
-                yield SyncEvent::Terminated(into_account_error(error, ctx));
+                yield SyncEvent::Terminated(into_account_error(*error, ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -205,7 +205,13 @@ async fn fetch_blob_stream(
         account.client.api_base()
     );
     let account_net = account.client.account_net().ok_or_else(|| {
-        BlobFetchError::Failed("Graph client is not attached to an account".to_string())
+        BlobFetchError::Failed(Box::new(crate::error::GraphError::Net(
+            bifrost_net::Error::Network {
+                message: "Graph client is not attached to an account".to_string(),
+                transmission_state: bifrost_types::TransmissionState::Unsent,
+                source: None,
+            },
+        )))
     })?;
     account_net
         .download_stream(&url, range)
@@ -215,7 +221,7 @@ async fn fetch_blob_stream(
 
 enum BlobFetchError {
     MethodNotAllowed,
-    Failed(crate::error::GraphError),
+    Failed(Box<crate::error::GraphError>),
 }
 
 impl From<bifrost_net::Error> for BlobFetchError {
@@ -227,15 +233,14 @@ impl From<bifrost_net::Error> for BlobFetchError {
                 Self::MethodNotAllowed
             }
             // All other net errors flow through the typed GraphError boundary.
-            other => Self::Failed(crate::error::GraphError::Net(other)),
+            other => Self::Failed(Box::new(crate::error::GraphError::Net(other))),
         }
     }
 }
 
 fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, String> {
-    serde_json::from_str(&handle.id.0).map_err(|error| {
-        format!("Graph blob handle is not an account blob locator: {error}")
-    })
+    serde_json::from_str(&handle.id.0)
+        .map_err(|error| format!("Graph blob handle is not an account blob locator: {error}"))
 }
 
 #[cfg(test)]

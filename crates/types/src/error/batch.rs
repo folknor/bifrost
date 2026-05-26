@@ -39,19 +39,19 @@ impl<T> Default for BatchOutcome<T> {
 impl<T> BatchOutcome<T> {
     pub fn push_succeeded(&mut self, item: BatchItemId, output: T) {
         let index = self.succeeded.len();
-        self.succeeded.push(BatchSuccess { item, output });
+        self.succeeded.push(BatchSuccess::new(item, output));
         self.order.push(BatchLane::Succeeded(index));
     }
 
     pub fn push_failed(&mut self, item: BatchItemId, error: AccountError) {
         let index = self.failed.len();
-        self.failed.push(BatchFailure { item, error });
+        self.failed.push(BatchFailure::new(item, error));
         self.order.push(BatchLane::Failed(index));
     }
 
     pub fn push_uncertain(&mut self, item: BatchItemId, error: AccountError) {
         let index = self.uncertain.len();
-        self.uncertain.push(BatchUncertain { item, error });
+        self.uncertain.push(BatchUncertain::new(item, error));
         self.order.push(BatchLane::Uncertain(index));
     }
 
@@ -97,6 +97,13 @@ pub struct BatchSuccess<T> {
     pub output: T,
 }
 
+impl<T> BatchSuccess<T> {
+    #[must_use]
+    pub fn new(item: BatchItemId, output: T) -> Self {
+        Self { item, output }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct BatchFailure {
@@ -104,11 +111,25 @@ pub struct BatchFailure {
     pub error: AccountError,
 }
 
+impl BatchFailure {
+    #[must_use]
+    pub fn new(item: BatchItemId, error: AccountError) -> Self {
+        Self { item, error }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct BatchUncertain {
     pub item: BatchItemId,
     pub error: AccountError,
+}
+
+impl BatchUncertain {
+    #[must_use]
+    pub fn new(item: BatchItemId, error: AccountError) -> Self {
+        Self { item, error }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -121,9 +142,7 @@ pub struct BatchItemId(pub String);
 /// crosses the side-effect boundary so empty/duplicate identifiers
 /// surface as `Err(AccountError { kind: Request(BatchInputInvalid),
 /// .. })` rather than silently splitting the caller's intent.
-pub fn validate_batch_input<I>(
-    items: &[BatchItem<I>],
-) -> Result<(), Vec<BatchInputInvalidItem>> {
+pub fn validate_batch_input<I>(items: &[BatchItem<I>]) -> Result<(), Vec<BatchInputInvalidItem>> {
     if items.is_empty() {
         return Err(vec![BatchInputInvalidItem {
             id: BatchItemId(String::new()),

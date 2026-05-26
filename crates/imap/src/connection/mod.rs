@@ -430,8 +430,10 @@ impl std::fmt::Debug for ImapConnection {
 
 /// Build the default native-tls connector.
 fn build_default_tls_connector() -> Result<native_tls::TlsConnector, Error> {
-    native_tls::TlsConnector::new()
-        .map_err(|e| Error::Io { source: Arc::new(std::io::Error::other(e)), attempt: None })
+    native_tls::TlsConnector::new().map_err(|e| Error::Io {
+        source: Arc::new(std::io::Error::other(e)),
+        attempt: None,
+    })
 }
 
 fn validate_tls_server_name(host: &str) -> Result<(), Error> {

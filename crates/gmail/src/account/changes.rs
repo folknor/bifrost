@@ -193,20 +193,20 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
     for item in history {
         for added in &item.messages_added {
             let object_id = ObjectId(added.message.id.clone());
-            changes.push(Change::Object(ObjectChange {
+            changes.push(Change::ObjectChange(ObjectChange {
                 id: object_id.clone(),
                 kind: ObjectChangeKind::Created,
             }));
             for label in label_ids(&added.message) {
-                changes.push(Change::Scope(ScopeChange {
-                    scope: MembershipScope::Label(LabelId(label.clone())),
+                changes.push(Change::ScopeChange(ScopeChange {
                     id: object_id.clone(),
+                    membership: MembershipScope::Label(LabelId(label.clone())),
                     kind: ScopeChangeKind::Added,
                 }));
             }
         }
         for deleted in &item.messages_deleted {
-            changes.push(Change::Object(ObjectChange {
+            changes.push(Change::ObjectChange(ObjectChange {
                 id: ObjectId(deleted.message.id.clone()),
                 kind: ObjectChangeKind::Destroyed,
             }));
@@ -214,9 +214,9 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
         for labels_added in &item.labels_added {
             let object_id = ObjectId(labels_added.message.id.clone());
             for label in &labels_added.label_ids {
-                changes.push(Change::Scope(ScopeChange {
-                    scope: MembershipScope::Label(LabelId(label.clone())),
+                changes.push(Change::ScopeChange(ScopeChange {
                     id: object_id.clone(),
+                    membership: MembershipScope::Label(LabelId(label.clone())),
                     kind: ScopeChangeKind::Added,
                 }));
             }
@@ -224,9 +224,9 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
         for labels_removed in &item.labels_removed {
             let object_id = ObjectId(labels_removed.message.id.clone());
             for label in &labels_removed.label_ids {
-                changes.push(Change::Scope(ScopeChange {
-                    scope: MembershipScope::Label(LabelId(label.clone())),
+                changes.push(Change::ScopeChange(ScopeChange {
                     id: object_id.clone(),
+                    membership: MembershipScope::Label(LabelId(label.clone())),
                     kind: ScopeChangeKind::Removed,
                 }));
             }

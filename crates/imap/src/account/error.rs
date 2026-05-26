@@ -17,11 +17,11 @@
 
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
-    AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
-    ErrorScope, ImapResponseCode, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
-    StrategyDowngrade, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
+    ImapResponseCode, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
+    SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
+    TransportKind, WireCause,
 };
 
 use crate::Error;
@@ -268,15 +268,13 @@ impl Translation {
 
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
-        Error::Io { source, .. } => {
-            Translation::new(
-                AccountErrorKind::Transport(TransportErrorKind::Network),
-                Cause::Transport(TransportCause::new(
-                    TransportKind::Network,
-                    Some(DiagnosticText::support_only(source.to_string())),
-                )),
-            )
-        }
+        Error::Io { source, .. } => Translation::new(
+            AccountErrorKind::Transport(TransportErrorKind::Network),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Network,
+                Some(DiagnosticText::support_only(source.to_string())),
+            )),
+        ),
         Error::Timeout { .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Timeout),
             Cause::Transport(TransportCause::new(TransportKind::Timeout, None)),
@@ -660,7 +658,9 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText::support_only("server returned [COMPRESSIONACTIVE]")),
+                detail: Some(DiagnosticText::support_only(
+                    "server returned [COMPRESSIONACTIVE]",
+                )),
             }),
         ),
         ResponseCode::UseAttr => {
@@ -732,7 +732,9 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Imap(ImapResponseCode::Unknown {
                 code: name.clone(),
-                value: value.as_ref().map(|v| DiagnosticText::support_only(v.clone())),
+                value: value
+                    .as_ref()
+                    .map(|v| DiagnosticText::support_only(v.clone())),
             })),
         ),
 
@@ -827,7 +829,9 @@ fn imap_response_code(code: &ResponseCode) -> ImapResponseCode {
         ResponseCode::MetadataNoPrivate => ImapResponseCode::MetadataNoPrivate,
         ResponseCode::Other { name, value } => ImapResponseCode::Unknown {
             code: name.clone(),
-            value: value.as_ref().map(|v| DiagnosticText::support_only(v.clone())),
+            value: value
+                .as_ref()
+                .map(|v| DiagnosticText::support_only(v.clone())),
         },
     }
 }

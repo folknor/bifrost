@@ -289,7 +289,7 @@ fn classify(
             // error; we keep the HTTP status to disambiguate.
             return (
                 AccountErrorKind::Server(ServerErrorKind::Error { status: Some(410) }),
-                Cause::Server(ServerCause::Error { status: 410 }),
+                Cause::Server(ServerCause::Error { status: Some(410) }),
                 false,
             );
         }
@@ -314,6 +314,7 @@ fn classify(
             );
         }
         GraphSignal::Unknown { .. } => {}
+        _ => {}
     }
 
     // 2) Status-only fallback when the GraphSignal carries no
@@ -391,7 +392,7 @@ fn classify_by_status(
 fn server_error_tuple(code: u16) -> (AccountErrorKind, Cause, bool) {
     (
         AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
-        Cause::Server(ServerCause::Error { status: code }),
+        Cause::Server(ServerCause::Error { status: Some(code) }),
         false,
     )
 }
@@ -443,7 +444,7 @@ fn response_diagnostics(
     body: &bytes::Bytes,
     inner: Option<&GraphInnerError>,
 ) -> AccountErrorBuilder {
-    builder = builder.status(status.as_u16());
+    builder = builder.status(Some(status.as_u16()));
 
     // Prefer header request-id; fall back to innerError.request-id
     // when the headers do not carry one.
@@ -529,6 +530,7 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
             | ErrorScope::CalendarCollection
             | ErrorScope::ContactCollection,
         )
+        | Some(_)
         | None => None,
     }
 }
@@ -548,6 +550,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
             | ErrorScope::CalendarCollection
             | ErrorScope::ContactCollection,
         )
+        | Some(_)
         | None => None,
     }
 }
@@ -585,15 +588,15 @@ pub(crate) fn cursor_error_to_account_error(
 ) -> AccountError {
     use crate::account::cursor::CursorError;
     match error {
-        CursorError::ProtocolMismatch | CursorError::EnvelopeUnknown | CursorError::SchemaIncompatible => {
-            base_builder(
-                &ctx,
-                AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
-                Cause::State(StateCause::SchemaIncompatible),
-            )
-            .text(DiagnosticText::support_only(error.to_string()))
-            .build()
-        }
+        CursorError::ProtocolMismatch
+        | CursorError::EnvelopeUnknown
+        | CursorError::SchemaIncompatible => base_builder(
+            &ctx,
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+            Cause::State(StateCause::SchemaIncompatible),
+        )
+        .text(DiagnosticText::support_only(error.to_string()))
+        .build(),
         CursorError::Unsupported => base_builder(
             &ctx,
             AccountErrorKind::Unsupported(ctx.operation),
@@ -632,16 +635,10 @@ pub(crate) fn mutation_item_outcome(
     use bifrost_types::{BatchFailure, BatchSuccess, ItemOutcome, MutationSuccess};
 
     if (200..300).contains(&status) {
-        return ItemOutcome::Succeeded(BatchSuccess {
-            item: item_id,
-            output: MutationSuccess::Applied,
-        });
+        return ItemOutcome::Succeeded(BatchSuccess::new(item_id, MutationSuccess::Applied));
     }
     if status == 404 && destroy {
-        return ItemOutcome::Succeeded(BatchSuccess {
-            item: item_id,
-            output: MutationSuccess::Skipped,
-        });
+        return ItemOutcome::Succeeded(BatchSuccess::new(item_id, MutationSuccess::Skipped));
     }
     let response = GraphResponseError::from_response(
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -650,10 +647,7 @@ pub(crate) fn mutation_item_outcome(
     );
     let ctx = GraphErrorContext::graph(operation).with_scope(scope);
     let error = response_to_account_error(response, &ctx);
-    ItemOutcome::Failed(BatchFailure {
-        item: item_id,
-        error,
-    })
+    ItemOutcome::Failed(BatchFailure::new(item_id, error))
 }
 
 #[cfg(test)]

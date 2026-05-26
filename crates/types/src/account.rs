@@ -169,8 +169,10 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<SubscriptionHandle, AccountError>>;
 
     /// Server-side push subscription CRUD: destroy.
-    fn push_unsubscribe(&self, handle: SubscriptionHandle)
-    -> AccountFuture<Result<(), AccountError>>;
+    fn push_unsubscribe(
+        &self,
+        handle: SubscriptionHandle,
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Event stream from the protocol crate to the engine. Contents
     /// depend on `push_in_process`:
@@ -352,10 +354,8 @@ pub trait Account: Send + Sync {
     /// Thread-shaped search. Returns a page of `ThreadId`. Each
     /// call's page cursor is opaque; pass the previous page's
     /// `next_cursor` back to fetch the next page.
-    fn search(
-        &self,
-        request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>>;
+    fn search(&self, request: SearchRequest)
+    -> AccountFuture<Result<Page<ThreadId>, AccountError>>;
 
     /// Message-shaped search using the same request AST.
     fn search_messages(
@@ -486,9 +486,7 @@ pub trait Account: Send + Sync {
         _target: ContainerId,
         _source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported_error(AccountOperation::BulkMove))
-        })
+        Box::pin(async { Err(unsupported_error(AccountOperation::BulkMove)) })
     }
 
     /// Apply a label to `target`. Dispatches by `label.provenance`
@@ -648,10 +646,7 @@ pub trait AccountFactory: Send + Sync + 'static {
     /// it as the registration key. On reopen the engine calls
     /// `open` with the same id so attached resources can be
     /// re-registered against the same key.
-    fn open(
-        &self,
-        account_id: AccountId,
-    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>>;
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>>;
 }
 
 /// Shared dispatch for `apply_label` / `remove_label`.

@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, BlobId, Cause, ChangeCursor, CursorScope,
-    DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind,
-    RequestCause, RequestErrorKind, SyncStateErrorKind, ThreadId,
+    DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind, RequestCause,
+    RequestErrorKind, SyncStateErrorKind, ThreadId,
 };
 
 use crate::types::MailboxName;
@@ -65,7 +65,9 @@ pub(crate) fn encode_cursor(scope: CursorScope, cursor: &FolderCursor) -> Change
 
 pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<FolderCursor, AccountError> {
     if cursor.server_state.protocol != ProtocolKind::Imap {
-        return Err(schema_incompatible("cursor protocol mismatch: expected IMAP"));
+        return Err(schema_incompatible(
+            "cursor protocol mismatch: expected IMAP",
+        ));
     }
     if cursor.server_state.envelope_version != ENVELOPE_VERSION {
         return Err(schema_incompatible(&format!(
@@ -395,8 +397,7 @@ fn decode_len_prefixed(prefix: &str, value: &str) -> Result<(MailboxName, String
         .get(len..)
         .and_then(|v| v.strip_prefix(':'))
         .ok_or_else(|| malformed("invalid IMAP id separator"))?;
-    let folder =
-        MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string()))?;
+    let folder = MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string()))?;
     Ok((folder, after.to_owned()))
 }
 
@@ -436,7 +437,6 @@ fn schema_incompatible(detail: &str) -> AccountError {
     .text(DiagnosticText::support_only(detail.to_owned()))
     .build()
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -10,9 +10,9 @@ use std::{
 use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
 
 use super::PoolConfig;
-use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
 #[cfg(feature = "tokio")]
 use super::Tls;
+use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
 use super::pool::async_impl::Pool;
 use super::{
     AsyncSmtpConnection, ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions,
@@ -402,8 +402,10 @@ where
             return Err(batch_input_invalid_error(Protocol::Smtp, invalid));
         }
 
-        let batch_recipients: Vec<SmtpBatchRecipient> =
-            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+        let batch_recipients: Vec<SmtpBatchRecipient> = recipients
+            .into_iter()
+            .map(SmtpBatchRecipient::from)
+            .collect();
 
         let mut conn = self
             .inner
@@ -411,7 +413,10 @@ where
             .await
             .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
-        match conn.send_smtp_batch(from, batch_recipients, email, options).await {
+        match conn
+            .send_smtp_batch(from, batch_recipients, email, options)
+            .await
+        {
             Ok(progress) => Ok(progress.resolve()),
             Err((e, _progress)) => Err(batch_level_error(e, ctx)),
         }
@@ -578,8 +583,10 @@ where
             return Err(batch_input_invalid_error(Protocol::Lmtp, invalid));
         }
 
-        let batch_recipients: Vec<SmtpBatchRecipient> =
-            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+        let batch_recipients: Vec<SmtpBatchRecipient> = recipients
+            .into_iter()
+            .map(SmtpBatchRecipient::from)
+            .collect();
 
         let mut conn = self
             .inner
@@ -587,7 +594,10 @@ where
             .await
             .map_err(|e| batch_level_error(e, ctx.clone()))?;
 
-        match conn.send_lmtp_batch(from, batch_recipients, email, options).await {
+        match conn
+            .send_lmtp_batch(from, batch_recipients, email, options)
+            .await
+        {
             Ok(progress) => Ok(progress.resolve()),
             Err((e, _progress)) => Err(batch_level_error(e, ctx)),
         }

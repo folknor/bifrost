@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::GraphError;
+
 use super::client::GraphClient;
 
 const DEFAULT_EXPIRATION_MINUTES: u32 = 1440;
@@ -49,7 +51,10 @@ pub(crate) async fn create_subscription(
         client_state: Some(generate_client_state()?),
     };
 
-    let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
+    let response: SubscriptionResponse = client
+        .post("/subscriptions", &body)
+        .await
+        .map_err(graph_error_text)?;
     tracing::info!(
         "[Graph webhooks] Created subscription {} for resource '{}' (expires {})",
         response.id,
@@ -74,7 +79,8 @@ pub(crate) async fn renew_subscription(
 
     client
         .patch(&format!("/subscriptions/{subscription_id}"), &body)
-        .await?;
+        .await
+        .map_err(graph_error_text)?;
     tracing::info!(
         "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {new_expiry})"
     );
@@ -88,9 +94,9 @@ pub(crate) async fn delete_subscription(
     let server_result = client
         .delete(&format!("/subscriptions/{subscription_id}"))
         .await;
-    if let Err(ref error) = server_result {
-        if !error.contains("404") {
-            return Err(error.clone());
+    if let Err(error) = server_result {
+        if !is_not_found(&error) {
+            return Err(graph_error_text(error));
         }
         tracing::info!(
             "[Graph webhooks] Subscription {subscription_id} already gone on server (404)"
@@ -105,6 +111,17 @@ fn generate_client_state() -> Result<String, String> {
     let mut buf = [0u8; CLIENT_STATE_BYTES];
     getrandom::fill(&mut buf).map_err(|e| format!("RNG failed: {e}"))?;
     Ok(hex_encode(&buf))
+}
+
+fn graph_error_text(error: GraphError) -> String {
+    format!("{error:?}")
+}
+
+fn is_not_found(error: &GraphError) -> bool {
+    matches!(
+        error,
+        GraphError::Response(response) if response.status == reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

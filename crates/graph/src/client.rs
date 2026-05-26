@@ -198,10 +198,7 @@ impl GraphClient {
         self.inner.mailbox_id.as_deref()
     }
 
-    pub(crate) async fn get_json<T: DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, GraphError> {
+    pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, GraphError> {
         let url = self.api_url(path);
         self.request::<T, ()>(&url, "GET", None).await
     }
@@ -228,11 +225,7 @@ impl GraphClient {
         check_response_status(response)
     }
 
-    pub(crate) async fn patch<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<(), GraphError> {
+    pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "PATCH", Some(body)).await?;
         check_response_status(response)
@@ -271,22 +264,17 @@ impl GraphClient {
         method: &str,
         body: Option<&B>,
     ) -> Result<Response, GraphError> {
-        let _permit = self
-            .inner
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| {
-                GraphError::Net(bifrost_net::Error::Network {
-                    message: "Graph request semaphore closed".to_string(),
-                    transmission_state: bifrost_net::TransmissionState::Unsent,
-                    source: None,
-                })
-            })?;
+        let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
+            GraphError::Net(bifrost_net::Error::Network {
+                message: "Graph request semaphore closed".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            })
+        })?;
         let account_net = self.account_net().ok_or_else(|| {
             GraphError::Net(bifrost_net::Error::Network {
                 message: "Graph client is not attached to an account".to_string(),
-                transmission_state: bifrost_net::TransmissionState::Unsent,
+                transmission_state: TransmissionState::Unsent,
                 source: None,
             })
         })?;
@@ -299,7 +287,7 @@ impl GraphClient {
             _ => {
                 return Err(GraphError::Net(bifrost_net::Error::Network {
                     message: format!("Unsupported HTTP method: {method}"),
-                    transmission_state: bifrost_net::TransmissionState::Unsent,
+                    transmission_state: TransmissionState::Unsent,
                     source: None,
                 }));
             }

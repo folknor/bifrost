@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Checkpoint, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
-    InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion,
-    SyncEvent, ThreadId,
+    AccountOperation, AccountStream, Batch, Checkpoint, CursorScope, Fingerprint, HydratedObject,
+    HydratedObjectKind, InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary,
+    Projection, ServerVersion, SyncEvent, ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -239,7 +239,10 @@ async fn list_messages_page(
 async fn inventory_checkpoint(client: &GmailClient) -> crate::Result<Option<Checkpoint>> {
     let profile = client.get_profile().await?;
     let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-        crate::Error::MalformedPayload(format!("gmail profile carried invalid history id: {error}"))
+        crate::Error::invalid_request(
+            AccountOperation::SyncInventory,
+            format!("gmail profile carried invalid history id: {error}"),
+        )
     })?;
     Ok(Some(Checkpoint::Change(cursor_for_history(
         history_id,
@@ -300,7 +303,7 @@ async fn hydrate_one(
 
 fn raw_bytes(message: &GmailMessage) -> crate::Result<Bytes> {
     let raw = message.raw.as_deref().ok_or_else(|| {
-        crate::Error::MalformedPayload("gmail raw projection did not include raw bytes".to_string())
+        crate::Error::missing_field("raw", "gmail raw projection did not include raw bytes")
     })?;
     let bytes = decode_base64url_nopad(raw)?;
     Ok(Bytes::from(bytes))
@@ -361,4 +364,3 @@ fn headers(message: &GmailMessage) -> &[GmailHeader] {
 fn non_negative_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
-

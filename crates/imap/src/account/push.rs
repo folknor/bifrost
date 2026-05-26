@@ -3,8 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountFuture, AccountStream, CursorScope, Error as AccountError, HintPayload,
-    InvalidationHint, PushSource, SubscriptionHandle, WatchEvent,
+    AccountError, AccountFuture, AccountStream, CursorScope, HintPayload, InvalidationHint,
+    PushSource, SubscriptionHandle, WatchEvent,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;

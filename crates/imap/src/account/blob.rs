@@ -7,8 +7,8 @@ use bytes::Bytes;
 use crate::types::FetchAttr;
 
 use super::{
-    ImapAccount, batch, boxed_receiver_stream, decode_blob_id, fatal_event, uid_set_from_u32,
-    terminated_event,
+    ImapAccount, batch, boxed_receiver_stream, decode_blob_id, fatal_event, terminated_event,
+    uid_set_from_u32,
 };
 
 pub(crate) fn open_blob(

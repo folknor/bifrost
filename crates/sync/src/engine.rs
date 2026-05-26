@@ -924,7 +924,7 @@ impl SyncEngine {
             // No more attempts. Anything still in `retry_ids` becomes
             // a pending read-back candidate so the guard can decide
             // applied vs failed_terminal.
-            for id in retry_set.iter() {
+            for id in &retry_set {
                 readback_ids.push(id.clone());
                 outcomes.insert(id.clone(), MutationBucket::PendingRetry);
             }
@@ -1595,17 +1595,11 @@ async fn handle_engine_directive(
             broadcast_warning(
                 changes_tx,
                 Some(directive_scope.clone()),
-                bifrost_types::Warning {
-                    kind: bifrost_types::WarningKind::Other,
-                    message: DiagnosticText::user_safe(format!(
-                        "scope capability downgraded: {directive_scope:?}"
-                    )),
-                    next_action: None,
-                    protocol_detail: Some(DiagnosticText::support_only(format!(
-                        "{directive_scope:?}"
-                    ))),
-                    retry_count: 0,
-                },
+                bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::Other,
+                    format!("scope capability downgraded: {directive_scope:?}"),
+                )
+                .with_protocol_detail(DiagnosticText::support_only(format!("{directive_scope:?}"))),
             );
             restart_scope(
                 current,
@@ -1630,13 +1624,11 @@ async fn handle_engine_directive(
             broadcast_warning(
                 changes_tx,
                 fallback_scope.clone(),
-                bifrost_types::Warning {
-                    kind: bifrost_types::WarningKind::Other,
-                    message: DiagnosticText::user_safe("account capabilities changed"),
-                    next_action: None,
-                    protocol_detail: Some(DiagnosticText::support_only(format!("{delta:?}"))),
-                    retry_count: 0,
-                },
+                bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::Other,
+                    "account capabilities changed",
+                )
+                .with_protocol_detail(DiagnosticText::support_only(format!("{delta:?}"))),
             );
         }
         EngineDirective::DowngradeStrategy(downgrade) => {
@@ -1649,15 +1641,11 @@ async fn handle_engine_directive(
             broadcast_warning(
                 changes_tx,
                 fallback_scope.clone(),
-                bifrost_types::Warning {
-                    kind: bifrost_types::WarningKind::StrategyDowngraded,
-                    message: DiagnosticText::user_safe(format!(
-                        "downgraded sync strategy: {downgrade:?}"
-                    )),
-                    next_action: None,
-                    protocol_detail: Some(DiagnosticText::support_only(format!("{downgrade:?}"))),
-                    retry_count: 0,
-                },
+                bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::StrategyDowngraded,
+                    format!("downgraded sync strategy: {downgrade:?}"),
+                )
+                .with_protocol_detail(DiagnosticText::support_only(format!("{downgrade:?}"))),
             );
             restart_account(factory, current, account_id, control).await;
             // If the originating error was scoped to a cursor, also
@@ -1725,13 +1713,19 @@ async fn handle_engine_directive(
             broadcast_warning(
                 changes_tx,
                 fallback_scope.clone(),
-                bifrost_types::Warning {
-                    kind: bifrost_types::WarningKind::OperatorAttentionNeeded,
-                    message: DiagnosticText::user_safe(reason.clone()),
-                    next_action: None,
-                    protocol_detail: Some(DiagnosticText::support_only(reason)),
-                    retry_count: 0,
-                },
+                bifrost_types::Warning::user_safe(
+                    bifrost_types::WarningKind::OperatorAttentionNeeded,
+                    reason.clone(),
+                )
+                .with_protocol_detail(DiagnosticText::support_only(reason)),
+            );
+        }
+        _ => {
+            tracing::warn!(
+                target: "bifrost.sync.changes",
+                account = ?account_id,
+                directive = ?directive,
+                "unknown engine directive; no automated action"
             );
         }
     }
@@ -1932,6 +1926,7 @@ fn classify_item_outcome(
             let bucket = match success.output {
                 MutationSuccess::Applied => MutationBucket::Applied,
                 MutationSuccess::Skipped => MutationBucket::Skipped,
+                _ => MutationBucket::Applied,
             };
             outcomes.insert(id, bucket);
         }
@@ -1947,6 +1942,10 @@ fn classify_item_outcome(
                     | bifrost_types::RetryDisposition::AfterAuthRefresh => {
                         retry_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingRetry);
+                    }
+                    _ => {
+                        readback_ids.push(id.clone());
+                        outcomes.insert(id, MutationBucket::PendingReadback);
                     }
                 },
                 RecoveryClass::Reconcile(_) => {

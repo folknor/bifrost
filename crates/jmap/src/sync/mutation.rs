@@ -162,10 +162,10 @@ async fn apply_batch(
             }
         };
         let outcome: ItemOutcome<MutationSuccess> = match raw {
-            Ok(()) => ItemOutcome::Succeeded(BatchSuccess {
-                item: BatchItemId(id.0.clone()),
-                output: MutationSuccess::Applied,
-            }),
+            Ok(()) => ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId(id.0.clone()),
+                MutationSuccess::Applied,
+            )),
             Err(crate::Error::Set(set_error)) => {
                 let ctx = super::error::JmapErrorContext::new(operation);
                 let item_scope = Some(ErrorScope::Message { id: id.0.clone() });
@@ -176,14 +176,14 @@ async fn apply_batch(
                     item_scope,
                 )
             }
-            Err(err) => ItemOutcome::Failed(BatchFailure {
-                item: BatchItemId(id.0.clone()),
-                error: super::error::into_account_error(
+            Err(err) => ItemOutcome::Failed(BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                super::error::into_account_error(
                     err,
                     super::error::JmapErrorContext::new(operation)
                         .with_scope(ErrorScope::Message { id: id.0.clone() }),
                 ),
-            }),
+            )),
         };
         results.push(outcome);
     }

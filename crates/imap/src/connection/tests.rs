@@ -200,7 +200,10 @@ async fn invariant_driver_panic_subsequent_commands_fail() {
     );
     let inner = result.unwrap();
     assert!(
-        matches!(inner, Err(Error::DriverPanicked { .. } | Error::DriverGone { .. })),
+        matches!(
+            inner,
+            Err(Error::DriverPanicked { .. } | Error::DriverGone { .. })
+        ),
         "post-panic command should be DriverPanicked or DriverGone, got: {inner:?}"
     );
 }

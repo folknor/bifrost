@@ -3,12 +3,12 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Address, AttachmentInline,
-    Cause, Container, ContainerId, ContainerKind, DiagnosticText, DraftHandle, DraftPatch,
-    FolderRole, HydrationProjection, Identity, IdentityId, LabelId, Message, MutationTarget,
-    ObjectId, Page, Protocol, ProtocolErrorKind, ProtocolKind, Provider, Provenance, RequestCause,
-    SearchFilter, SearchRequest, ServerCause, ServerErrorKind, StateCause, ThreadHydration,
-    ThreadId, VacationConfig, WireCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Address,
+    AttachmentInline, Cause, Container, ContainerId, ContainerKind, DiagnosticText, DraftHandle,
+    DraftPatch, FolderRole, HydrationProjection, Identity, IdentityId, LabelId, Message,
+    MutationTarget, ObjectId, Page, Protocol, ProtocolErrorKind, ProtocolKind, Provenance,
+    Provider, SearchFilter, SearchRequest, ServerCause, ServerErrorKind, StateCause,
+    ThreadHydration, ThreadId, VacationConfig, WireCause,
 };
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -223,17 +223,18 @@ pub(crate) async fn draft_update(
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftUpdate)))
 }
 
-pub(crate) async fn draft_discard(account: GraphAccount, draft: DraftHandle) -> Result<(), AccountError> {
+pub(crate) async fn draft_discard(
+    account: GraphAccount,
+    draft: DraftHandle,
+) -> Result<(), AccountError> {
     let path = format!(
         "{}/messages/{}",
         account.client.api_path_prefix(),
         bifrost_net::url::encode_component(&draft.0)
     );
-    account
-        .client
-        .delete(&path)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard)))
+    account.client.delete(&path).await.map_err(|e| {
+        into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
+    })
 }
 
 pub(crate) async fn draft_send(
@@ -282,7 +283,10 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Contain
         .list_mail_folders_recursive()
         .await
         .map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::DiscoverMemberships))
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::DiscoverMemberships),
+            )
         })?;
     account.folder_tree.write().await.replace_mail_folders(
         folders
@@ -318,7 +322,10 @@ pub(crate) async fn container_create(
         .post(&path, &json!({ "displayName": name }))
         .await
         .map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::ContainerCreate))
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::ContainerCreate),
+            )
         })?;
     Ok(ContainerId(folder.id))
 }
@@ -338,7 +345,10 @@ pub(crate) async fn container_rename(
         .patch(&path, &json!({ "displayName": name }))
         .await
         .map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::ContainerRename))
+            into_account_error(
+                e,
+                GraphErrorContext::graph(AccountOperation::ContainerRename),
+            )
         })
 }
 
@@ -372,21 +382,19 @@ pub(crate) async fn container_delete(
         account.client.api_path_prefix(),
         bifrost_net::url::encode_component(&container.0)
     );
-    account
-        .client
-        .delete(&path)
-        .await
-        .map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::ContainerDelete))
-        })
+    account.client.delete(&path).await.map_err(|e| {
+        into_account_error(
+            e,
+            GraphErrorContext::graph(AccountOperation::ContainerDelete),
+        )
+    })
 }
 
 pub(crate) async fn identities_list(account: GraphAccount) -> Result<Vec<Identity>, AccountError> {
-    let profile = account
-        .client
-        .get_profile()
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Discover)))?;
+    let profile =
+        account.client.get_profile().await.map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::Discover))
+        })?;
     let address = profile.mail.or(profile.user_principal_name);
     let Some(address) = address else {
         return Ok(Vec::new());
@@ -402,16 +410,16 @@ pub(crate) async fn identities_list(account: GraphAccount) -> Result<Vec<Identit
     }])
 }
 
-pub(crate) async fn vacation_get(account: GraphAccount) -> Result<Option<VacationConfig>, AccountError> {
+pub(crate) async fn vacation_get(
+    account: GraphAccount,
+) -> Result<Option<VacationConfig>, AccountError> {
     let path = format!(
         "{}/mailboxSettings?$select=automaticRepliesSetting",
         account.client.api_path_prefix()
     );
-    let settings: MailboxSettings = account
-        .client
-        .get_json(&path)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationGet)))?;
+    let settings: MailboxSettings = account.client.get_json(&path).await.map_err(|e| {
+        into_account_error(e, GraphErrorContext::graph(AccountOperation::VacationGet))
+    })?;
     Ok(settings.automatic_replies_setting.map(vacation_from_graph))
 }
 
@@ -545,11 +553,10 @@ async fn fetch_message_value(
         bifrost_net::url::encode_component(&id.0),
         select_query(select)
     );
-    let value = account
-        .client
-        .get_json(&path)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate)))?;
+    let value =
+        account.client.get_json(&path).await.map_err(|e| {
+            into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate))
+        })?;
     cache_etag(account, &value).await?;
     Ok(value)
 }
@@ -589,7 +596,10 @@ async fn fetch_paged_values(
     Ok(values)
 }
 
-async fn patch_messages(account: &GraphAccount, patches: Vec<MessagePatch>) -> Result<(), AccountError> {
+async fn patch_messages(
+    account: &GraphAccount,
+    patches: Vec<MessagePatch>,
+) -> Result<(), AccountError> {
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
     for (index, patch) in patches.iter().enumerate() {
@@ -693,34 +703,32 @@ async fn submit_write_batch(
             200..=299 => {}
             404 if destroy => {}
             412 => {
-                return Err(
-                    AccountErrorBuilder::new(
-                        AccountErrorKind::ConcurrencyConflict,
-                        Cause::State(StateCause::ConcurrencyConflict),
-                    )
-                    .operation(ctx.operation)
-                    .provider(Provider::Microsoft)
-                    .protocol(Protocol::Graph)
-                    .build(),
-                );
+                return Err(AccountErrorBuilder::new(
+                    AccountErrorKind::ConcurrencyConflict,
+                    Cause::State(StateCause::ConcurrencyConflict),
+                )
+                .operation(ctx.operation)
+                .provider(Provider::Microsoft)
+                .protocol(Protocol::Graph)
+                .build());
             }
             status => {
-                return Err(
-                    AccountErrorBuilder::new(
-                        AccountErrorKind::Server(ServerErrorKind::Error {
-                            status: Some(status),
-                        }),
-                        Cause::Server(ServerCause::Error { status }),
-                    )
-                    .text(DiagnosticText::support_only(format!(
-                        "Graph write batch item {} failed with HTTP {status}",
-                        item.id
-                    )))
-                    .operation(ctx.operation)
-                    .provider(Provider::Microsoft)
-                    .protocol(Protocol::Graph)
-                    .build(),
-                );
+                return Err(AccountErrorBuilder::new(
+                    AccountErrorKind::Server(ServerErrorKind::Error {
+                        status: Some(status),
+                    }),
+                    Cause::Server(ServerCause::Error {
+                        status: Some(status),
+                    }),
+                )
+                .text(DiagnosticText::support_only(format!(
+                    "Graph write batch item {} failed with HTTP {status}",
+                    item.id
+                )))
+                .operation(ctx.operation)
+                .provider(Provider::Microsoft)
+                .protocol(Protocol::Graph)
+                .build());
             }
         }
     }
@@ -809,7 +817,10 @@ fn message_from_send_request(request: &bifrost_types::SendRequest) -> Result<Val
     message_from_draft_patch(&patch, true)
 }
 
-fn message_from_draft_patch(patch: &DraftPatch, include_empty: bool) -> Result<Value, AccountError> {
+fn message_from_draft_patch(
+    patch: &DraftPatch,
+    include_empty: bool,
+) -> Result<Value, AccountError> {
     if patch
         .attachments_uploaded
         .as_ref()
@@ -934,11 +945,9 @@ async fn create_draft_message(
     message: Value,
 ) -> Result<DraftHandle, AccountError> {
     let path = format!("{}/messages", account.client.api_path_prefix());
-    let created: Value = account
-        .client
-        .post(&path, &message)
-        .await
-        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate)))?;
+    let created: Value = account.client.post(&path, &message).await.map_err(|e| {
+        into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
+    })?;
     let id = created
         .get("id")
         .and_then(Value::as_str)
@@ -946,7 +955,10 @@ async fn create_draft_message(
     Ok(DraftHandle(id.to_string()))
 }
 
-async fn send_draft_message(account: &GraphAccount, draft: &DraftHandle) -> Result<(), AccountError> {
+async fn send_draft_message(
+    account: &GraphAccount,
+    draft: &DraftHandle,
+) -> Result<(), AccountError> {
     let path = format!(
         "{}/messages/{}/send",
         account.client.api_path_prefix(),
@@ -1114,7 +1126,10 @@ fn expand_blobs(projection: HydrationProjection) -> bool {
     matches!(projection, HydrationProjection::FullWithBlobs)
 }
 
-fn message_from_value(value: &Value, projection: HydrationProjection) -> Result<Message, AccountError> {
+fn message_from_value(
+    value: &Value,
+    projection: HydrationProjection,
+) -> Result<Message, AccountError> {
     let id = object_id_from_value(value)?;
     let body = value.get("body");
     let (mut body_text, mut body_html) = match body {

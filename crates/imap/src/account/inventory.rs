@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    AccountFuture, AccountStream, Checkpoint, CursorEstablishment, CursorScope,
-    Error as AccountError, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
+    AccountError, AccountFuture, AccountStream, Checkpoint, CursorEstablishment, CursorScope,
+    DiagnosticText, Fingerprint, InventoryEntry, PageBoundary, ServerVersion, SyncEvent,
     SyncStrategy, ThreadId, Warning, WarningKind,
 };
 
@@ -49,16 +49,15 @@ async fn run_inventory(
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
 ) -> Result<(), crate::Error> {
     if let Some(reason) = account.take_qresync_negotiation_warning() {
-        tx.send(SyncEvent::Warning(Warning {
-            kind: WarningKind::StrategyDowngraded {
-                from: SyncStrategy::QResync,
-                to: SyncStrategy::Condstore,
-            },
-            message: reason,
-            retry_count: 0,
-            next_action: None,
-            protocol_detail: Some("imap".to_string()),
-        }))
+        tx.send(SyncEvent::Warning(
+            Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
+                DiagnosticText::support_only(format!(
+                    "{:?}->{:?}",
+                    SyncStrategy::QResync,
+                    SyncStrategy::Condstore
+                )),
+            ),
+        ))
         .await
         .map_err(|_| crate::Error::closed())?;
     }

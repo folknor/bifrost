@@ -23,7 +23,7 @@ impl Clone for Error {
             .inner
             .source
             .as_ref()
-            .map(|e| Box::new(StringError(e.to_string())) as BoxError);
+            .map(|e| -> BoxError { Box::new(StringError(e.to_string())) });
         Self {
             inner: Box::new(Inner {
                 kind: self.inner.kind.clone(),
@@ -62,8 +62,8 @@ pub(crate) struct SmtpAttempt {
 
 /// Coarse command phase at the point an SMTP transport error was constructed.
 ///
-/// Used by the shared-error mapper to refine kind/cause selection (notably AUTH
-/// vs send-side effects) without leaking the public transport ErrorKind enum.
+/// Used by the shared-error mapper to refine kind/cause selection (notably `AUTH`
+/// vs send-side effects) without leaking the public transport `ErrorKind` enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SmtpCommandPhase {
     Connect,
@@ -139,7 +139,10 @@ impl Error {
     /// already redact credentials before they reach here; this just exposes the
     /// boxed source or the kind discriminant for support text.
     pub(crate) fn diagnostic_text(&self) -> Option<String> {
-        self.inner.source.as_ref().map(|src| src.to_string())
+        self.inner
+            .source
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 
     /// Returns the classification for this SMTP error.

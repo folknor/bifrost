@@ -8,8 +8,7 @@
 use std::sync::Arc;
 
 use bifrost_types::{
-    Account, AccountId, CursorScope, DiagnosticText, HintPayload, InvalidationHint, RecoveryClass,
-    WatchEvent,
+    Account, AccountId, CursorScope, HintPayload, InvalidationHint, RecoveryClass, WatchEvent,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -163,13 +162,7 @@ impl Reconciler {
             .into_iter()
             .next()
             .unwrap_or(CursorScope::Account);
-        let warning: Warning = Warning {
-            kind,
-            message: DiagnosticText::user_safe(message),
-            retry_count: 0,
-            next_action: None,
-            protocol_detail: None,
-        };
+        let warning = Warning::user_safe(kind, message);
         MultiplexerEvent {
             scope,
             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),

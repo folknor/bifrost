@@ -32,15 +32,10 @@ pub(crate) fn get_stream(
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(SyncEvent::Warning(bifrost_types::Warning {
-                            kind: bifrost_types::WarningKind::Other(
-                                "invalid_imap_object_id".into(),
-                            ),
-                            message: err.to_string(),
-                            retry_count: 0,
-                            next_action: None,
-                            protocol_detail: None,
-                        }))
+                        .send(SyncEvent::Warning(bifrost_types::Warning::support_only(
+                            bifrost_types::WarningKind::Other,
+                            err.to_string(),
+                        )))
                         .await;
                 }
             }

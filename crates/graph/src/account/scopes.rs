@@ -87,13 +87,18 @@ pub(crate) fn batch<T>(items: Vec<T>, page_boundary: Option<PageBoundary>) -> Sy
     })
 }
 
-async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<CursorScope>, AccountError> {
+async fn discover_cursor_scopes_inner(
+    account: &GraphAccount,
+) -> Result<Vec<CursorScope>, AccountError> {
     let mail_folders = account
         .client
         .list_mail_folders_recursive()
         .await
         .map_err(|error| {
-            into_account_error(error, GraphErrorContext::graph(AccountOperation::DiscoverMemberships))
+            into_account_error(
+                error,
+                GraphErrorContext::graph(AccountOperation::DiscoverMemberships),
+            )
         })?;
     account.folder_tree.write().await.replace_mail_folders(
         mail_folders
@@ -112,7 +117,9 @@ async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<Curs
     Ok(scopes)
 }
 
-async fn discover_memberships_inner(account: &GraphAccount) -> Result<Vec<MembershipScope>, AccountError> {
+async fn discover_memberships_inner(
+    account: &GraphAccount,
+) -> Result<Vec<MembershipScope>, AccountError> {
     let scopes = {
         let cached = account.cursor_index.read().await.scopes();
         if cached.is_empty() {

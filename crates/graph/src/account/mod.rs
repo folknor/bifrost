@@ -21,11 +21,11 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountStream,
     BlobHandle, ByteRange, Change, ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydrationProjection,
-    IdempotencyKey, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, Priority, Projection, ScopeLifecycle, SearchRequest,
-    SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection, IdempotencyKey,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectId, Page, Priority, Projection, ScopeLifecycle, SearchRequest, SendRequest,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -254,7 +254,10 @@ impl Account for GraphAccount {
         Box::pin(async move { push::push_subscribe(account, scopes).await })
     }
 
-    fn push_unsubscribe(&self, handle: SubscriptionHandle) -> AccountFuture<Result<(), AccountError>> {
+    fn push_unsubscribe(
+        &self,
+        handle: SubscriptionHandle,
+    ) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
         Box::pin(async move { push::push_unsubscribe(account, handle).await })
     }
@@ -420,7 +423,10 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::draft_send(account, draft).await })
     }
 
-    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
+    fn search(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::search(account, request).await })
     }
@@ -433,7 +439,9 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::search_messages(account, request).await })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<bifrost_types::Container>, AccountError>> {
+    fn containers_list(
+        &self,
+    ) -> AccountFuture<Result<Vec<bifrost_types::Container>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::containers_list(account).await })
     }
@@ -509,7 +517,10 @@ impl Account for GraphAccount {
         })
     }
 
-    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, AccountError>> {
+    fn thread_hydrate(
+        &self,
+        thread: ThreadId,
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::thread_hydrate(account, thread).await })
     }

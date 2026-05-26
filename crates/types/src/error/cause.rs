@@ -213,7 +213,7 @@ impl fmt::Display for AttemptCause {
 
 impl StdError for AttemptCause {}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum TransmissionState {
     Unsent,
@@ -436,7 +436,6 @@ impl WireCause {
             Self::Graph(_)
             | Self::Jmap(_)
             | Self::Imap(_)
-            | Self::Smtp(_)
             | Self::Gmail(_)
             | Self::MalformedResponse { detail: None, .. } => None,
         }
@@ -779,12 +778,12 @@ pub struct EnhancedStatusCode {
 
 impl EnhancedStatusCode {
     #[must_use]
-    pub fn new(
-        code: u16,
-        enhanced: Option<DiagnosticText>,
-        text: Option<DiagnosticText>,
-    ) -> Self {
-        Self { code, enhanced, text }
+    pub fn new(code: u16, enhanced: Option<DiagnosticText>, text: Option<DiagnosticText>) -> Self {
+        Self {
+            code,
+            enhanced,
+            text,
+        }
     }
 }
 

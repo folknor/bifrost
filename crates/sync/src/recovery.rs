@@ -79,6 +79,7 @@ pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<Curs
         | EngineDirective::SchemaIncompatible
         | EngineDirective::CapabilityChanged { .. }
         | EngineDirective::OperatorOverrideRequired { .. } => None,
+        _ => None,
     }
 }
 
@@ -148,15 +149,10 @@ mod tests {
     fn transport_retry_error() -> AccountError {
         AccountErrorBuilder::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
         )
         .operation(AccountOperation::SyncChanges)
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Unsent,
-        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
         .build()
     }
 
@@ -188,15 +184,12 @@ mod tests {
         // Non-idempotent op + InFlight transport drop -> Reconcile.
         let err = AccountErrorBuilder::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: None,
-            }),
+            Cause::Transport(TransportCause::new(TransportKind::Network, None)),
         )
         .operation(AccountOperation::Send)
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::InFlight,
-        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::InFlight,
+        )))
         .build();
 
         match plan_recovery(err) {
@@ -331,9 +324,9 @@ mod tests {
             Cause::Server(ServerCause::Error { status: Some(451) }),
         )
         .operation(AccountOperation::SyncChanges)
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Acknowledged,
-        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
         .build();
         assert!(matches!(
             plan_recovery(refused),
@@ -359,34 +352,34 @@ mod tests {
     #[test]
     fn retry_delay_uses_later_of_not_before_and_min_delay() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let advice = RetryAdvice {
-            disposition: RetryDisposition::SameRequest,
-            not_before: Some(now + Duration::from_secs(5)),
-            min_delay: Some(Duration::from_secs(2)),
-            reason: RetryReason::Transport,
-            throttle_scope: None,
-        };
+        let advice = RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            Some(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(2)),
+            RetryReason::Transport,
+            None,
+        );
         // not_before is +5s from now, min_delay is 2s; choose +5s.
         let delay = retry_delay(&advice, now, Duration::from_secs(1));
         assert_eq!(delay, Duration::from_secs(5));
 
-        let advice2 = RetryAdvice {
-            disposition: RetryDisposition::SameRequest,
-            not_before: Some(now + Duration::from_secs(1)),
-            min_delay: Some(Duration::from_secs(10)),
-            reason: RetryReason::Transport,
-            throttle_scope: None,
-        };
+        let advice2 = RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            Some(now + Duration::from_secs(1)),
+            Some(Duration::from_secs(10)),
+            RetryReason::Transport,
+            None,
+        );
         let delay2 = retry_delay(&advice2, now, Duration::from_secs(1));
         assert_eq!(delay2, Duration::from_secs(10));
 
-        let advice3 = RetryAdvice {
-            disposition: RetryDisposition::SameRequest,
-            not_before: None,
-            min_delay: None,
-            reason: RetryReason::Transport,
-            throttle_scope: None,
-        };
+        let advice3 = RetryAdvice::new(
+            RetryDisposition::SameRequest,
+            None,
+            None,
+            RetryReason::Transport,
+            None,
+        );
         let delay3 = retry_delay(&advice3, now, Duration::from_secs(3));
         assert_eq!(delay3, Duration::from_secs(3));
     }

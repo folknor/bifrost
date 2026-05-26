@@ -19,7 +19,6 @@ use bifrost_types::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause,
     BatchInputInvalidItem, BatchItem, BatchItemId, BatchOutcome, Cause, DiagnosticText, Protocol,
     ProtocolErrorKind, RequestCause, RequestErrorKind, TransmissionState, WireCause,
-    validate_batch_input,
 };
 
 use crate::address::Address;
@@ -32,7 +31,7 @@ use crate::transport::smtp::response::Response;
 /// Account-oriented recipient input. The address part is the SMTP envelope
 /// recipient; the id is opaque to SMTP and round-tripped to each lane entry.
 #[derive(Clone, Debug)]
-pub struct SmtpBatchRecipient {
+pub(crate) struct SmtpBatchRecipient {
     pub id: BatchItemId,
     pub address: Address,
 }
@@ -253,18 +252,18 @@ fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountErr
         Cause::Wire(WireCause::MalformedResponse {
             protocol,
             detail: Some(DiagnosticText::support_only(format!(
-                "transport drop after body write; recipient {} uncertain",
-                address
+                "transport drop after body write; recipient {address} uncertain"
             ))),
         }),
     )
     .protocol(protocol)
     .operation(AccountOperation::Send)
     .idempotency_override(false)
-    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)))
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::InFlight,
+    )))
     .text(DiagnosticText::support_only(format!(
-        "recipient {} uncertain after body write",
-        address
+        "recipient {address} uncertain after body write"
     )))
     .build()
 }
@@ -302,7 +301,7 @@ mod tests {
 
     fn recip(id: &str, addr: &str) -> SmtpBatchRecipient {
         SmtpBatchRecipient {
-            id: BatchItemId(id.to_string()),
+            id: BatchItemId(id.to_owned()),
             address: addr.parse().expect("valid address"),
         }
     }
@@ -357,12 +356,12 @@ mod tests {
     fn validation_rejects_duplicate_ids() {
         let items = vec![
             BatchItem::new(
-                BatchItemId("a".to_string()),
-                "a@example.com".parse().unwrap(),
+                BatchItemId("a".to_owned()),
+                "a@example.com".parse::<Address>().unwrap(),
             ),
             BatchItem::new(
-                BatchItemId("a".to_string()),
-                "b@example.com".parse().unwrap(),
+                BatchItemId("a".to_owned()),
+                "b@example.com".parse::<Address>().unwrap(),
             ),
         ];
         let err = validate_batch_input(&items).unwrap_err();
@@ -502,7 +501,7 @@ mod tests {
         // Recipients b and c are still Pending. Simulate batch tracker marking
         // unresolved uncertain on a transport drop during drain.
         progress.mark_uncertain_unresolved(|| {
-            partial_completion_error(Protocol::Smtp, &"y@x.com".parse().unwrap())
+            partial_completion_error(Protocol::Smtp, &"y@x.com".parse::<Address>().unwrap())
         });
 
         let outcome = progress.resolve();
@@ -560,7 +559,7 @@ mod tests {
         progress.record_lmtp_final(0, positive_data_final());
         // b and c never got their final status.
         progress.mark_uncertain_unresolved(|| {
-            partial_completion_error(Protocol::Lmtp, &"y@x.com".parse().unwrap())
+            partial_completion_error(Protocol::Lmtp, &"y@x.com".parse::<Address>().unwrap())
         });
 
         let outcome = progress.resolve();

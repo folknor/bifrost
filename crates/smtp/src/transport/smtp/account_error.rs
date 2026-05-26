@@ -289,13 +289,13 @@ pub(crate) fn response_to_account_error(
         .as_ref()
         .map(|d| d.value.clone())
         .unwrap_or_else(|| status.to_string());
-    let text_first = response.message().next().map(|s| s.to_owned());
+    let text_first = response.message().next().map(str::to_owned);
 
     let (kind, primary_cause) = classify_response(response, phase);
 
     let mut builder = AccountErrorBuilder::new(kind, primary_cause)
         .protocol(ctx.protocol)
-        .status(status)
+        .status(Some(status))
         .native_code(native);
     builder = apply_context(builder, ctx);
     builder = builder.push_cause(Cause::Wire(WireCause::Smtp(wire)));
@@ -308,21 +308,18 @@ pub(crate) fn response_to_account_error(
     }
     // Wire 4xx rate-limit text gets a throttle-scope hint so recovery can
     // surface throttle scope. Default to ThrottleScope::Account.
-    if matches!(builder_kind_is_rate_or_quota(response, phase), Some(true)) {
+    if builder_kind_is_rate_or_quota(response, phase) {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
     builder.build()
 }
 
-fn builder_kind_is_rate_or_quota(
-    response: &Response,
-    phase: Option<SmtpCommandPhase>,
-) -> Option<bool> {
+fn builder_kind_is_rate_or_quota(response: &Response, phase: Option<SmtpCommandPhase>) -> bool {
     let (kind, _) = classify_response(response, phase);
-    Some(matches!(
+    matches!(
         kind,
         AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
-    ))
+    )
 }
 
 fn classify_response(
@@ -343,7 +340,7 @@ fn diag_detail(response: &Response) -> DiagnosticText {
     let text = response
         .message()
         .next()
-        .map(|s| s.to_owned())
+        .map(str::to_owned)
         .unwrap_or_default();
     DiagnosticText::support_only(text)
 }
@@ -470,7 +467,8 @@ fn classify_enhanced(
         (_, 7, 1 | 2) => Some(permission_denied()),
         (_, 7, 3 | 4 | 5 | 6) => Some(policy_blocked()),
         (_, 7, 7) => Some(malformed(response)),
-        (_, 7, 8) => Some(auth_reauth()),
+        (4, 7, 8) => Some(auth_refresh_transient()),
+        (5, 7, 8) => Some(auth_reauth()),
         (_, 7, 9) => Some(policy_blocked()),
         (_, 7, 10 | 11) => Some(policy_blocked()),
         (_, 7, 12) => Some(auth_reauth()),
@@ -658,14 +656,16 @@ fn server_error(status: u16) -> (AccountErrorKind, Cause) {
         AccountErrorKind::Server(ServerErrorKind::Error {
             status: Some(status),
         }),
-        Cause::Server(ServerCause::Error { status }),
+        Cause::Server(ServerCause::Error {
+            status: Some(status),
+        }),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::smtp::error::{self as smtp_error};
+    use crate::transport::smtp::error as smtp_error;
     use crate::transport::smtp::response::{Category, Code, Detail, Severity};
     use bifrost_types::error::{
         AccountErrorKind, AuthErrorKind, ReconcileReason, RecoveryClass, RetryReason,
@@ -941,7 +941,7 @@ mod tests {
     fn status_535_fallback_reauth() {
         let resp = response(
             Severity::PermanentNegativeCompletion,
-            Category::MailSystem,
+            Category::Unspecified3,
             Detail::Five,
             &["authentication failed"],
         );
@@ -978,11 +978,13 @@ mod tests {
 
     #[test]
     fn wire_cause_includes_status_enhanced_and_text() {
-        let resp = response(
-            Severity::PermanentNegativeCompletion,
-            Category::Information,
-            Detail::One,
-            &["5.1.1 user unknown"],
+        let resp = Response::new(
+            Code::new(
+                Severity::PermanentNegativeCompletion,
+                Category::MailSystem,
+                Detail::Zero,
+            ),
+            vec!["5.1.1 user unknown".to_owned()],
         );
         let err = smtp_error::status(resp);
         let account = into_account_error(err, ctx_smtp_send());

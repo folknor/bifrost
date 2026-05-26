@@ -258,7 +258,7 @@ pub(crate) fn classify_set_item(
 ) -> ItemOutcome<MutationSuccess> {
     let absorb = matches!(
         set_error.error_type(),
-        SetErrorType::NotFound | SetErrorType::BlobNotFound
+        &SetErrorType::NotFound | &SetErrorType::BlobNotFound
     ) && matches!(
         ctx.operation,
         AccountOperation::UpdateFlags
@@ -270,13 +270,10 @@ pub(crate) fn classify_set_item(
             | AccountOperation::RemoveFromContainer
     );
     if absorb {
-        ItemOutcome::Succeeded(BatchSuccess {
-            item,
-            output: MutationSuccess::Skipped,
-        })
+        ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Skipped))
     } else {
         let error = set_error_to_account_error(set_error, ctx, item_scope);
-        ItemOutcome::Failed(BatchFailure { item, error })
+        ItemOutcome::Failed(BatchFailure::new(item, error))
     }
 }
 
@@ -290,7 +287,8 @@ pub(crate) fn set_error_to_account_error(
     item_scope: Option<ErrorScope>,
 ) -> AccountError {
     let scope_for_resource = item_scope.as_ref().or(ctx.scope.as_ref());
-    let (kind, primary) = match set_error.error_type() {
+    let error_type = set_error.error_type().clone();
+    let (kind, primary) = match error_type {
         SetErrorType::Forbidden
         | SetErrorType::ForbiddenFrom
         | SetErrorType::ForbiddenMailFrom
@@ -309,7 +307,7 @@ pub(crate) fn set_error_to_account_error(
             Cause::Server(ServerCause::RateLimited { retry_after: None }),
         ),
         SetErrorType::NotFound | SetErrorType::BlobNotFound => {
-            let wire = if set_error.error_type() == SetErrorType::BlobNotFound {
+            let wire = if matches!(set_error.error_type(), &SetErrorType::BlobNotFound) {
                 JmapMethod::BlobNotFound
             } else {
                 JmapMethod::NotFound
@@ -376,12 +374,20 @@ pub(crate) fn set_error_to_account_error(
                 code: "other".to_string(),
             })),
         ),
+        _ => (
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
+            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
+                code: set_error.error_type().to_string(),
+            })),
+        ),
     };
 
     let mut builder = build_with(&ctx, kind, primary)
         // Set errors are returned in a successful JMAP response, which
         // already crossed the side-effect boundary.
-        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)));
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )));
     // Push the typed wire cause as a forensic layer for all non-Other
     // variants whose primary cause is not already a WireCause. For
     // WillDestroy/Singleton/etc. the primary IS the WireCause so we
@@ -389,23 +395,23 @@ pub(crate) fn set_error_to_account_error(
     // the primary is an Access/Server cause and we add the wire signal.
     let primary_was_wire = matches!(
         set_error.error_type(),
-        SetErrorType::WillDestroy
-            | SetErrorType::Singleton
-            | SetErrorType::ScriptIsActive
-            | SetErrorType::CannotUnsend
-            | SetErrorType::MailboxHasChild
-            | SetErrorType::MailboxHasEmail
-            | SetErrorType::Other
+        &SetErrorType::WillDestroy
+            | &SetErrorType::Singleton
+            | &SetErrorType::ScriptIsActive
+            | &SetErrorType::CannotUnsend
+            | &SetErrorType::MailboxHasChild
+            | &SetErrorType::MailboxHasEmail
+            | &SetErrorType::Other
     );
     if !primary_was_wire {
-        if let Some(wire) = set_error_type_to_jmap_method(set_error.error_type()) {
+        if let Some(wire) = set_error_type_to_jmap_method(set_error.error_type().clone()) {
             builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
         }
     }
     if let Some(description) = set_error.description() {
         builder = builder.text(DiagnosticText::support_only(description));
     }
-    if matches!(set_error.error_type(), SetErrorType::RateLimit) {
+    if matches!(set_error.error_type(), &SetErrorType::RateLimit) {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
     if let Some(scope) = item_scope {
@@ -481,6 +487,7 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
         }
         ErrorScope::Contact { .. } | ErrorScope::ContactCollection => Some(ResourceKind::Contact),
         ErrorScope::Account | ErrorScope::Cursor(_) => None,
+        _ => None,
     }
 }
 
@@ -495,6 +502,7 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection
         | ErrorScope::ContactCollection => None,
+        _ => None,
     }
 }
 
@@ -584,7 +592,7 @@ fn convert_problem(
             } else {
                 (
                     AccountErrorKind::Server(ServerErrorKind::Error { status: Some(404) }),
-                    Cause::Server(ServerCause::Error { status: 404 }),
+                    Cause::Server(ServerCause::Error { status: Some(404) }),
                 )
             }
         }
@@ -608,7 +616,9 @@ fn convert_problem(
             AccountErrorKind::Server(ServerErrorKind::Error {
                 status: Some(status),
             }),
-            Cause::Server(ServerCause::Error { status }),
+            Cause::Server(ServerCause::Error {
+                status: Some(status),
+            }),
         ),
         (ProblemType::Other(code), None) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
@@ -617,10 +627,12 @@ fn convert_problem(
     };
 
     let mut builder = build_with(&ctx, kind, primary)
-        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)))
+        .push_cause(Cause::Attempt(AttemptCause::new(
+            TransmissionState::Acknowledged,
+        )))
         .push_cause(Cause::Wire(wire_for_problem(details.error())));
     if let Some(status) = status_u16 {
-        builder = builder.status(status);
+        builder = builder.status(Some(status));
     }
     if let Some(request_id) = details.request_id() {
         builder = builder.request_id(request_id.to_string());
@@ -810,8 +822,9 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         ),
     };
 
-    let mut builder = build_with(&ctx, kind, primary)
-        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)));
+    let mut builder = build_with(&ctx, kind, primary).push_cause(Cause::Attempt(
+        AttemptCause::new(TransmissionState::Acknowledged),
+    ));
     // Push the wire cause as a forensic-only layer only if it differs
     // from the primary cause already on the chain (ServerPartialFail
     // and Other already use Wire as primary).
@@ -866,7 +879,9 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
         }),
         &ctx,
     )
-    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)))
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )))
     .build()
 }
 
@@ -876,7 +891,7 @@ mod tests {
     use crate::core::error::{MethodError, ProblemDetails};
     use bifrost_types::{
         AccessErrorKind, AccountErrorKind, AccountOperation, ProtocolErrorKind, RecoveryClass,
-        RetryDisposition, ServerErrorKind, SyncStateErrorKind, ThrottleScope, TransmissionState,
+        RetryDisposition, ServerErrorKind, SyncStateErrorKind, ThrottleScope,
     };
 
     fn method_error(kind: &str) -> crate::Error {

@@ -136,8 +136,7 @@ async fn download_blob(client: &GmailClient, handle: &BlobHandle) -> Result<Byte
         .get_attachment(&key.message_id, &key.attachment_id)
         .await
         .map_err(BlobError::Gmail)?;
-    let decoded = decode_base64url_nopad(&attachment.data)
-        .map_err(|err| BlobError::Gmail(crate::error::Error::base64url(err)))?;
+    let decoded = decode_base64url_nopad(&attachment.data).map_err(BlobError::Gmail)?;
     Ok(Bytes::from(decoded))
 }
 

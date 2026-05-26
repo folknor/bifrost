@@ -76,7 +76,7 @@ fn mutation_stream(
                     let item_id = BatchItemId(id.0.clone());
                     let _ = tx
                         .send(batch(
-                            vec![ItemOutcome::Failed(BatchFailure { item: item_id, error: err })],
+                            vec![ItemOutcome::Failed(BatchFailure::new(item_id, err))],
                             PageBoundary::Page,
                             None,
                         ))
@@ -94,9 +94,7 @@ fn mutation_stream(
                     let _ = tx
                         .send(fatal_event(
                             err,
-                            super::error::ImapErrorContext::operation(
-                                mutation_operation(&kind),
-                            ),
+                            super::error::ImapErrorContext::operation(mutation_operation(&kind)),
                         ))
                         .await;
                     return;
@@ -161,9 +159,9 @@ async fn run_folder_mutation(
                 MailboxName::new(id.0.clone()).map_err(crate::Error::from)?
             } else {
                 return Ok(failed_all(
-                valid,
-                super::error::unsupported(AccountOperation::BulkMove),
-            ));
+                    valid,
+                    super::error::unsupported(AccountOperation::BulkMove),
+                ));
             };
             conn.connection()
                 .uid_move_messages(
@@ -437,31 +435,20 @@ fn mutation_results(
         StoreWireOutcome::Applied => ids
             .into_iter()
             .map(|id| {
-                let item = BatchItemId(
-                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                );
-                ItemOutcome::Succeeded(BatchSuccess {
-                    item,
-                    output: MutationSuccess::Applied,
-                })
+                let item =
+                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+                ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Applied))
             })
             .collect(),
         StoreWireOutcome::Modified(modified) => ids
             .into_iter()
             .map(|id| {
-                let item = BatchItemId(
-                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                );
+                let item =
+                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
                 if modified.contains(&id.uid) {
-                    ItemOutcome::Failed(BatchFailure {
-                        item,
-                        error: concurrency_conflict_error(),
-                    })
+                    ItemOutcome::Failed(BatchFailure::new(item, concurrency_conflict_error()))
                 } else {
-                    ItemOutcome::Succeeded(BatchSuccess {
-                        item,
-                        output: MutationSuccess::Applied,
-                    })
+                    ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Applied))
                 }
             })
             .collect(),
@@ -471,19 +458,12 @@ fn mutation_results(
         StoreWireOutcome::PendingRetry(modified) => ids
             .into_iter()
             .map(|id| {
-                let item = BatchItemId(
-                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-                );
+                let item =
+                    BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
                 if modified.contains(&id.uid) {
-                    ItemOutcome::Uncertain(BatchUncertain {
-                        item,
-                        error: concurrency_conflict_error(),
-                    })
+                    ItemOutcome::Uncertain(BatchUncertain::new(item, concurrency_conflict_error()))
                 } else {
-                    ItemOutcome::Failed(BatchFailure {
-                        item,
-                        error: store_failed_error(),
-                    })
+                    ItemOutcome::Failed(BatchFailure::new(item, store_failed_error()))
                 }
             })
             .collect(),
@@ -491,19 +471,11 @@ fn mutation_results(
     }
 }
 
-fn failed_all(
-    ids: Vec<DecodedObjectId>,
-    error: AccountError,
-) -> Vec<ItemOutcome<MutationSuccess>> {
+fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.into_iter()
         .map(|id| {
-            let item = BatchItemId(
-                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
-            );
-            ItemOutcome::Failed(BatchFailure {
-                item,
-                error: error.clone(),
-            })
+            let item = BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
+            ItemOutcome::Failed(BatchFailure::new(item, error.clone()))
         })
         .collect()
 }

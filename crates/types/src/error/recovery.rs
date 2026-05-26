@@ -77,6 +77,25 @@ pub struct RetryAdvice {
     pub throttle_scope: Option<ThrottleScope>,
 }
 
+impl RetryAdvice {
+    #[must_use]
+    pub fn new(
+        disposition: RetryDisposition,
+        not_before: Option<SystemTime>,
+        min_delay: Option<Duration>,
+        reason: RetryReason,
+        throttle_scope: Option<ThrottleScope>,
+    ) -> Self {
+        Self {
+            disposition,
+            not_before,
+            min_delay,
+            reason,
+            throttle_scope,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum RetryDisposition {
@@ -180,7 +199,7 @@ pub(crate) fn derive(
 ) -> RecoveryClass {
     let tx_state = transmission_state(chain).unwrap_or(TransmissionState::Unsent);
     let idempotent = idempotency_override
-        .unwrap_or_else(|| operation.map_or(true, AccountOperation::is_idempotent));
+        .unwrap_or_else(|| operation.is_none_or(AccountOperation::is_idempotent));
 
     match kind {
         AccountErrorKind::Transport(_) => {

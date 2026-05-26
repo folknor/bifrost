@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use bifrost_types::{AccountFuture, Error as AccountError};
+use bifrost_types::{AccountError, AccountFuture};
 
 use super::ImapAccount;
 

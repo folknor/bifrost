@@ -50,7 +50,9 @@ pub(crate) fn remove_from_container(
             .filter(|id| id.folder == source)
             .collect::<Vec<_>>();
         if ids.is_empty() {
-            return Err(super::error::unsupported(AccountOperation::RemoveFromContainer));
+            return Err(super::error::unsupported(
+                AccountOperation::RemoveFromContainer,
+            ));
         }
         delete_messages(&account, ids).await
     })
@@ -311,9 +313,7 @@ pub(crate) fn container_delete(
 }
 
 pub(crate) fn identities_list() -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-    Box::pin(async {
-        Err(super::error::unsupported(AccountOperation::IdentitiesList))
-    })
+    Box::pin(async { Err(super::error::unsupported(AccountOperation::IdentitiesList)) })
 }
 
 pub(crate) fn identity_update(
@@ -822,8 +822,8 @@ fn merge_folder(
     match (current, next) {
         (Some(a), Some(b)) if a != b => {
             use bifrost_types::{
-                AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText,
-                Protocol, RequestCause, RequestErrorKind,
+                AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, Protocol,
+                RequestCause, RequestErrorKind,
             };
             Err(AccountErrorBuilder::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -1024,8 +1024,7 @@ fn renamed_sibling(
         .get(folder)
         .and_then(|entry| entry.delimiter);
     let Some(delimiter) = delimiter else {
-        return MailboxName::new(new_leaf.to_owned())
-            .map_err(|e| pim_malformed(e.to_string()));
+        return MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()));
     };
     if let Some((parent, _)) = folder.as_str().rsplit_once(delimiter) {
         MailboxName::new(format!("{parent}{delimiter}{new_leaf}"))

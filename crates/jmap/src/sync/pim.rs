@@ -124,7 +124,9 @@ pub(crate) fn set_keyword(
         )
         .await?;
         for id in &ids {
-            response.updated(id).map_err(to_acct_err(AccountOperation::SetKeyword))?;
+            response
+                .updated(id)
+                .map_err(to_acct_err(AccountOperation::SetKeyword))?;
         }
         Ok(())
     })
@@ -193,19 +195,27 @@ pub(crate) fn send_message(
         }
 
         let mut batch = mail.build();
-        let email_handle = batch.call(email_set).map_err(to_acct_err(AccountOperation::Send))?;
+        let email_handle = batch
+            .call(email_set)
+            .map_err(to_acct_err(AccountOperation::Send))?;
         let email_ref = email_handle.result_reference(format!("/created/{email_create_id}/id"));
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
             .email_id_ref(email_ref);
-        let submission_handle =
-            batch.call(submission_set).map_err(to_acct_err(AccountOperation::Send))?;
+        let submission_handle = batch
+            .call(submission_set)
+            .map_err(to_acct_err(AccountOperation::Send))?;
 
-        let mut response = batch.send().await.map_err(to_acct_err(AccountOperation::Send))?;
-        let mut email_response =
-            response.get(&email_handle).map_err(to_acct_err(AccountOperation::Send))?;
-        let mut submission_response =
-            response.get(&submission_handle).map_err(to_acct_err(AccountOperation::Send))?;
+        let mut response = batch
+            .send()
+            .await
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let mut email_response = response
+            .get(&email_handle)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let mut submission_response = response
+            .get(&submission_handle)
+            .map_err(to_acct_err(AccountOperation::Send))?;
         let mut email = email_response
             .created(&email_create_id)
             .map_err(to_acct_err(AccountOperation::Send))?;
@@ -251,9 +261,13 @@ pub(crate) fn draft_create(
     Box::pin(async move {
         let draft_mailbox =
             role_mailbox(&mail, FolderRole::Drafts, AccountOperation::DraftCreate).await?;
-        let create =
-            build_email_create_from_draft(&mail, patch, draft_mailbox, AccountOperation::DraftCreate)
-                .await?;
+        let create = build_email_create_from_draft(
+            &mail,
+            patch,
+            draft_mailbox,
+            AccountOperation::DraftCreate,
+        )
+        .await?;
         let mut set = EmailSet::new();
         let create_id = set.create_item(create);
         let mut response = mail
@@ -279,7 +293,13 @@ pub(crate) fn draft_update(
     Box::pin(async move {
         let email_id = EmailId::new(draft.0);
         let mut email_patch = EmailPatch::default();
-        apply_draft_patch_to_email_patch(&mail, &mut email_patch, patch, AccountOperation::DraftUpdate).await?;
+        apply_draft_patch_to_email_patch(
+            &mail,
+            &mut email_patch,
+            patch,
+            AccountOperation::DraftUpdate,
+        )
+        .await?;
         let email_id_for_set = email_id.clone();
         let mut response = send_email_set_with_retry(
             &mail,
@@ -875,9 +895,12 @@ pub(crate) fn delete_thread(
             .as_ref()
             .is_some_and(|id| id.0.eq_ignore_ascii_case(trash.as_str()));
         if already_in_trash {
-            let ids =
-                resolve_target(&mail, MutationTarget::Thread(thread), AccountOperation::BulkDestroy)
-                    .await?;
+            let ids = resolve_target(
+                &mail,
+                MutationTarget::Thread(thread),
+                AccountOperation::BulkDestroy,
+            )
+            .await?;
             destroy_emails(&mail, &email_state, ids, AccountOperation::BulkDestroy).await
         } else {
             patch_mailbox_membership(
@@ -916,15 +939,14 @@ async fn patch_mailbox_membership(
     let ids = resolve_target(mail, target, op).await?;
     let mailbox = MailboxId::new(container.0);
     let ids_for_set = ids.clone();
-    let mut response =
-        send_email_set_with_retry(mail, email_state, op, move |state| {
-            let mut set = EmailSet::new().if_in_state(state.to_string());
-            for id in &ids_for_set {
-                set.update(id.clone()).mailbox_id(&mailbox, value);
-            }
-            set
-        })
-        .await?;
+    let mut response = send_email_set_with_retry(mail, email_state, op, move |state| {
+        let mut set = EmailSet::new().if_in_state(state.to_string());
+        for id in &ids_for_set {
+            set.update(id.clone()).mailbox_id(&mailbox, value);
+        }
+        set
+    })
+    .await?;
     for id in &ids {
         response.updated(id).map_err(to_acct_err(op))?;
     }
@@ -977,13 +999,12 @@ async fn destroy_emails(
         return Ok(());
     }
     let ids_for_set = ids_vec.clone();
-    let mut response =
-        send_email_set_with_retry(mail, email_state, op, move |state| {
-            EmailSet::new()
-                .if_in_state(state.to_string())
-                .destroy(ids_for_set.clone())
-        })
-        .await?;
+    let mut response = send_email_set_with_retry(mail, email_state, op, move |state| {
+        EmailSet::new()
+            .if_in_state(state.to_string())
+            .destroy(ids_for_set.clone())
+    })
+    .await?;
     for id in &ids_vec {
         response.destroyed(id).map_err(to_acct_err(op))?;
     }
@@ -1088,15 +1109,14 @@ async fn role_mailbox(
             }
         })
         .ok_or_else(|| {
-            super::error::unsupported_error(
-                op,
-                None,
-                "JMAP required mailbox role not found",
-            )
+            super::error::unsupported_error(op, None, "JMAP required mailbox role not found")
         })
 }
 
-async fn fetch_containers(mail: &MailAccount, op: AccountOperation) -> Result<Vec<Container>, AccountError> {
+async fn fetch_containers(
+    mail: &MailAccount,
+    op: AccountOperation,
+) -> Result<Vec<Container>, AccountError> {
     Ok(fetch_mailboxes(mail, op)
         .await?
         .into_iter()
@@ -1104,7 +1124,10 @@ async fn fetch_containers(mail: &MailAccount, op: AccountOperation) -> Result<Ve
         .collect())
 }
 
-async fn fetch_mailboxes(mail: &MailAccount, op: AccountOperation) -> Result<Vec<Mailbox>, AccountError> {
+async fn fetch_mailboxes(
+    mail: &MailAccount,
+    op: AccountOperation,
+) -> Result<Vec<Mailbox>, AccountError> {
     Ok(mail
         .call(MailboxGet::new().properties([
             MailboxProperty::Id,

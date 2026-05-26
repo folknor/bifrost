@@ -530,7 +530,12 @@ impl AsyncSmtpConnection {
 
         let mail_options = self
             .mail_options_for_batch(from.as_ref(), email, options, false)
-            .map_err(|e| (e.with_attempt(SmtpTransmissionState::Unsent), progress.clone()))?;
+            .map_err(|e| {
+                (
+                    e.with_attempt(SmtpTransmissionState::Unsent),
+                    progress.clone(),
+                )
+            })?;
 
         if self.server_info().supports_pipelining() {
             return self
@@ -564,8 +569,7 @@ impl AsyncSmtpConnection {
                     use crate::transport::smtp::error::SmtpCommandPhase;
                     let ae = into_account_error(
                         e.with_attempt(SmtpTransmissionState::InFlight),
-                        SmtpErrorContext::send(Protocol::Smtp)
-                            .with_phase(SmtpCommandPhase::RcptTo),
+                        SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
                     );
                     let ae2 = ae.clone();
                     progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -575,10 +579,12 @@ impl AsyncSmtpConnection {
             }
         }
 
-        let accepted = progress
-            .recipients
-            .iter()
-            .any(|r| matches!(r.rcpt, crate::transport::smtp::batch::RcptProgress::Accepted));
+        let accepted = progress.recipients.iter().any(|r| {
+            matches!(
+                r.rcpt,
+                crate::transport::smtp::batch::RcptProgress::Accepted
+            )
+        });
         if !accepted {
             return Ok(progress);
         }
@@ -593,9 +599,7 @@ impl AsyncSmtpConnection {
                 return Ok(progress);
             }
             Err(e) => {
-                use crate::transport::smtp::account_error::{
-                    SmtpErrorContext, into_account_error,
-                };
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
                 use crate::transport::smtp::error::SmtpCommandPhase;
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight),
@@ -616,14 +620,11 @@ impl AsyncSmtpConnection {
                 progress.set_data_response(resp);
             }
             Err(e) => {
-                use crate::transport::smtp::account_error::{
-                    SmtpErrorContext, into_account_error,
-                };
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
                 use crate::transport::smtp::error::SmtpCommandPhase;
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight),
-                    SmtpErrorContext::send(Protocol::Smtp)
-                        .with_phase(SmtpCommandPhase::DataBody),
+                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataBody),
                 );
                 let ae2 = ae.clone();
                 progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -647,7 +648,10 @@ impl AsyncSmtpConnection {
         let rcpt_options_all: Vec<Vec<RcptParameter>> = progress
             .recipients
             .iter()
-            .map(|r| self.rcpt_options_single(&r.address, options).unwrap_or_default())
+            .map(|r| {
+                self.rcpt_options_single(&r.address, options)
+                    .unwrap_or_default()
+            })
             .collect();
         for (rec, rcpt_opts) in progress.recipients.iter().zip(&rcpt_options_all) {
             commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
@@ -686,8 +690,7 @@ impl AsyncSmtpConnection {
                     use crate::transport::smtp::error::SmtpCommandPhase;
                     let ae = into_account_error(
                         e.with_attempt(SmtpTransmissionState::InFlight),
-                        SmtpErrorContext::send(Protocol::Smtp)
-                            .with_phase(SmtpCommandPhase::RcptTo),
+                        SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::RcptTo),
                     );
                     let ae2 = ae.clone();
                     progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -700,9 +703,7 @@ impl AsyncSmtpConnection {
         let data_response = match self.read_response_accepting_status().await {
             Ok(r) => r,
             Err(e) => {
-                use crate::transport::smtp::account_error::{
-                    SmtpErrorContext, into_account_error,
-                };
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
                 use crate::transport::smtp::error::SmtpCommandPhase;
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight),
@@ -716,10 +717,12 @@ impl AsyncSmtpConnection {
             }
         };
 
-        let accepted = progress
-            .recipients
-            .iter()
-            .any(|r| matches!(r.rcpt, crate::transport::smtp::batch::RcptProgress::Accepted));
+        let accepted = progress.recipients.iter().any(|r| {
+            matches!(
+                r.rcpt,
+                crate::transport::smtp::batch::RcptProgress::Accepted
+            )
+        });
 
         if !data_response.is_positive() {
             progress.mark_accepted_rejected_with_response(data_response);
@@ -734,12 +737,7 @@ impl AsyncSmtpConnection {
         }
 
         if !accepted {
-            if self
-                .write(b".\r\n")
-                .await
-                .and_then(|_| async { Ok(()) }.await)
-                .is_ok()
-            {
+            if self.write(b".\r\n").await.is_ok() {
                 let _ = self.read_response_accepting_status().await;
             } else {
                 self.abort().await;
@@ -754,14 +752,11 @@ impl AsyncSmtpConnection {
                 progress.set_data_response(resp);
             }
             Err(e) => {
-                use crate::transport::smtp::account_error::{
-                    SmtpErrorContext, into_account_error,
-                };
+                use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
                 use crate::transport::smtp::error::SmtpCommandPhase;
                 let ae = into_account_error(
                     e.with_attempt(SmtpTransmissionState::InFlight),
-                    SmtpErrorContext::send(Protocol::Smtp)
-                        .with_phase(SmtpCommandPhase::DataBody),
+                    SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataBody),
                 );
                 let ae2 = ae.clone();
                 progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -785,7 +780,12 @@ impl AsyncSmtpConnection {
 
         let mail_options = self
             .mail_options_for_batch(from.as_ref(), email, options, false)
-            .map_err(|e| (e.with_attempt(SmtpTransmissionState::Unsent), progress.clone()))?;
+            .map_err(|e| {
+                (
+                    e.with_attempt(SmtpTransmissionState::Unsent),
+                    progress.clone(),
+                )
+            })?;
 
         let mail_cmd = Mail::new(from, mail_options);
         if let Err(e) = self.command(mail_cmd).await {
@@ -817,8 +817,7 @@ impl AsyncSmtpConnection {
                     use crate::transport::smtp::error::SmtpCommandPhase;
                     let ae = into_account_error(
                         e.with_attempt(SmtpTransmissionState::InFlight),
-                        SmtpErrorContext::send(Protocol::Lmtp)
-                            .with_phase(SmtpCommandPhase::RcptTo),
+                        SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::RcptTo),
                     );
                     let ae2 = ae.clone();
                     progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -839,14 +838,11 @@ impl AsyncSmtpConnection {
 
         progress.set_body_started();
         if let Err(e) = self.write_body(email).await {
-            use crate::transport::smtp::account_error::{
-                SmtpErrorContext, into_account_error,
-            };
+            use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
             use crate::transport::smtp::error::SmtpCommandPhase;
             let ae = into_account_error(
                 e.with_attempt(SmtpTransmissionState::InFlight),
-                SmtpErrorContext::send(Protocol::Lmtp)
-                    .with_phase(SmtpCommandPhase::DataBody),
+                SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::DataBody),
             );
             let ae2 = ae.clone();
             progress.mark_uncertain_unresolved(|| ae2.clone());
@@ -928,7 +924,7 @@ impl AsyncSmtpConnection {
             .iter()
             .any(|parameter| matches!(parameter, MailParameter::Body(_)));
 
-        let has_non_ascii = from.is_some_and(|a| !a.as_ref().is_ascii());
+        let has_non_ascii = from.is_some_and(|a| !AsRef::<str>::as_ref(a).is_ascii());
         if has_non_ascii && !has_smtputf8 {
             if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
                 return Err(error::invalid_input(
@@ -966,7 +962,12 @@ impl AsyncSmtpConnection {
         }
 
         for parameter in options.mail_parameters() {
-            self.validate_mail_parameter(parameter, email.len(), email.is_ascii(), allow_binary_mime)?;
+            self.validate_mail_parameter(
+                parameter,
+                email.len(),
+                email.is_ascii(),
+                allow_binary_mime,
+            )?;
             mail_options.push(parameter.clone());
         }
 

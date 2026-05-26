@@ -304,9 +304,12 @@ impl ImapStream {
                 }
             },
             Self::Poisoned => {
-                return Err(Error::Io { source: std::sync::Arc::new(std::io::Error::other(
-                    "cannot set keepalive: stream is in upgrade transition",
-                )), attempt: None });
+                return Err(Error::Io {
+                    source: std::sync::Arc::new(std::io::Error::other(
+                        "cannot set keepalive: stream is in upgrade transition",
+                    )),
+                    attempt: None,
+                });
             }
             #[cfg(test)]
             Self::Memory(_) => {
@@ -318,7 +321,10 @@ impl ImapStream {
                 });
             }
         };
-        result.map_err(|e| Error::Io { source: std::sync::Arc::new(e), attempt: None })
+        result.map_err(|e| Error::Io {
+            source: std::sync::Arc::new(e),
+            attempt: None,
+        })
     }
 
     /// Extract the underlying `TcpStream` for STARTTLS upgrade.

@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, Checkpoint, CursorScope, DiagnosticText, ErrorScope,
-    FolderId, HydratedObject, HydratedObjectKind, MembershipScope, ObjectId, ObjectType,
-    PageBoundary, Projection, SyncEvent, Warning, WarningKind,
+    AccountOperation, AccountStream, Batch, Checkpoint, CursorScope, ErrorScope, FolderId,
+    HydratedObject, HydratedObjectKind, MembershipScope, ObjectId, ObjectType, PageBoundary,
+    Projection, SyncEvent, Warning, WarningKind,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -105,16 +105,10 @@ async fn fetch_batch(
             .cloned()
             .unwrap_or_else(|| ObjectId(item.id.clone()));
         if !(200..=299).contains(&item.status) {
-            warnings.push(SyncEvent::Warning(Warning {
-                kind: WarningKind::Other("graph_get_item_failed".to_string()),
-                message: DiagnosticText::support_only(format!(
-                    "Graph get for {} failed with HTTP {}",
-                    id.0, item.status
-                )),
-                retry_count: 0,
-                next_action: None,
-                protocol_detail: None,
-            }));
+            warnings.push(SyncEvent::Warning(Warning::support_only(
+                WarningKind::Other,
+                format!("Graph get for {} failed with HTTP {}", id.0, item.status),
+            )));
             continue;
         }
         let Some(body) = item.body else {

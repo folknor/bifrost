@@ -28,7 +28,9 @@ impl EwsClient {
         let status = resp.status();
         if !status.is_success() {
             let body = String::from_utf8_lossy(resp.body.as_ref());
-            return Err(EwsError::Transport(format!("EWS returned {status}: {body}")));
+            return Err(EwsError::Transport(format!(
+                "EWS returned {status}: {body}"
+            )));
         }
 
         let xml = String::from_utf8_lossy(resp.body.as_ref()).into_owned();

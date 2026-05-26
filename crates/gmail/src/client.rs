@@ -5,6 +5,7 @@ use bifrost_net::{
     AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response, RetryPolicy,
     StaticTokenSource, TokenSource,
 };
+use bifrost_types::AccountOperation;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -154,9 +155,10 @@ impl GmailClient {
             "PATCH" => self.inner.net.patch(url),
             "DELETE" => self.inner.net.delete(url),
             _ => {
-                return Err(Error::InvalidInput(format!(
-                    "unsupported HTTP method: {method}"
-                )));
+                return Err(Error::invalid_request(
+                    AccountOperation::Discover,
+                    format!("unsupported HTTP method: {method}"),
+                ));
             }
         };
 
