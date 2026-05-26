@@ -1,5 +1,6 @@
 use bifrost_types::{
-    BlobHandle, ByteRange, Checkpoint, Error as AccountError, PageBoundary, SyncEvent,
+    AccountError, AccountErrorBuilder, AccountErrorKind, BlobHandle, ByteRange, Cause, Checkpoint,
+    DiagnosticText, PageBoundary, Protocol, RequestCause, RequestErrorKind, SyncEvent,
 };
 use bytes::Bytes;
 
@@ -7,6 +8,7 @@ use crate::types::FetchAttr;
 
 use super::{
     ImapAccount, batch, boxed_receiver_stream, decode_blob_id, fatal_event, uid_set_from_u32,
+    terminated_event,
 };
 
 pub(crate) fn open_blob(
@@ -36,16 +38,17 @@ fn open_blob_inner(
                 let _ = tx.send(SyncEvent::Done(None::<Checkpoint>)).await;
             }
             Err(BlobError::Account(err)) => {
-                let _ = tx
-                    .send(SyncEvent::Fatal(bifrost_types::Fatal {
-                        recovery: bifrost_types::RecoveryClass::Fatal,
-                        message: err.to_string(),
-                        source: Some(err),
-                    }))
-                    .await;
+                let _ = tx.send(terminated_event(err)).await;
             }
             Err(BlobError::Imap(err)) => {
-                let _ = tx.send(fatal_event(err)).await;
+                let _ = tx
+                    .send(fatal_event(
+                        err,
+                        super::error::ImapErrorContext::operation(
+                            bifrost_types::AccountOperation::OpenBlob,
+                        ),
+                    ))
+                    .await;
             }
         }
     });
@@ -78,16 +81,37 @@ async fn run_blob(
     let decoded = decode_blob_id(&handle.id)?;
     if let Some(range) = range {
         if !handle.capabilities.supports_range {
-            return Err(AccountError::RangeNotSupported.into());
+            return Err(BlobError::Account(
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                    Cause::Request(RequestCause::Malformed {
+                        detail: DiagnosticText::support_only(
+                            "blob range reads are not supported for this handle",
+                        ),
+                    }),
+                )
+                .protocol(Protocol::Imap)
+                .operation(bifrost_types::AccountOperation::OpenBlobRange)
+                .build(),
+            ));
         }
         if let Some(total) = handle.size
             && range.start > total
         {
-            return Err(AccountError::RangeOutOfBounds {
-                start: range.start,
-                total,
-            }
-            .into());
+            return Err(BlobError::Account(
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                    Cause::Request(RequestCause::Malformed {
+                        detail: DiagnosticText::support_only(format!(
+                            "blob range start {} exceeds total size {}",
+                            range.start, total
+                        )),
+                    }),
+                )
+                .protocol(Protocol::Imap)
+                .operation(bifrost_types::AccountOperation::OpenBlobRange)
+                .build(),
+            ));
         }
     }
 
@@ -104,7 +128,17 @@ async fn run_blob(
         .uid_validity
         .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
     if uidvalidity != decoded.uidvalidity {
-        return Err(AccountError::Other("UIDVALIDITY changed before blob fetch".into()).into());
+        return Err(BlobError::Account(
+            AccountErrorBuilder::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only("UIDVALIDITY changed before blob fetch"),
+                }),
+            )
+            .protocol(Protocol::Imap)
+            .operation(bifrost_types::AccountOperation::OpenBlob)
+            .build(),
+        ));
     }
     let Some(uid_set) = uid_set_from_u32(&[decoded.uid]) else {
         return Ok(());
@@ -127,7 +161,7 @@ async fn run_blob(
                     None::<Checkpoint>,
                 ))
                 .await
-                .map_err(|_| crate::Error::Closed)?;
+                .map_err(|_| crate::Error::closed())?;
             }
         }
     }

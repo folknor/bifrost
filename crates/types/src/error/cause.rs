@@ -159,6 +159,11 @@ pub struct TransportCause {
 
 impl TransportCause {
     #[must_use]
+    pub fn new(kind: TransportKind, message: Option<DiagnosticText>) -> Self {
+        Self { kind, message }
+    }
+
+    #[must_use]
     pub(crate) fn error_kind(&self) -> TransportErrorKind {
         match self.kind {
             TransportKind::Network => TransportErrorKind::Network,
@@ -191,6 +196,13 @@ pub enum TransportKind {
 #[non_exhaustive]
 pub struct AttemptCause {
     pub transmission_state: TransmissionState,
+}
+
+impl AttemptCause {
+    #[must_use]
+    pub fn new(transmission_state: TransmissionState) -> Self {
+        Self { transmission_state }
+    }
 }
 
 impl fmt::Display for AttemptCause {
@@ -763,6 +775,17 @@ pub struct EnhancedStatusCode {
     pub code: u16,
     pub enhanced: Option<DiagnosticText>,
     pub text: Option<DiagnosticText>,
+}
+
+impl EnhancedStatusCode {
+    #[must_use]
+    pub fn new(
+        code: u16,
+        enhanced: Option<DiagnosticText>,
+        text: Option<DiagnosticText>,
+    ) -> Self {
+        Self { code, enhanced, text }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

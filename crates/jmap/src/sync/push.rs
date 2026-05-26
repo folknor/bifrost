@@ -7,9 +7,6 @@ use bifrost_types::{
     InvalidationHint, ObjectType, PushCapability, PushSource, SubscriptionHandle, WatchEvent,
 };
 
-// Phase-3 trait-shape parity: until the trait surface migrates,
-// `Error` here means `AccountError`.
-type Error = AccountError;
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -96,7 +93,7 @@ pub(crate) fn subscribe(
     scopes: Vec<CursorScope>,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
-) -> AccountFuture<Result<SubscriptionHandle, Error>> {
+) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
     Box::pin(async move {
         if push != PushCapability::InProcess {
             return Err(super::error::unsupported_error(
@@ -136,7 +133,7 @@ pub(crate) fn unsubscribe(
     handle: SubscriptionHandle,
     subscriptions: Arc<Mutex<HashMap<SubscriptionHandle, DataTypeSet>>>,
     enabled: Arc<Mutex<DataTypeSet>>,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let union = {
             let mut guard = subscriptions.lock().await;
@@ -182,7 +179,7 @@ async fn set_enabled_data_types(enabled: &Arc<Mutex<DataTypeSet>>, data_types: D
     *guard = data_types;
 }
 
-async fn apply_push_set(client: &Client, data_types: &DataTypeSet) -> Result<(), Error> {
+async fn apply_push_set(client: &Client, data_types: &DataTypeSet) -> Result<(), AccountError> {
     let result = if data_types.is_empty() {
         client.disable_push_ws().await
     } else {

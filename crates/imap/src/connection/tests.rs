@@ -150,7 +150,7 @@ async fn invariant_driver_panic_surfaces_as_error() {
     let _server = server_task.await.unwrap();
 
     match result {
-        Err(Error::DriverPanicked(msg)) => {
+        Err(Error::DriverPanicked { message: msg, .. }) => {
             assert!(
                 msg.contains("intentional panic for test"),
                 "panic message not propagated: {msg}"
@@ -200,7 +200,7 @@ async fn invariant_driver_panic_subsequent_commands_fail() {
     );
     let inner = result.unwrap();
     assert!(
-        matches!(inner, Err(Error::DriverPanicked(_) | Error::DriverGone)),
+        matches!(inner, Err(Error::DriverPanicked { .. } | Error::DriverGone { .. })),
         "post-panic command should be DriverPanicked or DriverGone, got: {inner:?}"
     );
 }

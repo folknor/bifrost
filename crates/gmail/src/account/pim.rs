@@ -43,7 +43,14 @@ pub(crate) fn add_to_container(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let (add, remove) = add_container_patch(&container);
-        modify_target(&client, target, add, remove).await
+        modify_target(
+            &client,
+            target,
+            add,
+            remove,
+            bifrost_types::AccountOperation::AddToContainer,
+        )
+        .await
     })
 }
 
@@ -54,7 +61,14 @@ pub(crate) fn remove_from_container(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let (add, remove) = remove_container_patch(&container);
-        modify_target(&client, target, add, remove).await
+        modify_target(
+            &client,
+            target,
+            add,
+            remove,
+            bifrost_types::AccountOperation::RemoveFromContainer,
+        )
+        .await
     })
 }
 
@@ -64,11 +78,21 @@ pub(crate) fn set_label_membership(
     label: ContainerId,
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
-    if value {
-        add_to_container(client, target, label)
-    } else {
-        remove_from_container(client, target, label)
-    }
+    Box::pin(async move {
+        let (add, remove) = if value {
+            add_container_patch(&label)
+        } else {
+            remove_container_patch(&label)
+        };
+        modify_target(
+            &client,
+            target,
+            add,
+            remove,
+            bifrost_types::AccountOperation::SetLabelMembership,
+        )
+        .await
+    })
 }
 
 pub(crate) fn set_is_read(
@@ -87,7 +111,14 @@ pub(crate) fn set_is_read(
         } else {
             Vec::new()
         };
-        modify_target(&client, target, add, remove).await
+        modify_target(
+            &client,
+            target,
+            add,
+            remove,
+            bifrost_types::AccountOperation::SetIsRead,
+        )
+        .await
     })
 }
 
@@ -98,14 +129,14 @@ pub(crate) fn send_message(
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         if !request.attachments_uploaded.is_empty() {
-            return Err(unsupported(bifrost_types::AccountOperation::Discover));
+            return Err(unsupported(bifrost_types::AccountOperation::AttachmentUpload));
         }
         let doc = MailDocument::from_send(request, &default_address);
         let raw = render_message(&doc, &default_address, true)?;
         let message = client
             .send_message(&raw, doc.thread_id.as_deref())
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::send()))?;
         Ok(ObjectId(message.id))
     })
 }
@@ -114,7 +145,7 @@ pub(crate) fn attachment_upload(
     _bytes: AccountStream<Result<Bytes, AccountError>>,
     _mime: String,
 ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::AttachmentUpload)) })
 }
 
 pub(crate) fn draft_create(
@@ -128,7 +159,9 @@ pub(crate) fn draft_create(
         let draft = client
             .create_draft(&raw, doc.thread_id.as_deref())
             .await
-            .map_err(account_error)?;
+            .map_err(|e| {
+                account_error_for(e, recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftCreate))
+            })?;
         Ok(DraftHandle(draft.id))
     })
 }
@@ -140,17 +173,18 @@ pub(crate) fn draft_update(
     patch: DraftPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        let ctx = recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
         let existing = client
             .get_draft(&draft.0, "full")
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, ctx.clone()))?;
         let mut doc = document_from_message(&client, &existing.message, true).await?;
         doc.apply_patch(patch);
         let raw = render_message(&doc, &default_address, false)?;
         client
             .update_draft(&draft.0, &raw, doc.thread_id.as_deref())
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, ctx))?;
         Ok(())
     })
 }
@@ -159,7 +193,12 @@ pub(crate) fn draft_discard(
     client: Arc<GmailClient>,
     draft: DraftHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async move { client.delete_draft(&draft.0).await.map_err(account_error) })
+    Box::pin(async move {
+        client
+            .delete_draft(&draft.0)
+            .await
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftDiscard)))
+    })
 }
 
 pub(crate) fn draft_send(
@@ -167,7 +206,10 @@ pub(crate) fn draft_send(
     draft: DraftHandle,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
-        let message = client.send_draft(&draft.0).await.map_err(account_error)?;
+        let message = client
+            .send_draft(&draft.0)
+            .await
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftSend)))?;
         Ok(ObjectId(message.id))
     })
 }
@@ -186,7 +228,7 @@ pub(crate) fn search(
         let (threads, next) = client
             .list_threads(query.as_deref(), Some(max), page_token.as_deref())
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::search()))?;
         Ok(Page {
             items: threads
                 .into_iter()
@@ -212,7 +254,7 @@ pub(crate) fn search_messages(
         let (messages, next, estimate) = client
             .list_messages(query.as_deref(), Some(max), page_token.as_deref())
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::search_messages()))?;
         Ok(Page {
             items: messages
                 .into_iter()
@@ -231,7 +273,7 @@ pub(crate) fn containers_list(
     Box::pin(async move {
         let snapshot = refresh_scope_snapshot(&client, &cache)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::containers_list()))?;
         let mut containers = Vec::with_capacity(snapshot.labels.len() + 1);
         containers.push(archive_container());
         containers.extend(snapshot.labels.iter().map(container_from_label));
@@ -247,12 +289,12 @@ pub(crate) fn container_create(
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if parent.is_some() || !matches!(kind, ContainerKind::Label) {
-            return Err(unsupported(bifrost_types::AccountOperation::Discover));
+            return Err(unsupported(bifrost_types::AccountOperation::ContainerCreate));
         }
         let label = client
             .create_label(&name, None)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::container(bifrost_types::AccountOperation::ContainerCreate)))?;
         Ok(ContainerId(label.id))
     })
 }
@@ -264,12 +306,12 @@ pub(crate) fn container_rename(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if is_archive_id(&container.0) {
-            return Err(unsupported(bifrost_types::AccountOperation::Discover));
+            return Err(unsupported(bifrost_types::AccountOperation::ContainerRename));
         }
         client
             .update_label(&container.0, Some(&name), None)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::container(bifrost_types::AccountOperation::ContainerRename)))?;
         Ok(())
     })
 }
@@ -278,7 +320,7 @@ pub(crate) fn container_move(
     _container: ContainerId,
     _new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerMove)) })
 }
 
 pub(crate) fn container_delete(
@@ -287,12 +329,12 @@ pub(crate) fn container_delete(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if is_archive_id(&container.0) {
-            return Err(unsupported(bifrost_types::AccountOperation::Discover));
+            return Err(unsupported(bifrost_types::AccountOperation::ContainerDelete));
         }
         client
             .delete_label(&container.0)
             .await
-            .map_err(account_error)
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::container(bifrost_types::AccountOperation::ContainerDelete)))
     })
 }
 
@@ -303,7 +345,7 @@ pub(crate) fn identities_list(
         let identities = client
             .list_send_as()
             .await
-            .map_err(account_error)?
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::identities_list()))?
             .into_iter()
             .map(|send_as| Identity {
                 id: IdentityId(send_as.send_as_email.clone()),
@@ -349,7 +391,7 @@ pub(crate) fn identity_update(
         client
             .patch_send_as(&identity.0, &body)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::identity_update()))?;
         Ok(())
     })
 }
@@ -358,7 +400,10 @@ pub(crate) fn vacation_get(
     client: Arc<GmailClient>,
 ) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
     Box::pin(async move {
-        let settings = client.get_vacation().await.map_err(account_error)?;
+        let settings = client
+            .get_vacation()
+            .await
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::vacation_get()))?;
         Ok(Some(VacationConfig {
             is_enabled: settings.enable_auto_reply.unwrap_or(false),
             subject: settings.response_subject,
@@ -392,13 +437,13 @@ pub(crate) fn vacation_set(
         client
             .update_vacation(&settings)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::vacation_set()))?;
         Ok(())
     })
 }
 
 pub(crate) fn quota_get() -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::QuotaGet)) })
 }
 
 pub(crate) fn thread_hydrate(
@@ -411,7 +456,7 @@ pub(crate) fn thread_hydrate(
         let gmail_thread = client
             .get_thread(&thread.0, "full")
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::hydrate_thread(thread.0.clone())))?;
         let mut messages = Vec::with_capacity(gmail_thread.messages.len());
         for message in &gmail_thread.messages {
             messages.push(message_from_gmail(&labels, message, HydrationProjection::Full).await?);
@@ -439,7 +484,7 @@ pub(crate) fn message_hydrate(
         let gmail_message = client
             .get_message(&message.0, format)
             .await
-            .map_err(account_error)?;
+            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::hydrate_message(message.0.clone())))?;
         message_from_gmail(&labels, &gmail_message, projection).await
     })
 }
@@ -453,12 +498,26 @@ pub(crate) fn move_thread(
     Box::pin(async move {
         let target_target = MutationTarget::Thread(thread.clone());
         let (add, remove) = add_container_patch(&target);
-        modify_target(&client, target_target, add, remove).await?;
+        modify_target(
+            &client,
+            target_target,
+            add,
+            remove,
+            bifrost_types::AccountOperation::BulkMove,
+        )
+        .await?;
         if let Some(source) = source
             && source != target
         {
             let (add, remove) = remove_container_patch(&source);
-            modify_target(&client, MutationTarget::Thread(thread), add, remove).await?;
+            modify_target(
+                &client,
+                MutationTarget::Thread(thread),
+                add,
+                remove,
+                bifrost_types::AccountOperation::RemoveFromContainer,
+            )
+            .await?;
         }
         Ok(())
     })
@@ -474,10 +533,20 @@ pub(crate) fn delete_thread(
             .as_ref()
             .is_some_and(|id| id.0.eq_ignore_ascii_case(LABEL_TRASH))
         {
-            return client.delete_thread(&thread.0).await.map_err(account_error);
+            return client
+                .delete_thread(&thread.0)
+                .await
+                .map_err(|e| account_error_for(e, recovery::GmailErrorContext::mutation(bifrost_types::AccountOperation::BulkDestroy)));
         }
         let (add, remove) = add_container_patch(&ContainerId(LABEL_TRASH.to_string()));
-        modify_target(&client, MutationTarget::Thread(thread), add, remove).await
+        modify_target(
+            &client,
+            MutationTarget::Thread(thread),
+            add,
+            remove,
+            bifrost_types::AccountOperation::BulkMove,
+        )
+        .await
     })
 }
 
@@ -486,6 +555,7 @@ async fn modify_target(
     target: MutationTarget,
     add_labels: Vec<String>,
     remove_labels: Vec<String>,
+    operation: bifrost_types::AccountOperation,
 ) -> Result<(), AccountError> {
     if add_labels.is_empty() && remove_labels.is_empty() {
         return Ok(());
@@ -495,15 +565,19 @@ async fn modify_target(
             client
                 .modify_message(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(account_error)?;
+                .map_err(|e| {
+                    account_error_for(e, recovery::GmailErrorContext::base(operation))
+                })?;
         }
         MutationTarget::Thread(id) => {
             client
                 .modify_thread(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(account_error)?;
+                .map_err(|e| {
+                    account_error_for(e, recovery::GmailErrorContext::base(operation))
+                })?;
         }
-        _ => return Err(unsupported(bifrost_types::AccountOperation::Discover)),
+        _ => return Err(unsupported(operation)),
     }
     Ok(())
 }
@@ -573,7 +647,7 @@ fn filter_query(filter: &SearchFilter) -> Result<String, AccountError> {
             .collect::<Result<Vec<_>, _>>()
             .map(|items| format!("({})", items.join(" OR "))),
         SearchFilter::Not(filter) => Ok(format!("-({})", filter_query(filter)?)),
-        _ => Err(unsupported(bifrost_types::AccountOperation::Discover)),
+        _ => Err(unsupported(bifrost_types::AccountOperation::Search)),
     }
 }
 
@@ -754,12 +828,16 @@ async fn attachment_inlines(
         collect_attachment_refs(payload, &mut refs);
     }
     let mut attachments = Vec::with_capacity(refs.len());
+    // attachment_inlines is used during draft hydration (draft_update);
+    // the error context is DraftUpdate.
+    let ctx = recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
     for item in refs {
         let attachment = client
             .get_attachment(&message.id, &item.attachment_id)
             .await
-            .map_err(account_error)?;
-        let data = decode_base64url_nopad(&attachment.data).map_err(account_error)?;
+            .map_err(|e| account_error_for(e, ctx.clone()))?;
+        let data =
+            decode_base64url_nopad(&attachment.data).map_err(|e| account_error_for(e, ctx.clone()))?;
         attachments.push(AttachmentInline {
             filename: item.filename,
             mime: item.mime,
@@ -1007,7 +1085,7 @@ fn render_message(
         ));
     }
     if !doc.attachments_uploaded.is_empty() {
-        return Err(unsupported(bifrost_types::AccountOperation::Discover));
+        return Err(unsupported(bifrost_types::AccountOperation::AttachmentUpload));
     }
 
     let mut headers = Vec::new();
@@ -1195,13 +1273,6 @@ fn non_negative_i64(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
-/// Generic fallback PIM error translation. Most PIM paths should
-/// migrate to a Gmail context constructor that reflects the actual
-/// operation (e.g. `recovery::GmailErrorContext::send()` for
-/// `users.messages.send` failures). This shim keeps the existing
-/// call sites compiling against the new translation boundary; per-
-/// site refinement lands as the PIM primitives migrate to typed
-/// operation contexts.
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     recovery::into_account_error(
         crate::error::Error::unsupported(op),
@@ -1216,11 +1287,11 @@ fn other_error(op: bifrost_types::AccountOperation, detail: impl Into<String>) -
     )
 }
 
-fn account_error(error: crate::Error) -> AccountError {
-    recovery::into_account_error(
-        error,
-        recovery::GmailErrorContext::base(bifrost_types::AccountOperation::HydrateMessage),
-    )
+/// Translate a `crate::Error` into `AccountError` with the given
+/// per-call-site context. Every PIM call site uses this so the
+/// operation, scope, and resource are correct for the classification.
+fn account_error_for(error: crate::Error, ctx: recovery::GmailErrorContext) -> AccountError {
+    recovery::into_account_error(error, ctx)
 }
 
 #[cfg(test)]

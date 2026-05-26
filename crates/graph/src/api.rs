@@ -1,8 +1,9 @@
 use crate::client::GraphClient;
+use crate::error::GraphError;
 use crate::types::{GraphMailFolder, GraphProfile, ODataCollection};
 
 impl GraphClient {
-    pub(crate) async fn get_profile(&self) -> Result<GraphProfile, String> {
+    pub(crate) async fn get_profile(&self) -> Result<GraphProfile, GraphError> {
         let prefix = self.api_path_prefix();
         self.get_json(&format!(
             "{prefix}?$select=displayName,mail,userPrincipalName"
@@ -10,7 +11,7 @@ impl GraphClient {
         .await
     }
 
-    pub(crate) async fn list_mail_folders(&self) -> Result<Vec<GraphMailFolder>, String> {
+    pub(crate) async fn list_mail_folders(&self) -> Result<Vec<GraphMailFolder>, GraphError> {
         let prefix = self.api_path_prefix();
         let mut folders = Vec::new();
         let mut next_url = Some(format!(
@@ -30,7 +31,9 @@ impl GraphClient {
         Ok(folders)
     }
 
-    pub(crate) async fn list_mail_folders_recursive(&self) -> Result<Vec<GraphMailFolder>, String> {
+    pub(crate) async fn list_mail_folders_recursive(
+        &self,
+    ) -> Result<Vec<GraphMailFolder>, GraphError> {
         let prefix = self.api_path_prefix();
         let mut folders = self.list_mail_folders().await?;
         let mut queue: std::collections::VecDeque<String> = folders

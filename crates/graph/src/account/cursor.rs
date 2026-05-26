@@ -1,10 +1,39 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    ChangeCursor, CursorScope, Error, FolderId, ObjectType, OpaqueChangeState, OpaqueProgressBytes,
+    ChangeCursor, CursorScope, FolderId, ObjectType, OpaqueChangeState, OpaqueProgressBytes,
     ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
+
+/// Internal cursor-layer errors. Callers translate these to
+/// `AccountError` via `cursor_error_to_account_error` before
+/// emitting them at the account boundary.
+#[derive(Debug)]
+pub(crate) enum CursorError {
+    /// Cursor belongs to a different protocol.
+    ProtocolMismatch,
+    /// Cursor envelope version is ahead of what this build understands.
+    EnvelopeUnknown,
+    /// Cursor envelope version is older than this build can migrate.
+    SchemaIncompatible,
+    /// Cursor operation is not supported for this scope.
+    Unsupported,
+    /// Serialization / deserialization error.
+    Encode(String),
+}
+
+impl std::fmt::Display for CursorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolMismatch => f.write_str("cursor protocol mismatch"),
+            Self::EnvelopeUnknown => f.write_str("cursor envelope version unknown"),
+            Self::SchemaIncompatible => f.write_str("cursor schema incompatible"),
+            Self::Unsupported => f.write_str("unsupported cursor scope"),
+            Self::Encode(msg) => write!(f, "cursor encode/decode error: {msg}"),
+        }
+    }
+}
 
 pub(crate) const GRAPH_CURSOR_ENVELOPE_VERSION: u32 = 1;
 pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
@@ -55,7 +84,7 @@ impl GraphCursorPayload {
     }
 }
 
-pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, Error> {
+pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, CursorError> {
     match scope {
         CursorScope::FolderType { folder, ty } => match ty {
             ObjectType::Email => Ok(GraphCursorKind::Messages {
@@ -67,9 +96,9 @@ pub(crate) fn kind_for_scope(scope: &CursorScope) -> Result<GraphCursorKind, Err
             ObjectType::Contact => Ok(GraphCursorKind::Contacts {
                 folder_id: folder.0.clone(),
             }),
-            _ => Err(Error::Unsupported),
+            _ => Err(CursorError::Unsupported),
         },
-        _ => Err(Error::Unsupported),
+        _ => Err(CursorError::Unsupported),
     }
 }
 
@@ -93,13 +122,14 @@ pub(crate) fn scope_for_kind(kind: &GraphCursorKind) -> CursorScope {
 pub(crate) fn encode_cursor(
     scope: CursorScope,
     payload: GraphCursorPayload,
-) -> Result<ChangeCursor, Error> {
+) -> Result<ChangeCursor, CursorError> {
     let progress = payload
         .advanced_through
         .as_ref()
         .map(encode_page_marker)
         .transpose()?;
-    let bytes = serde_json::to_vec(&payload).map_err(|error| Error::Other(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|error| CursorError::Encode(error.to_string()))?;
     Ok(ChangeCursor {
         scope,
         server_state: OpaqueChangeState {
@@ -112,33 +142,41 @@ pub(crate) fn encode_cursor(
     })
 }
 
-pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<GraphCursorPayload, Error> {
+pub(crate) fn decode_cursor(
+    cursor: &ChangeCursor,
+) -> Result<GraphCursorPayload, CursorError> {
     if cursor.server_state.protocol != ProtocolKind::Graph {
-        return Err(Error::CursorProtocolMismatch);
+        return Err(CursorError::ProtocolMismatch);
     }
     if cursor.server_state.envelope_version > GRAPH_CURSOR_ENVELOPE_VERSION {
-        return Err(Error::CursorEnvelopeUnknown);
+        return Err(CursorError::EnvelopeUnknown);
     }
     if cursor.server_state.envelope_version < GRAPH_CURSOR_ENVELOPE_VERSION {
-        return Err(Error::SchemaIncompatible);
+        return Err(CursorError::SchemaIncompatible);
     }
 
-    let mut payload: GraphCursorPayload = serde_json::from_slice(&cursor.server_state.bytes)
-        .map_err(|error| Error::Other(error.to_string()))?;
+    let mut payload: GraphCursorPayload =
+        serde_json::from_slice(&cursor.server_state.bytes)
+            .map_err(|error| CursorError::Encode(error.to_string()))?;
     if let Some(progress) = cursor.advanced_through.as_ref() {
         payload.advanced_through = Some(decode_page_marker(progress)?);
     }
     Ok(payload)
 }
 
-pub(crate) fn encode_page_marker(marker: &GraphPageMarker) -> Result<OpaqueProgressBytes, Error> {
+pub(crate) fn encode_page_marker(
+    marker: &GraphPageMarker,
+) -> Result<OpaqueProgressBytes, CursorError> {
     serde_json::to_vec(marker)
         .map(OpaqueProgressBytes)
-        .map_err(|error| Error::Other(error.to_string()))
+        .map_err(|error| CursorError::Encode(error.to_string()))
 }
 
-pub(crate) fn decode_page_marker(progress: &OpaqueProgressBytes) -> Result<GraphPageMarker, Error> {
-    serde_json::from_slice(&progress.0).map_err(|error| Error::Other(error.to_string()))
+pub(crate) fn decode_page_marker(
+    progress: &OpaqueProgressBytes,
+) -> Result<GraphPageMarker, CursorError> {
+    serde_json::from_slice(&progress.0)
+        .map_err(|error| CursorError::Encode(error.to_string()))
 }
 
 fn now_unix_secs() -> u64 {
@@ -196,7 +234,7 @@ mod tests {
 
         assert!(matches!(
             decode_cursor(&cursor),
-            Err(Error::CursorProtocolMismatch)
+            Err(CursorError::ProtocolMismatch)
         ));
     }
 
@@ -215,7 +253,7 @@ mod tests {
 
         assert!(matches!(
             decode_cursor(&cursor),
-            Err(Error::CursorEnvelopeUnknown)
+            Err(CursorError::EnvelopeUnknown)
         ));
     }
 
@@ -234,7 +272,7 @@ mod tests {
 
         assert!(matches!(
             decode_cursor(&cursor),
-            Err(Error::SchemaIncompatible)
+            Err(CursorError::SchemaIncompatible)
         ));
     }
 
@@ -251,7 +289,7 @@ mod tests {
             envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
         };
 
-        assert!(matches!(decode_cursor(&cursor), Err(Error::Other(_))));
+        assert!(matches!(decode_cursor(&cursor), Err(CursorError::Encode(_))));
     }
 
     #[test]
@@ -276,7 +314,7 @@ mod tests {
             envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
         };
 
-        assert!(matches!(decode_cursor(&cursor), Err(Error::Other(_))));
+        assert!(matches!(decode_cursor(&cursor), Err(CursorError::Encode(_))));
     }
 
     #[test]
@@ -285,14 +323,14 @@ mod tests {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Mailbox,
         };
-        assert!(matches!(kind_for_scope(&scope), Err(Error::Unsupported)));
+        assert!(matches!(kind_for_scope(&scope), Err(CursorError::Unsupported)));
     }
 
     #[test]
     fn kind_for_scope_rejects_non_folder_type_scope() {
         assert!(matches!(
             kind_for_scope(&CursorScope::Account),
-            Err(Error::Unsupported)
+            Err(CursorError::Unsupported)
         ));
     }
 }

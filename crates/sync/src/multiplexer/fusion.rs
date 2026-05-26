@@ -92,17 +92,16 @@ impl InventoryFusion {
                     }
                     return self.finalize(scope, checkpoint).await;
                 }
-                SyncEvent::Fatal(f) => {
-                    let account_error = f.0.clone();
+                SyncEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
-                            event: Arc::new(SyncEvent::Fatal(f)),
+                            event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
                         };
                         let _ = tx.send(me);
                     }
-                    return Ok(FusionOutcome::Terminated(account_error));
+                    return Ok(FusionOutcome::Terminated(err));
                 }
                 SyncEvent::Batch(batch) => {
                     if let Some(tx) = &changes_tx {

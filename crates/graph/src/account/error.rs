@@ -1,4 +1,4 @@
-//! Legacy Graph error helpers.
+//! Graph error helpers.
 //!
 //! The substring-matching recovery helpers that used to live here
 //! (`graph_error_to_fatal`, `recovery_for_graph_error`,
@@ -7,16 +7,16 @@
 //! Classification is now driven entirely by the typed `GraphSignal`
 //! in `crate::error` and the `into_account_error` translation in
 //! `account::graph_error`.
-//!
-//! `warning_blob_not_byte_stream` survives until Phase 3 updates the
-//! `Warning` shape workspace-wide.
 
-use bifrost_types::{ObjectId, Warning, WarningKind};
+use bifrost_types::{DiagnosticText, ObjectId, Warning, WarningKind};
 
 pub(crate) fn warning_blob_not_byte_stream(id: &ObjectId) -> Warning {
     Warning {
         kind: WarningKind::BlobNotByteStream,
-        message: format!("Graph attachment for object {} is not a byte stream", id.0),
+        message: DiagnosticText::user_safe(format!(
+            "Graph attachment for object {} is not a byte stream",
+            id.0
+        )),
         retry_count: 0,
         next_action: None,
         protocol_detail: None,

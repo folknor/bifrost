@@ -148,7 +148,7 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Fetch full messages by UID without setting `\Seen`.

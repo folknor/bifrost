@@ -159,6 +159,9 @@ pub(crate) fn classify_code(code: &str) -> GraphSignal {
         "MailboxNotEnabledForRESTAPI" => GraphSignal::MailboxNotEnabledForRestApi,
         "MailboxStoreUnavailable" => GraphSignal::MailboxStoreUnavailable,
         "ResyncRequired" => GraphSignal::ResyncRequired,
+        "InvalidDeltaToken" => GraphSignal::InvalidDeltaToken,
+        // Microsoft has shipped both capitalizations in the wild.
+        "SyncStateNotFound" | "syncStateNotFound" => GraphSignal::SyncStateNotFound,
         "TooManyRequests" => GraphSignal::TooManyRequests,
         "GenericFileError" => GraphSignal::GenericFileError,
         "PreconditionFailed" => GraphSignal::PreconditionFailed,
@@ -207,15 +210,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_code_preserves_verbatim_token() {
+    fn invalid_delta_token_classifies_to_typed_variant() {
         let json = r#"{"error":{"code":"InvalidDeltaToken","message":"bad token"}}"#;
         let err = GraphResponseError::from_response(
             StatusCode::BAD_REQUEST,
             HeaderMap::new(),
             body(json),
         );
+        assert!(
+            matches!(err.signal, GraphSignal::InvalidDeltaToken),
+            "expected InvalidDeltaToken, got {:?}",
+            err.signal
+        );
+    }
+
+    #[test]
+    fn unknown_code_preserves_verbatim_token() {
+        let json = r#"{"error":{"code":"SomeUnknownCode","message":"unknown"}}"#;
+        let err = GraphResponseError::from_response(
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            body(json),
+        );
         match err.signal {
-            GraphSignal::Unknown { code } => assert_eq!(code, "InvalidDeltaToken"),
+            GraphSignal::Unknown { code } => assert_eq!(code, "SomeUnknownCode"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -237,6 +255,9 @@ mod tests {
         for (token, want) in [
             ("Gone", "Gone"),
             ("ResyncRequired", "ResyncRequired"),
+            ("InvalidDeltaToken", "InvalidDeltaToken"),
+            ("SyncStateNotFound", "SyncStateNotFound"),
+            ("syncStateNotFound", "SyncStateNotFound"),
             ("PreconditionFailed", "PreconditionFailed"),
             ("TooManyRequests", "TooManyRequests"),
             ("MailboxNotEnabledForRESTAPI", "MailboxNotEnabledForRESTAPI"),
@@ -249,6 +270,8 @@ mod tests {
             let label = match signal {
                 GraphSignal::Gone => "Gone",
                 GraphSignal::ResyncRequired => "ResyncRequired",
+                GraphSignal::InvalidDeltaToken => "InvalidDeltaToken",
+                GraphSignal::SyncStateNotFound => "SyncStateNotFound",
                 GraphSignal::PreconditionFailed => "PreconditionFailed",
                 GraphSignal::TooManyRequests => "TooManyRequests",
                 GraphSignal::MailboxNotEnabledForRestApi => "MailboxNotEnabledForRESTAPI",

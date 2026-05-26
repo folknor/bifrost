@@ -63,8 +63,8 @@ pub async fn run_readback_guard(
                 }
             }
             SyncEvent::Done(_) => break,
-            SyncEvent::Fatal(f) => {
-                return Err(Error::Account(f.0.clone()));
+            SyncEvent::Terminated(err) => {
+                return Err(Error::Account(err));
             }
             SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
             _ => {}

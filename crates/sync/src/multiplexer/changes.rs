@@ -95,12 +95,9 @@ pub async fn drive_changes_stream(
         let is_done = matches!(&event, SyncEvent::Done(_));
         // Capture the full `AccountError` so the engine has the
         // derived recovery, scope, operation, provider, protocol, and
-        // diagnostics on hand. Phase 3 renames the variant to
-        // `Terminated`; until then we still match `SyncEvent::Fatal`
-        // (whose payload `Fatal.0` is already the new-model
-        // `AccountError`).
-        let terminated_error = if let SyncEvent::Fatal(f) = &event {
-            Some(f.0.clone())
+        // diagnostics on hand.
+        let terminated_error = if let SyncEvent::Terminated(err) = &event {
+            Some(err.clone())
         } else {
             None
         };

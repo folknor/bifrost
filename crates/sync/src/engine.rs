@@ -476,20 +476,24 @@ impl SyncEngine {
         // before broadcasting cold-start inventory batches, so those
         // batches do not vanish during attach.
         if !deferred_inventory_scopes.is_empty() {
+            let inventory_factory = Arc::clone(&factory);
             let inventory_account = Arc::clone(&current);
             let inventory_cursors = Arc::clone(&cursors);
             let inventory_store = Arc::clone(&self.checkpoints);
             let inventory_changes = changes_tx.clone();
             let inventory_shutdown = shutdown.clone();
             let inventory_aid = account_id.clone();
+            let inventory_control = control.clone();
             spawn(tokio::spawn(async move {
                 run_deferred_inventory_establishment(
+                    inventory_factory,
                     inventory_account,
                     inventory_cursors,
                     inventory_store,
                     inventory_changes,
                     inventory_shutdown,
                     inventory_aid,
+                    inventory_control,
                     deferred_inventory_scopes,
                 )
                 .await;
@@ -864,12 +868,12 @@ impl SyncEngine {
                             );
                         }
                     }
-                    bifrost_types::SyncEvent::Fatal(f) => {
+                    bifrost_types::SyncEvent::Terminated(err) => {
                         // Stream-level terminating event: dispatch via
                         // `error.recovery()`. Retry / Reconcile let
                         // the campaign continue; Engine and terminal
                         // bail.
-                        let recovery = f.0.recovery().clone();
+                        let recovery = err.recovery().clone();
                         match recovery {
                             RecoveryClass::Retry(advice) => {
                                 stream_termination_advice = Some(advice);
@@ -893,9 +897,9 @@ impl SyncEngine {
                                 break;
                             }
                             RecoveryClass::Engine(_) => {
-                                return Err(Error::Account(f.0.clone()));
+                                return Err(Error::Account(err));
                             }
-                            _ => return Err(Error::Account(f.0.clone())),
+                            _ => return Err(Error::Account(err)),
                         }
                     }
                     bifrost_types::SyncEvent::Done(_) => break,
@@ -964,8 +968,8 @@ impl SyncEngine {
             match event {
                 SyncEvent::Batch(batch) => out.extend(batch.items),
                 SyncEvent::Done(_) => break,
-                SyncEvent::Fatal(f) => {
-                    return Err(Error::Account(f.0.clone()));
+                SyncEvent::Terminated(err) => {
+                    return Err(Error::Account(err));
                 }
                 SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
                 // Future `SyncEvent` variants are ignored here; the
@@ -1299,12 +1303,14 @@ fn backfill_plan_for(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_deferred_inventory_establishment(
+    factory: Arc<dyn AccountFactory>,
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     cursors: Arc<CursorRegistry>,
     store: Arc<DynCheckpointStore>,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     shutdown: CancellationToken,
     account_id: AccountId,
+    control: crate::control::SyncControl,
     scopes: Vec<CursorScope>,
 ) {
     if !wait_for_real_subscriber(&changes_tx, &shutdown).await {
@@ -1345,20 +1351,24 @@ async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
-                // The fusion already broadcast the terminating event;
-                // log the structured account error for telemetry. The
-                // multiplexer poll loop or push reconciler will pick
-                // up the recovery via subsequent change-stream
-                // terminations once a cursor exists.
-                tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    account = ?account_id,
-                    scope = ?scope,
-                    kind = ?error.kind(),
-                    message_key = error.message_key(),
-                    recovery = ?error.recovery(),
-                    "deferred inventory terminated"
-                );
+                // The fusion already broadcast the terminating event.
+                // Route the error through `handle_account_error` so
+                // engine directives (RestartScope, RestartAccount,
+                // SchemaIncompatible, etc.) are dispatched, and
+                // terminal errors emit structured telemetry via the
+                // same path as every other recovery.
+                handle_account_error(
+                    &factory,
+                    &account,
+                    &cursors,
+                    &store,
+                    &changes_tx,
+                    &account_id,
+                    &control,
+                    Some(scope.clone()),
+                    error,
+                )
+                .await;
             }
             Err(err) => {
                 tracing::warn!(
@@ -1408,11 +1418,11 @@ async fn link_discovered_memberships(
                 }
             }
             SyncEvent::Done(_) => break,
-            SyncEvent::Fatal(f) => {
+            SyncEvent::Terminated(err) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    kind = ?f.0.kind(),
-                    message_key = f.0.message_key(),
+                    kind = ?err.kind(),
+                    message_key = err.message_key(),
                     "discover_memberships terminated; continuing without index"
                 );
                 break;

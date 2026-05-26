@@ -95,8 +95,8 @@ pub use ids::{
 
 // Mutation + projection + hydration types.
 pub use mutation::{
-    Fingerprint, FlagOp, HydratedObject, HydratedObjectKind, IdempotencyKey, MutationOutcome,
-    MutationResult, Projection, ProtocolSalt, ServerVersion,
+    Fingerprint, FlagOp, HydratedObject, HydratedObjectKind, IdempotencyKey, Projection,
+    ProtocolSalt, ServerVersion,
 };
 
 // Pagination.

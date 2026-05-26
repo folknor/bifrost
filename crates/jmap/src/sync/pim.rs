@@ -8,24 +8,13 @@ use bifrost_types::{
     LabelId, Message, MutationTarget, ObjectId, Page, Provenance, QuotaInfo, SearchFilter,
     SearchRequest, ThreadHydration, ThreadId, VacationConfig,
 };
-// Until Phase 3 rewrites the `Account` trait surface, every PIM
-// method returns `Result<_, Error>` where the Phase-2-removed `Error`
-// alias is the old bifrost-types error. Phase 3 changes the trait to
-// `Result<_, AccountError>`. Until then, every call site funnels
-// errors through this thin shim which delegates to the new
-// `super::error::into_account_error` with a defensive `Discover`
-// fallback operation. The shim name avoids the identifiers the
-// roadmap audit greps for. Sites that have natural operation context
-// should switch to `super::error::into_account_error` directly with a
-// proper `JmapErrorContext`; this shim is the bulk-migration baseline.
-type Error = AccountError;
-
+/// Convert a crate-internal error to `AccountError` with the correct
+/// `AccountOperation` for this call site. Every call site in this
+/// module passes the operation that produced the error; `Discover` is
+/// no longer used as a default.
 #[inline]
-fn to_acct_err_pim(err: crate::Error) -> AccountError {
-    super::error::into_account_error(
-        err,
-        super::error::JmapErrorContext::new(AccountOperation::Discover),
-    )
+fn to_acct_err(op: AccountOperation) -> impl Fn(crate::Error) -> AccountError {
+    move |err| super::error::into_account_error(err, super::error::JmapErrorContext::new(op))
 }
 
 /// Local helper for search-cursor decode failures: the page cursor
@@ -77,10 +66,18 @@ pub(crate) fn add_to_container(
     email_state: Arc<Mutex<Option<String>>>,
     target: MutationTarget,
     container: ContainerId,
-) -> AccountFuture<Result<(), Error>> {
-    Box::pin(
-        async move { patch_mailbox_membership(&mail, &email_state, target, container, true).await },
-    )
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        patch_mailbox_membership(
+            &mail,
+            &email_state,
+            target,
+            container,
+            true,
+            AccountOperation::AddToContainer,
+        )
+        .await
+    })
 }
 
 pub(crate) fn remove_from_container(
@@ -88,9 +85,17 @@ pub(crate) fn remove_from_container(
     email_state: Arc<Mutex<Option<String>>>,
     target: MutationTarget,
     container: ContainerId,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        patch_mailbox_membership(&mail, &email_state, target, container, false).await
+        patch_mailbox_membership(
+            &mail,
+            &email_state,
+            target,
+            container,
+            false,
+            AccountOperation::RemoveFromContainer,
+        )
+        .await
     })
 }
 
@@ -100,21 +105,26 @@ pub(crate) fn set_keyword(
     target: MutationTarget,
     keyword: String,
     value: bool,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let ids = resolve_target(&mail, target).await?;
+        let ids = resolve_target(&mail, target, AccountOperation::SetKeyword).await?;
         let keyword_for_set = keyword.clone();
         let ids_for_set = ids.clone();
-        let mut response = send_email_set_with_retry(&mail, &email_state, move |state| {
-            let mut set = EmailSet::new().if_in_state(state.to_string());
-            for id in &ids_for_set {
-                set.update(id.clone()).keyword(&keyword_for_set, value);
-            }
-            set
-        })
+        let mut response = send_email_set_with_retry(
+            &mail,
+            &email_state,
+            AccountOperation::SetKeyword,
+            move |state| {
+                let mut set = EmailSet::new().if_in_state(state.to_string());
+                for id in &ids_for_set {
+                    set.update(id.clone()).keyword(&keyword_for_set, value);
+                }
+                set
+            },
+        )
         .await?;
         for id in &ids {
-            response.updated(id).map_err(to_acct_err_pim)?;
+            response.updated(id).map_err(to_acct_err(AccountOperation::SetKeyword))?;
         }
         Ok(())
     })
@@ -125,7 +135,7 @@ pub(crate) fn set_is_read(
     email_state: Arc<Mutex<Option<String>>>,
     target: MutationTarget,
     is_read: bool,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     set_keyword(mail, email_state, target, SEEN_KEYWORD.to_string(), is_read)
 }
 
@@ -133,7 +143,7 @@ pub(crate) fn send_message(
     mail: MailAccount,
     email_state: Arc<Mutex<Option<String>>>,
     request: bifrost_types::SendRequest,
-) -> AccountFuture<Result<ObjectId, Error>> {
+) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         let identity = request.identity.clone();
         let envelope_from = request.from.clone();
@@ -144,11 +154,11 @@ pub(crate) fn send_message(
             .chain(&request.bcc)
             .cloned()
             .collect::<Vec<_>>();
-        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts).await?;
+        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts, AccountOperation::Send).await?;
         let sent_mailbox = if request.save_to_sent == Some(false) {
             None
         } else {
-            Some(role_mailbox(&mail, FolderRole::Sent).await?)
+            Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
         };
 
         let create = build_email_create_from_send(&mail, request, draft_mailbox).await?;
@@ -183,22 +193,25 @@ pub(crate) fn send_message(
         }
 
         let mut batch = mail.build();
-        let email_handle = batch.call(email_set).map_err(to_acct_err_pim)?;
+        let email_handle = batch.call(email_set).map_err(to_acct_err(AccountOperation::Send))?;
         let email_ref = email_handle.result_reference(format!("/created/{email_create_id}/id"));
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
             .email_id_ref(email_ref);
-        let submission_handle = batch.call(submission_set).map_err(to_acct_err_pim)?;
+        let submission_handle =
+            batch.call(submission_set).map_err(to_acct_err(AccountOperation::Send))?;
 
-        let mut response = batch.send().await.map_err(to_acct_err_pim)?;
-        let mut email_response = response.get(&email_handle).map_err(to_acct_err_pim)?;
-        let mut submission_response = response.get(&submission_handle).map_err(to_acct_err_pim)?;
+        let mut response = batch.send().await.map_err(to_acct_err(AccountOperation::Send))?;
+        let mut email_response =
+            response.get(&email_handle).map_err(to_acct_err(AccountOperation::Send))?;
+        let mut submission_response =
+            response.get(&submission_handle).map_err(to_acct_err(AccountOperation::Send))?;
         let mut email = email_response
             .created(&email_create_id)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::Send))?;
         submission_response
             .created(SUBMISSION_CREATE_ID)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::Send))?;
 
         if !email_response.new_state().is_empty() {
             advance_email_state(&email_state, None, email_response.new_state().to_string()).await;
@@ -210,9 +223,9 @@ pub(crate) fn send_message(
 
 pub(crate) fn attachment_upload(
     mail: MailAccount,
-    mut bytes: AccountStream<Result<Bytes, Error>>,
+    mut bytes: AccountStream<Result<Bytes, AccountError>>,
     mime: String,
-) -> AccountFuture<Result<bifrost_types::AttachmentHandle, Error>> {
+) -> AccountFuture<Result<bifrost_types::AttachmentHandle, AccountError>> {
     Box::pin(async move {
         let mut data = Vec::new();
         while let Some(chunk) = bytes.next().await {
@@ -222,7 +235,7 @@ pub(crate) fn attachment_upload(
         let blob = mail
             .upload(data, Some(&mime))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::AttachmentUpload))?;
         Ok(bifrost_types::AttachmentHandle(encode_attachment_handle(
             blob.blob_id.as_str(),
             Some(&mime),
@@ -234,17 +247,25 @@ pub(crate) fn draft_create(
     mail: MailAccount,
     email_state: Arc<Mutex<Option<String>>>,
     patch: bifrost_types::DraftPatch,
-) -> AccountFuture<Result<bifrost_types::DraftHandle, Error>> {
+) -> AccountFuture<Result<bifrost_types::DraftHandle, AccountError>> {
     Box::pin(async move {
-        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts).await?;
-        let create = build_email_create_from_draft(&mail, patch, draft_mailbox).await?;
+        let draft_mailbox =
+            role_mailbox(&mail, FolderRole::Drafts, AccountOperation::DraftCreate).await?;
+        let create =
+            build_email_create_from_draft(&mail, patch, draft_mailbox, AccountOperation::DraftCreate)
+                .await?;
         let mut set = EmailSet::new();
         let create_id = set.create_item(create);
-        let mut response = mail.call(set).await.map_err(to_acct_err_pim)?;
+        let mut response = mail
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::DraftCreate))?;
         if !response.new_state().is_empty() {
             advance_email_state(&email_state, None, response.new_state().to_string()).await;
         }
-        let mut email = response.created(&create_id).map_err(to_acct_err_pim)?;
+        let mut email = response
+            .created(&create_id)
+            .map_err(to_acct_err(AccountOperation::DraftCreate))?;
         Ok(bifrost_types::DraftHandle(email.take_id().into_string()))
     })
 }
@@ -254,19 +275,26 @@ pub(crate) fn draft_update(
     email_state: Arc<Mutex<Option<String>>>,
     draft: bifrost_types::DraftHandle,
     patch: bifrost_types::DraftPatch,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let email_id = EmailId::new(draft.0);
         let mut email_patch = EmailPatch::default();
-        apply_draft_patch_to_email_patch(&mail, &mut email_patch, patch).await?;
+        apply_draft_patch_to_email_patch(&mail, &mut email_patch, patch, AccountOperation::DraftUpdate).await?;
         let email_id_for_set = email_id.clone();
-        let mut response = send_email_set_with_retry(&mail, &email_state, move |state| {
-            let mut set = EmailSet::new().if_in_state(state.to_string());
-            set.update_item(email_id_for_set.clone(), email_patch.clone());
-            set
-        })
+        let mut response = send_email_set_with_retry(
+            &mail,
+            &email_state,
+            AccountOperation::DraftUpdate,
+            move |state| {
+                let mut set = EmailSet::new().if_in_state(state.to_string());
+                set.update_item(email_id_for_set.clone(), email_patch.clone());
+                set
+            },
+        )
         .await?;
-        response.updated(&email_id).map_err(to_acct_err_pim)?;
+        response
+            .updated(&email_id)
+            .map_err(to_acct_err(AccountOperation::DraftUpdate))?;
         Ok(())
     })
 }
@@ -275,18 +303,27 @@ pub(crate) fn draft_discard(
     mail: MailAccount,
     email_state: Arc<Mutex<Option<String>>>,
     draft: bifrost_types::DraftHandle,
-) -> AccountFuture<Result<(), Error>> {
-    Box::pin(async move { destroy_emails(&mail, &email_state, [EmailId::new(draft.0)]).await })
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        destroy_emails(
+            &mail,
+            &email_state,
+            [EmailId::new(draft.0)],
+            AccountOperation::DraftDiscard,
+        )
+        .await
+    })
 }
 
 pub(crate) fn draft_send(
     mail: MailAccount,
     email_state: Arc<Mutex<Option<String>>>,
     draft: bifrost_types::DraftHandle,
-) -> AccountFuture<Result<ObjectId, Error>> {
+) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         let draft_id = EmailId::new(draft.0.clone());
-        let sent_mailbox = role_mailbox(&mail, FolderRole::Sent).await?;
+        let sent_mailbox =
+            role_mailbox(&mail, FolderRole::Sent, AccountOperation::DraftSend).await?;
         let mut submission_set = EmailSubmissionSet::new();
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
@@ -295,13 +332,16 @@ pub(crate) fn draft_send(
         submission_set
             .on_success_update_email(SUBMISSION_CREATE_ID)
             .mailbox_ids([sent_mailbox]);
-        let mut response = mail.call(submission_set).await.map_err(to_acct_err_pim)?;
+        let mut response = mail
+            .call(submission_set)
+            .await
+            .map_err(to_acct_err(AccountOperation::DraftSend))?;
         response
             .created(SUBMISSION_CREATE_ID)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::DraftSend))?;
         let fresh = super::mutation::probe_email_state(&mail)
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::DraftSend))?;
         set_email_state(&email_state, fresh).await;
         Ok(ObjectId(draft_id.into_string()))
     })
@@ -310,9 +350,9 @@ pub(crate) fn draft_send(
 pub(crate) fn search(
     mail: MailAccount,
     request: SearchRequest,
-) -> AccountFuture<Result<Page<ThreadId>, Error>> {
+) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
-        let page = search_email_ids(&mail, request, true).await?;
+        let page = search_email_ids(&mail, request, true, AccountOperation::Search).await?;
         if page.items.is_empty() {
             return Ok(Page {
                 items: Vec::new(),
@@ -327,7 +367,7 @@ pub(crate) fn search(
                     .properties([EmailProperty::Id, EmailProperty::ThreadId]),
             )
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::Search))?;
         let mut items = Vec::new();
         for email in response.into_list() {
             if let Some(thread) = email.thread_id() {
@@ -345,9 +385,10 @@ pub(crate) fn search(
 pub(crate) fn search_messages(
     mail: MailAccount,
     request: SearchRequest,
-) -> AccountFuture<Result<Page<ObjectId>, Error>> {
+) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
-        let page = search_email_ids(&mail, request, false).await?;
+        let page =
+            search_email_ids(&mail, request, false, AccountOperation::SearchMessages).await?;
         Ok(Page {
             items: page
                 .items
@@ -360,8 +401,10 @@ pub(crate) fn search_messages(
     })
 }
 
-pub(crate) fn containers_list(mail: MailAccount) -> AccountFuture<Result<Vec<Container>, Error>> {
-    Box::pin(async move { fetch_containers(&mail).await })
+pub(crate) fn containers_list(
+    mail: MailAccount,
+) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+    Box::pin(async move { fetch_containers(&mail, AccountOperation::ContainersList).await })
 }
 
 pub(crate) fn container_create(
@@ -370,13 +413,13 @@ pub(crate) fn container_create(
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
-) -> AccountFuture<Result<ContainerId, Error>> {
+) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::ContainerCreate,
                 None,
-                "JMAP does not support this operation",
+                "JMAP only supports folder containers",
             ));
         }
         let mut set = MailboxSet::new();
@@ -384,11 +427,16 @@ pub(crate) fn container_create(
         create.name(name);
         create.parent_id(parent.map(|id| MailboxId::new(id.0)));
         let create_id = set.create_item(create);
-        let mut response = mail.call(set).await.map_err(to_acct_err_pim)?;
+        let mut response = mail
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
-        let mut mailbox = response.created(&create_id).map_err(to_acct_err_pim)?;
+        let mut mailbox = response
+            .created(&create_id)
+            .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
         Ok(ContainerId(mailbox.take_id().into_string()))
     })
 }
@@ -398,13 +446,18 @@ pub(crate) fn container_rename(
     mailbox_state: Arc<Mutex<Option<String>>>,
     container: ContainerId,
     name: String,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let mailbox = MailboxId::new(container.0);
         let mut set = MailboxSet::new();
         set.update(mailbox).name(name);
-        let response = mail.call(set).await.map_err(to_acct_err_pim)?;
-        response.unwrap_update_errors().map_err(to_acct_err_pim)?;
+        let response = mail
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::ContainerRename))?;
+        response
+            .unwrap_update_errors()
+            .map_err(to_acct_err(AccountOperation::ContainerRename))?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -417,14 +470,19 @@ pub(crate) fn container_move(
     mailbox_state: Arc<Mutex<Option<String>>>,
     container: ContainerId,
     new_parent: Option<ContainerId>,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let mailbox = MailboxId::new(container.0);
         let mut set = MailboxSet::new();
         set.update(mailbox)
             .parent_id(new_parent.map(|id| MailboxId::new(id.0)));
-        let response = mail.call(set).await.map_err(to_acct_err_pim)?;
-        response.unwrap_update_errors().map_err(to_acct_err_pim)?;
+        let response = mail
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::ContainerMove))?;
+        response
+            .unwrap_update_errors()
+            .map_err(to_acct_err(AccountOperation::ContainerMove))?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -436,7 +494,7 @@ pub(crate) fn container_delete(
     mail: MailAccount,
     mailbox_state: Arc<Mutex<Option<String>>>,
     container: ContainerId,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let mailbox = MailboxId::new(container.0);
         let mut response = mail
@@ -446,8 +504,10 @@ pub(crate) fn container_delete(
                     .on_destroy_remove_emails(false),
             )
             .await
-            .map_err(to_acct_err_pim)?;
-        response.destroyed(&mailbox).map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
+        response
+            .destroyed(&mailbox)
+            .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -457,13 +517,13 @@ pub(crate) fn container_delete(
 
 pub(crate) fn identities_list(
     submission: Option<MailAccount>,
-) -> AccountFuture<Result<Vec<bifrost_types::Identity>, Error>> {
+) -> AccountFuture<Result<Vec<bifrost_types::Identity>, AccountError>> {
     Box::pin(async move {
         let Some(account) = submission else {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::IdentitiesList,
                 None,
-                "JMAP does not support this operation",
+                "JMAP submission capability not available",
             ));
         };
         let response = account
@@ -476,7 +536,7 @@ pub(crate) fn identities_list(
                 crate::identity::Property::HtmlSignature,
             ]))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::IdentitiesList))?;
         let mut identities = Vec::new();
         for (idx, mut identity) in response.into_list().into_iter().enumerate() {
             let id = identity.take_id().into_string();
@@ -502,20 +562,20 @@ pub(crate) fn identity_update(
     submission: Option<MailAccount>,
     identity: bifrost_types::IdentityId,
     patch: bifrost_types::IdentityPatch,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let Some(account) = submission else {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::IdentityUpdate,
                 None,
-                "JMAP does not support this operation",
+                "JMAP submission capability not available",
             ));
         };
         if patch.is_default.is_some() {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::IdentityUpdate,
                 None,
-                "JMAP does not support this operation",
+                "JMAP does not support setting default identity",
             ));
         }
         let mut set = IdentitySet::new();
@@ -541,26 +601,31 @@ pub(crate) fn identity_update(
             let values = reply_to.into_iter().map(address_to_jmap);
             item.reply_to(Some(values));
         }
-        let response = account.call(set).await.map_err(to_acct_err_pim)?;
-        response.unwrap_update_errors().map_err(to_acct_err_pim)
+        let response = account
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::IdentityUpdate))?;
+        response
+            .unwrap_update_errors()
+            .map_err(to_acct_err(AccountOperation::IdentityUpdate))
     })
 }
 
 pub(crate) fn vacation_get(
     vacation: Option<MailAccount>,
-) -> AccountFuture<Result<Option<VacationConfig>, Error>> {
+) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
     Box::pin(async move {
         let Some(account) = vacation else {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::VacationGet,
                 None,
-                "JMAP does not support this operation",
+                "JMAP vacation capability not available",
             ));
         };
         let mut response = account
             .call(VacationResponseGet::new().ids([VacationResponseId::new("singleton")]))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::VacationGet))?;
         let Some(vacation) = response.pop() else {
             return Ok(None);
         };
@@ -578,13 +643,13 @@ pub(crate) fn vacation_get(
 pub(crate) fn vacation_set(
     vacation: Option<MailAccount>,
     config: VacationConfig,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let Some(account) = vacation else {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::VacationSet,
                 None,
-                "JMAP does not support this operation",
+                "JMAP vacation capability not available",
             ));
         };
         let mut set = VacationResponseSet::new();
@@ -615,20 +680,25 @@ pub(crate) fn vacation_set(
         } else {
             patch.null_property("toDate");
         }
-        let response = account.call(set).await.map_err(to_acct_err_pim)?;
-        response.unwrap_update_errors().map_err(to_acct_err_pim)
+        let response = account
+            .call(set)
+            .await
+            .map_err(to_acct_err(AccountOperation::VacationSet))?;
+        response
+            .unwrap_update_errors()
+            .map_err(to_acct_err(AccountOperation::VacationSet))
     })
 }
 
 pub(crate) fn quota_get(
     quota: Option<MailAccount>,
-) -> AccountFuture<Result<Option<QuotaInfo>, Error>> {
+) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
     Box::pin(async move {
         let Some(account) = quota else {
             return Err(super::error::unsupported_error(
-                AccountOperation::Discover,
+                AccountOperation::QuotaGet,
                 None,
-                "JMAP does not support this operation",
+                "JMAP quota capability not available",
             ));
         };
         let response = account
@@ -638,7 +708,7 @@ pub(crate) fn quota_get(
                 QuotaProperty::HardLimit,
             ]))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::QuotaGet))?;
         let mut fallback = None;
         for quota in response.into_list() {
             let info = QuotaInfo {
@@ -657,7 +727,7 @@ pub(crate) fn quota_get(
 pub(crate) fn thread_hydrate(
     mail: MailAccount,
     thread: ThreadId,
-) -> AccountFuture<Result<ThreadHydration, Error>> {
+) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
         let jmap_thread_id = JmapThreadId::new(thread.0.clone());
         let mut thread_response = mail
@@ -666,7 +736,7 @@ pub(crate) fn thread_hydrate(
                 crate::thread::Property::EmailIds,
             ]))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::HydrateThread))?;
         let thread_object = thread_response.pop().ok_or_else(|| {
             super::error::into_account_error(
                 crate::Error::IdNotFound(thread.0.clone()),
@@ -694,7 +764,7 @@ pub(crate) fn thread_hydrate(
                     .body_properties(body_properties()),
             )
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(AccountOperation::HydrateThread))?;
         let mut by_id = response
             .into_list()
             .into_iter()
@@ -717,7 +787,7 @@ pub(crate) fn message_hydrate(
     mail: MailAccount,
     message: ObjectId,
     projection: HydrationProjection,
-) -> AccountFuture<Result<Message, Error>> {
+) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
         let mut get = EmailGet::new()
             .ids([EmailId::new(message.0.clone())])
@@ -736,7 +806,10 @@ pub(crate) fn message_hydrate(
         if let HydrationProjection::Preview(max) = projection {
             get = get.max_body_value_bytes(max);
         }
-        let mut response = mail.call(get).await.map_err(to_acct_err_pim)?;
+        let mut response = mail
+            .call(get)
+            .await
+            .map_err(to_acct_err(AccountOperation::HydrateMessage))?;
         let email = response.pop().ok_or_else(|| {
             super::error::into_account_error(
                 crate::Error::IdNotFound(message.0.clone()),
@@ -757,7 +830,7 @@ pub(crate) fn move_thread(
     thread: ThreadId,
     target: ContainerId,
     source: Option<ContainerId>,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         patch_mailbox_membership(
             &mail,
@@ -765,6 +838,7 @@ pub(crate) fn move_thread(
             MutationTarget::Thread(thread.clone()),
             target,
             true,
+            AccountOperation::BulkMove,
         )
         .await?;
         if let Some(source) = source {
@@ -774,6 +848,7 @@ pub(crate) fn move_thread(
                 MutationTarget::Thread(thread),
                 source,
                 false,
+                AccountOperation::RemoveFromContainer,
             )
             .await?;
         }
@@ -786,9 +861,9 @@ pub(crate) fn delete_thread(
     email_state: Arc<Mutex<Option<String>>>,
     thread: ThreadId,
     current: Option<ContainerId>,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let trash = role_mailbox(&mail, FolderRole::Trash).await?;
+        let trash = role_mailbox(&mail, FolderRole::Trash, AccountOperation::BulkDestroy).await?;
         // JMAP mailbox ids are server-issued opaque strings and RFC
         // 8620 leaves case-sensitivity to the server, but two
         // mailboxes that differ only in case is a pathological shape
@@ -800,8 +875,10 @@ pub(crate) fn delete_thread(
             .as_ref()
             .is_some_and(|id| id.0.eq_ignore_ascii_case(trash.as_str()));
         if already_in_trash {
-            let ids = resolve_target(&mail, MutationTarget::Thread(thread)).await?;
-            destroy_emails(&mail, &email_state, ids).await
+            let ids =
+                resolve_target(&mail, MutationTarget::Thread(thread), AccountOperation::BulkDestroy)
+                    .await?;
+            destroy_emails(&mail, &email_state, ids, AccountOperation::BulkDestroy).await
         } else {
             patch_mailbox_membership(
                 &mail,
@@ -809,6 +886,7 @@ pub(crate) fn delete_thread(
                 MutationTarget::Thread(thread.clone()),
                 ContainerId(trash.into_string()),
                 true,
+                AccountOperation::BulkMove,
             )
             .await?;
             if let Some(source) = current {
@@ -818,6 +896,7 @@ pub(crate) fn delete_thread(
                     MutationTarget::Thread(thread),
                     source,
                     false,
+                    AccountOperation::RemoveFromContainer,
                 )
                 .await?;
             }
@@ -832,25 +911,31 @@ async fn patch_mailbox_membership(
     target: MutationTarget,
     container: ContainerId,
     value: bool,
-) -> Result<(), Error> {
-    let ids = resolve_target(mail, target).await?;
+    op: AccountOperation,
+) -> Result<(), AccountError> {
+    let ids = resolve_target(mail, target, op).await?;
     let mailbox = MailboxId::new(container.0);
     let ids_for_set = ids.clone();
-    let mut response = send_email_set_with_retry(mail, email_state, move |state| {
-        let mut set = EmailSet::new().if_in_state(state.to_string());
-        for id in &ids_for_set {
-            set.update(id.clone()).mailbox_id(&mailbox, value);
-        }
-        set
-    })
-    .await?;
+    let mut response =
+        send_email_set_with_retry(mail, email_state, op, move |state| {
+            let mut set = EmailSet::new().if_in_state(state.to_string());
+            for id in &ids_for_set {
+                set.update(id.clone()).mailbox_id(&mailbox, value);
+            }
+            set
+        })
+        .await?;
     for id in &ids {
-        response.updated(id).map_err(to_acct_err_pim)?;
+        response.updated(id).map_err(to_acct_err(op))?;
     }
     Ok(())
 }
 
-async fn resolve_target(mail: &MailAccount, target: MutationTarget) -> Result<Vec<EmailId>, Error> {
+async fn resolve_target(
+    mail: &MailAccount,
+    target: MutationTarget,
+    op: AccountOperation,
+) -> Result<Vec<EmailId>, AccountError> {
     match target {
         MutationTarget::Message(id) => Ok(vec![EmailId::new(id.0)]),
         MutationTarget::Thread(thread) => {
@@ -861,7 +946,7 @@ async fn resolve_target(mail: &MailAccount, target: MutationTarget) -> Result<Ve
                         .properties([crate::thread::Property::EmailIds]),
                 )
                 .await
-                .map_err(to_acct_err_pim)?;
+                .map_err(to_acct_err(op))?;
             let thread = response.pop().ok_or_else(|| {
                 super::error::into_account_error(
                     crate::Error::IdNotFound(thread.0.clone()),
@@ -874,9 +959,9 @@ async fn resolve_target(mail: &MailAccount, target: MutationTarget) -> Result<Ve
             Ok(thread.email_ids().to_vec())
         }
         _ => Err(super::error::unsupported_error(
-            AccountOperation::Discover,
+            op,
             None,
-            "JMAP does not support this operation",
+            "JMAP does not support this mutation target",
         )),
     }
 }
@@ -885,20 +970,22 @@ async fn destroy_emails(
     mail: &MailAccount,
     email_state: &Arc<Mutex<Option<String>>>,
     ids: impl IntoIterator<Item = EmailId> + Clone + Send + 'static,
-) -> Result<(), Error> {
+    op: AccountOperation,
+) -> Result<(), AccountError> {
     let ids_vec = ids.into_iter().collect::<Vec<_>>();
     if ids_vec.is_empty() {
         return Ok(());
     }
     let ids_for_set = ids_vec.clone();
-    let mut response = send_email_set_with_retry(mail, email_state, move |state| {
-        EmailSet::new()
-            .if_in_state(state.to_string())
-            .destroy(ids_for_set.clone())
-    })
-    .await?;
+    let mut response =
+        send_email_set_with_retry(mail, email_state, op, move |state| {
+            EmailSet::new()
+                .if_in_state(state.to_string())
+                .destroy(ids_for_set.clone())
+        })
+        .await?;
     for id in &ids_vec {
-        response.destroyed(id).map_err(to_acct_err_pim)?;
+        response.destroyed(id).map_err(to_acct_err(op))?;
     }
     Ok(())
 }
@@ -906,24 +993,26 @@ async fn destroy_emails(
 async fn send_email_set_with_retry<F>(
     mail: &MailAccount,
     email_state: &Arc<Mutex<Option<String>>>,
+    op: AccountOperation,
     mut make_set: F,
-) -> Result<crate::core::set::SetResponse<Email>, Error>
+) -> Result<crate::core::set::SetResponse<Email>, AccountError>
 where
     F: FnMut(&str) -> EmailSet,
 {
-    let mut state = current_or_probe_email_state(mail, email_state).await?;
+    let mut state = current_or_probe_email_state(mail, email_state, op).await?;
+    let err_fn = to_acct_err(op);
     let response = match mail.call(make_set(&state)).await {
         Ok(response) => response,
         Err(err) => {
             if !super::error::is_state_mismatch(&err) {
-                return Err(to_acct_err_pim(err));
+                return Err(err_fn(err));
             }
             let fresh = super::mutation::probe_email_state(mail)
                 .await
-                .map_err(to_acct_err_pim)?;
+                .map_err(to_acct_err(op))?;
             set_email_state(email_state, fresh.clone()).await;
             state = fresh;
-            mail.call(make_set(&state)).await.map_err(to_acct_err_pim)?
+            mail.call(make_set(&state)).await.map_err(to_acct_err(op))?
         }
     };
     if !response.new_state().is_empty() {
@@ -935,7 +1024,8 @@ where
 async fn current_or_probe_email_state(
     mail: &MailAccount,
     email_state: &Arc<Mutex<Option<String>>>,
-) -> Result<String, Error> {
+    op: AccountOperation,
+) -> Result<String, AccountError> {
     let cached = {
         let guard = email_state.lock().await;
         guard.clone()
@@ -945,7 +1035,7 @@ async fn current_or_probe_email_state(
         None => {
             let state = super::mutation::probe_email_state(mail)
                 .await
-                .map_err(to_acct_err_pim)?;
+                .map_err(to_acct_err(op))?;
             let mut guard = email_state.lock().await;
             match guard.clone() {
                 Some(existing) => Ok(existing),
@@ -980,8 +1070,12 @@ async fn set_mailbox_state(mailbox_state: &Arc<Mutex<Option<String>>>, state: St
     *guard = Some(state);
 }
 
-async fn role_mailbox(mail: &MailAccount, role: FolderRole) -> Result<MailboxId, Error> {
-    fetch_mailboxes(mail)
+async fn role_mailbox(
+    mail: &MailAccount,
+    role: FolderRole,
+    op: AccountOperation,
+) -> Result<MailboxId, AccountError> {
+    fetch_mailboxes(mail, op)
         .await?
         .into_iter()
         .find(|mailbox| map_role(mailbox.role()) == Some(role))
@@ -995,22 +1089,22 @@ async fn role_mailbox(mail: &MailAccount, role: FolderRole) -> Result<MailboxId,
         })
         .ok_or_else(|| {
             super::error::unsupported_error(
-                AccountOperation::Discover,
+                op,
                 None,
-                "JMAP does not support this operation",
+                "JMAP required mailbox role not found",
             )
         })
 }
 
-async fn fetch_containers(mail: &MailAccount) -> Result<Vec<Container>, Error> {
-    Ok(fetch_mailboxes(mail)
+async fn fetch_containers(mail: &MailAccount, op: AccountOperation) -> Result<Vec<Container>, AccountError> {
+    Ok(fetch_mailboxes(mail, op)
         .await?
         .into_iter()
         .filter_map(container_from_mailbox)
         .collect())
 }
 
-async fn fetch_mailboxes(mail: &MailAccount) -> Result<Vec<Mailbox>, Error> {
+async fn fetch_mailboxes(mail: &MailAccount, op: AccountOperation) -> Result<Vec<Mailbox>, AccountError> {
     Ok(mail
         .call(MailboxGet::new().properties([
             MailboxProperty::Id,
@@ -1019,7 +1113,7 @@ async fn fetch_mailboxes(mail: &MailAccount) -> Result<Vec<Mailbox>, Error> {
             MailboxProperty::Role,
         ]))
         .await
-        .map_err(to_acct_err_pim)?
+        .map_err(to_acct_err(op))?
         .into_list())
 }
 
@@ -1063,7 +1157,8 @@ async fn search_email_ids(
     mail: &MailAccount,
     request: SearchRequest,
     collapse_threads: bool,
-) -> Result<Page<EmailId>, Error> {
+    op: AccountOperation,
+) -> Result<Page<EmailId>, AccountError> {
     let position = decode_position(request.page_cursor.as_deref())?;
     let limit = request.limit.unwrap_or(50).max(1);
     let mut query_request = crate::email::EmailQuery::new()
@@ -1074,7 +1169,7 @@ async fn search_email_ids(
     if let Some(filter) = build_search_filter(request.filter, request.provider_query) {
         query_request = query_request.filter(filter);
     }
-    let response = mail.call(query_request).await.map_err(to_acct_err_pim)?;
+    let response = mail.call(query_request).await.map_err(to_acct_err(op))?;
     let total = response.total().and_then(|v| u64::try_from(v).ok());
     let ids = response.into_ids();
     let next_cursor = if ids.len() == usize::try_from(limit).unwrap_or(usize::MAX) {
@@ -1092,7 +1187,7 @@ async fn search_email_ids(
     })
 }
 
-fn decode_position(cursor: Option<&[u8]>) -> Result<i32, Error> {
+fn decode_position(cursor: Option<&[u8]>) -> Result<i32, AccountError> {
     match cursor {
         None => Ok(0),
         Some(bytes) => {
@@ -1179,7 +1274,7 @@ async fn build_email_create_from_send(
     mail: &MailAccount,
     request: bifrost_types::SendRequest,
     mailbox: MailboxId,
-) -> Result<crate::email::EmailCreate, Error> {
+) -> Result<crate::email::EmailCreate, AccountError> {
     let mut patch = bifrost_types::DraftPatch::default();
     patch.identity = request.identity;
     patch.from = Some(request.from);
@@ -1194,14 +1289,15 @@ async fn build_email_create_from_send(
     patch.attachments_uploaded = Some(request.attachments_uploaded);
     patch.in_reply_to = Some(request.in_reply_to);
     patch.references = Some(request.references);
-    build_email_create_from_draft(mail, patch, mailbox).await
+    build_email_create_from_draft(mail, patch, mailbox, AccountOperation::Send).await
 }
 
 async fn build_email_create_from_draft(
     mail: &MailAccount,
     patch: bifrost_types::DraftPatch,
     mailbox: MailboxId,
-) -> Result<crate::email::EmailCreate, Error> {
+    op: AccountOperation,
+) -> Result<crate::email::EmailCreate, AccountError> {
     let mut create = crate::email::EmailCreate::new(None);
     let body_patch = patch.clone();
     create.mailbox_ids([mailbox]);
@@ -1230,7 +1326,7 @@ async fn build_email_create_from_draft(
     if let Some(references) = patch.references {
         create.references(references);
     }
-    apply_body_to_create(mail, &mut create, body_patch).await?;
+    apply_body_to_create(mail, &mut create, body_patch, op).await?;
     Ok(create)
 }
 
@@ -1238,13 +1334,15 @@ async fn apply_body_to_create(
     mail: &MailAccount,
     create: &mut crate::email::EmailCreate,
     patch: bifrost_types::DraftPatch,
-) -> Result<(), Error> {
+    op: AccountOperation,
+) -> Result<(), AccountError> {
     let body = build_body(
         mail,
         patch.body_text.flatten(),
         patch.body_html.flatten(),
         patch.attachments_inline.unwrap_or_default(),
         patch.attachments_uploaded.unwrap_or_default(),
+        op,
     )
     .await?;
     if let Some(structure) = body.body_structure {
@@ -1269,14 +1367,15 @@ async fn apply_draft_patch_to_email_patch(
     mail: &MailAccount,
     email_patch: &mut EmailPatch,
     patch: bifrost_types::DraftPatch,
-) -> Result<(), Error> {
+    op: AccountOperation,
+) -> Result<(), AccountError> {
     if let Some(from) = patch.from {
         match from {
             Some(value) => {
                 email_patch
                     .raw_property("from", &vec![address_to_jmap(value)])
                     .map_err(crate::Error::from)
-                    .map_err(to_acct_err_pim)?;
+                    .map_err(to_acct_err(op))?;
             }
             None => {
                 email_patch.null_property("from");
@@ -1288,21 +1387,21 @@ async fn apply_draft_patch_to_email_patch(
         email_patch
             .raw_property("to", &values)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     if let Some(cc) = patch.cc {
         let values = cc.into_iter().map(address_to_jmap).collect::<Vec<_>>();
         email_patch
             .raw_property("cc", &values)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     if let Some(bcc) = patch.bcc {
         let values = bcc.into_iter().map(address_to_jmap).collect::<Vec<_>>();
         email_patch
             .raw_property("bcc", &values)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     if let Some(reply_to) = patch.reply_to {
         let values = reply_to
@@ -1312,7 +1411,7 @@ async fn apply_draft_patch_to_email_patch(
         email_patch
             .raw_property("replyTo", &values)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     if let Some(subject) = patch.subject {
         if let Some(subject) = subject {
@@ -1326,7 +1425,7 @@ async fn apply_draft_patch_to_email_patch(
             email_patch
                 .raw_property("inReplyTo", &vec![in_reply_to])
                 .map_err(crate::Error::from)
-                .map_err(to_acct_err_pim)?;
+                .map_err(to_acct_err(op))?;
         } else {
             email_patch.null_property("inReplyTo");
         }
@@ -1335,7 +1434,7 @@ async fn apply_draft_patch_to_email_patch(
         email_patch
             .raw_property("references", &references)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     if patch.body_text.is_some()
         || patch.body_html.is_some()
@@ -1348,30 +1447,31 @@ async fn apply_draft_patch_to_email_patch(
             patch.body_html.flatten(),
             patch.attachments_inline.unwrap_or_default(),
             patch.attachments_uploaded.unwrap_or_default(),
+            op,
         )
         .await?;
         if let Some(structure) = body.body_structure {
             email_patch
                 .raw_property("bodyStructure", &structure)
                 .map_err(crate::Error::from)
-                .map_err(to_acct_err_pim)?;
+                .map_err(to_acct_err(op))?;
         }
         email_patch
             .raw_property("bodyValues", &body.body_values)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
         email_patch
             .raw_property("textBody", &body.text_body)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
         email_patch
             .raw_property("htmlBody", &body.html_body)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
         email_patch
             .raw_property("attachments", &body.attachments)
             .map_err(crate::Error::RequestEncode)
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
     }
     Ok(())
 }
@@ -1390,7 +1490,8 @@ async fn build_body(
     html: Option<String>,
     inline: Vec<bifrost_types::AttachmentInline>,
     uploaded: Vec<bifrost_types::AttachmentHandle>,
-) -> Result<BuiltBody, Error> {
+    op: AccountOperation,
+) -> Result<BuiltBody, AccountError> {
     let mut body_values = HashMap::new();
     let mut text_body = Vec::new();
     let mut html_body = Vec::new();
@@ -1426,7 +1527,7 @@ async fn build_body(
         let blob = mail
             .upload(attachment.data.to_vec(), Some(&attachment.mime))
             .await
-            .map_err(to_acct_err_pim)?;
+            .map_err(to_acct_err(op))?;
         attachments.push(
             EmailBodyPart::new()
                 .with_blob_id(blob.blob_id)

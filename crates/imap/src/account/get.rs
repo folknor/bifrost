@@ -48,7 +48,14 @@ pub(crate) fn get_stream(
 
         for (_key, (folder, ids)) in grouped {
             if let Err(err) = run_folder_get(&account, &folder, ids, projection, &tx).await {
-                let _ = tx.send(fatal_event(err)).await;
+                let _ = tx
+                    .send(fatal_event(
+                        err,
+                        super::error::ImapErrorContext::operation(
+                            bifrost_types::AccountOperation::Hydrate,
+                        ),
+                    ))
+                    .await;
                 return;
             }
         }
@@ -102,14 +109,14 @@ async fn run_folder_get(
             if out.len() >= BATCH_ITEMS {
                 tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
                     .await
-                    .map_err(|_| crate::Error::Closed)?;
+                    .map_err(|_| crate::Error::closed())?;
             }
         }
     }
     if !out.is_empty() {
         tx.send(batch(out, PageBoundary::Page, None))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
     }
     Ok(())
 }

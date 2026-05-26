@@ -7,9 +7,6 @@ use bifrost_types::{
     PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, StateCause, SyncStateErrorKind,
 };
 
-// Phase-3 trait-shape parity.
-type Error = AccountError;
-
 fn missing_core_capability() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
@@ -43,7 +40,7 @@ pub(crate) struct PimSupport {
 pub(crate) fn build(
     session: &Session,
     support: PimSupport,
-) -> Result<(AccountCapabilities, CoreLimits), Error> {
+) -> Result<(AccountCapabilities, CoreLimits), AccountError> {
     let core = session
         .core_capabilities()
         .ok_or_else(missing_core_capability)?;

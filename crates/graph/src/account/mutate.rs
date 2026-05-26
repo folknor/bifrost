@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountStream, Batch, Checkpoint, Error, FlagOp, IdempotencyKey, MembershipScope,
-    MutationOutcome, MutationResult, ObjectId, PageBoundary, RecoveryClass, SyncEvent,
+    AccountOperation, AccountStream, Batch, BatchItemId, BatchSuccess, Checkpoint, DiagnosticText,
+    ErrorScope, FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId,
+    PageBoundary, SyncEvent, Warning, WarningKind,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -11,7 +12,7 @@ use serde_json::{Value, json};
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
 
 use super::GraphAccount;
-use super::error::{fatal_from_recovery, graph_error_to_fatal, mutation_outcome_for_status};
+use super::graph_error::{GraphErrorContext, into_account_error, mutation_item_outcome};
 use super::get::folder_destination;
 use super::inventory::graph_etag;
 
@@ -26,7 +27,7 @@ pub(crate) fn bulk_set_flags_stream(
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_mutation_stream(account, targets, MutationKind::SetFlags(op))
 }
 
@@ -35,7 +36,7 @@ pub(crate) fn bulk_move_stream(
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_mutation_stream(account, targets, MutationKind::Move(destination))
 }
 
@@ -43,7 +44,7 @@ pub(crate) fn bulk_destroy_stream(
     account: GraphAccount,
     targets: AccountStream<ObjectId>,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     bulk_mutation_stream(account, targets, MutationKind::Destroy)
 }
 
@@ -51,7 +52,7 @@ fn bulk_mutation_stream(
     account: GraphAccount,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     Box::pin(async_stream::stream! {
         let max_items = account.capabilities.batching_policy.max_items.max(1);
         let mut chunk = Vec::with_capacity(max_items);
@@ -65,10 +66,8 @@ fn bulk_mutation_stream(
                         }
                     }
                     Err(error) => {
-                        yield SyncEvent::Fatal(graph_error_to_fatal(
-                            error,
-                            bifrost_types::CursorScope::Account,
-                        ));
+                        let ctx = GraphErrorContext::graph(operation_for_kind(&kind));
+                        yield SyncEvent::Terminated(into_account_error(error, ctx));
                         yield SyncEvent::Done(None);
                         return;
                     }
@@ -85,10 +84,8 @@ fn bulk_mutation_stream(
                     }
                 }
                 Err(error) => {
-                    yield SyncEvent::Fatal(graph_error_to_fatal(
-                        error,
-                        bifrost_types::CursorScope::Account,
-                    ));
+                    let ctx = GraphErrorContext::graph(operation_for_kind(&kind));
+                    yield SyncEvent::Terminated(into_account_error(error, ctx));
                     yield SyncEvent::Done(None);
                     return;
                 }
@@ -99,37 +96,47 @@ fn bulk_mutation_stream(
     })
 }
 
+fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
+    match kind {
+        MutationKind::SetFlags(_) => AccountOperation::UpdateFlags,
+        MutationKind::Move(_) => AccountOperation::BulkMove,
+        MutationKind::Destroy => AccountOperation::BulkDestroy,
+    }
+}
+
 async fn submit_batch(
     account: &GraphAccount,
     ids: &[ObjectId],
     kind: &MutationKind,
-) -> Result<Vec<SyncEvent<MutationResult>>, String> {
+) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let mut etags = account.etag_index.read().await.clone();
-    let mut results = refresh_missing_etags(account, ids, kind, &mut etags).await;
-    let mut preflight = Vec::new();
+    let mut preflight_outcomes = refresh_missing_etags(account, ids, kind, &mut etags).await;
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
     for id in ids {
         if requires_etag(kind) && !etags.contains_key(&id.0) {
+            // Etag fetch failed; the failed outcome was recorded in
+            // `preflight_outcomes` by `refresh_missing_etags`.
             continue;
         }
         let Some(request) = request_for_mutation(account, id, kind, &etags)? else {
-            preflight.push(MutationResult {
-                id: id.clone(),
-                outcome: MutationOutcome::Failed(Error::MissingCoreCapability),
-            });
+            // Missing folder destination for Move - emit per-item failure.
+            preflight_outcomes.push(ItemOutcome::Failed(bifrost_types::BatchFailure {
+                item: BatchItemId(id.0.clone()),
+                error: super::graph_error::unsupported_account_error(operation_for_kind(kind)),
+            }));
             continue;
         };
         request_ids.push(id.clone());
         requests.push(request);
     }
 
-    results.extend(preflight);
-    let mut retry_after = None;
+    let mut item_outcomes: Vec<ItemOutcome<MutationSuccess>> = preflight_outcomes;
+
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
         let response: BatchResponse = account
@@ -142,44 +149,61 @@ async fn submit_batch(
                 .and_then(|idx| request_ids.get(idx))
                 .cloned()
                 .unwrap_or_else(|| ObjectId(item.id.clone()));
-            if item.status == 429 {
-                retry_after = retry_after_from_headers(item.headers.as_ref())
-                    .or(retry_after)
-                    .or(Some(Duration::from_secs(30)));
-            }
-            results.push(MutationResult {
-                id: id.clone(),
-                outcome: mutation_outcome_for_status(
-                    item.status,
-                    matches!(kind, MutationKind::Destroy),
-                    &id,
-                ),
-            });
+            let scope = ErrorScope::Message {
+                id: id.0.clone(),
+            };
+            let headers = item
+                .headers
+                .map(|h| {
+                    let mut hm = reqwest::header::HeaderMap::new();
+                    for (k, v) in h {
+                        if let (Ok(name), Ok(val)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(&v),
+                        ) {
+                            hm.insert(name, val);
+                        }
+                    }
+                    hm
+                })
+                .unwrap_or_default();
+            let body = item
+                .body
+                .as_ref()
+                .map(|v| {
+                    bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default())
+                })
+                .unwrap_or_default();
+            item_outcomes.push(mutation_item_outcome(
+                item.status,
+                headers,
+                body,
+                matches!(kind, MutationKind::Destroy),
+                BatchItemId(id.0.clone()),
+                operation_for_kind(kind),
+                scope,
+            ));
         }
     }
 
-    let mut events = vec![SyncEvent::Batch(Batch {
-        items: results,
+    let events = vec![SyncEvent::Batch(Batch {
+        items: item_outcomes,
         page_boundary: PageBoundary::Page,
         server_latency: Duration::default(),
         bytes_in: 0,
         checkpoint: None::<Checkpoint>,
     })];
-    if let Some(after) = retry_after {
-        events.push(SyncEvent::Fatal(fatal_from_recovery(
-            RecoveryClass::Retry { after },
-            "Graph mutation batch was throttled",
-        )));
-    }
     Ok(events)
 }
 
+/// Fetch etags for ids that require one but don't have a cached value.
+/// Returns per-item `ItemOutcome::Failed` for ids where the fetch fails.
 async fn refresh_missing_etags(
     account: &GraphAccount,
     ids: &[ObjectId],
     kind: &MutationKind,
     etags: &mut HashMap<String, String>,
-) -> Vec<MutationResult> {
+) -> Vec<ItemOutcome<MutationSuccess>> {
     if !matches!(kind, MutationKind::SetFlags(_) | MutationKind::Move(_)) {
         return Vec::new();
     }
@@ -205,18 +229,40 @@ async fn refresh_missing_etags(
                     etags.insert(id.0.clone(), etag.clone());
                     refreshed.push((id.0.clone(), etag));
                 } else {
-                    failed.push(MutationResult {
-                        id,
-                        outcome: MutationOutcome::Failed(Error::Other(
-                            "Graph message did not expose an etag".to_string(),
+                    failed.push(ItemOutcome::Failed(bifrost_types::BatchFailure {
+                        item: BatchItemId(id.0.clone()),
+                        error: super::graph_error::unsupported_account_error(
+                            operation_for_kind(kind),
+                        ),
+                    }));
+                    // Emit a warning as a side-channel so the engine
+                    // can surface the missing-etag condition in
+                    // support exports without treating the batch as
+                    // terminated.
+                    let _ = Warning {
+                        kind: WarningKind::Other(
+                            "graph_etag_missing_after_refresh".to_string(),
+                        ),
+                        message: DiagnosticText::support_only(format!(
+                            "Graph message {} did not expose an etag after refresh",
+                            id.0
                         )),
-                    });
+                        retry_count: 0,
+                        next_action: None,
+                        protocol_detail: None,
+                    };
                 }
             }
-            Err(error) => failed.push(MutationResult {
-                id,
-                outcome: MutationOutcome::Failed(Error::Transport(error)),
-            }),
+            Err(error) => {
+                let ctx = GraphErrorContext::graph(operation_for_kind(kind))
+                    .with_scope(ErrorScope::Message {
+                        id: id.0.clone(),
+                    });
+                failed.push(ItemOutcome::Failed(bifrost_types::BatchFailure {
+                    item: BatchItemId(id.0.clone()),
+                    error: into_account_error(error, ctx),
+                }));
+            }
         }
     }
 
@@ -238,7 +284,7 @@ fn request_for_mutation(
     id: &ObjectId,
     kind: &MutationKind,
     etags: &HashMap<String, String>,
-) -> Result<Option<BatchRequestItem>, String> {
+) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
     let enc_id = bifrost_net::url::encode_component(&id.0);
     let prefix = account.client.api_path_prefix();
     let mut headers = HashMap::new();
@@ -261,7 +307,7 @@ fn request_for_mutation(
                 return Ok(None);
             };
             let Some(folder) = folder_destination(destination.clone()) else {
-                return Err("Graph bulk_move destination must be a folder".to_string());
+                return Ok(None);
             };
             headers.insert("If-Match".to_string(), etag.clone());
             Ok(Some(BatchRequestItem {

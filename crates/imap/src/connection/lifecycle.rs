@@ -1,6 +1,9 @@
 #![allow(clippy::wildcard_imports)]
 use tokio::net::TcpStream;
 
+use crate::error::ImapAttempt;
+use bifrost_types::TransmissionState;
+
 use super::*;
 
 impl ImapConnection {
@@ -62,18 +65,19 @@ impl ImapConnection {
 
         debug!(host, port, ?tls_mode, "connecting to IMAP server");
 
+        let unsent = ImapAttempt::new(TransmissionState::Unsent);
         let tcp = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
             .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|e| Error::Io(std::sync::Arc::new(e)))?;
+            .map_err(|_| Error::Timeout { attempt: Some(unsent) })?
+            .map_err(|e| Error::Io { source: std::sync::Arc::new(e), attempt: Some(unsent) })?;
 
         let stream = if tls_mode.uses_implicit_tls() {
             validate_tls_server_name(host)?;
             let connector = tokio_native_tls::TlsConnector::from(tls_connector.clone());
             let tls_stream = tokio::time::timeout(timeout, connector.connect(host, tcp))
                 .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|e| Error::Io(std::sync::Arc::new(std::io::Error::other(e))))?;
+                .map_err(|_| Error::Timeout { attempt: Some(unsent) })?
+                .map_err(|e| Error::Io { source: std::sync::Arc::new(std::io::Error::other(e)), attempt: Some(unsent) })?;
             ImapStream::Tls(tls_stream)
         } else {
             ImapStream::Plain(tcp)
@@ -97,7 +101,8 @@ impl ImapConnection {
         // pub(in crate::connection::driver) and inaccessible from here).
         let greeting = tokio::time::timeout(timeout, wire_reader.read_greeting())
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| Error::Timeout { attempt: Some(unsent) })?
+            .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
 
         let Response::Greeting(g) = &greeting else {
             return Err(Error::Protocol(
@@ -137,7 +142,7 @@ impl ImapConnection {
                 ),
             )
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| Error::Timeout { attempt: Some(unsent) })??;
 
             // Downcast the erased output back to Vec<Capability>.
             // CapabilityConsumer::Output is Vec<Capability>, so the downcast
@@ -183,7 +188,7 @@ impl ImapConnection {
                 ),
             )
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| Error::Timeout { attempt: Some(unsent) })??;
         }
 
         // --- Spawn the driver task ---
@@ -245,7 +250,7 @@ impl ImapConnection {
     pub(super) async fn observe_driver_panic(&self) -> Error {
         let mut guard = self.driver_handle.lock().await;
         let Some(handle) = guard.take() else {
-            return Error::DriverGone;
+            return Error::driver_gone();
         };
         // `handle.is_finished()` avoids blocking if still running.
         if !handle.is_finished() {
@@ -253,7 +258,7 @@ impl ImapConnection {
             // a TOCTOU race with the driver exiting.
             *guard = Some(handle);
             drop(guard);
-            return Error::DriverGone;
+            return Error::driver_gone();
         }
         match handle.await {
             Err(join_err) if join_err.is_panic() => {
@@ -263,9 +268,9 @@ impl ImapConnection {
                     .map(|s| *s)
                     .or_else(|p| p.downcast::<&'static str>().map(|s| s.to_string()))
                     .unwrap_or_else(|_| "driver panicked (payload not a String)".to_string());
-                Error::DriverPanicked(panic_msg)
+                Error::DriverPanicked { message: panic_msg, attempt: None }
             }
-            Ok(()) | Err(_) => Error::DriverGone,
+            Ok(()) | Err(_) => Error::driver_gone(),
         }
     }
 
@@ -329,7 +334,7 @@ impl ImapConnection {
             }),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::timeout_inflight())??;
         self.tls_active
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())

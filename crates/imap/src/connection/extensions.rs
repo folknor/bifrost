@@ -39,7 +39,7 @@ impl ImapConnection {
             self.submit_upgrade(driver::UpgradePayload::Compress),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -96,7 +96,7 @@ impl ImapConnection {
         // error) so reclassified_as_events is always emitted.
         let overflow = tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)???;
+            .map_err(|_| Error::timeout_inflight())???;
 
         if overflow {
             // RFC 5465 Section 5.8: server cannot keep up. Notify flags
@@ -134,7 +134,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::timeout_inflight())??;
 
         debug!("NOTIFY NONE  -  notifications disabled (RFC 5465)");
         Ok(())
@@ -211,7 +211,7 @@ impl ImapConnection {
         let consumer = super::dispatch::EnableConsumer::default();
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -244,7 +244,7 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -281,7 +281,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::IdConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -329,7 +329,7 @@ impl ImapConnection {
         let consumer = super::dispatch::MetadataConsumer::new(mailbox_name.as_str().to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// SETMETADATA  -  set or delete mailbox/server metadata entries
@@ -369,7 +369,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -400,7 +400,7 @@ impl ImapConnection {
         let consumer = super::dispatch::QuotaConsumer::new(root.to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// GETQUOTAROOT  -  query quota roots for a mailbox
@@ -430,7 +430,7 @@ impl ImapConnection {
         let consumer = super::dispatch::QuotaRootConsumer::new(mailbox_name.as_str().to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// SETQUOTA  -  set resource limits on a quota root
@@ -463,7 +463,7 @@ impl ImapConnection {
         let consumer = super::dispatch::QuotaConsumer::new(root.to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -504,7 +504,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// DELETEACL  -  remove an access control list entry for a mailbox
@@ -537,7 +537,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// GETACL  -  retrieve the access control list for a mailbox
@@ -562,7 +562,7 @@ impl ImapConnection {
         let consumer = super::dispatch::AclConsumer::new(mailbox_name.as_str().to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LISTRIGHTS  -  query the set of rights grantable to an identifier
@@ -597,7 +597,7 @@ impl ImapConnection {
         );
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// MYRIGHTS  -  query the logged-in user's rights on a mailbox
@@ -622,7 +622,7 @@ impl ImapConnection {
         let consumer = super::dispatch::MyRightsConsumer::new(mailbox_name.as_str().to_owned());
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// Verify that the server advertises the NOTIFY capability (RFC 5465).

@@ -10,7 +10,10 @@ use bifrost_types::ids::{ObjectId, ThreadId};
 use bifrost_types::page::Page;
 use bifrost_types::search::{SearchFilter, SearchRequest};
 use bifrost_types::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
-use bifrost_types::{AccountFuture, Error as AccountError, LabelId, ProtocolKind};
+use bifrost_types::{
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountFuture, AccountOperation, Cause,
+    DiagnosticText, LabelId, Protocol, ProtocolKind, RequestCause, RequestErrorKind,
+};
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::types::{
@@ -47,7 +50,7 @@ pub(crate) fn remove_from_container(
             .filter(|id| id.folder == source)
             .collect::<Vec<_>>();
         if ids.is_empty() {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::RemoveFromContainer));
         }
         delete_messages(&account, ids).await
     })
@@ -101,9 +104,10 @@ pub(crate) fn draft_create(
 ) -> AccountFuture<Result<DraftHandle, AccountError>> {
     Box::pin(async move {
         if !account.capabilities.pim_methods.draft_create {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::DraftCreate));
         }
-        let folder = role_folder(&account, FolderRole::Drafts).ok_or(AccountError::Unsupported)?;
+        let folder = role_folder(&account, FolderRole::Drafts)
+            .ok_or_else(|| super::error::unsupported(AccountOperation::DraftCreate))?;
         let raw = draft_patch_to_rfc5322(&patch)?;
         let conn = account.pool.dial_idle().await.map_err(account_error)?;
         let appended = conn
@@ -117,7 +121,7 @@ pub(crate) fn draft_create(
             .await
             .map_err(account_error)?;
         let Some((uidvalidity, uid)) = appended else {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::DraftCreate));
         };
         Ok(DraftHandle(encode_object_id(&folder, uidvalidity, uid).0))
     })
@@ -139,7 +143,7 @@ pub(crate) fn search(
 ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
     Box::pin(async move {
         if !account.capabilities.pim_methods.search {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::Search));
         }
         let plan = search_plan(&request)?;
         let mut threads = Vec::new();
@@ -155,7 +159,7 @@ pub(crate) fn search(
             let uidvalidity = selected
                 .mailbox
                 .uid_validity
-                .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+                .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
             let roots = conn
                 .connection()
                 .uid_thread(
@@ -197,7 +201,7 @@ pub(crate) fn search_messages(
             let uidvalidity = selected
                 .mailbox
                 .uid_validity
-                .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+                .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
             let result = conn
                 .connection()
                 .uid_search(&plan.criteria, account.command_timeout())
@@ -228,7 +232,7 @@ pub(crate) fn container_create(
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::ContainerCreate));
         }
         let full_name = child_name(&account, parent.as_ref(), &name)?;
         let conn = account.pool.dial_idle().await.map_err(account_error)?;
@@ -297,9 +301,7 @@ pub(crate) fn container_delete(
             .iter()
             .any(|item| matches!(item, StatusItem::Messages(count) if *count > 0));
         if non_empty {
-            return Err(AccountError::Other(
-                "refusing to delete non-empty IMAP mailbox".into(),
-            ));
+            return Err(pim_malformed("refusing to delete non-empty IMAP mailbox"));
         }
         conn.delete(folder.as_str(), account.command_timeout())
             .await
@@ -309,22 +311,24 @@ pub(crate) fn container_delete(
 }
 
 pub(crate) fn identities_list() -> AccountFuture<Result<Vec<Identity>, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async {
+        Err(super::error::unsupported(AccountOperation::IdentitiesList))
+    })
 }
 
 pub(crate) fn identity_update(
     _identity: IdentityId,
     _patch: IdentityPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(super::error::unsupported(AccountOperation::IdentityUpdate)) })
 }
 
 pub(crate) fn vacation_get() -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(super::error::unsupported(AccountOperation::VacationGet)) })
 }
 
 pub(crate) fn vacation_set(_config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(super::error::unsupported(AccountOperation::VacationSet)) })
 }
 
 pub(crate) fn quota_get(
@@ -332,7 +336,7 @@ pub(crate) fn quota_get(
 ) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
     Box::pin(async move {
         if !account.capabilities.pim_methods.quota_get {
-            return Err(AccountError::Unsupported);
+            return Err(super::error::unsupported(AccountOperation::QuotaGet));
         }
         let Some(folder) = quota_probe_folder(&account) else {
             return Ok(None);
@@ -393,7 +397,7 @@ pub(crate) fn message_hydrate(
         let mut messages = hydrate_decoded(&account, vec![decoded], projection).await?;
         messages
             .pop()
-            .ok_or_else(|| AccountError::Other("message was not returned by IMAP FETCH".into()))
+            .ok_or_else(|| pim_malformed("message was not returned by IMAP FETCH"))
     })
 }
 
@@ -438,8 +442,8 @@ pub(crate) fn delete_thread(
                 return remove_from_container(account, MutationTarget::Thread(thread), current)
                     .await;
             }
-            let trash =
-                role_folder(&account, FolderRole::Trash).ok_or(AccountError::Unsupported)?;
+            let trash = role_folder(&account, FolderRole::Trash)
+                .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
             return move_thread(
                 account,
                 thread,
@@ -448,7 +452,8 @@ pub(crate) fn delete_thread(
             )
             .await;
         }
-        let trash = role_folder(&account, FolderRole::Trash).ok_or(AccountError::Unsupported)?;
+        let trash = role_folder(&account, FolderRole::Trash)
+            .ok_or_else(|| super::error::unsupported(AccountOperation::BulkMove))?;
         move_thread(
             account,
             thread,
@@ -476,7 +481,7 @@ async fn copy_messages(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
         let uids = valid_uids(ids, uidvalidity)?;
         let Some(uid_set) = uid_set_from_u32(&uids) else {
             continue;
@@ -509,7 +514,7 @@ async fn delete_messages(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
         let uids = valid_uids(ids, uidvalidity)?;
         let Some(uid_set) = uid_set_from_u32(&uids) else {
             continue;
@@ -556,7 +561,7 @@ async fn set_flag(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
         let uids = valid_uids(ids, uidvalidity)?;
         let Some(uid_set) = uid_set_from_u32(&uids) else {
             continue;
@@ -594,7 +599,7 @@ async fn hydrate_decoded(
         let uidvalidity = selected
             .mailbox
             .uid_validity
-            .ok_or_else(|| AccountError::Other("SELECT missing UIDVALIDITY".into()))?;
+            .ok_or_else(|| pim_malformed("SELECT missing UIDVALIDITY"))?;
         let uids = valid_uids(ids, uidvalidity)?;
         let Some(uid_set) = uid_set_from_u32(&uids) else {
             continue;
@@ -633,7 +638,7 @@ fn decoded_targets(target: &MutationTarget) -> Result<Vec<DecodedObjectId>, Acco
                 })
                 .collect())
         }
-        _ => Err(AccountError::Unsupported),
+        _ => Err(super::error::unsupported(AccountOperation::Discover)),
     }
 }
 
@@ -653,9 +658,7 @@ fn valid_uids(ids: Vec<DecodedObjectId>, uidvalidity: u32) -> Result<Vec<u32>, A
     let mut uids = Vec::new();
     for id in ids {
         if id.uidvalidity != uidvalidity {
-            return Err(AccountError::Other(
-                "UIDVALIDITY changed before IMAP operation".into(),
-            ));
+            return Err(pim_malformed("UIDVALIDITY changed before IMAP operation"));
         }
         uids.push(id.uid);
     }
@@ -663,7 +666,7 @@ fn valid_uids(ids: Vec<DecodedObjectId>, uidvalidity: u32) -> Result<Vec<u32>, A
 }
 
 fn folder_from_container(container: &ContainerId) -> Result<MailboxName, AccountError> {
-    MailboxName::new(container.0.clone()).map_err(|e| AccountError::Other(e.to_string()))
+    MailboxName::new(container.0.clone()).map_err(|e| pim_malformed(e.to_string()))
 }
 
 fn imap_flag_for_keyword(keyword: &str) -> Flag {
@@ -737,12 +740,12 @@ fn criteria_from_filter(filter: &SearchFilter) -> Result<CriteriaPart, AccountEr
             if let Some(after) = after {
                 criteria = criteria
                     .sent_since(&imap_date(*after))
-                    .map_err(|e| AccountError::Other(e.to_string()))?;
+                    .map_err(|e| pim_malformed(e.to_string()))?;
             }
             if let Some(before) = before {
                 criteria = criteria
                     .sent_before(&imap_date(*before))
-                    .map_err(|e| AccountError::Other(e.to_string()))?;
+                    .map_err(|e| pim_malformed(e.to_string()))?;
             }
             Ok(CriteriaPart {
                 criteria: empty_to_all(criteria.as_str()),
@@ -758,12 +761,12 @@ fn criteria_from_filter(filter: &SearchFilter) -> Result<CriteriaPart, AccountEr
                 folder: inner.folder,
             })
         }
-        _ => Err(AccountError::Unsupported),
+        _ => Err(super::error::unsupported(AccountOperation::Search)),
     }
 }
 
 fn leaf(result: Result<SearchCriteria, crate::Error>) -> Result<CriteriaPart, AccountError> {
-    let criteria = result.map_err(|e| AccountError::Other(e.to_string()))?;
+    let criteria = result.map_err(|e| pim_malformed(e.to_string()))?;
     Ok(CriteriaPart {
         criteria: empty_to_all(criteria.as_str()),
         folder: None,
@@ -815,9 +818,29 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
 fn merge_folder(
     current: Option<MailboxName>,
     next: Option<MailboxName>,
-) -> Result<Option<MailboxName>, AccountError> {
+) -> Result<Option<MailboxName>, bifrost_types::AccountError> {
     match (current, next) {
-        (Some(a), Some(b)) if a != b => Err(AccountError::Unsupported),
+        (Some(a), Some(b)) if a != b => {
+            use bifrost_types::{
+                AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText,
+                Protocol, RequestCause, RequestErrorKind,
+            };
+            Err(AccountErrorBuilder::new(
+                AccountErrorKind::Request(RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::InvalidArgument {
+                    field: Some("folder"),
+                    message: Some(DiagnosticText::support_only(format!(
+                        "search filter spans two folders ({} and {}); \
+                         IMAP SEARCH cannot span multiple mailboxes in one command",
+                        a.as_str(),
+                        b.as_str()
+                    ))),
+                }),
+            )
+            .protocol(Protocol::Imap)
+            .operation(bifrost_types::AccountOperation::SearchMessages)
+            .build())
+        }
         (Some(a), _) => Ok(Some(a)),
         (_, Some(b)) => Ok(Some(b)),
         (None, None) => Ok(None),
@@ -873,7 +896,7 @@ fn page_from_items<T: Clone>(
         Some(cursor) => std::str::from_utf8(cursor)
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| AccountError::Other("invalid IMAP page cursor".into()))?,
+            .ok_or_else(|| pim_malformed("invalid IMAP page cursor"))?,
         None => 0,
     };
     let limit = usize::try_from(request.limit.unwrap_or(500)).unwrap_or(usize::MAX);
@@ -979,16 +1002,16 @@ fn child_name(
     leaf: &str,
 ) -> Result<MailboxName, AccountError> {
     let Some(parent) = parent else {
-        return MailboxName::new(leaf.to_owned()).map_err(|e| AccountError::Other(e.to_string()));
+        return MailboxName::new(leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()));
     };
     let parent_folder = folder_from_container(parent)?;
     let delimiter = account
         .folders
         .get(&parent_folder)
         .and_then(|entry| entry.delimiter)
-        .ok_or(AccountError::Unsupported)?;
+        .ok_or_else(|| super::error::unsupported(AccountOperation::ContainerCreate))?;
     MailboxName::new(format!("{}{delimiter}{leaf}", parent_folder.as_str()))
-        .map_err(|e| AccountError::Other(e.to_string()))
+        .map_err(|e| pim_malformed(e.to_string()))
 }
 
 fn renamed_sibling(
@@ -1002,13 +1025,13 @@ fn renamed_sibling(
         .and_then(|entry| entry.delimiter);
     let Some(delimiter) = delimiter else {
         return MailboxName::new(new_leaf.to_owned())
-            .map_err(|e| AccountError::Other(e.to_string()));
+            .map_err(|e| pim_malformed(e.to_string()));
     };
     if let Some((parent, _)) = folder.as_str().rsplit_once(delimiter) {
         MailboxName::new(format!("{parent}{delimiter}{new_leaf}"))
-            .map_err(|e| AccountError::Other(e.to_string()))
+            .map_err(|e| pim_malformed(e.to_string()))
     } else {
-        MailboxName::new(new_leaf.to_owned()).map_err(|e| AccountError::Other(e.to_string()))
+        MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()))
     }
 }
 
@@ -1138,7 +1161,7 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
             .as_ref()
             .is_some_and(|attachments| !attachments.is_empty())
     {
-        return Err(AccountError::Unsupported);
+        return Err(super::error::unsupported(AccountOperation::DraftCreate));
     }
     let mut out = String::new();
     if let Some(Some(from)) = &patch.from {
@@ -1216,6 +1239,19 @@ fn header(out: &mut String, name: &str, value: &str) {
 
 fn sanitize_header(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
+}
+
+/// Build a `Request(Malformed)` `AccountError` for local PIM failures
+/// where the caller provided invalid or internally inconsistent state.
+fn pim_malformed(detail: impl Into<String>) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.into()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .build()
 }
 
 fn format_addresses(addresses: &[Address]) -> String {

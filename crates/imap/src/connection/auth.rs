@@ -209,7 +209,7 @@ impl ImapConnection {
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_regular(cmd, LoginConsumer::default()))
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -279,7 +279,7 @@ impl ImapConnection {
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -345,7 +345,7 @@ impl ImapConnection {
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -375,7 +375,7 @@ impl ImapConnection {
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -435,7 +435,7 @@ impl ImapConnection {
         let caps_provided =
             tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
     }
@@ -459,7 +459,7 @@ impl ImapConnection {
         if !caps_provided {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err(Error::Timeout);
+                return Err(Error::timeout_inflight());
             }
             // Send CAPABILITY via the driver. apply_side_effects inside
             // the driver updates the cached capabilities automatically
@@ -467,7 +467,7 @@ impl ImapConnection {
             // [CAPABILITY] response code (RFC 3501 Section7.2.1).
             tokio::time::timeout(remaining, self.fetch_capabilities_via_driver())
                 .await
-                .map_err(|_| Error::Timeout)??;
+                .map_err(|_| Error::timeout_inflight())??;
         }
         Ok(())
     }
@@ -551,18 +551,18 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::timeout_inflight())??;
 
         // RFC 8437 Section2: capabilities may change after unauthentication.
         // Unconditional refresh  -  the server SHOULD send caps but is not
         // required to.
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(Error::Timeout);
+            return Err(Error::timeout_inflight());
         }
         tokio::time::timeout(remaining, self.fetch_capabilities_via_driver())
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| Error::timeout_inflight())??;
 
         Ok(())
     }

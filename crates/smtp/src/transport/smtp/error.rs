@@ -15,6 +15,26 @@ pub struct Error {
     inner: Box<Inner>,
 }
 
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        // BoxError is not Clone. Preserve diagnostic text as a plain string source so
+        // batch pipelines that clone an error mid-flight retain the diagnostic message.
+        let source: Option<BoxError> = self
+            .inner
+            .source
+            .as_ref()
+            .map(|e| Box::new(StringError(e.to_string())) as BoxError);
+        Self {
+            inner: Box::new(Inner {
+                kind: self.inner.kind.clone(),
+                source,
+                attempt: self.inner.attempt,
+                phase: self.inner.phase,
+            }),
+        }
+    }
+}
+
 struct Inner {
     kind: ErrorKind,
     source: Option<BoxError>,
@@ -329,6 +349,20 @@ pub(crate) fn status(response: Response) -> Error {
         )),
     }
 }
+
+/// Helper for `Clone` on `Error`: wraps a diagnostic string as a `BoxError`
+/// source so the cloned error retains its human-readable message while discarding
+/// the original non-Clone source.
+#[derive(Debug)]
+pub(crate) struct StringError(pub(crate) String);
+
+impl fmt::Display for StringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for StringError {}
 
 pub(crate) fn parse<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::Parse, Some(e))

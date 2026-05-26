@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use bifrost_types::{
-    AccountStream, Batch, BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange,
-    Checkpoint, Error, ObjectId, PageBoundary, RecoveryClass, SyncEvent,
+    AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream, Batch, BlobCapabilities,
+    BlobEncoding, BlobHandle, BlobId, ByteRange, Cause, Checkpoint, DiagnosticText, ErrorScope,
+    ObjectId, PageBoundary, Protocol, ProtocolErrorKind, Provider, RequestCause, SyncEvent,
+    WireCause,
 };
 
 use super::GraphAccount;
-use super::error::{graph_error_to_fatal, warning_blob_not_byte_stream};
+use super::error::warning_blob_not_byte_stream;
+use super::graph_error::{GraphErrorContext, into_account_error};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum GraphBlobKind {
@@ -96,11 +99,20 @@ fn open_blob_inner_stream(
         let locator = match decode_locator(&handle) {
             Ok(locator) => locator,
             Err(error) => {
-                yield SyncEvent::Fatal(bifrost_types::Fatal {
-                    recovery: RecoveryClass::Fatal,
-                    message: error.to_string(),
-                    source: Some(error),
-                });
+                // Malformed blob handle - this is a protocol contract
+                // violation; the locator was minted by this crate.
+                let account_error = AccountErrorBuilder::new(
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+                    Cause::Wire(WireCause::MalformedResponse {
+                        protocol: Protocol::Graph,
+                        detail: Some(DiagnosticText::support_only(error.to_string())),
+                    }),
+                )
+                .operation(AccountOperation::OpenBlob)
+                .provider(Provider::Microsoft)
+                .protocol(Protocol::Graph)
+                .build();
+                yield SyncEvent::Terminated(account_error);
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -110,12 +122,24 @@ fn open_blob_inner_stream(
             yield SyncEvent::Done(None);
             return;
         }
+        let op = if range.is_some() {
+            AccountOperation::OpenBlobRange
+        } else {
+            AccountOperation::OpenBlob
+        };
         if range.is_some() && !handle.capabilities.supports_range {
-            yield SyncEvent::Fatal(bifrost_types::Fatal {
-                recovery: RecoveryClass::Fatal,
-                message: "Graph blob does not support range fetches".to_string(),
-                source: Some(Error::RangeNotSupported),
-            });
+            let account_error = AccountErrorBuilder::new(
+                AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
+                Cause::Request(RequestCause::Unsupported {
+                    operation: AccountOperation::OpenBlobRange,
+                }),
+            )
+            .operation(AccountOperation::OpenBlobRange)
+            .provider(Provider::Microsoft)
+            .protocol(Protocol::Graph)
+            .scope(ErrorScope::Account)
+            .build();
+            yield SyncEvent::Terminated(account_error);
             yield SyncEvent::Done(None);
             return;
         }
@@ -128,10 +152,8 @@ fn open_blob_inner_stream(
                 return;
             }
             Err(BlobFetchError::Failed(error)) => {
-                yield SyncEvent::Fatal(graph_error_to_fatal(
-                    error,
-                    bifrost_types::CursorScope::Account,
-                ));
+                let ctx = GraphErrorContext::graph(op).with_scope(ErrorScope::Account);
+                yield SyncEvent::Terminated(into_account_error(error, ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -147,10 +169,21 @@ fn open_blob_inner_stream(
                     checkpoint: None::<Checkpoint>,
                 }),
                 Err(error) => {
-                    yield SyncEvent::Fatal(graph_error_to_fatal(
-                        format!("Graph blob stream failed: {error}"),
-                        bifrost_types::CursorScope::Account,
-                    ));
+                    let account_error = AccountErrorBuilder::new(
+                        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                        Cause::Wire(WireCause::MalformedResponse {
+                            protocol: Protocol::Graph,
+                            detail: Some(DiagnosticText::support_only(format!(
+                                "Graph blob stream error: {error}"
+                            ))),
+                        }),
+                    )
+                    .operation(op)
+                    .provider(Provider::Microsoft)
+                    .protocol(Protocol::Graph)
+                    .scope(ErrorScope::Account)
+                    .build();
+                    yield SyncEvent::Terminated(account_error);
                     break;
                 }
             }
@@ -182,7 +215,7 @@ async fn fetch_blob_stream(
 
 enum BlobFetchError {
     MethodNotAllowed,
-    Failed(String),
+    Failed(crate::error::GraphError),
 }
 
 impl From<bifrost_net::Error> for BlobFetchError {
@@ -193,23 +226,15 @@ impl From<bifrost_net::Error> for BlobFetchError {
             {
                 Self::MethodNotAllowed
             }
-            bifrost_net::Error::Status { code, body, .. } => Self::Failed(format!(
-                "Graph blob request failed with HTTP {code}: {}",
-                String::from_utf8_lossy(body.as_ref())
-            )),
-            bifrost_net::Error::RangeNotHonored { message } => {
-                Self::Failed(format!("Graph range request failed: {message}"))
-            }
-            other => Self::Failed(format!("Graph blob request failed: {other}")),
+            // All other net errors flow through the typed GraphError boundary.
+            other => Self::Failed(crate::error::GraphError::Net(other)),
         }
     }
 }
 
-fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, Error> {
+fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, String> {
     serde_json::from_str(&handle.id.0).map_err(|error| {
-        Error::Other(format!(
-            "Graph blob handle is not an account blob locator: {error}"
-        ))
+        format!("Graph blob handle is not an account blob locator: {error}")
     })
 }
 

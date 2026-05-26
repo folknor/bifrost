@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::{
-    Batch, Checkpoint, CursorScope, Fatal, FolderId, MembershipScope, ObjectType, PageBoundary,
-    ScopeLifecycle, SyncEvent,
+    AccountError, AccountOperation, Batch, Checkpoint, CursorScope, FolderId, MembershipScope,
+    ObjectType, PageBoundary, ScopeLifecycle, SyncEvent,
 };
 
 use super::GraphAccount;
-use super::error::graph_error_to_fatal;
+use super::graph_error::{GraphErrorContext, into_account_error};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CursorIndex {
@@ -52,7 +52,7 @@ pub(crate) async fn discover_cursor_scope_events(
                 SyncEvent::Done(None),
             ]
         }
-        Err(fatal) => vec![SyncEvent::Fatal(fatal), SyncEvent::Done(None)],
+        Err(error) => vec![SyncEvent::Terminated(error), SyncEvent::Done(None)],
     }
 }
 
@@ -64,7 +64,7 @@ pub(crate) async fn discover_membership_events(
             batch(memberships, Some(PageBoundary::Final)),
             SyncEvent::Done(None),
         ],
-        Err(fatal) => vec![SyncEvent::Fatal(fatal), SyncEvent::Done(None)],
+        Err(error) => vec![SyncEvent::Terminated(error), SyncEvent::Done(None)],
     }
 }
 
@@ -87,12 +87,14 @@ pub(crate) fn batch<T>(items: Vec<T>, page_boundary: Option<PageBoundary>) -> Sy
     })
 }
 
-async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<CursorScope>, Fatal> {
+async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<CursorScope>, AccountError> {
     let mail_folders = account
         .client
         .list_mail_folders_recursive()
         .await
-        .map_err(|error| graph_error_to_fatal(error, CursorScope::Account))?;
+        .map_err(|error| {
+            into_account_error(error, GraphErrorContext::graph(AccountOperation::DiscoverMemberships))
+        })?;
     account.folder_tree.write().await.replace_mail_folders(
         mail_folders
             .iter()
@@ -110,7 +112,7 @@ async fn discover_cursor_scopes_inner(account: &GraphAccount) -> Result<Vec<Curs
     Ok(scopes)
 }
 
-async fn discover_memberships_inner(account: &GraphAccount) -> Result<Vec<MembershipScope>, Fatal> {
+async fn discover_memberships_inner(account: &GraphAccount) -> Result<Vec<MembershipScope>, AccountError> {
     let scopes = {
         let cached = account.cursor_index.read().await.scopes();
         if cached.is_empty() {

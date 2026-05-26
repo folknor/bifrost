@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    AccountStream, Batch, Checkpoint, CursorScope, FolderId, HydratedObject, HydratedObjectKind,
-    MembershipScope, ObjectId, ObjectType, PageBoundary, Projection, SyncEvent, Warning,
-    WarningKind,
+    AccountOperation, AccountStream, Batch, Checkpoint, CursorScope, DiagnosticText, ErrorScope,
+    FolderId, HydratedObject, HydratedObjectKind, MembershipScope, ObjectId, ObjectType,
+    PageBoundary, Projection, SyncEvent, Warning, WarningKind,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -13,7 +13,7 @@ use crate::types::{BatchRequest, BatchRequestItem, BatchResponse, MESSAGE_SELECT
 
 use super::GraphAccount;
 use super::blob::blob_handle_from_graph_attachment;
-use super::error::graph_error_to_fatal;
+use super::graph_error::{GraphErrorContext, into_account_error};
 use super::inventory::{graph_etag, inventory_entry_from_value};
 
 pub(crate) fn get_stream(
@@ -34,7 +34,9 @@ pub(crate) fn get_stream(
                         }
                     }
                     Err(error) => {
-                        yield SyncEvent::Fatal(graph_error_to_fatal(error, CursorScope::Account));
+                        let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
+                            .with_scope(ErrorScope::Account);
+                        yield SyncEvent::Terminated(into_account_error(error, ctx));
                         yield SyncEvent::Done(None);
                         return;
                     }
@@ -51,7 +53,9 @@ pub(crate) fn get_stream(
                     }
                 }
                 Err(error) => {
-                    yield SyncEvent::Fatal(graph_error_to_fatal(error, CursorScope::Account));
+                    let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
+                        .with_scope(ErrorScope::Account);
+                    yield SyncEvent::Terminated(into_account_error(error, ctx));
                     yield SyncEvent::Done(None);
                     return;
                 }
@@ -66,7 +70,7 @@ async fn fetch_batch(
     account: &GraphAccount,
     ids: &[ObjectId],
     projection: Projection,
-) -> Result<Vec<SyncEvent<HydratedObject>>, String> {
+) -> Result<Vec<SyncEvent<HydratedObject>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -103,7 +107,10 @@ async fn fetch_batch(
         if !(200..=299).contains(&item.status) {
             warnings.push(SyncEvent::Warning(Warning {
                 kind: WarningKind::Other("graph_get_item_failed".to_string()),
-                message: format!("Graph get for {} failed with HTTP {}", id.0, item.status),
+                message: DiagnosticText::support_only(format!(
+                    "Graph get for {} failed with HTTP {}",
+                    id.0, item.status
+                )),
                 retry_count: 0,
                 next_action: None,
                 protocol_detail: None,

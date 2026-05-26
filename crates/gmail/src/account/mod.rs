@@ -22,8 +22,7 @@ use bifrost_types::{
     IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
     MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
     Priority, Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -259,7 +258,7 @@ impl Account for GmailAccount {
         targets: AccountStream<ObjectId>,
         op: FlagOp,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_set_flags(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
@@ -274,7 +273,7 @@ impl Account for GmailAccount {
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_move(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
@@ -288,7 +287,7 @@ impl Account for GmailAccount {
         &self,
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::bulk_destroy(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),

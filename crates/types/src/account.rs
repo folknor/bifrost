@@ -31,14 +31,17 @@ use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycle,
 };
-use crate::error::{Error, Fatal, RecoveryClass};
+use crate::error::{
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ItemOutcome,
+    MutationSuccess, RequestCause,
+};
 use crate::events::{
     Change, InventoryEntry, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
     WatchEvent,
 };
 use crate::hydration::{HydrationProjection, Message, ThreadHydration};
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
-use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, MutationResult, Projection};
+use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
 use crate::page::Page;
 use crate::search::SearchRequest;
 use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
@@ -104,7 +107,7 @@ pub trait Account: Send + Sync {
     fn establish_initial_cursor(
         &self,
         scope: CursorScope,
-    ) -> AccountFuture<Result<CursorEstablishment, Error>>;
+    ) -> AccountFuture<Result<CursorEstablishment, AccountError>>;
 
     /// Inventory: projection-only cold-start primitive. Also the
     /// cursor-establishment pass for scopes that returned
@@ -131,14 +134,19 @@ pub trait Account: Send + Sync {
     ) -> AccountStream<SyncEvent<InventoryEntry>> {
         match partition {
             InventoryPartition::Full => self.inventory_stream(scope),
-            _ => Box::pin(futures::stream::iter([
-                SyncEvent::Fatal(Fatal {
-                    recovery: RecoveryClass::Fatal,
-                    message: "inventory partition is not supported by this account".to_string(),
-                    source: Some(Error::Unsupported),
-                }),
-                SyncEvent::Done(None),
-            ])),
+            _ => {
+                let op = AccountOperation::SyncInventory;
+                let error = AccountErrorBuilder::new(
+                    AccountErrorKind::Unsupported(op),
+                    Cause::Request(RequestCause::Unsupported { operation: op }),
+                )
+                .operation(op)
+                .build();
+                Box::pin(futures::stream::iter([
+                    SyncEvent::Terminated(error),
+                    SyncEvent::Done(None),
+                ]))
+            }
         }
     }
 
@@ -158,10 +166,11 @@ pub trait Account: Send + Sync {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, Error>>;
+    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>>;
 
     /// Server-side push subscription CRUD: destroy.
-    fn push_unsubscribe(&self, handle: SubscriptionHandle) -> AccountFuture<Result<(), Error>>;
+    fn push_unsubscribe(&self, handle: SubscriptionHandle)
+    -> AccountFuture<Result<(), AccountError>>;
 
     /// Event stream from the protocol crate to the engine. Contents
     /// depend on `push_in_process`:
@@ -178,8 +187,9 @@ pub trait Account: Send + Sync {
     /// Open a blob for streaming download.
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<Bytes>>;
 
-    /// Open a byte range of a blob. Errors with `Error::RangeNotSupported`
-    /// where the blob's capability flag is false.
+    /// Open a byte range of a blob. Errors with
+    /// `AccountErrorKind::Unsupported(OpenBlobRange)` where the blob's
+    /// capability flag is false.
     fn open_blob_range(
         &self,
         handle: BlobHandle,
@@ -191,27 +201,37 @@ pub trait Account: Send + Sync {
     /// `op` carries both the operation kind AND the flag set per
     /// variant; a `FlagOp::Set(HashSet)` pins the target flag set
     /// directly.
+    ///
+    /// Returns per-item `ItemOutcome<MutationSuccess>` envelopes.
+    /// Every pulled item produces exactly one outcome. Locally-invalid
+    /// items emit `Failed` rather than poisoning the stream. Early
+    /// termination via `SyncEvent::Terminated(AccountError)` covers
+    /// only already-pulled items.
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,
         op: FlagOp,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>>;
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     /// Bulk move. Targets are moved into `destination`.
+    ///
+    /// Same streaming invariants as `bulk_set_flags`.
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>>;
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     /// Bulk destroy.
+    ///
+    /// Same streaming invariants as `bulk_set_flags`.
     fn bulk_destroy(
         &self,
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>>;
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
 
     // ------------------------------------------------------------
     // Mail mutation primitives (S1-W1)
@@ -229,7 +249,7 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         container: ContainerId,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Remove `target` from `container`. JMAP `Email/set` mailboxIds
     /// remove; IMAP `+FLAGS \Deleted` + `EXPUNGE`; Gmail
@@ -239,44 +259,44 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         container: ContainerId,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Set or clear a single IMAP / JMAP keyword. Gmail and Graph
-    /// return `Err(Unsupported)`; the convenience layer chooses an
-    /// alternate primitive instead.
+    /// return `Err(AccountErrorKind::Unsupported)`; the convenience
+    /// layer chooses an alternate primitive instead.
     fn set_keyword(
         &self,
         target: MutationTarget,
         keyword: String,
         value: bool,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Set or clear membership in a Gmail-style label. JMAP / IMAP /
-    /// Graph return `Err(Unsupported)`.
+    /// Graph return `Err(AccountErrorKind::Unsupported)`.
     fn set_label_membership(
         &self,
         target: MutationTarget,
         label: ContainerId,
         value: bool,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Set or clear a Graph category. JMAP / IMAP / Gmail return
-    /// `Err(Unsupported)`.
+    /// `Err(AccountErrorKind::Unsupported)`.
     fn set_category(
         &self,
         target: MutationTarget,
         category: String,
         value: bool,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Set or clear a Graph singleValueExtendedProperty. JMAP / IMAP
-    /// / Gmail return `Err(Unsupported)`.
+    /// / Gmail return `Err(AccountErrorKind::Unsupported)`.
     fn set_extended_property(
         &self,
         target: MutationTarget,
         property_id: String,
         value: Option<String>,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Mark read state. Every protocol implements this; canonical
     /// across the four.
@@ -284,7 +304,7 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         is_read: bool,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     // ------------------------------------------------------------
     // Mail composition primitives (S1-W1)
@@ -293,7 +313,7 @@ pub trait Account: Send + Sync {
     /// Send an RFC 5322 message. JMAP `EmailSubmission/set`; Gmail
     /// `messages.send`; Graph `POST /me/sendMail`; IMAP via the
     /// configured `bifrost-smtp` transport.
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, Error>>;
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>>;
 
     /// Streaming upload of an attachment. Returns a handle the
     /// consumer references in subsequent `SendRequest` /
@@ -302,12 +322,12 @@ pub trait Account: Send + Sync {
     /// attachment.
     fn attachment_upload(
         &self,
-        bytes: AccountStream<Result<Bytes, Error>>,
+        bytes: AccountStream<Result<Bytes, AccountError>>,
         mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, Error>>;
+    ) -> AccountFuture<Result<AttachmentHandle, AccountError>>;
 
     /// Create a new draft.
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, Error>>;
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>>;
 
     /// Update an existing draft. The patch is partial: only `Some`
     /// fields are applied.
@@ -315,15 +335,15 @@ pub trait Account: Send + Sync {
         &self,
         draft: DraftHandle,
         patch: DraftPatch,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Discard (delete) a draft without sending.
-    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), Error>>;
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>>;
 
     /// Convert a draft into a sent message. The provider chooses
     /// atomicity; protocols that don't support atomic draft->send
     /// implement this as draft fetch + send + discard.
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, Error>>;
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>>;
 
     // ------------------------------------------------------------
     // Search primitives (S1-W1)
@@ -332,59 +352,62 @@ pub trait Account: Send + Sync {
     /// Thread-shaped search. Returns a page of `ThreadId`. Each
     /// call's page cursor is opaque; pass the previous page's
     /// `next_cursor` back to fetch the next page.
-    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, Error>>;
+    fn search(
+        &self,
+        request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>>;
 
     /// Message-shaped search using the same request AST.
     fn search_messages(
         &self,
         request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, Error>>;
+    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>>;
 
     // ------------------------------------------------------------
     // Container CRUD primitives (S1-W1)
     // ------------------------------------------------------------
 
     /// Enumerate containers (folders, labels, mailboxes).
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, Error>>;
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>>;
 
     /// Create a new container of the given `kind` with `name` under
     /// `parent`. Returns the engine-facing id.
     ///
     /// Contract: protocols that do not support nesting return
-    /// `Err(Unsupported)` when `parent` is `Some`.
+    /// `Err(AccountErrorKind::Unsupported)` when `parent` is `Some`.
     fn container_create(
         &self,
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<ContainerId, Error>>;
+    ) -> AccountFuture<Result<ContainerId, AccountError>>;
 
     /// Rename a container.
     fn container_rename(
         &self,
         container: ContainerId,
         name: String,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Move a container under a new parent. Folder-kind only;
-    /// label-kind containers return `Err(Unsupported)`.
+    /// label-kind containers return `Err(AccountErrorKind::Unsupported)`.
     fn container_move(
         &self,
         container: ContainerId,
         new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Delete a container. Contract: a non-empty container either
     /// fails or moves contents to Trash; protocols MUST NOT silently
     /// drop messages.
-    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), Error>>;
+    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>>;
 
     // ------------------------------------------------------------
     // Settings primitives (S1-W1)
     // ------------------------------------------------------------
 
     /// List all sending identities on this account.
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, Error>>;
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>>;
 
     /// Update one identity. `patch` is partial; only `Some` fields
     /// are applied.
@@ -392,16 +415,16 @@ pub trait Account: Send + Sync {
         &self,
         identity: IdentityId,
         patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), Error>>;
+    ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Read the vacation responder config, when supported.
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, Error>>;
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>>;
 
     /// Replace the vacation responder config.
-    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), Error>>;
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>>;
 
     /// Read the storage quota readout, when supported.
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, Error>>;
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>>;
 
     // ------------------------------------------------------------
     // Threading + hydration primitives (S1-W1)
@@ -410,14 +433,17 @@ pub trait Account: Send + Sync {
     /// Hydrate every message in a thread. JMAP `Thread/get` +
     /// `Email/get`; IMAP `THREAD REFERENCES` + per-message FETCH;
     /// Gmail `threads.get`; Graph conversation API.
-    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, Error>>;
+    fn thread_hydrate(
+        &self,
+        thread: ThreadId,
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>>;
 
     /// Hydrate one message at a specific projection level.
     fn message_hydrate(
         &self,
         message: ObjectId,
         projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, Error>>;
+    ) -> AccountFuture<Result<Message, AccountError>>;
 
     // ------------------------------------------------------------
     // Conveniences (S1-W1)
@@ -449,8 +475,8 @@ pub trait Account: Send + Sync {
     /// being moved out of (`None` when the consumer is not tracking
     /// a source container, e.g. unifying a flat label-rendering UI).
     ///
-    /// Default impl returns `Err(Unsupported)`; protocol crates
-    /// override with `add_to_container(target)` followed by
+    /// Default impl returns `Err(AccountErrorKind::Unsupported)`; protocol
+    /// crates override with `add_to_container(target)` followed by
     /// `remove_from_container(source)`. Order: add-then-remove so a
     /// failure on the second step leaves the message in both
     /// containers (recoverable) rather than neither (lost).
@@ -459,8 +485,10 @@ pub trait Account: Send + Sync {
         _thread: ThreadId,
         _target: ContainerId,
         _source: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>> {
-        Box::pin(async { Err(Error::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(unsupported_error(AccountOperation::BulkMove))
+        })
     }
 
     /// Apply a label to `target`. Dispatches by `label.provenance`
@@ -469,7 +497,7 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         label: Label,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         dispatch_label(self, target, label, true)
     }
 
@@ -479,13 +507,17 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         label: Label,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         dispatch_label(self, target, label, false)
     }
 
     /// Alias for `set_is_read`. Exists for naming symmetry with the
     /// other convenience setters.
-    fn set_read(&self, target: MutationTarget, is_read: bool) -> AccountFuture<Result<(), Error>> {
+    fn set_read(
+        &self,
+        target: MutationTarget,
+        is_read: bool,
+    ) -> AccountFuture<Result<(), AccountError>> {
         self.set_is_read(target, is_read)
     }
 
@@ -505,7 +537,7 @@ pub trait Account: Send + Sync {
         &self,
         target: MutationTarget,
         starred: bool,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         const STARRED_KEYWORD: &str = "$flagged";
         const STARRED_LABEL: &str = "STARRED";
         match self.capabilities().conveniences.starred {
@@ -518,7 +550,9 @@ pub trait Account: Send + Sync {
             StarredFlagShape::Category => {
                 self.set_category(target, STARRED_KEYWORD.to_string(), starred)
             }
-            StarredFlagShape::None => Box::pin(async { Err(Error::Unsupported) }),
+            StarredFlagShape::None => {
+                Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+            }
         }
     }
 
@@ -527,7 +561,7 @@ pub trait Account: Send + Sync {
     /// `replied_via_extended_property`; if neither flag is set,
     /// returns `Err(Unsupported)` (Gmail's case: replied state is
     /// derived on sync, not a writeable flag).
-    fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), Error>> {
+    fn mark_replied(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         const ANSWERED_KEYWORD: &str = "$answered";
         const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
         const PR_LAST_VERB_REPLIED: &str = "102";
@@ -543,12 +577,12 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_REPLIED.to_string()),
             );
         }
-        Box::pin(async { Err(Error::Unsupported) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
     }
 
     /// Mark a message as forwarded. Same dispatch shape as
     /// `mark_replied`.
-    fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), Error>> {
+    fn mark_forwarded(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
         const FORWARDED_KEYWORD: &str = "$forwarded";
         const PR_LAST_VERB_EXECUTED: &str = "PR_LAST_VERB_EXECUTED";
         const PR_LAST_VERB_FORWARDED: &str = "104";
@@ -564,7 +598,7 @@ pub trait Account: Send + Sync {
                 Some(PR_LAST_VERB_FORWARDED.to_string()),
             );
         }
-        Box::pin(async { Err(Error::Unsupported) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
     }
 
     /// Move a thread to Trash, or delete-permanently if already in
@@ -581,8 +615,8 @@ pub trait Account: Send + Sync {
         &self,
         _thread: ThreadId,
         _current: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>> {
-        Box::pin(async { Err(Error::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::BulkDestroy)) })
     }
 
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,
@@ -592,7 +626,7 @@ pub trait Account: Send + Sync {
     ///
     /// Does NOT destroy durable server-side push subscriptions; those
     /// go through `push_unsubscribe` explicitly.
-    fn close(&self) -> AccountFuture<Result<(), Error>>;
+    fn close(&self) -> AccountFuture<Result<(), AccountError>>;
 }
 
 /// Engine-facing factory.
@@ -614,7 +648,10 @@ pub trait AccountFactory: Send + Sync + 'static {
     /// it as the registration key. On reopen the engine calls
     /// `open` with the same id so attached resources can be
     /// re-registered against the same key.
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, Error>>;
+    fn open(
+        &self,
+        account_id: AccountId,
+    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>>;
 }
 
 /// Shared dispatch for `apply_label` / `remove_label`.
@@ -633,7 +670,7 @@ fn dispatch_label<T: Account + ?Sized>(
     target: MutationTarget,
     label: Label,
     value: bool,
-) -> AccountFuture<Result<(), Error>> {
+) -> AccountFuture<Result<(), AccountError>> {
     use crate::cursor::ProtocolKind;
     match (label.provenance.kind, label.provenance.provider) {
         (ContainerKind::Label, ProtocolKind::Gmail) => {
@@ -654,4 +691,18 @@ fn dispatch_label<T: Account + ?Sized>(
             }
         }
     }
+}
+
+/// Construct a canonical `AccountError` for an unsupported operation.
+///
+/// Used by default impls that have no provider-specific context. The
+/// `AccountOperation` narrows the error so the engine and consumer know
+/// which operation was rejected without having to infer it from the call site.
+fn unsupported_error(op: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(op),
+        Cause::Request(RequestCause::Unsupported { operation: op }),
+    )
+    .operation(op)
+    .build()
 }

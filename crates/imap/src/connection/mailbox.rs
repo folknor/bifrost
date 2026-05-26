@@ -31,7 +31,7 @@ impl ImapConnection {
         // snapshots have list=false.
         tokio::time::timeout(timeout, self.submit_regular(cmd, ListConsumer::new()))
             .await
-            .map_err(|_| Error::Timeout)??
+            .map_err(|_| Error::timeout_inflight())??
     }
 
     /// LIST mailboxes with RFC 5258 selection options, multiple patterns, and
@@ -97,7 +97,7 @@ impl ImapConnection {
         );
         tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)??
+            .map_err(|_| Error::timeout_inflight())??
     }
 
     /// LIST with STATUS return option (RFC 5819 Section 2).
@@ -139,7 +139,7 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, ListStatusConsumer::new()))
             .await
-            .map_err(|_| Error::Timeout)??
+            .map_err(|_| Error::timeout_inflight())??
     }
 
     /// SELECT a mailbox (RFC 3501 Section 6.3.1).
@@ -260,7 +260,7 @@ impl ImapConnection {
         // reclassify accumulated responses as events on those paths.
         let inner = tokio::time::timeout(timeout, self.submit_regular(cmd, consumer))
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| Error::timeout_inflight())??;
         // State transitions (Selected on OK, Authenticated on NO) are
         // handled by the driver's apply_tagged via the in_select flag.
         inner
@@ -320,7 +320,7 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// CREATE a mailbox with special-use attributes (RFC 6154 Section 3).
@@ -381,7 +381,7 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, CreateConsumer::default()))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// DELETE a mailbox (RFC 3501 Section 6.3.4).
@@ -398,7 +398,7 @@ impl ImapConnection {
             self.submit_regular(cmd, TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// RENAME a mailbox (RFC 3501 Section 6.3.5).
@@ -421,7 +421,7 @@ impl ImapConnection {
             self.submit_regular(cmd, TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// SUBSCRIBE to a mailbox (RFC 3501 Section 6.3.6).
@@ -441,7 +441,7 @@ impl ImapConnection {
             self.submit_regular(cmd, TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UNSUBSCRIBE from a mailbox (RFC 3501 Section 6.3.7).
@@ -458,7 +458,7 @@ impl ImapConnection {
             self.submit_regular(cmd, TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// LSUB  -  list subscribed mailboxes (RFC 3501 Section 6.3.9).
@@ -492,7 +492,7 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, LsubConsumer::default()))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 
     /// CLOSE the selected mailbox (RFC 3501 Section 6.4.2).
@@ -512,7 +512,7 @@ impl ImapConnection {
             self.submit_regular(Command::Close, TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::timeout_inflight())??;
         Ok(())
     }
 
@@ -551,7 +551,7 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)??;
+        .map_err(|_| Error::timeout_inflight())??;
         Ok(())
     }
 
@@ -581,6 +581,6 @@ impl ImapConnection {
         };
         tokio::time::timeout(timeout, self.submit_regular(cmd, StatusConsumer::new()))
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
     }
 }

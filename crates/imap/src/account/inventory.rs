@@ -30,7 +30,14 @@ pub(crate) fn inventory_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         if let Err(err) = run_inventory(account, scope, tx.clone()).await {
-            let _ = tx.send(fatal_event(err)).await;
+            let _ = tx
+                .send(fatal_event(
+                    err,
+                    super::error::ImapErrorContext::operation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                    ),
+                ))
+                .await;
         }
     });
     boxed_receiver_stream(rx)
@@ -53,7 +60,7 @@ async fn run_inventory(
             protocol_detail: Some("imap".to_string()),
         }))
         .await
-        .map_err(|_| crate::Error::Closed)?;
+        .map_err(|_| crate::Error::closed())?;
     }
     let folder = folder_from_scope(&scope).map_err(|e| crate::Error::Protocol(e.to_string()))?;
     let mut conn = account.checkout_for_folder(&folder).await?;
@@ -96,7 +103,7 @@ async fn run_inventory(
                             batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch));
                             if batch_items.len() >= BATCH_ITEMS {
                                 let out = std::mem::take(&mut batch_items);
-                                tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| crate::Error::Closed)?;
+                                tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| crate::Error::closed())?;
                             }
                         }
                     }
@@ -122,14 +129,14 @@ async fn run_inventory(
     if batch_items.is_empty() {
         tx.send(SyncEvent::Done(checkpoint))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
     } else {
         tx.send(batch(batch_items, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
         tx.send(SyncEvent::Done(checkpoint))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
     }
     Ok(())
 }

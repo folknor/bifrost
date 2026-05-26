@@ -3,13 +3,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, time::Duration};
 
+use bifrost_types::error::{AccountError, BatchItem, BatchOutcome};
+
 use super::PoolConfig;
+use super::batch::{SmtpBatchRecipient, batch_input_invalid_error, batch_level_error};
 use super::pool::sync_impl::Pool;
 use super::{
     ClientId, Credentials, Error, Mechanism, Protocol, Response, SendOptions, SmtpConnection,
     SmtpInfo, error,
 };
 use super::{SUBMISSION_PORT, SUBMISSIONS_PORT, Tls, TlsParameters};
+use crate::address::Address;
+use crate::transport::smtp::account_error::SmtpErrorContext;
 use crate::transport::smtp::authentication::IntoSecretString;
 use crate::{Transport, address::Envelope};
 
@@ -331,6 +336,39 @@ impl SmtpTransport {
 
         Ok(result)
     }
+
+    /// Account-oriented multi-recipient send over SMTP.
+    ///
+    /// Validates batch input, runs MAIL FROM / RCPT TO / DATA body, and returns
+    /// a `BatchOutcome<()>` with every submitted recipient accounted for in
+    /// exactly one lane (`succeeded`, `failed`, or `uncertain`).
+    ///
+    /// Returns `Err(AccountError)` only for batch-level failures where no
+    /// per-recipient outcome can be attributed: pool checkout failure, connection
+    /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
+    pub fn send_raw_batch_with_options(
+        &self,
+        from: Option<Address>,
+        recipients: Vec<BatchItem<Address>>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<BatchOutcome<()>, AccountError> {
+        let ctx = SmtpErrorContext::send(Protocol::Smtp);
+
+        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
+            return Err(batch_input_invalid_error(Protocol::Smtp, invalid));
+        }
+
+        let batch_recipients: Vec<SmtpBatchRecipient> =
+            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+
+        let mut conn = self.inner.connection().map_err(|e| batch_level_error(e, ctx.clone()))?;
+
+        match conn.send_smtp_batch(from, batch_recipients, email, options) {
+            Ok(progress) => Ok(progress.resolve()),
+            Err((e, _progress)) => Err(batch_level_error(e, ctx)),
+        }
+    }
 }
 
 impl LmtpTransport {
@@ -425,6 +463,39 @@ impl LmtpTransport {
         let result = conn.send_lmtp_bdat_with_options(envelope, email, options)?;
 
         Ok(result)
+    }
+
+    /// Account-oriented multi-recipient send over LMTP.
+    ///
+    /// Validates batch input, runs MAIL FROM / RCPT TO / DATA body, reads one
+    /// final status per accepted recipient, and returns a `BatchOutcome<()>`
+    /// with every submitted recipient accounted for exactly once.
+    ///
+    /// Returns `Err(AccountError)` only for batch-level failures where no
+    /// per-recipient outcome can be attributed: pool checkout failure, connection
+    /// setup failure, MAIL FROM rejection, or a pre-MAIL transport drop.
+    pub fn send_raw_batch_with_options(
+        &self,
+        from: Option<Address>,
+        recipients: Vec<BatchItem<Address>>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<BatchOutcome<()>, AccountError> {
+        let ctx = SmtpErrorContext::send(Protocol::Lmtp);
+
+        if let Err(invalid) = bifrost_types::error::validate_batch_input(&recipients) {
+            return Err(batch_input_invalid_error(Protocol::Lmtp, invalid));
+        }
+
+        let batch_recipients: Vec<SmtpBatchRecipient> =
+            recipients.into_iter().map(SmtpBatchRecipient::from).collect();
+
+        let mut conn = self.inner.connection().map_err(|e| batch_level_error(e, ctx.clone()))?;
+
+        match conn.send_lmtp_batch(from, batch_recipients, email, options) {
+            Ok(progress) => Ok(progress.resolve()),
+            Err((e, _progress)) => Err(batch_level_error(e, ctx)),
+        }
     }
 }
 

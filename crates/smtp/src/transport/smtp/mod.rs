@@ -193,6 +193,8 @@
 
 use std::{path::PathBuf, time::Duration};
 
+pub(crate) use bifrost_types::error::Protocol;
+
 #[cfg(feature = "tokio")]
 // pub: async SMTP and LMTP transports are the tokio user-facing API.
 pub use self::async_transport::{
@@ -219,13 +221,11 @@ use crate::transport::smtp::{
     response::Response,
 };
 
-#[cfg(feature = "account-error")]
 mod account_error;
 #[cfg(feature = "tokio")]
 mod async_transport;
 // pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
-#[cfg(feature = "account-error")]
 mod batch;
 mod client;
 mod commands;
@@ -265,21 +265,6 @@ pub const SUBMISSIONS_PORT: u16 = 465;
 
 /// Default timeout
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Protocol {
-    Smtp,
-    Lmtp,
-}
-
-impl Protocol {
-    fn default_port(self) -> u16 {
-        match self {
-            Protocol::Smtp => SMTP_PORT,
-            Protocol::Lmtp => LMTP_PORT,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct SmtpInfo {
@@ -328,10 +313,15 @@ impl Default for SmtpInfo {
 
 impl SmtpInfo {
     fn new<T: Into<String>>(server: T, protocol: Protocol) -> Self {
+        let port = match protocol {
+            Protocol::Smtp => SMTP_PORT,
+            Protocol::Lmtp => LMTP_PORT,
+            _ => SMTP_PORT,
+        };
         Self {
             protocol,
             server: server.into(),
-            port: protocol.default_port(),
+            port,
             ..Default::default()
         }
     }
@@ -359,6 +349,7 @@ impl SmtpInfo {
             let protocol = match self.protocol {
                 Protocol::Smtp => "SMTP",
                 Protocol::Lmtp => "LMTP",
+                _ => "SMTP",
             };
             Err(error::policy(format!(
                 "refusing to authenticate over an unencrypted {protocol} connection"

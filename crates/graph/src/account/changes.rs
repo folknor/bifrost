@@ -1,12 +1,12 @@
 use bifrost_types::{
-    AccountStream, Change, ChangeCursor, Checkpoint, ObjectChange, ObjectChangeKind, PageBoundary,
-    RecoveryClass, ScopeChange, ScopeChangeKind, SyncEvent,
+    AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, ErrorScope, ObjectChange,
+    ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
 };
 use serde_json::Value;
 
 use super::GraphAccount;
-use super::cursor::{decode_cursor, encode_cursor};
-use super::error::{fatal_from_recovery, graph_error_to_fatal};
+use super::cursor::{CursorError, decode_cursor, encode_cursor};
+use super::graph_error::{GraphErrorContext, cursor_error_to_account_error, into_account_error};
 use super::inventory::{
     batch, fetch_delta_page, graph_etag, is_removed, membership_from_value, page_marker,
     removed_id, scope_matches_payload,
@@ -20,25 +20,19 @@ pub(crate) fn changes_stream(
         let mut payload = match decode_cursor(&cursor) {
             Ok(payload) => payload,
             Err(error) => {
-                yield SyncEvent::Fatal(fatal_from_recovery(
-                    match error {
-                        bifrost_types::Error::CursorProtocolMismatch
-                        | bifrost_types::Error::CursorEnvelopeUnknown
-                        | bifrost_types::Error::SchemaIncompatible => {
-                            RecoveryClass::SchemaIncompatible
-                        }
-                        _ => RecoveryClass::Fatal,
-                    },
-                    error.to_string(),
-                ));
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
         };
         if !scope_matches_payload(&cursor.scope, &payload) {
-            yield SyncEvent::Fatal(fatal_from_recovery(
-                RecoveryClass::SchemaIncompatible,
-                "Graph cursor scope does not match cursor payload",
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+            yield SyncEvent::Terminated(cursor_error_to_account_error(
+                CursorError::SchemaIncompatible,
+                ctx,
             ));
             yield SyncEvent::Done(None);
             return;
@@ -51,7 +45,9 @@ pub(crate) fn changes_stream(
             let page = match fetch_delta_page(&account, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {
-                    yield SyncEvent::Fatal(graph_error_to_fatal(error, scope.clone()));
+                    let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                        .with_scope(ErrorScope::Cursor(scope.clone()));
+                    yield SyncEvent::Terminated(into_account_error(error, ctx));
                     yield SyncEvent::Done(None);
                     return;
                 }
@@ -99,33 +95,33 @@ pub(crate) fn changes_stream(
 
             if let Some(next_link) = page.next_link {
                 payload.advanced_through = Some(page_marker(next_link.clone(), last_seen_id));
-                let checkpoint_cursor = match encode_cursor(scope.clone(), payload.clone()) {
-                    Ok(cursor) => cursor,
-                    Err(error) => {
-                        yield SyncEvent::Fatal(graph_error_to_fatal(
-                            error.to_string(),
-                            scope.clone(),
-                        ));
-                        yield SyncEvent::Done(None);
-                        return;
-                    }
-                };
+                let checkpoint_cursor =
+                    match encode_cursor(scope.clone(), payload.clone()) {
+                        Ok(cursor) => cursor,
+                        Err(error) => {
+                            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                                .with_scope(ErrorScope::Cursor(scope.clone()));
+                            yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                            yield SyncEvent::Done(None);
+                            return;
+                        }
+                    };
                 yield batch(changes, PageBoundary::Page, Some(checkpoint_cursor));
                 current_url = next_link;
             } else if let Some(delta_link) = page.delta_link {
                 payload.delta_link = delta_link;
                 payload.advanced_through = None;
-                let checkpoint_cursor = match encode_cursor(scope.clone(), payload.clone()) {
-                    Ok(cursor) => cursor,
-                    Err(error) => {
-                        yield SyncEvent::Fatal(graph_error_to_fatal(
-                            error.to_string(),
-                            scope.clone(),
-                        ));
-                        yield SyncEvent::Done(None);
-                        return;
-                    }
-                };
+                let checkpoint_cursor =
+                    match encode_cursor(scope.clone(), payload.clone()) {
+                        Ok(cursor) => cursor,
+                        Err(error) => {
+                            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                                .with_scope(ErrorScope::Cursor(scope.clone()));
+                            yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
+                            yield SyncEvent::Done(None);
+                            return;
+                        }
+                    };
                 let checkpoint = Checkpoint::Change(checkpoint_cursor.clone());
                 yield batch(changes, PageBoundary::Final, Some(checkpoint_cursor));
                 yield SyncEvent::Done(Some(checkpoint));

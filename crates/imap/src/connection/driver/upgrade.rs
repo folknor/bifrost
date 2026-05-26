@@ -123,7 +123,7 @@ pub(in crate::connection) async fn run_starttls_upgrade(
         Err(e) => {
             // TLS handshake failed; connection is dead (Poisoned stays).
             state.apply_infrastructure_failure();
-            return Err(Error::Io(Arc::new(std::io::Error::other(e))));
+            return Err(Error::Io { source: Arc::new(std::io::Error::other(e)), attempt: None });
         }
     };
 

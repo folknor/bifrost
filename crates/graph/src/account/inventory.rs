@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountStream, Batch, ChangeCursor, Checkpoint, CursorScope, Fingerprint, FolderId,
-    InventoryEntry, MembershipScope, ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent,
-    ThreadId,
+    AccountOperation, AccountStream, Batch, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
+    Fingerprint, FolderId, InventoryEntry, MembershipScope, ObjectId, ObjectType, PageBoundary,
+    ServerVersion, SyncEvent, ThreadId,
 };
 use serde_json::Value;
 
@@ -13,7 +13,7 @@ use super::GraphAccount;
 use super::cursor::{
     GraphCursorPayload, GraphPageMarker, encode_cursor, kind_for_scope, scope_for_kind,
 };
-use super::error::graph_error_to_fatal;
+use super::graph_error::{GraphErrorContext, cursor_error_to_account_error, into_account_error};
 
 const EVENT_SELECT: &str = "\
 id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
@@ -25,10 +25,13 @@ pub(crate) fn inventory_stream(
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     Box::pin(async_stream::stream! {
+        let sync_ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+            .with_scope(ErrorScope::Cursor(scope.clone()));
+
         let mut current_url = match initial_delta_url(&account, &scope) {
             Ok(url) => url,
             Err(error) => {
-                yield SyncEvent::Fatal(graph_error_to_fatal(error.to_string(), scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(error, sync_ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -36,7 +39,9 @@ pub(crate) fn inventory_stream(
         let kind = match kind_for_scope(&scope) {
             Ok(kind) => kind,
             Err(error) => {
-                yield SyncEvent::Fatal(graph_error_to_fatal(error.to_string(), scope.clone()));
+                let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+                    .with_scope(ErrorScope::Cursor(scope.clone()));
+                yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -46,7 +51,9 @@ pub(crate) fn inventory_stream(
             let page: ODataCollection<Value> = match fetch_page(&account, &current_url).await {
                 Ok(page) => page,
                 Err(error) => {
-                    yield SyncEvent::Fatal(graph_error_to_fatal(error, scope.clone()));
+                    let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+                        .with_scope(ErrorScope::Cursor(scope.clone()));
+                    yield SyncEvent::Terminated(into_account_error(error, ctx));
                     yield SyncEvent::Done(None);
                     return;
                 }
@@ -84,10 +91,9 @@ pub(crate) fn inventory_stream(
                 ) {
                     Ok(cursor) => cursor,
                     Err(error) => {
-                        yield SyncEvent::Fatal(graph_error_to_fatal(
-                            error.to_string(),
-                            scope.clone(),
-                        ));
+                        let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
+                            .with_scope(ErrorScope::Cursor(scope.clone()));
+                        yield SyncEvent::Terminated(cursor_error_to_account_error(error, ctx));
                         yield SyncEvent::Done(None);
                         return;
                     }
@@ -110,7 +116,7 @@ pub(crate) fn inventory_stream(
 pub(crate) async fn fetch_delta_page(
     account: &GraphAccount,
     url: &str,
-) -> Result<ODataCollection<Value>, String> {
+) -> Result<ODataCollection<Value>, crate::error::GraphError> {
     fetch_page(account, url).await
 }
 
@@ -198,7 +204,7 @@ pub(crate) fn page_marker(next_link: String, last_seen_id: Option<String>) -> Gr
 pub(crate) fn initial_delta_url(
     account: &GraphAccount,
     scope: &CursorScope,
-) -> Result<String, &'static str> {
+) -> Result<String, super::cursor::CursorError> {
     let prefix = account.client.api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => {
@@ -219,10 +225,10 @@ pub(crate) fn initial_delta_url(
                 ObjectType::Contact => Ok(format!(
                     "{prefix}/contactFolders/{encoded}/contacts/delta?$select={CONTACT_SELECT}&$top=250"
                 )),
-                _ => Err("unsupported Graph cursor scope type"),
+                _ => Err(super::cursor::CursorError::Unsupported),
             }
         }
-        _ => Err("unsupported Graph cursor scope"),
+        _ => Err(super::cursor::CursorError::Unsupported),
     }
 }
 
@@ -261,7 +267,10 @@ fn event_aliases(a: &CursorScope, b: &CursorScope) -> bool {
     aliased && fa == fb
 }
 
-async fn fetch_page(account: &GraphAccount, url: &str) -> Result<ODataCollection<Value>, String> {
+async fn fetch_page(
+    account: &GraphAccount,
+    url: &str,
+) -> Result<ODataCollection<Value>, crate::error::GraphError> {
     if url.starts_with("http") {
         account.client.get_absolute(url).await
     } else {
@@ -456,7 +465,7 @@ mod tests {
         let account = test_account();
         let mut stream = inventory_stream(account, CursorScope::Account);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Fatal(_)));
+        assert!(matches!(first, SyncEvent::Terminated(_)));
         let second = stream.next().await.expect("done event");
         assert!(matches!(second, SyncEvent::Done(None)));
         assert!(stream.next().await.is_none());
@@ -468,7 +477,7 @@ mod tests {
         let scope = CursorScope::Query(QueryId("q1".to_string()));
         let mut stream = inventory_stream(account, scope);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Fatal(_)));
+        assert!(matches!(first, SyncEvent::Terminated(_)));
         let second = stream.next().await.expect("done event");
         assert!(matches!(second, SyncEvent::Done(None)));
     }
@@ -482,7 +491,7 @@ mod tests {
         };
         let mut stream = inventory_stream(account, scope);
         let first = stream.next().await.expect("fatal event");
-        assert!(matches!(first, SyncEvent::Fatal(_)));
+        assert!(matches!(first, SyncEvent::Terminated(_)));
     }
 
     #[test]

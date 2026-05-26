@@ -64,36 +64,35 @@ pub(crate) fn discover_memberships(
     client: Arc<GmailClient>,
     cache: ScopeCache,
 ) -> AccountStream<SyncEvent<MembershipScope>> {
-    Box::pin(
-        stream::once(async move {
-            let started = Instant::now();
-            match refresh_scope_snapshot(&client, &cache).await {
-                Ok(snapshot) => {
-                    let items = snapshot
-                        .labels
-                        .iter()
-                        .map(|label| MembershipScope::Label(LabelId(label.id.clone())))
-                        .collect();
-                    SyncEvent::Batch(Batch {
-                        items,
-                        page_boundary: PageBoundary::Final,
-                        server_latency: started.elapsed(),
-                        bytes_in: 0,
-                        checkpoint: None,
-                    })
-                }
-                Err(error) => {
-                    let _account_error = recovery::into_account_error(
-                        error,
-                        recovery::GmailErrorContext::containers_list(),
-                    );
-                    // Phase 3 swaps this for SyncEvent::Terminated.
-                    SyncEvent::Done(None)
-                }
+    Box::pin(stream::once(async move {
+        let started = Instant::now();
+        match refresh_scope_snapshot(&client, &cache).await {
+            Ok(snapshot) => {
+                let items = snapshot
+                    .labels
+                    .iter()
+                    .map(|label| MembershipScope::Label(LabelId(label.id.clone())))
+                    .collect();
+                // Success: emit the batch then Done.
+                let batch = SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Final,
+                    server_latency: started.elapsed(),
+                    bytes_in: 0,
+                    checkpoint: None,
+                });
+                vec![batch, SyncEvent::Done(None)]
             }
-        })
-        .chain(stream::once(async { SyncEvent::Done(None) })),
-    )
+            Err(error) => {
+                let account_error = recovery::into_account_error(
+                    error,
+                    recovery::GmailErrorContext::containers_list(),
+                );
+                vec![SyncEvent::Terminated(account_error)]
+            }
+        }
+    })
+    .flat_map(stream::iter))
 }
 
 pub(crate) fn scope_lifecycle_stream(

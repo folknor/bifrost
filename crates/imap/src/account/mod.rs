@@ -11,10 +11,10 @@ use bifrost_types::{
     Account, AccountError, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
     Change, ChangeCursor, Container, ContainerId, ContainerKind, CursorDescriptor,
     CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, MembershipScope, Message,
-    MutationResult, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, SearchRequest,
-    SendRequest, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
+    Projection, QuotaInfo, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -344,7 +344,7 @@ impl Account for ImapAccount {
         targets: AccountStream<bifrost_types::ObjectId>,
         op: bifrost_types::FlagOp,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutate::bulk_set_flags(self.clone(), targets, op, key)
     }
 
@@ -354,7 +354,7 @@ impl Account for ImapAccount {
         targets: AccountStream<bifrost_types::ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutate::bulk_move(self.clone(), targets, destination, key)
     }
 
@@ -363,7 +363,7 @@ impl Account for ImapAccount {
         &self,
         targets: AccountStream<bifrost_types::ObjectId>,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutate::bulk_destroy(self.clone(), targets, key)
     }
 
@@ -585,12 +585,6 @@ pub(crate) fn account_error_with(err: Error, ctx: error::ImapErrorContext) -> Ac
 }
 
 /// Wrap a crate-private error as a terminal sync-stream event.
-///
-/// Phase 3 will reconcile this against whatever shape
-/// `bifrost_types::events::SyncEvent` carries for terminal errors after
-/// the rename from `Fatal(Fatal)` to `Terminated(AccountError)`. Until
-/// then, this helper builds the `AccountError` correctly; the
-/// `SyncEvent` adapter glue moves with that rename.
 pub(crate) fn fatal_event<T>(err: Error, ctx: error::ImapErrorContext) -> SyncEvent<T> {
     SyncEvent::Terminated(error::into_account_error(err, ctx))
 }

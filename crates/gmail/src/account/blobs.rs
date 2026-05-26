@@ -4,11 +4,8 @@
 //! do not support HTTP byte ranges. `open_blob_range` thus always
 //! returns `Unsupported(OpenBlobRange)` per capabilities.
 //!
-//! Errors funnel through `recovery::into_account_error`. Phase 3
-//! migrates `SyncEvent::Fatal(Fatal)` to
-//! `SyncEvent::Terminated(AccountError)`; until that lands the
-//! workspace-wide stream-termination signal carries `AccountError`
-//! through the same channel.
+//! Errors funnel through `recovery::into_account_error` and
+//! terminate streams with `SyncEvent::Terminated(AccountError)`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -164,12 +161,6 @@ fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
     }
 }
 
-/// Phase 3 will replace this with `SyncEvent::Terminated(error)`. For
-/// now we forward the structured error through `SyncEvent::Done(None)`
-/// to keep the stream surface alive without dropping the data; the
-/// engine reads the new `AccountError` via the broken-branch
-/// `SyncEvent::Fatal` carrier once Phase 3 lands the rename.
 fn terminate_blob(error: AccountError) -> SyncEvent<Bytes> {
-    let _ = error;
-    SyncEvent::Done(None)
+    SyncEvent::Terminated(error)
 }

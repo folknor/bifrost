@@ -10,8 +10,6 @@
 //! `AccountErrorBuilder::build`, which derives recovery centrally from the kind
 //! + cause chain + transmission state + idempotency.
 
-#![cfg(feature = "account-error")]
-
 use bifrost_types::error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText,
@@ -199,9 +197,7 @@ fn build_basic(
     let mut builder = AccountErrorBuilder::new(kind, cause).protocol(ctx.protocol);
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
-        builder = builder.push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: to_types_state(state),
-        }));
+        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
     }
     if let Some(extra) = extra {
         builder = builder.push_cause(extra);
@@ -225,17 +221,15 @@ fn build_transport(
     let attempt = attempt.filter(|s| *s != SmtpTransmissionState::Acknowledged);
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Transport(kind),
-        Cause::Transport(TransportCause {
-            kind: cause_kind,
-            message: diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
-        }),
+        Cause::Transport(TransportCause::new(
+            cause_kind,
+            diagnostic.map(|t| DiagnosticText::support_only(t.to_owned())),
+        )),
     )
     .protocol(ctx.protocol);
     builder = apply_context(builder, ctx);
     if let Some(state) = attempt {
-        builder = builder.push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: to_types_state(state),
-        }));
+        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(state))));
     }
     if let Some(text) = diagnostic {
         builder = builder.text(DiagnosticText::support_only(text.to_owned()));
@@ -276,11 +270,7 @@ pub(crate) fn smtp_wire_cause(response: &Response) -> TypesEnhancedStatusCode {
         .message()
         .next()
         .map(|line| DiagnosticText::support_only(line.to_owned()));
-    TypesEnhancedStatusCode {
-        code: u16::from(response.code()),
-        enhanced,
-        text,
-    }
+    TypesEnhancedStatusCode::new(u16::from(response.code()), enhanced, text)
 }
 
 /// Convert an SMTP reply (4xx or 5xx) into an `AccountError`. This is the lane
@@ -312,9 +302,7 @@ pub(crate) fn response_to_account_error(
     // Negative SMTP replies are by definition Acknowledged unless the caller
     // overrode it (e.g. drained reply but body unsent).
     let attempt = attempt.unwrap_or(SmtpTransmissionState::Acknowledged);
-    builder = builder.push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: to_types_state(attempt),
-    }));
+    builder = builder.push_cause(Cause::Attempt(AttemptCause::new(to_types_state(attempt))));
     if let Some(text) = text_first {
         builder = builder.text(DiagnosticText::support_only(text));
     }

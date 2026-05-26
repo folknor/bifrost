@@ -3,14 +3,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountFuture, AccountStream, AttachmentHandle, BlobHandle,
-    ByteRange, ChangeCursor, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, Error, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    InventoryPartition, InventoryPartitioning, Label, MembershipScope, Message, MutationResult,
-    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, ScopeLifecycle, SearchRequest,
-    SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
+    AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
+    Cause, ChangeCursor, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
+    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition,
+    InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, Page, Priority, Projection, Protocol, QuotaInfo, RequestCause,
+    ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -151,10 +152,20 @@ impl Account for JmapAccount {
     fn establish_initial_cursor(
         &self,
         scope: CursorScope,
-    ) -> AccountFuture<Result<CursorEstablishment, Error>> {
+    ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let seed = self.seed_states.get(&scope).cloned();
         Box::pin(async move {
-            let server_state = seed.ok_or(Error::Unsupported)?;
+            let server_state = seed.ok_or_else(|| {
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Unsupported(AccountOperation::EstablishCursor),
+                    Cause::Request(RequestCause::Unsupported {
+                        operation: AccountOperation::EstablishCursor,
+                    }),
+                )
+                .operation(AccountOperation::EstablishCursor)
+                .protocol(Protocol::Jmap)
+                .build()
+            })?;
             Ok(CursorEstablishment::Ready(ChangeCursor {
                 scope,
                 server_state,
@@ -213,7 +224,7 @@ impl Account for JmapAccount {
     fn push_subscribe(
         &self,
         scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, Error>> {
+    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
         push::subscribe(
             self.client.clone(),
             self.caps.push,
@@ -224,7 +235,10 @@ impl Account for JmapAccount {
         )
     }
 
-    fn push_unsubscribe(&self, handle: SubscriptionHandle) -> AccountFuture<Result<(), Error>> {
+    fn push_unsubscribe(
+        &self,
+        handle: SubscriptionHandle,
+    ) -> AccountFuture<Result<(), AccountError>> {
         push::unsubscribe(
             self.client.clone(),
             handle,
@@ -254,7 +268,7 @@ impl Account for JmapAccount {
         targets: AccountStream<ObjectId>,
         op: bifrost_types::FlagOp,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::set_flags(
             self.mail.clone(),
             self.core_limits,
@@ -270,7 +284,7 @@ impl Account for JmapAccount {
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::move_to(
             self.mail.clone(),
             self.core_limits,
@@ -285,7 +299,7 @@ impl Account for JmapAccount {
         &self,
         targets: AccountStream<ObjectId>,
         key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::destroy(
             self.mail.clone(),
             self.core_limits,
@@ -299,7 +313,7 @@ impl Account for JmapAccount {
         &self,
         target: MutationTarget,
         container: ContainerId,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::add_to_container(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -312,7 +326,7 @@ impl Account for JmapAccount {
         &self,
         target: MutationTarget,
         container: ContainerId,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::remove_from_container(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -326,7 +340,7 @@ impl Account for JmapAccount {
         target: MutationTarget,
         keyword: String,
         value: bool,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_keyword(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -341,8 +355,13 @@ impl Account for JmapAccount {
         _target: MutationTarget,
         _label: ContainerId,
         _value: bool,
-    ) -> AccountFuture<Result<(), Error>> {
-        Box::pin(async { Err(Error::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::SetLabelMembership,
+            None,
+            "JMAP does not support label membership",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn set_category(
@@ -350,8 +369,13 @@ impl Account for JmapAccount {
         _target: MutationTarget,
         _category: String,
         _value: bool,
-    ) -> AccountFuture<Result<(), Error>> {
-        Box::pin(async { Err(Error::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::SetCategory,
+            None,
+            "JMAP does not support categories",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn set_extended_property(
@@ -359,15 +383,20 @@ impl Account for JmapAccount {
         _target: MutationTarget,
         _property_id: String,
         _value: Option<String>,
-    ) -> AccountFuture<Result<(), Error>> {
-        Box::pin(async { Err(Error::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::SetExtendedProperty,
+            None,
+            "JMAP does not support extended properties",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn set_is_read(
         &self,
         target: MutationTarget,
         is_read: bool,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_is_read(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -376,22 +405,27 @@ impl Account for JmapAccount {
         )
     }
 
-    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, Error>> {
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
         if self.submission.is_none() {
-            return Box::pin(async { Err(Error::Unsupported) });
+            let err = super::error::unsupported_error(
+                AccountOperation::Send,
+                None,
+                "JMAP submission capability not available",
+            );
+            return Box::pin(async move { Err(err) });
         }
         pim::send_message(self.mail.clone(), Arc::clone(&self.email_state), request)
     }
 
     fn attachment_upload(
         &self,
-        bytes: AccountStream<Result<bytes::Bytes, Error>>,
+        bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
         mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, Error>> {
+    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
         pim::attachment_upload(self.mail.clone(), bytes, mime)
     }
 
-    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, Error>> {
+    fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
         pim::draft_create(self.mail.clone(), Arc::clone(&self.email_state), patch)
     }
 
@@ -399,7 +433,7 @@ impl Account for JmapAccount {
         &self,
         draft: DraftHandle,
         patch: DraftPatch,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::draft_update(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -408,29 +442,34 @@ impl Account for JmapAccount {
         )
     }
 
-    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), Error>> {
+    fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
         pim::draft_discard(self.mail.clone(), Arc::clone(&self.email_state), draft)
     }
 
-    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, Error>> {
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
         if self.submission.is_none() {
-            return Box::pin(async { Err(Error::Unsupported) });
+            let err = super::error::unsupported_error(
+                AccountOperation::DraftSend,
+                None,
+                "JMAP submission capability not available",
+            );
+            return Box::pin(async move { Err(err) });
         }
         pim::draft_send(self.mail.clone(), Arc::clone(&self.email_state), draft)
     }
 
-    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, Error>> {
+    fn search(&self, request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
         pim::search(self.mail.clone(), request)
     }
 
     fn search_messages(
         &self,
         request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, Error>> {
+    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
         pim::search_messages(self.mail.clone(), request)
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, Error>> {
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
         pim::containers_list(self.mail.clone())
     }
 
@@ -439,7 +478,7 @@ impl Account for JmapAccount {
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<ContainerId, Error>> {
+    ) -> AccountFuture<Result<ContainerId, AccountError>> {
         pim::container_create(
             self.mail.clone(),
             Arc::clone(&self.mailbox_state),
@@ -453,7 +492,7 @@ impl Account for JmapAccount {
         &self,
         container: ContainerId,
         name: String,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::container_rename(
             self.mail.clone(),
             Arc::clone(&self.mailbox_state),
@@ -466,7 +505,7 @@ impl Account for JmapAccount {
         &self,
         container: ContainerId,
         new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::container_move(
             self.mail.clone(),
             Arc::clone(&self.mailbox_state),
@@ -475,7 +514,7 @@ impl Account for JmapAccount {
         )
     }
 
-    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), Error>> {
+    fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
         pim::container_delete(
             self.mail.clone(),
             Arc::clone(&self.mailbox_state),
@@ -483,7 +522,7 @@ impl Account for JmapAccount {
         )
     }
 
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, Error>> {
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
         pim::identities_list(self.submission.clone())
     }
 
@@ -491,23 +530,23 @@ impl Account for JmapAccount {
         &self,
         identity: IdentityId,
         patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::identity_update(self.submission.clone(), identity, patch)
     }
 
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, Error>> {
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
         pim::vacation_get(self.vacation.clone())
     }
 
-    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), Error>> {
+    fn vacation_set(&self, config: VacationConfig) -> AccountFuture<Result<(), AccountError>> {
         pim::vacation_set(self.vacation.clone(), config)
     }
 
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, Error>> {
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
         pim::quota_get(self.quota.clone())
     }
 
-    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, Error>> {
+    fn thread_hydrate(&self, thread: ThreadId) -> AccountFuture<Result<ThreadHydration, AccountError>> {
         pim::thread_hydrate(self.mail.clone(), thread)
     }
 
@@ -515,7 +554,7 @@ impl Account for JmapAccount {
         &self,
         message: ObjectId,
         projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, Error>> {
+    ) -> AccountFuture<Result<Message, AccountError>> {
         pim::message_hydrate(self.mail.clone(), message, projection)
     }
 
@@ -524,7 +563,7 @@ impl Account for JmapAccount {
         thread: ThreadId,
         target: ContainerId,
         source: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::move_thread(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -538,11 +577,18 @@ impl Account for JmapAccount {
         &self,
         target: MutationTarget,
         label: Label,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         match label.provenance.kind {
             ContainerKind::Label => self.set_keyword(target, label.provenance.native, true),
             ContainerKind::Folder => self.add_to_container(target, label.id),
-            _ => Box::pin(async { Err(Error::Unsupported) }),
+            _ => {
+                let err = super::error::unsupported_error(
+                    AccountOperation::SetLabelMembership,
+                    None,
+                    "JMAP does not support this label kind",
+                );
+                Box::pin(async move { Err(err) })
+            }
         }
     }
 
@@ -550,11 +596,18 @@ impl Account for JmapAccount {
         &self,
         target: MutationTarget,
         label: Label,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         match label.provenance.kind {
             ContainerKind::Label => self.set_keyword(target, label.provenance.native, false),
             ContainerKind::Folder => self.remove_from_container(target, label.id),
-            _ => Box::pin(async { Err(Error::Unsupported) }),
+            _ => {
+                let err = super::error::unsupported_error(
+                    AccountOperation::SetLabelMembership,
+                    None,
+                    "JMAP does not support this label kind",
+                );
+                Box::pin(async move { Err(err) })
+            }
         }
     }
 
@@ -562,7 +615,7 @@ impl Account for JmapAccount {
         &self,
         thread: ThreadId,
         current: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), Error>> {
+    ) -> AccountFuture<Result<(), AccountError>> {
         pim::delete_thread(
             self.mail.clone(),
             Arc::clone(&self.email_state),
@@ -571,7 +624,7 @@ impl Account for JmapAccount {
         )
     }
 
-    fn close(&self) -> AccountFuture<Result<(), Error>> {
+    fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Box::pin(async { Ok(()) });
         }

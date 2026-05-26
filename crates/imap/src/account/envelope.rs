@@ -1,6 +1,7 @@
 use bifrost_types::{
-    BlobId, ChangeCursor, CursorScope, Error as AccountError, ObjectId, OpaqueChangeState,
-    ProtocolKind, ThreadId,
+    AccountError, AccountErrorBuilder, AccountErrorKind, BlobId, Cause, ChangeCursor, CursorScope,
+    DiagnosticText, ObjectId, OpaqueChangeState, Protocol, ProtocolKind,
+    RequestCause, RequestErrorKind, SyncStateErrorKind, ThreadId,
 };
 
 use crate::types::MailboxName;
@@ -64,10 +65,13 @@ pub(crate) fn encode_cursor(scope: CursorScope, cursor: &FolderCursor) -> Change
 
 pub(crate) fn decode_cursor(cursor: &ChangeCursor) -> Result<FolderCursor, AccountError> {
     if cursor.server_state.protocol != ProtocolKind::Imap {
-        return Err(AccountError::CursorProtocolMismatch);
+        return Err(schema_incompatible("cursor protocol mismatch: expected IMAP"));
     }
     if cursor.server_state.envelope_version != ENVELOPE_VERSION {
-        return Err(AccountError::CursorEnvelopeUnknown);
+        return Err(schema_incompatible(&format!(
+            "unsupported IMAP cursor envelope version {}",
+            cursor.server_state.envelope_version
+        )));
     }
     decode_folder_cursor(&cursor.server_state.bytes)
 }
@@ -156,7 +160,7 @@ fn decode_folder_cursor(bytes: &[u8]) -> Result<FolderCursor, AccountError> {
             uidnext: input.take_u32()?,
             known_uids: input.take_uid_set()?,
         }),
-        _ => Err(AccountError::SchemaIncompatible),
+        _ => Err(schema_incompatible("unknown IMAP cursor tag")),
     }
 }
 
@@ -191,7 +195,7 @@ impl<'a> CursorBytes<'a> {
         if magic == MAGIC {
             Ok(())
         } else {
-            Err(AccountError::SchemaIncompatible)
+            Err(schema_incompatible("IMAP cursor magic bytes did not match"))
         }
     }
 
@@ -199,11 +203,11 @@ impl<'a> CursorBytes<'a> {
         let end = self
             .offset
             .checked_add(count)
-            .ok_or(AccountError::SchemaIncompatible)?;
+            .ok_or_else(|| schema_incompatible("IMAP cursor byte offset overflow"))?;
         let out = self
             .bytes
             .get(self.offset..end)
-            .ok_or(AccountError::SchemaIncompatible)?;
+            .ok_or_else(|| schema_incompatible("IMAP cursor data truncated"))?;
         self.offset = end;
         Ok(out)
     }
@@ -220,7 +224,7 @@ impl<'a> CursorBytes<'a> {
         let bytes: [u8; 4] = self
             .take(4)?
             .try_into()
-            .map_err(|_| AccountError::SchemaIncompatible)?;
+            .map_err(|_| schema_incompatible("IMAP cursor u32 field malformed"))?;
         Ok(u32::from_le_bytes(bytes))
     }
 
@@ -228,7 +232,7 @@ impl<'a> CursorBytes<'a> {
         let bytes: [u8; 8] = self
             .take(8)?
             .try_into()
-            .map_err(|_| AccountError::SchemaIncompatible)?;
+            .map_err(|_| schema_incompatible("IMAP cursor u64 field malformed"))?;
         Ok(u64::from_le_bytes(bytes))
     }
 
@@ -287,7 +291,7 @@ pub(crate) fn decode_object_id(id: &ObjectId) -> Result<DecodedObjectId, Account
     let uidvalidity = parse_u32(parts.next())?;
     let uid = parse_u32(parts.next())?;
     if parts.next().is_some() {
-        return Err(AccountError::Other("invalid IMAP object id".into()));
+        return Err(malformed("invalid IMAP object id"));
     }
     Ok(DecodedObjectId {
         folder,
@@ -355,16 +359,16 @@ pub(crate) fn decode_thread_id(id: &ThreadId) -> Result<DecodedThreadId, Account
     let uidvalidity = parse_u32(parts.next())?;
     let uid_part = parts
         .next()
-        .ok_or_else(|| AccountError::Other("missing IMAP thread uid set".into()))?;
+        .ok_or_else(|| malformed("missing IMAP thread uid set"))?;
     let mut uids = Vec::new();
     for uid in uid_part.split(',').filter(|part| !part.is_empty()) {
         uids.push(
             uid.parse::<u32>()
-                .map_err(|_| AccountError::Other("invalid IMAP thread uid".into()))?,
+                .map_err(|_| malformed("invalid IMAP thread uid"))?,
         );
     }
     if uids.is_empty() {
-        return Err(AccountError::Other("empty IMAP thread uid set".into()));
+        return Err(malformed("empty IMAP thread uid set"));
     }
     Ok(DecodedThreadId {
         folder,
@@ -377,31 +381,62 @@ fn decode_len_prefixed(prefix: &str, value: &str) -> Result<(MailboxName, String
     let value = value
         .strip_prefix(prefix)
         .and_then(|v| v.strip_prefix(':'))
-        .ok_or_else(|| AccountError::Other("invalid IMAP id prefix".into()))?;
+        .ok_or_else(|| malformed("invalid IMAP id prefix"))?;
     let Some((len, rest)) = value.split_once(':') else {
-        return Err(AccountError::Other("invalid IMAP id length".into()));
+        return Err(malformed("invalid IMAP id length"));
     };
     let len = len
         .parse::<usize>()
-        .map_err(|_| AccountError::Other("invalid IMAP id length".into()))?;
+        .map_err(|_| malformed("invalid IMAP id length"))?;
     let folder = rest
         .get(..len)
-        .ok_or_else(|| AccountError::Other("invalid IMAP id folder length".into()))?;
+        .ok_or_else(|| malformed("invalid IMAP id folder length"))?;
     let after = rest
         .get(len..)
         .and_then(|v| v.strip_prefix(':'))
-        .ok_or_else(|| AccountError::Other("invalid IMAP id separator".into()))?;
+        .ok_or_else(|| malformed("invalid IMAP id separator"))?;
     let folder =
-        MailboxName::new(folder.to_owned()).map_err(|e| AccountError::Other(e.to_string()))?;
+        MailboxName::new(folder.to_owned()).map_err(|e| malformed(&e.to_string()))?;
     Ok((folder, after.to_owned()))
 }
 
 fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
     value
-        .ok_or_else(|| AccountError::Other("missing IMAP id field".into()))?
+        .ok_or_else(|| malformed("missing IMAP id field"))?
         .parse::<u32>()
-        .map_err(|_| AccountError::Other("invalid IMAP id integer".into()))
+        .map_err(|_| malformed("invalid IMAP id integer"))
 }
+
+/// Build a `Request(Malformed)` `AccountError` for IMAP object-id or
+/// cursor decode failures. These are caller-side invalid inputs (the
+/// object id was not produced by this crate or was corrupted in transit).
+fn malformed(detail: &str) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.to_owned()),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .build()
+}
+
+/// Build a `SyncState(SchemaIncompatible)` `AccountError` for IMAP
+/// cursor envelope decoding failures. The cursor bytes are structurally
+/// unrecognizable, which triggers the `SchemaIncompatible` engine
+/// directive to clear cursor state and re-establish from inventory.
+fn schema_incompatible(detail: &str) -> AccountError {
+    use bifrost_types::{AccountOperation, StateCause};
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+        Cause::State(StateCause::SchemaIncompatible),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::EstablishCursor)
+    .text(DiagnosticText::support_only(detail.to_owned()))
+    .build()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -446,10 +481,15 @@ mod tests {
             },
         );
         change.server_state.envelope_version = ENVELOPE_VERSION + 1;
-        assert!(matches!(
-            decode_cursor(&change),
-            Err(AccountError::CursorEnvelopeUnknown)
-        ));
+        let err = decode_cursor(&change).expect_err("should fail on version mismatch");
+        assert!(
+            matches!(
+                err.kind(),
+                AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::SchemaIncompatible)
+            ),
+            "unexpected kind: {:?}",
+            err.kind()
+        );
     }
 
     #[test]

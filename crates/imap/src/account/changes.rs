@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use bifrost_types::{
-    Change, ChangeCursor, Checkpoint, CostClass, CursorDescriptor, Error as AccountError, Fatal,
-    ObjectChange, ObjectChangeKind, PageBoundary, RecoveryClass, ScopeChange, ScopeChangeKind,
-    SyncEvent, SyncStrategy, Warning, WarningKind,
+    Change, ChangeCursor, Checkpoint, CostClass, CursorDescriptor, AccountError, ObjectChange,
+    ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent, SyncStrategy, Warning,
+    WarningKind,
 };
 
 use crate::connection::FetchStreamItem;
@@ -13,7 +13,7 @@ use super::folder_registry::expand_range;
 use super::{
     BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, batch, boxed_receiver_stream,
     decode_cursor, encode_cursor, encode_object_id, fatal_event, folder_from_scope, folder_scope,
-    membership_scope,
+    membership_scope, terminated_event,
 };
 
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
@@ -62,16 +62,17 @@ pub(crate) fn changes_stream(
         match run_changes(account, cursor, tx.clone()).await {
             Ok(()) => {}
             Err(ChangeError::Account(err)) => {
-                let _ = tx
-                    .send(SyncEvent::Fatal(bifrost_types::Fatal {
-                        recovery: RecoveryClass::SchemaIncompatible,
-                        message: err.to_string(),
-                        source: Some(err),
-                    }))
-                    .await;
+                let _ = tx.send(terminated_event(err)).await;
             }
             Err(ChangeError::Imap(err)) => {
-                let _ = tx.send(fatal_event(err)).await;
+                let _ = tx
+                    .send(fatal_event(
+                        err,
+                        super::error::ImapErrorContext::operation(
+                            bifrost_types::AccountOperation::SyncChanges,
+                        ),
+                    ))
+                    .await;
             }
             Err(ChangeError::UidValidityChanged {
                 folder,
@@ -79,7 +80,7 @@ pub(crate) fn changes_stream(
                 actual,
             }) => {
                 let _ = tx
-                    .send(SyncEvent::Fatal(uidvalidity_changed_fatal(
+                    .send(terminated_event(super::error::uidvalidity_changed(
                         &folder, expected, actual,
                     )))
                     .await;
@@ -90,7 +91,7 @@ pub(crate) fn changes_stream(
                 current,
             }) => {
                 let _ = tx
-                    .send(SyncEvent::Fatal(modseq_reset_fatal(
+                    .send(terminated_event(super::error::modseq_reset(
                         &folder, previous, current,
                     )))
                     .await;
@@ -337,7 +338,7 @@ async fn run_qresync(
                                     let out = std::mem::take(&mut changes);
                                     tx.send(batch(out, PageBoundary::Page, None))
                                         .await
-                                        .map_err(|_| crate::Error::Closed)?;
+                                        .map_err(|_| crate::Error::closed())?;
                                     flushed_qresync_changes = true;
                                 }
                             }
@@ -357,7 +358,7 @@ async fn run_qresync(
                         let out = std::mem::take(&mut changes);
                         tx.send(batch(out, PageBoundary::Page, None))
                             .await
-                            .map_err(|_| crate::Error::Closed)?;
+                            .map_err(|_| crate::Error::closed())?;
                         flushed_qresync_changes = true;
                     }
                 }
@@ -403,11 +404,11 @@ async fn run_qresync(
     if !changes.is_empty() {
         tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
     }
     tx.send(SyncEvent::Done(checkpoint))
         .await
-        .map_err(|_| crate::Error::Closed)?;
+        .map_err(|_| crate::Error::closed())?;
     Ok(())
 }
 
@@ -597,11 +598,11 @@ async fn finish_changes(
     if !changes.is_empty() {
         tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::Closed)?;
+            .map_err(|_| crate::Error::closed())?;
     }
     tx.send(SyncEvent::Done(checkpoint))
         .await
-        .map_err(|_| crate::Error::Closed)?;
+        .map_err(|_| crate::Error::closed())?;
     Ok(())
 }
 
@@ -769,7 +770,7 @@ async fn send_warning<T>(
         protocol_detail: Some("imap".to_string()),
     }))
     .await
-    .map_err(|_| crate::Error::Closed)?;
+    .map_err(|_| crate::Error::closed())?;
     Ok(())
 }
 
@@ -787,7 +788,7 @@ async fn send_strategy_downgrade<T>(
         protocol_detail: Some("imap".to_string()),
     }))
     .await
-    .map_err(|_| crate::Error::Closed)?;
+    .map_err(|_| crate::Error::closed())?;
     Ok(())
 }
 
@@ -809,39 +810,9 @@ fn mentions_qresync_capability(value: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case("QRESYNC"))
 }
 
-fn uidvalidity_changed_fatal(folder: &MailboxName, expected: u32, actual: u32) -> Fatal {
-    Fatal {
-        recovery: RecoveryClass::RestartScope(folder_scope(folder)),
-        message: format!(
-            "IMAP UIDVALIDITY changed for {} from {} to {}",
-            folder.as_str(),
-            expected,
-            actual,
-        ),
-        source: Some(AccountError::Other(
-            "IMAP UIDVALIDITY changed before changes_stream".to_string(),
-        )),
-    }
-}
-
-fn modseq_reset_fatal(folder: &MailboxName, previous: u64, current: Option<u64>) -> Fatal {
-    Fatal {
-        recovery: RecoveryClass::RestartScope(folder_scope(folder)),
-        message: format!(
-            "IMAP HIGHESTMODSEQ reset for {} from {} to {:?}",
-            folder.as_str(),
-            previous,
-            current,
-        ),
-        source: Some(AccountError::Other(
-            "IMAP mod-sequence reset before changes_stream".to_string(),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use bifrost_types::CursorScope;
+    use bifrost_types::{CursorScope, RecoveryClass};
 
     use super::*;
 
@@ -857,10 +828,12 @@ mod tests {
         else {
             panic!("expected uidvalidity change");
         };
-        let fatal = uidvalidity_changed_fatal(&folder, expected, actual);
+        let account_err = super::error::uidvalidity_changed(&folder, expected, actual);
         assert!(matches!(
-            fatal.recovery,
-            RecoveryClass::RestartScope(CursorScope::Folder(_))
+            account_err.recovery(),
+            RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+                CursorScope::Folder(_)
+            ))
         ));
     }
 
@@ -876,10 +849,12 @@ mod tests {
         else {
             panic!("expected modseq reset");
         };
-        let fatal = modseq_reset_fatal(&folder, previous, current);
+        let account_err = super::error::modseq_reset(&folder, previous, current);
         assert!(matches!(
-            fatal.recovery,
-            RecoveryClass::RestartScope(CursorScope::Folder(_))
+            account_err.recovery(),
+            RecoveryClass::Engine(bifrost_types::EngineDirective::RestartScope(
+                CursorScope::Folder(_)
+            ))
         ));
     }
 

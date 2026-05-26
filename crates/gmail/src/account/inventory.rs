@@ -43,12 +43,11 @@ pub(crate) fn inventory_stream(
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     if !matches!(scope, CursorScope::Account) {
-        let _account_error = recovery::into_account_error(
+        let account_error = recovery::into_account_error(
             crate::error::Error::unsupported(bifrost_types::AccountOperation::SyncInventory),
             recovery::GmailErrorContext::inventory(),
         );
-        // Phase 3 swaps Done(None) for Terminated(_account_error).
-        return Box::pin(stream::iter([SyncEvent::Done(None)]));
+        return Box::pin(stream::iter([SyncEvent::Terminated(account_error)]));
     }
 
     Box::pin(async_stream::stream! {
@@ -59,12 +58,11 @@ pub(crate) fn inventory_stream(
             let page = match list_messages_page(&client, page_token.as_deref()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    let _account_error = recovery::into_account_error(
+                    let account_error = recovery::into_account_error(
                         error,
                         recovery::GmailErrorContext::inventory(),
                     );
-                    // Phase 3 swaps this for SyncEvent::Terminated(_account_error).
-                    yield SyncEvent::Done(None);
+                    yield SyncEvent::Terminated(account_error);
                     return;
                 }
             };
@@ -100,11 +98,11 @@ pub(crate) fn inventory_stream(
                         }
                     }
                     Err(error) => {
-                        let _account_error = recovery::into_account_error(
+                        let account_error = recovery::into_account_error(
                             error,
                             recovery::GmailErrorContext::inventory(),
                         );
-                        yield SyncEvent::Done(None);
+                        yield SyncEvent::Terminated(account_error);
                         return;
                     }
                 }
@@ -114,11 +112,11 @@ pub(crate) fn inventory_stream(
                 let checkpoint = match inventory_checkpoint(&client).await {
                     Ok(checkpoint) => checkpoint,
                     Err(error) => {
-                        let _account_error = recovery::into_account_error(
+                        let account_error = recovery::into_account_error(
                             error,
                             recovery::GmailErrorContext::inventory(),
                         );
-                        yield SyncEvent::Done(None);
+                        yield SyncEvent::Terminated(account_error);
                         return;
                     }
                 };
@@ -193,13 +191,13 @@ pub(crate) fn get_stream(
             match hydrate_one(&state.client, &labels, id, state.projection).await {
                 Ok(hydrated) => items.push(hydrated),
                 Err(error) => {
-                    let _account_error = recovery::into_account_error(
+                    let account_error = recovery::into_account_error(
                         error,
                         recovery::GmailErrorContext::hydrate_message(""),
                     );
                     state.finished = true;
                     state.emitted_done = true;
-                    return Some((SyncEvent::Done(None), state));
+                    return Some((SyncEvent::Terminated(account_error), state));
                 }
             }
         }
@@ -364,10 +362,3 @@ fn non_negative_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
 
-// Inventory-rejection tests previously asserted SyncEvent::Fatal +
-// RecoveryClass::Fatal shapes that no longer exist in the new error
-// model. The non-account-scope rejection path now produces an
-// AccountError via `recovery::into_account_error` with kind
-// `Unsupported(SyncInventory)`; Phase 3's `SyncEvent::Terminated`
-// rename will surface that to the engine. Rewriting the tests is
-// deferred to Phase 3 when the stream-termination event shape lands.

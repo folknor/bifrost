@@ -86,7 +86,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::FetchConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID FETCH with CHANGEDSINCE and VANISHED modifiers (RFC 7162 Section 3.2.6).
@@ -141,7 +141,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::FetchVanishedConsumer::new(parsed_set)),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID FETCH with CHANGEDSINCE and VANISHED as a bounded stream.
@@ -191,7 +191,7 @@ impl ImapConnection {
                 ),
             )
             .await
-            .map_err(|_| Error::Timeout)?
+            .map_err(|_| Error::timeout_inflight())?
         };
         Ok((rx, fut))
     }
@@ -301,7 +301,7 @@ impl ImapConnection {
             self.submit_streaming(cmd, dispatch::BoundedStreamingFetchConsumer::new(tx)),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SEARCH (RFC 3501 Section 6.4.4).
@@ -350,7 +350,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::SearchConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)??
+        .map_err(|_| Error::timeout_inflight())??
     }
 
     /// UID SEARCH with RETURN options (RFC 4731 Section 3.2).
@@ -420,7 +420,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::EsearchConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)??
+        .map_err(|_| Error::timeout_inflight())??
     }
 
     /// UID STORE (RFC 3501 Section 6.4.6).
@@ -478,7 +478,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::StoreConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID MOVE (RFC 6851 Section 3, RFC 9051 Appendix E item 2).
@@ -574,7 +574,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::MoveConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID COPY (RFC 3501 Section 6.4.7, RFC 4315 Section 3).
@@ -620,7 +620,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::CopyConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID EXPUNGE (RFC 4315 UIDPLUS / RFC 9051 Section 6.4.9).
@@ -653,7 +653,7 @@ impl ImapConnection {
             self.submit_regular(cmd, dispatch::ExpungeConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// EXPUNGE (RFC 3501 Section 6.4.3 / RFC 7162 Section 3.2.10).
@@ -671,6 +671,6 @@ impl ImapConnection {
             self.submit_regular(Command::Expunge, dispatch::ExpungeConsumer::new()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 }

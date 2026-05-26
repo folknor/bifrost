@@ -19,8 +19,8 @@ use bifrost_net::{NetErrorContext, into_account_error as net_into_account_error}
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
-    BatchSuccess, CapabilityDelta, Cause, CursorScope, DiagnosticText, ErrorScope, Fatal,
-    ItemOutcome, JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    BatchSuccess, CapabilityDelta, Cause, CursorScope, DiagnosticText, ErrorScope, ItemOutcome,
+    JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause,
     RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, SyncEvent,
     SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
     TransportKind, WireCause,
@@ -164,15 +164,13 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         crate::Error::WebSocketSetup(setup) => match setup {
             crate::WebSocketSetupError::Tls(message) => build(
                 AccountErrorKind::Transport(TransportErrorKind::Tls),
-                Cause::Transport(TransportCause {
-                    kind: TransportKind::Tls,
-                    message: Some(DiagnosticText::support_only(message)),
-                }),
+                Cause::Transport(TransportCause::new(
+                    TransportKind::Tls,
+                    Some(DiagnosticText::support_only(message)),
+                )),
                 &ctx,
             )
-            .push_cause(Cause::Attempt(AttemptCause {
-                transmission_state: TransmissionState::Unsent,
-            }))
+            .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
             .build(),
             crate::WebSocketSetupError::InvalidHeader(message) => build(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -209,15 +207,10 @@ pub(crate) fn is_state_mismatch(err: &crate::Error) -> bool {
     )
 }
 
-/// Construct a `SyncEvent::Terminated`-equivalent for the current
-/// broken-branch surface. Phase 3 renames `SyncEvent::Fatal(Fatal)`
-/// to `SyncEvent::Terminated(AccountError)`; until then, JMAP wraps
-/// the `AccountError` in the `Fatal` newtype directly (bypassing
-/// `Fatal::try_from`'s terminal check so non-terminal recovery
-/// classes can also flow through stream termination).
+/// Emit `SyncEvent::Terminated(AccountError)` for stream termination.
 #[must_use]
 pub(crate) fn terminated<T>(error: AccountError) -> SyncEvent<T> {
-    SyncEvent::Fatal(Fatal(error))
+    SyncEvent::Terminated(error)
 }
 
 #[must_use]
@@ -316,6 +309,11 @@ pub(crate) fn set_error_to_account_error(
             Cause::Server(ServerCause::RateLimited { retry_after: None }),
         ),
         SetErrorType::NotFound | SetErrorType::BlobNotFound => {
+            let wire = if set_error.error_type() == SetErrorType::BlobNotFound {
+                JmapMethod::BlobNotFound
+            } else {
+                JmapMethod::NotFound
+            };
             if let Some(resource) = resource_from_scope(scope_for_resource) {
                 let id = id_from_scope(scope_for_resource);
                 (
@@ -325,9 +323,7 @@ pub(crate) fn set_error_to_account_error(
             } else {
                 (
                     AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-                    Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
-                        code: set_error.error_type().to_string(),
-                    })),
+                    Cause::Wire(WireCause::Jmap(wire)),
                 )
             }
         }
@@ -350,16 +346,29 @@ pub(crate) fn set_error_to_account_error(
                 detail: DiagnosticText::support_only(set_error.to_string()),
             }),
         ),
-        SetErrorType::WillDestroy
-        | SetErrorType::Singleton
-        | SetErrorType::ScriptIsActive
-        | SetErrorType::CannotUnsend
-        | SetErrorType::MailboxHasChild
-        | SetErrorType::MailboxHasEmail => (
+        SetErrorType::WillDestroy => (
             AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
-                code: set_error.error_type().to_string(),
-            })),
+            Cause::Wire(WireCause::Jmap(JmapMethod::WillDestroy)),
+        ),
+        SetErrorType::Singleton => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Wire(WireCause::Jmap(JmapMethod::Singleton)),
+        ),
+        SetErrorType::ScriptIsActive => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Wire(WireCause::Jmap(JmapMethod::ScriptIsActive)),
+        ),
+        SetErrorType::CannotUnsend => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Wire(WireCause::Jmap(JmapMethod::CannotUnsend)),
+        ),
+        SetErrorType::MailboxHasChild => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasChild)),
+        ),
+        SetErrorType::MailboxHasEmail => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasEmail)),
         ),
         SetErrorType::Other => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
@@ -372,13 +381,26 @@ pub(crate) fn set_error_to_account_error(
     let mut builder = build_with(&ctx, kind, primary)
         // Set errors are returned in a successful JMAP response, which
         // already crossed the side-effect boundary.
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Acknowledged,
-        }));
-    if !matches!(set_error.error_type(), SetErrorType::Other) {
-        builder = builder.push_cause(Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
-            code: set_error.error_type().to_string(),
-        })));
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)));
+    // Push the typed wire cause as a forensic layer for all non-Other
+    // variants whose primary cause is not already a WireCause. For
+    // WillDestroy/Singleton/etc. the primary IS the WireCause so we
+    // skip to avoid duplication; for Forbidden/OverQuota/RateLimit/etc.
+    // the primary is an Access/Server cause and we add the wire signal.
+    let primary_was_wire = matches!(
+        set_error.error_type(),
+        SetErrorType::WillDestroy
+            | SetErrorType::Singleton
+            | SetErrorType::ScriptIsActive
+            | SetErrorType::CannotUnsend
+            | SetErrorType::MailboxHasChild
+            | SetErrorType::MailboxHasEmail
+            | SetErrorType::Other
+    );
+    if !primary_was_wire {
+        if let Some(wire) = set_error_type_to_jmap_method(set_error.error_type()) {
+            builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
+        }
     }
     if let Some(description) = set_error.description() {
         builder = builder.text(DiagnosticText::support_only(description));
@@ -390,6 +412,40 @@ pub(crate) fn set_error_to_account_error(
         builder = builder.scope(scope);
     }
     builder.build()
+}
+
+/// Map a `SetErrorType` to the corresponding typed `JmapMethod` wire
+/// cause variant. Returns `None` only for `SetErrorType::Other` (no
+/// stable wire code) and the resource-classified cases handled above
+/// whose primary cause is already a `WireCause` (`WillDestroy`,
+/// `Singleton`, etc.). Callers that already check `primary_was_wire`
+/// will not call this for those variants.
+fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod> {
+    match error_type {
+        SetErrorType::Forbidden
+        | SetErrorType::ForbiddenFrom
+        | SetErrorType::ForbiddenMailFrom
+        | SetErrorType::ForbiddenToSend => Some(JmapMethod::Forbidden),
+        SetErrorType::OverQuota => Some(JmapMethod::OverQuota),
+        SetErrorType::RateLimit => Some(JmapMethod::RateLimit),
+        SetErrorType::NotFound => Some(JmapMethod::NotFound),
+        SetErrorType::BlobNotFound => Some(JmapMethod::BlobNotFound),
+        SetErrorType::AlreadyExists => Some(JmapMethod::AlreadyExists),
+        SetErrorType::TooLarge => Some(JmapMethod::TooLarge),
+        SetErrorType::TooManyKeywords => Some(JmapMethod::TooManyKeywords),
+        SetErrorType::TooManyMailboxes => Some(JmapMethod::TooManyMailboxes),
+        SetErrorType::TooManyRecipients => Some(JmapMethod::TooManyRecipients),
+        SetErrorType::InvalidPatch => Some(JmapMethod::InvalidPatch),
+        SetErrorType::InvalidProperties => Some(JmapMethod::InvalidProperties),
+        SetErrorType::InvalidEmail => Some(JmapMethod::InvalidEmail),
+        SetErrorType::InvalidRecipients => Some(JmapMethod::InvalidRecipients),
+        SetErrorType::InvalidScript => Some(JmapMethod::InvalidScript),
+        SetErrorType::NoRecipients => Some(JmapMethod::NoRecipients),
+        // WillDestroy/Singleton/ScriptIsActive/CannotUnsend/MailboxHasChild/
+        // MailboxHasEmail primary IS the WireCause; callers skip these.
+        // Other has no stable code.
+        _ => None,
+    }
 }
 
 // ---- internal helpers --------------------------------------------------
@@ -461,10 +517,10 @@ fn convert_transport(
         // cause: we have no wire-level signal about transmission.
         build(
             AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: Some(DiagnosticText::support_only(transport.message.clone())),
-            }),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Network,
+                Some(DiagnosticText::support_only(transport.message.clone())),
+            )),
             &ctx,
         )
         .build()
@@ -561,9 +617,7 @@ fn convert_problem(
     };
 
     let mut builder = build_with(&ctx, kind, primary)
-        .push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: TransmissionState::Acknowledged,
-        }))
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)))
         .push_cause(Cause::Wire(wire_for_problem(details.error())));
     if let Some(status) = status_u16 {
         builder = builder.status(status);
@@ -756,9 +810,8 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         ),
     };
 
-    let mut builder = build_with(&ctx, kind, primary).push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: TransmissionState::Acknowledged,
-    }));
+    let mut builder = build_with(&ctx, kind, primary)
+        .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)));
     // Push the wire cause as a forensic-only layer only if it differs
     // from the primary cause already on the chain (ServerPartialFail
     // and Other already use Wire as primary).
@@ -813,9 +866,7 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
         }),
         &ctx,
     )
-    .push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: TransmissionState::Acknowledged,
-    }))
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Acknowledged)))
     .build()
 }
 

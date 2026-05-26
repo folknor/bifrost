@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use bytes::Bytes;
 
 use crate::blob::BlobHandle;
-use crate::error::Error;
 use crate::ids::{ObjectId, RunId};
 
 /// Server-side version stamp used in `Fingerprint`.
@@ -150,24 +149,6 @@ pub enum ProtocolSalt {
     /// IMAP carries no replay token; engine relies on the read-back
     /// guard after retry.
     Imap,
-}
-
-/// Per-item mutation outcome.
-#[derive(Debug)]
-pub struct MutationResult {
-    pub id: ObjectId,
-    pub outcome: MutationOutcome,
-}
-
-/// What happened to the item the mutation targeted.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum MutationOutcome {
-    Applied,
-    /// The read-back guard determined the target was already in the
-    /// requested state. No write was attempted.
-    Skipped,
-    Failed(Error),
 }
 
 /// Bulk flag mutation. Carries both the operation and the flag set

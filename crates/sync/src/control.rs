@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bifrost_types::{AccountId, Checkpoint, Control, Error as TypesError, Priority};
+use bifrost_types::{AccountError, AccountErrorBuilder, AccountErrorKind, AccountId, Cause, Checkpoint, Control, Priority, RequestCause, RequestErrorKind};
 use tokio::sync::watch;
 
 use crate::cancel::{Boundary, BoundaryRequest};
@@ -124,7 +124,7 @@ impl SyncControl {
     async fn wait_for_checkpoint_at_or_after(
         &self,
         generation: u64,
-    ) -> Result<Checkpoint, TypesError> {
+    ) -> Result<Checkpoint, AccountError> {
         // Subscribe to a fresh receiver. The current value is the
         // last recorded snapshot; if it already matches the
         // generation we return immediately.
@@ -139,9 +139,15 @@ impl SyncControl {
                 }
             }
             if rx.changed().await.is_err() {
-                return Err(TypesError::Other(
-                    "control: checkpoint watch channel closed".into(),
-                ));
+                return Err(AccountErrorBuilder::new(
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                    Cause::Request(RequestCause::Malformed {
+                        detail: bifrost_types::DiagnosticText::support_only(
+                            "control: checkpoint watch channel closed".into(),
+                        ),
+                    }),
+                )
+                .build());
             }
         }
     }
@@ -151,7 +157,7 @@ impl Control for SyncControl {
     fn pause(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Checkpoint, TypesError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
     > {
         Box::pin(async move {
             // Bump the generation BEFORE flipping the boundary so
@@ -166,7 +172,7 @@ impl Control for SyncControl {
     fn checkpoint_now(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Checkpoint, TypesError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
     > {
         Box::pin(async move {
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;

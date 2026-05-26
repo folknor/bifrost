@@ -284,7 +284,7 @@ async fn subscribe(
 ) -> Result<EwsStreamingSubscription, String> {
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
-    let xml = ews.execute(&body).await?;
+    let xml = ews.execute(&body).await.map_err(|e| e.to_string())?;
     parse_subscribe_response(&xml)?
         .into_iter()
         .next()
@@ -302,7 +302,7 @@ async fn run_get_events_loop(
             return StreamLoopExit::Shutdown;
         }
         let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&body).await {
+        match ews.execute(&body).await.map_err(|e| e.to_string()) {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {

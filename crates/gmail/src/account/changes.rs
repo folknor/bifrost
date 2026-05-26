@@ -53,35 +53,35 @@ pub(crate) fn changes_stream(
             let Some(cursor) = state.cursor.take() else {
                 state.finished = true;
                 state.emitted_done = true;
-                let _account_error = recovery::into_account_error(
+                let account_error = recovery::into_account_error(
                     Error::Local(GmailLocalError::Internal {
                         detail: "gmail change stream missing cursor".to_string(),
                     }),
                     recovery::GmailErrorContext::changes(),
                 );
-                return Some((SyncEvent::Done(None), state));
+                return Some((SyncEvent::Terminated(account_error), state));
             };
             let decoded = match decode_gmail_state(&cursor.server_state) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let _account_error =
+                    let account_error =
                         recovery::into_account_error(error, recovery::GmailErrorContext::changes());
-                    return Some((SyncEvent::Done(None), state));
+                    return Some((SyncEvent::Terminated(account_error), state));
                 }
             };
             if decoded.profile_email != state.profile.email_address {
                 state.finished = true;
                 state.emitted_done = true;
-                let _account_error = recovery::into_account_error(
+                let account_error = recovery::into_account_error(
                     Error::Local(GmailLocalError::AccountIdentityMismatch {
                         cursor_email: decoded.profile_email,
                         profile_email: state.profile.email_address.clone(),
                     }),
                     recovery::GmailErrorContext::changes(),
                 );
-                return Some((SyncEvent::Done(None), state));
+                return Some((SyncEvent::Terminated(account_error), state));
             }
             match state.client.get_profile().await {
                 Ok(current) if current.email_address == decoded.profile_email => {
@@ -91,21 +91,21 @@ pub(crate) fn changes_stream(
                 Ok(current) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let _account_error = recovery::into_account_error(
+                    let account_error = recovery::into_account_error(
                         Error::Local(GmailLocalError::AccountIdentityMismatch {
                             cursor_email: decoded.profile_email,
                             profile_email: current.email_address,
                         }),
                         recovery::GmailErrorContext::changes(),
                     );
-                    return Some((SyncEvent::Done(None), state));
+                    return Some((SyncEvent::Terminated(account_error), state));
                 }
                 Err(error) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let _account_error =
+                    let account_error =
                         recovery::into_account_error(error, recovery::GmailErrorContext::changes());
-                    return Some((SyncEvent::Done(None), state));
+                    return Some((SyncEvent::Terminated(account_error), state));
                 }
             }
         }
@@ -113,11 +113,11 @@ pub(crate) fn changes_stream(
         let Some(start_history_id) = state.start_history_id.as_deref() else {
             state.finished = true;
             state.emitted_done = true;
-            let _account_error = recovery::into_account_error(
+            let account_error = recovery::into_account_error(
                 Error::missing_field("start_history_id", "gmail change stream"),
                 recovery::GmailErrorContext::changes(),
             );
-            return Some((SyncEvent::Done(None), state));
+            return Some((SyncEvent::Terminated(account_error), state));
         };
 
         match state
@@ -131,14 +131,14 @@ pub(crate) fn changes_stream(
                     Err(error) => {
                         state.finished = true;
                         state.emitted_done = true;
-                        let _account_error = recovery::into_account_error(
+                        let account_error = recovery::into_account_error(
                             Error::missing_field(
                                 "historyId",
                                 format!("gmail history response invalid: {error}"),
                             ),
                             recovery::GmailErrorContext::changes(),
                         );
-                        return Some((SyncEvent::Done(None), state));
+                        return Some((SyncEvent::Terminated(account_error), state));
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor_for_history(
@@ -169,9 +169,9 @@ pub(crate) fn changes_stream(
             Err(error) => {
                 state.finished = true;
                 state.emitted_done = true;
-                let _account_error =
+                let account_error =
                     recovery::into_account_error(error, recovery::GmailErrorContext::changes());
-                Some((SyncEvent::Done(None), state))
+                Some((SyncEvent::Terminated(account_error), state))
             }
         }
     }))

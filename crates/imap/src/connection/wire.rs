@@ -92,7 +92,7 @@ impl WireReader {
             // Need more data from the wire.
             let n = self.stream.read_buf(&mut self.buf).await?;
             if n == 0 {
-                return Err(Error::Closed);
+                return Err(Error::closed());
             }
             self.metering.record_in(n).await;
         }
@@ -110,7 +110,7 @@ impl WireReader {
             }
             let n = self.stream.read_buf(&mut self.buf).await?;
             if n == 0 {
-                return Err(Error::Closed);
+                return Err(Error::closed());
             }
             self.metering.record_in(n).await;
         }

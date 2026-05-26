@@ -11,6 +11,8 @@ use bytes::BytesMut;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::trace;
 
+use bifrost_types::TransmissionState;
+
 use crate::codec::classification::{self, ClassificationContext, SolicitationRule};
 use crate::codec::encode::{EncodeOptions, LiteralMode};
 use crate::error::Error;
@@ -557,13 +559,24 @@ pub(in crate::connection) async fn run_one_command(
     }
 
     // Encode, tag, and send the command (handles literal sync).
+    // Encoding / send errors: the command bytes may not have reached the
+    // server, so these are Unsent. The `?` propagates without further
+    // decoration; send_command_on_wire owns the pre-send phase.
     let tag = send_command_on_wire(wire_reader, state, tag_gen, event_sink, &cmd).await?;
 
+    // After a successful send, any transport failure is InFlight: the
+    // command bytes crossed the side-effect boundary.
     loop {
         let notify_before = state.notify();
         let utf8 = utf8_mode(state);
-        consumer.prepare_to_read().await?;
-        let resp = wire_reader.read_one(utf8).await?;
+        consumer
+            .prepare_to_read()
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+        let resp = wire_reader
+            .read_one(utf8)
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let _digest = state.apply_side_effects(&resp);
 
         match resp {
@@ -572,7 +585,13 @@ pub(in crate::connection) async fn run_one_command(
                 // tagged response codes before finalization.
                 emit_tagged_response_code_events(&t, event_sink);
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), &tag);
-                let finalized = consumer.finalize_erased(t, &ctx)?;
+                // Tagged response received: the server acknowledged the
+                // command. Errors from finalization (NO/BAD status) carry
+                // Acknowledged so recovery can distinguish them from
+                // in-flight drops.
+                let finalized = consumer
+                    .finalize_erased(t, &ctx)
+                    .map_err(|e| e.with_attempt(TransmissionState::Acknowledged))?;
                 // Re-emit any responses the consumer marked as events.
                 // Skip those whose critical code (ALERT/NOTIFICATIONOVERFLOW)
                 // was already emitted in the pre-classification pass
@@ -621,7 +640,10 @@ pub(in crate::connection) async fn run_one_command(
                 // supported (RFC 3501 Section7.5). Regular consumers error.
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), &tag);
                 let ContinuationReply::Write(bytes) = consumer.on_continuation(c, &ctx)?;
-                wire_reader.write_all(&bytes).await?;
+                wire_reader
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
             }
             crate::types::Response::Greeting(_) => {
                 return Err(Error::Protocol("unexpected greeting mid-command".into()));
@@ -658,21 +680,32 @@ pub(in crate::connection) async fn run_prebuilt_command(
     trace!(tag, ?cmd_kind, "driver: sending pre-built command");
 
     // Send pre-built bytes with literal synchronization.
+    // Errors before a tagged response are Unsent or InFlight depending
+    // on where in the send they occur; send_with_literal_sync propagates
+    // them without decoration. After send, responses are InFlight.
     send_with_literal_sync(wire_reader, state, event_sink, &wire_bytes).await?;
 
     // Response classification loop  -  identical to run_one_command.
     loop {
         let notify_before = state.notify();
         let utf8 = utf8_mode(state);
-        consumer.prepare_to_read().await?;
-        let resp = wire_reader.read_one(utf8).await?;
+        consumer
+            .prepare_to_read()
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
+        let resp = wire_reader
+            .read_one(utf8)
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let _digest = state.apply_side_effects(&resp);
 
         match resp {
             crate::types::Response::Tagged(t) if t.tag == tag => {
                 emit_tagged_response_code_events(&t, event_sink);
                 let ctx = build_consumer_context(state, cmd_target.as_ref(), tag);
-                let finalized = consumer.finalize_erased(t, &ctx)?;
+                let finalized = consumer
+                    .finalize_erased(t, &ctx)
+                    .map_err(|e| e.with_attempt(TransmissionState::Acknowledged))?;
                 for resp in finalized.reclassified_as_events {
                     if !has_critical_response_code(&resp) {
                         let _ = event_sink.emit(resp.into());

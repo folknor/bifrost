@@ -1,3 +1,4 @@
+use bifrost_types::TransmissionState;
 use bytes::BytesMut;
 use tracing::{trace, warn};
 
@@ -69,16 +70,26 @@ pub(super) async fn send_with_literal_sync(
         if let Some((marker_end, literal_size)) = super::super::find_literal_boundary(&buf[pos..]) {
             // marker_end is the offset past `\r\n` within buf[pos..]
             let send_end = pos + marker_end;
-            wire_reader.write_all(&buf[pos..send_end]).await?;
+            wire_reader
+                .write_all(&buf[pos..send_end])
+                .await
+                .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
             wait_for_continuation(wire_reader, state, event_sink).await?;
             // Send the literal body data (RFC 3501 Section4.3).
+            // After the continuation is received the server is expecting
+            // our literal bytes, so a send failure here is InFlight: the
+            // preceding pre-literal bytes were accepted.
             wire_reader
                 .write_all(&buf[send_end..send_end + literal_size])
-                .await?;
+                .await
+                .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
             pos = send_end + literal_size;
         } else {
             // No more literals; send the rest.
-            wire_reader.write_all(&buf[pos..]).await?;
+            wire_reader
+                .write_all(&buf[pos..])
+                .await
+                .map_err(|e| e.with_attempt(TransmissionState::Unsent))?;
             break;
         }
     }
@@ -97,7 +108,19 @@ pub(super) async fn send_encoded_segments(
     segments: &[BytesMut],
 ) -> Result<(), Error> {
     for (i, segment) in segments.iter().enumerate() {
-        wire_reader.write_all(segment).await?;
+        // Whether this segment is Unsent or InFlight depends on whether a
+        // prior continuation was received. The first segment is always
+        // Unsent. Subsequent segments come after a server `+`, so their
+        // send failures are InFlight (the server already ACKed the prefix).
+        let state_for_segment = if i == 0 {
+            TransmissionState::Unsent
+        } else {
+            TransmissionState::InFlight
+        };
+        wire_reader
+            .write_all(segment)
+            .await
+            .map_err(|e| e.with_attempt(state_for_segment))?;
         // After every segment except the last, wait for `+`
         // (RFC 3501 Section4.3).
         if i + 1 < segments.len() {
@@ -121,15 +144,22 @@ pub(super) async fn wait_for_continuation(
 ) -> Result<(), Error> {
     loop {
         let utf8 = super::utf8_mode(state);
-        let resp = wire_reader.read_one(utf8).await?;
+        // We have already sent the pre-literal bytes; a transport failure
+        // reading the server's continuation grant is InFlight.
+        let resp = wire_reader
+            .read_one(utf8)
+            .await
+            .map_err(|e| e.with_attempt(TransmissionState::InFlight))?;
         let digest = state.apply_side_effects(&resp);
         match resp {
             crate::types::Response::Continuation(_) => return Ok(()),
             crate::types::Response::Tagged(t) => {
                 // Server rejected the command before the literal was
-                // sent. Side effects already applied (RFC 3501 Section4.3).
+                // sent. The server processed the prefix, so this is
+                // Acknowledged. Side effects already applied (RFC 3501 Section4.3).
                 super::emit_tagged_response_code_events(&t, event_sink);
                 return match t.status {
+                    // NO/BAD are tagged responses - inherently Acknowledged.
                     StatusKind::No => Err(Error::no_with_code(t.text, t.code)),
                     StatusKind::Bad => Err(Error::bad_with_code(t.text, t.code)),
                     StatusKind::Ok => Err(Error::Protocol(

@@ -17,7 +17,7 @@
 
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
-    AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DetailVisibility, DiagnosticText,
+    AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
     ErrorScope, ImapResponseCode, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider,
     RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
     StrategyDowngrade, SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause,
@@ -154,9 +154,7 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     // failures must never carry `Acknowledged`; the builder asserts).
     let effective_attempt = explicit_attempt.or(attempt);
     if !skip_attempt_cause && let Some(state) = effective_attempt {
-        builder = builder.push_cause(Cause::Attempt(AttemptCause {
-            transmission_state: state,
-        }));
+        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
     }
 
     builder.build()
@@ -188,15 +186,12 @@ pub(crate) fn uidvalidity_changed(
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
-    .text(DiagnosticText {
-        value: format!(
-            "IMAP UIDVALIDITY changed for {} from {} to {}",
-            folder.as_str(),
-            expected,
-            actual,
-        ),
-        visibility: DetailVisibility::SupportOnly,
-    })
+    .text(DiagnosticText::support_only(format!(
+        "IMAP UIDVALIDITY changed for {} from {} to {}",
+        folder.as_str(),
+        expected,
+        actual,
+    )))
     .build()
 }
 
@@ -213,15 +208,12 @@ pub(crate) fn modseq_reset(
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
-    .text(DiagnosticText {
-        value: format!(
-            "IMAP HIGHESTMODSEQ reset for {} from {} to {:?}",
-            folder.as_str(),
-            previous,
-            current,
-        ),
-        visibility: DetailVisibility::SupportOnly,
-    })
+    .text(DiagnosticText::support_only(format!(
+        "IMAP HIGHESTMODSEQ reset for {} from {} to {:?}",
+        folder.as_str(),
+        previous,
+        current,
+    )))
     .build()
 }
 
@@ -277,53 +269,39 @@ impl Translation {
 fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
     match error {
         Error::Io { source, .. } => {
-            let detail = DiagnosticText {
-                value: source.to_string(),
-                visibility: DetailVisibility::SupportOnly,
-            };
             Translation::new(
                 AccountErrorKind::Transport(TransportErrorKind::Network),
-                Cause::Transport(TransportCause {
-                    kind: TransportKind::Network,
-                    message: Some(detail),
-                }),
+                Cause::Transport(TransportCause::new(
+                    TransportKind::Network,
+                    Some(DiagnosticText::support_only(source.to_string())),
+                )),
             )
         }
         Error::Timeout { .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Timeout),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Timeout,
-                message: None,
-            }),
+            Cause::Transport(TransportCause::new(TransportKind::Timeout, None)),
         ),
         Error::Closed { .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: Some(DiagnosticText {
-                    value: "IMAP connection closed".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
-            }),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Network,
+                Some(DiagnosticText::support_only("IMAP connection closed")),
+            )),
         ),
         Error::DriverGone { .. } => Translation::new(
             AccountErrorKind::Transport(TransportErrorKind::Network),
-            Cause::Transport(TransportCause {
-                kind: TransportKind::Network,
-                message: Some(DiagnosticText {
-                    value: "IMAP driver task gone".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
-            }),
+            Cause::Transport(TransportCause::new(
+                TransportKind::Network,
+                Some(DiagnosticText::support_only("IMAP driver task gone")),
+            )),
         ),
         Error::DriverPanicked { message, .. } => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: format!("IMAP driver panicked: {message}"),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only(format!(
+                    "IMAP driver panicked: {message}"
+                ))),
             }),
         ),
         Error::Auth { text, code } => classify_auth(text, code.as_ref()),
@@ -332,10 +310,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
             );
-            t.diagnostic_text = Some(DiagnosticText {
-                value: failure.to_string(),
-                visibility: DetailVisibility::SupportOnly,
-            });
+            t.diagnostic_text = Some(DiagnosticText::support_only(failure.to_string()));
             t
         }
         Error::StartTlsUnavailable => {
@@ -343,10 +318,9 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PolicyBlocked),
                 Cause::Access(AccessCause::PolicyBlocked),
             );
-            t.diagnostic_text = Some(DiagnosticText {
-                value: "server does not advertise STARTTLS".to_owned(),
-                visibility: DetailVisibility::SupportOnly,
-            });
+            t.diagnostic_text = Some(DiagnosticText::support_only(
+                "server does not advertise STARTTLS",
+            ));
             t
         }
         Error::No { text, code } => classify_status(text, code.as_ref(), StatusFallback::No, ctx),
@@ -358,39 +332,27 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: msg.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
         Error::Parse(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: msg.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
         Error::InvalidInput(msg) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: msg.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only(msg.clone()),
             }),
         ),
         Error::Internal(msg) => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: msg.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only(msg.clone())),
             }),
         ),
         Error::MissingCapability(cap) => {
@@ -399,19 +361,15 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
             );
-            t.diagnostic_text = Some(DiagnosticText {
-                value: cap.clone(),
-                visibility: DetailVisibility::SupportOnly,
-            });
+            t.diagnostic_text = Some(DiagnosticText::support_only(cap.clone()));
             t
         }
         Error::AppendLimit { size, limit } => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: format!("message size {size} exceeds server APPENDLIMIT of {limit}"),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only(format!(
+                    "message size {size} exceeds server APPENDLIMIT of {limit}"
+                )),
             }),
         ),
         Error::FetchLimit {
@@ -420,12 +378,9 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             let mut t = Translation::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText {
-                        value: format!(
-                            "FETCH estimated size {estimated} exceeds caller budget {limit}"
-                        ),
-                        visibility: DetailVisibility::SupportOnly,
-                    },
+                    detail: DiagnosticText::support_only(format!(
+                        "FETCH estimated size {estimated} exceeds caller budget {limit}"
+                    )),
                 }),
             );
             t.attempt = Some(TransmissionState::Acknowledged);
@@ -434,10 +389,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
         Error::InvalidAppendDate(msg) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: msg.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only(msg.clone()),
             }),
         ),
     }
@@ -468,10 +420,7 @@ fn classify_auth(text: &str, code: Option<&ResponseCode>) -> Translation {
     };
     let mut t = Translation::new(kind, cause);
     if !text.is_empty() {
-        t.diagnostic_text = Some(DiagnosticText {
-            value: text.to_owned(),
-            visibility: DetailVisibility::SupportOnly,
-        });
+        t.diagnostic_text = Some(DiagnosticText::support_only(text.to_owned()));
     }
     if let Some(code) = code {
         t.wire_code = Some(imap_response_code(code));
@@ -511,10 +460,7 @@ fn classify_status(
         }
     }
     if !text.is_empty() && t.diagnostic_text.is_none() {
-        t.diagnostic_text = Some(DiagnosticText {
-            value: text.to_owned(),
-            visibility: DetailVisibility::SupportOnly,
-        });
+        t.diagnostic_text = Some(DiagnosticText::support_only(text.to_owned()));
     }
     t
 }
@@ -523,15 +469,12 @@ fn fallback_status(_text: &str, fallback: &StatusFallback) -> Translation {
     match fallback {
         StatusFallback::No => Translation::new(
             AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
-            Cause::Server(ServerCause::Error { status: 0 }),
+            Cause::Server(ServerCause::Error { status: None }),
         ),
         StatusFallback::Bad => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: "server returned BAD with no response code".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only("server returned BAD with no response code"),
             }),
         ),
         StatusFallback::Bye => Translation::new(
@@ -600,10 +543,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: "server returned [SERVERBUG]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only("server returned [SERVERBUG]")),
             }),
         ),
 
@@ -678,10 +618,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::MetadataMaxSize(_) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: response_code_name(code).to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only(response_code_name(code).to_owned()),
             }),
         ),
 
@@ -723,10 +660,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: "server returned [COMPRESSIONACTIVE]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only("server returned [COMPRESSIONACTIVE]")),
             }),
         ),
         ResponseCode::UseAttr => {
@@ -749,10 +683,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: "[NEWNAME]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only("[NEWNAME]")),
             }),
         ),
         ResponseCode::UrlMech(_) => {
@@ -765,10 +696,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         ResponseCode::BadUrl(_) => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: "[BADURL]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only("[BADURL]"),
             }),
         ),
 
@@ -777,19 +705,13 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
                 protocol: Protocol::Imap,
-                detail: Some(DiagnosticText {
-                    value: "[PARSE]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                detail: Some(DiagnosticText::support_only("[PARSE]")),
             }),
         ),
         ResponseCode::ClientBug => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: "[CLIENTBUG]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only("[CLIENTBUG]"),
             }),
         ),
 
@@ -797,10 +719,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         ResponseCode::NotSaved => Translation::new(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText {
-                    value: "[NOTSAVED]".to_owned(),
-                    visibility: DetailVisibility::SupportOnly,
-                },
+                detail: DiagnosticText::support_only("[NOTSAVED]"),
             }),
         ),
         ResponseCode::NotificationOverflow(_) => Translation::new(
@@ -813,10 +732,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Imap(ImapResponseCode::Unknown {
                 code: name.clone(),
-                value: value.as_ref().map(|v| DiagnosticText {
-                    value: v.clone(),
-                    visibility: DetailVisibility::SupportOnly,
-                }),
+                value: value.as_ref().map(|v| DiagnosticText::support_only(v.clone())),
             })),
         ),
 
@@ -911,10 +827,7 @@ fn imap_response_code(code: &ResponseCode) -> ImapResponseCode {
         ResponseCode::MetadataNoPrivate => ImapResponseCode::MetadataNoPrivate,
         ResponseCode::Other { name, value } => ImapResponseCode::Unknown {
             code: name.clone(),
-            value: value.as_ref().map(|v| DiagnosticText {
-                value: v.clone(),
-                visibility: DetailVisibility::SupportOnly,
-            }),
+            value: value.as_ref().map(|v| DiagnosticText::support_only(v.clone())),
         },
     }
 }
@@ -1013,10 +926,7 @@ fn response_code_payload(code: &ResponseCode) -> Option<DiagnosticText> {
         ResponseCode::MetadataLongEntries(n) => format!("METADATA LONGENTRIES {n}"),
         _ => return None,
     };
-    Some(DiagnosticText {
-        value,
-        visibility: DetailVisibility::SupportOnly,
-    })
+    Some(DiagnosticText::support_only(value))
 }
 
 // Used by the kind/cause classifier in `MailboxUnavailableKind` paths.

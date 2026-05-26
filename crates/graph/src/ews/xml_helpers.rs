@@ -31,7 +31,7 @@ fn strip_ns(name: &str) -> &str {
 
 // SOAP fault check.
 
-pub(super) fn check_soap_fault(xml: &str) -> Result<(), String> {
+pub(super) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
     let mut reader = Reader::from_str(xml);
     let mut in_fault = false;
     let mut in_faultstring = false;
@@ -77,12 +77,12 @@ pub(super) fn check_soap_fault(xml: &str) -> Result<(), String> {
     }
 
     if in_fault || !fault_message.is_empty() {
-        let msg = if fault_message.is_empty() {
+        let message = if fault_message.is_empty() {
             "Unknown SOAP fault".to_string()
         } else {
             fault_message
         };
-        return Err(format!("EWS SOAP Fault: {msg}"));
+        return Err(super::EwsError::SoapFault { message });
     }
 
     Ok(())

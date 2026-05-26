@@ -55,12 +55,12 @@ impl Pool {
         folder: &MailboxName,
     ) -> Result<PooledConn, Error> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::Closed);
+            return Err(Error::closed());
         }
         let permit = Arc::clone(&self.inner.permits)
             .acquire_owned()
             .await
-            .map_err(|_| Error::Closed)?;
+            .map_err(|_| Error::closed())?;
         let member = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
             let idx = idle
@@ -97,7 +97,7 @@ impl Pool {
 
     pub(crate) async fn dial_idle(&self) -> Result<ImapConnection, Error> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::Closed);
+            return Err(Error::closed());
         }
         let (conn, _auth) = self
             .inner

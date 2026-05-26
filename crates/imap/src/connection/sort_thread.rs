@@ -43,7 +43,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::SortConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID SORT  -  server-side sorting returning UIDs (RFC 5256 Section 2).
@@ -79,7 +79,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::SortConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -128,7 +128,7 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::ThreadConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// UID THREAD  -  server-side threading returning UIDs
@@ -172,6 +172,6 @@ impl ImapConnection {
             self.submit_regular(cmd, super::dispatch::ThreadConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 }

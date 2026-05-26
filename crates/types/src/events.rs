@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::cursor::{ChangeCursor, CursorScope, MembershipScope};
-use crate::error::{Error, Fatal, Warning};
+use crate::error::{AccountError, Warning};
 use crate::ids::{AccountId, ObjectId};
 use crate::mutation::Fingerprint;
 
@@ -141,9 +141,15 @@ pub struct Batch<T> {
 /// or advancing any cursor (a discovery stream, a no-op pass).
 ///
 /// The `Batch` variant dominates traffic (one per page, every page);
-/// `Progress` / `Warning` / `Fatal` / `Done` are rare. Boxing the
-/// rare arms would slow the hot path without saving real memory, so
-/// we accept the size asymmetry instead.
+/// `Progress` / `Warning` / `Terminated` / `Done` are rare. Boxing
+/// the rare arms would slow the hot path without saving real memory,
+/// so we accept the size asymmetry instead.
+///
+/// `Terminated(AccountError)` signals that this stream ends here. The
+/// engine reads `error.recovery()` to decide what to do next. It is
+/// distinct from `bifrost-types::error::Fatal`, which collapses any
+/// terminal `RecoveryClass` at the engine boundary; stream termination
+/// is not always a terminal error (the engine may retry or restart).
 #[derive(Debug)]
 #[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
@@ -151,7 +157,7 @@ pub enum SyncEvent<T> {
     Batch(Batch<T>),
     Progress(Progress),
     Warning(Warning),
-    Fatal(Fatal),
+    Terminated(AccountError),
     Done(Option<Checkpoint>),
 }
 
@@ -289,10 +295,14 @@ pub trait InvalidationSink: Send + Sync + 'static {
 pub trait Control: Send + Sync {
     fn pause(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Checkpoint, Error>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
+    >;
     fn checkpoint_now(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Checkpoint, Error>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
+    >;
     fn resume(&self);
     fn priority(&self, p: Priority);
     fn bandwidth_cap(&self, bps: Option<u64>);

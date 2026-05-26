@@ -14,13 +14,14 @@ use super::{
     TlsParameters,
 };
 use crate::{
-    address::Envelope,
+    address::{Address, Envelope},
     transport::smtp::{
         Protocol,
         authentication::{Credentials, Mechanism},
+        batch::{SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
         error,
-        error::Error,
+        error::{Error, SmtpTransmissionState},
         extension::{
             ClientId, DeliverByMode, Extension, FutureReleaseParameter, MailBodyParameter,
             MailParameter, RcptParameter, SendOptions, ServerInfo,
@@ -400,6 +401,498 @@ impl SmtpConnection {
             .collect())
     }
 
+    /// Account-oriented SMTP multi-recipient send.
+    ///
+    /// Drives the SMTP command sequence (MAIL FROM, sequential RCPTs, DATA,
+    /// body, final reply) and records per-recipient progress into a
+    /// `SendProgress` tracker.
+    ///
+    /// Returns `Ok(progress)` when the command sequence completes (even if
+    /// some recipients were rejected). Returns `Err((error, progress))` for
+    /// batch-level failures where no recipient-specific outcome can be
+    /// attributed: MAIL FROM rejection, transport drop before any command,
+    /// or pre-MAIL local validation errors. In the `Err` case, the progress
+    /// tracker contains whatever state was accumulated before the abort.
+    pub(crate) fn send_smtp_batch(
+        &mut self,
+        from: Option<Address>,
+        recipients: Vec<SmtpBatchRecipient>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<SendProgress, (Error, SendProgress)> {
+        let mut progress = SendProgress::new(Protocol::Smtp, recipients);
+
+        let mail_options = self
+            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .map_err(|e| (e.with_attempt(SmtpTransmissionState::Unsent), progress.clone()))?;
+
+        if self.server_info().supports_pipelining() {
+            return self.send_smtp_batch_pipelined(from, email, mail_options, options, progress);
+        }
+
+        // Non-pipelined path.
+        let mail_cmd = Mail::new(from, mail_options);
+        if let Err(e) = self.command(mail_cmd) {
+            self.abort();
+            return Err((e.with_attempt(SmtpTransmissionState::Unsent), progress));
+        }
+
+        let recipient_addresses: Vec<Address> = progress
+            .recipients
+            .iter()
+            .map(|r| r.address.clone())
+            .collect();
+        for (i, addr) in recipient_addresses.into_iter().enumerate() {
+            let rcpt_options = self.rcpt_options_single(&addr, options).unwrap_or_default();
+            match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
+                Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
+                Ok(resp) => progress.record_rcpt_rejected(i, resp),
+                Err(e) => {
+                    // Transport drop during RCPT TO. Mark this and all
+                    // subsequent recipients uncertain and return.
+                    let err_clone = e.with_attempt(SmtpTransmissionState::InFlight);
+                    {
+                        let err_for_closure = err_clone.clone();
+                        let addr_str = progress.recipients[i].address.clone();
+                        use crate::transport::smtp::account_error::{
+                            SmtpErrorContext, into_account_error,
+                        };
+                        use crate::transport::smtp::error::SmtpCommandPhase;
+                        progress.mark_uncertain_unresolved(|| {
+                            into_account_error(
+                                err_for_closure.clone(),
+                                SmtpErrorContext::send(Protocol::Smtp)
+                                    .with_attempt(SmtpTransmissionState::InFlight)
+                                    .with_phase(SmtpCommandPhase::RcptTo)
+                                    .with_scope(
+                                        bifrost_types::error::ErrorScope::Account,
+                                    ),
+                            )
+                        });
+                        let _ = addr_str;
+                    }
+                    self.abort();
+                    return Ok(progress);
+                }
+            }
+        }
+
+        let accepted = progress
+            .recipients
+            .iter()
+            .any(|r| matches!(r.rcpt, crate::transport::smtp::batch::RcptProgress::Accepted));
+        if !accepted {
+            return Ok(progress);
+        }
+
+        // Send DATA command.
+        match self.command_accepting_status(Data) {
+            Ok(resp) if resp.is_positive() => {}
+            Ok(resp) => {
+                // DATA rejected before body: all accepted recipients failed with this response.
+                progress.mark_accepted_rejected_with_response(resp);
+                if let Err(_e) = self.command_accepting_status(Rset) {
+                    self.abort();
+                }
+                return Ok(progress);
+            }
+            Err(e) => {
+                // Transport drop during DATA command: outcome for accepted recipients uncertain.
+                use crate::transport::smtp::account_error::{
+                    SmtpErrorContext, into_account_error,
+                };
+                use crate::transport::smtp::error::SmtpCommandPhase;
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::InFlight),
+                    SmtpErrorContext::send(Protocol::Smtp)
+                        .with_phase(SmtpCommandPhase::DataCommand),
+                );
+                let ae2 = ae.clone();
+                progress.mark_accepted_uncertain(|| ae2.clone());
+                self.abort();
+                return Ok(progress);
+            }
+        }
+
+        // Body starts here: side-effect boundary crossed.
+        progress.set_body_started();
+        match self.message(email) {
+            Ok(resp) => {
+                progress.set_body_finished();
+                progress.set_data_response(resp);
+            }
+            Err(e) => {
+                // Transport drop after body write started: accepted recipients uncertain.
+                use crate::transport::smtp::account_error::{
+                    SmtpErrorContext, into_account_error,
+                };
+                use crate::transport::smtp::error::SmtpCommandPhase;
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::InFlight),
+                    SmtpErrorContext::send(Protocol::Smtp)
+                        .with_phase(SmtpCommandPhase::DataBody),
+                );
+                let ae2 = ae.clone();
+                progress.mark_uncertain_unresolved(|| ae2.clone());
+                self.abort();
+                return Ok(progress);
+            }
+        }
+
+        Ok(progress)
+    }
+
+    fn send_smtp_batch_pipelined(
+        &mut self,
+        from: Option<Address>,
+        email: &[u8],
+        mail_options: Vec<MailParameter>,
+        options: &SendOptions,
+        mut progress: SendProgress,
+    ) -> Result<SendProgress, (Error, SendProgress)> {
+        // Build and write the pipelined command batch (MAIL FROM + all RCPTs + DATA).
+        let mut commands = Mail::new(from, mail_options).to_string();
+        let rcpt_options_all: Vec<Vec<RcptParameter>> = progress
+            .recipients
+            .iter()
+            .map(|r| self.rcpt_options_single(&r.address, options).unwrap_or_default())
+            .collect();
+        for (rec, rcpt_opts) in progress.recipients.iter().zip(&rcpt_options_all) {
+            commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
+        }
+        commands.push_str(&Data.to_string());
+
+        if let Err(e) = self.write(commands.as_bytes()) {
+            self.abort();
+            return Err((e.with_attempt(SmtpTransmissionState::Unsent), progress));
+        }
+
+        // Drain MAIL FROM reply.
+        let mail_response = match self.read_response_accepting_status() {
+            Ok(r) => r,
+            Err(e) => {
+                self.abort();
+                return Err((e.with_attempt(SmtpTransmissionState::InFlight), progress));
+            }
+        };
+        if !mail_response.is_positive() {
+            self.abort();
+            return Err((
+                error::status(mail_response).with_attempt(SmtpTransmissionState::Acknowledged),
+                progress,
+            ));
+        }
+
+        // Drain RCPT replies.
+        let n_recipients = progress.recipients.len();
+        for i in 0..n_recipients {
+            match self.read_response_accepting_status() {
+                Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
+                Ok(resp) => progress.record_rcpt_rejected(i, resp),
+                Err(e) => {
+                    // Transport drop during RCPT drain: remaining recipients uncertain.
+                    use crate::transport::smtp::account_error::{
+                        SmtpErrorContext, into_account_error,
+                    };
+                    use crate::transport::smtp::error::SmtpCommandPhase;
+                    let ae = into_account_error(
+                        e.with_attempt(SmtpTransmissionState::InFlight),
+                        SmtpErrorContext::send(Protocol::Smtp)
+                            .with_phase(SmtpCommandPhase::RcptTo),
+                    );
+                    let ae2 = ae.clone();
+                    progress.mark_uncertain_unresolved(|| ae2.clone());
+                    self.abort();
+                    return Ok(progress);
+                }
+            }
+        }
+
+        // Drain DATA reply.
+        let data_response = match self.read_response_accepting_status() {
+            Ok(r) => r,
+            Err(e) => {
+                use crate::transport::smtp::account_error::{
+                    SmtpErrorContext, into_account_error,
+                };
+                use crate::transport::smtp::error::SmtpCommandPhase;
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::InFlight),
+                    SmtpErrorContext::send(Protocol::Smtp)
+                        .with_phase(SmtpCommandPhase::DataCommand),
+                );
+                let ae2 = ae.clone();
+                progress.mark_uncertain_unresolved(|| ae2.clone());
+                self.abort();
+                return Ok(progress);
+            }
+        };
+
+        let accepted = progress
+            .recipients
+            .iter()
+            .any(|r| matches!(r.rcpt, crate::transport::smtp::batch::RcptProgress::Accepted));
+
+        if !data_response.is_positive() {
+            // DATA negative: all accepted recipients failed with this response.
+            progress.mark_accepted_rejected_with_response(data_response);
+            if !accepted {
+                // No accepted recipients and DATA negative; clean up.
+                if let Err(_e) = self.command_accepting_status(Rset) {
+                    self.abort();
+                }
+            } else {
+                self.abort();
+            }
+            return Ok(progress);
+        }
+
+        if !accepted {
+            // No accepted recipients, DATA positive; send terminating dot to complete transaction.
+            if self
+                .write(b".\r\n")
+                .and_then(|_| self.read_response_accepting_status())
+                .is_err()
+            {
+                self.abort();
+            }
+            return Ok(progress);
+        }
+
+        // Body starts here.
+        progress.set_body_started();
+        match self.message(email) {
+            Ok(resp) => {
+                progress.set_body_finished();
+                progress.set_data_response(resp);
+            }
+            Err(e) => {
+                use crate::transport::smtp::account_error::{
+                    SmtpErrorContext, into_account_error,
+                };
+                use crate::transport::smtp::error::SmtpCommandPhase;
+                let ae = into_account_error(
+                    e.with_attempt(SmtpTransmissionState::InFlight),
+                    SmtpErrorContext::send(Protocol::Smtp)
+                        .with_phase(SmtpCommandPhase::DataBody),
+                );
+                let ae2 = ae.clone();
+                progress.mark_uncertain_unresolved(|| ae2.clone());
+                self.abort();
+                return Ok(progress);
+            }
+        }
+
+        Ok(progress)
+    }
+
+    /// Account-oriented LMTP multi-recipient send.
+    ///
+    /// Like `send_smtp_batch` but reads one final status per accepted recipient
+    /// after the DATA body. Returns `Err((error, progress))` for batch-level
+    /// failures; returns `Ok(progress)` otherwise.
+    pub(crate) fn send_lmtp_batch(
+        &mut self,
+        from: Option<Address>,
+        recipients: Vec<SmtpBatchRecipient>,
+        email: &[u8],
+        options: &SendOptions,
+    ) -> Result<SendProgress, (Error, SendProgress)> {
+        let mut progress = SendProgress::new(Protocol::Lmtp, recipients);
+
+        let mail_options = self
+            .mail_options_for_batch(from.as_ref(), email, options, false)
+            .map_err(|e| (e.with_attempt(SmtpTransmissionState::Unsent), progress.clone()))?;
+
+        let mail_cmd = Mail::new(from, mail_options);
+        if let Err(e) = self.command(mail_cmd) {
+            self.abort();
+            return Err((e.with_attempt(SmtpTransmissionState::Unsent), progress));
+        }
+
+        let recipient_addresses: Vec<Address> = progress
+            .recipients
+            .iter()
+            .map(|r| r.address.clone())
+            .collect();
+        let mut accepted_count = 0usize;
+        for (i, addr) in recipient_addresses.into_iter().enumerate() {
+            let rcpt_options = self.rcpt_options_single(&addr, options).unwrap_or_default();
+            match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
+                Ok(resp) if resp.is_positive() => {
+                    progress.record_rcpt_accepted(i);
+                    accepted_count += 1;
+                }
+                Ok(resp) => progress.record_rcpt_rejected(i, resp),
+                Err(e) => {
+                    use crate::transport::smtp::account_error::{
+                        SmtpErrorContext, into_account_error,
+                    };
+                    use crate::transport::smtp::error::SmtpCommandPhase;
+                    let ae = into_account_error(
+                        e.with_attempt(SmtpTransmissionState::InFlight),
+                        SmtpErrorContext::send(Protocol::Lmtp)
+                            .with_phase(SmtpCommandPhase::RcptTo),
+                    );
+                    let ae2 = ae.clone();
+                    progress.mark_uncertain_unresolved(|| ae2.clone());
+                    self.abort();
+                    return Ok(progress);
+                }
+            }
+        }
+
+        if accepted_count == 0 {
+            return Ok(progress);
+        }
+
+        // DATA command.
+        if let Err(e) = self.command(Data) {
+            self.abort();
+            return Err((e.with_attempt(SmtpTransmissionState::Unsent), progress));
+        }
+
+        // Body starts here.
+        progress.set_body_started();
+        if let Err(e) = self.write_body(email) {
+            use crate::transport::smtp::account_error::{
+                SmtpErrorContext, into_account_error,
+            };
+            use crate::transport::smtp::error::SmtpCommandPhase;
+            let ae = into_account_error(
+                e.with_attempt(SmtpTransmissionState::InFlight),
+                SmtpErrorContext::send(Protocol::Lmtp)
+                    .with_phase(SmtpCommandPhase::DataBody),
+            );
+            let ae2 = ae.clone();
+            progress.mark_uncertain_unresolved(|| ae2.clone());
+            self.abort();
+            return Ok(progress);
+        }
+        progress.set_body_finished();
+
+        // Read one final LMTP status per accepted recipient.
+        let mut lmtp_index = 0usize;
+        for i in 0..progress.recipients.len() {
+            if !matches!(
+                progress.recipients[i].rcpt,
+                crate::transport::smtp::batch::RcptProgress::Accepted
+            ) {
+                continue;
+            }
+            match self.read_response_accepting_status() {
+                Ok(resp) => {
+                    progress.record_lmtp_final(i, resp);
+                    lmtp_index += 1;
+                }
+                Err(e) => {
+                    use crate::transport::smtp::account_error::{
+                        SmtpErrorContext, into_account_error,
+                    };
+                    use crate::transport::smtp::error::SmtpCommandPhase;
+                    let ae = into_account_error(
+                        e.with_attempt(SmtpTransmissionState::InFlight),
+                        SmtpErrorContext::send(Protocol::Lmtp)
+                            .with_phase(SmtpCommandPhase::LmtpFinalStatus),
+                    );
+                    let ae2 = ae.clone();
+                    progress.mark_uncertain_unresolved(|| ae2.clone());
+                    self.abort();
+                    return Ok(progress);
+                }
+            }
+        }
+        let _ = lmtp_index;
+
+        Ok(progress)
+    }
+
+    /// Write the DATA body without reading the final reply.
+    fn write_body(&mut self, email: &[u8]) -> Result<(), Error> {
+        let mut codec = ClientCodec::new();
+        let mut out_buf = Vec::with_capacity(email.len());
+        codec.encode(email, &mut out_buf);
+        self.write(out_buf.as_slice())?;
+        self.write(b"\r\n.\r\n")
+    }
+
+    /// Compute RCPT TO parameters for a single recipient and the given options.
+    fn rcpt_options_single(
+        &self,
+        addr: &Address,
+        options: &SendOptions,
+    ) -> Result<Vec<RcptParameter>, Error> {
+        let parameters = options.rcpt_parameters_for(addr);
+        for parameter in &parameters {
+            self.validate_rcpt_parameter(parameter)?;
+        }
+        Ok(parameters)
+    }
+
+    /// Like `mail_options` but takes an explicit sender address instead of an `Envelope`.
+    fn mail_options_for_batch(
+        &self,
+        from: Option<&Address>,
+        email: &[u8],
+        options: &SendOptions,
+        allow_binary_mime: bool,
+    ) -> Result<Vec<MailParameter>, Error> {
+        let mut mail_options = vec![];
+
+        let has_smtputf8 = options
+            .mail_parameters()
+            .iter()
+            .any(|parameter| matches!(parameter, MailParameter::SmtpUtfEight));
+        let has_body_parameter = options
+            .mail_parameters()
+            .iter()
+            .any(|parameter| matches!(parameter, MailParameter::Body(_)));
+
+        let has_non_ascii = from.is_some_and(|a| !a.as_ref().is_ascii());
+        if has_non_ascii && !has_smtputf8 {
+            if !self.server_info().supports_feature(Extension::SmtpUtfEight) {
+                return Err(error::invalid_input(
+                    "Envelope contains non-ascii chars but server does not support SMTPUTF8",
+                ));
+            }
+            mail_options.push(MailParameter::SmtpUtfEight);
+        }
+
+        if !email.is_ascii() && !has_body_parameter {
+            if !self.server_info().supports_feature(Extension::EightBitMime) {
+                return Err(error::invalid_input(
+                    "Message contains non-ascii chars but server does not support 8BITMIME",
+                ));
+            }
+            mail_options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+        }
+
+        if self.server_info().supports_size()
+            && !options
+                .mail_parameters()
+                .iter()
+                .any(|parameter| matches!(parameter, MailParameter::Size(_)))
+        {
+            if self
+                .server_info()
+                .size_limit()
+                .is_some_and(|limit| email.len() > limit)
+            {
+                return Err(error::invalid_input(
+                    "Message is larger than the server-advertised SIZE limit",
+                ));
+            }
+            mail_options.push(MailParameter::Size(email.len()));
+        }
+
+        for parameter in options.mail_parameters() {
+            self.validate_mail_parameter(parameter, email.len(), email.is_ascii(), allow_binary_mime)?;
+            mail_options.push(parameter.clone());
+        }
+
+        Ok(mail_options)
+    }
+
     fn mail_options(
         &self,
         envelope: &Envelope,
@@ -690,8 +1183,8 @@ impl SmtpConnection {
     /// Send EHLO or LHLO and update server info
     fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
         let response = match self.protocol {
-            Protocol::Smtp => try_smtp!(self.command(Ehlo::new(hello_name.clone())), self),
             Protocol::Lmtp => try_smtp!(self.command(Lhlo::new(hello_name.clone())), self),
+            _ => try_smtp!(self.command(Ehlo::new(hello_name.clone())), self),
         };
         self.server_info = try_smtp!(ServerInfo::from_response(&response), self);
         Ok(())

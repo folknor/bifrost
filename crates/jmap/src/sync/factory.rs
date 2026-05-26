@@ -7,10 +7,6 @@ use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
 };
 
-// Phase 3 will reshape the AccountFactory trait to return AccountError
-// natively; until then the local alias keeps factory.rs compiling
-// against the Phase 1 type surface.
-type Error = AccountError;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, Credentials};
@@ -99,7 +95,7 @@ impl JmapAccountFactoryBuilder {
 }
 
 impl AccountFactory for JmapAccountFactory {
-    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
+    fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
         let config = self.config.clone();
         Box::pin(async move {
             let client = connect(config.clone(), account_id).await.map_err(|err| {

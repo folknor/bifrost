@@ -336,44 +336,27 @@ pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
 /// the outermost interpretation; the primary delete's outermost cause
 /// is attached as a secondary cause so the support export carries
 /// both signals.
+///
+/// Uses `AccountError::into_builder()` to preserve all fallback fields
+/// and derived values, then pushes the primary's outermost cause as
+/// secondary evidence and adds a diagnostic note.
 pub(crate) fn merge_delete_fallback_error(
     fallback: AccountError,
     primary: &AccountError,
 ) -> AccountError {
-    // `AccountError` is opaque so we cannot deconstruct it. We rebuild
-    // via the builder using the fallback's kind/outermost cause and
-    // push the primary's outermost cause + diagnostic text. Because
-    // we go through the builder, recovery/remediation/message_key are
-    // re-derived from the fallback (the new outermost).
     let primary_outermost = primary.chain().outermost().clone();
-    let mut builder = AccountErrorBuilder::new(
-        fallback.kind().clone(),
-        fallback.chain().outermost().clone(),
-    )
-    .provider(Provider::Gmail)
-    .protocol(Protocol::Gmail);
-    if let Some(op) = fallback.operation() {
-        builder = builder.operation(op);
-    }
-    if let Some(scope) = fallback.scope() {
-        builder = builder.scope(scope.clone());
-    }
-    // Carry the remaining causes from the fallback's chain, then push
-    // the primary's outermost cause to preserve the double-cause
-    // chain.
-    for cause in fallback.chain().iter().skip(1) {
-        builder = builder.push_cause(cause.clone());
-    }
-    builder = builder.push_cause(primary_outermost);
     let primary_kind = primary
         .telemetry_fields()
         .native_code
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{:?}", primary.kind()));
-    builder = builder.text(DiagnosticText::support_only(format!(
-        "primary batchDelete failed before TRASH fallback: {primary_kind}"
-    )));
-    builder.build()
+    fallback
+        .into_builder()
+        .push_cause(primary_outermost)
+        .text(DiagnosticText::support_only(format!(
+            "primary batchDelete failed before TRASH fallback: {primary_kind}"
+        )))
+        .build()
 }
 
 // ---------------------------------------------------------------------

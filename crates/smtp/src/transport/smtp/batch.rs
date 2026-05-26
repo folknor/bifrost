@@ -1,7 +1,5 @@
 //! Account-oriented multi-recipient send.
 //!
-//! Two responsibilities, both feature-gated on `account-error`:
-//!
 //! 1. Validate `BatchItem<Address>` input as `RequestErrorKind::BatchInputInvalid`
 //!    before any wire activity.
 //! 2. Provide a `SendProgress` tracker that captures the per-recipient command
@@ -17,15 +15,11 @@
 //! it through the existing command sequence, then resolve into a
 //! `BatchOutcome<()>`.
 
-#![cfg(feature = "account-error")]
-
-use std::collections::HashSet;
-
 use bifrost_types::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AttemptCause,
-    BatchInputInvalidItem, BatchInputInvalidReason, BatchItem, BatchItemId, BatchOutcome, Cause,
-    DiagnosticText, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, TransmissionState,
-    WireCause,
+    BatchInputInvalidItem, BatchItem, BatchItemId, BatchOutcome, Cause, DiagnosticText, Protocol,
+    ProtocolErrorKind, RequestCause, RequestErrorKind, TransmissionState, WireCause,
+    validate_batch_input,
 };
 
 use crate::address::Address;
@@ -132,6 +126,30 @@ impl SendProgress {
         }
     }
 
+    /// Mark all `Accepted` recipients as `Rejected` with the given DATA-level
+    /// response. Used when the DATA command reply is negative before the body
+    /// was started.
+    pub(crate) fn mark_accepted_rejected_with_response(&mut self, response: Response) {
+        for rec in &mut self.recipients {
+            if matches!(rec.rcpt, RcptProgress::Accepted) {
+                rec.rcpt = RcptProgress::Rejected(response.clone());
+            }
+        }
+    }
+
+    /// Mark all `Accepted` recipients as `Uncertain` with the given error.
+    ///
+    /// Used when an error leaves accepted recipients in an ambiguous state
+    /// (e.g. transport drop after DATA body was sent, or DATA command transport
+    /// error where we cannot attribute the failure per-recipient).
+    pub(crate) fn mark_accepted_uncertain(&mut self, error_factory: impl Fn() -> AccountError) {
+        for rec in &mut self.recipients {
+            if matches!(rec.rcpt, RcptProgress::Accepted) {
+                rec.rcpt = RcptProgress::Uncertain(error_factory());
+            }
+        }
+    }
+
     pub(crate) fn set_body_started(&mut self) {
         self.body_started = true;
     }
@@ -224,9 +242,8 @@ fn with_recipient_text(error: AccountError, _address: &Address) -> AccountError 
     // attached at the original construction site (the wire-cause classifier
     // already adds the response's first line, which RFC-compliant servers
     // include the recipient address in for RCPT-related codes). A richer
-    // attach-recipient-text follow-up requires either a rebuild API on
-    // AccountErrorBuilder or threading the recipient through the lane
-    // constructors - see plans/error-model-smtp.md follow-up.
+    // attach-recipient-text path requires either a rebuild API on
+    // AccountErrorBuilder or threading the recipient through the lane constructors.
     error
 }
 
@@ -244,53 +261,12 @@ fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountErr
     .protocol(protocol)
     .operation(AccountOperation::Send)
     .idempotency_override(false)
-    .push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: TransmissionState::InFlight,
-    }))
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::InFlight)))
     .text(DiagnosticText::support_only(format!(
         "recipient {} uncertain after body write",
         address
     )))
     .build()
-}
-
-/// Validate the recipient list before any wire activity.
-///
-/// NOTE: this duplicates `bifrost_types::error::batch::validate_batch_input`,
-/// which is `pub(crate)` in `bifrost-types` today. Phase 3.5 promotes that
-/// helper to `pub` and removes this copy. See plans/error-model-smtp.md
-/// (#dependencies-and-features) for the follow-up anchor.
-pub(crate) fn validate_recipients(
-    items: &[BatchItem<Address>],
-) -> Result<(), Vec<BatchInputInvalidItem>> {
-    if items.is_empty() {
-        return Err(vec![BatchInputInvalidItem {
-            id: BatchItemId(String::new()),
-            reason: BatchInputInvalidReason::Empty,
-        }]);
-    }
-    let mut seen = HashSet::new();
-    let mut invalid = Vec::new();
-    for item in items {
-        if item.id.0.is_empty() {
-            invalid.push(BatchInputInvalidItem {
-                id: item.id.clone(),
-                reason: BatchInputInvalidReason::Empty,
-            });
-            continue;
-        }
-        if !seen.insert(item.id.clone()) {
-            invalid.push(BatchInputInvalidItem {
-                id: item.id.clone(),
-                reason: BatchInputInvalidReason::Duplicate,
-            });
-        }
-    }
-    if invalid.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid)
-    }
 }
 
 pub(crate) fn batch_input_invalid_error(
@@ -320,8 +296,8 @@ mod tests {
     use super::*;
     use crate::transport::smtp::response::{Category, Code, Detail, Severity};
     use bifrost_types::error::{
-        AccountErrorKind, BatchItem, BatchItemId, ReconcileReason, RecoveryClass, RequestErrorKind,
-        ResourceKind,
+        AccountErrorKind, BatchInputInvalidReason, BatchItem, BatchItemId, ReconcileReason,
+        RecoveryClass, RequestErrorKind, ResourceKind, validate_batch_input,
     };
 
     fn recip(id: &str, addr: &str) -> SmtpBatchRecipient {
@@ -367,7 +343,7 @@ mod tests {
     #[test]
     fn validation_rejects_empty() {
         let items: Vec<BatchItem<Address>> = Vec::new();
-        let err = validate_recipients(&items).unwrap_err();
+        let err = validate_batch_input(&items).unwrap_err();
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].reason, BatchInputInvalidReason::Empty);
         let account = batch_input_invalid_error(Protocol::Smtp, err);
@@ -389,7 +365,7 @@ mod tests {
                 "b@example.com".parse().unwrap(),
             ),
         ];
-        let err = validate_recipients(&items).unwrap_err();
+        let err = validate_batch_input(&items).unwrap_err();
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].reason, BatchInputInvalidReason::Duplicate);
     }

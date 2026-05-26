@@ -306,37 +306,19 @@ fn classify(
                 None => server_error_tuple(404),
             };
         }
-        GraphSignal::Unknown { code } => {
-            // Unknown stable codes that mean "delta cursor is dead".
-            // Graph historically returns these with HTTP 400 and the
-            // typed Microsoft documentation has never promoted them to
-            // named tokens, so we read them here and flag the
-            // promotion under the wire-enum escape hatch in the
-            // roadmap audit (see GraphSignal additions request).
-            if is_cursor_invalid_unknown(code) {
-                return (
-                    AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                    Cause::State(StateCause::CursorInvalid),
-                    false,
-                );
-            }
+        GraphSignal::InvalidDeltaToken | GraphSignal::SyncStateNotFound => {
+            return (
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+                Cause::State(StateCause::CursorInvalid),
+                false,
+            );
         }
+        GraphSignal::Unknown { .. } => {}
     }
 
     // 2) Status-only fallback when the GraphSignal carries no
     //    actionable code.
     classify_by_status(ctx, code, retry_after)
-}
-
-fn is_cursor_invalid_unknown(code: &str) -> bool {
-    // The known Microsoft delta-token-dead tokens, matched on the
-    // exact code field - not on `error.message` substring. These
-    // should be promoted to named GraphSignal variants under the
-    // wire-enum escape hatch.
-    matches!(
-        code,
-        "InvalidDeltaToken" | "SyncStateNotFound" | "syncStateNotFound"
-    )
 }
 
 fn classify_by_status(
@@ -451,7 +433,7 @@ fn push_attempt(
     builder: AccountErrorBuilder,
     transmission_state: TransmissionState,
 ) -> AccountErrorBuilder {
-    builder.push_cause(Cause::Attempt(AttemptCause { transmission_state }))
+    builder.push_cause(Cause::Attempt(AttemptCause::new(transmission_state)))
 }
 
 fn response_diagnostics(
@@ -574,6 +556,62 @@ fn throttle_scope_for(_ctx: &GraphErrorContext) -> Option<ThrottleScope> {
     // All Microsoft tenants share the per-tenant throttle policy
     // (Graph REST and EWS both meter at the tenant level).
     Some(ThrottleScope::Tenant)
+}
+
+/// Build an `AccountError` for an operation this account does not support.
+#[must_use]
+pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(operation),
+        Cause::Request(RequestCause::Unsupported { operation }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .build()
+}
+
+/// Translate a `CursorError` into the account-boundary `AccountError`.
+///
+/// `CursorProtocolMismatch`, `CursorEnvelopeUnknown`, and
+/// `SchemaIncompatible` map to `SyncState(SchemaIncompatible)` so the
+/// engine can restart the scope with a cleared cursor. `Unsupported`
+/// maps to `Unsupported(EstablishCursor)`. `Encode` (serialization
+/// failures) maps to `Protocol(ContractViolation)`.
+#[must_use]
+pub(crate) fn cursor_error_to_account_error(
+    error: crate::account::cursor::CursorError,
+    ctx: GraphErrorContext,
+) -> AccountError {
+    use crate::account::cursor::CursorError;
+    match error {
+        CursorError::ProtocolMismatch | CursorError::EnvelopeUnknown | CursorError::SchemaIncompatible => {
+            base_builder(
+                &ctx,
+                AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+                Cause::State(StateCause::SchemaIncompatible),
+            )
+            .text(DiagnosticText::support_only(error.to_string()))
+            .build()
+        }
+        CursorError::Unsupported => base_builder(
+            &ctx,
+            AccountErrorKind::Unsupported(ctx.operation),
+            Cause::Request(RequestCause::Unsupported {
+                operation: ctx.operation,
+            }),
+        )
+        .build(),
+        CursorError::Encode(msg) => base_builder(
+            &ctx,
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(DiagnosticText::support_only(msg)),
+            }),
+        )
+        .build(),
+    }
 }
 
 /// Translate a single `$batch` response item into an
@@ -786,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_delta_token_maps_to_cursor_invalid_via_unknown() {
+    fn invalid_delta_token_maps_to_cursor_invalid() {
         let err = classify(
             StatusCode::BAD_REQUEST,
             r#"{"error":{"code":"InvalidDeltaToken"}}"#,
@@ -801,18 +839,25 @@ mod tests {
     }
 
     #[test]
-    fn sync_state_not_found_maps_to_cursor_invalid_via_unknown() {
-        let err = classify(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"code":"syncStateNotFound"}}"#,
-            graph_ctx(AccountOperation::SyncChanges)
-                .with_scope(ErrorScope::Cursor(CursorScope::Account)),
-            &[],
-        );
-        assert!(matches!(
-            err.kind(),
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
-        ));
+    fn sync_state_not_found_maps_to_cursor_invalid() {
+        // Microsoft ships both SyncStateNotFound and syncStateNotFound; both
+        // must classify as CursorInvalid via the typed variant.
+        for code in ["SyncStateNotFound", "syncStateNotFound"] {
+            let err = classify(
+                StatusCode::BAD_REQUEST,
+                &format!(r#"{{"error":{{"code":"{code}"}}}}"#),
+                graph_ctx(AccountOperation::SyncChanges)
+                    .with_scope(ErrorScope::Cursor(CursorScope::Account)),
+                &[],
+            );
+            assert!(
+                matches!(
+                    err.kind(),
+                    AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+                ),
+                "code={code} did not classify as CursorInvalid"
+            );
+        }
     }
 
     #[test]

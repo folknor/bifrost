@@ -142,7 +142,7 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     /// MULTIAPPEND  -  append multiple messages in a single APPEND command (RFC 3502).
@@ -299,6 +299,6 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 }

@@ -404,7 +404,7 @@ impl ImapConnection {
         let mut rx = self.events_rx.lock().await;
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(ev)) => Ok(Some(ev)),
-            Ok(None) => Err(crate::error::Error::DriverGone),
+            Ok(None) => Err(crate::error::Error::driver_gone()),
             Err(_) => Ok(None), // timeout
         }
     }
@@ -430,7 +430,8 @@ impl std::fmt::Debug for ImapConnection {
 
 /// Build the default native-tls connector.
 fn build_default_tls_connector() -> Result<native_tls::TlsConnector, Error> {
-    native_tls::TlsConnector::new().map_err(|e| Error::Io(Arc::new(std::io::Error::other(e))))
+    native_tls::TlsConnector::new()
+        .map_err(|e| Error::Io { source: Arc::new(std::io::Error::other(e)), attempt: None })
 }
 
 fn validate_tls_server_name(host: &str) -> Result<(), Error> {

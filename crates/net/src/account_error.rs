@@ -37,7 +37,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             TransportErrorKind::Network,
             message,
             transmission_state,
-            source.as_ref().map(|source| source.to_string()),
+            source.as_ref().map(ToString::to_string),
         ),
         Error::Timeout { transmission_state } => transport_or_partial(
             &ctx,
@@ -79,10 +79,10 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 let mut builder = base_builder(
                     &ctx,
                     AccountErrorKind::Transport(TransportErrorKind::Network),
-                    Cause::Transport(TransportCause {
-                        kind: TransportKind::Network,
-                        message: detail.clone(),
-                    }),
+                    Cause::Transport(TransportCause::new(
+                        TransportKind::Network,
+                        detail.clone(),
+                    )),
                 );
                 if let Some(text) = detail {
                     builder = builder.text(text);
@@ -102,10 +102,10 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             let builder = base_builder(
                 &ctx,
                 AccountErrorKind::Transport(TransportErrorKind::Network),
-                Cause::Transport(TransportCause {
-                    kind: TransportKind::Network,
-                    message: Some(DiagnosticText::support_only("request cancelled")),
-                }),
+                Cause::Transport(TransportCause::new(
+                    TransportKind::Network,
+                    Some(DiagnosticText::support_only("request cancelled")),
+                )),
             )
             .text(DiagnosticText::support_only("request cancelled"));
             finish(push_attempt(builder, TransmissionState::InFlight), &ctx)
@@ -119,13 +119,13 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             &ctx,
             "body",
             message,
-            source.as_ref().map(|source| source.to_string()),
+            source.as_ref().map(ToString::to_string),
         ),
         Error::InvalidHeader { message, source } => invalid_argument_with_source(
             &ctx,
             "header",
             message,
-            source.as_ref().map(|source| source.to_string()),
+            source.as_ref().map(ToString::to_string),
         ),
         Error::InvalidRequest { field, detail } => invalid_argument(&ctx, field, detail),
         Error::RefreshFailed {
@@ -144,7 +144,7 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
             &ctx,
             "client_config",
             message,
-            source.as_ref().map(|source| source.to_string()),
+            source.as_ref().map(ToString::to_string),
         ),
         Error::RedirectRejected { message } => {
             let builder = invalid_argument_builder(&ctx, "redirect_policy", message);
@@ -183,10 +183,7 @@ fn transport_or_partial(
     let mut builder = base_builder(
         ctx,
         AccountErrorKind::Transport(error_kind),
-        Cause::Transport(TransportCause {
-            kind: transport_kind,
-            message: diagnostic.clone(),
-        }),
+        Cause::Transport(TransportCause::new(transport_kind, diagnostic.clone())),
     );
     if let Some(text) = diagnostic {
         builder = builder.text(text);
@@ -482,7 +479,7 @@ fn push_attempt(
     builder: AccountErrorBuilder,
     transmission_state: TransmissionState,
 ) -> AccountErrorBuilder {
-    builder.push_cause(Cause::Attempt(AttemptCause { transmission_state }))
+    builder.push_cause(Cause::Attempt(AttemptCause::new(transmission_state)))
 }
 
 fn response_diagnostics(
@@ -629,13 +626,7 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
         Some(ErrorScope::Thread { .. }) => Some(ResourceKind::Thread),
         Some(ErrorScope::Calendar { .. }) => Some(ResourceKind::Calendar),
         Some(ErrorScope::Contact { .. }) => Some(ResourceKind::Contact),
-        Some(
-            ErrorScope::Account
-            | ErrorScope::Cursor(_)
-            | ErrorScope::CalendarCollection
-            | ErrorScope::ContactCollection,
-        )
-        | None => None,
+        Some(_) | None => None,
     }
 }
 
@@ -648,22 +639,17 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
             | ErrorScope::Calendar { id }
             | ErrorScope::Contact { id },
         ) => Some(id.clone()),
-        Some(
-            ErrorScope::Account
-            | ErrorScope::Cursor(_)
-            | ErrorScope::CalendarCollection
-            | ErrorScope::ContactCollection,
-        )
-        | None => None,
+        Some(_) | None => None,
     }
 }
 
 fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
     if ctx.protocol == Protocol::Graph || ctx.provider == Some(Provider::Microsoft) {
         Some(ThrottleScope::Tenant)
-    } else if ctx.protocol == Protocol::Gmail || ctx.provider == Some(Provider::Gmail) {
-        Some(ThrottleScope::Account)
-    } else if ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail) {
+    } else if ctx.protocol == Protocol::Gmail
+        || ctx.provider == Some(Provider::Gmail)
+        || (ctx.protocol == Protocol::Jmap && ctx.provider == Some(Provider::Fastmail))
+    {
         Some(ThrottleScope::Account)
     } else {
         None
@@ -672,18 +658,18 @@ fn throttle_scope(ctx: &NetErrorContext) -> Option<ThrottleScope> {
 
 fn support_cause_from_source(error: &Error) -> Option<Cause> {
     match error {
-        Error::Network { message, .. } => Some(Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: maybe_support_text(message.clone()),
-        })),
-        Error::Timeout { .. } => Some(Cause::Transport(TransportCause {
-            kind: TransportKind::Timeout,
-            message: Some(DiagnosticText::support_only("request timed out")),
-        })),
-        Error::Tls { message, .. } => Some(Cause::Transport(TransportCause {
-            kind: TransportKind::Tls,
-            message: maybe_support_text(message.clone()),
-        })),
+        Error::Network { message, .. } => Some(Cause::Transport(TransportCause::new(
+            TransportKind::Network,
+            maybe_support_text(message.clone()),
+        ))),
+        Error::Timeout { .. } => Some(Cause::Transport(TransportCause::new(
+            TransportKind::Timeout,
+            Some(DiagnosticText::support_only("request timed out")),
+        ))),
+        Error::Tls { message, .. } => Some(Cause::Transport(TransportCause::new(
+            TransportKind::Tls,
+            maybe_support_text(message.clone()),
+        ))),
         Error::AuthLost { .. } => Some(Cause::Auth(AuthCause::ReauthorizationRequired)),
         Error::RefreshFailed { .. } => Some(Cause::Auth(AuthCause::RefreshTransient)),
         Error::RateLimited {
@@ -704,17 +690,17 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         Error::RetryBudgetExhausted {
             final_response: None,
             ..
-        } => Some(Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: Some(DiagnosticText::support_only("retry budget exhausted")),
-        })),
+        } => Some(Cause::Transport(TransportCause::new(
+            TransportKind::Network,
+            Some(DiagnosticText::support_only("retry budget exhausted")),
+        ))),
         Error::Status { code, headers, .. } => {
             server_cause_from_status(code.as_u16(), headers.get(RETRY_AFTER), None)
         }
-        Error::Cancelled => Some(Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: Some(DiagnosticText::support_only("request cancelled")),
-        })),
+        Error::Cancelled => Some(Cause::Transport(TransportCause::new(
+            TransportKind::Network,
+            Some(DiagnosticText::support_only("request cancelled")),
+        ))),
         Error::CostExceedsBurst { .. }
         | Error::EncodeBody { .. }
         | Error::InvalidHeader { .. }

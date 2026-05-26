@@ -7,6 +7,32 @@ use self::xml_helpers::*;
 
 const EWS_URL: &str = "https://outlook.office365.com/EWS/Exchange.asmx";
 
+/// Structured EWS transport or protocol error.
+///
+/// Used by `EwsClient::execute` so callers receive structured evidence
+/// rather than a formatted string. Callers that only need a display
+/// message can call `.to_string()` via the `Display` impl.
+#[derive(Debug)]
+#[non_exhaustive]
+pub(crate) enum EwsError {
+    /// The HTTP request failed or the server returned a non-success
+    /// status. Carries the formatted network message.
+    Transport(String),
+    /// The server returned a SOAP fault. `message` is the
+    /// `<faultstring>` text, or "Unknown SOAP fault" when the element
+    /// is absent.
+    SoapFault { message: String },
+}
+
+impl std::fmt::Display for EwsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EwsError::Transport(msg) => write!(f, "EWS transport error: {msg}"),
+            EwsError::SoapFault { message } => write!(f, "EWS SOAP fault: {message}"),
+        }
+    }
+}
+
 pub(crate) struct EwsClient {
     net: AccountNet,
     ews_url: String,
@@ -44,7 +70,10 @@ mod tests {
         let result = check_soap_fault(xml);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("schema validation"));
+        assert!(
+            err.to_string().contains("schema validation"),
+            "unexpected fault message: {err}"
+        );
     }
 
     #[test]

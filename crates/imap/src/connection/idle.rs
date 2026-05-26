@@ -120,9 +120,9 @@ impl ImapConnection {
                             }
                         }
                         Ok(None) => break IdleEvent::Timeout,
-                        Err(Error::DriverGone) => {
+                        Err(Error::DriverGone { .. }) => {
                             // Driver exited  -  don't try to send DONE.
-                            return Err(Error::DriverGone);
+                            return Err(Error::driver_gone());
                         }
                         Err(e) => return Err(e),
                     }

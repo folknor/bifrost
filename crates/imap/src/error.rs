@@ -270,6 +270,17 @@ impl Error {
         Self::Timeout { attempt: None }
     }
 
+    /// Construct a `Timeout` with `InFlight` attempt evidence.
+    ///
+    /// Used by command sites that submit to the driver and then time out
+    /// waiting for the response: the command bytes have already been sent
+    /// to the server by the time the outer timeout fires.
+    pub(crate) fn timeout_inflight() -> Self {
+        Self::Timeout {
+            attempt: Some(ImapAttempt::new(TransmissionState::InFlight)),
+        }
+    }
+
     /// Construct a `Closed` with no attempt-state evidence.
     pub(crate) const fn closed() -> Self {
         Self::Closed { attempt: None }

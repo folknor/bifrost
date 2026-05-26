@@ -663,7 +663,7 @@ impl ImapConnection {
             self.submit_regular(Command::Noop, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -695,7 +695,7 @@ impl ImapConnection {
             self.submit_regular(Command::Check, super::dispatch::TaggedOkConsumer::default()),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 
     // -----------------------------------------------------------------------
@@ -720,6 +720,6 @@ impl ImapConnection {
             ),
         )
         .await
-        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::timeout_inflight())?
     }
 }

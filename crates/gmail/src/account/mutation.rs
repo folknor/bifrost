@@ -6,11 +6,9 @@
 //! Errors funnel through `recovery::into_account_error`; the driver
 //! never reaches for `RecoveryClass` directly.
 //!
-//! Phase 3 will migrate the trait signature to
-//! `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`. Until
-//! then the per-batch return type lives in `MutationApply` below and
-//! the call sites in `mod.rs` continue to feed the engine the
-//! workspace's existing `MutationResult` shape.
+//! The trait signature is `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`.
+//! Per-batch outcomes use the `MutationApply` internal enum before being
+//! lifted into `SyncEvent` at the stream boundary.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -139,10 +137,6 @@ fn mutation_stream(
             MutationApply::Terminate(error) => {
                 state.finished = true;
                 state.emitted_done = true;
-                // Phase 3 will rename SyncEvent::Fatal to
-                // SyncEvent::Terminated(AccountError). For Phase 2.2
-                // we keep the current stream-termination path so the
-                // engine continues to observe the same signal.
                 Some((terminate_event(error), state))
             }
         }
@@ -274,13 +268,7 @@ fn shallow_clone(error: &GmailError) -> GmailError {
 }
 
 fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess>> {
-    // Phase 3 swaps this for `SyncEvent::Terminated(error)`. Until the
-    // workspace surface migration lands we route through the legacy
-    // SyncEvent::Fatal carrier and stash the structured error as a
-    // boxed Debug string. The engine path is being rewritten in
-    // Phase 3, so this shim has a known short lifespan.
-    let _ = error;
-    SyncEvent::Done(None)
+    SyncEvent::Terminated(error)
 }
 
 fn move_patch(destination: &MembershipScope) -> LabelPatch {

@@ -1,7 +1,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bifrost_types::{CursorScope, Error, ObjectType, SubscriptionHandle, WatchEvent};
+use bifrost_types::{
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
+    DiagnosticText, ObjectType, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    SubscriptionHandle, WireCause,
+};
+use bifrost_types::WatchEvent;
 
 use crate::webhooks::{
     create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
@@ -38,7 +43,7 @@ pub(crate) struct EwsSubscriptionState {
 pub(crate) async fn push_subscribe(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, Error> {
+) -> Result<SubscriptionHandle, AccountError> {
     match account.push_mode {
         PushMode::GraphSubscriptions => subscribe_graph(account, scopes).await,
         PushMode::EwsStreaming => subscribe_ews(account, scopes).await,
@@ -48,19 +53,46 @@ pub(crate) async fn push_subscribe(
 pub(crate) async fn push_unsubscribe(
     account: GraphAccount,
     handle: SubscriptionHandle,
-) -> Result<(), Error> {
+) -> Result<(), AccountError> {
     match account.push_mode {
         PushMode::GraphSubscriptions => unsubscribe_graph(account, handle).await,
         PushMode::EwsStreaming => unsubscribe_ews(account, handle).await,
     }
 }
 
+fn unsupported_push_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(AccountOperation::PushSubscribe),
+        Cause::Request(RequestCause::Unsupported {
+            operation: AccountOperation::PushSubscribe,
+        }),
+    )
+    .operation(AccountOperation::PushSubscribe)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .build()
+}
+
+fn transport_string_error(op: AccountOperation, message: impl Into<String>) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Graph,
+            detail: Some(DiagnosticText::support_only(message.into())),
+        }),
+    )
+    .operation(op)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .build()
+}
+
 async fn subscribe_graph(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, Error> {
+) -> Result<SubscriptionHandle, AccountError> {
     let Some(endpoint) = account.push_endpoint.clone() else {
-        return Err(Error::MissingCoreCapability);
+        return Err(unsupported_push_error());
     };
     let mut grouped: HashMap<String, Vec<CursorScope>> = HashMap::new();
     for scope in scopes {
@@ -73,7 +105,7 @@ async fn subscribe_graph(
     for (resource, _) in grouped {
         let response = create_subscription(&account.client, &resource, &endpoint.webhook_url, None)
             .await
-            .map_err(Error::Transport)?;
+            .map_err(|e| transport_string_error(AccountOperation::PushSubscribe, e))?;
         subscriptions.push(GraphSubscriptionState {
             server_id: response.id,
             expires_at: response.expiration_date_time,
@@ -91,14 +123,17 @@ async fn subscribe_graph(
     Ok(handle)
 }
 
-async fn unsubscribe_graph(account: GraphAccount, handle: SubscriptionHandle) -> Result<(), Error> {
+async fn unsubscribe_graph(
+    account: GraphAccount,
+    handle: SubscriptionHandle,
+) -> Result<(), AccountError> {
     let Some(group) = account.graph_subscriptions.write().await.remove(&handle) else {
         return Ok(());
     };
     for state in group.subscriptions {
         delete_subscription(&account.client, &state.server_id)
             .await
-            .map_err(Error::Transport)?;
+            .map_err(|e| transport_string_error(AccountOperation::PushUnsubscribe, e))?;
     }
     if account.graph_subscriptions.read().await.is_empty()
         && let Some(worker) = account.graph_worker.lock().await.take()
@@ -189,7 +224,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
 async fn subscribe_ews(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
-) -> Result<SubscriptionHandle, Error> {
+) -> Result<SubscriptionHandle, AccountError> {
     let handle = new_handle()?;
     account.ews_subscriptions.write().await.insert(
         handle.clone(),
@@ -203,7 +238,7 @@ async fn subscribe_ews(
     Ok(handle)
 }
 
-async fn unsubscribe_ews(account: GraphAccount, handle: SubscriptionHandle) -> Result<(), Error> {
+async fn unsubscribe_ews(account: GraphAccount, handle: SubscriptionHandle) -> Result<(), AccountError> {
     account.ews_subscriptions.write().await.remove(&handle);
     Ok(())
 }
@@ -227,9 +262,9 @@ fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<Str
     }
 }
 
-fn new_handle() -> Result<SubscriptionHandle, Error> {
+fn new_handle() -> Result<SubscriptionHandle, AccountError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| Error::Other(error.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|error| transport_string_error(AccountOperation::PushSubscribe, error.to_string()))?;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;

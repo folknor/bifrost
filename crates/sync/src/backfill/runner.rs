@@ -214,17 +214,16 @@ impl BackfillRunner {
                     }
                 }
                 SyncEvent::Done(_) => break,
-                SyncEvent::Fatal(f) => {
-                    let account_error = f.0.clone();
+                SyncEvent::Terminated(err) => {
                     if let Some(tx) = &changes_tx {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
-                            event: Arc::new(SyncEvent::Fatal(f)),
+                            event: Arc::new(SyncEvent::Terminated(err.clone())),
                             checkpoint: None,
                         };
                         let _ = tx.send(me);
                     }
-                    return Err(Error::Account(account_error));
+                    return Err(Error::Account(err));
                 }
                 SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
                 _ => {}

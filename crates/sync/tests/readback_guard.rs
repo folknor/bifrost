@@ -10,19 +10,32 @@ use std::sync::Arc;
 
 use bifrost_sync::run_readback_guard;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountFuture, AccountStream, AttachmentHandle, Batch,
-    BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Change, ChangeCursor, Container,
-    ContainerId, ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment,
-    CursorFreshness, CursorScope, DraftHandle, DraftPatch, Error as TypesError, FlagOp,
-    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, InventoryEntry, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationResult, MutationTarget, ObjectId, Page,
-    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
+    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
+    AccountFuture, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
+    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, Container, ContainerId,
+    ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
+    CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydratedObjectKind,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
+    MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
+    PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
+    RequestCause, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
+
+/// Convenience for stubs that just need to signal "this operation is
+/// not implemented in this test double." Maps to `Unsupported(op)` +
+/// `ClientBug` recovery so any unexpected call is obvious in output.
+fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(op),
+        Cause::Request(RequestCause::Unsupported { operation: op }),
+    )
+    .operation(op)
+    .build()
+}
 
 /// Synthetic Account that returns predetermined flags for each id on
 /// `get_stream(Projection::FlagsOnly)`. All other methods are
@@ -85,8 +98,8 @@ impl Account for FlagsAccount {
     fn establish_initial_cursor(
         &self,
         _scope: CursorScope,
-    ) -> AccountFuture<Result<CursorEstablishment, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EstablishCursor)) })
     }
 
     fn inventory_stream(&self, _scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
@@ -133,15 +146,15 @@ impl Account for FlagsAccount {
     fn push_subscribe(
         &self,
         _scopes: &[CursorScope],
-    ) -> AccountFuture<Result<SubscriptionHandle, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushSubscribe)) })
     }
 
     fn push_unsubscribe(
         &self,
         _handle: SubscriptionHandle,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushUnsubscribe)) })
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
@@ -165,7 +178,7 @@ impl Account for FlagsAccount {
         _targets: AccountStream<ObjectId>,
         _op: FlagOp,
         _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
 
@@ -174,7 +187,7 @@ impl Account for FlagsAccount {
         _targets: AccountStream<ObjectId>,
         _destination: MembershipScope,
         _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
 
@@ -182,11 +195,11 @@ impl Account for FlagsAccount {
         &self,
         _targets: AccountStream<ObjectId>,
         _key: IdempotencyKey,
-    ) -> AccountStream<SyncEvent<MutationResult>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         Box::pin(stream::empty())
     }
 
-    fn close(&self) -> AccountFuture<Result<(), TypesError>> {
+    fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -196,16 +209,16 @@ impl Account for FlagsAccount {
         &self,
         _target: MutationTarget,
         _container: ContainerId,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::AddToContainer)) })
     }
 
     fn remove_from_container(
         &self,
         _target: MutationTarget,
         _container: ContainerId,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RemoveFromContainer)) })
     }
 
     fn set_keyword(
@@ -213,8 +226,8 @@ impl Account for FlagsAccount {
         _target: MutationTarget,
         _keyword: String,
         _value: bool,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetKeyword)) })
     }
 
     fn set_label_membership(
@@ -222,8 +235,8 @@ impl Account for FlagsAccount {
         _target: MutationTarget,
         _label: ContainerId,
         _value: bool,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetLabelMembership)) })
     }
 
     fn set_category(
@@ -231,8 +244,8 @@ impl Account for FlagsAccount {
         _target: MutationTarget,
         _category: String,
         _value: bool,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetCategory)) })
     }
 
     fn set_extended_property(
@@ -240,63 +253,82 @@ impl Account for FlagsAccount {
         _target: MutationTarget,
         _property_id: String,
         _value: Option<String>,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::SetExtendedProperty,
+            ))
+        })
     }
 
     fn set_is_read(
         &self,
         _target: MutationTarget,
         _is_read: bool,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetIsRead)) })
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn send_message(
+        &self,
+        _request: SendRequest,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Send)) })
     }
 
     fn attachment_upload(
         &self,
-        _bytes: AccountStream<Result<Bytes, TypesError>>,
+        _bytes: AccountStream<Result<Bytes, AccountError>>,
         _mime: String,
-    ) -> AccountFuture<Result<AttachmentHandle, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::AttachmentUpload)) })
     }
 
-    fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn draft_create(
+        &self,
+        _patch: DraftPatch,
+    ) -> AccountFuture<Result<DraftHandle, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftCreate)) })
     }
 
     fn draft_update(
         &self,
         _draft: DraftHandle,
         _patch: DraftPatch,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftUpdate)) })
     }
 
-    fn draft_discard(&self, _draft: DraftHandle) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn draft_discard(
+        &self,
+        _draft: DraftHandle,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftDiscard)) })
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn draft_send(
+        &self,
+        _draft: DraftHandle,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
     }
 
-    fn search(&self, _request: SearchRequest) -> AccountFuture<Result<Page<ThreadId>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn search(
+        &self,
+        _request: SearchRequest,
+    ) -> AccountFuture<Result<Page<ThreadId>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Search)) })
     }
 
     fn search_messages(
         &self,
         _request: SearchRequest,
-    ) -> AccountFuture<Result<Page<ObjectId>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SearchMessages)) })
     }
 
-    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainersList)) })
     }
 
     fn container_create(
@@ -304,67 +336,73 @@ impl Account for FlagsAccount {
         _kind: ContainerKind,
         _name: String,
         _parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<ContainerId, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<ContainerId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerCreate)) })
     }
 
     fn container_rename(
         &self,
         _container: ContainerId,
         _name: String,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerRename)) })
     }
 
     fn container_move(
         &self,
         _container: ContainerId,
         _new_parent: Option<ContainerId>,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerMove)) })
     }
 
-    fn container_delete(&self, _container: ContainerId) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn container_delete(
+        &self,
+        _container: ContainerId,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContainerDelete)) })
     }
 
-    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn identities_list(&self) -> AccountFuture<Result<Vec<Identity>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentitiesList)) })
     }
 
     fn identity_update(
         &self,
         _identity: IdentityId,
         _patch: IdentityPatch,
-    ) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::IdentityUpdate)) })
     }
 
-    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn vacation_get(&self) -> AccountFuture<Result<Option<VacationConfig>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationGet)) })
     }
 
-    fn vacation_set(&self, _config: VacationConfig) -> AccountFuture<Result<(), TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn vacation_set(
+        &self,
+        _config: VacationConfig,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::VacationSet)) })
     }
 
-    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::QuotaGet)) })
     }
 
     fn thread_hydrate(
         &self,
         _thread: ThreadId,
-    ) -> AccountFuture<Result<ThreadHydration, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HydrateThread)) })
     }
 
     fn message_hydrate(
         &self,
         _message: ObjectId,
         _projection: HydrationProjection,
-    ) -> AccountFuture<Result<Message, TypesError>> {
-        Box::pin(async { Err(TypesError::Unsupported) })
+    ) -> AccountFuture<Result<Message, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HydrateMessage)) })
     }
 }
 

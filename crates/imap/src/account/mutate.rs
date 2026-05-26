@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bifrost_types::{
-    AccountStream, Error as AccountError, FlagOp, IdempotencyKey, MembershipScope, MutationOutcome,
-    MutationResult, PageBoundary, SyncEvent,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, AccountStream,
+    BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, Cause, DiagnosticText, FlagOp,
+    IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, PageBoundary, Protocol,
+    RequestCause, RequestErrorKind, StateCause, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -18,7 +20,7 @@ pub(crate) fn bulk_set_flags(
     targets: AccountStream<bifrost_types::ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(account, targets, MutationKind::Flags(op))
 }
 
@@ -27,7 +29,7 @@ pub(crate) fn bulk_move(
     targets: AccountStream<bifrost_types::ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(account, targets, MutationKind::Move(destination))
 }
 
@@ -35,7 +37,7 @@ pub(crate) fn bulk_destroy(
     account: ImapAccount,
     targets: AccountStream<bifrost_types::ObjectId>,
     _key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(account, targets, MutationKind::Destroy)
 }
 
@@ -45,11 +47,19 @@ enum MutationKind {
     Destroy,
 }
 
+fn mutation_operation(kind: &MutationKind) -> AccountOperation {
+    match kind {
+        MutationKind::Flags(_) => AccountOperation::UpdateFlags,
+        MutationKind::Move(_) => AccountOperation::BulkMove,
+        MutationKind::Destroy => AccountOperation::BulkDestroy,
+    }
+}
+
 fn mutation_stream(
     account: ImapAccount,
     mut targets: AccountStream<bifrost_types::ObjectId>,
     kind: MutationKind,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
@@ -63,12 +73,10 @@ fn mutation_stream(
                         .push(decoded);
                 }
                 Err(err) => {
+                    let item_id = BatchItemId(id.0.clone());
                     let _ = tx
                         .send(batch(
-                            vec![MutationResult {
-                                id,
-                                outcome: MutationOutcome::Failed(err),
-                            }],
+                            vec![ItemOutcome::Failed(BatchFailure { item: item_id, error: err })],
                             PageBoundary::Page,
                             None,
                         ))
@@ -83,7 +91,14 @@ fn mutation_stream(
                     let _ = tx.send(batch(results, PageBoundary::Page, None)).await;
                 }
                 Err(err) => {
-                    let _ = tx.send(fatal_event(err)).await;
+                    let _ = tx
+                        .send(fatal_event(
+                            err,
+                            super::error::ImapErrorContext::operation(
+                                mutation_operation(&kind),
+                            ),
+                        ))
+                        .await;
                     return;
                 }
             }
@@ -98,7 +113,7 @@ async fn run_folder_mutation(
     folder: &MailboxName,
     ids: Vec<DecodedObjectId>,
     kind: &MutationKind,
-) -> Result<Vec<MutationResult>, crate::Error> {
+) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut conn = account.checkout_for_folder(folder).await?;
     let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
     let selected = account
@@ -120,10 +135,7 @@ async fn run_folder_mutation(
         }
     }
     let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
-    let stale_results = failed_all(
-        stale,
-        AccountError::Other("UIDVALIDITY changed before mutation".into()),
-    );
+    let stale_results = failed_all(stale, uidvalidity_changed_error());
     if let MutationKind::Flags(op) = kind {
         let mut results = stale_results;
         results.extend(
@@ -148,7 +160,10 @@ async fn run_folder_mutation(
             let folder = if let MembershipScope::Folder(id) = destination {
                 MailboxName::new(id.0.clone()).map_err(crate::Error::from)?
             } else {
-                return Ok(failed_all(valid, AccountError::Unsupported));
+                return Ok(failed_all(
+                valid,
+                super::error::unsupported(AccountOperation::BulkMove),
+            ));
             };
             conn.connection()
                 .uid_move_messages(
@@ -179,7 +194,7 @@ async fn run_destroy_mutation_groups(
     folder: &MailboxName,
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
-) -> Result<Vec<MutationResult>, crate::Error> {
+) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
         let uids: Vec<u32> = ids.iter().map(|id| id.uid).collect();
@@ -230,7 +245,7 @@ async fn run_flag_mutation_groups(
     uidvalidity: u32,
     ids: Vec<DecodedObjectId>,
     op: &FlagOp,
-) -> Result<Vec<MutationResult>, crate::Error> {
+) -> Result<Vec<ItemOutcome<MutationSuccess>>, crate::Error> {
     let mut results = Vec::new();
     for (unchanged_since, ids) in partition_by_modseq(account, folder, uidvalidity, ids) {
         let uids: Vec<u32> = ids.iter().map(|id| id.uid).collect();
@@ -417,55 +432,125 @@ fn mutation_results(
     ids: Vec<DecodedObjectId>,
     requested_uids: &[u32],
     outcome: StoreWireOutcome,
-) -> Vec<MutationResult> {
+) -> Vec<ItemOutcome<MutationSuccess>> {
     match outcome {
         StoreWireOutcome::Applied => ids
             .into_iter()
-            .map(|id| MutationResult {
-                id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
-                outcome: MutationOutcome::Applied,
+            .map(|id| {
+                let item = BatchItemId(
+                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                );
+                ItemOutcome::Succeeded(BatchSuccess {
+                    item,
+                    output: MutationSuccess::Applied,
+                })
             })
             .collect(),
         StoreWireOutcome::Modified(modified) => ids
             .into_iter()
             .map(|id| {
-                let failed = modified.contains(&id.uid);
-                MutationResult {
-                    id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
-                    outcome: if failed {
-                        MutationOutcome::Failed(AccountError::ConcurrencyConflict)
-                    } else {
-                        MutationOutcome::Applied
-                    },
+                let item = BatchItemId(
+                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                );
+                if modified.contains(&id.uid) {
+                    ItemOutcome::Failed(BatchFailure {
+                        item,
+                        error: concurrency_conflict_error(),
+                    })
+                } else {
+                    ItemOutcome::Succeeded(BatchSuccess {
+                        item,
+                        output: MutationSuccess::Applied,
+                    })
                 }
             })
             .collect(),
+        // UNCHANGEDSINCE conflict on pending-retry batch: modified UIDs
+        // are concurrency conflicts; remaining UIDs were not committed
+        // because the whole STORE was rejected.
         StoreWireOutcome::PendingRetry(modified) => ids
             .into_iter()
-            .map(|id| MutationResult {
-                id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
-                outcome: if modified.contains(&id.uid) {
-                    MutationOutcome::Failed(AccountError::ConcurrencyConflict)
+            .map(|id| {
+                let item = BatchItemId(
+                    super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                );
+                if modified.contains(&id.uid) {
+                    ItemOutcome::Uncertain(BatchUncertain {
+                        item,
+                        error: concurrency_conflict_error(),
+                    })
                 } else {
-                    MutationOutcome::Failed(AccountError::Other("pending retry".into()))
-                },
+                    ItemOutcome::Failed(BatchFailure {
+                        item,
+                        error: store_failed_error(),
+                    })
+                }
             })
             .collect(),
         StoreWireOutcome::Failed => failed_all_by_uids(ids, requested_uids),
     }
 }
 
-fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<MutationResult> {
+fn failed_all(
+    ids: Vec<DecodedObjectId>,
+    error: AccountError,
+) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.into_iter()
-        .map(|id| MutationResult {
-            id: super::encode_object_id(&id.folder, id.uidvalidity, id.uid),
-            outcome: MutationOutcome::Failed(AccountError::Other(error.to_string())),
+        .map(|id| {
+            let item = BatchItemId(
+                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+            );
+            ItemOutcome::Failed(BatchFailure {
+                item,
+                error: error.clone(),
+            })
         })
         .collect()
 }
 
-fn failed_all_by_uids(ids: Vec<DecodedObjectId>, _requested_uids: &[u32]) -> Vec<MutationResult> {
-    failed_all(ids, AccountError::Other("mutation failed".into()))
+fn failed_all_by_uids(
+    ids: Vec<DecodedObjectId>,
+    _requested_uids: &[u32],
+) -> Vec<ItemOutcome<MutationSuccess>> {
+    failed_all(ids, store_failed_error())
+}
+
+/// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE conflicts.
+fn concurrency_conflict_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::ConcurrencyConflict,
+        Cause::State(StateCause::ConcurrencyConflict),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::UpdateFlags)
+    .build()
+}
+
+/// Build a generic `Request(Malformed)` for UIDVALIDITY mismatch before mutation.
+fn uidvalidity_changed_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only("UIDVALIDITY changed before mutation"),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .build()
+}
+
+/// Build a generic transport/protocol error for a STORE command failure
+/// without a specific per-item response code.
+fn store_failed_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(
+                "STORE command failed with no per-item response code",
+            ),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .build()
 }
 
 fn split_by_uidvalidity(

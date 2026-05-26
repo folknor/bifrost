@@ -4,9 +4,13 @@ use bifrost_net::{
     AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy,
     StaticTokenSource, TokenSource,
 };
+use bifrost_types::TransmissionState;
+use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Semaphore;
+
+use crate::error::{GraphError, GraphResponseError};
 
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 pub(crate) const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
@@ -194,12 +198,18 @@ impl GraphClient {
         self.inner.mailbox_id.as_deref()
     }
 
-    pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+    pub(crate) async fn get_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, GraphError> {
         let url = self.api_url(path);
         self.request::<T, ()>(&url, "GET", None).await
     }
 
-    pub(crate) async fn get_absolute<T: DeserializeOwned>(&self, url: &str) -> Result<T, String> {
+    pub(crate) async fn get_absolute<T: DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, GraphError> {
         self.request::<T, ()>(url, "GET", None).await
     }
 
@@ -207,33 +217,37 @@ impl GraphClient {
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, String> {
+    ) -> Result<T, GraphError> {
         let url = self.api_url(path);
         self.request(&url, "POST", Some(body)).await
     }
 
-    pub(crate) async fn post_empty(&self, path: &str) -> Result<(), String> {
+    pub(crate) async fn post_empty(&self, path: &str) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "POST", None::<&()>).await?;
-        check_response_status(response, "Graph API").await
+        check_response_status(response)
     }
 
-    pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
+    pub(crate) async fn patch<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "PATCH", Some(body)).await?;
-        check_response_status(response, "Graph API").await
+        check_response_status(response)
     }
 
-    pub(crate) async fn delete(&self, path: &str) -> Result<(), String> {
+    pub(crate) async fn delete(&self, path: &str) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "DELETE", None::<&()>).await?;
-        check_response_status(response, "Graph API").await
+        check_response_status(response)
     }
 
     pub(crate) async fn post_batch(
         &self,
         batch: &crate::types::BatchRequest,
-    ) -> Result<crate::types::BatchResponse, String> {
+    ) -> Result<crate::types::BatchResponse, GraphError> {
         self.post("/$batch", batch).await
     }
 
@@ -246,9 +260,9 @@ impl GraphClient {
         url: &str,
         method: &str,
         body: Option<&B>,
-    ) -> Result<T, String> {
+    ) -> Result<T, GraphError> {
         let response = self.execute(url, method, body).await?;
-        parse_json_response(response, "Graph API").await
+        parse_json_response(response)
     }
 
     async fn execute<B: Serialize>(
@@ -256,23 +270,39 @@ impl GraphClient {
         url: &str,
         method: &str,
         body: Option<&B>,
-    ) -> Result<Response, String> {
+    ) -> Result<Response, GraphError> {
         let _permit = self
             .inner
             .semaphore
             .acquire()
             .await
-            .map_err(|_| "Graph request semaphore closed".to_string())?;
-        let account_net = self
-            .account_net()
-            .ok_or_else(|| "Graph client is not attached to an account".to_string())?;
+            .map_err(|_| {
+                GraphError::Net(bifrost_net::Error::Network {
+                    message: "Graph request semaphore closed".to_string(),
+                    transmission_state: bifrost_net::TransmissionState::Unsent,
+                    source: None,
+                })
+            })?;
+        let account_net = self.account_net().ok_or_else(|| {
+            GraphError::Net(bifrost_net::Error::Network {
+                message: "Graph client is not attached to an account".to_string(),
+                transmission_state: bifrost_net::TransmissionState::Unsent,
+                source: None,
+            })
+        })?;
 
         let mut builder = match method {
             "GET" => account_net.get(url),
             "POST" => account_net.post(url),
             "PATCH" => account_net.patch(url),
             "DELETE" => account_net.delete(url),
-            _ => return Err(format!("Unsupported HTTP method: {method}")),
+            _ => {
+                return Err(GraphError::Net(bifrost_net::Error::Network {
+                    message: format!("Unsupported HTTP method: {method}"),
+                    transmission_state: bifrost_net::TransmissionState::Unsent,
+                    source: None,
+                }));
+            }
         };
 
         builder = builder.header("Content-Type", "application/json");
@@ -281,10 +311,7 @@ impl GraphClient {
             builder = builder.json(b);
         }
 
-        builder
-            .send()
-            .await
-            .map_err(|error| net_error("Graph API", error))
+        builder.send().await.map_err(GraphError::Net)
     }
 }
 
@@ -316,52 +343,34 @@ fn build_url(base: &str, path: &str) -> String {
     }
 }
 
-async fn parse_json_response<T: DeserializeOwned>(
-    response: Response,
-    service: &str,
-) -> Result<T, String> {
+/// Parse a Graph JSON success response. On a non-success status,
+/// constructs a `GraphResponseError` from the raw response so the
+/// account boundary receives structured evidence, not a formatted
+/// string.
+fn parse_json_response<T: DeserializeOwned>(response: Response) -> Result<T, GraphError> {
     let status = response.status();
+    let Response { headers, body, .. } = response;
     if !status.is_success() {
-        let body = response_body_string(response);
-        return Err(format!("{service} error {status}: {body}"));
+        let err = GraphResponseError::from_response(status, headers, body);
+        return Err(GraphError::Response(err));
     }
 
-    serde_json::from_slice(response.body.as_ref())
-        .map_err(|e| format!("{service} JSON parse failed: {e}"))
+    serde_json::from_slice(body.as_ref()).map_err(|e| GraphError::Json {
+        message: e.to_string(),
+        body: if body.is_empty() { None } else { Some(body) },
+    })
 }
 
-async fn check_response_status(response: Response, service: &str) -> Result<(), String> {
+/// Check a Graph response for success status. On failure, constructs
+/// a `GraphResponseError` from the raw response.
+fn check_response_status(response: Response) -> Result<(), GraphError> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
-
-    let body = response_body_string(response);
-    Err(format!("{service} error {status}: {body}"))
-}
-
-fn response_body_string(response: Response) -> String {
-    String::from_utf8_lossy(response.body.as_ref()).into_owned()
-}
-
-fn net_error(service: &str, err: bifrost_net::Error) -> String {
-    match err {
-        bifrost_net::Error::Status { code, body, .. } => {
-            format!(
-                "{service} error {code}: {}",
-                String::from_utf8_lossy(body.as_ref())
-            )
-        }
-        bifrost_net::Error::AuthLost => format!("{service} error 401 Unauthorized: auth lost"),
-        bifrost_net::Error::RateLimited { .. } => {
-            format!("{service} error 429 Too Many Requests: rate limited")
-        }
-        bifrost_net::Error::RetryBudgetExhausted {
-            last_status: Some(status),
-            ..
-        } => format!("{service} error {status}: retry budget exhausted"),
-        other => format!("{service} request failed: {other}"),
-    }
+    let body = Bytes::copy_from_slice(response.body.as_ref());
+    let err = GraphResponseError::from_response(status, response.headers, body);
+    Err(GraphError::Response(err))
 }
 
 #[cfg(test)]
