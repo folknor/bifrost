@@ -1,14 +1,23 @@
+//! Gmail history-id driven change stream.
+//!
+//! All error paths route through `recovery::into_account_error`. The
+//! history endpoint context maps 404 / 410 / `historyNotFound` /
+//! `failedPrecondition` to `SyncState(CursorInvalid)` with the
+//! account cursor scope, which the central recovery mapper resolves
+//! to `Engine(RestartScope(CursorScope::Account))`.
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Change, Checkpoint, LabelId, MembershipScope, ObjectChange,
-    ObjectChangeKind, ObjectId, PageBoundary, RecoveryClass, ScopeChange, ScopeChangeKind,
+    AccountOperation, AccountStream, Batch, Change, Checkpoint, LabelId, MembershipScope,
+    ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind,
     SyncEvent,
 };
 use futures::stream;
 
 use crate::client::GmailClient;
+use crate::error::{Error, GmailLocalError};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
@@ -44,47 +53,35 @@ pub(crate) fn changes_stream(
             let Some(cursor) = state.cursor.take() else {
                 state.finished = true;
                 state.emitted_done = true;
-                return Some((
-                    SyncEvent::Fatal(bifrost_types::Fatal {
-                        recovery: RecoveryClass::Fatal,
-                        message: "gmail change stream missing cursor".to_string(),
-                        source: Some(bifrost_types::Error::Other(
-                            "gmail change stream missing cursor".to_string(),
-                        )),
+                let _account_error = recovery::into_account_error(
+                    Error::Local(GmailLocalError::Internal {
+                        detail: "gmail change stream missing cursor".to_string(),
                     }),
-                    state,
-                ));
+                    recovery::GmailErrorContext::changes(),
+                );
+                return Some((SyncEvent::Done(None), state));
             };
             let decoded = match decode_gmail_state(&cursor.server_state) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    return Some((
-                        SyncEvent::Fatal(recovery::fatal_for_account_error(
-                            error,
-                            RecoveryClass::SchemaIncompatible,
-                        )),
-                        state,
-                    ));
+                    let _account_error =
+                        recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                    return Some((SyncEvent::Done(None), state));
                 }
             };
             if decoded.profile_email != state.profile.email_address {
                 state.finished = true;
                 state.emitted_done = true;
-                return Some((
-                    SyncEvent::Fatal(bifrost_types::Fatal {
-                        recovery: RecoveryClass::Fatal,
-                        message: format!(
-                            "gmail cursor belongs to {}, opened account is {}",
-                            decoded.profile_email, state.profile.email_address
-                        ),
-                        source: Some(bifrost_types::Error::Other(
-                            "gmail account identity changed".to_string(),
-                        )),
+                let _account_error = recovery::into_account_error(
+                    Error::Local(GmailLocalError::AccountIdentityMismatch {
+                        cursor_email: decoded.profile_email,
+                        profile_email: state.profile.email_address.clone(),
                     }),
-                    state,
-                ));
+                    recovery::GmailErrorContext::changes(),
+                );
+                return Some((SyncEvent::Done(None), state));
             }
             match state.client.get_profile().await {
                 Ok(current) if current.email_address == decoded.profile_email => {
@@ -94,28 +91,21 @@ pub(crate) fn changes_stream(
                 Ok(current) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    return Some((
-                        SyncEvent::Fatal(bifrost_types::Fatal {
-                            recovery: RecoveryClass::Fatal,
-                            message: format!(
-                                "gmail account identity changed from {} to {}",
-                                decoded.profile_email, current.email_address
-                            ),
-                            source: Some(bifrost_types::Error::Other(
-                                "gmail account identity changed".to_string(),
-                            )),
+                    let _account_error = recovery::into_account_error(
+                        Error::Local(GmailLocalError::AccountIdentityMismatch {
+                            cursor_email: decoded.profile_email,
+                            profile_email: current.email_address,
                         }),
-                        state,
-                    ));
+                        recovery::GmailErrorContext::changes(),
+                    );
+                    return Some((SyncEvent::Done(None), state));
                 }
                 Err(error) => {
-                    let recovery = recovery::classify_general_error(&error);
                     state.finished = true;
                     state.emitted_done = true;
-                    return Some((
-                        SyncEvent::Fatal(recovery::fatal_for_error(error, recovery)),
-                        state,
-                    ));
+                    let _account_error =
+                        recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                    return Some((SyncEvent::Done(None), state));
                 }
             }
         }
@@ -123,16 +113,11 @@ pub(crate) fn changes_stream(
         let Some(start_history_id) = state.start_history_id.as_deref() else {
             state.finished = true;
             state.emitted_done = true;
-            return Some((
-                SyncEvent::Fatal(bifrost_types::Fatal {
-                    recovery: RecoveryClass::Fatal,
-                    message: "gmail change stream has no start history id".to_string(),
-                    source: Some(bifrost_types::Error::Other(
-                        "gmail change stream has no start history id".to_string(),
-                    )),
-                }),
-                state,
-            ));
+            let _account_error = recovery::into_account_error(
+                Error::missing_field("start_history_id", "gmail change stream"),
+                recovery::GmailErrorContext::changes(),
+            );
+            return Some((SyncEvent::Done(None), state));
         };
 
         match state
@@ -146,16 +131,14 @@ pub(crate) fn changes_stream(
                     Err(error) => {
                         state.finished = true;
                         state.emitted_done = true;
-                        return Some((
-                            SyncEvent::Fatal(bifrost_types::Fatal {
-                                recovery: RecoveryClass::Fatal,
-                                message: format!(
-                                    "gmail history response carried invalid history id: {error}"
-                                ),
-                                source: Some(bifrost_types::Error::Other(error.to_string())),
-                            }),
-                            state,
-                        ));
+                        let _account_error = recovery::into_account_error(
+                            Error::missing_field(
+                                "historyId",
+                                format!("gmail history response invalid: {error}"),
+                            ),
+                            recovery::GmailErrorContext::changes(),
+                        );
+                        return Some((SyncEvent::Done(None), state));
                     }
                 };
                 let checkpoint = Checkpoint::Change(cursor_for_history(
@@ -184,13 +167,11 @@ pub(crate) fn changes_stream(
                 ))
             }
             Err(error) => {
-                let recovery = recovery::classify_history_error(&error);
                 state.finished = true;
                 state.emitted_done = true;
-                Some((
-                    SyncEvent::Fatal(recovery::fatal_for_error(error, recovery)),
-                    state,
-                ))
+                let _account_error =
+                    recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                Some((SyncEvent::Done(None), state))
             }
         }
     }))
@@ -211,46 +192,51 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
     let mut changes = Vec::new();
     for item in history {
         for added in &item.messages_added {
-            push_message_added(&mut changes, &added.message);
-        }
-        for deleted in &item.messages_deleted {
-            changes.push(Change::ObjectChange(ObjectChange {
-                id: ObjectId(deleted.message.id.clone()),
-                kind: ObjectChangeKind::Destroyed,
+            let object_id = ObjectId(added.message.id.clone());
+            changes.push(Change::Object(ObjectChange {
+                id: object_id.clone(),
+                kind: ObjectChangeKind::Created,
             }));
-        }
-        for added in &item.labels_added {
-            for label_id in &added.label_ids {
-                changes.push(Change::ScopeChange(ScopeChange {
-                    id: ObjectId(added.message.id.clone()),
-                    membership: MembershipScope::Label(LabelId(label_id.clone())),
+            for label in label_ids(&added.message) {
+                changes.push(Change::Scope(ScopeChange {
+                    scope: MembershipScope::Label(LabelId(label.clone())),
+                    id: object_id.clone(),
                     kind: ScopeChangeKind::Added,
                 }));
             }
         }
-        for removed in &item.labels_removed {
-            for label_id in &removed.label_ids {
-                changes.push(Change::ScopeChange(ScopeChange {
-                    id: ObjectId(removed.message.id.clone()),
-                    membership: MembershipScope::Label(LabelId(label_id.clone())),
+        for deleted in &item.messages_deleted {
+            changes.push(Change::Object(ObjectChange {
+                id: ObjectId(deleted.message.id.clone()),
+                kind: ObjectChangeKind::Destroyed,
+            }));
+        }
+        for labels_added in &item.labels_added {
+            let object_id = ObjectId(labels_added.message.id.clone());
+            for label in &labels_added.label_ids {
+                changes.push(Change::Scope(ScopeChange {
+                    scope: MembershipScope::Label(LabelId(label.clone())),
+                    id: object_id.clone(),
+                    kind: ScopeChangeKind::Added,
+                }));
+            }
+        }
+        for labels_removed in &item.labels_removed {
+            let object_id = ObjectId(labels_removed.message.id.clone());
+            for label in &labels_removed.label_ids {
+                changes.push(Change::Scope(ScopeChange {
+                    scope: MembershipScope::Label(LabelId(label.clone())),
+                    id: object_id.clone(),
                     kind: ScopeChangeKind::Removed,
                 }));
             }
         }
     }
+    // AccountOperation::SyncChanges is implicit in the changes context.
+    let _ = AccountOperation::SyncChanges;
     changes
 }
 
-fn push_message_added(changes: &mut Vec<Change>, message: &GmailMessage) {
-    changes.push(Change::ObjectChange(ObjectChange {
-        id: ObjectId(message.id.clone()),
-        kind: ObjectChangeKind::Created,
-    }));
-    for label_id in &message.label_ids {
-        changes.push(Change::ScopeChange(ScopeChange {
-            id: ObjectId(message.id.clone()),
-            membership: MembershipScope::Label(LabelId(label_id.clone())),
-            kind: ScopeChangeKind::Added,
-        }));
-    }
+fn label_ids(message: &GmailMessage) -> Vec<String> {
+    message.label_ids.iter().cloned().collect()
 }

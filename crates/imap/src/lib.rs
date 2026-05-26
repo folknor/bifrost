@@ -26,7 +26,7 @@ pub use connection::ImapConfig;
 pub use types::{AuthPolicy, Credentials};
 
 pub(crate) use connection::{ImapConnection, typed_event::TypedEvent};
-pub(crate) use error::{Error, Recovery};
+pub(crate) use error::Error;
 
 /// Result type alias for IMAP operations.
 pub(crate) type Result<T> = std::result::Result<T, Error>;

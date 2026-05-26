@@ -1,99 +1,107 @@
-//! Error types for IMAP operations.
+//! Internal IMAP error type.
 //!
-//! Distinguishes protocol errors, I/O errors, auth failures, parse errors, and timeouts.
-//! Server status responses (OK, NO, BAD, BYE) are defined in RFC 3501 Section 7.1
-//! and RFC 9051 Section 7.1.
+//! `Error` is the crate-private failure representation produced by the
+//! driver, parser, encoder, and high-level command surface. It carries
+//! enough wire-level evidence (response codes, attempt state) for the
+//! account-boundary translation in `account/error.rs` to build a
+//! faithful `bifrost_types::AccountError`.
+//!
+//! Server status responses (OK, NO, BAD, BYE) are defined in RFC 3501
+//! Section 7.1 and RFC 9051 Section 7.1.
 
 use std::sync::Arc;
 
+use bifrost_types::TransmissionState;
+
 use crate::types::{AuthMechanism, ResponseCode};
 
+/// Crate-internal wire-level transmission evidence attached to
+/// transport-shaped failures.
+///
+/// The driver populates this when it has direct knowledge of whether a
+/// command's bytes ever crossed the side-effect boundary; the account
+/// boundary then projects it into `bifrost_types::AttemptCause`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct ImapAttempt {
+    pub(crate) transmission_state: TransmissionState,
+}
+
+impl ImapAttempt {
+    pub(crate) const fn new(transmission_state: TransmissionState) -> Self {
+        Self { transmission_state }
+    }
+}
+
 /// Error type for IMAP client operations.
-// protocol-specific: direct IMAP APIs preserve response codes beyond bifrost_types::Error.
+//
+// Several variants carry `attempt: Option<ImapAttempt>` so the account
+// boundary can distinguish `Unsent` / `InFlight` / `Acknowledged`
+// transmissions when building `bifrost_types::AccountError`. The
+// driver fills this in at the point of failure; pre-driver call sites
+// (encoding, validation, builder preflight) leave it `None`.
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum Error {
     /// Underlying I/O error, including TLS transport errors (RFC 3501 Section 2.1).
-    ///
-    /// Wrapped in [`Arc`] so that `Error` can implement `Clone`.
-    #[error("I/O error: {0}")]
-    Io(#[source] Arc<std::io::Error>),
+    #[error("I/O error: {source}")]
+    Io {
+        #[source]
+        source: Arc<std::io::Error>,
+        attempt: Option<ImapAttempt>,
+    },
 
     /// Authentication was rejected by the server (RFC 3501 Section 6.2.2).
-    ///
-    /// The optional [`ResponseCode`] carries the structured reason code
-    /// (e.g., `[AUTHENTICATIONFAILED]`, `[EXPIRED]`, `[PRIVACYREQUIRED]`)
-    /// when the server provides one (RFC 5530 Section 3).
     #[error("authentication failed: {text}")]
     Auth {
-        /// Human-readable response text.
         text: String,
-        /// Structured response code, if present (RFC 5530 Section 3).
         code: Option<ResponseCode>,
     },
 
     /// Server returned a NO response to a command (RFC 3501 Section 7.1.2).
-    ///
-    /// The optional [`ResponseCode`] carries the structured reason code
-    /// (e.g., `[NOPERM]`, `[OVERQUOTA]`) when the server provides one
-    /// (RFC 5530 Section 3).
     #[error("server rejected command: {text}")]
     No {
-        /// Human-readable response text.
         text: String,
-        /// Structured response code, if present (RFC 5530 Section 3).
         code: Option<ResponseCode>,
     },
 
-    /// Server returned a BAD response  -  client sent something invalid (RFC 3501 Section 7.1.3).
-    ///
-    /// The optional [`ResponseCode`] carries the structured reason code
-    /// when the server provides one (RFC 5530 Section 3).
+    /// Server returned a BAD response (RFC 3501 Section 7.1.3).
     #[error("server reported bad command: {text}")]
     Bad {
-        /// Human-readable response text.
         text: String,
-        /// Structured response code, if present (RFC 5530 Section 3).
         code: Option<ResponseCode>,
     },
 
-    /// Server sent BYE  -  closing connection (RFC 3501 Section 7.1.5).
-    ///
-    /// BYE responses can include response codes such as `[ALERT]` or
-    /// `[UNAVAILABLE]` that carry actionable information for the client
-    /// (RFC 3501 Section 7.1.5, RFC 5530 Section 3).
-    /// The `[ALERT]` code in particular MUST be presented to the user
-    /// (RFC 3501 Section 7.1).
+    /// Server sent BYE (RFC 3501 Section 7.1.5).
     #[error("server closing connection: {text}")]
     Bye {
-        /// Human-readable response text.
         text: String,
-        /// Structured response code, if present (RFC 5530 Section 3).
         code: Option<ResponseCode>,
+        attempt: Option<ImapAttempt>,
     },
 
-    /// IMAP protocol violation by the server (RFC 3501 Section 7 / RFC 9051 Section 7).
+    /// IMAP protocol violation by the server.
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// Failed to parse a server response (RFC 3501 Section 7 / RFC 9051 Section 7).
+    /// Failed to parse a server response.
     #[error("parse error: {0}")]
     Parse(String),
 
+    /// Local request was rejected before transmission (invalid input,
+    /// mailbox name, validator failure). Distinct from `Protocol`,
+    /// which means the *server* violated the wire contract.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// Operation exceeded the caller-supplied timeout.
-    ///
-    /// This is a client-imposed constraint, not a protocol-level error.
-    /// See RFC 3501 Section 5.4 for the server-side autologout timer;
-    /// client-side timeouts guard against indefinite blocking on I/O.
     #[error("operation timed out")]
-    Timeout,
+    Timeout { attempt: Option<ImapAttempt> },
 
     /// The TCP connection has been closed (RFC 3501 Section 2.1).
     #[error("connection closed")]
-    Closed,
+    Closed { attempt: Option<ImapAttempt> },
 
-    /// STARTTLS was requested but the server does not advertise it
-    /// (RFC 3501 Section 6.2.1, RFC 9051 Section 6.2.1).
+    /// STARTTLS was requested but the server does not advertise it.
     #[error("STARTTLS not supported by server")]
     StartTlsUnavailable,
 
@@ -101,79 +109,55 @@ pub(crate) enum Error {
     #[error("authentication policy rejected authentication: {0}")]
     AuthPolicy(AuthPolicyFailure),
 
-    /// A capability required for the requested operation is not advertised
-    /// (RFC 3501 Section 6.1.1).
+    /// A capability required for the requested operation is not advertised.
     #[error("missing required capability: {0}")]
     MissingCapability(String),
 
     /// Message exceeds the server's advertised APPENDLIMIT (RFC 7889 Section 3).
     #[error("message size {size} exceeds server APPENDLIMIT of {limit}")]
-    AppendLimit {
-        /// Size of the message the caller tried to append (RFC 7889 Section 3).
-        size: u64,
-        /// Server-advertised maximum in octets (RFC 7889 Section 5).
-        limit: u64,
-    },
+    AppendLimit { size: u64, limit: u64 },
 
     /// A buffered FETCH exceeded the caller's configured memory budget.
-    ///
-    /// The driver drains the command to tagged completion before returning
-    /// this error so the IMAP stream remains usable. `seq` and `uid` identify
-    /// the response that first crossed the budget when the server supplied
-    /// those values.
     #[error("estimated FETCH response size {estimated} exceeds caller limit of {limit}")]
     FetchLimit {
-        /// Estimated bytes observed while parsing the FETCH responses.
         estimated: usize,
-        /// Caller-supplied maximum estimated bytes.
         limit: usize,
-        /// Message sequence number of the response that crossed the limit.
         seq: u32,
-        /// UID of the response that crossed the limit, if present.
         uid: Option<u32>,
     },
 
-    /// The date-time string supplied to APPEND does not conform to the
-    /// `date-time` production in RFC 3501 Section 9.
-    ///
-    /// ```text
-    /// date-time      = DQUOTE date-day-fixed "-" date-month "-" date-year
-    ///                  SP time SP zone DQUOTE
-    /// date-day-fixed = (SP DIGIT) / 2DIGIT
-    /// date-month     = "Jan" / "Feb" / ... / "Dec"
-    /// time           = 2DIGIT ":" 2DIGIT ":" 2DIGIT
-    /// zone           = ("+" / "-") 4DIGIT
-    /// ```
+    /// Invalid APPEND date-time (RFC 3501 Section 9 `date-time`).
     #[error("invalid APPEND date-time: {0}")]
     InvalidAppendDate(String),
 
-    /// Internal driver error  -  the driver task stub has not been replaced
-    /// by its full implementation yet, or an invariant was violated that
-    /// indicates a bug in the library.
+    /// Internal driver invariant violation.
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// The driver task panicked. The payload is the panic message
-    /// extracted from the `JoinError` (best-effort  -  non-string panics
-    /// produce a generic description).
-    #[error("driver task panicked: {0}")]
-    DriverPanicked(String),
+    /// The driver task panicked.
+    #[error("driver task panicked: {message}")]
+    DriverPanicked {
+        message: String,
+        attempt: Option<ImapAttempt>,
+    },
 
-    /// The driver task exited (cleanly or via cancellation) and the
-    /// command channel is closed, but no panic was observed.
+    /// The driver task exited and the command channel is closed.
     #[error("driver task gone")]
-    DriverGone,
+    DriverGone { attempt: Option<ImapAttempt> },
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(Arc::new(e))
+        Self::Io {
+            source: Arc::new(e),
+            attempt: None,
+        }
     }
 }
 
 impl From<crate::types::ValidationError> for Error {
     fn from(e: crate::types::ValidationError) -> Self {
-        Self::Protocol(e.to_string())
+        Self::InvalidInput(e.to_string())
     }
 }
 
@@ -183,37 +167,64 @@ impl From<crate::codec::encode::EncodeError> for Error {
             crate::codec::encode::EncodeError::MissingCapability { cmd, cap } => {
                 Self::MissingCapability(format!("{cmd} requires {cap}"))
             }
-            crate::codec::encode::EncodeError::Validation(msg) => Self::Protocol(msg),
+            crate::codec::encode::EncodeError::Validation(msg) => Self::InvalidInput(msg),
         }
     }
 }
 
-/// Compares two IMAP errors for equality.
-///
-/// The [`Io`](Error::Io) variant compares by [`std::io::ErrorKind`] only, since
-/// `std::io::Error` does not implement `PartialEq`. Two `Io` errors with the
-/// same `ErrorKind` are considered equal even if their messages differ.
+/// Equality across variants. `Io` compares by `std::io::ErrorKind` only
+/// (the underlying error is not `PartialEq`).
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
+            (
+                Self::Io {
+                    source: a,
+                    attempt: a_att,
+                },
+                Self::Io {
+                    source: b,
+                    attempt: b_att,
+                },
+            ) => a.kind() == b.kind() && a_att == b_att,
             (Self::Auth { text: t1, code: c1 }, Self::Auth { text: t2, code: c2 })
             | (Self::No { text: t1, code: c1 }, Self::No { text: t2, code: c2 })
-            | (Self::Bad { text: t1, code: c1 }, Self::Bad { text: t2, code: c2 })
-            | (Self::Bye { text: t1, code: c1 }, Self::Bye { text: t2, code: c2 }) => {
+            | (Self::Bad { text: t1, code: c1 }, Self::Bad { text: t2, code: c2 }) => {
                 t1 == t2 && c1 == c2
             }
+            (
+                Self::Bye {
+                    text: t1,
+                    code: c1,
+                    attempt: a1,
+                },
+                Self::Bye {
+                    text: t2,
+                    code: c2,
+                    attempt: a2,
+                },
+            ) => t1 == t2 && c1 == c2 && a1 == a2,
             (Self::Protocol(a), Self::Protocol(b))
             | (Self::Parse(a), Self::Parse(b))
+            | (Self::InvalidInput(a), Self::InvalidInput(b))
             | (Self::MissingCapability(a), Self::MissingCapability(b))
             | (Self::InvalidAppendDate(a), Self::InvalidAppendDate(b))
-            | (Self::Internal(a), Self::Internal(b))
-            | (Self::DriverPanicked(a), Self::DriverPanicked(b)) => a == b,
+            | (Self::Internal(a), Self::Internal(b)) => a == b,
             (Self::AuthPolicy(a), Self::AuthPolicy(b)) => a == b,
-            (Self::Timeout, Self::Timeout)
-            | (Self::Closed, Self::Closed)
-            | (Self::StartTlsUnavailable, Self::StartTlsUnavailable)
-            | (Self::DriverGone, Self::DriverGone) => true,
+            (Self::Timeout { attempt: a }, Self::Timeout { attempt: b })
+            | (Self::Closed { attempt: a }, Self::Closed { attempt: b })
+            | (Self::DriverGone { attempt: a }, Self::DriverGone { attempt: b }) => a == b,
+            (Self::StartTlsUnavailable, Self::StartTlsUnavailable) => true,
+            (
+                Self::DriverPanicked {
+                    message: m1,
+                    attempt: a1,
+                },
+                Self::DriverPanicked {
+                    message: m2,
+                    attempt: a2,
+                },
+            ) => m1 == m2 && a1 == a2,
             (
                 Self::AppendLimit {
                     size: s1,
@@ -246,78 +257,89 @@ impl PartialEq for Error {
 impl Eq for Error {}
 
 impl Error {
-    /// Construct an [`Error::No`] with an optional response code (RFC 5530 Section 3).
+    /// Construct a transport-flavored I/O error with no attempt-state evidence.
+    pub(crate) fn io(source: std::io::Error) -> Self {
+        Self::Io {
+            source: Arc::new(source),
+            attempt: None,
+        }
+    }
+
+    /// Construct a `Timeout` with no attempt-state evidence.
+    pub(crate) const fn timeout() -> Self {
+        Self::Timeout { attempt: None }
+    }
+
+    /// Construct a `Closed` with no attempt-state evidence.
+    pub(crate) const fn closed() -> Self {
+        Self::Closed { attempt: None }
+    }
+
+    /// Construct a `DriverGone` with no attempt-state evidence.
+    pub(crate) const fn driver_gone() -> Self {
+        Self::DriverGone { attempt: None }
+    }
+
+    /// Attach (or override) the attempt evidence on a transport-shaped error.
+    ///
+    /// No-op for variants that do not carry attempt state (auth status,
+    /// local validation, capability gating).
+    #[must_use]
+    pub(crate) fn with_attempt(self, state: TransmissionState) -> Self {
+        let attempt = Some(ImapAttempt::new(state));
+        match self {
+            Self::Io { source, .. } => Self::Io { source, attempt },
+            Self::Timeout { .. } => Self::Timeout { attempt },
+            Self::Closed { .. } => Self::Closed { attempt },
+            Self::Bye { text, code, .. } => Self::Bye {
+                text,
+                code,
+                attempt,
+            },
+            Self::DriverGone { .. } => Self::DriverGone { attempt },
+            Self::DriverPanicked { message, .. } => Self::DriverPanicked { message, attempt },
+            other => other,
+        }
+    }
+
+    /// Read out attempt evidence, if any.
+    pub(crate) fn attempt(&self) -> Option<TransmissionState> {
+        match self {
+            Self::Io { attempt, .. }
+            | Self::Timeout { attempt }
+            | Self::Closed { attempt }
+            | Self::Bye { attempt, .. }
+            | Self::DriverPanicked { attempt, .. }
+            | Self::DriverGone { attempt } => attempt.map(|a| a.transmission_state),
+            _ => None,
+        }
+    }
+
+    /// Construct an [`Error::No`] with an optional response code.
     pub(crate) fn no_with_code(text: String, code: Option<ResponseCode>) -> Self {
         Self::No { text, code }
     }
 
-    /// Construct an [`Error::Bad`] with an optional response code (RFC 5530 Section 3).
+    /// Construct an [`Error::Bad`] with an optional response code.
     pub(crate) fn bad_with_code(text: String, code: Option<ResponseCode>) -> Self {
         Self::Bad { text, code }
     }
 
-    /// Construct an [`Error::Auth`] with an optional response code (RFC 5530 Section 3).
+    /// Construct an [`Error::Auth`] with an optional response code.
     pub(crate) fn auth_with_code(text: String, code: Option<ResponseCode>) -> Self {
         Self::Auth { text, code }
     }
 
-    /// Construct an [`Error::Bye`] with an optional response code
-    /// (RFC 3501 Section 7.1.5, RFC 5530 Section 3).
+    /// Construct an [`Error::Bye`] with an optional response code.
     pub(crate) fn bye_with_code(text: String, code: Option<ResponseCode>) -> Self {
-        Self::Bye { text, code }
-    }
-
-    /// Return the broad policy category for this error.
-    pub(crate) fn category(&self) -> ErrorCategory {
-        match self {
-            Self::Io(_) => ErrorCategory::Transport,
-            Self::Closed | Self::DriverGone | Self::DriverPanicked(_) => ErrorCategory::Connection,
-            Self::Auth { .. } | Self::AuthPolicy(_) => ErrorCategory::Authentication,
-            Self::No { code, .. } | Self::Bad { code, .. } => {
-                ErrorCategory::from_response_code(code.as_ref())
-            }
-            Self::Bye { code: None, .. } => ErrorCategory::Connection,
-            Self::Bye {
-                code: Some(code), ..
-            } => ErrorCategory::from_response_code(Some(code)),
-            Self::Protocol(_) => ErrorCategory::Protocol,
-            Self::Parse(_) => ErrorCategory::Parse,
-            Self::Timeout => ErrorCategory::Timeout,
-            Self::StartTlsUnavailable => ErrorCategory::SecurityPolicy,
-            Self::MissingCapability(_) => ErrorCategory::Capability,
-            Self::AppendLimit { .. } | Self::FetchLimit { .. } => ErrorCategory::Limit,
-            Self::InvalidAppendDate(_) => ErrorCategory::InvalidInput,
-            Self::Internal(_) => ErrorCategory::Internal,
-        }
-    }
-
-    /// Suggested high-level recovery action.
-    pub(crate) fn recovery(&self) -> Recovery {
-        match self.category() {
-            ErrorCategory::Connection => Recovery::Reconnect,
-            ErrorCategory::Transport => Recovery::Reconnect,
-            ErrorCategory::Timeout => Recovery::RetryOrReconnect,
-            ErrorCategory::Authentication => Recovery::Reauthenticate,
-            ErrorCategory::Capability
-            | ErrorCategory::SecurityPolicy
-            | ErrorCategory::InvalidInput
-            | ErrorCategory::Internal => Recovery::DoNotRetry,
-            ErrorCategory::Protocol | ErrorCategory::Parse => Recovery::Reconnect,
-            ErrorCategory::Transient => Recovery::RetryAfter,
-            ErrorCategory::Referral => Recovery::FollowReferral,
-            ErrorCategory::NotificationOverflow => Recovery::RebuildNotificationRegistration,
-            ErrorCategory::Authorization | ErrorCategory::Limit | ErrorCategory::ServerRejected => {
-                Recovery::DoNotRetry
-            }
-            ErrorCategory::MailboxState => Recovery::ResyncMailbox,
+        Self::Bye {
+            text,
+            code,
+            attempt: None,
         }
     }
 
     /// Response code carried by a server status error, if any.
-    ///
-    /// The current parser stores the single response code attached to a
-    /// status response. If a future parser preserves multiple codes, this
-    /// accessor should grow alongside the stored representation.
     pub(crate) fn response_code(&self) -> Option<&ResponseCode> {
         match self {
             Self::Auth { code, .. }
@@ -329,37 +351,11 @@ impl Error {
     }
 }
 
-/// Broad error category for consumer policy decisions.
-// protocol-specific: direct IMAP callers classify RFC 5530 response codes locally.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ErrorCategory {
-    Connection,
-    Transport,
-    Timeout,
-    Authentication,
-    Authorization,
-    Capability,
-    SecurityPolicy,
-    Limit,
-    MailboxState,
-    Transient,
-    Referral,
-    NotificationOverflow,
-    ServerRejected,
-    Protocol,
-    Parse,
-    InvalidInput,
-    Internal,
-}
-
 /// Structured reason automatic authentication could not select a mechanism.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthPolicyFailure {
-    /// Mechanisms or commands the server offered for the supplied credential type.
     pub(crate) offered: Vec<String>,
-    /// Offered mechanisms rejected by local policy.
     pub(crate) rejected: Vec<AuthMechanismRejection>,
 }
 
@@ -400,9 +396,7 @@ impl std::fmt::Display for AuthPolicyFailure {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AuthMechanismRejection {
-    /// Mechanism or legacy command rejected by policy.
     pub(crate) mechanism: AuthMechanism,
-    /// Why the mechanism was rejected.
     pub(crate) reason: AuthMechanismRejectionReason,
 }
 
@@ -419,9 +413,7 @@ impl AuthMechanismRejection {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AuthMechanismRejectionReason {
-    /// Mechanism is disabled by local policy.
     DisabledByPolicy,
-    /// Mechanism would expose credentials or bearer tokens without TLS.
     CleartextWithoutTls,
 }
 
@@ -432,76 +424,6 @@ impl std::fmt::Display for AuthMechanismRejectionReason {
             Self::CleartextWithoutTls => f.write_str("requires TLS by policy"),
         }
     }
-}
-
-impl ErrorCategory {
-    fn from_response_code(code: Option<&ResponseCode>) -> Self {
-        match code {
-            Some(
-                ResponseCode::AuthenticationFailed
-                | ResponseCode::Expired
-                | ResponseCode::PrivacyRequired,
-            ) => Self::Authentication,
-            Some(ResponseCode::AuthorizationFailed | ResponseCode::NoPerm) => Self::Authorization,
-            Some(ResponseCode::ContactAdmin) => Self::Authorization,
-            Some(
-                ResponseCode::OverQuota
-                | ResponseCode::TooBig
-                | ResponseCode::Limit
-                | ResponseCode::MetadataMaxSize(_),
-            ) => Self::Limit,
-            Some(
-                ResponseCode::ExpungeIssued
-                | ResponseCode::UidNotSticky
-                | ResponseCode::Closed
-                | ResponseCode::NoModSeq,
-            ) => Self::MailboxState,
-            Some(ResponseCode::AlreadyExists | ResponseCode::NonExistent) => Self::MailboxState,
-            Some(
-                ResponseCode::Unavailable
-                | ResponseCode::InUse
-                | ResponseCode::Corruption
-                | ResponseCode::TempFail(_),
-            ) => Self::Transient,
-            Some(ResponseCode::Referral(_)) => Self::Referral,
-            Some(ResponseCode::NotificationOverflow(_)) => Self::NotificationOverflow,
-            Some(ResponseCode::Parse) => Self::Parse,
-            Some(ResponseCode::BadCharset(_)) => Self::Capability,
-            Some(
-                ResponseCode::TryCreate
-                | ResponseCode::NotSaved
-                | ResponseCode::MetadataTooMany
-                | ResponseCode::MetadataNoPrivate,
-            ) => Self::MailboxState,
-            Some(ResponseCode::Cannot | ResponseCode::ClientBug | ResponseCode::ServerBug) => {
-                Self::Protocol
-            }
-            _ => Self::ServerRejected,
-        }
-    }
-}
-
-/// Suggested high-level recovery action for an IMAP error.
-// protocol-specific: mapped into bifrost_types::RecoveryClass only at the Account boundary.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Recovery {
-    /// The same request may be retried, but reconnecting may also be needed.
-    RetryOrReconnect,
-    /// Drop the connection and establish a new one.
-    Reconnect,
-    /// Re-authenticate before retrying account operations.
-    Reauthenticate,
-    /// Resynchronize the selected mailbox.
-    ResyncMailbox,
-    /// Retry later, optionally honoring backoff information from the server text.
-    RetryAfter,
-    /// Follow the referral target carried by the response code before retrying.
-    FollowReferral,
-    /// Rebuild NOTIFY registration state before relying on asynchronous events.
-    RebuildNotificationRegistration,
-    /// Do not retry automatically.
-    DoNotRetry,
 }
 
 #[cfg(test)]

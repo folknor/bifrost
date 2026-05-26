@@ -4,8 +4,13 @@ use std::time::Duration;
 
 use bifrost_net::{AccessToken, StaticTokenSource};
 use bifrost_types::{
-    Account, AccountFactory, AccountFuture, AccountId, CursorScope, Error, ObjectType,
+    Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
 };
+
+// Phase 3 will reshape the AccountFactory trait to return AccountError
+// natively; until then the local alias keeps factory.rs compiling
+// against the Phase 1 type surface.
+type Error = AccountError;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, Credentials};
@@ -97,12 +102,24 @@ impl AccountFactory for JmapAccountFactory {
     fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, Error>> {
         let config = self.config.clone();
         Box::pin(async move {
-            let client = connect(config.clone(), account_id)
-                .await
-                .map_err(super::error::to_account_error)?;
+            let client = connect(config.clone(), account_id).await.map_err(|err| {
+                super::error::into_account_error(
+                    err,
+                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
+                        .with_scope(bifrost_types::ErrorScope::Account),
+                )
+            })?;
             let mail = client
                 .primary_account::<capability::Mail>()
-                .map_err(super::error::to_account_error)?;
+                .map_err(|err| {
+                    super::error::into_account_error(
+                        err,
+                        super::error::JmapErrorContext::new(
+                            bifrost_types::AccountOperation::Discover,
+                        )
+                        .with_scope(bifrost_types::ErrorScope::Account),
+                    )
+                })?;
             let submission = client.primary_account::<capability::Submission>().ok();
             let vacation = client
                 .primary_account::<capability::VacationResponseCap>()
@@ -116,15 +133,30 @@ impl AccountFactory for JmapAccountFactory {
             };
             let (caps, limits) = capabilities::build(&session, support)?;
 
-            let email_state = mutation::probe_email_state(&mail)
-                .await
-                .map_err(super::error::to_account_error)?;
-            let (mailbox_state, mailbox_names) = discover::fetch_mailbox_names(&mail)
-                .await
-                .map_err(super::error::to_account_error)?;
-            let thread_state = probe_thread_state(&mail)
-                .await
-                .map_err(super::error::to_account_error)?;
+            let email_state = mutation::probe_email_state(&mail).await.map_err(|err| {
+                super::error::into_account_error(
+                    err,
+                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
+                        .with_scope(bifrost_types::ErrorScope::Account),
+                )
+            })?;
+            let (mailbox_state, mailbox_names) =
+                discover::fetch_mailbox_names(&mail).await.map_err(|err| {
+                    super::error::into_account_error(
+                        err,
+                        super::error::JmapErrorContext::new(
+                            bifrost_types::AccountOperation::Discover,
+                        )
+                        .with_scope(bifrost_types::ErrorScope::Account),
+                    )
+                })?;
+            let thread_state = probe_thread_state(&mail).await.map_err(|err| {
+                super::error::into_account_error(
+                    err,
+                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Discover)
+                        .with_scope(bifrost_types::ErrorScope::Account),
+                )
+            })?;
 
             let mut seed_states = HashMap::new();
             seed_states.insert(

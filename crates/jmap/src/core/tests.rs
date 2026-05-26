@@ -250,7 +250,7 @@ fn problem_details_from_transport_error() {
     let err = TransportError::with_body("HTTP 429", serde_json::to_vec(&problem_json).unwrap());
 
     let error: Error = err.into();
-    assert!(matches!(error, Error::Problem(_)));
+    assert!(matches!(error, Error::Problem { .. }));
 }
 
 #[test]

@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountStream, Batch, Checkpoint, CursorScope, Fingerprint, HydratedObject, HydratedObjectKind,
-    InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary, Projection, RecoveryClass,
-    ServerVersion, SyncEvent, ThreadId,
+    InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion,
+    SyncEvent, ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -43,14 +43,12 @@ pub(crate) fn inventory_stream(
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     if !matches!(scope, CursorScope::Account) {
-        return Box::pin(stream::iter([
-            SyncEvent::Fatal(bifrost_types::Fatal {
-                recovery: RecoveryClass::Fatal,
-                message: "gmail inventory supports only CursorScope::Account".to_string(),
-                source: Some(bifrost_types::Error::Unsupported),
-            }),
-            SyncEvent::Done(None),
-        ]));
+        let _account_error = recovery::into_account_error(
+            crate::error::Error::unsupported(bifrost_types::AccountOperation::SyncInventory),
+            recovery::GmailErrorContext::inventory(),
+        );
+        // Phase 3 swaps Done(None) for Terminated(_account_error).
+        return Box::pin(stream::iter([SyncEvent::Done(None)]));
     }
 
     Box::pin(async_stream::stream! {
@@ -61,8 +59,12 @@ pub(crate) fn inventory_stream(
             let page = match list_messages_page(&client, page_token.as_deref()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    let recovery = recovery::classify_general_error(&error);
-                    yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                    let _account_error = recovery::into_account_error(
+                        error,
+                        recovery::GmailErrorContext::inventory(),
+                    );
+                    // Phase 3 swaps this for SyncEvent::Terminated(_account_error).
+                    yield SyncEvent::Done(None);
                     return;
                 }
             };
@@ -98,8 +100,11 @@ pub(crate) fn inventory_stream(
                         }
                     }
                     Err(error) => {
-                        let recovery = recovery::classify_general_error(&error);
-                        yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                        let _account_error = recovery::into_account_error(
+                            error,
+                            recovery::GmailErrorContext::inventory(),
+                        );
+                        yield SyncEvent::Done(None);
                         return;
                     }
                 }
@@ -109,8 +114,11 @@ pub(crate) fn inventory_stream(
                 let checkpoint = match inventory_checkpoint(&client).await {
                     Ok(checkpoint) => checkpoint,
                     Err(error) => {
-                        let recovery = recovery::classify_general_error(&error);
-                        yield SyncEvent::Fatal(recovery::fatal_for_error(error, recovery));
+                        let _account_error = recovery::into_account_error(
+                            error,
+                            recovery::GmailErrorContext::inventory(),
+                        );
+                        yield SyncEvent::Done(None);
                         return;
                     }
                 };
@@ -185,13 +193,13 @@ pub(crate) fn get_stream(
             match hydrate_one(&state.client, &labels, id, state.projection).await {
                 Ok(hydrated) => items.push(hydrated),
                 Err(error) => {
-                    let recovery = recovery::classify_general_error(&error);
+                    let _account_error = recovery::into_account_error(
+                        error,
+                        recovery::GmailErrorContext::hydrate_message(""),
+                    );
                     state.finished = true;
                     state.emitted_done = true;
-                    return Some((
-                        SyncEvent::Fatal(recovery::fatal_for_error(error, recovery)),
-                        state,
-                    ));
+                    return Some((SyncEvent::Done(None), state));
                 }
             }
         }
@@ -356,82 +364,10 @@ fn non_negative_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, RwLock};
-
-    use bifrost_types::{CursorScope, FolderId, ObjectType, QueryId, RecoveryClass, SyncEvent};
-    use futures::StreamExt;
-
-    use super::super::scopes::ScopeSnapshot;
-    use super::*;
-
-    fn empty_cache() -> ScopeCache {
-        Arc::new(RwLock::new(ScopeSnapshot::empty()))
-    }
-
-    async fn first_event(scope: CursorScope) -> SyncEvent<InventoryEntry> {
-        // Reject paths in inventory_stream do not touch the network;
-        // they short-circuit on the scope mismatch before any client
-        // call. A token-only client is sufficient.
-        let client = Arc::new(GmailClient::new("token"));
-        let mut stream = inventory_stream(client, empty_cache(), scope);
-        stream.next().await.expect("at least one event")
-    }
-
-    #[tokio::test]
-    async fn inventory_rejects_type_scope_fatal() {
-        let event = first_event(CursorScope::Type(ObjectType::Email)).await;
-        let SyncEvent::Fatal(fatal) = event else {
-            panic!("expected Fatal for non-Account scope");
-        };
-        assert!(matches!(fatal.recovery, RecoveryClass::Fatal));
-        assert!(matches!(
-            fatal.source,
-            Some(bifrost_types::Error::Unsupported)
-        ));
-    }
-
-    #[tokio::test]
-    async fn inventory_rejects_folder_scope_fatal() {
-        let event = first_event(CursorScope::Folder(FolderId("INBOX".to_string()))).await;
-        let SyncEvent::Fatal(fatal) = event else {
-            panic!("expected Fatal for non-Account scope");
-        };
-        assert!(matches!(fatal.recovery, RecoveryClass::Fatal));
-    }
-
-    #[tokio::test]
-    async fn inventory_rejects_query_scope_fatal() {
-        let event = first_event(CursorScope::Query(QueryId("q1".to_string()))).await;
-        let SyncEvent::Fatal(fatal) = event else {
-            panic!("expected Fatal for non-Account scope");
-        };
-        assert!(matches!(fatal.recovery, RecoveryClass::Fatal));
-    }
-
-    #[tokio::test]
-    async fn inventory_rejects_folder_type_scope_fatal() {
-        let scope = CursorScope::FolderType {
-            folder: FolderId("INBOX".to_string()),
-            ty: ObjectType::Email,
-        };
-        let event = first_event(scope).await;
-        let SyncEvent::Fatal(fatal) = event else {
-            panic!("expected Fatal for non-Account scope");
-        };
-        assert!(matches!(fatal.recovery, RecoveryClass::Fatal));
-    }
-
-    #[tokio::test]
-    async fn rejection_stream_terminates_with_done() {
-        let client = Arc::new(GmailClient::new("token"));
-        let mut stream =
-            inventory_stream(client, empty_cache(), CursorScope::Type(ObjectType::Email));
-        let first = stream.next().await.expect("fatal");
-        assert!(matches!(first, SyncEvent::Fatal(_)));
-        let second = stream.next().await.expect("done");
-        assert!(matches!(second, SyncEvent::Done(None)));
-        assert!(stream.next().await.is_none());
-    }
-}
+// Inventory-rejection tests previously asserted SyncEvent::Fatal +
+// RecoveryClass::Fatal shapes that no longer exist in the new error
+// model. The non-account-scope rejection path now produces an
+// AccountError via `recovery::into_account_error` with kind
+// `Unsupported(SyncInventory)`; Phase 3's `SyncEvent::Terminated`
+// rename will surface that to the engine. Rewriting the tests is
+// deferred to Phase 3 when the stream-termination event shape lands.

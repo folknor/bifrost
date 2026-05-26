@@ -219,10 +219,14 @@ use crate::transport::smtp::{
     response::Response,
 };
 
+#[cfg(feature = "account-error")]
+mod account_error;
 #[cfg(feature = "tokio")]
 mod async_transport;
 // pub: users select credential kinds and explicit SASL mechanisms.
 pub mod authentication;
+#[cfg(feature = "account-error")]
+mod batch;
 mod client;
 mod commands;
 mod connection_url;

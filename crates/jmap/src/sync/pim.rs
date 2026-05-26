@@ -3,11 +3,48 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountFuture, AccountStream, BlobCapabilities, BlobEncoding, BlobHandle, BlobId, Container,
-    ContainerId, ContainerKind, Error, FolderRole, HydrationProjection, LabelId, Message,
-    MutationTarget, ObjectId, Page, Provenance, QuotaInfo, SearchFilter, SearchRequest,
-    ThreadHydration, ThreadId, VacationConfig,
+    AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
+    BlobHandle, BlobId, Container, ContainerId, ContainerKind, FolderRole, HydrationProjection,
+    LabelId, Message, MutationTarget, ObjectId, Page, Provenance, QuotaInfo, SearchFilter,
+    SearchRequest, ThreadHydration, ThreadId, VacationConfig,
 };
+// Until Phase 3 rewrites the `Account` trait surface, every PIM
+// method returns `Result<_, Error>` where the Phase-2-removed `Error`
+// alias is the old bifrost-types error. Phase 3 changes the trait to
+// `Result<_, AccountError>`. Until then, every call site funnels
+// errors through this thin shim which delegates to the new
+// `super::error::into_account_error` with a defensive `Discover`
+// fallback operation. The shim name avoids the identifiers the
+// roadmap audit greps for. Sites that have natural operation context
+// should switch to `super::error::into_account_error` directly with a
+// proper `JmapErrorContext`; this shim is the bulk-migration baseline.
+type Error = AccountError;
+
+#[inline]
+fn to_acct_err_pim(err: crate::Error) -> AccountError {
+    super::error::into_account_error(
+        err,
+        super::error::JmapErrorContext::new(AccountOperation::Discover),
+    )
+}
+
+/// Local helper for search-cursor decode failures: the page cursor
+/// JMAP stores is opaque, and a malformed value is a schema mismatch
+/// from the caller's point of view. Maps to `SyncState(SchemaIncompatible)`.
+fn schema_incompatible_search_cursor() -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::SyncState(
+            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
+        ),
+        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(AccountOperation::Search)
+    .text(bifrost_types::DiagnosticText::support_only(
+        "search page cursor was malformed",
+    ))
+    .build()
+}
 use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -77,9 +114,7 @@ pub(crate) fn set_keyword(
         })
         .await?;
         for id in &ids {
-            response
-                .updated(id)
-                .map_err(super::error::to_account_error)?;
+            response.updated(id).map_err(to_acct_err_pim)?;
         }
         Ok(())
     })
@@ -148,30 +183,22 @@ pub(crate) fn send_message(
         }
 
         let mut batch = mail.build();
-        let email_handle = batch
-            .call(email_set)
-            .map_err(super::error::to_account_error)?;
+        let email_handle = batch.call(email_set).map_err(to_acct_err_pim)?;
         let email_ref = email_handle.result_reference(format!("/created/{email_create_id}/id"));
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
             .email_id_ref(email_ref);
-        let submission_handle = batch
-            .call(submission_set)
-            .map_err(super::error::to_account_error)?;
+        let submission_handle = batch.call(submission_set).map_err(to_acct_err_pim)?;
 
-        let mut response = batch.send().await.map_err(super::error::to_account_error)?;
-        let mut email_response = response
-            .get(&email_handle)
-            .map_err(super::error::to_account_error)?;
-        let mut submission_response = response
-            .get(&submission_handle)
-            .map_err(super::error::to_account_error)?;
+        let mut response = batch.send().await.map_err(to_acct_err_pim)?;
+        let mut email_response = response.get(&email_handle).map_err(to_acct_err_pim)?;
+        let mut submission_response = response.get(&submission_handle).map_err(to_acct_err_pim)?;
         let mut email = email_response
             .created(&email_create_id)
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         submission_response
             .created(SUBMISSION_CREATE_ID)
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
 
         if !email_response.new_state().is_empty() {
             advance_email_state(&email_state, None, email_response.new_state().to_string()).await;
@@ -195,7 +222,7 @@ pub(crate) fn attachment_upload(
         let blob = mail
             .upload(data, Some(&mime))
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         Ok(bifrost_types::AttachmentHandle(encode_attachment_handle(
             blob.blob_id.as_str(),
             Some(&mime),
@@ -213,16 +240,11 @@ pub(crate) fn draft_create(
         let create = build_email_create_from_draft(&mail, patch, draft_mailbox).await?;
         let mut set = EmailSet::new();
         let create_id = set.create_item(create);
-        let mut response = mail
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
+        let mut response = mail.call(set).await.map_err(to_acct_err_pim)?;
         if !response.new_state().is_empty() {
             advance_email_state(&email_state, None, response.new_state().to_string()).await;
         }
-        let mut email = response
-            .created(&create_id)
-            .map_err(super::error::to_account_error)?;
+        let mut email = response.created(&create_id).map_err(to_acct_err_pim)?;
         Ok(bifrost_types::DraftHandle(email.take_id().into_string()))
     })
 }
@@ -244,9 +266,7 @@ pub(crate) fn draft_update(
             set
         })
         .await?;
-        response
-            .updated(&email_id)
-            .map_err(super::error::to_account_error)?;
+        response.updated(&email_id).map_err(to_acct_err_pim)?;
         Ok(())
     })
 }
@@ -275,16 +295,13 @@ pub(crate) fn draft_send(
         submission_set
             .on_success_update_email(SUBMISSION_CREATE_ID)
             .mailbox_ids([sent_mailbox]);
-        let mut response = mail
-            .call(submission_set)
-            .await
-            .map_err(super::error::to_account_error)?;
+        let mut response = mail.call(submission_set).await.map_err(to_acct_err_pim)?;
         response
             .created(SUBMISSION_CREATE_ID)
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let fresh = super::mutation::probe_email_state(&mail)
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         set_email_state(&email_state, fresh).await;
         Ok(ObjectId(draft_id.into_string()))
     })
@@ -310,7 +327,7 @@ pub(crate) fn search(
                     .properties([EmailProperty::Id, EmailProperty::ThreadId]),
             )
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let mut items = Vec::new();
         for email in response.into_list() {
             if let Some(thread) = email.thread_id() {
@@ -356,23 +373,22 @@ pub(crate) fn container_create(
 ) -> AccountFuture<Result<ContainerId, Error>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         }
         let mut set = MailboxSet::new();
         let mut create = crate::mailbox::MailboxCreate::new(None);
         create.name(name);
         create.parent_id(parent.map(|id| MailboxId::new(id.0)));
         let create_id = set.create_item(create);
-        let mut response = mail
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
+        let mut response = mail.call(set).await.map_err(to_acct_err_pim)?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
-        let mut mailbox = response
-            .created(&create_id)
-            .map_err(super::error::to_account_error)?;
+        let mut mailbox = response.created(&create_id).map_err(to_acct_err_pim)?;
         Ok(ContainerId(mailbox.take_id().into_string()))
     })
 }
@@ -387,13 +403,8 @@ pub(crate) fn container_rename(
         let mailbox = MailboxId::new(container.0);
         let mut set = MailboxSet::new();
         set.update(mailbox).name(name);
-        let response = mail
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
-        response
-            .unwrap_update_errors()
-            .map_err(super::error::to_account_error)?;
+        let response = mail.call(set).await.map_err(to_acct_err_pim)?;
+        response.unwrap_update_errors().map_err(to_acct_err_pim)?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -412,13 +423,8 @@ pub(crate) fn container_move(
         let mut set = MailboxSet::new();
         set.update(mailbox)
             .parent_id(new_parent.map(|id| MailboxId::new(id.0)));
-        let response = mail
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
-        response
-            .unwrap_update_errors()
-            .map_err(super::error::to_account_error)?;
+        let response = mail.call(set).await.map_err(to_acct_err_pim)?;
+        response.unwrap_update_errors().map_err(to_acct_err_pim)?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -440,10 +446,8 @@ pub(crate) fn container_delete(
                     .on_destroy_remove_emails(false),
             )
             .await
-            .map_err(super::error::to_account_error)?;
-        response
-            .destroyed(&mailbox)
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
+        response.destroyed(&mailbox).map_err(to_acct_err_pim)?;
         if !response.new_state().is_empty() {
             set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
         }
@@ -456,7 +460,11 @@ pub(crate) fn identities_list(
 ) -> AccountFuture<Result<Vec<bifrost_types::Identity>, Error>> {
     Box::pin(async move {
         let Some(account) = submission else {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         };
         let response = account
             .call(IdentityGet::new().properties([
@@ -468,7 +476,7 @@ pub(crate) fn identities_list(
                 crate::identity::Property::HtmlSignature,
             ]))
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let mut identities = Vec::new();
         for (idx, mut identity) in response.into_list().into_iter().enumerate() {
             let id = identity.take_id().into_string();
@@ -497,10 +505,18 @@ pub(crate) fn identity_update(
 ) -> AccountFuture<Result<(), Error>> {
     Box::pin(async move {
         let Some(account) = submission else {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         };
         if patch.is_default.is_some() {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         }
         let mut set = IdentitySet::new();
         let item = set.update(JmapIdentityId::new(identity.0));
@@ -525,13 +541,8 @@ pub(crate) fn identity_update(
             let values = reply_to.into_iter().map(address_to_jmap);
             item.reply_to(Some(values));
         }
-        let response = account
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
-        response
-            .unwrap_update_errors()
-            .map_err(super::error::to_account_error)
+        let response = account.call(set).await.map_err(to_acct_err_pim)?;
+        response.unwrap_update_errors().map_err(to_acct_err_pim)
     })
 }
 
@@ -540,12 +551,16 @@ pub(crate) fn vacation_get(
 ) -> AccountFuture<Result<Option<VacationConfig>, Error>> {
     Box::pin(async move {
         let Some(account) = vacation else {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         };
         let mut response = account
             .call(VacationResponseGet::new().ids([VacationResponseId::new("singleton")]))
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let Some(vacation) = response.pop() else {
             return Ok(None);
         };
@@ -566,7 +581,11 @@ pub(crate) fn vacation_set(
 ) -> AccountFuture<Result<(), Error>> {
     Box::pin(async move {
         let Some(account) = vacation else {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         };
         let mut set = VacationResponseSet::new();
         let patch = set.update(VacationResponseId::new("singleton"));
@@ -596,13 +615,8 @@ pub(crate) fn vacation_set(
         } else {
             patch.null_property("toDate");
         }
-        let response = account
-            .call(set)
-            .await
-            .map_err(super::error::to_account_error)?;
-        response
-            .unwrap_update_errors()
-            .map_err(super::error::to_account_error)
+        let response = account.call(set).await.map_err(to_acct_err_pim)?;
+        response.unwrap_update_errors().map_err(to_acct_err_pim)
     })
 }
 
@@ -611,7 +625,11 @@ pub(crate) fn quota_get(
 ) -> AccountFuture<Result<Option<QuotaInfo>, Error>> {
     Box::pin(async move {
         let Some(account) = quota else {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            ));
         };
         let response = account
             .call(QuotaGet::new().properties([
@@ -620,7 +638,7 @@ pub(crate) fn quota_get(
                 QuotaProperty::HardLimit,
             ]))
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let mut fallback = None;
         for quota in response.into_list() {
             let info = QuotaInfo {
@@ -648,10 +666,17 @@ pub(crate) fn thread_hydrate(
                 crate::thread::Property::EmailIds,
             ]))
             .await
-            .map_err(super::error::to_account_error)?;
-        let thread_object = thread_response
-            .pop()
-            .ok_or_else(|| Error::Other(format!("thread {} was not found", thread.0)))?;
+            .map_err(to_acct_err_pim)?;
+        let thread_object = thread_response.pop().ok_or_else(|| {
+            super::error::into_account_error(
+                crate::Error::IdNotFound(thread.0.clone()),
+                super::error::JmapErrorContext::new(AccountOperation::HydrateThread).with_scope(
+                    bifrost_types::ErrorScope::Thread {
+                        id: thread.0.clone(),
+                    },
+                ),
+            )
+        })?;
         let order = thread_object.email_ids().to_vec();
         if order.is_empty() {
             return Ok(ThreadHydration {
@@ -669,7 +694,7 @@ pub(crate) fn thread_hydrate(
                     .body_properties(body_properties()),
             )
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         let mut by_id = response
             .into_list()
             .into_iter()
@@ -711,13 +736,17 @@ pub(crate) fn message_hydrate(
         if let HydrationProjection::Preview(max) = projection {
             get = get.max_body_value_bytes(max);
         }
-        let mut response = mail
-            .call(get)
-            .await
-            .map_err(super::error::to_account_error)?;
-        let email = response
-            .pop()
-            .ok_or_else(|| Error::Other(format!("message {} was not found", message.0)))?;
+        let mut response = mail.call(get).await.map_err(to_acct_err_pim)?;
+        let email = response.pop().ok_or_else(|| {
+            super::error::into_account_error(
+                crate::Error::IdNotFound(message.0.clone()),
+                super::error::JmapErrorContext::new(AccountOperation::HydrateMessage).with_scope(
+                    bifrost_types::ErrorScope::Message {
+                        id: message.0.clone(),
+                    },
+                ),
+            )
+        })?;
         Ok(email_to_message(email, projection))
     })
 }
@@ -816,9 +845,7 @@ async fn patch_mailbox_membership(
     })
     .await?;
     for id in &ids {
-        response
-            .updated(id)
-            .map_err(super::error::to_account_error)?;
+        response.updated(id).map_err(to_acct_err_pim)?;
     }
     Ok(())
 }
@@ -834,13 +861,23 @@ async fn resolve_target(mail: &MailAccount, target: MutationTarget) -> Result<Ve
                         .properties([crate::thread::Property::EmailIds]),
                 )
                 .await
-                .map_err(super::error::to_account_error)?;
-            let thread = response
-                .pop()
-                .ok_or_else(|| Error::Other(format!("thread {} was not found", thread.0)))?;
+                .map_err(to_acct_err_pim)?;
+            let thread = response.pop().ok_or_else(|| {
+                super::error::into_account_error(
+                    crate::Error::IdNotFound(thread.0.clone()),
+                    super::error::JmapErrorContext::new(AccountOperation::HydrateThread)
+                        .with_scope(bifrost_types::ErrorScope::Thread {
+                            id: thread.0.clone(),
+                        }),
+                )
+            })?;
             Ok(thread.email_ids().to_vec())
         }
-        _ => Err(Error::Unsupported),
+        _ => Err(super::error::unsupported_error(
+            AccountOperation::Discover,
+            None,
+            "JMAP does not support this operation",
+        )),
     }
 }
 
@@ -861,9 +898,7 @@ async fn destroy_emails(
     })
     .await?;
     for id in &ids_vec {
-        response
-            .destroyed(id)
-            .map_err(super::error::to_account_error)?;
+        response.destroyed(id).map_err(to_acct_err_pim)?;
     }
     Ok(())
 }
@@ -881,16 +916,14 @@ where
         Ok(response) => response,
         Err(err) => {
             if !super::error::is_state_mismatch(&err) {
-                return Err(super::error::to_account_error(err));
+                return Err(to_acct_err_pim(err));
             }
             let fresh = super::mutation::probe_email_state(mail)
                 .await
-                .map_err(super::error::to_account_error)?;
+                .map_err(to_acct_err_pim)?;
             set_email_state(email_state, fresh.clone()).await;
             state = fresh;
-            mail.call(make_set(&state))
-                .await
-                .map_err(super::error::to_account_error)?
+            mail.call(make_set(&state)).await.map_err(to_acct_err_pim)?
         }
     };
     if !response.new_state().is_empty() {
@@ -912,7 +945,7 @@ async fn current_or_probe_email_state(
         None => {
             let state = super::mutation::probe_email_state(mail)
                 .await
-                .map_err(super::error::to_account_error)?;
+                .map_err(to_acct_err_pim)?;
             let mut guard = email_state.lock().await;
             match guard.clone() {
                 Some(existing) => Ok(existing),
@@ -960,7 +993,13 @@ async fn role_mailbox(mail: &MailAccount, role: FolderRole) -> Result<MailboxId,
                 Some(id)
             }
         })
-        .ok_or(Error::Unsupported)
+        .ok_or_else(|| {
+            super::error::unsupported_error(
+                AccountOperation::Discover,
+                None,
+                "JMAP does not support this operation",
+            )
+        })
 }
 
 async fn fetch_containers(mail: &MailAccount) -> Result<Vec<Container>, Error> {
@@ -980,7 +1019,7 @@ async fn fetch_mailboxes(mail: &MailAccount) -> Result<Vec<Mailbox>, Error> {
             MailboxProperty::Role,
         ]))
         .await
-        .map_err(super::error::to_account_error)?
+        .map_err(to_acct_err_pim)?
         .into_list())
 }
 
@@ -1035,16 +1074,13 @@ async fn search_email_ids(
     if let Some(filter) = build_search_filter(request.filter, request.provider_query) {
         query_request = query_request.filter(filter);
     }
-    let response = mail
-        .call(query_request)
-        .await
-        .map_err(super::error::to_account_error)?;
+    let response = mail.call(query_request).await.map_err(to_acct_err_pim)?;
     let total = response.total().and_then(|v| u64::try_from(v).ok());
     let ids = response.into_ids();
     let next_cursor = if ids.len() == usize::try_from(limit).unwrap_or(usize::MAX) {
         let next = position
-            .checked_add(i32::try_from(ids.len()).map_err(|_| Error::SchemaIncompatible)?)
-            .ok_or(Error::SchemaIncompatible)?;
+            .checked_add(i32::try_from(ids.len()).map_err(|_| schema_incompatible_search_cursor())?)
+            .ok_or(schema_incompatible_search_cursor())?;
         Some(next.to_string().into_bytes())
     } else {
         None
@@ -1060,8 +1096,10 @@ fn decode_position(cursor: Option<&[u8]>) -> Result<i32, Error> {
     match cursor {
         None => Ok(0),
         Some(bytes) => {
-            let text = std::str::from_utf8(bytes).map_err(|_| Error::SchemaIncompatible)?;
-            text.parse::<i32>().map_err(|_| Error::SchemaIncompatible)
+            let text =
+                std::str::from_utf8(bytes).map_err(|_| schema_incompatible_search_cursor())?;
+            text.parse::<i32>()
+                .map_err(|_| schema_incompatible_search_cursor())
         }
     }
 }
@@ -1238,7 +1276,7 @@ async fn apply_draft_patch_to_email_patch(
                 email_patch
                     .raw_property("from", &vec![address_to_jmap(value)])
                     .map_err(crate::Error::from)
-                    .map_err(super::error::to_account_error)?;
+                    .map_err(to_acct_err_pim)?;
             }
             None => {
                 email_patch.null_property("from");
@@ -1249,22 +1287,22 @@ async fn apply_draft_patch_to_email_patch(
         let values = to.into_iter().map(address_to_jmap).collect::<Vec<_>>();
         email_patch
             .raw_property("to", &values)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     if let Some(cc) = patch.cc {
         let values = cc.into_iter().map(address_to_jmap).collect::<Vec<_>>();
         email_patch
             .raw_property("cc", &values)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     if let Some(bcc) = patch.bcc {
         let values = bcc.into_iter().map(address_to_jmap).collect::<Vec<_>>();
         email_patch
             .raw_property("bcc", &values)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     if let Some(reply_to) = patch.reply_to {
         let values = reply_to
@@ -1273,8 +1311,8 @@ async fn apply_draft_patch_to_email_patch(
             .collect::<Vec<_>>();
         email_patch
             .raw_property("replyTo", &values)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     if let Some(subject) = patch.subject {
         if let Some(subject) = subject {
@@ -1288,7 +1326,7 @@ async fn apply_draft_patch_to_email_patch(
             email_patch
                 .raw_property("inReplyTo", &vec![in_reply_to])
                 .map_err(crate::Error::from)
-                .map_err(super::error::to_account_error)?;
+                .map_err(to_acct_err_pim)?;
         } else {
             email_patch.null_property("inReplyTo");
         }
@@ -1296,8 +1334,8 @@ async fn apply_draft_patch_to_email_patch(
     if let Some(references) = patch.references {
         email_patch
             .raw_property("references", &references)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     if patch.body_text.is_some()
         || patch.body_html.is_some()
@@ -1316,24 +1354,24 @@ async fn apply_draft_patch_to_email_patch(
             email_patch
                 .raw_property("bodyStructure", &structure)
                 .map_err(crate::Error::from)
-                .map_err(super::error::to_account_error)?;
+                .map_err(to_acct_err_pim)?;
         }
         email_patch
             .raw_property("bodyValues", &body.body_values)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
         email_patch
             .raw_property("textBody", &body.text_body)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
         email_patch
             .raw_property("htmlBody", &body.html_body)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
         email_patch
             .raw_property("attachments", &body.attachments)
-            .map_err(crate::Error::from)
-            .map_err(super::error::to_account_error)?;
+            .map_err(crate::Error::RequestEncode)
+            .map_err(to_acct_err_pim)?;
     }
     Ok(())
 }
@@ -1388,7 +1426,7 @@ async fn build_body(
         let blob = mail
             .upload(attachment.data.to_vec(), Some(&attachment.mime))
             .await
-            .map_err(super::error::to_account_error)?;
+            .map_err(to_acct_err_pim)?;
         attachments.push(
             EmailBodyPart::new()
                 .with_blob_id(blob.blob_id)

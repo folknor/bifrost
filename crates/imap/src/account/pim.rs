@@ -77,16 +77,22 @@ pub(crate) fn set_is_read(
     })
 }
 
-pub(crate) fn unsupported_unit() -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+pub(crate) fn unsupported_unit(
+    operation: bifrost_types::AccountOperation,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move { Err(super::error::unsupported(operation)) })
 }
 
-pub(crate) fn unsupported_object() -> AccountFuture<Result<ObjectId, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+pub(crate) fn unsupported_object(
+    operation: bifrost_types::AccountOperation,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move { Err(super::error::unsupported(operation)) })
 }
 
-pub(crate) fn unsupported_attachment() -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+pub(crate) fn unsupported_attachment(
+    operation: bifrost_types::AccountOperation,
+) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+    Box::pin(async move { Err(super::error::unsupported(operation)) })
 }
 
 pub(crate) fn draft_create(

@@ -18,6 +18,49 @@ pub struct Error {
 struct Inner {
     kind: ErrorKind,
     source: Option<BoxError>,
+    attempt: Option<SmtpAttempt>,
+    phase: Option<SmtpCommandPhase>,
+}
+
+/// Wire-level transmission state for the mail-send side effect.
+///
+/// `Unsent` means no recipient command has been written.
+/// `InFlight` means a write or read failed mid-command and the server's view is
+/// ambiguous. `Acknowledged` means the server returned a definitive negative
+/// reply for the command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SmtpTransmissionState {
+    Unsent,
+    InFlight,
+    Acknowledged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SmtpAttempt {
+    pub(crate) transmission_state: SmtpTransmissionState,
+}
+
+/// Coarse command phase at the point an SMTP transport error was constructed.
+///
+/// Used by the shared-error mapper to refine kind/cause selection (notably AUTH
+/// vs send-side effects) without leaking the public transport ErrorKind enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SmtpCommandPhase {
+    Connect,
+    Greeting,
+    Hello,
+    StartTls,
+    Auth,
+    MailFrom,
+    RcptTo,
+    DataCommand,
+    DataBody,
+    BdatBody,
+    LmtpFinalStatus,
+    Noop,
+    Vrfy,
+    Expn,
+    Rset,
 }
 
 impl Error {
@@ -29,14 +72,54 @@ impl Error {
             inner: Box::new(Inner {
                 kind,
                 source: source.map(Into::into),
+                attempt: None,
+                phase: None,
             }),
         }
     }
 
     fn without_source(kind: ErrorKind) -> Error {
         Error {
-            inner: Box::new(Inner { kind, source: None }),
+            inner: Box::new(Inner {
+                kind,
+                source: None,
+                attempt: None,
+                phase: None,
+            }),
         }
+    }
+
+    /// Attach transmission state to a transport-layer error. Returns a builder-
+    /// style updated `Error`. Crate-internal: send pipelines decorate errors at
+    /// the point they cross a command boundary so the account-error mapper can
+    /// emit the right `Attempt` cause without re-deriving wire context.
+    pub(crate) fn with_attempt(mut self, state: SmtpTransmissionState) -> Self {
+        self.inner.attempt = Some(SmtpAttempt {
+            transmission_state: state,
+        });
+        self
+    }
+
+    /// Attach the command phase the error originated in. Diagnostic only;
+    /// classification continues to use `ErrorKind` and the response payload.
+    pub(crate) fn with_phase(mut self, phase: SmtpCommandPhase) -> Self {
+        self.inner.phase = Some(phase);
+        self
+    }
+
+    pub(crate) fn attempt(&self) -> Option<SmtpTransmissionState> {
+        self.inner.attempt.map(|a| a.transmission_state)
+    }
+
+    pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {
+        self.inner.phase
+    }
+
+    /// Support-safe diagnostic string for the account-error mapper. AUTH paths
+    /// already redact credentials before they reach here; this just exposes the
+    /// boxed source or the kind discriminant for support text.
+    pub(crate) fn diagnostic_text(&self) -> Option<String> {
+        self.inner.source.as_ref().map(|src| src.to_string())
     }
 
     /// Returns the classification for this SMTP error.

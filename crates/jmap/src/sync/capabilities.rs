@@ -1,10 +1,29 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
-    Error, MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
+    BatchingPolicy, BlobRangeSupport, Cause, ConvenienceShape, CursorFreshness, DiagnosticText,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport, Protocol,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, StateCause, SyncStateErrorKind,
 };
+
+// Phase-3 trait-shape parity.
+type Error = AccountError;
+
+fn missing_core_capability() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
+        Cause::State(StateCause::CapabilityChanged {
+            delta: bifrost_types::CapabilityDelta::default(),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .text(DiagnosticText::support_only(
+        "JMAP session is missing or has zero-valued core limits",
+    ))
+    .build()
+}
 
 use crate::core::session::Session;
 
@@ -27,14 +46,14 @@ pub(crate) fn build(
 ) -> Result<(AccountCapabilities, CoreLimits), Error> {
     let core = session
         .core_capabilities()
-        .ok_or(Error::MissingCoreCapability)?;
+        .ok_or_else(missing_core_capability)?;
 
     if core.max_calls_in_request() == 0
         || core.max_objects_in_get() == 0
         || core.max_objects_in_set() == 0
         || core.max_size_request() == 0
     {
-        return Err(Error::MissingCoreCapability);
+        return Err(missing_core_capability());
     }
 
     let ws_push = session

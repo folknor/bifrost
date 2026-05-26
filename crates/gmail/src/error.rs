@@ -1,7 +1,13 @@
 use std::error::Error as StdError;
 use std::fmt::{self, Display, Formatter};
+use std::time::Duration;
 
-const MAX_BODY_EXCERPT_CHARS: usize = 4096;
+use bifrost_types::AccountOperation;
+use bytes::Bytes;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use serde::Deserialize;
+
+const MAX_BODY_EXCERPT_BYTES: usize = 4096;
 
 /// Result type for Gmail client operations.
 pub(crate) type Result<T> = std::result::Result<T, Error>;
@@ -22,48 +28,267 @@ impl Display for Base64Encoding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum GmailService {
+    GmailApi,
+}
+
+impl Display for GmailService {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::GmailApi => f.write_str("Gmail API"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GmailResponseHeaders {
+    pub(crate) retry_after: Option<Duration>,
+    pub(crate) request_id: Option<String>,
+    pub(crate) trace_id: Option<String>,
+}
+
+impl GmailResponseHeaders {
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            retry_after: parse_retry_after_value(headers.get(RETRY_AFTER)),
+            request_id: first_header(
+                headers,
+                &["x-goog-request-id", "x-google-request-id", "x-request-id"],
+            ),
+            trace_id: trace_id_from_headers(headers),
+        }
+    }
+}
+
+/// Parse `Retry-After` as either a delta-seconds integer or an HTTP date.
+/// HTTP-date parsing is deliberately not implemented; Gmail only emits
+/// delta-seconds in practice and `bifrost-net` covers the parser for
+/// retry-driven flows. This helper is for diagnostics-only retention.
+fn parse_retry_after_value(value: Option<&HeaderValue>) -> Option<Duration> {
+    let raw = value?.to_str().ok()?.trim();
+    let seconds: u64 = raw.parse().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Some(value) = header_text(headers, name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let value = headers.get(name)?;
+    let text = value.to_str().ok()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
+}
+
+fn trace_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = header_text(headers, "traceparent") {
+        let mut parts = value.split('-');
+        let _version = parts.next()?;
+        let trace_id = parts.next()?;
+        if trace_id.len() == 32 && trace_id.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+            return Some(trace_id.to_owned());
+        }
+    }
+    header_text(headers, "x-cloud-trace-context").and_then(|value| {
+        let trace_id = match value.split_once('/') {
+            Some((trace_id, _)) => trace_id.trim(),
+            None => value.trim(),
+        };
+        if trace_id.is_empty() {
+            None
+        } else {
+            Some(trace_id.to_owned())
+        }
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct GmailResponseError {
+    pub(crate) service: GmailService,
+    pub(crate) status: u16,
+    pub(crate) headers: GmailResponseHeaders,
+    pub(crate) body: Bytes,
+    pub(crate) envelope: Option<GmailErrorEnvelope>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GmailErrorEnvelope {
+    #[serde(default)]
+    pub(crate) code: Option<u16>,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) errors: Vec<GmailErrorDetail>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct GmailErrorDetail {
+    #[serde(default)]
+    pub(crate) domain: Option<String>,
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+    #[serde(default, rename = "locationType")]
+    pub(crate) location_type: Option<String>,
+    #[serde(default)]
+    pub(crate) location: Option<String>,
+}
+
+impl GmailErrorEnvelope {
+    /// Returns the first non-empty `errors[].reason`, falling back to
+    /// the top-level `status` string, then `None`.
+    pub(crate) fn primary_reason(&self) -> Option<&str> {
+        for detail in &self.errors {
+            if let Some(reason) = detail.reason.as_deref() {
+                let trimmed = reason.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        self.status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Primary human-readable message from the envelope.
+    pub(crate) fn primary_message(&self) -> Option<&str> {
+        for detail in &self.errors {
+            if let Some(msg) = detail.message.as_deref() {
+                let trimmed = msg.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        self.message
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum GmailLocalError {
+    Unsupported {
+        operation: AccountOperation,
+        detail: Option<&'static str>,
+    },
+    InvalidRequest {
+        operation: AccountOperation,
+        detail: String,
+    },
+    InvalidCursor {
+        kind: GmailCursorFailure,
+        detail: String,
+    },
+    AccountIdentityMismatch {
+        cursor_email: String,
+        profile_email: String,
+    },
+    MissingField {
+        field: &'static str,
+        detail: String,
+    },
+    BlobRangeUnsupported {
+        blob_id: String,
+    },
+    BlobRangeOutOfBounds {
+        start: u64,
+        total: u64,
+    },
+    Internal {
+        detail: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum GmailCursorFailure {
+    ProtocolMismatch,
+    EnvelopeMismatch,
+    SchemaMismatch,
+    MalformedPayload,
+}
+
+impl Display for GmailLocalError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported { operation, detail } => match detail {
+                Some(text) => write!(f, "unsupported operation {operation:?}: {text}"),
+                None => write!(f, "unsupported operation {operation:?}"),
+            },
+            Self::InvalidRequest { operation, detail } => {
+                write!(f, "invalid request for {operation:?}: {detail}")
+            }
+            Self::InvalidCursor { kind, detail } => {
+                write!(f, "invalid cursor ({kind:?}): {detail}")
+            }
+            Self::AccountIdentityMismatch {
+                cursor_email,
+                profile_email,
+            } => write!(
+                f,
+                "cursor account {cursor_email} does not match open account {profile_email}"
+            ),
+            Self::MissingField { field, detail } => {
+                write!(f, "missing required field `{field}`: {detail}")
+            }
+            Self::BlobRangeUnsupported { blob_id } => {
+                write!(f, "blob {blob_id} does not support range reads")
+            }
+            Self::BlobRangeOutOfBounds { start, total } => {
+                write!(f, "blob range start {start} >= total {total}")
+            }
+            Self::Internal { detail } => write!(f, "internal gmail error: {detail}"),
+        }
+    }
+}
+
 /// Error type for Gmail API operations.
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum Error {
-    /// Network, TLS, timeout, or response-body read failure.
-    Transport {
-        /// Human-readable transport failure.
-        message: String,
-        /// True when callers can retry without changing inputs.
-        retryable: bool,
+    /// A transport-level failure from `bifrost-net`.
+    ///
+    /// Carries the original `bifrost_net::Error` so the account-side
+    /// translation boundary can inspect transmission state, retry-after
+    /// history, and other forensic evidence rather than relying on a
+    /// flattened string.
+    Net(bifrost_net::Error),
+    /// Gmail returned an unsuccessful HTTP response.
+    ///
+    /// The raw body bytes are preserved (capped at
+    /// `MAX_BODY_EXCERPT_BYTES`) along with the Gmail JSON envelope
+    /// (if parseable), so the account-side mapper can route on
+    /// stable Gmail reason codes rather than substring matches.
+    Response(Box<GmailResponseError>),
+    /// JSON decoding of a successful Gmail response failed.
+    JsonDecode {
+        service: GmailService,
+        source: serde_json::Error,
     },
-    /// Server returned an unsuccessful HTTP status.
-    HttpStatus {
-        /// Logical service being called.
-        service: String,
-        /// HTTP response status.
-        status: reqwest::StatusCode,
-        /// Truncated response body suitable for diagnostics.
-        body: String,
+    /// JSON encoding of a request body failed.
+    JsonEncode {
+        service: GmailService,
+        source: serde_json::Error,
     },
-    /// Gmail refused the bearer token.
-    Auth {
-        /// Logical service being called.
-        service: String,
-        /// HTTP response status, when known.
-        status: Option<reqwest::StatusCode>,
-        /// Truncated response body suitable for diagnostics.
-        body: String,
-        /// True when callers should refresh the token before retrying.
-        refresh_required: bool,
-    },
-    /// Quota or rate-limit response.
-    QuotaExhausted {
-        /// Logical service being called.
-        service: String,
-        /// HTTP response status.
-        status: reqwest::StatusCode,
-        /// Truncated response body suitable for diagnostics.
-        body: String,
-    },
-    /// JSON response could not be decoded into the requested type.
-    Json(serde_json::Error),
     /// Gmail body or raw-message base64 data could not be decoded.
     Base64 {
         /// Alphabet that was attempted.
@@ -71,45 +296,27 @@ pub(crate) enum Error {
         /// Decoder failure.
         source: base64::DecodeError,
     },
-    /// Gmail returned a response shape that is not usable.
-    MalformedPayload(String),
-    /// Caller supplied an invalid argument.
-    InvalidInput(String),
+    /// A locally-detected error (unsupported operation, malformed
+    /// caller input, cursor envelope mismatch, etc.).
+    Local(GmailLocalError),
 }
 
 impl Error {
-    pub(crate) fn status(
-        service: impl Into<String>,
-        status: reqwest::StatusCode,
-        body: String,
+    pub(crate) fn response_from_parts(
+        service: GmailService,
+        status: u16,
+        headers: GmailResponseHeaders,
+        body: Bytes,
     ) -> Self {
-        let service = service.into();
         let body = body_excerpt(body);
-
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Self::Auth {
-                service,
-                status: Some(status),
-                body,
-                refresh_required: true,
-            };
-        }
-
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-            || (status == reqwest::StatusCode::FORBIDDEN && looks_like_quota_error(&body))
-        {
-            return Self::QuotaExhausted {
-                service,
-                status,
-                body,
-            };
-        }
-
-        Self::HttpStatus {
+        let envelope = parse_gmail_envelope(&body);
+        Self::Response(Box::new(GmailResponseError {
             service,
             status,
+            headers,
             body,
-        }
+            envelope,
+        }))
     }
 
     pub(crate) fn base64url(source: base64::DecodeError) -> Self {
@@ -118,46 +325,59 @@ impl Error {
             source,
         }
     }
+
+    pub(crate) fn unsupported(operation: AccountOperation) -> Self {
+        Self::Local(GmailLocalError::Unsupported {
+            operation,
+            detail: None,
+        })
+    }
+
+    pub(crate) fn unsupported_with(operation: AccountOperation, detail: &'static str) -> Self {
+        Self::Local(GmailLocalError::Unsupported {
+            operation,
+            detail: Some(detail),
+        })
+    }
+
+    pub(crate) fn invalid_request(operation: AccountOperation, detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::InvalidRequest {
+            operation,
+            detail: detail.into(),
+        })
+    }
+
+    pub(crate) fn missing_field(field: &'static str, detail: impl Into<String>) -> Self {
+        Self::Local(GmailLocalError::MissingField {
+            field,
+            detail: detail.into(),
+        })
+    }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport { message, .. } => write!(f, "transport error: {message}"),
-            Self::HttpStatus {
-                service,
-                status,
-                body,
-            } => write!(f, "{service} returned HTTP {status}: {body}"),
-            Self::Auth {
-                service,
-                status,
-                body,
-                refresh_required,
-            } => match status {
-                Some(status) if *refresh_required => {
-                    write!(
-                        f,
-                        "{service} authentication failed with HTTP {status}: {body}"
-                    )
-                }
-                Some(status) => write!(
+            Self::Net(err) => write!(f, "net transport error: {err}"),
+            Self::Response(resp) => {
+                write!(
                     f,
-                    "{service} authentication failed with HTTP {status}: {body}"
-                ),
-                None => write!(f, "{service} authentication failed: {body}"),
-            },
-            Self::QuotaExhausted {
-                service,
-                status,
-                body,
-            } => write!(f, "{service} quota exhausted with HTTP {status}: {body}"),
-            Self::Json(err) => write!(f, "JSON decode failed: {err}"),
+                    "{} returned HTTP {}: {}",
+                    resp.service,
+                    resp.status,
+                    String::from_utf8_lossy(resp.body.as_ref())
+                )
+            }
+            Self::JsonDecode { service, source } => {
+                write!(f, "{service} JSON decode failed: {source}")
+            }
+            Self::JsonEncode { service, source } => {
+                write!(f, "{service} JSON encode failed: {source}")
+            }
             Self::Base64 { encoding, source } => {
                 write!(f, "{encoding} decode failed: {source}")
             }
-            Self::MalformedPayload(message) => write!(f, "malformed API payload: {message}"),
-            Self::InvalidInput(message) => f.write_str(message),
+            Self::Local(local) => Display::fmt(local, f),
         }
     }
 }
@@ -165,147 +385,98 @@ impl Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Json(err) => Some(err),
+            Self::Net(err) => Some(err),
+            Self::JsonDecode { source, .. } | Self::JsonEncode { source, .. } => Some(source),
             Self::Base64 { source, .. } => Some(source),
-            Self::Transport { .. }
-            | Self::HttpStatus { .. }
-            | Self::Auth { .. }
-            | Self::QuotaExhausted { .. }
-            | Self::MalformedPayload(_)
-            | Self::InvalidInput(_) => None,
-        }
-    }
-}
-
-impl From<reqwest::Error> for Error {
-    fn from(err: reqwest::Error) -> Self {
-        let retryable = err.is_connect() || err.is_timeout();
-        Self::Transport {
-            message: err.to_string(),
-            retryable,
+            Self::Response(_) | Self::Local(_) => None,
         }
     }
 }
 
 impl From<bifrost_net::Error> for Error {
     fn from(err: bifrost_net::Error) -> Self {
-        Self::from_net("Gmail API", err)
+        // Preserve the structured net error. The account-side
+        // translation boundary in `account/recovery.rs` is responsible
+        // for inspecting Status bodies, retry-after, and transmission
+        // state via `bifrost_net::into_account_error`. We deliberately
+        // do NOT promote `Error::Status` into `Error::Response` here:
+        // the body parsing happens after the net error has been
+        // contextualized with the Gmail operation/scope.
+        Self::Net(err)
     }
 }
 
-impl Error {
-    pub(crate) fn from_net(service: impl Into<String>, err: bifrost_net::Error) -> Self {
-        let message = err.to_string();
-        match err {
-            bifrost_net::Error::Status { code, body, .. } => Self::status(
-                service,
-                code,
-                String::from_utf8_lossy(body.as_ref()).into_owned(),
-            ),
-            bifrost_net::Error::AuthLost => Self::Auth {
-                service: service.into(),
-                status: Some(reqwest::StatusCode::UNAUTHORIZED),
-                body: "authorization lost".to_string(),
-                refresh_required: true,
-            },
-            bifrost_net::Error::RateLimited { .. } => Self::QuotaExhausted {
-                service: service.into(),
-                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                body: "rate limited".to_string(),
-            },
-            bifrost_net::Error::RetryBudgetExhausted {
-                last_status: Some(status),
-                ..
-            } => Self::status(service, status, "retry budget exhausted".to_string()),
-            bifrost_net::Error::Timeout => Self::Transport {
-                message,
-                retryable: true,
-            },
-            bifrost_net::Error::Network { .. } | bifrost_net::Error::RefreshFailed { .. } => {
-                Self::Transport {
-                    message,
-                    retryable: true,
-                }
-            }
-            _ => Self::Transport {
-                message,
-                retryable: false,
-            },
-        }
-    }
-}
-
-impl From<serde_json::Error> for Error {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Json(err)
-    }
-}
-
-fn body_excerpt(body: String) -> String {
-    if body.chars().count() <= MAX_BODY_EXCERPT_CHARS {
+fn body_excerpt(body: Bytes) -> Bytes {
+    if body.len() <= MAX_BODY_EXCERPT_BYTES {
         return body;
     }
-
-    let mut excerpt = body
-        .chars()
-        .take(MAX_BODY_EXCERPT_CHARS)
-        .collect::<String>();
-    excerpt.push_str("...");
-    excerpt
+    body.slice(..MAX_BODY_EXCERPT_BYTES)
 }
 
-fn looks_like_quota_error(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    lower.contains("quota")
-        || lower.contains("rate limit")
-        || lower.contains("ratelimit")
-        || lower.contains("user-rate-limit")
+/// Gmail wraps error responses under a top-level `error` object. This
+/// helper parses only the inner envelope; if the body is not Gmail-
+/// shaped JSON the caller falls back to HTTP status classification.
+fn parse_gmail_envelope(body: &[u8]) -> Option<GmailErrorEnvelope> {
+    #[derive(Deserialize)]
+    struct Wrapper {
+        error: GmailErrorEnvelope,
+    }
+    serde_json::from_slice::<Wrapper>(body)
+        .ok()
+        .map(|w| w.error)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MAX_BODY_EXCERPT_CHARS};
+    use super::*;
 
     #[test]
-    fn status_truncates_http_body_excerpt() {
-        let err = Error::status(
-            "Gmail API",
-            reqwest::StatusCode::BAD_REQUEST,
-            "x".repeat(MAX_BODY_EXCERPT_CHARS + 10),
-        );
-
-        let Error::HttpStatus { body, .. } = err else {
-            panic!("expected HTTP status error");
-        };
-        assert_eq!(body.chars().count(), MAX_BODY_EXCERPT_CHARS + 3);
-        assert!(body.ends_with("..."));
+    fn parses_gmail_error_envelope() {
+        let body = br#"{
+            "error": {
+                "code": 429,
+                "message": "User-rate limit exceeded.",
+                "status": "RESOURCE_EXHAUSTED",
+                "errors": [
+                    {
+                        "domain": "usageLimits",
+                        "reason": "userRateLimitExceeded",
+                        "message": "User Rate Limit Exceeded"
+                    }
+                ]
+            }
+        }"#;
+        let env = parse_gmail_envelope(body).expect("envelope");
+        assert_eq!(env.primary_reason(), Some("userRateLimitExceeded"));
+        assert_eq!(env.code, Some(429));
+        assert_eq!(env.status.as_deref(), Some("RESOURCE_EXHAUSTED"));
     }
 
     #[test]
-    fn status_classifies_unauthorized_as_auth_refresh() {
-        let err = Error::status(
-            "Gmail API",
-            reqwest::StatusCode::UNAUTHORIZED,
-            "invalid token".to_string(),
-        );
-
-        let Error::Auth {
-            refresh_required, ..
-        } = err
-        else {
-            panic!("expected auth error");
-        };
-        assert!(refresh_required);
+    fn primary_reason_falls_back_to_status() {
+        let body = br#"{"error":{"status":"NOT_FOUND","code":404}}"#;
+        let env = parse_gmail_envelope(body).expect("envelope");
+        assert_eq!(env.primary_reason(), Some("NOT_FOUND"));
     }
 
     #[test]
-    fn status_classifies_rate_limit_as_retryable_quota() {
-        let err = Error::status(
-            "Gmail API",
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-            "slow down".to_string(),
-        );
+    fn non_gmail_body_returns_none() {
+        let body = br#"<html>oops</html>"#;
+        assert!(parse_gmail_envelope(body).is_none());
+    }
 
-        assert!(matches!(err, Error::QuotaExhausted { .. }));
+    #[test]
+    fn response_truncates_long_body() {
+        let body = Bytes::from(vec![b'x'; MAX_BODY_EXCERPT_BYTES + 64]);
+        let err = Error::response_from_parts(
+            GmailService::GmailApi,
+            400,
+            GmailResponseHeaders::default(),
+            body,
+        );
+        let Error::Response(resp) = err else {
+            panic!("expected response error");
+        };
+        assert_eq!(resp.body.len(), MAX_BODY_EXCERPT_BYTES);
     }
 }

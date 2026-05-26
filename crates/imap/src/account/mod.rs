@@ -8,13 +8,13 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bifrost_types::{
-    Account, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Change,
-    ChangeCursor, Container, ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, Error as AccountError, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    MembershipScope, Message, MutationResult, MutationTarget, ObjectId, Page, Priority, Projection,
-    QuotaInfo, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, ThreadHydration,
-    ThreadId, VacationConfig, WatchEvent,
+    Account, AccountError, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
+    Change, ChangeCursor, Container, ContainerId, ContainerKind, CursorDescriptor,
+    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, MembershipScope, Message,
+    MutationResult, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, SearchRequest,
+    SendRequest, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,7 @@ mod capabilities;
 mod changes;
 mod close;
 mod envelope;
+pub(crate) mod error;
 mod factory;
 mod folder_registry;
 mod get;
@@ -397,7 +398,7 @@ impl Account for ImapAccount {
         _label: ContainerId,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit()
+        pim::unsupported_unit(bifrost_types::AccountOperation::SetLabelMembership)
     }
 
     fn set_category(
@@ -406,7 +407,7 @@ impl Account for ImapAccount {
         _category: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit()
+        pim::unsupported_unit(bifrost_types::AccountOperation::SetCategory)
     }
 
     fn set_extended_property(
@@ -415,7 +416,7 @@ impl Account for ImapAccount {
         _property_id: String,
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit()
+        pim::unsupported_unit(bifrost_types::AccountOperation::SetExtendedProperty)
     }
 
     fn set_is_read(
@@ -427,7 +428,7 @@ impl Account for ImapAccount {
     }
 
     fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object()
+        pim::unsupported_object(bifrost_types::AccountOperation::Send)
     }
 
     fn attachment_upload(
@@ -435,7 +436,7 @@ impl Account for ImapAccount {
         _bytes: AccountStream<Result<bytes::Bytes, AccountError>>,
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-        pim::unsupported_attachment()
+        pim::unsupported_attachment(bifrost_types::AccountOperation::AttachmentUpload)
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
@@ -447,7 +448,7 @@ impl Account for ImapAccount {
         _draft: DraftHandle,
         _patch: DraftPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::unsupported_unit()
+        pim::unsupported_unit(bifrost_types::AccountOperation::DraftUpdate)
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
@@ -455,7 +456,7 @@ impl Account for ImapAccount {
     }
 
     fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object()
+        pim::unsupported_object(bifrost_types::AccountOperation::DraftSend)
     }
 
     fn search(
@@ -567,33 +568,37 @@ impl Account for ImapAccount {
     }
 }
 
+/// Convert a crate-private `crate::Error` into a public `AccountError`
+/// at the account-trait boundary.
+///
+/// Every call site should pass a populated `ImapErrorContext` so that
+/// the central recovery mapping has the operation and scope it needs
+/// to derive `RecoveryClass`. A bare `ImapErrorContext::empty()` is
+/// allowed for sites still being migrated, but produces a less precise
+/// recovery verdict.
 pub(crate) fn account_error(err: Error) -> AccountError {
-    match err {
-        Error::Auth { text, .. } => AccountError::Auth(text),
-        Error::AuthPolicy(text) => AccountError::Auth(text.to_string()),
-        Error::Io(e) => AccountError::Transport(e.to_string()),
-        Error::Closed | Error::DriverGone | Error::DriverPanicked(_) => {
-            AccountError::Transport(err.to_string())
-        }
-        other => AccountError::Other(other.to_string()),
-    }
+    error::into_account_error(err, error::ImapErrorContext::empty())
 }
 
-pub(crate) fn fatal_event<T>(err: Error) -> SyncEvent<T> {
-    SyncEvent::Fatal(bifrost_types::Fatal {
-        recovery: match err.recovery() {
-            crate::Recovery::Reconnect
-            | crate::Recovery::RetryOrReconnect
-            | crate::Recovery::RetryAfter => bifrost_types::RecoveryClass::Retry {
-                after: Duration::from_secs(5),
-            },
-            crate::Recovery::Reauthenticate => bifrost_types::RecoveryClass::AuthLost,
-            crate::Recovery::ResyncMailbox => bifrost_types::RecoveryClass::RestartAccount,
-            _ => bifrost_types::RecoveryClass::Fatal,
-        },
-        message: err.to_string(),
-        source: Some(account_error(err)),
-    })
+pub(crate) fn account_error_with(err: Error, ctx: error::ImapErrorContext) -> AccountError {
+    error::into_account_error(err, ctx)
+}
+
+/// Wrap a crate-private error as a terminal sync-stream event.
+///
+/// Phase 3 will reconcile this against whatever shape
+/// `bifrost_types::events::SyncEvent` carries for terminal errors after
+/// the rename from `Fatal(Fatal)` to `Terminated(AccountError)`. Until
+/// then, this helper builds the `AccountError` correctly; the
+/// `SyncEvent` adapter glue moves with that rename.
+pub(crate) fn fatal_event<T>(err: Error, ctx: error::ImapErrorContext) -> SyncEvent<T> {
+    SyncEvent::Terminated(error::into_account_error(err, ctx))
+}
+
+/// Wrap a structured `AccountError` (already built by the account
+/// boundary, e.g. UIDVALIDITY change) as a terminal stream event.
+pub(crate) fn terminated_event<T>(err: AccountError) -> SyncEvent<T> {
+    SyncEvent::Terminated(err)
 }
 
 pub(crate) fn boxed_receiver_stream<T: Send + 'static>(
@@ -648,10 +653,15 @@ pub(crate) fn batch<T>(
 
 pub(crate) fn folder_from_scope(scope: &CursorScope) -> Result<MailboxName, AccountError> {
     match scope {
-        CursorScope::Folder(folder) => {
-            MailboxName::new(folder.0.clone()).map_err(|e| AccountError::Other(e.to_string()))
-        }
-        _ => Err(AccountError::Unsupported),
+        CursorScope::Folder(folder) => MailboxName::new(folder.0.clone()).map_err(|e| {
+            error::into_account_error(
+                Error::InvalidInput(e.to_string()),
+                error::ImapErrorContext::operation(bifrost_types::AccountOperation::Discover),
+            )
+        }),
+        _ => Err(error::unsupported(
+            bifrost_types::AccountOperation::Discover,
+        )),
     }
 }
 

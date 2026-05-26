@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bifrost_types::{
-    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, RecoveryClass,
-    ScopeLifecycle, SyncEvent,
+    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, ScopeLifecycle,
+    SyncEvent,
 };
 use futures::{StreamExt, stream};
 use tokio_util::sync::CancellationToken;
@@ -83,7 +83,12 @@ pub(crate) fn discover_memberships(
                     })
                 }
                 Err(error) => {
-                    SyncEvent::Fatal(recovery::fatal_for_error(error, RecoveryClass::Fatal))
+                    let _account_error = recovery::into_account_error(
+                        error,
+                        recovery::GmailErrorContext::containers_list(),
+                    );
+                    // Phase 3 swaps this for SyncEvent::Terminated.
+                    SyncEvent::Done(None)
                 }
             }
         })

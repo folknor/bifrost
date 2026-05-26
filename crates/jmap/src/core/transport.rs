@@ -11,6 +11,11 @@ pub(crate) struct TransportError {
     pub(crate) message: String,
     /// HTTP response body, if available (for parsing ProblemDetails).
     pub(crate) body: Option<Bytes>,
+    /// Original net error, when the default reqwest-backed transport
+    /// produced this `TransportError`. Custom transports leave this
+    /// `None`; the conversion boundary falls back to a generic
+    /// `Transport(Network)` classification when absent.
+    pub(crate) net: Option<bifrost_net::Error>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -33,6 +38,7 @@ impl TransportError {
         Self {
             message: message.into(),
             body: None,
+            net: None,
             source: None,
         }
     }
@@ -44,6 +50,7 @@ impl TransportError {
         Self {
             message: message.into(),
             body: None,
+            net: None,
             source: Some(Box::new(source)),
         }
     }
@@ -52,7 +59,38 @@ impl TransportError {
         Self {
             message: message.into(),
             body: Some(body.into()),
+            net: None,
             source: None,
+        }
+    }
+
+    /// Construct a `TransportError` from a `bifrost_net::Error`,
+    /// preserving the original net error so the JMAP conversion
+    /// boundary can delegate to `bifrost_net::into_account_error`
+    /// for pure transport failures.
+    pub(crate) fn from_net(error: bifrost_net::Error) -> Self {
+        let message = error.to_string();
+        match error {
+            bifrost_net::Error::Status {
+                code,
+                body,
+                headers,
+            } => Self {
+                message: format!("HTTP {code}"),
+                body: Some(body.clone()),
+                net: Some(bifrost_net::Error::Status {
+                    code,
+                    body,
+                    headers,
+                }),
+                source: None,
+            },
+            other => Self {
+                message,
+                body: None,
+                net: Some(other),
+                source: None,
+            },
         }
     }
 }

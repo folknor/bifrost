@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
-    AccountFuture, AccountStream, CursorScope, Error as AccountError, SubscriptionHandle,
+    AccountError, AccountFuture, AccountOperation, AccountStream, CursorScope, SubscriptionHandle,
     WatchEvent,
 };
 use serde::{Deserialize, Serialize};
@@ -126,14 +126,23 @@ pub(crate) fn push_subscribe(
                 .iter()
                 .any(|scope| !matches!(scope, CursorScope::Account))
         {
-            return Err(AccountError::Unsupported);
+            return Err(recovery::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::PushSubscribe),
+                recovery::GmailErrorContext::push_subscribe(),
+            ));
         }
         let Some(config) = pubsub.config().cloned() else {
-            return Err(AccountError::Unsupported);
+            return Err(recovery::into_account_error(
+                crate::error::Error::unsupported_with(
+                    AccountOperation::PushSubscribe,
+                    "no Pub/Sub topic configured",
+                ),
+                recovery::GmailErrorContext::push_subscribe(),
+            ));
         };
-        let response = watch_once(&client, &config)
-            .await
-            .map_err(|error| recovery::account_error_from_gmail(&error))?;
+        let response = watch_once(&client, &config).await.map_err(|error| {
+            recovery::into_account_error(error, recovery::GmailErrorContext::push_subscribe())
+        })?;
         pubsub.store_watch_response(&response).await;
         pubsub.report_health(WatchEvent::Reconnected);
         start_renewer(
@@ -150,7 +159,15 @@ pub(crate) fn push_subscribe(
         };
         let handle = serde_json::to_string(&handle)
             .map(SubscriptionHandle)
-            .map_err(|error| AccountError::Other(error.to_string()))?;
+            .map_err(|error| {
+                recovery::into_account_error(
+                    crate::error::Error::invalid_request(
+                        AccountOperation::PushSubscribe,
+                        format!("subscription handle encode failed: {error}"),
+                    ),
+                    recovery::GmailErrorContext::push_subscribe(),
+                )
+            })?;
         pubsub.insert_handle(&handle).await;
         Ok(handle)
     })
@@ -164,14 +181,20 @@ pub(crate) fn push_unsubscribe(
     Box::pin(async move {
         let _decoded: GmailSubscriptionHandle =
             serde_json::from_str(&handle.0).map_err(|error| {
-                AccountError::Other(format!("invalid gmail subscription handle: {error}"))
+                recovery::into_account_error(
+                    crate::error::Error::invalid_request(
+                        AccountOperation::PushUnsubscribe,
+                        format!("invalid gmail subscription handle: {error}"),
+                    ),
+                    recovery::GmailErrorContext::push_unsubscribe(),
+                )
             })?;
         if !pubsub.remove_handle(&handle).await {
             return Ok(());
         }
-        stop_watch(&client)
-            .await
-            .map_err(|error| recovery::account_error_from_gmail(&error))?;
+        stop_watch(&client).await.map_err(|error| {
+            recovery::into_account_error(error, recovery::GmailErrorContext::push_unsubscribe())
+        })?;
         *pubsub.expiration.lock().await = None;
         *pubsub.last_history_id.lock().await = None;
         pubsub.abort_renewer().await;

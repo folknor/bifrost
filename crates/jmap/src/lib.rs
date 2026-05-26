@@ -209,10 +209,25 @@ pub(crate) enum WebSocketSetupError {
 pub(crate) enum Error {
     /// Transport-level failure (network, TLS, timeout).
     Transport(core::transport::TransportError),
-    /// JSON deserialization failure.
-    Parse(serde_json::Error),
-    /// Server returned an RFC 7807 problem details response.
-    Problem(Box<ProblemDetails>),
+    /// Outbound JSON request serialization failure. Produced when the
+    /// crate fails to encode a `Request` or per-method body before the
+    /// request crosses the side-effect boundary. Maps to
+    /// `Request(Malformed)` / `ClientBug` in the conversion boundary.
+    RequestEncode(serde_json::Error),
+    /// Inbound JSON response decoding failure. Produced when the JMAP
+    /// server's reply or session document cannot be parsed as the
+    /// expected shape. Maps to `Protocol(ParseFailed)` /
+    /// `ProviderContractViolation`.
+    ResponseDecode(serde_json::Error),
+    /// Server returned an RFC 7807 problem details response. Carries
+    /// the parsed `ProblemDetails` plus, when the failure flowed
+    /// through the default reqwest transport, the originating
+    /// `TransportError` so the conversion can pull status, headers,
+    /// retry hints, and trace IDs straight off `bifrost_net::Error`.
+    Problem {
+        details: Box<ProblemDetails>,
+        transport: Option<core::transport::TransportError>,
+    },
     /// A JMAP method call returned an error response.
     Method(MethodError),
     /// A JMAP set operation returned per-object errors.
@@ -253,15 +268,21 @@ impl From<core::transport::TransportError> for Error {
         if let Some(ref body) = e.body
             && let Ok(problem) = serde_json::from_slice::<ProblemDetails>(body)
         {
-            return Error::Problem(Box::new(problem));
+            return Error::Problem {
+                details: Box::new(problem),
+                transport: Some(e),
+            };
         }
         Error::Transport(e)
     }
 }
 
+// Default JSON-error conversion treats failures as response decoding.
+// Outbound request encoding sites must use Error::RequestEncode
+// explicitly rather than relying on `?`.
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
-        Error::Parse(e)
+        Error::ResponseDecode(e)
     }
 }
 
@@ -273,7 +294,10 @@ impl From<MethodError> for Error {
 
 impl From<ProblemDetails> for Error {
     fn from(e: ProblemDetails) -> Self {
-        Error::Problem(Box::new(e))
+        Error::Problem {
+            details: Box::new(e),
+            transport: None,
+        }
     }
 }
 
@@ -322,8 +346,9 @@ impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Transport(e) => write!(f, "Transport error: {e}"),
-            Error::Parse(e) => write!(f, "Parse error: {e}"),
-            Error::Problem(e) => write!(f, "Problem: {e}"),
+            Error::RequestEncode(e) => write!(f, "Request encode error: {e}"),
+            Error::ResponseDecode(e) => write!(f, "Response decode error: {e}"),
+            Error::Problem { details, .. } => write!(f, "Problem: {details}"),
             Error::Method(e) => write!(f, "Method error: {e}"),
             Error::Set(e) => write!(f, "Set error: {e}"),
             Error::CallNotFound(id) => write!(f, "Call {id} not found in response"),

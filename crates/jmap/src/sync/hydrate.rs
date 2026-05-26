@@ -23,7 +23,7 @@ pub(crate) fn stream(
 ) -> AccountStream<SyncEvent<HydratedObject>> {
     Box::pin(async_stream::stream! {
         if !matches!(projection, Projection::FlagsOnly | Projection::Metadata) {
-            yield super::error::fatal_unsupported(
+            yield super::error::terminated_unsupported(
                 "JMAP raw-MIME hydration projections need a MIME assembly path outside this wave",
             );
             return;
@@ -37,7 +37,10 @@ pub(crate) fn stream(
                     Ok(Some(batch)) => yield SyncEvent::Batch(batch),
                     Ok(None) => {}
                     Err(err) => {
-                        yield super::error::fatal_from_jmap(err, None);
+                        yield super::error::terminated_from_jmap(
+                            err,
+                            super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Hydrate),
+                        );
                         return;
                     }
                 }
@@ -49,7 +52,10 @@ pub(crate) fn stream(
                 Ok(Some(batch)) => yield SyncEvent::Batch(batch),
                 Ok(None) => {}
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(err, None);
+                    yield super::error::terminated_from_jmap(
+                        err,
+                        super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Hydrate),
+                    );
                     return;
                 }
             }

@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use bifrost_types::{AccountStream, Batch, BlobHandle, ByteRange, Error, PageBoundary, SyncEvent};
+use bifrost_types::{
+    AccountOperation, AccountStream, Batch, BlobHandle, ByteRange, PageBoundary, SyncEvent,
+};
 
 use crate::blob::BlobRef;
 use crate::client::Client;
@@ -31,7 +33,10 @@ pub(crate) fn open(
                 yield SyncEvent::Done(None);
             }
             Err(err) => {
-                yield super::error::fatal_from_jmap(err, None);
+                yield super::error::terminated_from_jmap(
+                    err,
+                    super::error::JmapErrorContext::new(AccountOperation::OpenBlob),
+                );
             }
         }
     })
@@ -45,26 +50,20 @@ pub(crate) fn open_range(
         if let (Some(total), start) = (handle.size, range.start)
             && start >= total
         {
-            yield super::error::fatal_from_account_error(
-                Error::RangeOutOfBounds { start, total },
-                None,
-                "JMAP blob range starts past the known blob size",
-            );
+            yield super::error::terminated_unsupported(format!(
+                "JMAP blob range starts past the known blob size (start {start}, total {total})",
+            ));
             return;
         }
 
         if !handle.capabilities.supports_range {
-            yield super::error::fatal_from_account_error(
-                Error::RangeNotSupported,
-                None,
+            yield super::error::terminated_unsupported(
                 "JMAP blob handle does not support range fetches",
             );
             return;
         }
 
-        yield super::error::fatal_from_account_error(
-            Error::Unsupported,
-            None,
+        yield super::error::terminated_unsupported(
             "JMAP ranged blob download needs a Range-capable transport hook",
         );
     })

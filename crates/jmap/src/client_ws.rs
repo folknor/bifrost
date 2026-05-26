@@ -189,7 +189,7 @@ impl Client {
                                     });
                                     match serde_json::from_value::<Response>(json) {
                                         Ok(resp) => yield Ok(WebSocketMessage::Response(resp)),
-                                        Err(e) => yield Err(crate::Error::Parse(e)),
+                                        Err(e) => yield Err(crate::Error::ResponseDecode(e)),
                                     }
                                 }
                                 WebSocketMessage_::StateChange(push) => {

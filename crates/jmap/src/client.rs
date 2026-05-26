@@ -342,7 +342,7 @@ impl<T: HttpTransport> Client<T> {
         &self,
         request: &request::Request<'_, T>,
     ) -> crate::Result<response::Response> {
-        let body = serde_json::to_vec(request)?;
+        let body = serde_json::to_vec(request).map_err(crate::Error::RequestEncode)?;
         let bytes = self
             .inner
             .transport

@@ -5,6 +5,7 @@
 pub mod account;
 mod api;
 mod client;
+mod error;
 mod ews;
 mod types;
 mod webhooks;

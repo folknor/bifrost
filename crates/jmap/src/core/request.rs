@@ -127,8 +127,11 @@ impl<'x, T: HttpTransport> Request<'x, T> {
         // field. No-op for methods that don't carry an accountId.
         method.set_account_id(&self.account_id);
 
-        // Serialize method arguments once as raw JSON
-        let arguments = serde_json::value::to_raw_value(&method)?;
+        // Serialize method arguments once as raw JSON. This is an
+        // outbound encode; classify as RequestEncode rather than the
+        // default ResponseDecode conversion.
+        let arguments =
+            serde_json::value::to_raw_value(&method).map_err(crate::Error::RequestEncode)?;
 
         self.method_calls.push(RawMethodCall {
             name: M::NAME,

@@ -23,17 +23,17 @@ pub(crate) fn stream(
         CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
         CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
         CursorScope::Type(ObjectType::Thread) => Box::pin(async_stream::stream! {
-                yield super::error::fatal_unsupported(
+                yield super::error::terminated_unsupported(
                     "JMAP thread inventory is derived from Email inventory in this implementation",
                 );
         }),
         CursorScope::Query(_) => Box::pin(async_stream::stream! {
-                yield super::error::fatal_unsupported(
+                yield super::error::terminated_unsupported(
                     "JMAP query inventory requires registered query definitions outside the v1 Account trait",
                 );
         }),
         _ => Box::pin(async_stream::stream! {
-                yield super::error::fatal_unsupported("cursor scope is not supported by JMAP");
+                yield super::error::terminated_unsupported("cursor scope is not supported by JMAP");
         }),
     }
 }
@@ -52,7 +52,7 @@ pub(crate) fn stream_partition(
             email_inventory_page(mail, limits, from, to)
         }
         _ => Box::pin(async_stream::stream! {
-            yield super::error::fatal_unsupported(
+            yield super::error::terminated_unsupported(
                 "JMAP inventory partition is not supported for this cursor scope",
             );
         }),
@@ -81,9 +81,12 @@ fn email_inventory(
             let query_response = match query_response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(
+                    yield super::error::terminated_from_jmap(
                         err,
-                        Some(CursorScope::Type(ObjectType::Email)),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            CursorScope::Type(ObjectType::Email),
+                        ),
                     );
                     break;
                 }
@@ -102,9 +105,12 @@ fn email_inventory(
             let get_response = match get_response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(
+                    yield super::error::terminated_from_jmap(
                         err,
-                        Some(CursorScope::Type(ObjectType::Email)),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            CursorScope::Type(ObjectType::Email),
+                        ),
                     );
                     break;
                 }
@@ -135,7 +141,7 @@ fn email_inventory(
             let advance = match i32::try_from(batch_len) {
                 Ok(value) => value,
                 Err(_) => {
-                    yield super::error::fatal_unsupported(
+                    yield super::error::terminated_unsupported(
                         "JMAP inventory page was too large to advance an i32 position",
                     );
                     break;
@@ -144,7 +150,7 @@ fn email_inventory(
             position = match position.checked_add(advance) {
                 Some(next) => next,
                 None => {
-                    yield super::error::fatal_unsupported(
+                    yield super::error::terminated_unsupported(
                         "JMAP inventory position overflowed",
                     );
                     break;
@@ -170,7 +176,7 @@ fn email_inventory_page(
         let limit = match usize::try_from(to - from) {
             Ok(limit) if limit != 0 => limit,
             _ => {
-                yield super::error::fatal_unsupported(
+                yield super::error::terminated_unsupported(
                     "JMAP inventory page range could not be converted to usize",
                 );
                 return;
@@ -179,7 +185,7 @@ fn email_inventory_page(
         let position = match i32::try_from(from) {
             Ok(position) => position,
             Err(_) => {
-                yield super::error::fatal_unsupported(
+                yield super::error::terminated_unsupported(
                     "JMAP inventory page position exceeded i32",
                 );
                 return;
@@ -197,9 +203,12 @@ fn email_inventory_page(
         let query_response = match query_response {
             Ok(response) => response,
             Err(err) => {
-                yield super::error::fatal_from_jmap(
+                yield super::error::terminated_from_jmap(
                     err,
-                    Some(CursorScope::Type(ObjectType::Email)),
+                    super::error::JmapErrorContext::cursor(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        CursorScope::Type(ObjectType::Email),
+                    ),
                 );
                 return;
             }
@@ -218,9 +227,12 @@ fn email_inventory_page(
         let get_response = match get_response {
             Ok(response) => response,
             Err(err) => {
-                yield super::error::fatal_from_jmap(
+                yield super::error::terminated_from_jmap(
                     err,
-                    Some(CursorScope::Type(ObjectType::Email)),
+                    super::error::JmapErrorContext::cursor(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        CursorScope::Type(ObjectType::Email),
+                    ),
                 );
                 return;
             }
@@ -271,9 +283,12 @@ fn mailbox_inventory(mail: MailAccount) -> AccountStream<SyncEvent<InventoryEntr
         let response = match response {
             Ok(response) => response,
             Err(err) => {
-                yield super::error::fatal_from_jmap(
+                yield super::error::terminated_from_jmap(
                     err,
-                    Some(CursorScope::Type(ObjectType::Mailbox)),
+                    super::error::JmapErrorContext::cursor(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        CursorScope::Type(ObjectType::Mailbox),
+                    ),
                 );
                 return;
             }

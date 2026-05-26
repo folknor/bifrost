@@ -5,6 +5,7 @@ mod cursor;
 mod error;
 mod ews_stream;
 mod get;
+mod graph_error;
 mod inventory;
 mod mutate;
 mod pim;

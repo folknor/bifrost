@@ -583,7 +583,10 @@ impl Account for JmapAccount {
             let result = client.disable_push_ws().await;
             match result {
                 Ok(()) | Err(crate::Error::WebSocketNotConnected) => Ok(()),
-                Err(err) => Err(super::error::to_account_error(err)),
+                Err(err) => Err(super::error::into_account_error(
+                    err,
+                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::Close),
+                )),
             }
         })
     }

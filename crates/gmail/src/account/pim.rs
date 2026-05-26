@@ -7,8 +7,8 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use bifrost_types::{
-    AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline, Container,
-    ContainerId, ContainerKind, DraftHandle, DraftPatch, Error as AccountError, FolderRole,
+    AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
+    Container, ContainerId, ContainerKind, DraftHandle, DraftPatch, FolderRole,
     HydrationProjection, Identity, IdentityId, IdentityPatch, Message, MutationTarget, ObjectId,
     Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter, SearchRequest, SendRequest,
     ThreadHydration, ThreadId, VacationConfig,
@@ -98,7 +98,7 @@ pub(crate) fn send_message(
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         if !request.attachments_uploaded.is_empty() {
-            return Err(AccountError::Unsupported);
+            return Err(unsupported(bifrost_types::AccountOperation::Discover));
         }
         let doc = MailDocument::from_send(request, &default_address);
         let raw = render_message(&doc, &default_address, true)?;
@@ -114,7 +114,7 @@ pub(crate) fn attachment_upload(
     _bytes: AccountStream<Result<Bytes, AccountError>>,
     _mime: String,
 ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
 }
 
 pub(crate) fn draft_create(
@@ -247,7 +247,7 @@ pub(crate) fn container_create(
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if parent.is_some() || !matches!(kind, ContainerKind::Label) {
-            return Err(AccountError::Unsupported);
+            return Err(unsupported(bifrost_types::AccountOperation::Discover));
         }
         let label = client
             .create_label(&name, None)
@@ -264,7 +264,7 @@ pub(crate) fn container_rename(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if is_archive_id(&container.0) {
-            return Err(AccountError::Unsupported);
+            return Err(unsupported(bifrost_types::AccountOperation::Discover));
         }
         client
             .update_label(&container.0, Some(&name), None)
@@ -278,7 +278,7 @@ pub(crate) fn container_move(
     _container: ContainerId,
     _new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
 }
 
 pub(crate) fn container_delete(
@@ -287,7 +287,7 @@ pub(crate) fn container_delete(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if is_archive_id(&container.0) {
-            return Err(AccountError::Unsupported);
+            return Err(unsupported(bifrost_types::AccountOperation::Discover));
         }
         client
             .delete_label(&container.0)
@@ -398,7 +398,7 @@ pub(crate) fn vacation_set(
 }
 
 pub(crate) fn quota_get() -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
-    Box::pin(async { Err(AccountError::Unsupported) })
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::Discover)) })
 }
 
 pub(crate) fn thread_hydrate(
@@ -503,7 +503,7 @@ async fn modify_target(
                 .await
                 .map_err(account_error)?;
         }
-        _ => return Err(AccountError::Unsupported),
+        _ => return Err(unsupported(bifrost_types::AccountOperation::Discover)),
     }
     Ok(())
 }
@@ -573,7 +573,7 @@ fn filter_query(filter: &SearchFilter) -> Result<String, AccountError> {
             .collect::<Result<Vec<_>, _>>()
             .map(|items| format!("({})", items.join(" OR "))),
         SearchFilter::Not(filter) => Ok(format!("-({})", filter_query(filter)?)),
-        _ => Err(AccountError::Unsupported),
+        _ => Err(unsupported(bifrost_types::AccountOperation::Discover)),
     }
 }
 
@@ -582,8 +582,12 @@ fn page_token(request: &SearchRequest) -> Result<Option<String>, AccountError> {
         .page_cursor
         .as_ref()
         .map(|cursor| {
-            String::from_utf8(cursor.clone())
-                .map_err(|error| AccountError::Other(format!("invalid gmail page cursor: {error}")))
+            String::from_utf8(cursor.clone()).map_err(|error| {
+                other_error(
+                    bifrost_types::AccountOperation::Search,
+                    format!("invalid gmail page cursor: {error}"),
+                )
+            })
         })
         .transpose()
 }
@@ -997,12 +1001,13 @@ fn render_message(
     require_recipient: bool,
 ) -> Result<String, AccountError> {
     if require_recipient && doc.to.is_empty() && doc.cc.is_empty() && doc.bcc.is_empty() {
-        return Err(AccountError::Other(
-            "gmail send requires at least one recipient".to_string(),
+        return Err(other_error(
+            bifrost_types::AccountOperation::Send,
+            "gmail send requires at least one recipient",
         ));
     }
     if !doc.attachments_uploaded.is_empty() {
-        return Err(AccountError::Unsupported);
+        return Err(unsupported(bifrost_types::AccountOperation::Discover));
     }
 
     let mut headers = Vec::new();
@@ -1190,8 +1195,32 @@ fn non_negative_i64(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
+/// Generic fallback PIM error translation. Most PIM paths should
+/// migrate to a Gmail context constructor that reflects the actual
+/// operation (e.g. `recovery::GmailErrorContext::send()` for
+/// `users.messages.send` failures). This shim keeps the existing
+/// call sites compiling against the new translation boundary; per-
+/// site refinement lands as the PIM primitives migrate to typed
+/// operation contexts.
+fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
+    recovery::into_account_error(
+        crate::error::Error::unsupported(op),
+        recovery::GmailErrorContext::base(op),
+    )
+}
+
+fn other_error(op: bifrost_types::AccountOperation, detail: impl Into<String>) -> AccountError {
+    recovery::into_account_error(
+        crate::error::Error::invalid_request(op, detail),
+        recovery::GmailErrorContext::base(op),
+    )
+}
+
 fn account_error(error: crate::Error) -> AccountError {
-    recovery::account_error_from_gmail(&error)
+    recovery::into_account_error(
+        error,
+        recovery::GmailErrorContext::base(bifrost_types::AccountOperation::HydrateMessage),
+    )
 }
 
 #[cfg(test)]

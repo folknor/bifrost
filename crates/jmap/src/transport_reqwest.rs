@@ -242,12 +242,11 @@ impl Stream for ReqwestByteStream {
 impl Unpin for ReqwestByteStream {}
 
 fn transport_error_from_net(error: bifrost_net::Error) -> TransportError {
-    match error {
-        bifrost_net::Error::Status { code, body, .. } => {
-            TransportError::with_body(format!("HTTP {code}"), body)
-        }
-        other => TransportError::with_source("HTTP transport failed", other),
-    }
+    // Preserve the original net error so the JMAP conversion boundary
+    // can delegate to bifrost_net::into_account_error for pure
+    // transport-level signals. `TransportError::from_net` retains the
+    // 4xx/5xx body for ProblemDetails parsing as a side benefit.
+    TransportError::from_net(error)
 }
 
 fn redirect_policy_from_trusted_hosts(trusted_hosts: &HashSet<String>) -> RedirectPolicy {

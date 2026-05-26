@@ -22,6 +22,8 @@ email_address = { version = "0.2.1", default-features = false }
 nom = { workspace = true }
 idna = "1"
 
+bifrost-types = { path = "../types", optional = true }
+
 tracing = { workspace = true, features = ["std"], optional = true }
 
 httpdate = "1"
@@ -56,6 +58,8 @@ serde_json = { workspace = true }
 
 [features]
 default = []
+
+account-error = ["dep:bifrost-types"]
 
 tokio = [
     "dep:tokio",

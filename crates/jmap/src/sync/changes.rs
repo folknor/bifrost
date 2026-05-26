@@ -34,10 +34,26 @@ pub(crate) fn stream(
         Ok(decoded) => decoded,
         Err(err) => {
             return Box::pin(async_stream::stream! {
-                yield super::error::fatal_from_account_error(
-                    err,
-                    Some(cursor.scope.clone()),
-                    "failed to decode JMAP change cursor",
+                // Cursor decode failure: the cursor envelope produced
+                // by `state::decode_cursor` is a local cursor schema
+                // error. Phase 3 reshapes `state.rs` to return
+                // `AccountError`; for now we synthesize a
+                // SchemaIncompatible/CursorInvalid AccountError here.
+                let _ = err;
+                yield super::error::terminated(
+                    bifrost_types::AccountErrorBuilder::new(
+                        bifrost_types::AccountErrorKind::SyncState(
+                            bifrost_types::SyncStateErrorKind::SchemaIncompatible,
+                        ),
+                        bifrost_types::Cause::State(bifrost_types::StateCause::SchemaIncompatible),
+                    )
+                    .protocol(bifrost_types::Protocol::Jmap)
+                    .operation(bifrost_types::AccountOperation::SyncChanges)
+                    .scope(bifrost_types::ErrorScope::Cursor(cursor.scope.clone()))
+                    .text(bifrost_types::DiagnosticText::support_only(
+                        "failed to decode JMAP change cursor",
+                    ))
+                    .build(),
                 );
             });
         }
@@ -87,7 +103,13 @@ fn email_changes(
             let response = match response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(err, Some(scope.clone()));
+                    yield super::error::terminated_from_jmap(
+                        err,
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncChanges,
+                            scope.clone(),
+                        ),
+                    );
                     break;
                 }
             };
@@ -139,7 +161,13 @@ fn mailbox_changes(
             let response = match response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(err, Some(scope.clone()));
+                    yield super::error::terminated_from_jmap(
+                        err,
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncChanges,
+                            scope.clone(),
+                        ),
+                    );
                     break;
                 }
             };
@@ -194,7 +222,13 @@ fn thread_changes(
             let response = match response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(err, Some(scope.clone()));
+                    yield super::error::terminated_from_jmap(
+                        err,
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncChanges,
+                            scope.clone(),
+                        ),
+                    );
                     break;
                 }
             };
@@ -243,9 +277,12 @@ fn query_changes(
         let response: QueryChangesResponse<Email> = match response {
             Ok(response) => response,
             Err(err) => {
-                yield super::error::fatal_from_jmap(
+                yield super::error::terminated_from_jmap(
                     err,
-                    Some(CursorScope::Query(bifrost_types::QueryId(query_id.clone()))),
+                    super::error::JmapErrorContext::cursor(
+                        bifrost_types::AccountOperation::SyncChanges,
+                        CursorScope::Query(bifrost_types::QueryId(query_id.clone())),
+                    ),
                 );
                 return;
             }

@@ -67,7 +67,10 @@ pub(crate) fn memberships(mail: MailAccount) -> AccountStream<SyncEvent<Membersh
                 yield SyncEvent::Done(None);
             }
             Err(err) => {
-                yield super::error::fatal_from_jmap(err, None);
+                yield super::error::terminated_from_jmap(
+                    err,
+                    super::error::JmapErrorContext::new(bifrost_types::AccountOperation::DiscoverMemberships),
+                );
             }
         }
     })

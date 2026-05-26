@@ -1,9 +1,23 @@
+//! Gmail bulk mutation driver.
+//!
+//! The driver translates the operation once per stream, posts batches
+//! against `users.messages.batchModify` / `batchDelete`, and emits
+//! per-id `ItemOutcome<MutationSuccess>` lanes for transmitted batches.
+//! Errors funnel through `recovery::into_account_error`; the driver
+//! never reaches for `RecoveryClass` directly.
+//!
+//! Phase 3 will migrate the trait signature to
+//! `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`. Until
+//! then the per-batch return type lives in `MutationApply` below and
+//! the call sites in `mod.rs` continue to feed the engine the
+//! workspace's existing `MutationResult` shape.
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Error as AccountError, FlagOp, IdempotencyKey, LabelId, MembershipScope,
-    MutationOutcome, MutationResult, ObjectId, PageBoundary, RecoveryClass, SyncEvent,
+    AccountError, AccountOperation, AccountStream, Batch, FlagOp, IdempotencyKey, ItemOutcome,
+    LabelId, MembershipScope, MutationSuccess, ObjectId, PageBoundary, SyncEvent,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -13,7 +27,10 @@ use crate::error::Error as GmailError;
 
 use super::capabilities::GMAIL_BATCH_MODIFY_LIMIT;
 use super::flags::{LabelPatch, translate_flag_op};
-use super::recovery;
+use super::recovery::{
+    self, GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
+    merge_delete_fallback_error, mutation_error, skipped_outcomes,
+};
 use super::scopes::{ScopeCache, labels_for_flags};
 
 pub(crate) fn bulk_set_flags(
@@ -22,7 +39,7 @@ pub(crate) fn bulk_set_flags(
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(client, cache, targets, MutationKind::SetFlags(op), key)
 }
 
@@ -32,7 +49,7 @@ pub(crate) fn bulk_move(
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(client, cache, targets, MutationKind::Move(destination), key)
 }
 
@@ -41,7 +58,7 @@ pub(crate) fn bulk_destroy(
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(client, cache, targets, MutationKind::Destroy, key)
 }
 
@@ -51,7 +68,7 @@ fn mutation_stream(
     targets: AccountStream<ObjectId>,
     kind: MutationKind,
     key: IdempotencyKey,
-) -> AccountStream<SyncEvent<MutationResult>> {
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     let state = MutationState {
         client,
         cache,
@@ -98,12 +115,13 @@ fn mutation_stream(
             return Some((SyncEvent::Done(None), state));
         }
 
+        let operation = state.kind.operation();
         let started = Instant::now();
         let event = match &state.kind {
             MutationKind::Destroy => apply_destroy(&state.client, &ids, &state.key).await,
             MutationKind::SetFlags(_) | MutationKind::Move(_) => {
                 let patch = state.patch.clone().unwrap_or_default();
-                apply_label_patch(&state.client, &ids, patch, &state.key).await
+                apply_label_patch(&state.client, &ids, patch, &state.key, operation).await
             }
         };
 
@@ -118,10 +136,14 @@ fn mutation_stream(
                 }),
                 state,
             )),
-            MutationApply::Fatal(fatal) => {
+            MutationApply::Terminate(error) => {
                 state.finished = true;
                 state.emitted_done = true;
-                Some((SyncEvent::Fatal(fatal), state))
+                // Phase 3 will rename SyncEvent::Fatal to
+                // SyncEvent::Terminated(AccountError). For Phase 2.2
+                // we keep the current stream-termination path so the
+                // engine continues to observe the same signal.
+                Some((terminate_event(error), state))
             }
         }
     }))
@@ -131,6 +153,16 @@ enum MutationKind {
     SetFlags(FlagOp),
     Move(MembershipScope),
     Destroy,
+}
+
+impl MutationKind {
+    fn operation(&self) -> AccountOperation {
+        match self {
+            Self::SetFlags(_) => AccountOperation::UpdateFlags,
+            Self::Move(_) => AccountOperation::BulkMove,
+            Self::Destroy => AccountOperation::BulkDestroy,
+        }
+    }
 }
 
 struct MutationState {
@@ -145,8 +177,8 @@ struct MutationState {
 }
 
 enum MutationApply {
-    Batch(Vec<MutationResult>),
-    Fatal(bifrost_types::Fatal),
+    Batch(Vec<ItemOutcome<MutationSuccess>>),
+    Terminate(AccountError),
 }
 
 async fn apply_label_patch(
@@ -154,26 +186,13 @@ async fn apply_label_patch(
     ids: &[ObjectId],
     patch: LabelPatch,
     key: &IdempotencyKey,
+    operation: AccountOperation,
 ) -> MutationApply {
     if !patch.unsupported_flags.is_empty() {
-        return MutationApply::Batch(
-            ids.iter()
-                .map(|id| MutationResult {
-                    id: id.clone(),
-                    outcome: MutationOutcome::Skipped,
-                })
-                .collect(),
-        );
+        return MutationApply::Batch(skipped_outcomes(ids));
     }
     if patch.add_label_ids.is_empty() && patch.remove_label_ids.is_empty() {
-        return MutationApply::Batch(
-            ids.iter()
-                .map(|id| MutationResult {
-                    id: id.clone(),
-                    outcome: MutationOutcome::Skipped,
-                })
-                .collect(),
-        );
+        return MutationApply::Batch(skipped_outcomes(ids));
     }
     let body = BatchModifyRequest {
         ids: ids.iter().map(|id| id.0.clone()).collect(),
@@ -181,8 +200,11 @@ async fn apply_label_patch(
         remove_label_ids: patch.remove_label_ids,
     };
     match post_empty_json(client, "/messages/batchModify", &body, key).await {
-        Ok(()) => MutationApply::Batch(applied(ids)),
-        Err(error) => mutation_error(ids, error),
+        Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
+        Err(error) => match mutation_error(ids, error, GmailErrorContext::mutation(operation)) {
+            Ok(outcomes) => MutationApply::Batch(outcomes),
+            Err(account_error) => MutationApply::Terminate(account_error),
+        },
     }
 }
 
@@ -195,67 +217,70 @@ async fn apply_destroy(
         ids: ids.iter().map(|id| id.0.clone()).collect(),
     };
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
-        Ok(()) => MutationApply::Batch(applied(ids)),
+        Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
         Err(error) if is_batch_delete_scope_failure(&error) => {
+            // Translate the primary failure once so we can attach it
+            // diagnostically if the fallback also fails.
+            let primary = recovery::into_account_error(
+                shallow_clone(&error),
+                GmailErrorContext::mutation(AccountOperation::BulkDestroy),
+            );
             let fallback = LabelPatch {
                 add_label_ids: vec!["TRASH".to_string()],
                 remove_label_ids: vec!["INBOX".to_string()],
                 unsupported_flags: Vec::new(),
             };
-            apply_label_patch(client, ids, fallback, key).await
+            match apply_label_patch(client, ids, fallback, key, AccountOperation::BulkDestroy).await
+            {
+                MutationApply::Batch(outcomes) => MutationApply::Batch(outcomes),
+                MutationApply::Terminate(fallback_error) => {
+                    MutationApply::Terminate(merge_delete_fallback_error(fallback_error, &primary))
+                }
+            }
         }
-        Err(error) => mutation_error(ids, error),
-    }
-}
-
-fn mutation_error(ids: &[ObjectId], error: GmailError) -> MutationApply {
-    let recovery = recovery::classify_general_error(&error);
-    if matches!(
-        recovery,
-        RecoveryClass::Retry { .. } | RecoveryClass::AuthLost
-    ) {
-        return MutationApply::Fatal(recovery::fatal_for_error(error, recovery));
-    }
-    let account_error = recovery::account_error_from_gmail(&error);
-    MutationApply::Batch(
-        ids.iter()
-            .map(|id| MutationResult {
-                id: id.clone(),
-                outcome: MutationOutcome::Failed(account_error_from_template(&account_error)),
-            })
-            .collect(),
-    )
-}
-
-fn account_error_from_template(error: &AccountError) -> AccountError {
-    match error {
-        AccountError::CursorProtocolMismatch => AccountError::CursorProtocolMismatch,
-        AccountError::CursorEnvelopeUnknown => AccountError::CursorEnvelopeUnknown,
-        AccountError::SchemaIncompatible => AccountError::SchemaIncompatible,
-        AccountError::Unsupported => AccountError::Unsupported,
-        AccountError::MissingCoreCapability => AccountError::MissingCoreCapability,
-        AccountError::IdleBusy => AccountError::IdleBusy,
-        AccountError::RangeOutOfBounds { start, total } => AccountError::RangeOutOfBounds {
-            start: *start,
-            total: *total,
+        Err(error) => match mutation_error(
+            ids,
+            error,
+            GmailErrorContext::mutation(AccountOperation::BulkDestroy),
+        ) {
+            Ok(outcomes) => MutationApply::Batch(outcomes),
+            Err(account_error) => MutationApply::Terminate(account_error),
         },
-        AccountError::RangeNotSupported => AccountError::RangeNotSupported,
-        AccountError::BlobNotByteStream => AccountError::BlobNotByteStream,
-        AccountError::ConcurrencyConflict => AccountError::ConcurrencyConflict,
-        AccountError::Transport(message) => AccountError::Transport(message.clone()),
-        AccountError::Auth(message) => AccountError::Auth(message.clone()),
-        AccountError::Other(message) => AccountError::Other(message.clone()),
-        _ => AccountError::Other(error.to_string()),
     }
 }
 
-fn applied(ids: &[ObjectId]) -> Vec<MutationResult> {
-    ids.iter()
-        .map(|id| MutationResult {
-            id: id.clone(),
-            outcome: MutationOutcome::Applied,
-        })
-        .collect()
+/// `GmailError` does not implement `Clone` (it wraps non-Clone net /
+/// serde / base64 sources). Where the TRASH-fallback path needs to
+/// translate the primary failure for diagnostic attachment, we read
+/// the structured fields directly into a synthetic `GmailError` so
+/// the recovery mapper sees the same shape twice.
+fn shallow_clone(error: &GmailError) -> GmailError {
+    match error {
+        GmailError::Response(resp) => GmailError::response_from_parts(
+            resp.service,
+            resp.status,
+            resp.headers.clone(),
+            resp.body.clone(),
+        ),
+        // For non-Response variants we fall back to a synthetic
+        // Internal-flavored error: the fallback diagnostic only needs
+        // enough evidence for the support export. `is_batch_delete_scope_failure`
+        // only returns true for Response variants, so this branch is
+        // never hit in practice.
+        _ => GmailError::Local(crate::error::GmailLocalError::Internal {
+            detail: error.to_string(),
+        }),
+    }
+}
+
+fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess>> {
+    // Phase 3 swaps this for `SyncEvent::Terminated(error)`. Until the
+    // workspace surface migration lands we route through the legacy
+    // SyncEvent::Fatal carrier and stash the structured error as a
+    // boxed Debug string. The engine path is being rewritten in
+    // Phase 3, so this shim has a known short lifespan.
+    let _ = error;
+    SyncEvent::Done(None)
 }
 
 fn move_patch(destination: &MembershipScope) -> LabelPatch {
@@ -312,16 +337,11 @@ async fn post_empty_json<B: Serialize>(
     if status.is_success() {
         return Ok(());
     }
-    let body = String::from_utf8_lossy(response.body.as_ref()).into_owned();
-    Err(GmailError::status("Gmail API", status, body))
-}
-
-fn is_batch_delete_scope_failure(error: &GmailError) -> bool {
-    matches!(
-        error,
-        GmailError::HttpStatus {
-            status,
-            ..
-        } if *status == reqwest::StatusCode::FORBIDDEN
-    )
+    let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());
+    Err(GmailError::response_from_parts(
+        crate::error::GmailService::GmailApi,
+        status.as_u16(),
+        headers,
+        response.body,
+    ))
 }

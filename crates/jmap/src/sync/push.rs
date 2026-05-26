@@ -3,9 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountFuture, AccountStream, CursorScope, Error, HintPayload, InvalidationHint, ObjectType,
-    PushCapability, PushSource, SubscriptionHandle, WatchEvent,
+    AccountError, AccountFuture, AccountOperation, AccountStream, CursorScope, HintPayload,
+    InvalidationHint, ObjectType, PushCapability, PushSource, SubscriptionHandle, WatchEvent,
 };
+
+// Phase-3 trait-shape parity: until the trait surface migrates,
+// `Error` here means `AccountError`.
+type Error = AccountError;
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -95,7 +99,11 @@ pub(crate) fn subscribe(
 ) -> AccountFuture<Result<SubscriptionHandle, Error>> {
     Box::pin(async move {
         if push != PushCapability::InProcess {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::PushSubscribe,
+                None,
+                "JMAP push requires WebSocket subprotocol support",
+            ));
         }
 
         let data_types = scopes
@@ -104,7 +112,11 @@ pub(crate) fn subscribe(
             .collect::<DataTypeSet>();
 
         if data_types.is_empty() {
-            return Err(Error::Unsupported);
+            return Err(super::error::unsupported_error(
+                AccountOperation::PushSubscribe,
+                None,
+                "JMAP push subscribe requires at least one supported scope",
+            ));
         }
 
         let union = {
@@ -180,8 +192,15 @@ async fn apply_push_set(client: &Client, data_types: &DataTypeSet) -> Result<(),
 
     match result {
         Ok(()) => Ok(()),
-        Err(crate::Error::WebSocketNotConnected) => Err(Error::Unsupported),
-        Err(err) => Err(super::error::to_account_error(err)),
+        Err(crate::Error::WebSocketNotConnected) => Err(super::error::unsupported_error(
+            AccountOperation::PushSubscribe,
+            None,
+            "JMAP push: WebSocket not connected",
+        )),
+        Err(err) => Err(super::error::into_account_error(
+            err,
+            super::error::JmapErrorContext::new(AccountOperation::PushSubscribe),
+        )),
     }
 }
 

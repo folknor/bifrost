@@ -1,14 +1,21 @@
-use bifrost_types::{
-    ChangeCursor, CursorScope, Error as AccountError, OpaqueChangeState, ProtocolKind,
-};
+//! Gmail cursor envelope: encode, decode, and identity check.
+//!
+//! Decode failures return crate-internal `GmailLocalError` variants;
+//! the account translation boundary maps these to
+//! `SyncState(SchemaIncompatible | CursorInvalid)` with the cursor
+//! scope so the central recovery mapper derives
+//! `Engine(SchemaIncompatible)` or
+//! `Engine(RestartScope(CursorScope::Account))`.
+
+use bifrost_types::{ChangeCursor, CursorScope, OpaqueChangeState, ProtocolKind};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, GmailCursorFailure, GmailLocalError};
 
 pub(crate) const GMAIL_PROTOCOL: ProtocolKind = ProtocolKind::Gmail;
 pub(crate) const GMAIL_ENVELOPE_VERSION: u32 = 1;
 const GMAIL_SCHEMA_VERSION: u8 = 1;
 
-// Gmail needs a protocol-specific cursor payload for historyId plus
-// account identity; bifrost-types supplies only the opaque envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GmailChangeState {
     pub(crate) history_id: u64,
@@ -35,19 +42,36 @@ pub(crate) fn encode_gmail_state(state: &GmailChangeState) -> OpaqueChangeState 
     }
 }
 
-pub(crate) fn decode_gmail_state(
-    state: &OpaqueChangeState,
-) -> Result<GmailChangeState, AccountError> {
+pub(crate) fn decode_gmail_state(state: &OpaqueChangeState) -> Result<GmailChangeState, Error> {
     if state.protocol != GMAIL_PROTOCOL {
-        return Err(AccountError::SchemaIncompatible);
+        return Err(cursor_error(
+            GmailCursorFailure::ProtocolMismatch,
+            format!("expected {GMAIL_PROTOCOL:?}, got {:?}", state.protocol),
+        ));
     }
     if state.envelope_version != GMAIL_ENVELOPE_VERSION {
-        return Err(AccountError::SchemaIncompatible);
+        return Err(cursor_error(
+            GmailCursorFailure::EnvelopeMismatch,
+            format!(
+                "expected envelope version {GMAIL_ENVELOPE_VERSION}, got {}",
+                state.envelope_version
+            ),
+        ));
     }
-    let decoded: GmailChangeState =
-        serde_json::from_slice(&state.bytes).map_err(|err| AccountError::Other(err.to_string()))?;
+    let decoded: GmailChangeState = serde_json::from_slice(&state.bytes).map_err(|err| {
+        cursor_error(
+            GmailCursorFailure::MalformedPayload,
+            format!("cursor JSON decode failed: {err}"),
+        )
+    })?;
     if decoded.schema_version != GMAIL_SCHEMA_VERSION {
-        return Err(AccountError::SchemaIncompatible);
+        return Err(cursor_error(
+            GmailCursorFailure::SchemaMismatch,
+            format!(
+                "expected schema version {GMAIL_SCHEMA_VERSION}, got {}",
+                decoded.schema_version
+            ),
+        ));
     }
     Ok(decoded)
 }
@@ -55,13 +79,13 @@ pub(crate) fn decode_gmail_state(
 pub(crate) fn decode_gmail_state_for_profile(
     state: &OpaqueChangeState,
     profile_email: &str,
-) -> Result<GmailChangeState, AccountError> {
+) -> Result<GmailChangeState, Error> {
     let decoded = decode_gmail_state(state)?;
     if decoded.profile_email != profile_email {
-        return Err(AccountError::Other(format!(
-            "gmail cursor belongs to {}, opened account is {profile_email}",
-            decoded.profile_email
-        )));
+        return Err(Error::Local(GmailLocalError::AccountIdentityMismatch {
+            cursor_email: decoded.profile_email,
+            profile_email: profile_email.to_string(),
+        }));
     }
     Ok(decoded)
 }
@@ -82,11 +106,24 @@ pub(crate) fn cursor_for_history(history_id: u64, profile_email: &str) -> Change
     )))
 }
 
+fn cursor_error(kind: GmailCursorFailure, detail: String) -> Error {
+    Error::Local(GmailLocalError::InvalidCursor { kind, detail })
+}
+
 #[cfg(test)]
 mod tests {
     use bifrost_types::ProtocolKind;
 
     use super::*;
+
+    fn assert_cursor_kind(err: Error, kind: GmailCursorFailure) {
+        match err {
+            Error::Local(GmailLocalError::InvalidCursor { kind: k, .. }) => {
+                assert_eq!(k, kind);
+            }
+            other => panic!("expected cursor error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn cursor_envelope_round_trips() {
@@ -102,20 +139,16 @@ mod tests {
     fn rejects_wrong_protocol() {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
         opaque.protocol = ProtocolKind::Jmap;
-        assert!(matches!(
-            decode_gmail_state(&opaque),
-            Err(AccountError::SchemaIncompatible)
-        ));
+        let err = decode_gmail_state(&opaque).expect_err("wrong protocol");
+        assert_cursor_kind(err, GmailCursorFailure::ProtocolMismatch);
     }
 
     #[test]
     fn rejects_envelope_version_mismatch() {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
         opaque.envelope_version = 2;
-        assert!(matches!(
-            decode_gmail_state(&opaque),
-            Err(AccountError::SchemaIncompatible)
-        ));
+        let err = decode_gmail_state(&opaque).expect_err("envelope mismatch");
+        assert_cursor_kind(err, GmailCursorFailure::EnvelopeMismatch);
     }
 
     #[test]
@@ -123,7 +156,10 @@ mod tests {
         let opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
         let err =
             decode_gmail_state_for_profile(&opaque, "b@example.test").expect_err("profile swap");
-        assert!(matches!(err, AccountError::Other(_)));
+        assert!(matches!(
+            err,
+            Error::Local(GmailLocalError::AccountIdentityMismatch { .. })
+        ));
     }
 
     #[test]
@@ -138,7 +174,6 @@ mod tests {
 
     #[test]
     fn rejects_schema_version_mismatch() {
-        // Synthesize a payload with a future schema version.
         let payload = serde_json::json!({
             "history_id": 7u64,
             "profile_email": "a@example.test",
@@ -149,19 +184,16 @@ mod tests {
             envelope_version: GMAIL_ENVELOPE_VERSION,
             bytes: serde_json::to_vec(&payload).expect("serialize"),
         };
-        assert!(matches!(
-            decode_gmail_state(&opaque),
-            Err(AccountError::SchemaIncompatible)
-        ));
+        let err = decode_gmail_state(&opaque).expect_err("schema mismatch");
+        assert_cursor_kind(err, GmailCursorFailure::SchemaMismatch);
     }
 
     #[test]
     fn rejects_truncated_bytes() {
         let mut opaque = encode_gmail_state(&GmailChangeState::new(1, "a@example.test"));
-        // Truncate to a definitely-invalid prefix.
         opaque.bytes.truncate(opaque.bytes.len() / 2);
         let err = decode_gmail_state(&opaque).expect_err("truncated bytes");
-        assert!(matches!(err, AccountError::Other(_)));
+        assert_cursor_kind(err, GmailCursorFailure::MalformedPayload);
     }
 
     #[test]
@@ -172,7 +204,7 @@ mod tests {
             bytes: Vec::new(),
         };
         let err = decode_gmail_state(&opaque).expect_err("empty bytes");
-        assert!(matches!(err, AccountError::Other(_)));
+        assert_cursor_kind(err, GmailCursorFailure::MalformedPayload);
     }
 
     #[test]

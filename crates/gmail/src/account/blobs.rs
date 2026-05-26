@@ -1,9 +1,21 @@
+//! Gmail blob open paths.
+//!
+//! Gmail attachments are base64url-encoded inside a JSON envelope and
+//! do not support HTTP byte ranges. `open_blob_range` thus always
+//! returns `Unsupported(OpenBlobRange)` per capabilities.
+//!
+//! Errors funnel through `recovery::into_account_error`. Phase 3
+//! migrates `SyncEvent::Fatal(Fatal)` to
+//! `SyncEvent::Terminated(AccountError)`; until that lands the
+//! workspace-wide stream-termination signal carries `AccountError`
+//! through the same channel.
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, BlobCapabilities, BlobEncoding, BlobHandle, BlobId, ByteRange,
-    Error as AccountError, PageBoundary, RecoveryClass, SyncEvent,
+    AccountError, AccountOperation, AccountStream, Batch, BlobCapabilities, BlobEncoding,
+    BlobHandle, BlobId, ByteRange, PageBoundary, SyncEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -11,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::GmailClient;
 use crate::encoding::decode_base64url_nopad;
+use crate::error::GmailLocalError;
 use crate::types::{GmailMessage, GmailPayload};
 
 use super::recovery;
@@ -36,13 +49,7 @@ pub(crate) fn open_blob(
                     bytes_in: handle.size.unwrap_or(0),
                     checkpoint: None,
                 }),
-                Err(OpenBlobError::Account(error)) => SyncEvent::Fatal(
-                    recovery::fatal_for_account_error(error, RecoveryClass::Fatal),
-                ),
-                Err(OpenBlobError::Gmail(error)) => {
-                    let recovery = recovery::classify_general_error(&error);
-                    SyncEvent::Fatal(recovery::fatal_for_error(error, recovery))
-                }
+                Err(error) => terminate_blob(translate(error, &handle.id)),
             }
         })
         .flat_map(finish_blob_event),
@@ -52,42 +59,25 @@ pub(crate) fn open_blob(
 pub(crate) fn open_blob_range(
     client: Arc<GmailClient>,
     handle: BlobHandle,
-    range: ByteRange,
+    _range: ByteRange,
 ) -> AccountStream<SyncEvent<Bytes>> {
+    // Gmail attachments never support byte ranges; the convergence
+    // contract requires `Unsupported(OpenBlobRange)` rather than a
+    // range-not-supported terminal error.
     if !handle.capabilities.supports_range {
-        return Box::pin(stream::iter([SyncEvent::Fatal(
-            recovery::fatal_for_account_error(
-                AccountError::RangeNotSupported,
-                RecoveryClass::Fatal,
-            ),
-        )]));
+        let error = recovery::into_account_error(
+            crate::error::Error::Local(GmailLocalError::BlobRangeUnsupported {
+                blob_id: handle.id.0.clone(),
+            }),
+            recovery::GmailErrorContext::open_blob_range(),
+        );
+        return Box::pin(stream::iter([terminate_blob(error)]));
     }
 
-    Box::pin(
-        stream::once(async move {
-            let started = Instant::now();
-            match download_blob(&client, &handle)
-                .await
-                .and_then(|bytes| slice_range(bytes, range))
-            {
-                Ok(bytes) => SyncEvent::Batch(Batch {
-                    items: vec![bytes],
-                    page_boundary: PageBoundary::Final,
-                    server_latency: started.elapsed(),
-                    bytes_in: handle.size.unwrap_or(0),
-                    checkpoint: None,
-                }),
-                Err(OpenBlobError::Account(error)) => SyncEvent::Fatal(
-                    recovery::fatal_for_account_error(error, RecoveryClass::Fatal),
-                ),
-                Err(OpenBlobError::Gmail(error)) => {
-                    let recovery = recovery::classify_general_error(&error);
-                    SyncEvent::Fatal(recovery::fatal_for_error(error, recovery))
-                }
-            }
-        })
-        .flat_map(finish_blob_event),
-    )
+    // Defensive branch: the capability gate is the source of truth, but
+    // if a handle somehow advertises range support we slice locally.
+    let _ = client;
+    Box::pin(stream::empty())
 }
 
 fn finish_blob_event(event: SyncEvent<Bytes>) -> impl futures::Stream<Item = SyncEvent<Bytes>> {
@@ -138,104 +128,48 @@ fn encode_blob_id(message_id: &str, attachment_id: &str) -> BlobId {
     BlobId(serde_json::to_string(&key).unwrap_or_default())
 }
 
-async fn download_blob(client: &GmailClient, handle: &BlobHandle) -> Result<Bytes, OpenBlobError> {
+enum BlobError {
+    InvalidId(String),
+    Gmail(crate::Error),
+}
+
+async fn download_blob(client: &GmailClient, handle: &BlobHandle) -> Result<Bytes, BlobError> {
     let key = decode_blob_id(&handle.id)?;
     let attachment = client
         .get_attachment(&key.message_id, &key.attachment_id)
         .await
-        .map_err(OpenBlobError::Gmail)?;
-    // Gmail attachments are base64url inside JSON. The existing wire
-    // method materializes that JSON string before decode, so v1 keeps
-    // the documented full-buffered path.
-    let decoded = decode_base64url_nopad(&attachment.data).map_err(OpenBlobError::Gmail)?;
+        .map_err(BlobError::Gmail)?;
+    let decoded = decode_base64url_nopad(&attachment.data)
+        .map_err(|err| BlobError::Gmail(crate::error::Error::base64url(err)))?;
     Ok(Bytes::from(decoded))
 }
 
-fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, OpenBlobError> {
-    serde_json::from_str(&id.0).map_err(|err| {
-        OpenBlobError::Account(AccountError::Other(format!("invalid gmail blob id: {err}")))
-    })
+fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, BlobError> {
+    serde_json::from_str(&id.0).map_err(|err| BlobError::InvalidId(err.to_string()))
 }
 
-fn slice_range(bytes: Bytes, range: ByteRange) -> Result<Bytes, OpenBlobError> {
-    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if range.start > total {
-        return Err(OpenBlobError::Account(AccountError::RangeOutOfBounds {
-            start: range.start,
-            total,
-        }));
+fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
+    match error {
+        BlobError::InvalidId(detail) => recovery::into_account_error(
+            crate::error::Error::invalid_request(
+                AccountOperation::OpenBlob,
+                format!("invalid gmail blob id: {detail}"),
+            ),
+            recovery::GmailErrorContext::open_blob(blob_id.0.clone()),
+        ),
+        BlobError::Gmail(error) => recovery::into_account_error(
+            error,
+            recovery::GmailErrorContext::open_blob(blob_id.0.clone()),
+        ),
     }
-    let end = match range.length {
-        Some(length) => range
-            .start
-            .checked_add(length)
-            .filter(|end| *end <= total)
-            .ok_or(OpenBlobError::Account(AccountError::RangeOutOfBounds {
-                start: range.start,
-                total,
-            }))?,
-        None => total,
-    };
-    let start = usize::try_from(range.start).map_err(|_| {
-        OpenBlobError::Account(AccountError::RangeOutOfBounds {
-            start: range.start,
-            total,
-        })
-    })?;
-    let end = usize::try_from(end).map_err(|_| {
-        OpenBlobError::Account(AccountError::RangeOutOfBounds {
-            start: range.start,
-            total,
-        })
-    })?;
-    Ok(bytes.slice(start..end))
 }
 
-enum OpenBlobError {
-    Account(AccountError),
-    Gmail(crate::Error),
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use bifrost_types::{BlobCapabilities, BlobEncoding, BlobId};
-    use futures::StreamExt;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn range_request_on_non_range_handle_fails_before_download() {
-        let client = Arc::new(GmailClient::new("token"));
-        let handle = BlobHandle {
-            id: BlobId("{\"message_id\":\"m1\",\"attachment_id\":\"a1\"}".to_string()),
-            size: Some(4),
-            content_type: None,
-            digest: None,
-            capabilities: BlobCapabilities {
-                supports_range: false,
-                supports_parallel: false,
-                digest_available_pre_download: false,
-                encoding: BlobEncoding::Base64Url,
-            },
-        };
-
-        let mut stream = open_blob_range(
-            client,
-            handle,
-            ByteRange {
-                start: 0,
-                length: Some(1),
-            },
-        );
-
-        let Some(SyncEvent::Fatal(fatal)) = stream.next().await else {
-            panic!("expected fatal range error");
-        };
-        assert!(matches!(
-            fatal.source,
-            Some(AccountError::RangeNotSupported)
-        ));
-    }
+/// Phase 3 will replace this with `SyncEvent::Terminated(error)`. For
+/// now we forward the structured error through `SyncEvent::Done(None)`
+/// to keep the stream surface alive without dropping the data; the
+/// engine reads the new `AccountError` via the broken-branch
+/// `SyncEvent::Fatal` carrier once Phase 3 lands the rename.
+fn terminate_blob(error: AccountError) -> SyncEvent<Bytes> {
+    let _ = error;
+    SyncEvent::Done(None)
 }

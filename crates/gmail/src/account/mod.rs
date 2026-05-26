@@ -15,14 +15,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountFactory, AccountFuture, AccountId, AccountStream,
-    AttachmentHandle, BlobHandle, ByteRange, Change, ChangeCursor, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, Error as AccountError, FlagOp, HydratedObject, HydrationProjection, IdempotencyKey,
-    Identity, IdentityId, IdentityPatch, InventoryEntry, MembershipScope, Message, MutationResult,
-    MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo,
-    ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
+    AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Change, ChangeCursor,
+    Container, ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment,
+    CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
+    Priority, Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -100,12 +101,17 @@ impl GmailAccount {
         client: Arc<GmailClient>,
         pubsub: Option<PubSubConfig>,
     ) -> Result<Arc<Self>, AccountError> {
-        let profile = client
-            .get_profile()
-            .await
-            .map_err(|error| recovery::account_error_from_gmail(&error))?;
+        let profile = client.get_profile().await.map_err(|error| {
+            recovery::into_account_error(error, recovery::GmailErrorContext::open())
+        })?;
         let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-            AccountError::Other(format!("gmail profile carried invalid history id: {error}"))
+            recovery::into_account_error(
+                crate::error::Error::missing_field(
+                    "historyId",
+                    format!("gmail profile invalid history id: {error}"),
+                ),
+                recovery::GmailErrorContext::open(),
+            )
         })?;
         let seed_state = encode_gmail_state(&GmailChangeState::new(
             history_id,
@@ -179,7 +185,10 @@ impl Account for GmailAccount {
         let seed = self.seed_state.clone();
         Box::pin(async move {
             if !matches!(scope, CursorScope::Account) {
-                return Err(AccountError::Unsupported);
+                return Err(recovery::into_account_error(
+                    crate::error::Error::unsupported(AccountOperation::EstablishCursor),
+                    recovery::GmailErrorContext::establish_cursor(),
+                ));
             }
             Ok(CursorEstablishment::Ready(cursor_from_state(seed)))
         })
@@ -310,7 +319,12 @@ impl Account for GmailAccount {
         _keyword: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(AccountError::Unsupported) })
+        Box::pin(async {
+            Err(recovery::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::SetKeyword),
+                recovery::GmailErrorContext::mutation(AccountOperation::SetKeyword),
+            ))
+        })
     }
 
     fn set_label_membership(
@@ -328,7 +342,12 @@ impl Account for GmailAccount {
         _category: String,
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(AccountError::Unsupported) })
+        Box::pin(async {
+            Err(recovery::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::SetCategory),
+                recovery::GmailErrorContext::mutation(AccountOperation::SetCategory),
+            ))
+        })
     }
 
     fn set_extended_property(
@@ -337,7 +356,12 @@ impl Account for GmailAccount {
         _property_id: String,
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(AccountError::Unsupported) })
+        Box::pin(async {
+            Err(recovery::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::SetExtendedProperty),
+                recovery::GmailErrorContext::mutation(AccountOperation::SetExtendedProperty),
+            ))
+        })
     }
 
     fn set_is_read(

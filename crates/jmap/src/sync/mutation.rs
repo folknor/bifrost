@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Error, FlagOp, IdempotencyKey, MembershipScope, MutationOutcome,
-    MutationResult, ObjectId, PageBoundary, SyncEvent,
+    AccountOperation, AccountStream, Batch, BatchItemId, ErrorScope, FlagOp, IdempotencyKey,
+    ItemOutcome, MembershipScope, MutationOutcome, MutationResult, MutationSuccess, ObjectId,
+    PageBoundary, SyncEvent,
 };
 use futures::StreamExt;
 use tokio::sync::Mutex;
@@ -39,11 +40,11 @@ pub(crate) fn move_to(
         MembershipScope::Mailbox(mailbox) => MutationKind::Move(MailboxId::new(mailbox.0)),
         _ => {
             return Box::pin(async_stream::stream! {
-                yield super::error::fatal_from_account_error(
-                    Error::Unsupported,
+                yield super::error::terminated(super::error::unsupported_error(
+                    bifrost_types::AccountOperation::BulkMove,
                     None,
                     "JMAP bulk_move only supports MembershipScope::Mailbox",
-                );
+                ));
             });
         }
     };
@@ -66,6 +67,14 @@ enum MutationKind {
     Destroy,
 }
 
+fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
+    match kind {
+        MutationKind::Flags(_) => AccountOperation::UpdateFlags,
+        MutationKind::Move(_) => AccountOperation::BulkMove,
+        MutationKind::Destroy => AccountOperation::BulkDestroy,
+    }
+}
+
 fn mutation_stream(
     mail: MailAccount,
     limits: CoreLimits,
@@ -83,7 +92,10 @@ fn mutation_stream(
                     Ok(Some(out)) => yield SyncEvent::Batch(out),
                     Ok(None) => {}
                     Err(err) => {
-                        yield super::error::fatal_from_jmap(err, None);
+                        yield super::error::terminated_from_jmap(
+                            err,
+                            super::error::JmapErrorContext::new(operation_for_kind(&kind)),
+                        );
                         return;
                     }
                 }
@@ -95,7 +107,10 @@ fn mutation_stream(
                 Ok(Some(out)) => yield SyncEvent::Batch(out),
                 Ok(None) => {}
                 Err(err) => {
-                    yield super::error::fatal_from_jmap(err, None);
+                    yield super::error::terminated_from_jmap(
+                        err,
+                        super::error::JmapErrorContext::new(operation_for_kind(&kind)),
+                    );
                     return;
                 }
             }
@@ -136,18 +151,44 @@ async fn apply_batch(
         advance_email_state(email_state, Some(&state), new_state).await;
     }
 
+    let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());
     for id in ids {
         let email_id = EmailId::new(id.0.clone());
-        let outcome = match kind {
-            MutationKind::Destroy => match response.destroyed(&email_id) {
-                Ok(()) => MutationOutcome::Applied,
-                Err(err) => MutationOutcome::Failed(super::error::to_account_error(err)),
-            },
-            MutationKind::Flags(_) | MutationKind::Move(_) => match response.updated(&email_id) {
-                Ok(_) => MutationOutcome::Applied,
-                Err(err) => MutationOutcome::Failed(super::error::to_account_error(err)),
-            },
+        let raw = match kind {
+            MutationKind::Destroy => response.destroyed(&email_id),
+            MutationKind::Flags(_) | MutationKind::Move(_) => {
+                response.updated(&email_id).map(|_| ())
+            }
+        };
+        let outcome = match raw {
+            Ok(()) => MutationOutcome::Applied,
+            Err(crate::Error::Set(set_error)) => {
+                // Wire the per-item classification helper. This is
+                // the Phase 2 contact point - Phase 3 changes the
+                // stream signature to `ItemOutcome<MutationSuccess>`
+                // and bypasses the `MutationOutcome` adapter below.
+                let ctx = super::error::JmapErrorContext::new(operation);
+                let item_scope = Some(ErrorScope::Message { id: id.0.clone() });
+                match super::error::classify_set_item(
+                    set_error,
+                    ctx,
+                    BatchItemId(id.0.clone()),
+                    item_scope,
+                ) {
+                    ItemOutcome::Succeeded(success) => match success.output {
+                        MutationSuccess::Applied => MutationOutcome::Applied,
+                        MutationSuccess::Skipped => MutationOutcome::Skipped,
+                    },
+                    ItemOutcome::Failed(failure) => MutationOutcome::Failed(failure.error),
+                    ItemOutcome::Uncertain(uncertain) => MutationOutcome::Failed(uncertain.error),
+                }
+            }
+            Err(err) => MutationOutcome::Failed(super::error::into_account_error(
+                err,
+                super::error::JmapErrorContext::new(operation)
+                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            )),
         };
         results.push(MutationResult { id, outcome });
     }

@@ -43,51 +43,68 @@ pub(crate) struct MethodError {
     p_type: MethodErrorType,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub(crate) enum MethodErrorType {
-    #[serde(rename = "serverUnavailable")]
     ServerUnavailable,
-    #[serde(rename = "serverFail")]
     ServerFail,
-    #[serde(rename = "serverPartialFail")]
     ServerPartialFail,
-    #[serde(rename = "unknownMethod")]
     UnknownMethod,
-    #[serde(rename = "invalidArguments")]
     InvalidArguments,
-    #[serde(rename = "invalidResultReference")]
     InvalidResultReference,
-    #[serde(rename = "forbidden")]
     Forbidden,
-    #[serde(rename = "accountNotFound")]
     AccountNotFound,
-    #[serde(rename = "accountNotSupportedByMethod")]
     AccountNotSupportedByMethod,
-    #[serde(rename = "accountReadOnly")]
     AccountReadOnly,
-    #[serde(rename = "requestTooLarge")]
     RequestTooLarge,
-    #[serde(rename = "cannotCalculateChanges")]
     CannotCalculateChanges,
-    #[serde(rename = "stateMismatch")]
     StateMismatch,
-    #[serde(rename = "alreadyExists")]
     AlreadyExists,
-    #[serde(rename = "fromAccountNotFound")]
     FromAccountNotFound,
-    #[serde(rename = "fromAccountNotSupportedByMethod")]
     FromAccountNotSupportedByMethod,
-    #[serde(rename = "anchorNotFound")]
     AnchorNotFound,
-    #[serde(rename = "unsupportedSort")]
     UnsupportedSort,
-    #[serde(rename = "unsupportedFilter")]
     UnsupportedFilter,
-    #[serde(rename = "tooManyChanges")]
     TooManyChanges,
-    #[serde(other)]
-    Other,
+    /// Catch-all for unrecognized method-error type strings. Carries
+    /// the wire-supplied identifier so the JMAP conversion can map it
+    /// to `WireCause::Jmap(JmapMethod::Unknown { code })` without
+    /// inventing placeholder values. Serde's `#[serde(other)]` would
+    /// discard the string, so this variant uses a hand-rolled
+    /// `Deserialize` impl.
+    Other(String),
+}
+
+impl<'de> serde::Deserialize<'de> for MethodErrorType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "serverUnavailable" => Self::ServerUnavailable,
+            "serverFail" => Self::ServerFail,
+            "serverPartialFail" => Self::ServerPartialFail,
+            "unknownMethod" => Self::UnknownMethod,
+            "invalidArguments" => Self::InvalidArguments,
+            "invalidResultReference" => Self::InvalidResultReference,
+            "forbidden" => Self::Forbidden,
+            "accountNotFound" => Self::AccountNotFound,
+            "accountNotSupportedByMethod" => Self::AccountNotSupportedByMethod,
+            "accountReadOnly" => Self::AccountReadOnly,
+            "requestTooLarge" => Self::RequestTooLarge,
+            "cannotCalculateChanges" => Self::CannotCalculateChanges,
+            "stateMismatch" => Self::StateMismatch,
+            "alreadyExists" => Self::AlreadyExists,
+            "fromAccountNotFound" => Self::FromAccountNotFound,
+            "fromAccountNotSupportedByMethod" => Self::FromAccountNotSupportedByMethod,
+            "anchorNotFound" => Self::AnchorNotFound,
+            "unsupportedSort" => Self::UnsupportedSort,
+            "unsupportedFilter" => Self::UnsupportedFilter,
+            "tooManyChanges" => Self::TooManyChanges,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 impl ProblemDetails {
@@ -167,7 +184,7 @@ impl Display for MethodError {
             MethodErrorType::UnsupportedSort => write!(f, "Unsupported sort"),
             MethodErrorType::UnsupportedFilter => write!(f, "Unsupported filter"),
             MethodErrorType::TooManyChanges => write!(f, "Too many changes"),
-            MethodErrorType::Other => write!(f, "Other"),
+            MethodErrorType::Other(code) => write!(f, "Other ({code})"),
         }
     }
 }

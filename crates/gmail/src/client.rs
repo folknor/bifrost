@@ -172,37 +172,45 @@ impl GmailClient {
     pub(crate) async fn execute_builder(
         &self,
         builder: RequestBuilder,
-        service: &str,
+        _service: &str,
     ) -> Result<Response> {
-        builder
-            .send()
-            .await
-            .map_err(|error| Error::from_net(service, error))
+        // Net errors are preserved verbatim through `Error::Net(_)` so
+        // the account-side translation boundary can inspect transmission
+        // state, retry-after, and other forensic evidence. Service
+        // string is unused now that we no longer flatten errors here.
+        builder.send().await.map_err(Error::from)
     }
 }
 
-async fn parse_json_response<T: DeserializeOwned>(response: Response, service: &str) -> Result<T> {
+async fn parse_json_response<T: DeserializeOwned>(response: Response, _service: &str) -> Result<T> {
     let status = response.status();
-    let body = response_body_string(response);
     if !status.is_success() {
-        return Err(Error::status(service, status, body));
+        let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());
+        return Err(Error::response_from_parts(
+            crate::error::GmailService::GmailApi,
+            status.as_u16(),
+            headers,
+            response.body,
+        ));
     }
-
-    serde_json::from_str(&body).map_err(Error::from)
+    serde_json::from_slice(response.body.as_ref()).map_err(|source| Error::JsonDecode {
+        service: crate::error::GmailService::GmailApi,
+        source,
+    })
 }
 
-async fn check_response_status(response: Response, service: &str) -> Result<()> {
+async fn check_response_status(response: Response, _service: &str) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
     }
-
-    let body = response_body_string(response);
-    Err(Error::status(service, status, body))
-}
-
-fn response_body_string(response: Response) -> String {
-    String::from_utf8_lossy(response.body.as_ref()).into_owned()
+    let headers = crate::error::GmailResponseHeaders::from_headers(response.headers());
+    Err(Error::response_from_parts(
+        crate::error::GmailService::GmailApi,
+        status.as_u16(),
+        headers,
+        response.body,
+    ))
 }
 
 fn default_account_net(
