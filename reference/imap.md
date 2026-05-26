@@ -187,12 +187,27 @@ Containers use native mailbox paths as primitive ids and provenance-native ids. 
 `Error` is `pub(crate)` and `#[non_exhaustive]`. Variants include
 `AuthPolicy(String)`, `FetchLimit { estimated, limit }`, plus
 protocol/transport/capability variants. The account boundary converts
-protocol errors into `bifrost_types::Error`; consumers do not import
-the IMAP error taxonomy directly.
+protocol errors into `bifrost_types::AccountError` via
+`error::into_account_error(error, ctx)`; consumers never see the
+crate-internal IMAP error taxonomy.
 
-- `Error::category()` returns `ErrorCategory`: `Auth`, `AuthPolicy`, `Authorization`, `Capability`, `MailboxState`, `Limit`, `ServerRejected`, `Transport`, `Protocol`, `Tls`, etc.
-- `Error::recovery()` returns `Recovery`: `RetryOrReconnect`, `Reconnect`, `Reauthenticate`, `ResyncMailbox`, `Transient`, `DoNotRetry`. Transient RFC 5530 codes (Unavailable, InUse, TempFail, Corruption, ExpungeIssued, NotificationOverflow, Referral) report retry-safe outcomes.
-- `Error::response_code()` returns the structured `ResponseCode` from `[CODE ...]` brackets (first only).
+`ImapErrorContext` carries the calling `AccountOperation` (now a
+required field, not `Option`), optional `ErrorScope`, `Provider`,
+explicit `transmission_state`, and an `idempotency_override`. Every
+public `pim.rs` method threads its operation via a local `op_err`
+closure that stamps `ImapErrorContext::operation(<op>)` on every
+`map_err`; multi-call helpers (`copy_messages`, `delete_messages`,
+`set_flag`, `hydrate_decoded`, `refresh_folders`, `folder_from_scope`)
+take an explicit `op: AccountOperation` parameter so they emit errors
+tagged with the caller's operation rather than a generic default.
+This is what lets the central recovery mapping distinguish
+`Reconcile` from `Retry::SameRequest` for non-idempotent ops like
+`AddToContainer` and `DraftCreate`.
+
+`Error::response_code()` returns the structured `ResponseCode` from
+`[CODE ...]` brackets (first only); the central recovery mapping
+in `bifrost-types::recovery` consumes those response codes via the
+typed `ImapResponseCode` wire variants.
 
 ## Module layout
 

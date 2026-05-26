@@ -239,11 +239,11 @@ Push runs through a single reader task spawned at factory `open()` when the sess
 
 ### Mutation pipeline
 
-`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets are accumulated into batches sized at `max_objects_in_set` clamped to `[1, 500]`. Each batch is sent as a single `Email/set` call gated by `ifInState(current_state)`. On a `stateMismatch` method error the pipeline probes the current state via `Email/get` (empty ids), updates the cached state, and retries the same batch once. Other errors abort the stream with `SyncEvent::Fatal`.
+`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets are accumulated into batches sized at `max_objects_in_set` clamped to `[1, 500]`. Each batch is sent as a single `Email/set` call gated by `ifInState(current_state)`. On a `stateMismatch` method error the pipeline probes the current state via `Email/get` (empty ids), updates the cached state, and retries the same batch once. Other errors abort the stream with `SyncEvent::Terminated(AccountError)`.
 
 `IdempotencyKey` is currently accepted on the API surface but not used at the wire level - JMAP exposes no idempotency token, so replay safety stays `MutationReplaySafety::None` and the engine's read-back guard is the protection against double-apply.
 
-Per-id outcomes flow from `SetResponse::updated` / `destroyed`. A `MutationOutcome::Failed(Error::ConcurrencyConflict)` is emitted when a `stateMismatch` survives the retry; other JMAP errors are mapped through `to_account_error` and surfaced as `MutationOutcome::Failed(...)`.
+Per-id outcomes flow from `SetResponse::updated` / `destroyed`. An `ItemOutcome::Failed` with `AccountErrorKind::ConcurrencyConflict` is emitted when a `stateMismatch` survives the retry; other JMAP errors are mapped through `into_account_error` and surfaced as `ItemOutcome::Failed(BatchFailure { error, .. })`.
 
 `bulk_move` only accepts `MembershipScope::Mailbox`; other membership shapes emit a fatal-unsupported event before any wire write.
 
@@ -265,37 +265,63 @@ Settings primitives use `Identity/get` / `Identity/set`, `VacationResponse/get` 
 
 `ReqwestTransport` no longer carries a local redirect loop. It configures `bifrost-net` with `NetConfig::follow_redirects(FollowRedirects::Enabled(...))`, preserving JMAP's trusted-host allowlist and the old five-hop limit while using the shared RFC 7231 method-aware redirect implementation. The factory-provided engine account id is used when attaching the transport to `bifrost-net`. `bifrost-net` strips `Authorization` on every cross-host hop regardless of allowlist membership, so the Basic-auth header that `ReqwestTransport` injects directly into the request `HeaderMap` (rather than through the bearer-token source) is no longer at risk of crossing a host boundary even when the consumer trusts the destination host.
 
-### Error mapping to the recovery taxonomy
+### Error translation
 
-`error::to_recovery` maps `crate::Error` onto `RecoveryClass`:
+`sync/error.rs::into_account_error(error, ctx)` is the single
+translation boundary: it consumes `crate::Error` plus a
+`JmapErrorContext { operation, scope, .. }` and emits an
+`AccountError` via `AccountErrorBuilder`. The builder routes
+`(AccountErrorKind, Cause)` plus operation, scope, and any
+`AttemptCause` through `bifrost-types::recovery::derive` so the
+final `RecoveryClass` is computed centrally - the JMAP crate
+no longer carries a private `to_recovery` table.
 
-- `Error::Method` cases:
-  - `cannotCalculateChanges` -> `RestartScope(scope)` if a scope is known, else `RestartAccount`.
-  - `stateMismatch` -> `Retry { after: 0 }`.
-  - `accountNotFound`, `fromAccountNotFound`, `accountNotSupportedByMethod`, `fromAccountNotSupportedByMethod`, `accountReadOnly` -> `RestartAccount`.
-  - `serverUnavailable` -> `Retry { after: 5s }`. `serverFail` / `serverPartialFail` -> `Retry { after: 30s }`.
-  - `requestTooLarge` / `tooManyChanges` -> `Retry { after: 1s }`.
-  - `forbidden` -> `AuthLost`.
-  - argument-shape errors (`invalidArguments`, `unknownMethod`, `unsupportedSort`, etc.) -> `Fatal`.
-- `Error::Problem` (RFC 7807 problem-details):
-  - JMAP `limit` -> `Retry { after: 30s }`.
-  - JMAP `unknownCapability` -> `CapabilityChanged { delta: default }`.
-  - `notJSON` / `notRequest` -> `Fatal`.
-  - HTTP status fallback: 401/403 -> `AuthLost`, 429 -> `Retry { after: 30s }`, 5xx -> `Retry { after: 30s }`, other -> `Fatal`.
-- `Error::Transport(_)` -> `Retry { after: 5s }`.
-- `Error::WebSocket(_)` / `Error::WebSocketClosed` / `Error::WebSocketNotConnected` -> `Retry { after: 5s }`.
-- `Error::WebSocketSetup(Tls)` -> `Retry { after: 5s }`, `InvalidHeader` -> `AuthLost`, `Subprotocol` -> `CapabilityChanged { delta: default }`.
-- `Error::NoPrimaryAccount { .. }` -> `RestartAccount`.
-- Parse / set / shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`, `EmptyResponse`, `NotParsable`, `InvalidUrl`) -> `Fatal`.
+Mapping highlights for the JMAP signals the central table reads:
 
-`error::to_account_error` collapses `crate::Error` onto `bifrost_types::Error`:
+- `Method(stateMismatch)` -> `ConcurrencyConflict` kind +
+  `State(ConcurrencyConflict)` cause -> `Retry::AfterStateRefresh`.
+- `Method(cannotCalculateChanges)` -> `SyncState(CursorInvalid)` +
+  `State(CursorInvalid)` -> `Engine(RestartScope)` when scope is
+  known, otherwise `Engine(RestartAccount)`.
+- `Method(serverUnavailable | serverFail | serverPartialFail)` ->
+  `Server(Unavailable)` -> `Retry::SameRequest, reason:
+  ServerUnavailable`.
+- `Method(requestTooLarge | tooManyChanges)` -> `SyncState
+  (CursorInvalid)` or `Request(Malformed)` depending on context.
+- `Method(forbidden)` -> `Authorization(PermissionDenied)` ->
+  `NoPermission`.
+- `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`
+  from documented JMAP behavior.
+- `Problem(unknownCapability)` -> `SyncState(CapabilityDelta)` ->
+  `Engine(CapabilityChanged)`.
+- `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`
+  -> `ProviderContractViolation`.
+- HTTP-only status fallbacks (401/403/429/5xx) on bare
+  `Problem` -> `Authentication` / `Server(RateLimited)` /
+  `Server(Unavailable)` per the central rules.
+- `Transport(_)` and `WebSocket(_)` -> `Transport(Network)` with
+  `AttemptCause::transmission_state` derived from where the wire
+  failure occurred; the central mapping picks `Retry::SameRequest`
+  for idempotent ops and `Reconcile` for non-idempotent ops
+  caught mid-flight.
+- `NoPrimaryAccount` -> `Authentication(ReauthorizationRequired)`
+  -> `AuthLost`.
+- Local shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`,
+  `EmptyResponse`, `NotParsable`, `InvalidUrl`) -> `Request
+  (Malformed)` -> `ClientBug`.
 
-- `stateMismatch` -> `Error::ConcurrencyConflict`.
-- Problem-details with status 401/403 -> `Error::Auth(...)`.
-- `NoPrimaryAccount` -> `Error::Auth(...)`.
-- Everything else -> `Error::Transport(other.to_string())`.
+Cursor-decode failures from `cursor::envelope` (protocol mismatch,
+unknown envelope, malformed payload) build their own AccountError
+with `SyncState(SchemaIncompatible)`, which the central mapping
+routes to `Engine(SchemaIncompatible)`.
 
-`fatal_from_account_error` is the parallel mapping for cursor / capability / range errors raised by the sync tree itself: `CursorProtocolMismatch` and `CursorEnvelopeUnknown` -> `SchemaIncompatible`, `Unsupported` and `RangeNotSupported` / `BlobNotByteStream` / `RangeOutOfBounds` -> `Fatal`, `ConcurrencyConflict` -> `Retry { after: 0 }`, `Auth` -> `AuthLost`, `Transport` -> `Retry { after: 5s }`, `MissingCoreCapability` -> `CapabilityChanged`, `IdleBusy` / `Other` -> `RestartScope(scope)` if known else `Fatal`.
+Known JMAP `SetErrorType` vocabulary lands on typed
+`WireCause::Jmap(JmapMethod::*)` variants
+(`StateMismatch`, `MailboxHasChild`, `MailboxHasEmail`,
+`OverQuota`, `RateLimit`, ...). `SetErrorType::Other(code)` is the
+only path to `JmapMethod::Unknown { code }`; matching unknown
+vocabulary via string comparison is forbidden by the convergence
+plan's gate-5 invariant.
 
 ### Known limitations
 

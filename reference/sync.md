@@ -103,8 +103,8 @@ for each (logging but not failing on per-account errors), then
 cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
-`reopen` (driven by `RecoveryClass::RestartAccount` or
-`CapabilityChanged`) calls `factory.open(account_id)` again and
+`reopen` (driven by `RecoveryClass::Engine(EngineDirective::RestartAccount)`
+or `Engine(EngineDirective::CapabilityChanged)`) calls `factory.open(account_id)` again and
 `slot.current.store(Arc::new(next))` after reapplying the
 priority and bandwidth-cap snapshots. Spawned tasks pick up the
 new handle on their next `load_full()`.
@@ -141,7 +141,7 @@ cursor-establishment pass progresses and the cursor persists on a
 successful `Done`.
 
 `ChangesEvent` is the per-batch outcome returned by the driver:
-`Advanced` / `Done` / `Stopped` / `Paused` / `Fatal(RecoveryClass)`.
+`Advanced` / `Done` / `Stopped` / `Paused` / `Terminated(AccountError)`.
 
 ## Multiplexer
 
@@ -227,8 +227,10 @@ collapsed to an `Unknown` reconcile request rather than dropped.
 calls `scopes_for_hint(&cursors, &hint.payload)` (which consults
 the membership index populated at attach), then drives
 `changes_stream` to completion for each affected scope. On
-`Fatal`, the reconciler routes the recovery class to the slot's
-reopen channel; `Retry { after }` sleeps in place. On
+`Terminated(err)`, the reconciler reads `err.recovery()` and
+routes `Engine(_)` directives to the slot's reopen channel;
+`Retry(advice)` sleeps for the effective delay computed from
+`advice.not_before` and `advice.min_delay`. On
 `Disconnected` / `Reconnected`, `Reconciler::warning_event`
 synthesizes a `MultiplexerEvent` carrying
 `SyncEvent::Warning { kind: WarningKind::Other("push:disconnected"
@@ -247,20 +249,26 @@ is the engine-side entry that records the handle on success.
 `bulk_set_flags` flow:
 
 1. Submit the batch via `Account::bulk_set_flags(targets, op, key)`.
-2. Collect `MutationOutcome::Failed` ids whose error is a
-   `RecoveryClass::Retry { after }`.
-3. Sleep `after`, resubmit with the **same** `IdempotencyKey`
+2. Collect `ItemOutcome::Failed` ids whose `AccountError::recovery()`
+   is `RecoveryClass::Retry(advice)` or
+   `RecoveryClass::Reconcile(_)`.
+3. Sleep for the effective delay (from `advice.not_before` /
+   `advice.min_delay`) and resubmit with the **same** `IdempotencyKey`
    (engine bookkeeping; no protocol today emits it on the wire).
    Repeat up to `EngineConfig::mutation_max_retries`.
 4. Run `run_readback_guard` once at the end against unresolved
    failures: `get_stream(Projection::FlagsOnly)` re-fetches and
    reconciles applied / skipped / failed_terminal.
 
-`MutationCounters` buckets `Failed` outcomes by `Error` variant:
-`is_terminal_mutation_error` returns true for `Auth`,
-`Unsupported`, `MissingCoreCapability`, `CursorProtocolMismatch`,
-`CursorEnvelopeUnknown`, `SchemaIncompatible`; those land in
-`failed_terminal`. Everything else goes to `pending_retry`.
+`MutationCounters` buckets `ItemOutcome::Failed` outcomes by the
+carried `AccountError::recovery()`: `Retry` and `Reconcile` are
+candidates for retry; every terminal `RecoveryClass` variant
+(`AuthLost`, `NeedsAdminConsent`, `NeedsPolicyChange`,
+`NoPermission`, `Unsupported`, `ClientBug`,
+`ProviderContractViolation`, `ProviderRefused`,
+`UnknownPermanent`) lands in `failed_terminal`. `Engine(_)`
+directives surface to the engine's reopen / restart-scope /
+downgrade machinery and never re-enter the per-item retry queue.
 
 `IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
 is consumer-minted and consumer-persisted across process restarts
@@ -366,9 +374,9 @@ pub trait CheckpointStore: Send + Sync {
 
 `put_*` take owned `ChangeCursor` / `BackfillCheckpoint`; `get_*`
 take a borrowed `&CursorScope`. `delete_change_cursor` is required
-because `RecoveryClass::RestartScope` must drop the durable cursor
-so the next establish re-runs via inventory; a no-op delete would
-silently preserve the stale cursor.
+because `RecoveryClass::Engine(EngineDirective::RestartScope)` must
+drop the durable cursor so the next establish re-runs via inventory;
+a no-op delete would silently preserve the stale cursor.
 
 `InMemoryCheckpointStore` is the test backend (HashMap-backed). No
 sled / sqlite default; storage is consumer-owned.
@@ -384,26 +392,37 @@ disambiguate ambiguous transport failures). The guard re-fetches
 affected ids via `Account::get_stream(ids, Projection::FlagsOnly)`
 and reconciles against the intended mutation.
 
-## Error / Fatal / Warning
+## Error / Terminated / Warning
 
-Engine-side `Error` (distinct from `bifrost-types::Error`):
+Engine-side `Error` (distinct from `bifrost-types::AccountError`):
 
 - `AccountNotAttached(AccountId)`
 - `AccountAlreadyAttached(AccountId)`
-- `OpenFailed(#[source] bifrost_types::Error)`
+- `OpenFailed(#[source] bifrost_types::AccountError)`
 - `EstablishCursorFailed(String)`
-- `EstablishCursorFatal { message, recovery }`
+- `EstablishCursorTerminated(#[source] bifrost_types::AccountError)`
 - `CheckpointStore(String)`
 - `SchemaIncompatible`
 - `ShuttingDown`
 - `Paused`
-- `Account(#[from] bifrost_types::Error)`
+- `Account(#[from] bifrost_types::AccountError)`
 - `Other(String)`
 
-`Fatal` is a stream terminator carrying a `RecoveryClass`;
-`FatalAction` is the engine's response (drop / restart-scope /
-restart-account / reopen / surface to consumer). `Warning` is a
-re-export of `bifrost_types::Warning`.
+Stream termination is the `SyncEvent::Terminated(AccountError)`
+variant; the engine reads `error.recovery()` and dispatches via
+the four mutually-exclusive helpers (`is_retryable`,
+`requires_reconciliation`, `requires_engine_action`,
+`is_terminal`). `Engine(EngineDirective::*)` directives drive
+`drop` / `restart-scope` / `restart-account` / `downgrade-strategy`
+/ `downgrade-capability` / `schema-clear` / `capability-changed`
+/ `operator-override` reopens; terminal recovery surfaces to the
+consumer. `bifrost_types::Fatal` is a separate terminal-only
+newtype available at engine boundaries that specifically need
+"the engine has nothing more to try"; the stream itself uses
+`Terminated`.
+
+`Warning` is a re-export of `bifrost_types::Warning` and is
+outside the error model (advisory only, never aborts streams).
 
 ## File map
 
@@ -416,7 +435,7 @@ crates/sync/src/
                           // ack_checkpoint, ack_writer,
                           // handle_recovery, scope_covers_membership
   control.rs              // SyncControl + record_checkpoint hook
-  error.rs                // engine Error / Fatal / Warning
+  error.rs                // engine Error wrapping AccountError + Warning
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask

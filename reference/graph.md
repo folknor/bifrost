@@ -166,8 +166,9 @@ that selects against the same shutdown token.
   per-mailbox concurrency tier and per-application throttling
   budget.
 - `quota_signal: QuotaSignal::RetryAfter`. Throttled responses
-  carry an explicit `Retry-After` header that the mutation
-  pipeline forwards into `RecoveryClass::Retry`.
+  carry an explicit `Retry-After` header that the central
+  recovery mapping translates into `RecoveryClass::Retry`'s
+  `not_before` deadline.
 - `requires_uidvalidity_recheck: false`. Graph has no UIDVALIDITY
   concept.
 - `historyid_expires_after: None`. Graph has no historyId.
@@ -226,8 +227,10 @@ also encoded into the outer `ChangeCursor::advanced_through` as
 `scope_matches_payload` is an additional cross-check in
 `changes_stream`: if the decoded payload's `GraphCursorKind`
 projects to a `CursorScope` that does not match
-`cursor.scope`, the stream emits a Fatal carrying
-`RecoveryClass::SchemaIncompatible` and exits.
+`cursor.scope`, the stream emits a `SyncEvent::Terminated
+(AccountError)` whose kind is `SyncState(SchemaIncompatible)` -
+the central mapping resolves that to
+`Engine(SchemaIncompatible)` and exits.
 
 `establish_initial_cursor(scope)` calls `kind_for_scope(&scope)`
 to validate that the scope shape is one of the three
@@ -268,9 +271,10 @@ Supported scopes:
   with `CONTACT_SELECT`.
 - Any other scope / type combination causes
   `initial_delta_url` to return an error string that
-  `inventory_stream` projects into a `SyncEvent::Fatal` with a
-  default-retry recovery; downstream callers should rely on
-  `establish_initial_cursor` to gate scopes before that point.
+  `inventory_stream` projects into a `SyncEvent::Terminated
+  (AccountError)` with kind `Unsupported(_)`; downstream callers
+  should rely on `establish_initial_cursor` to gate scopes
+  before that point.
 
 The inventory walk reads pages through
 `GraphClient::get_json` for relative URLs and
@@ -405,22 +409,22 @@ still sees events.
 1. Snapshot the etag cache, then refresh any missing etags for
    `SetFlags` / `Move` operations by issuing
    `GET /messages/{id}?$select=id` per missing id. Failures here
-   produce per-id `MutationOutcome::Failed(Error::Transport(...))`.
-   `Destroy` does not require an etag.
+   produce per-id `ItemOutcome::Failed(BatchFailure { error, .. })`
+   carrying an `AccountError` of kind `Transport(_)`. `Destroy`
+   does not require an etag.
 2. Build one `BatchRequestItem` per id: `PATCH` for `SetFlags`,
    `POST /messages/{id}/move` for `Move`, `DELETE` for `Destroy`.
    `If-Match: <changeKey>` is attached when an etag is available
    (mandatory for `SetFlags` / `Move`, opportunistic for
    `Destroy`).
 3. Send the `/$batch` request. Per-response status drives
-   `mutation_outcome_for_status`: 2xx -> `Applied`,
-   404-on-destroy -> `Skipped`, 412 (precondition failed) ->
-   `Skipped`, 429 -> `Failed(Transport(...))` plus a sticky
-   `retry_after` capture, other -> `Failed(Transport(...))`.
-4. If any item returned 429, emit a trailing
-   `SyncEvent::Fatal(RecoveryClass::Retry { after })` with the
-   `Retry-After` header value (or 30s default) so the engine
-   backs off before resending the rest of the stream.
+   `mutation_outcome_for_status`: 2xx -> `Succeeded(Applied)`,
+   404-on-destroy -> `Succeeded(Skipped)`, 412 (precondition
+   failed) -> `Succeeded(Skipped)`, 429 -> `Failed(BatchFailure
+   { error, .. })` carrying a rate-limited AccountError, other ->
+   `Failed(BatchFailure { error, .. })` carrying a status-derived
+   AccountError. The central recovery mapping reads
+   `Retry-After` off the cause chain into `RetryAdvice::not_before`.
 
 `bulk_set_flags` translates the `FlagOp` to a Graph PATCH body:
 `isRead` for `\\seen` / `read`, `flag.flagStatus` for
@@ -522,60 +526,72 @@ and reference-attachments have `supports_range = false`. The
 handle does not carry a digest (`digest_available_pre_download:
 false` matches the account capability).
 
-## Error mapping to the recovery taxonomy
+## Error translation
 
-`recovery_for_graph_error(message, scope)` in `error.rs` is the
-shared message-shape classifier. It receives a `&str` because the
-underlying `GraphClient` returns `Result<T, String>` end-to-end:
-every method in `api.rs` and the HTTP plumbing in `client.rs`
-formats the upstream status code and body into a string of the
-shape `"Graph upload error {status}: {body}"`. The classifier
-therefore matches on the lowercased message body rather than on
-a structured status enum. The format is stable because the
-client itself produces it, but the approach is fragile to any
-upstream change to the error envelope shape or to localization
-of the status text. Reconciling onto a structured per-call error
-type with a typed `status: u16` is in scope for Phase 4 error
-model convergence. Mappings:
+`graph_error::into_account_error(error, ctx)` converts the
+crate-internal `Error` enum into an `AccountError` via
+`AccountErrorBuilder`. `GraphErrorContext { protocol, operation,
+scope }` threads the calling operation so `bifrost-types::recovery::
+derive` computes `RecoveryClass`; the Graph crate has no private
+recovery table.
 
-- 410 / "gone" -> `RecoveryClass::RestartScope(scope.clone())`.
-  The Graph delta token has been compacted past retention; the
-  engine must mint a new cursor for this scope from inventory.
-- 400 + ("invaliddeltatoken" | "invalid delta token" |
-  "syncstatenotfound") -> `RecoveryClass::RestartScope(scope.clone())`.
-  Same shape as 410, surfaced through 400 by some endpoints.
-- 429 or "too many requests" -> `RecoveryClass::Retry { after: 30s }`.
-- 503 / 504 -> `RecoveryClass::Retry { after: 30s }`.
-- 401 / "unauthorized" -> `RecoveryClass::AuthLost`.
-- Anything else -> `None`; the caller decides the default. In
-  `graph_error_to_fatal` the default is `AuthLost` when the
-  message smells like auth and `Retry { after: 30s }` otherwise.
+Known Graph vocabulary lands on typed `WireCause::Graph
+(GraphSignal::*)` variants - `InvalidAuthenticationToken`,
+`AccessDenied`, `Forbidden`, `AccessRestricted`,
+`ConditionalAccessBlocked`, `AdminConsentRequired`,
+`MailboxNotEnabledForRestApi`, `MailboxStoreUnavailable`,
+`ResyncRequired`, `TooManyRequests`, `GenericFileError`,
+`PreconditionFailed`, `NotFound`, `InvalidDeltaToken`,
+`SyncStateNotFound`, `Gone`. `GraphSignal::Unknown { code }` is
+reserved for forward-compat fallback; matching unknown
+vocabulary via string comparison is forbidden by the
+convergence plan's gate-5 invariant.
 
-`mutation_outcome_for_status(status, destroy, id)` projects
-per-id `$batch` responses onto `MutationOutcome`: 2xx -> Applied,
-404-on-destroy -> Skipped (idempotent delete), 412 -> Skipped
-(etag mismatch; the engine reads back), 429 -> Failed(Transport),
-other -> Failed(Transport).
+Mapping highlights:
 
-`fatal_from_recovery(recovery, message)` is the constructor used
-when the change stream detects a cursor protocol/envelope/schema
-mismatch. Cursor decode errors map onto:
+- `Gone` / 410 / `InvalidDeltaToken` / `SyncStateNotFound` ->
+  `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`.
+- `TooManyRequests` / 429 -> `Server(RateLimited)` with
+  `throttle_scope: Tenant` and `not_before` from `Retry-After`.
+- 503 / 504 -> `Server(Unavailable)` ->
+  `Retry::SameRequest`.
+- `InvalidAuthenticationToken` / 401 ->
+  `Authentication(ReauthorizationRequired)` -> `AuthLost`.
+- `AdminConsentRequired` -> `Authorization(AdminConsentRequired)`
+  -> `NeedsAdminConsent`.
+- `ConditionalAccessBlocked` / `AccessRestricted` /
+  `MailboxNotEnabledForRestApi` -> `Authorization
+  (ConditionalAccessBlocked | PolicyBlocked | MailboxNotLicensed)`
+  -> `NeedsPolicyChange`.
+- `AccessDenied` / `Forbidden` ->
+  `Authorization(PermissionDenied)` -> `NoPermission`.
+- `MailboxStoreUnavailable` -> `Authorization(MailboxUnavailable
+  { Transient })` -> `Retry::SameRequest`.
+- `PreconditionFailed` / 412 -> `ConcurrencyConflict` ->
+  `Retry::AfterStateRefresh`.
 
-- `Error::CursorProtocolMismatch` -> `RecoveryClass::SchemaIncompatible`.
-- `Error::CursorEnvelopeUnknown` -> `RecoveryClass::SchemaIncompatible`.
-- `Error::SchemaIncompatible` -> `RecoveryClass::SchemaIncompatible`.
-- Any other cursor decode error -> `RecoveryClass::Fatal`.
+`mutation_outcome_for_status` projects per-id `$batch` responses
+onto `ItemOutcome`: 2xx -> `Succeeded(Applied)`, 404-on-destroy ->
+`Succeeded(Skipped)` (idempotent delete), 412 ->
+`Succeeded(Skipped)` (etag mismatch; engine reads back), 429 and
+other failures -> `Failed(BatchFailure { error })` carrying the
+status-derived AccountError.
+
+Cursor-decode failures (`CursorProtocolMismatch`,
+`CursorEnvelopeUnknown`, `SchemaIncompatible`, malformed payload)
+build an AccountError with `SyncState(SchemaIncompatible)`, which
+the central mapping routes to `Engine(SchemaIncompatible)`.
 
 Non-byte-stream attachments emit
 `Warning { kind: WarningKind::BlobNotByteStream, .. }` rather
-than a Fatal, so the engine can continue past a
+than a terminal error, so the engine can continue past a
 referenceAttachment in a mixed batch.
 
 ## Known limitations
 
 - Discovery is mail-only. `discover_cursor_scope_events` emits
-  mail-folder Email scopes; event and contact cursors are valid
-  only if the engine constructs them by hand.
+  mail-folder Email scopes; event/contact cursors must be
+  engine-constructed.
 - `scope_lifecycle_stream` is empty. Folder creates / renames /
   deletes are observed only at account reopen.
 - EWS streaming requires Exchange Web Services to be reachable
@@ -588,24 +604,20 @@ referenceAttachment in a mixed batch.
   referenceAttachment handles do not. The account capability is
   `BlobRangeSupport::Conditional` to reflect this split.
 - Delta-token expiry is reactive. 410 Gone or 400
-  InvalidDeltaToken collapses onto `RestartScope`.
+  InvalidDeltaToken collapses onto
+  `Engine(RestartScope(scope))`.
 - `MutationReplaySafety::None`. `IdempotencyKey` is accepted on
   the API surface but not transmitted; the engine's read-back
   guard is the only lost-update protection beyond the
   `If-Match` etag gate.
 - `remove_from_container`, keyword writes, Gmail-style label
-  membership, standalone `attachment_upload`, `identity_update`, and
-  `quota_get` are unsupported and flagged false in `pim_methods`.
+  membership, standalone `attachment_upload`, `identity_update`,
+  and `quota_get` are unsupported (flagged false in `pim_methods`).
 - `send_message` / `draft_send` return the draft id because the
   send actions answer `202 Accepted` with no body. Callers needing
-  the final Sent Items id rediscover it through sync or search.
+  the Sent Items id rediscover via sync or search.
 - `draft_update` does not replace attachments; Graph attachment
   upload sessions need a larger primitive than Stage 1 exposes.
 - `send_message` / `draft_create` / `draft_update` accept inline
-  attachments embedded in the request (base64 `fileAttachment` via
-  `graph_attachment_from_inline`) but reject pre-uploaded
-  `AttachmentHandle`s with `Unsupported`, mirroring
-  `attachment_upload` itself.
-- `recovery_for_graph_error` is substring-based because
-  `GraphClient` returns `Result<T, String>`; structured-error
-  convergence is S1-W4 (error model) work.
+  base64 `fileAttachment` via `graph_attachment_from_inline` but
+  reject pre-uploaded `AttachmentHandle`s with `Unsupported`.

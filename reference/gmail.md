@@ -270,9 +270,11 @@ in the cursor.
 
 `CursorScope::Account` is the only scope. `inventory_stream`,
 `establish_initial_cursor`, `push_subscribe`, and the change
-stream each reject any other scope with a Fatal carrying
-`RecoveryClass::Fatal` (inventory) or
-`AccountError::Unsupported` (cursor establishment, push).
+stream each reject any other scope with a
+`SyncEvent::Terminated(AccountError)` whose kind is
+`Unsupported(_)` and recovery is `Unsupported(_)` - the central
+recovery mapping resolves an `Unsupported` kind to the terminal
+`Unsupported` `RecoveryClass`.
 
 `inventory_stream` walks `users.messages.list` in pages of 500
 ids, then hydrates each page through `users.messages.get` with
@@ -300,7 +302,9 @@ and dispatches per `Projection`:
 `changes_stream` decodes the cursor, re-verifies
 `profile_email`, then `users.getProfile`-checks that the open
 account still matches the cursor's recorded identity. A drift
-yields a Fatal with `RecoveryClass::Fatal`. With the identity
+yields a `SyncEvent::Terminated(AccountError)` with kind
+`SyncState(SchemaIncompatible)`, which the central mapping
+resolves to `Engine(SchemaIncompatible)`. With the identity
 confirmed, the stream pages `users.history.list` from
 `startHistoryId`. Each page emits a `Batch` whose `checkpoint`
 is a `Checkpoint::Change(cursor_for_history(history_id,
@@ -378,15 +382,17 @@ single `mutation_stream` driver:
 
 Result classification:
 
-- All ids in a successful batch -> `MutationOutcome::Applied`.
+- All ids in a successful batch -> `ItemOutcome::Succeeded` with
+  `MutationSuccess::Applied`.
 - An empty patch (label op with no changes) or an
-  unsupported-flag patch -> `MutationOutcome::Skipped` per id.
+  unsupported-flag patch -> `ItemOutcome::Succeeded` with
+  `MutationSuccess::Skipped` per id.
 - A retry-class or auth-class error -> stream-level
-  `SyncEvent::Fatal` so the engine can re-issue. The driver
-  does not split applied vs failed across the same batch on
-  HTTP failure.
-- Any other error -> per-id `MutationOutcome::Failed(error)`,
-  carrying the projected `AccountError`.
+  `SyncEvent::Terminated(AccountError)` so the engine can re-issue
+  via `error.recovery()`. The driver does not split applied vs
+  failed across the same batch on HTTP failure.
+- Any other error -> per-id `ItemOutcome::Failed(BatchFailure {
+  error, .. })`, carrying the projected `AccountError`.
 
 Flag canonicalization in `flags.rs`:
 
@@ -433,54 +439,60 @@ under the capability shape.
 part whose `body.attachment_id` is set. Inline bodies (no
 attachment id) are not surfaced as blob handles.
 
-## Error mapping
+## Error translation
 
-`recovery.rs` exposes two classifiers over `crate::Error`:
+`recovery.rs::into_account_error(error, ctx)` is the single
+boundary that converts `crate::Error` (Net / Response / JsonDecode
+/ Base64 / Local) into an `AccountError`. The
+`GmailErrorContext { operation, scope, .. }` carries the calling
+operation so the central recovery mapping in
+`bifrost-types::recovery::derive` produces a precise
+`RecoveryClass`; the Gmail crate no longer has its own
+`classify_general_error` / `account_error_from_gmail` /
+`fatal_for_error` tables.
 
-- `classify_general_error`:
-  - `GmailError::Auth { .. }` -> `RecoveryClass::AuthLost`.
-  - `GmailError::QuotaExhausted { .. }` (HTTP 429 or 403 with
-    a quota-shaped body) -> `RecoveryClass::Retry { after: 1s }`.
-  - `GmailError::Transport(err)` where `err.is_timeout()` or
-    `err.is_connect()` -> `RecoveryClass::Retry { after: 1s }`.
-  - `GmailError::HttpStatus { status, .. }` where
-    `status.is_server_error()` -> `RecoveryClass::Retry { after: 1s }`.
-  - Everything else -> `RecoveryClass::Fatal`. This covers 4xx
-    bodies that are not quota-shaped, JSON decode failures,
-    base64 decode failures, and malformed payloads.
-- `classify_history_error` overrides 404 and 410 on the
-  history endpoint to `RecoveryClass::RestartScope(CursorScope::Account)`.
-  Gmail returns 404 or 410 when the supplied `startHistoryId`
-  has been compacted past the server's retention window; the
-  engine must re-establish from a fresh `getProfile`
-  `historyId`. All other history-endpoint errors fall through
-  to `classify_general_error`.
+Mapping highlights:
 
-`account_error_from_gmail` projects `GmailError` onto
-`AccountError` for use in `Fatal.source` and per-id
-`MutationOutcome::Failed`:
+- Stable Gmail reason codes from `GmailErrorEnvelope.primary_reason()`
+  route to typed `WireCause::Gmail(GmailSignal::*)` variants and
+  the appropriate `AccountErrorKind` (e.g.
+  `quotaExceeded`/`rateLimitExceeded` -> `Server(RateLimited)` ->
+  `Retry::SameRequest, reason: RateLimited` with the documented
+  `throttle_scope`).
+- Authentication failures (HTTP 401 or `authError`) ->
+  `Authentication(ReauthorizationRequired)` -> `AuthLost`.
+- Authorization failures (HTTP 403 outside the quota path) ->
+  `Authorization(PermissionDenied)` -> `NoPermission`.
+- Transport network failures (DNS, TLS, timeout) ->
+  `Transport(_)` with an `AttemptCause` whose
+  `transmission_state` carries the wire-level evidence; the
+  central mapping picks `Retry::SameRequest` for idempotent ops
+  and `Reconcile` for non-idempotent ops caught mid-flight.
+- 5xx and `internalError` -> `Server(Unavailable)` ->
+  `Retry::SameRequest, reason: ServerUnavailable`.
+- 404 / 410 on the history endpoint -> `SyncState(CursorInvalid)`
+  -> `Engine(RestartScope(scope))`; the cursor scope is always
+  `CursorScope::Account` for Gmail, so this is effectively a
+  request to reseed from `getProfile`.
+- Local validation failures (`GmailLocalError::*`) ->
+  `Request(Malformed)` or `Request(InvalidArgument)` ->
+  `ClientBug`. The identity-mismatch and cursor-envelope
+  variants produce `SyncState(SchemaIncompatible)` ->
+  `Engine(SchemaIncompatible)` so the engine clears the cursor.
 
-- `Auth { service, body, .. }` -> `AccountError::Auth`.
-- `Transport(err)` -> `AccountError::Transport(err.to_string())`.
-- `QuotaExhausted { service, body, .. }` and
-  `HttpStatus { service, status, body }` -> `AccountError::Transport(...)`
-  so the engine treats both as transport-shaped failures.
-- `Json`, `Base64`, `MalformedPayload`, `InvalidInput` ->
-  `AccountError::Other`.
-
-`fatal_for_error(error, recovery)` and
-`fatal_for_account_error(error, recovery)` are the two `Fatal`
-constructors used across the account layer. The first preserves
-the Gmail-side error message; the second is used when the
-failure originates from envelope or schema checks rather than
-the wire.
+`mutation_error(ids, error, ctx)` is the per-id fan-out for
+batched mutations: it translates the single crate-level error
+once via `into_account_error` and produces one
+`ItemOutcome::Failed(BatchFailure { error: account_error.clone(),
+.. })` per submitted id - `AccountError` is `Arc<Inner>`-backed,
+so the per-id clones share storage.
 
 ## Known limitations
 
 - Only `CursorScope::Account`. There is no thread scope, label
   scope, or query scope. Inventory, push, and cursor
-  establishment all return `Unsupported` / Fatal for non-Account
-  scopes.
+  establishment all return `Unsupported` or
+  `SyncEvent::Terminated(AccountError)` for non-Account scopes.
 - No blob range support. `BlobRangeSupport::No` is advertised;
   `open_blob_range` enforces it.
 - Push requires a consumer-supplied Pub/Sub topic.
