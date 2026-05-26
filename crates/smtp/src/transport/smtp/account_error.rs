@@ -52,22 +52,6 @@ impl SmtpErrorContext {
         }
     }
 
-    pub(crate) fn discover(protocol: Protocol) -> Self {
-        assert!(
-            matches!(protocol, Protocol::Smtp | Protocol::Lmtp),
-            "SmtpErrorContext requires Protocol::Smtp or Protocol::Lmtp"
-        );
-        Self {
-            operation: Some(AccountOperation::Discover),
-            scope: None,
-            provider: None,
-            protocol,
-            idempotency_override: None,
-            transmission_state: None,
-            phase: None,
-        }
-    }
-
     pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
         self.scope = Some(scope);
         self
@@ -87,7 +71,7 @@ impl SmtpErrorContext {
 /// Convert a low-level SMTP transport `Error` into an `AccountError`.
 pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> AccountError {
     let attempt_state = error.attempt().or(ctx.transmission_state);
-    let phase = error.phase().or(ctx.phase);
+    let phase = ctx.phase;
     let diagnostic = error.diagnostic_text();
 
     match error.kind() {
@@ -165,25 +149,6 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             response_to_account_error(response, &ctx, phase, attempt_state)
         }
     }
-}
-
-/// Convert a message-builder error into an `AccountError`. These are local
-/// content validation failures; they have no wire side effect.
-pub(crate) fn message_error_to_account_error(
-    error: crate::error::Error,
-    ctx: SmtpErrorContext,
-) -> AccountError {
-    let detail = error.to_string();
-    let mut builder = AccountErrorBuilder::new(
-        AccountErrorKind::Request(RequestErrorKind::Malformed),
-        Cause::Request(RequestCause::Malformed {
-            detail: DiagnosticText::support_only(detail.clone()),
-        }),
-    )
-    .protocol(ctx.protocol);
-    builder = apply_context(builder, &ctx);
-    builder = builder.text(DiagnosticText::support_only(detail));
-    builder.build()
 }
 
 fn build_basic(
@@ -328,10 +293,10 @@ fn classify_response(
 ) -> (AccountErrorKind, Cause) {
     let status = u16::from(response.code());
     let enhanced = response.enhanced_status_code();
-    if let Some(code) = enhanced {
-        if let Some(mapping) = classify_enhanced(code, response, phase) {
-            return mapping;
-        }
+    if let Some(code) = enhanced
+        && let Some(mapping) = classify_enhanced(code, response, phase)
+    {
+        return mapping;
     }
     classify_status(status, response, phase)
 }
@@ -416,7 +381,7 @@ fn classify_enhanced(
         } else {
             server_error(u16::from(response.code()))
         }),
-        (_, 4, 1 | 2 | 3) => Some((
+        (_, 4, 1..=3) => Some((
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_after: None }),
         )),
@@ -465,7 +430,7 @@ fn classify_enhanced(
         // X.7 security/policy
         (_, 7, 0) => Some(policy_blocked()),
         (_, 7, 1 | 2) => Some(permission_denied()),
-        (_, 7, 3 | 4 | 5 | 6) => Some(policy_blocked()),
+        (_, 7, 3..=6) => Some(policy_blocked()),
         (_, 7, 7) => Some(malformed(response)),
         (4, 7, 8) => Some(auth_refresh_transient()),
         (5, 7, 8) => Some(auth_reauth()),
@@ -483,8 +448,8 @@ fn classify_enhanced(
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_after: None }),
         )),
-        (_, 7, 20 | 21 | 22) => Some(malformed(response)),
-        (_, 7, 23 | 24 | 25 | 26) => Some(policy_blocked()),
+        (_, 7, 20..=22) => Some(malformed(response)),
+        (_, 7, 23..=26) => Some(policy_blocked()),
         (_, 7, 27) => Some(malformed(response)),
         (_, 7, 28) => Some((
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
@@ -530,16 +495,10 @@ fn classify_status(
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
             Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
         ),
-        454 => {
-            if matches!(phase, Some(SmtpCommandPhase::Auth)) {
-                auth_refresh_transient()
-            } else {
-                (
-                    AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                    Cause::Server(ServerCause::Unavailable { retry_after: None }),
-                )
-            }
-        }
+        454 => (
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+        ),
         400..=499 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_after: None }),
@@ -681,16 +640,6 @@ mod tests {
 
     fn ctx_smtp_send() -> SmtpErrorContext {
         SmtpErrorContext::send(Protocol::Smtp)
-    }
-
-    #[test]
-    fn message_builder_missing_to_is_request_malformed() {
-        let err = message_error_to_account_error(crate::error::Error::MissingTo, ctx_smtp_send());
-        assert!(matches!(
-            err.kind(),
-            AccountErrorKind::Request(RequestErrorKind::Malformed)
-        ));
-        assert!(matches!(err.recovery(), RecoveryClass::ClientBug));
     }
 
     #[test]

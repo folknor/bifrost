@@ -32,18 +32,6 @@ const MSG_FOLDER_ROOT: &str = "msgfolderroot";
 // Returned by send_message / draft_create when the request carries an
 // AttachmentHandle minted by attachment_upload. Graph does not
 // implement upload-session attachment_upload (capability flag false),
-// so any handle here was minted on another account; embed the bytes
-// inline via SendRequest.attachments_inline / DraftPatch.attachments_inline
-// instead.
-const GRAPH_PRE_UPLOADED_ATTACHMENTS_MSG: &str =
-    "graph: pre-uploaded attachment handles are not supported; embed inline via attachments_inline";
-
-// Returned by draft_update when the patch tries to add or replace
-// attachments. Graph attachment management on existing drafts needs
-// an upload-session primitive that Stage 1 does not expose.
-const GRAPH_DRAFT_UPDATE_ATTACHMENTS_MSG: &str =
-    "graph: draft_update cannot add or replace attachments; recreate the draft instead";
-
 pub(crate) async fn add_to_container(
     account: GraphAccount,
     target: MutationTarget,
@@ -391,10 +379,12 @@ pub(crate) async fn container_delete(
 }
 
 pub(crate) async fn identities_list(account: GraphAccount) -> Result<Vec<Identity>, AccountError> {
-    let profile =
-        account.client.get_profile().await.map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::Discover))
-        })?;
+    let profile = account.client.get_profile().await.map_err(|e| {
+        into_account_error(
+            e,
+            GraphErrorContext::graph(AccountOperation::IdentitiesList),
+        )
+    })?;
     let address = profile.mail.or(profile.user_principal_name);
     let Some(address) = address else {
         return Ok(Vec::new());

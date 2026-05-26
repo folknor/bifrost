@@ -18,7 +18,8 @@ use super::{
 
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
     let decoded = decode_cursor(cursor);
-    let folder = folder_from_scope(&cursor.scope).ok();
+    let folder =
+        folder_from_scope(&cursor.scope, bifrost_types::AccountOperation::SyncChanges).ok();
     let freshness = folder
         .as_ref()
         .and_then(|folder| account.folders.get(folder))
@@ -134,7 +135,10 @@ async fn run_changes(
     change_cursor: ChangeCursor,
     tx: tokio::sync::mpsc::Sender<SyncEvent<Change>>,
 ) -> Result<(), ChangeError> {
-    let folder = folder_from_scope(&change_cursor.scope)?;
+    let folder = folder_from_scope(
+        &change_cursor.scope,
+        bifrost_types::AccountOperation::SyncChanges,
+    )?;
     let cursor = decode_cursor(&change_cursor)?;
     let qresync_negotiation_warning = if matches!(cursor, FolderCursor::QResync { .. }) {
         account.take_qresync_negotiation_warning()

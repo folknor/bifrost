@@ -33,9 +33,9 @@ use crate::types::{MailboxName, ResponseCode};
 /// way and the scope identifying which mailbox / message / thread the
 /// error pertains to. `transmission_state` is a fallback only - the
 /// translation prefers `Error::attempt()` when the driver populated it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ImapErrorContext {
-    pub(crate) operation: Option<AccountOperation>,
+    pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
     pub(crate) provider: Option<Provider>,
     pub(crate) idempotency_override: Option<bool>,
@@ -43,20 +43,13 @@ pub(crate) struct ImapErrorContext {
 }
 
 impl ImapErrorContext {
-    pub(crate) const fn empty() -> Self {
+    pub(crate) fn operation(operation: AccountOperation) -> Self {
         Self {
-            operation: None,
+            operation,
             scope: None,
             provider: None,
             idempotency_override: None,
             transmission_state: None,
-        }
-    }
-
-    pub(crate) fn operation(operation: AccountOperation) -> Self {
-        Self {
-            operation: Some(operation),
-            ..Self::empty()
         }
     }
 
@@ -120,11 +113,10 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         skip_attempt_cause,
     } = translation;
 
-    let mut builder = AccountErrorBuilder::new(kind, primary_cause).protocol(Protocol::Imap);
+    let mut builder = AccountErrorBuilder::new(kind, primary_cause)
+        .protocol(Protocol::Imap)
+        .operation(ctx.operation);
 
-    if let Some(op) = ctx.operation {
-        builder = builder.operation(op);
-    }
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
@@ -354,7 +346,7 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             }),
         ),
         Error::MissingCapability(cap) => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::Discover);
+            let operation = ctx.operation;
             let mut t = Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
@@ -622,14 +614,14 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
 
         // Unsupported / unknown feature
         ResponseCode::BadCharset(_) => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::Search);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
             )
         }
         ResponseCode::Cannot | ResponseCode::Annotate(_) | ResponseCode::Annotations(_) => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::Discover);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
@@ -648,7 +640,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             }),
         ),
         ResponseCode::UnknownCte => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::OpenBlob);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
@@ -664,7 +656,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             }),
         ),
         ResponseCode::UseAttr => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::ContainerCreate);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
@@ -673,7 +665,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
 
         // Referral and URL
         ResponseCode::Referral(_) => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::Discover);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),
@@ -687,7 +679,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
             }),
         ),
         ResponseCode::UrlMech(_) => {
-            let operation = ctx.operation.unwrap_or(AccountOperation::Discover);
+            let operation = ctx.operation;
             Translation::new(
                 AccountErrorKind::Unsupported(operation),
                 Cause::Request(RequestCause::Unsupported { operation }),

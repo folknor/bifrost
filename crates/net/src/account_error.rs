@@ -275,15 +275,11 @@ fn status_error(
     let mut builder = base_builder(ctx, kind, cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
-    if apply_retry_deadline {
-        if let Some(deadline) = retry_deadline(retry_after) {
-            builder = builder.retry_not_before(deadline);
-        }
+    if apply_retry_deadline && let Some(deadline) = retry_deadline(retry_after) {
+        builder = builder.retry_not_before(deadline);
     }
-    if throttle {
-        if let Some(scope) = throttle_scope(ctx) {
-            builder = builder.throttle_scope(scope);
-        }
+    if throttle && let Some(scope) = throttle_scope(ctx) {
+        builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
 }

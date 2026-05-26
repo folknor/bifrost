@@ -13,6 +13,13 @@
 // shapes are RFC-imposed and won't be renamed.
 #![allow(clippy::upper_case_acronyms)]
 #![allow(clippy::enum_variant_names)]
+// The crate-internal `Error` aggregates JMAP method errors, set errors,
+// problem details, and WebSocket failures. These get translated to
+// `AccountError` (8 bytes, `Arc<Inner>`-backed) at the protocol boundary,
+// so the lint's concern (large Err pessimizing the happy path) only
+// applies briefly. Boxing each variant individually would add allocation
+// churn for the much more common decode/method paths.
+#![allow(clippy::result_large_err)]
 
 pub(crate) mod account;
 #[cfg(feature = "contacts")]

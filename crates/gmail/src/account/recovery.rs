@@ -20,7 +20,7 @@ use bifrost_types::{
     AccountOperation, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
     GmailSignal, ItemOutcome, MutationSuccess, ObjectId, Protocol, ProtocolErrorKind, Provider,
     RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
-    SyncStateErrorKind, ThrottleScope, TransportErrorKind, WireCause,
+    SyncStateErrorKind, ThrottleScope, WireCause,
 };
 use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess};
 
@@ -239,10 +239,6 @@ pub(crate) fn into_account_error(error: Error, ctx: GmailErrorContext) -> Accoun
         Error::JsonDecode { source, .. } => {
             parse_failed(&ctx, format!("Gmail JSON decode: {source}"))
         }
-        Error::JsonEncode { source, .. } => malformed_request(
-            &ctx,
-            format!("Gmail JSON encode failed for {:?}: {source}", ctx.operation),
-        ),
         Error::Base64 { encoding, source } => {
             parse_failed(&ctx, format!("Gmail {encoding} decode failed: {source}"))
         }
@@ -258,7 +254,6 @@ pub(crate) fn into_account_error(error: Error, ctx: GmailErrorContext) -> Accoun
 /// failure is per-item (permanent provider refusal of a transmitted
 /// batch, 404 for every id, etc.). `AccountError` is cloneable, so the
 /// per-id outcomes carry direct clones - no template helper is needed.
-#[must_use]
 pub(crate) fn mutation_error(
     ids: &[ObjectId],
     error: Error,
@@ -936,12 +931,6 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             }
             builder.build()
         }
-        GmailLocalError::BlobRangeOutOfBounds { start, total } => {
-            let detail = format!("blob range start {start} >= total {total}");
-            let mut new_ctx = ctx.clone();
-            new_ctx.operation = AccountOperation::OpenBlobRange;
-            malformed_request(&new_ctx, detail)
-        }
         GmailLocalError::Internal { detail } => {
             // Internal failures classify as protocol contract violations
             // so the engine routes them to telemetry rather than retry.
@@ -989,7 +978,9 @@ fn map_reason_to_signal(reason: &str) -> GmailSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::{EngineDirective, RecoveryClass, RetryDisposition, RetryReason};
+    use bifrost_types::{
+        EngineDirective, RecoveryClass, RetryDisposition, RetryReason, TransportErrorKind,
+    };
     use bytes::Bytes;
 
     fn gmail_response(status: u16, body: &str) -> Error {

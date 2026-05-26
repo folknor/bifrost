@@ -320,14 +320,6 @@ fn request_for_mutation(
     }
 }
 
-fn retry_after_from_headers(headers: Option<&HashMap<String, String>>) -> Option<Duration> {
-    let value = headers?.iter().find_map(|(name, value)| {
-        name.eq_ignore_ascii_case("retry-after")
-            .then_some(value.as_str())
-    })?;
-    value.trim().parse::<u64>().ok().map(Duration::from_secs)
-}
-
 pub(crate) fn assign_batch_ids(requests: &mut [BatchRequestItem]) {
     for (index, request) in requests.iter_mut().enumerate() {
         request.id = index.to_string();
@@ -388,9 +380,6 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
-
     use super::*;
 
     #[test]
@@ -414,14 +403,5 @@ mod tests {
         assign_batch_ids(&mut requests);
         assert_eq!(requests[0].id, "0");
         assert_eq!(requests[1].id, "1");
-    }
-
-    #[test]
-    fn retry_after_header_is_read_case_insensitively() {
-        let headers = HashMap::from([("Retry-After".to_string(), "17".to_string())]);
-        assert_eq!(
-            retry_after_from_headers(Some(&headers)),
-            Some(Duration::from_secs(17))
-        );
     }
 }

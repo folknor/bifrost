@@ -238,5 +238,5 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
 }
 
 fn label_ids(message: &GmailMessage) -> Vec<String> {
-    message.label_ids.iter().cloned().collect()
+    message.label_ids.clone()
 }

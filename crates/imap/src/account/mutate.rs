@@ -181,7 +181,13 @@ async fn run_folder_mutation(
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
             mutation_results(valid, &uids, outcome)
         }
-        Err(err) => failed_all(valid, super::account_error(err)),
+        Err(err) => failed_all(
+            valid,
+            super::account_error_with(
+                err,
+                super::error::ImapErrorContext::operation(mutation_operation(kind)),
+            ),
+        ),
     });
     Ok(results)
 }
@@ -212,7 +218,13 @@ async fn run_destroy_mutation_groups(
         let outcome = match store {
             Ok(result) => StoreWireOutcome::from_response_code(result.code.as_ref(), true),
             Err(err) => {
-                results.extend(failed_all(ids, super::account_error(err)));
+                results.extend(failed_all(
+                    ids,
+                    super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                    ),
+                ));
                 continue;
             }
         };
@@ -227,7 +239,13 @@ async fn run_destroy_mutation_groups(
                 .await
         {
             let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
-            results.extend(failed_all(expunging_ids, super::account_error(err)));
+            results.extend(failed_all(
+                expunging_ids,
+                super::account_error_with(
+                    err,
+                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                ),
+            ));
             results.extend(mutation_results(remaining_ids, &uids, outcome));
             continue;
         }
@@ -270,7 +288,13 @@ async fn run_flag_mutation_groups(
                 if matches!(op, FlagOp::Patch { .. }) {
                     account.folders.clear_modseqs(folder, uidvalidity, &uids);
                 }
-                failed_all(ids, super::account_error(err))
+                failed_all(
+                    ids,
+                    super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
+                    ),
+                )
             }
         });
     }

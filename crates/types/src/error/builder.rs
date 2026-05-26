@@ -8,6 +8,17 @@ use super::message_key;
 use super::recovery::{self, ThrottleScope};
 use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 
+pub(crate) struct RebuildParts {
+    pub kind: AccountErrorKind,
+    pub primary_cause: Cause,
+    pub chain_extras: Vec<Cause>,
+    pub scope: Option<ErrorScope>,
+    pub operation: Option<AccountOperation>,
+    pub provider: Option<Provider>,
+    pub protocol: Option<Protocol>,
+    pub diagnostics: DiagnosticInfo,
+}
+
 #[derive(Clone, Debug)]
 pub struct AccountErrorBuilder {
     kind: AccountErrorKind,
@@ -53,25 +64,16 @@ impl AccountErrorBuilder {
     /// that want to preserve those overrides must reapply them after
     /// `into_builder`.
     #[must_use]
-    pub(crate) fn from_rebuild(
-        kind: AccountErrorKind,
-        primary_cause: Cause,
-        chain_extras: Vec<Cause>,
-        scope: Option<ErrorScope>,
-        operation: Option<AccountOperation>,
-        provider: Option<Provider>,
-        protocol: Option<Protocol>,
-        diagnostics: DiagnosticInfo,
-    ) -> Self {
+    pub(crate) fn from_rebuild(parts: RebuildParts) -> Self {
         Self {
-            kind,
-            primary_cause,
-            chain_extras,
-            scope,
-            operation,
-            provider,
-            protocol,
-            diagnostics,
+            kind: parts.kind,
+            primary_cause: parts.primary_cause,
+            chain_extras: parts.chain_extras,
+            scope: parts.scope,
+            operation: parts.operation,
+            provider: parts.provider,
+            protocol: parts.protocol,
+            diagnostics: parts.diagnostics,
             idempotency_override: None,
             retry_not_before: None,
             throttle_scope: None,

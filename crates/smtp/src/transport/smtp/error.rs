@@ -29,7 +29,6 @@ impl Clone for Error {
                 kind: self.inner.kind.clone(),
                 source,
                 attempt: self.inner.attempt,
-                phase: self.inner.phase,
             }),
         }
     }
@@ -39,7 +38,6 @@ struct Inner {
     kind: ErrorKind,
     source: Option<BoxError>,
     attempt: Option<SmtpAttempt>,
-    phase: Option<SmtpCommandPhase>,
 }
 
 /// Wire-level transmission state for the mail-send side effect.
@@ -62,25 +60,15 @@ pub(crate) struct SmtpAttempt {
 
 /// Coarse command phase at the point an SMTP transport error was constructed.
 ///
-/// Used by the shared-error mapper to refine kind/cause selection (notably `AUTH`
-/// vs send-side effects) without leaking the public transport `ErrorKind` enum.
+/// Attached to the `SmtpErrorContext` at the call site so the shared-error
+/// mapper can refine recipient-lane vs body-lane classification without
+/// leaking the public transport `ErrorKind` enum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SmtpCommandPhase {
-    Connect,
-    Greeting,
-    Hello,
-    StartTls,
-    Auth,
-    MailFrom,
     RcptTo,
     DataCommand,
     DataBody,
-    BdatBody,
     LmtpFinalStatus,
-    Noop,
-    Vrfy,
-    Expn,
-    Rset,
 }
 
 impl Error {
@@ -93,7 +81,6 @@ impl Error {
                 kind,
                 source: source.map(Into::into),
                 attempt: None,
-                phase: None,
             }),
         }
     }
@@ -104,7 +91,6 @@ impl Error {
                 kind,
                 source: None,
                 attempt: None,
-                phase: None,
             }),
         }
     }
@@ -120,19 +106,8 @@ impl Error {
         self
     }
 
-    /// Attach the command phase the error originated in. Diagnostic only;
-    /// classification continues to use `ErrorKind` and the response payload.
-    pub(crate) fn with_phase(mut self, phase: SmtpCommandPhase) -> Self {
-        self.inner.phase = Some(phase);
-        self
-    }
-
     pub(crate) fn attempt(&self) -> Option<SmtpTransmissionState> {
         self.inner.attempt.map(|a| a.transmission_state)
-    }
-
-    pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {
-        self.inner.phase
     }
 
     /// Support-safe diagnostic string for the account-error mapper. AUTH paths

@@ -22,9 +22,18 @@ use crate::types::{
 };
 
 use super::{
-    DecodedObjectId, ImapAccount, account_error, decode_object_id, decode_thread_id,
+    DecodedObjectId, ImapAccount, account_error_with, decode_object_id, decode_thread_id,
     encode_object_id, encode_thread_id, factory, uid_set_from_u32,
 };
+use crate::error::Error;
+
+/// Build a `map_err` closure that stamps every internal IMAP `Error` with
+/// the operation of the calling public method. Threading operation
+/// per call site is what lets the central recovery mapping distinguish
+/// `Reconcile` vs `Retry::SameRequest` on non-idempotent operations.
+fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
+    move |e| account_error_with(e, super::error::ImapErrorContext::operation(op))
+}
 
 pub(crate) fn add_to_container(
     account: ImapAccount,
@@ -34,7 +43,13 @@ pub(crate) fn add_to_container(
     Box::pin(async move {
         let destination = folder_from_container(&container)?;
         let ids = decoded_targets(&target)?;
-        copy_messages(&account, ids, &destination).await
+        copy_messages(
+            &account,
+            ids,
+            &destination,
+            AccountOperation::AddToContainer,
+        )
+        .await
     })
 }
 
@@ -54,7 +69,7 @@ pub(crate) fn remove_from_container(
                 AccountOperation::RemoveFromContainer,
             ));
         }
-        delete_messages(&account, ids).await
+        delete_messages(&account, ids, AccountOperation::RemoveFromContainer).await
     })
 }
 
@@ -67,7 +82,7 @@ pub(crate) fn set_keyword(
     Box::pin(async move {
         let flag = imap_flag_for_keyword(&keyword);
         let ids = decoded_targets(&target)?;
-        set_flag(&account, ids, flag, value).await
+        set_flag(&account, ids, flag, value, AccountOperation::SetKeyword).await
     })
 }
 
@@ -78,7 +93,14 @@ pub(crate) fn set_is_read(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let ids = decoded_targets(&target)?;
-        set_flag(&account, ids, Flag::Seen, is_read).await
+        set_flag(
+            &account,
+            ids,
+            Flag::Seen,
+            is_read,
+            AccountOperation::SetIsRead,
+        )
+        .await
     })
 }
 
@@ -111,7 +133,8 @@ pub(crate) fn draft_create(
         let folder = role_folder(&account, FolderRole::Drafts)
             .ok_or_else(|| super::error::unsupported(AccountOperation::DraftCreate))?;
         let raw = draft_patch_to_rfc5322(&patch)?;
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::DraftCreate);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         let appended = conn
             .append(
                 folder.as_str(),
@@ -121,7 +144,7 @@ pub(crate) fn draft_create(
                 account.command_timeout(),
             )
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let Some((uidvalidity, uid)) = appended else {
             return Err(super::error::unsupported(AccountOperation::DraftCreate));
         };
@@ -135,7 +158,7 @@ pub(crate) fn draft_discard(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let id = decode_object_id(&ObjectId(draft.0))?;
-        delete_messages(&account, vec![id]).await
+        delete_messages(&account, vec![id], AccountOperation::DraftDiscard).await
     })
 }
 
@@ -147,17 +170,15 @@ pub(crate) fn search(
         if !account.capabilities.pim_methods.search {
             return Err(super::error::unsupported(AccountOperation::Search));
         }
+        let err = op_err(AccountOperation::Search);
         let plan = search_plan(&request)?;
         let mut threads = Vec::new();
         for folder in search_folders(&account, plan.folder.as_ref()) {
-            let mut conn = account
-                .checkout_for_folder(&folder)
-                .await
-                .map_err(account_error)?;
+            let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, None, true)
                 .await
-                .map_err(account_error)?;
+                .map_err(err)?;
             let uidvalidity = selected
                 .mailbox
                 .uid_validity
@@ -171,7 +192,7 @@ pub(crate) fn search(
                     account.command_timeout(),
                 )
                 .await
-                .map_err(account_error)?;
+                .map_err(err)?;
             for root in roots {
                 let mut uids = Vec::new();
                 flatten_thread(&root, &mut uids);
@@ -189,17 +210,15 @@ pub(crate) fn search_messages(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
+        let err = op_err(AccountOperation::SearchMessages);
         let plan = search_plan(&request)?;
         let mut messages = Vec::new();
         for folder in search_folders(&account, plan.folder.as_ref()) {
-            let mut conn = account
-                .checkout_for_folder(&folder)
-                .await
-                .map_err(account_error)?;
+            let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
             let selected = account
                 .select_folder(&mut conn, &folder, None, true)
                 .await
-                .map_err(account_error)?;
+                .map_err(err)?;
             let uidvalidity = selected
                 .mailbox
                 .uid_validity
@@ -208,7 +227,7 @@ pub(crate) fn search_messages(
                 .connection()
                 .uid_search(&plan.criteria, account.command_timeout())
                 .await
-                .map_err(account_error)?;
+                .map_err(err)?;
             messages.extend(
                 result
                     .ids
@@ -237,11 +256,12 @@ pub(crate) fn container_create(
             return Err(super::error::unsupported(AccountOperation::ContainerCreate));
         }
         let full_name = child_name(&account, parent.as_ref(), &name)?;
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::ContainerCreate);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         conn.create(full_name.as_str(), account.command_timeout())
             .await
-            .map_err(account_error)?;
-        refresh_folders(&account).await?;
+            .map_err(err)?;
+        refresh_folders(&account, AccountOperation::ContainerCreate).await?;
         Ok(ContainerId(full_name.as_str().to_owned()))
     })
 }
@@ -254,15 +274,16 @@ pub(crate) fn container_rename(
     Box::pin(async move {
         let folder = folder_from_container(&container)?;
         let new_name = renamed_sibling(&account, &folder, &name)?;
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::ContainerRename);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         conn.rename(
             folder.as_str(),
             new_name.as_str(),
             account.command_timeout(),
         )
         .await
-        .map_err(account_error)?;
-        refresh_folders(&account).await
+        .map_err(err)?;
+        refresh_folders(&account, AccountOperation::ContainerRename).await
     })
 }
 
@@ -275,15 +296,16 @@ pub(crate) fn container_move(
         let folder = folder_from_container(&container)?;
         let leaf = leaf_name(&account, &folder);
         let new_name = child_name(&account, new_parent.as_ref(), &leaf)?;
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::ContainerMove);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         conn.rename(
             folder.as_str(),
             new_name.as_str(),
             account.command_timeout(),
         )
         .await
-        .map_err(account_error)?;
-        refresh_folders(&account).await
+        .map_err(err)?;
+        refresh_folders(&account, AccountOperation::ContainerMove).await
     })
 }
 
@@ -293,11 +315,12 @@ pub(crate) fn container_delete(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let folder = folder_from_container(&container)?;
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::ContainerDelete);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         let status = conn
             .status(folder.as_str(), "MESSAGES", account.command_timeout())
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let non_empty = status
             .items
             .iter()
@@ -307,8 +330,8 @@ pub(crate) fn container_delete(
         }
         conn.delete(folder.as_str(), account.command_timeout())
             .await
-            .map_err(account_error)?;
-        refresh_folders(&account).await
+            .map_err(err)?;
+        refresh_folders(&account, AccountOperation::ContainerDelete).await
     })
 }
 
@@ -341,11 +364,12 @@ pub(crate) fn quota_get(
         let Some(folder) = quota_probe_folder(&account) else {
             return Ok(None);
         };
-        let conn = account.pool.dial_idle().await.map_err(account_error)?;
+        let err = op_err(AccountOperation::QuotaGet);
+        let conn = account.pool.dial_idle().await.map_err(err)?;
         let quota = conn
             .get_quota_root(folder.as_str(), account.command_timeout())
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         for (_root, resources) in quota.resources {
             for resource in resources {
                 if resource.name.eq_ignore_ascii_case("STORAGE") {
@@ -378,6 +402,7 @@ pub(crate) fn thread_hydrate(
                 })
                 .collect(),
             HydrationProjection::Full,
+            AccountOperation::HydrateThread,
         )
         .await?;
         Ok(ThreadHydration {
@@ -394,7 +419,13 @@ pub(crate) fn message_hydrate(
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
         let decoded = decode_object_id(&message)?;
-        let mut messages = hydrate_decoded(&account, vec![decoded], projection).await?;
+        let mut messages = hydrate_decoded(
+            &account,
+            vec![decoded],
+            projection,
+            AccountOperation::HydrateMessage,
+        )
+        .await?;
         messages
             .pop()
             .ok_or_else(|| pim_malformed("message was not returned by IMAP FETCH"))
@@ -468,16 +499,15 @@ async fn copy_messages(
     account: &ImapAccount,
     ids: Vec<DecodedObjectId>,
     destination: &MailboxName,
+    op: AccountOperation,
 ) -> Result<(), AccountError> {
+    let err = op_err(op);
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(account_error)?;
+        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let uidvalidity = selected
             .mailbox
             .uid_validity
@@ -493,7 +523,7 @@ async fn copy_messages(
                 account.command_timeout(),
             )
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
     }
     Ok(())
 }
@@ -501,16 +531,15 @@ async fn copy_messages(
 async fn delete_messages(
     account: &ImapAccount,
     ids: Vec<DecodedObjectId>,
+    op: AccountOperation,
 ) -> Result<(), AccountError> {
+    let err = op_err(op);
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(account_error)?;
+        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let uidvalidity = selected
             .mailbox
             .uid_validity
@@ -528,11 +557,11 @@ async fn delete_messages(
                 account.command_timeout(),
             )
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         conn.connection()
             .uid_expunge(uid_set.as_sequence_set(), account.command_timeout())
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         account.folders.clear_modseqs(&folder, uidvalidity, &uids);
     }
     Ok(())
@@ -543,21 +572,20 @@ async fn set_flag(
     ids: Vec<DecodedObjectId>,
     flag: Flag,
     value: bool,
+    op: AccountOperation,
 ) -> Result<(), AccountError> {
+    let err = op_err(op);
     let operation = if value {
         StoreOperation::AddSilent
     } else {
         StoreOperation::RemoveSilent
     };
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(account_error)?;
+        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, false)
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let uidvalidity = selected
             .mailbox
             .uid_validity
@@ -575,7 +603,7 @@ async fn set_flag(
                 account.command_timeout(),
             )
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         account.folders.clear_modseqs(&folder, uidvalidity, &uids);
     }
     Ok(())
@@ -585,17 +613,16 @@ async fn hydrate_decoded(
     account: &ImapAccount,
     ids: Vec<DecodedObjectId>,
     projection: HydrationProjection,
+    op: AccountOperation,
 ) -> Result<Vec<Message>, AccountError> {
+    let err = op_err(op);
     let mut messages = Vec::new();
     for (folder, ids) in group_by_folder(ids) {
-        let mut conn = account
-            .checkout_for_folder(&folder)
-            .await
-            .map_err(account_error)?;
+        let mut conn = account.checkout_for_folder(&folder).await.map_err(err)?;
         let selected = account
             .select_folder(&mut conn, &folder, None, true)
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         let uidvalidity = selected
             .mailbox
             .uid_validity
@@ -612,7 +639,7 @@ async fn hydrate_decoded(
                 account.command_timeout(),
             )
             .await
-            .map_err(account_error)?;
+            .map_err(err)?;
         for fetch in fetches {
             if let Some(message) = fetch_to_message(&folder, uidvalidity, fetch, projection) {
                 messages.push(message);
@@ -638,7 +665,9 @@ fn decoded_targets(target: &MutationTarget) -> Result<Vec<DecodedObjectId>, Acco
                 })
                 .collect())
         }
-        _ => Err(super::error::unsupported(AccountOperation::Discover)),
+        _ => Err(pim_malformed(
+            "unsupported MutationTarget variant for IMAP per-message operation",
+        )),
     }
 }
 
@@ -1045,12 +1074,13 @@ fn leaf_name(account: &ImapAccount, folder: &MailboxName) -> String {
         .to_owned()
 }
 
-async fn refresh_folders(account: &ImapAccount) -> Result<(), AccountError> {
-    let conn = account.pool.dial_idle().await.map_err(account_error)?;
+async fn refresh_folders(account: &ImapAccount, op: AccountOperation) -> Result<(), AccountError> {
+    let err = op_err(op);
+    let conn = account.pool.dial_idle().await.map_err(err)?;
     let profile = conn.server_profile();
     let folders = factory::list_folders(&conn, &account.config, &profile)
         .await
-        .map_err(account_error)?;
+        .map_err(err)?;
     account.folders.replace_all(folders);
     Ok(())
 }

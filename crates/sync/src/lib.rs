@@ -1,3 +1,10 @@
+// The crate-internal `Error` aggregates engine failure modes plus a wrapped
+// `AccountError` when one crosses a sync boundary. `AccountError` itself is
+// `Arc<Inner>`-backed and small; the engine's own variants account for the
+// other size. Boxing each variant would add allocation churn in the engine
+// hot path (cursor decode, checkpoint write) without changing the trait
+// surface that consumers see, which already returns `Result<_, AccountError>`.
+#![allow(clippy::result_large_err)]
 //! `bifrost-sync` is the engine that drives `bifrost-types::Account`
 //! implementations.
 //!

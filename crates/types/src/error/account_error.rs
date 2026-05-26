@@ -17,6 +17,11 @@ use super::scope::{AccountOperation, ErrorScope, Protocol, Provider};
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct AccountError {
+    inner: Arc<AccountErrorInner>,
+}
+
+#[derive(Clone, Debug)]
+struct AccountErrorInner {
     kind: AccountErrorKind,
     recovery: RecoveryClass,
     remediation: Option<RemediationAction>,
@@ -24,69 +29,72 @@ pub struct AccountError {
     operation: Option<AccountOperation>,
     provider: Option<Provider>,
     protocol: Option<Protocol>,
-    diagnostics: Arc<DiagnosticInfo>,
-    chain: Arc<CauseChain>,
+    diagnostics: DiagnosticInfo,
+    chain: CauseChain,
     message_key: &'static str,
 }
 
 impl AccountError {
     pub(crate) fn from_parts(parts: AccountErrorParts) -> Self {
         Self {
-            kind: parts.kind,
-            recovery: parts.recovery,
-            remediation: parts.remediation,
-            scope: parts.scope,
-            operation: parts.operation,
-            provider: parts.provider,
-            protocol: parts.protocol,
-            diagnostics: Arc::new(parts.diagnostics),
-            chain: Arc::new(parts.chain),
-            message_key: parts.message_key,
+            inner: Arc::new(AccountErrorInner {
+                kind: parts.kind,
+                recovery: parts.recovery,
+                remediation: parts.remediation,
+                scope: parts.scope,
+                operation: parts.operation,
+                provider: parts.provider,
+                protocol: parts.protocol,
+                diagnostics: parts.diagnostics,
+                chain: parts.chain,
+                message_key: parts.message_key,
+            }),
         }
     }
 
     #[must_use]
     pub fn kind(&self) -> &AccountErrorKind {
-        &self.kind
+        &self.inner.kind
     }
 
     #[must_use]
     pub fn recovery(&self) -> &RecoveryClass {
-        &self.recovery
+        &self.inner.recovery
     }
 
     #[must_use]
     pub fn suggested_remediation(&self) -> Option<&RemediationAction> {
-        self.remediation.as_ref()
+        self.inner.remediation.as_ref()
     }
 
     #[must_use]
     pub fn scope(&self) -> Option<&ErrorScope> {
-        self.scope.as_ref()
+        self.inner.scope.as_ref()
     }
 
     #[must_use]
     pub fn operation(&self) -> Option<AccountOperation> {
-        self.operation
+        self.inner.operation
     }
 
     #[must_use]
     pub fn provider(&self) -> Option<Provider> {
-        self.provider
+        self.inner.provider
     }
 
     #[must_use]
     pub fn protocol(&self) -> Option<Protocol> {
-        self.protocol
+        self.inner.protocol
     }
 
     #[must_use]
     pub fn message_key(&self) -> &'static str {
-        self.message_key
+        self.inner.message_key
     }
 
     pub fn user_safe_text(&self) -> impl Iterator<Item = &str> {
-        self.diagnostics
+        self.inner
+            .diagnostics
             .text
             .iter()
             .filter(|text| text.visibility == DetailVisibility::UserSafe)
@@ -107,7 +115,7 @@ impl AccountError {
     pub fn support_consented(&self) -> SupportExportConsented<'_> {
         let mut user_safe_text = Vec::new();
         let mut support_text = Vec::new();
-        for text in &self.diagnostics.text {
+        for text in &self.inner.diagnostics.text {
             match text.visibility {
                 DetailVisibility::UserSafe => user_safe_text.push(text.value.as_str()),
                 DetailVisibility::SupportOnly => support_text.push(text.value.as_str()),
@@ -118,7 +126,7 @@ impl AccountError {
             telemetry: self.telemetry_fields(),
             user_safe_text,
             support_text,
-            scope: self.scope.as_ref(),
+            scope: self.inner.scope.as_ref(),
         }
     }
 
@@ -127,6 +135,7 @@ impl AccountError {
         SupportExportInternal {
             consented: self.support_consented(),
             chain: self
+                .inner
                 .chain
                 .iter()
                 .map(super::cause::Cause::summary)
@@ -136,7 +145,7 @@ impl AccountError {
 
     #[must_use]
     pub fn chain(&self) -> &CauseChain {
-        &self.chain
+        &self.inner.chain
     }
 
     /// Consume this error and return a builder pre-populated with its
@@ -156,32 +165,31 @@ impl AccountError {
     /// the caller needs them.
     #[must_use]
     pub fn into_builder(self) -> super::builder::AccountErrorBuilder {
-        let chain = Arc::try_unwrap(self.chain).unwrap_or_else(|arc| (*arc).clone());
-        let diagnostics = Arc::try_unwrap(self.diagnostics).unwrap_or_else(|arc| (*arc).clone());
-        let mut causes = chain.into_vec();
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
+        let mut causes = inner.chain.into_vec();
         let primary_cause = causes.remove(0);
-        super::builder::AccountErrorBuilder::from_rebuild(
-            self.kind,
+        super::builder::AccountErrorBuilder::from_rebuild(super::builder::RebuildParts {
+            kind: inner.kind,
             primary_cause,
-            causes,
-            self.scope,
-            self.operation,
-            self.provider,
-            self.protocol,
-            diagnostics,
-        )
+            chain_extras: causes,
+            scope: inner.scope,
+            operation: inner.operation,
+            provider: inner.provider,
+            protocol: inner.protocol,
+            diagnostics: inner.diagnostics,
+        })
     }
 }
 
 impl fmt::Display for AccountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({:?})", self.message_key, self.kind)
+        write!(f, "{} ({:?})", self.inner.message_key, self.inner.kind)
     }
 }
 
 impl StdError for AccountError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(self.chain.outermost())
+        Some(self.inner.chain.outermost())
     }
 }
 
@@ -211,10 +219,10 @@ impl<'a> TelemetryView<'a> {
             recovery_discriminant: recovery_discriminant(error.recovery()),
             provider: error.provider(),
             protocol: error.protocol(),
-            status: error.diagnostics.status,
-            native_code: error.diagnostics.native_code.as_deref(),
-            request_id: error.diagnostics.request_id.as_deref(),
-            trace_id: error.diagnostics.trace_id.as_deref(),
+            status: error.inner.diagnostics.status,
+            native_code: error.inner.diagnostics.native_code.as_deref(),
+            request_id: error.inner.diagnostics.request_id.as_deref(),
+            trace_id: error.inner.diagnostics.trace_id.as_deref(),
             retry_disposition,
             retry_reason,
             throttle_scope,

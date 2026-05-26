@@ -3,15 +3,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
-    AccountError, AccountFuture, AccountStream, CursorScope, HintPayload, InvalidationHint,
-    PushSource, SubscriptionHandle, WatchEvent,
+    AccountError, AccountFuture, AccountOperation, AccountStream, CursorScope, HintPayload,
+    InvalidationHint, PushSource, SubscriptionHandle, WatchEvent,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::account::error::ImapErrorContext;
 use crate::connection::IdleEvent;
 
-use super::{ImapAccount, account_error, boxed_receiver_stream, folder_scope};
+use super::{ImapAccount, account_error_with, boxed_receiver_stream, folder_scope};
 
 pub(crate) struct PushState {
     tx: broadcast::Sender<WatchEvent>,
@@ -56,7 +57,12 @@ pub(crate) fn push_subscribe(
             .lock()
             .expect("push scopes lock poisoned")
             .insert(handle.0.clone(), scopes.into_iter().collect());
-        ensure_idle_task(account.clone()).map_err(account_error)?;
+        ensure_idle_task(account.clone()).map_err(|e| {
+            account_error_with(
+                e,
+                ImapErrorContext::operation(AccountOperation::PushSubscribe),
+            )
+        })?;
         Ok(handle)
     })
 }

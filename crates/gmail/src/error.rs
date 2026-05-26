@@ -126,8 +126,6 @@ pub(crate) struct GmailResponseError {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct GmailErrorEnvelope {
     #[serde(default)]
-    pub(crate) code: Option<u16>,
-    #[serde(default)]
     pub(crate) message: Option<String>,
     #[serde(default)]
     pub(crate) status: Option<String>,
@@ -138,15 +136,9 @@ pub(crate) struct GmailErrorEnvelope {
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct GmailErrorDetail {
     #[serde(default)]
-    pub(crate) domain: Option<String>,
-    #[serde(default)]
     pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) message: Option<String>,
-    #[serde(default, rename = "locationType")]
-    pub(crate) location_type: Option<String>,
-    #[serde(default)]
-    pub(crate) location: Option<String>,
 }
 
 impl GmailErrorEnvelope {
@@ -209,10 +201,6 @@ pub(crate) enum GmailLocalError {
     BlobRangeUnsupported {
         blob_id: String,
     },
-    BlobRangeOutOfBounds {
-        start: u64,
-        total: u64,
-    },
     Internal {
         detail: String,
     },
@@ -253,9 +241,6 @@ impl Display for GmailLocalError {
             Self::BlobRangeUnsupported { blob_id } => {
                 write!(f, "blob {blob_id} does not support range reads")
             }
-            Self::BlobRangeOutOfBounds { start, total } => {
-                write!(f, "blob range start {start} >= total {total}")
-            }
             Self::Internal { detail } => write!(f, "internal gmail error: {detail}"),
         }
     }
@@ -281,11 +266,6 @@ pub(crate) enum Error {
     Response(Box<GmailResponseError>),
     /// JSON decoding of a successful Gmail response failed.
     JsonDecode {
-        service: GmailService,
-        source: serde_json::Error,
-    },
-    /// JSON encoding of a request body failed.
-    JsonEncode {
         service: GmailService,
         source: serde_json::Error,
     },
@@ -371,9 +351,6 @@ impl Display for Error {
             Self::JsonDecode { service, source } => {
                 write!(f, "{service} JSON decode failed: {source}")
             }
-            Self::JsonEncode { service, source } => {
-                write!(f, "{service} JSON encode failed: {source}")
-            }
             Self::Base64 { encoding, source } => {
                 write!(f, "{encoding} decode failed: {source}")
             }
@@ -386,7 +363,7 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Net(err) => Some(err),
-            Self::JsonDecode { source, .. } | Self::JsonEncode { source, .. } => Some(source),
+            Self::JsonDecode { source, .. } => Some(source),
             Self::Base64 { source, .. } => Some(source),
             Self::Response(_) | Self::Local(_) => None,
         }
@@ -448,7 +425,6 @@ mod tests {
         }"#;
         let env = parse_gmail_envelope(body).expect("envelope");
         assert_eq!(env.primary_reason(), Some("userRateLimitExceeded"));
-        assert_eq!(env.code, Some(429));
         assert_eq!(env.status.as_deref(), Some("RESOURCE_EXHAUSTED"));
     }
 

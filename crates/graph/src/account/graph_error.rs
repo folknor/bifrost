@@ -44,15 +44,6 @@ impl GraphErrorContext {
     }
 
     #[must_use]
-    pub(crate) fn ews(operation: AccountOperation) -> Self {
-        Self {
-            protocol: Protocol::Ews,
-            operation,
-            scope: None,
-        }
-    }
-
-    #[must_use]
     pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
         self.scope = Some(scope);
         self
@@ -1017,21 +1008,6 @@ mod tests {
         ));
         assert_eq!(err.protocol(), Some(Protocol::Graph));
         assert_eq!(err.provider(), Some(Provider::Microsoft));
-    }
-
-    #[test]
-    fn ews_context_stamps_ews_protocol() {
-        let err = classify(
-            StatusCode::UNAUTHORIZED,
-            r#"{"error":{"code":"InvalidAuthenticationToken"}}"#,
-            GraphErrorContext::ews(AccountOperation::PushStream),
-            &[],
-        );
-        assert_eq!(err.protocol(), Some(Protocol::Ews));
-        assert!(matches!(
-            err.kind(),
-            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
-        ));
     }
 
     #[test]

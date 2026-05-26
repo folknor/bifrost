@@ -583,8 +583,8 @@ mod tests {
         );
         let err = response_to_account_error(
             &resp,
-            &SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::BdatBody),
-            Some(SmtpCommandPhase::BdatBody),
+            &SmtpErrorContext::send(Protocol::Smtp).with_phase(SmtpCommandPhase::DataCommand),
+            Some(SmtpCommandPhase::DataCommand),
             Some(SmtpTransmissionState::Acknowledged),
         );
         assert!(matches!(

@@ -18,7 +18,7 @@ pub(crate) fn establish_initial_cursor(
     scope: CursorScope,
 ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
     Box::pin(async move {
-        let _folder = folder_from_scope(&scope)?;
+        let _folder = folder_from_scope(&scope, bifrost_types::AccountOperation::EstablishCursor)?;
         Ok(CursorEstablishment::EstablishViaInventory)
     })
 }
@@ -61,7 +61,8 @@ async fn run_inventory(
         .await
         .map_err(|_| crate::Error::closed())?;
     }
-    let folder = folder_from_scope(&scope).map_err(|e| crate::Error::Protocol(e.to_string()))?;
+    let folder = folder_from_scope(&scope, bifrost_types::AccountOperation::SyncInventory)
+        .map_err(|e| crate::Error::Protocol(e.to_string()))?;
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, None, true)

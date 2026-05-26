@@ -569,17 +569,11 @@ impl Account for ImapAccount {
 }
 
 /// Convert a crate-private `crate::Error` into a public `AccountError`
-/// at the account-trait boundary.
+/// at the account-trait boundary, stamping the supplied `ImapErrorContext`.
 ///
-/// Every call site should pass a populated `ImapErrorContext` so that
-/// the central recovery mapping has the operation and scope it needs
-/// to derive `RecoveryClass`. A bare `ImapErrorContext::empty()` is
-/// allowed for sites still being migrated, but produces a less precise
-/// recovery verdict.
-pub(crate) fn account_error(err: Error) -> AccountError {
-    error::into_account_error(err, error::ImapErrorContext::empty())
-}
-
+/// Every call site must populate the context with the calling operation
+/// so the central recovery mapping has the operation and scope it needs
+/// to derive `RecoveryClass`.
 pub(crate) fn account_error_with(err: Error, ctx: error::ImapErrorContext) -> AccountError {
     error::into_account_error(err, ctx)
 }
@@ -645,17 +639,18 @@ pub(crate) fn batch<T>(
     })
 }
 
-pub(crate) fn folder_from_scope(scope: &CursorScope) -> Result<MailboxName, AccountError> {
+pub(crate) fn folder_from_scope(
+    scope: &CursorScope,
+    op: bifrost_types::AccountOperation,
+) -> Result<MailboxName, AccountError> {
     match scope {
         CursorScope::Folder(folder) => MailboxName::new(folder.0.clone()).map_err(|e| {
             error::into_account_error(
                 Error::InvalidInput(e.to_string()),
-                error::ImapErrorContext::operation(bifrost_types::AccountOperation::Discover),
+                error::ImapErrorContext::operation(op),
             )
         }),
-        _ => Err(error::unsupported(
-            bifrost_types::AccountOperation::Discover,
-        )),
+        _ => Err(error::unsupported(op)),
     }
 }
 

@@ -6,7 +6,13 @@ use bifrost_types::{Account, AccountError, AccountFactory, AccountFuture, Accoun
 use crate::connection::ImapConfig;
 use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};
 
-use super::{ImapAccount, Pool, account_error, capabilities, folder_registry::FolderRegistry};
+use super::error::ImapErrorContext;
+use super::{ImapAccount, Pool, account_error_with, capabilities, folder_registry::FolderRegistry};
+use bifrost_types::AccountOperation;
+
+fn discover_err(err: crate::Error) -> AccountError {
+    account_error_with(err, ImapErrorContext::operation(AccountOperation::Discover))
+}
 
 /// Configuration used by `ImapAccountFactory`.
 #[non_exhaustive]
@@ -82,20 +88,20 @@ impl AccountFactory for ImapAccountFactory {
                     Some(Arc::clone(&bandwidth_cap)),
                 )
                 .await
-                .map_err(account_error)?;
+                .map_err(discover_err)?;
 
             let mut profile = conn.server_profile();
             let server_id = read_server_id(&conn, &cfg, &profile)
                 .await
-                .map_err(account_error)?;
+                .map_err(discover_err)?;
             let qresync = negotiate_qresync(&conn, &cfg, &profile, &server_id)
                 .await
-                .map_err(account_error)?;
+                .map_err(discover_err)?;
             profile = conn.server_profile();
 
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
-                .map_err(account_error)?;
+                .map_err(discover_err)?;
             let caps = capabilities::build_capabilities(&profile, &folders);
             let registry = Arc::new(FolderRegistry::from_list(folders));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);

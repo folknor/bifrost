@@ -809,10 +809,12 @@ impl SyncEngine {
     ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
     /// dispatches retries from `AccountError::recovery()`:
+    ///
     /// - `Retry::SameRequest` / `AfterAuthRefresh` queue for retry.
     /// - `Retry::AfterStateRefresh` and `Reconcile` queue for read-back.
     /// - `Engine(_)` blocks the campaign and signals the engine.
     /// - terminal recovery lands in `failed_terminal`.
+    ///
     /// `ItemOutcome::Uncertain` is always queued for read-back.
     pub async fn bulk_set_flags(
         &self,

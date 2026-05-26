@@ -374,12 +374,6 @@ pub(crate) fn set_error_to_account_error(
                 code: "other".to_string(),
             })),
         ),
-        _ => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
-                code: set_error.error_type().to_string(),
-            })),
-        ),
     };
 
     let mut builder = build_with(&ctx, kind, primary)
@@ -403,10 +397,10 @@ pub(crate) fn set_error_to_account_error(
             | &SetErrorType::MailboxHasEmail
             | &SetErrorType::Other
     );
-    if !primary_was_wire {
-        if let Some(wire) = set_error_type_to_jmap_method(set_error.error_type().clone()) {
-            builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
-        }
+    if !primary_was_wire
+        && let Some(wire) = set_error_type_to_jmap_method(set_error.error_type().clone())
+    {
+        builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
     }
     if let Some(description) = set_error.description() {
         builder = builder.text(DiagnosticText::support_only(description));
