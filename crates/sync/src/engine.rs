@@ -986,6 +986,15 @@ impl SyncEngine {
                                         )
                                     ) {
                                         readback_ids.push(id.clone());
+                                        // Mark the item as PendingReadback so
+                                        // `counters_from_outcomes` counts it
+                                        // alongside other read-back-queued
+                                        // items. Without this insert the
+                                        // counter rebalance would underflow
+                                        // when read-back resolves these ids
+                                        // to skipped/still_failed.
+                                        outcomes
+                                            .insert(id.clone(), MutationBucket::PendingReadback);
                                     }
                                 }
                                 if wants_dedupe {

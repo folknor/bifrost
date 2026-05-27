@@ -74,7 +74,7 @@ pub struct MultiplexerEvent {
 /// (`Engine(RestartScope)`, `Engine(DowngradeCapabilityForScope)`,
 /// `Engine(DowngradeStrategy)` with `ErrorScope::Cursor`) carry
 /// `Some(scope)`. Account-wide directives (`RestartAccount`,
-/// `SchemaIncompatible`, `CapabilityChanged`, `OperatorOverrideRequired`)
+/// `SchemaIncompatible`, `OperatorOverrideRequired`)
 /// carry `None`. Workers must not paper over an account-wide directive
 /// with the worker's own scope - passing `Some(arbitrary_scope)` would
 /// mask the directive's account-wide intent.

@@ -235,7 +235,7 @@ Push runs through a single reader task spawned at factory `open()` when the sess
 
 `subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
 
-`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Destroyed` for membership scope churn. Errors from the poll are classified through `into_account_error`; terminal classes (or engine-action classes) break out of the polling loop so the engine reopens the account, instead of the previous sleep-and-retry-silently behavior. The stream's element type is `ScopeLifecycle` (not `SyncEvent<_>`), so the protocol cannot emit a typed `Terminated(AccountError)` on this channel - ending the stream is the protocol-side signal the engine has to act on.
+`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Deleted` for membership scope churn. Errors from the poll are classified through `into_account_error`; terminal classes (or engine-action classes) break out of the polling loop so the engine reopens the account, instead of the previous sleep-and-retry-silently behavior. The stream's element type is `ScopeLifecycle` (not `SyncEvent<_>`), so the protocol cannot emit a typed `Terminated(AccountError)` on this channel - ending the stream is the protocol-side signal the engine has to act on.
 
 ### Mutation pipeline
 
@@ -292,8 +292,10 @@ Mapping highlights for the JMAP signals the central table reads:
   `NoPermission`.
 - `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`
   from documented JMAP behavior.
-- `Problem(unknownCapability)` -> `SyncState(CapabilityDelta)` ->
-  `Engine(CapabilityChanged)`.
+- `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
+  `Engine(RestartAccount)` (the `EngineDirective::CapabilityChanged`
+  variant was removed in Phase 5A; capability shifts now route through
+  full account reopen).
 - `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`
   -> `ProviderContractViolation`.
 - HTTP-only status fallbacks (401/403/429/5xx) on bare

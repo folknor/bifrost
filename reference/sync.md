@@ -166,8 +166,10 @@ successful `Done`.
   cancels the per-scope token and drops the cursor.
 - **Reopen requests** on a `mpsc::Sender<ReopenRequest>` channel:
   `RestartScope` deletes the in-memory and durable cursor before
-  re-establishing; `RestartAccount` and `CapabilityChanged` route
-  up to the engine's reopen path.
+  re-establishing; `RestartAccount` routes up to the engine's reopen
+  path. Capability shifts arrive as `RestartAccount` since the
+  `EngineDirective::CapabilityChanged` variant was removed in Phase
+  5A.
 
 Per-scope cancellation tokens live in
 `Multiplexer::scope_tokens` so a `ScopeLifecycle::Deleted` stops
@@ -264,8 +266,10 @@ is the engine-side entry that records the handle on success.
 2. Collect `ItemOutcome::Failed` ids whose `AccountError::recovery()`
    is `RecoveryClass::Retry(advice)` or
    `RecoveryClass::Reconcile(_)`.
-3. Sleep for the effective delay (from `advice.not_before` /
-   `advice.min_delay`) and resubmit with the **same** `IdempotencyKey`
+3. Sleep for the effective delay from `advice.retry_hint`
+   (`RetryHint::min_delay(now)` or `RetryHint::not_before(now)` per
+   the caller's scheduler shape) and resubmit with the **same**
+   `IdempotencyKey`
    (engine bookkeeping; no protocol today emits it on the wire).
    Repeat up to `EngineConfig::mutation_max_retries`.
 4. Run `run_readback_guard` once at the end against unresolved

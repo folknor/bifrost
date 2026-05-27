@@ -798,6 +798,104 @@ Phase 5D confirms no live bug/gap findings remain.
 
 None blocking. Begin Phase A on confirmation.
 
+## Phase 5D follow-ups (deferred, not blocking)
+
+Findings surfaced by the Phase 5D re-audit that aren't already
+covered by an existing `*-F*` item. Tracked here so they don't rot
+in the audit reports.
+
+- **sync-F4.** `ThrottleBucket` is write-only.
+  - **status:** `apply_throttle` (`engine.rs:1740-1757`) records
+    deadlines on `Retry` dispatch, but no production code path reads
+    the bucket via `wait_for(...)` before driving work. sync-D3's
+    intent ("engine consults the bucket before driving any work") is
+    unmet. Tenant- and provider-wide throttles recorded by one scope
+    do not pause sibling scopes or sibling accounts.
+  - **plan:** wire `ThrottleBucket::wait_for(key, now)` consultation
+    into the poll loop (`multiplexer/mod.rs` per-scope drive) and the
+    push reconciler (`push/reconciler.rs::reconcile`). Deferred until
+    a consumer actually needs cross-account pause coordination; the
+    record side is already in place.
+
+- **sync-F5.** `apply_throttle` only resolves `Account` scope.
+  - **status:** `engine.rs:1740-1757` calls
+    `throttle_key_for(scope, ctx.account_id, None, None, None)`.
+    `Mailbox` / `Tenant` / `Provider` scopes return `None` from
+    `throttle_key_for` and the bucket entry is dropped. `RecoveryContext`
+    does not carry mailbox / tenant / provider identity.
+  - **plan:** extend `RecoveryContext` with `Option<MailboxId>`,
+    `Option<String>` (tenant), `Option<Provider>` and thread them
+    through `apply_throttle`. Coupled with sync-F4; doing F5 alone
+    has no observable effect because the read side isn't wired.
+
+- **sync-F6.** `discover_memberships` terminal swallowed.
+  - **status:** `engine.rs:1581-1589` logs the kind and breaks the
+    loop, returning `Ok(())`. Push reconciler then routes hints to
+    "every registered scope" because the membership index is empty.
+    Original Phase 4 audit gap not closed by Phase 5B/5E.
+  - **plan:** match `scope_lifecycle` shape: classify-and-break on
+    terminal / engine-action classes so the engine reopens the
+    account; preserve sleep on retry classes. Same shape as
+    `jmap-D3` for the JMAP side. Small fix.
+
+- **gmail-F3.** `scope_lifecycle_stream` and `labels_for_flags`
+  swallow with `tracing::warn!`.
+  - **status:** `crates/gmail/src/account/scopes.rs:134-136` and
+    `:152-155` bare-warn on `list_labels()` failures. An
+    auth-lost loop forever instead of surfacing.
+  - **plan:** classify through
+    `into_account_error(_, GmailErrorContext::containers_list())` and
+    break the loop on terminal classes. Trait-shape constraint same
+    as `jmap-F1` (the stream element type is `ScopeLifecycle`, not
+    `SyncEvent<_>`), so no `Terminated(AccountError)` emission until
+    that's resolved. Mirror of `jmap-F1`.
+
+- **smtp-F1.** Legacy non-batch SMTP/LMTP send paths don't tag phase.
+  - **status:** `crates/smtp/src/transport/smtp/client/connection.rs:142+`
+    (`send_with_options`), `:172+` (`send_bdat_with_options`), `:324`
+    (`send_lmtp_with_options`), `:340+` (`send_lmtp_bdat_with_options`)
+    use `self.command(...)` with no `with_phase` decoration. Async
+    siblings have the same shape. No `Account` impl wires them yet,
+    so the P0 double-send pattern is dormant rather than active.
+  - **plan:** either (a) deprecate the legacy paths in favor of
+    `send_lmtp_batch` once an `Account::send` impl lands and confirm
+    the batch helper is the only public surface, or (b) thread phase
+    tags + per-recipient lane resolution into them. Defer until a
+    consumer wires `Account::send`.
+
+- **smtp-F2.** AUTH-command wire failures inside `auth()` not
+  phase-tagged.
+  - **status:** `connection.rs:1307` (`command(auth)`) and
+    `:1311-1318` (challenge `command(...)`) propagate via `try_smtp!`
+    without `with_phase(SmtpCommandPhase::Auth)`. Async siblings
+    same. Server `535` / `534` replies still reach `Permanent(response)`
+    and classify as `Authentication(...)` / `Authorization(...)` via
+    the response-code path, so the routing is correct today; what's
+    lost is the AUTH-phase tag for non-reply failures (challenge
+    formatting faults, etc.).
+  - **plan:** wrap `command(auth)` / challenge commands with
+    `.map_err(|e| e.with_phase(SmtpCommandPhase::Auth))`. Trivial
+    once someone touches `auth()`.
+
+- **graph-F5.** `SoapFaultCode` coverage gap for Microsoft EWS faults.
+  - **status:** `crates/graph/src/ews/mod.rs:78-89` `SoapFaultCode::parse`
+    only matches the four SOAP 1.1 names (`VersionMismatch`,
+    `MustUnderstand`, `Client`, `Server`). Microsoft EWS in practice
+    ships `<faultcode>` values like `a:ErrorAccessDenied`,
+    `a:ErrorServerBusy`, `a:ErrorMailboxStoreUnavailable`,
+    `a:ErrorImpersonateUserDenied`, etc. - all collapse to
+    `SoapFaultCode::Unknown` and then to `Protocol(ContractViolation)`
+    -> `ProviderContractViolation` (terminal). Recoverable faults
+    (server busy, mailbox store unavailable) are misclassified as
+    terminal.
+  - **plan:** extend `SoapFaultCode` with `ErrorAccessDenied`,
+    `ErrorServerBusy`, `ErrorImpersonateUserDenied`,
+    `ErrorMailboxStoreUnavailable`, and any other commonly-seen
+    Microsoft EWS faults. Map onto the same `AccessCause::*` /
+    `ServerCause::*` / `Access(MailboxUnavailable)` shapes the REST
+    path uses. Defer to when EWS is actually exercised in
+    production; until then misclassification is latent.
+
 ## Phase 5C follow-ups (deferred, not blocking)
 
 Items the Phase 5C protocol agents landed correctly but with explicit
