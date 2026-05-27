@@ -103,11 +103,14 @@ for each (logging but not failing on per-account errors), then
 cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
-`reopen` (driven by `RecoveryClass::Engine(EngineDirective::RestartAccount)`
-or `Engine(EngineDirective::CapabilityChanged)`) calls `factory.open(account_id)` again and
-`slot.current.store(Arc::new(next))` after reapplying the
-priority and bandwidth-cap snapshots. Spawned tasks pick up the
-new handle on their next `load_full()`.
+`reopen` (driven by `EngineDirective::RestartAccount`) calls
+`factory.open(account_id)` again and
+`slot.current.store(Arc::new(next))` after reapplying the priority
+and bandwidth-cap snapshots. Spawned tasks pick up the new handle
+on their next `load_full()`. Capability shifts no longer have a
+dedicated directive variant; the convergence rewrite collapsed
+them onto `RestartAccount` because account reopen already re-runs
+`discover_cursor_scopes` / `discover_memberships` / `push_subscribe`.
 
 ## Stream contract: broadcast + consumer ack
 
@@ -227,15 +230,24 @@ collapsed to an `Unknown` reconcile request rather than dropped.
 calls `scopes_for_hint(&cursors, &hint.payload)` (which consults
 the membership index populated at attach), then drives
 `changes_stream` to completion for each affected scope. On
-`Terminated(err)`, the reconciler reads `err.recovery()` and
-routes `Engine(_)` directives to the slot's reopen channel;
-`Retry(advice)` sleeps for the effective delay computed from
-`advice.not_before` and `advice.min_delay`. On
+`Terminated(err)`, the reconciler routes through
+`crate::recovery::plan_recovery` and forwards
+`RecoveryPlan::Engine(directive)` to the slot's reopen channel
+carrying the original account error; `Retry(advice)` sleeps for the
+duration derived from `advice.retry_hint`. On
 `Disconnected` / `Reconnected`, `Reconciler::warning_event`
 synthesizes a `MultiplexerEvent` carrying
 `SyncEvent::Warning { kind: WarningKind::Other("push:disconnected"
 | "push:reconnected"), ... }` and `Reconnected` additionally
 triggers a full `HintPayload::Unknown` reconcile.
+
+`WatchEvent::Terminated(AccountError)` (push streams that classify
+their own exit) flows through the same `plan_recovery` dispatch:
+engine directives route through the reopen channel, terminal
+classes broadcast `SyncEvent::Terminated(err)` so consumers observe
+the structured error, and retryable / reconcilable verdicts emit a
+warning while the in-process forwarder reconnects on its next
+iteration.
 
 `SubscriptionRegistry` (per-engine `DashMap<AccountId,
 Vec<SubscriptionHandle>>`) stashes handles returned by
@@ -260,15 +272,27 @@ is the engine-side entry that records the handle on success.
    failures: `get_stream(Projection::FlagsOnly)` re-fetches and
    reconciles applied / skipped / failed_terminal.
 
-`MutationCounters` buckets `ItemOutcome::Failed` outcomes by the
-carried `AccountError::recovery()`: `Retry` and `Reconcile` are
-candidates for retry; every terminal `RecoveryClass` variant
-(`AuthLost`, `NeedsAdminConsent`, `NeedsPolicyChange`,
-`NoPermission`, `Unsupported`, `ClientBug`,
-`ProviderContractViolation`, `ProviderRefused`,
-`UnknownPermanent`) lands in `failed_terminal`. `Engine(_)`
-directives surface to the engine's reopen / restart-scope /
-downgrade machinery and never re-enter the per-item retry queue.
+`MutationCounters` buckets `ItemOutcome::Failed` outcomes via
+`crate::recovery::plan_recovery`:
+- `Retry { SameRequest | AfterAuthRefresh }` -> `pending_retry`.
+- `Retry { AfterStateRefresh }` and
+  `Reconcile { CheckTarget }` -> `pending_retry` then the
+  read-back guard reclassifies into `skipped` /
+  `failed_terminal`.
+- `Reconcile { DedupeByClientId }` increments
+  `dedupe_by_client_id` and broadcasts a
+  `Warning::OperatorAttentionNeeded` (the dedupe lives at the
+  consumer because the client-id space is theirs).
+- `Engine(_)` -> `blocked_by_engine` AND the directive is
+  forwarded through `ReopenRequest::Recovery` so the engine's
+  recovery dispatch performs the restart / downgrade / schema
+  clear. `blocked_by_engine` is distinct from `failed_terminal`:
+  the campaign was halted by the engine, not by per-item
+  terminal classification.
+- terminal recovery -> `failed_terminal`.
+
+`ItemOutcome::Uncertain` always queues for read-back so a
+non-idempotent transport drop never replays blindly.
 
 `IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
 is consumer-minted and consumer-persisted across process restarts
@@ -409,17 +433,52 @@ Engine-side `Error` (distinct from `bifrost-types::AccountError`):
 - `Other(String)`
 
 Stream termination is the `SyncEvent::Terminated(AccountError)`
-variant; the engine reads `error.recovery()` and dispatches via
-the four mutually-exclusive helpers (`is_retryable`,
-`requires_reconciliation`, `requires_engine_action`,
-`is_terminal`). `Engine(EngineDirective::*)` directives drive
-`drop` / `restart-scope` / `restart-account` / `downgrade-strategy`
-/ `downgrade-capability` / `schema-clear` / `capability-changed`
-/ `operator-override` reopens; terminal recovery surfaces to the
-consumer. `bifrost_types::Fatal` is a separate terminal-only
-newtype available at engine boundaries that specifically need
-"the engine has nothing more to try"; the stream itself uses
-`Terminated`.
+variant; the engine dispatches every termination through
+`crate::recovery::plan_recovery(error)`, which collapses
+`AccountError::recovery()` into the closed
+`RecoveryPlan { Retry, Reconcile, Engine, Terminal(Fatal) }` enum.
+Adding a future `RecoveryClass` variant fails to compile in
+`plan_recovery` (the four mutually-exclusive helpers cover the
+case, but the closed `RecoveryPlan` enum enforces the dispatch
+surface). `Engine(EngineDirective::*)` directives drive
+`restart-scope` / `restart-account` / `downgrade-strategy` /
+`downgrade-capability` / `schema-clear` / `operator-override`
+flows; `Terminal(Fatal)` carries the typed terminal account error
+into operator-notification queues and persistent-failure dashboards.
+
+Reopens use exponential backoff with ±20% jitter (1s initial, 5min
+cap) and a three-attempt budget. After three failures the engine
+broadcasts `SyncEvent::Terminated(last_error)` for the affected
+scope (per-scope re-establishment) or for the account
+(`RestartAccount`), then publishes
+`AccountControl::Pause(PauseReason::RetryBudgetExhausted)` and
+flips the boundary to `Pause` so workers park. Consumers subscribe
+to the per-account `AccountControl` broadcast via
+`SyncEngine::account_control_stream` and flip back via
+`SyncEngine::resume_account`.
+
+`EngineDirective::OperatorOverrideRequired { reason }` auto-pauses
+the account with `PauseReason::OperatorOverrideRequired` and emits
+a `Warning::OperatorAttentionNeeded` carrying the protocol-supplied
+reason. The reason rides on the warning's free-form fields; the
+`PauseReason` enum is bounded.
+
+`crate::recovery::ThrottleBucket` is a `HashMap<ThrottleKey,
+SystemTime>` keyed by `ThrottleKey::{Mailbox, Account, Tenant,
+Provider}`. `Tenant` and `Provider` keys cross account boundaries
+- a `Tenant` throttle pauses every account on that tenant.
+`ThrottleScope::CurrentOperation` is a per-call hint and never
+enters the bucket. The engine records `RetryAdvice::throttle_scope
++ retry_hint` on `Retry` dispatch via `apply_throttle`.
+
+Cursor envelope schema mismatches at `get_change_cursor` are
+translated through `crate::recovery::cursor_decode_failure` into an
+`AccountError` whose derived recovery is
+`Engine(SchemaIncompatible)`; the reopen listener then clears every
+in-memory and durable cursor and re-establishes each scope under
+the same backoff/budget contract above. Per-scope failures
+escalate per-scope (account continues for sibling scopes);
+`RestartAccount` failure escalates per-account (every scope pauses).
 
 `Warning` is a re-export of `bifrost_types::Warning` and is
 outside the error model (advisory only, never aborts streams).
@@ -439,6 +498,10 @@ crates/sync/src/
   types.rs                // EngineConfig, MultiplexerConfig,
                           // BackfillConfig, MutationConfig, PushConfig,
                           // SchedulerConfig, AccountSlot, WorkerTask
+  recovery.rs             // plan_recovery + RecoveryPlan dispatch;
+                          // ThrottleBucket + throttle_key_for;
+                          // retry_delay; restart_scope_error;
+                          // cursor_decode_failure translator
   multiplexer/
     mod.rs                // Multiplexer::run; ReopenRequest;
                           // MultiplexerEvent { scope, event, checkpoint };

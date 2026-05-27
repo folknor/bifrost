@@ -26,7 +26,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountError, AccountId, AccountOperation, ChangeCursor, Checkpoint, CursorScope,
-    MembershipScope, RecoveryClass, ScopeLifecycle, SyncEvent, WatchEvent,
+    MembershipScope, ScopeLifecycle, SyncEvent, WatchEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::{broadcast, mpsc};
@@ -450,7 +450,7 @@ fn spawn_missing_scope_polls(
 /// Per-scope poll loop. Drives `changes_stream(cursor)` and sleeps
 /// for the scope's adaptive cadence between passes. Stream-end
 /// recovery actions are propagated to the engine via `ReopenRequest`
-/// with the full `RecoveryClass`.
+/// with the originating `AccountError`.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_scope_poll_inner(
     account_id: AccountId,
@@ -601,15 +601,20 @@ async fn handle_drive_outcome(
             }
         }
         Ok(ChangesEvent::Terminated(error)) => {
-            use crate::recovery::{directive_target_scope, retry_delay};
-            // Dispatch via `error.recovery()`. Retry and reconcile
-            // keep the poll loop alive; engine directives hand off to
-            // the reopen listener with the full account error;
-            // terminal errors stop the loop (the broadcast already
-            // carried the terminating event).
-            let recovery = error.recovery().clone();
-            match recovery {
-                RecoveryClass::Retry(advice) => {
+            use crate::recovery::{
+                RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
+            };
+            // Dispatch via `plan_recovery` so the closed `RecoveryPlan`
+            // drives the branch. Retry and reconcile keep the poll
+            // loop alive; engine directives hand off to the reopen
+            // listener carrying the original account error; terminal
+            // errors stop the loop (the broadcast already carried the
+            // terminating event). The account error needs to ride
+            // along on the engine directive arm; we clone it before
+            // planning.
+            let original = error.clone();
+            match plan_recovery(error) {
+                RecoveryPlan::Retry(advice) => {
                     let delay = retry_delay(
                         &advice,
                         std::time::SystemTime::now(),
@@ -621,22 +626,26 @@ async fn handle_drive_outcome(
                         exit: false,
                     }
                 }
-                RecoveryClass::Reconcile(_) => {
+                RecoveryPlan::Reconcile(_) => {
                     // A read stream's reconcile collapses to "rerun
                     // this scope soon". Sleep briefly so we do not
-                    // hot-spin, then re-enter the poll loop.
+                    // hot-spin, then re-enter the poll loop. The
+                    // mutation-side `Reconcile` actions (CheckTarget /
+                    // DedupeByClientId) drive through the mutation
+                    // pipeline; the change-stream side does not have a
+                    // per-item lane to dedupe.
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     DriveRecovery {
                         advanced: false,
                         exit: false,
                     }
                 }
-                RecoveryClass::Engine(directive) => {
+                RecoveryPlan::Engine(directive) => {
                     let directive_scope = directive_target_scope(&directive);
                     let _ = reopen_tx
                         .send(ReopenRequest::Recovery {
                             scope: directive_scope,
-                            error,
+                            error: original,
                         })
                         .await;
                     DriveRecovery {
@@ -644,18 +653,17 @@ async fn handle_drive_outcome(
                         exit: false,
                     }
                 }
-                _ => {
-                    // Terminal stream ending: the broadcast already
-                    // carried the terminating event, and no further
-                    // automated action will resume the stream. Exit
-                    // the poll loop so we do not re-poll a terminal
-                    // scope forever.
+                RecoveryPlan::Terminal(fatal) => {
+                    let err = fatal.as_ref();
+                    let view = err.telemetry_fields();
                     tracing::warn!(
                         target: "bifrost.sync.changes",
                         account = ?account_id,
                         scope = ?scope,
-                        kind = ?error.kind(),
-                        message_key = error.message_key(),
+                        kind = view.kind_discriminant,
+                        message_key = view.message_key,
+                        recovery = view.recovery_discriminant,
+                        operation = ?view.operation,
                         "changes stream terminated with terminal recovery"
                     );
                     DriveRecovery {

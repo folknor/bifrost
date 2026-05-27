@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText, ErrorScope,
-    Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind,
+    Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind, ResourceKind, RetryHint,
     ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState,
     TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
@@ -227,9 +227,11 @@ fn refresh_failed(
     if let Some(cause) = support_cause_from_source(source) {
         builder = builder.push_cause(cause);
     }
-    if let Some(deadline) = retry_after {
-        builder = builder.retry_not_before(deadline);
-    }
+    // retry hint flows through the source cause (e.g. ServerCause::RateLimited)
+    // attached above. retry_after parameter is preserved here for backward
+    // compatibility with callers that pass it but no longer used as a
+    // builder side-channel.
+    let _ = retry_after;
     finish(builder, ctx)
 }
 
@@ -243,7 +245,9 @@ fn rate_limited(
     let mut builder = base_builder(
         ctx,
         AccountErrorKind::Server(ServerErrorKind::RateLimited),
-        Cause::Server(ServerCause::RateLimited { retry_after }),
+        Cause::Server(ServerCause::RateLimited {
+            retry_hint: retry_after.map(RetryHint::After),
+        }),
     );
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(
@@ -252,9 +256,6 @@ fn rate_limited(
         &final_response.headers,
         &final_response.body,
     );
-    if let Some(deadline) = retry_deadline(retry_after) {
-        builder = builder.retry_not_before(deadline);
-    }
     if let Some(scope) = throttle_scope(ctx) {
         builder = builder.throttle_scope(scope);
     }
@@ -266,18 +267,14 @@ fn status_error(
     status: StatusCode,
     headers: &HeaderMap,
     body: &Bytes,
-    retry_hint: Option<Duration>,
+    retry_hint_param: Option<Duration>,
 ) -> AccountError {
     let code = status.as_u16();
-    let retry_after = retry_hint.or_else(|| parse_retry_after(headers.get(RETRY_AFTER)));
+    let retry_after = retry_hint_param.or_else(|| parse_retry_after(headers.get(RETRY_AFTER)));
     let (kind, cause, throttle) = status_kind_cause(ctx, code, body, retry_after);
-    let apply_retry_deadline = should_apply_retry_deadline(&kind);
     let mut builder = base_builder(ctx, kind, cause);
     builder = push_attempt(builder, TransmissionState::Acknowledged);
     builder = response_diagnostics(builder, status, headers, body);
-    if apply_retry_deadline && let Some(deadline) = retry_deadline(retry_after) {
-        builder = builder.retry_not_before(deadline);
-    }
     if throttle && let Some(scope) = throttle_scope(ctx) {
         builder = builder.throttle_scope(scope);
     }
@@ -335,36 +332,28 @@ fn status_kind_cause(
         410 => server_error(code),
         408 | 502 | 503 | 504 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after }),
+            Cause::Server(ServerCause::Unavailable {
+                retry_hint: retry_after.map(RetryHint::After),
+            }),
             false,
         ),
         429 => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after }),
+            Cause::Server(ServerCause::RateLimited {
+                retry_hint: retry_after.map(RetryHint::After),
+            }),
             true,
         ),
         507 => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after }),
+            Cause::Server(ServerCause::QuotaExhausted {
+                retry_hint: retry_after.map(RetryHint::After),
+            }),
             true,
         ),
         500..=599 => server_error(code),
         _ => server_error(code),
     }
-}
-
-fn should_apply_retry_deadline(kind: &AccountErrorKind) -> bool {
-    matches!(
-        kind,
-        AccountErrorKind::Server(
-            ServerErrorKind::Unavailable
-                | ServerErrorKind::RateLimited
-                | ServerErrorKind::QuotaExhausted
-                | ServerErrorKind::Error {
-                    status: Some(500..=599),
-                }
-        )
-    )
 }
 
 fn server_error(code: u16) -> (AccountErrorKind, Cause, bool) {
@@ -465,7 +454,9 @@ fn finish(builder: AccountErrorBuilder, ctx: &NetErrorContext) -> AccountError {
         Some(scope) => builder.scope(scope.clone()),
         None => builder,
     };
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn push_attempt(
@@ -598,10 +589,6 @@ fn maybe_support_text_from_option(value: Option<String>) -> Option<DiagnosticTex
     value.and_then(maybe_support_text)
 }
 
-fn retry_deadline(retry_after: Option<Duration>) -> Option<SystemTime> {
-    retry_after.and_then(|duration| SystemTime::now().checked_add(duration))
-}
-
 fn retry_history_text(history: &[Duration]) -> Option<DiagnosticText> {
     if history.is_empty() {
         None
@@ -669,8 +656,9 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
             retry_after,
             final_response,
         } => Some(Cause::Server(ServerCause::RateLimited {
-            retry_after: (*retry_after)
-                .or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER))),
+            retry_hint: (*retry_after)
+                .or_else(|| parse_retry_after(final_response.headers.get(RETRY_AFTER)))
+                .map(RetryHint::After),
         })),
         Error::RetryBudgetExhausted {
             final_response: Some(response),
@@ -709,13 +697,14 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
 fn server_cause_from_status(
     code: u16,
     retry_after_header: Option<&reqwest::header::HeaderValue>,
-    retry_hint: Option<Duration>,
+    retry_hint_param: Option<Duration>,
 ) -> Option<Cause> {
-    let retry_after = retry_hint.or_else(|| parse_retry_after(retry_after_header));
+    let retry_after = retry_hint_param.or_else(|| parse_retry_after(retry_after_header));
+    let retry_hint = retry_after.map(RetryHint::After);
     match code {
-        408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_after })),
-        429 => Some(Cause::Server(ServerCause::RateLimited { retry_after })),
-        507 => Some(Cause::Server(ServerCause::QuotaExhausted { retry_after })),
+        408 | 502 | 503 | 504 => Some(Cause::Server(ServerCause::Unavailable { retry_hint })),
+        429 => Some(Cause::Server(ServerCause::RateLimited { retry_hint })),
+        507 => Some(Cause::Server(ServerCause::QuotaExhausted { retry_hint })),
         500..=599 => Some(Cause::Server(ServerCause::Error { status: Some(code) })),
         _ => None,
     }

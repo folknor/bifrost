@@ -34,7 +34,8 @@ fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
         Cause::Request(RequestCause::Unsupported { operation: op }),
     )
     .operation(op)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Synthetic Account that returns predetermined flags for each id on
@@ -114,22 +115,26 @@ impl Account for FlagsAccount {
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         assert_eq!(projection, Projection::FlagsOnly);
         let table = self.flag_table.clone();
         let collected: Pin<Box<dyn futures::Future<Output = Vec<ObjectId>> + Send>> =
             Box::pin(async move { ids.collect::<Vec<_>>().await });
         let s = async move {
             let ids: Vec<ObjectId> = collected.await;
-            let items: Vec<HydratedObject> = ids
+            let items: Vec<ItemOutcome<HydratedObject>> = ids
                 .into_iter()
                 .map(|id| {
                     let flags = table.get(&id).cloned().unwrap_or_default();
-                    HydratedObject {
-                        id,
+                    let hydrated = HydratedObject {
+                        id: id.clone(),
                         kind: HydratedObjectKind::FlagsOnly(flags),
                         blobs: Vec::new(),
-                    }
+                    };
+                    ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+                        bifrost_types::BatchItemId(id.0),
+                        hydrated,
+                    ))
                 })
                 .collect();
             SyncEvent::Batch(Batch {

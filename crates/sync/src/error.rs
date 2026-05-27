@@ -1,12 +1,12 @@
 //! Engine-side error vocabulary.
 //!
-//! Distinct from `bifrost_types::AccountError` (which is the
-//! per-operation, protocol-facing failure type) and from
-//! `bifrost_types::Fatal` (the engine-boundary newtype for terminal
-//! account errors). `engine::Error` wraps an `AccountError` when one
-//! crosses a sync boundary, plus the engine's own failure modes
-//! (account not attached, checkpoint store rejected the write,
-//! shutdown in progress).
+//! Distinct from `bifrost_types::AccountError` (the per-operation,
+//! protocol-facing failure type) and from `bifrost_types::Fatal` (the
+//! terminal-only newtype the engine's `RecoveryPlan::Terminal` arm
+//! emits). `engine::Error` wraps an `AccountError` when one crosses a
+//! sync boundary, plus the engine's own failure modes (account not
+//! attached, checkpoint store rejected the write, shutdown in
+//! progress).
 
 use bifrost_types::{AccountError, AccountId};
 

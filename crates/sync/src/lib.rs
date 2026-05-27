@@ -34,7 +34,7 @@ pub mod error;
 pub mod multiplexer;
 pub mod mutation;
 pub mod push;
-pub(crate) mod recovery;
+pub mod recovery;
 pub mod scheduler;
 pub mod types;
 
@@ -49,9 +49,13 @@ pub use bifrost_types::{Control, Priority};
 pub use bifrost_types::{InvalidationSink, WatchEvent};
 
 // Engine-side error and the shared warning vocabulary. Terminal
-// account errors are exposed through `bifrost_types::Fatal`; the
-// engine-local `FatalAction` enum is gone.
+// account errors are surfaced through `bifrost_types::Fatal` (the
+// engine boundary newtype) via `RecoveryPlan::Terminal`.
 pub use error::{Error, Warning};
+
+// Throttle bucket so consumers / instrumentation can observe engine
+// throttle state if needed.
+pub use recovery::ThrottleBucket;
 
 // Cursor and checkpoint plumbing.
 pub use cursor::{

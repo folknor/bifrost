@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use bifrost_types::{
-    Account, AccountId, CursorScope, HintPayload, InvalidationHint, RecoveryClass, WatchEvent,
-};
+use bifrost_types::{Account, AccountId, CursorScope, HintPayload, InvalidationHint, WatchEvent};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -74,6 +72,66 @@ impl Reconciler {
                     tracing::warn!(target: "bifrost.sync.reconcile", error=%err, "post-reconnect reconcile failed");
                 }
             }
+            WatchEvent::Terminated(error) => {
+                // Push stream cannot be reconnected without engine
+                // intervention. Plan recovery and route engine
+                // directives through the reopen channel so the engine
+                // restarts the subscription (or escalates per its
+                // budget). Terminal classes broadcast a Terminated
+                // event so consumers observe the structured error.
+                use crate::recovery::{RecoveryPlan, directive_target_scope, plan_recovery};
+                let original = error.clone();
+                match plan_recovery(error) {
+                    RecoveryPlan::Engine(directive) => {
+                        let scope = directive_target_scope(&directive);
+                        let _ = self
+                            .reopen_tx
+                            .send(ReopenRequest::Recovery {
+                                scope,
+                                error: original,
+                            })
+                            .await;
+                    }
+                    RecoveryPlan::Retry(_) | RecoveryPlan::Reconcile(_) => {
+                        // Push streams cannot retry inline; the
+                        // forwarder reconnects on the next iteration.
+                        // Surface a warning so dashboards observe the
+                        // hiccup.
+                        let warning = bifrost_types::Warning::user_safe(
+                            bifrost_types::WarningKind::Other,
+                            "push stream terminated with retryable recovery",
+                        );
+                        let scope = self
+                            .cursors
+                            .all_scopes()
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CursorScope::Account);
+                        let me = MultiplexerEvent {
+                            scope,
+                            event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
+                            checkpoint: None,
+                        };
+                        let _ = self.changes_tx.send(me);
+                    }
+                    RecoveryPlan::Terminal(fatal) => {
+                        let scope = self
+                            .cursors
+                            .all_scopes()
+                            .into_iter()
+                            .next()
+                            .unwrap_or(CursorScope::Account);
+                        let me = MultiplexerEvent {
+                            scope,
+                            event: Arc::new(bifrost_types::SyncEvent::Terminated(
+                                fatal.into_inner(),
+                            )),
+                            checkpoint: None,
+                        };
+                        let _ = self.changes_tx.send(me);
+                    }
+                }
+            }
             // `WatchEvent` is `#[non_exhaustive]`; an unknown variant
             // is treated as a no-op wakeup.
             _ => {}
@@ -108,10 +166,12 @@ impl Reconciler {
                 | ChangesEvent::Stopped
                 | ChangesEvent::Paused => {}
                 ChangesEvent::Terminated(error) => {
-                    use crate::recovery::{directive_target_scope, retry_delay};
-                    let recovery = error.recovery().clone();
-                    match recovery {
-                        RecoveryClass::Retry(advice) => {
+                    use crate::recovery::{
+                        RecoveryPlan, directive_target_scope, plan_recovery, retry_delay,
+                    };
+                    let original = error.clone();
+                    match plan_recovery(error) {
+                        RecoveryPlan::Retry(advice) => {
                             let delay = retry_delay(
                                 &advice,
                                 std::time::SystemTime::now(),
@@ -119,31 +179,21 @@ impl Reconciler {
                             );
                             tokio::time::sleep(delay).await;
                         }
-                        RecoveryClass::Reconcile(_) => {
-                            // Reconcile on a push-driven read: rerun
-                            // the same hinted scope set once. We are
-                            // already inside that loop, so falling
-                            // through to the next scope (and finishing
-                            // this reconcile pass) is the bounded
-                            // re-run; future hints / polls handle the
-                            // rest.
+                        RecoveryPlan::Reconcile(_) => {
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
-                        RecoveryClass::Engine(directive) => {
+                        RecoveryPlan::Engine(directive) => {
                             let directive_scope = directive_target_scope(&directive);
                             let _ = self
                                 .reopen_tx
                                 .send(ReopenRequest::Recovery {
                                     scope: directive_scope,
-                                    error,
+                                    error: original,
                                 })
                                 .await;
                             return Ok(());
                         }
-                        _ => {
-                            // Terminal: the broadcast already carried
-                            // the terminating event. Bail out of this
-                            // reconcile pass; do not re-dispatch.
+                        RecoveryPlan::Terminal(_) => {
                             return Ok(());
                         }
                     }

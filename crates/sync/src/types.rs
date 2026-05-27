@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use bifrost_types::{Account, AccountCapabilities, AccountFactory, Priority};
-use tokio::sync::watch;
+use bifrost_types::{Account, AccountCapabilities, AccountControl, AccountFactory, Priority};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
+
+use crate::multiplexer::ReopenRequest;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -199,6 +201,27 @@ pub(crate) struct AccountSlot {
     /// `Control::bandwidth_observed` returns a real reading.
     #[allow(dead_code)]
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
+    /// Per-account control stream. Engine publishes
+    /// `AccountControl::Pause(reason)` when the engine has automatically
+    /// paused the account (operator-override directive, retry budget
+    /// exhausted, tenant throttle). Consumers subscribe via
+    /// `SyncEngine::account_control_stream`.
+    pub account_control_tx: broadcast::Sender<AccountControl>,
+    /// Sentinel receiver keeps the account-control channel alive.
+    #[allow(dead_code)]
+    pub _account_control_sentinel: broadcast::Receiver<AccountControl>,
+    /// Notify fired when a new real subscriber arrives on
+    /// `changes_tx`. Lets deferred-inventory workers park on `notified`
+    /// instead of hot-polling `receiver_count`.
+    pub subscriber_notify: Arc<Notify>,
+    /// Per-account reopen channel. The bulk-mutation campaign routes
+    /// `EngineDirective::*` raised mid-stream through here so the
+    /// reopen listener dispatches via `handle_engine_directive`.
+    pub reopen_tx: mpsc::Sender<ReopenRequest>,
+    /// Per-account throttle bucket. The recovery path records waits
+    /// keyed by `ThrottleKey`; mutation / poll loops may consult this
+    /// to pause work that maps to a busy key.
+    pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }
 
 pub(crate) struct WorkerTask {

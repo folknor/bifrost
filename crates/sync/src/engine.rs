@@ -12,15 +12,15 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountFactory, AccountId, AccountStream,
-    ChangeCursor, Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective,
-    ErrorScope, InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome,
-    MembershipScope, MutationSuccess, Priority, RecoveryClass, RetryAdvice, SubscriptionHandle,
-    SyncEvent, WatchEvent,
+    Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountId,
+    AccountStream, ChangeCursor, Checkpoint, CursorEstablishment, CursorScope, DiagnosticText,
+    EngineDirective, ErrorScope, InvalidationSink, InventoryPartition, InventoryPartitioning,
+    ItemOutcome, MembershipScope, MutationSuccess, PauseReason, Priority, ReconcileAction,
+    ReconcileAdvice, RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::backfill::{
@@ -215,6 +215,22 @@ impl SyncEngine {
         let (changes_tx, sentinel_rx) =
             broadcast::channel::<MultiplexerEvent>(self.config.multiplexer.changes_capacity);
 
+        // Per-account control broadcast. The engine publishes
+        // `AccountControl::Pause(reason)` on this channel when it
+        // auto-pauses the account (operator override, retry budget
+        // exhausted). Consumers subscribe via
+        // `SyncEngine::account_control_stream`.
+        let (account_control_tx, account_control_sentinel) =
+            broadcast::channel::<AccountControl>(16);
+
+        // Notify fired when a real subscriber arrives so deferred
+        // inventory workers can park without hot-polling.
+        let subscriber_notify = Arc::new(Notify::new());
+
+        // Per-account throttle bucket. Shared via Mutex because the
+        // engine's recovery paths cross task boundaries.
+        let throttles = Arc::new(std::sync::Mutex::new(crate::recovery::ThrottleBucket::new()));
+
         // Drive cursor establishment per scope. We do this before
         // spawning long-running tasks because multiplexer + backfill
         // need the registry pre-populated for `Ready` scopes. For
@@ -283,8 +299,8 @@ impl SyncEngine {
         );
 
         // Reopen channel: the multiplexer's per-scope tasks raise
-        // requests when a stream ends with a recoverable Fatal,
-        // carrying the full `RecoveryClass`.
+        // requests when a stream ends with an `EngineDirective`-class
+        // recovery, carrying the originating `AccountError`.
         let (reopen_tx, mut reopen_rx) = mpsc::channel::<ReopenRequest>(16);
 
         let mut workers: Vec<WorkerTask> = Vec::new();
@@ -484,6 +500,10 @@ impl SyncEngine {
             let inventory_shutdown = shutdown.clone();
             let inventory_aid = account_id.clone();
             let inventory_control = control.clone();
+            let inventory_account_control_tx = account_control_tx.clone();
+            let inventory_throttles = Arc::clone(&throttles);
+            let inventory_notify = Arc::clone(&subscriber_notify);
+            let inventory_boundary_tx = boundary.sender();
             spawn(tokio::spawn(async move {
                 run_deferred_inventory_establishment(
                     inventory_factory,
@@ -494,6 +514,10 @@ impl SyncEngine {
                     inventory_shutdown,
                     inventory_aid,
                     inventory_control,
+                    inventory_account_control_tx,
+                    inventory_throttles,
+                    inventory_notify,
+                    inventory_boundary_tx,
                     deferred_inventory_scopes,
                 )
                 .await;
@@ -509,6 +533,9 @@ impl SyncEngine {
         let reopen_shutdown = shutdown.clone();
         let reopen_store = Arc::clone(&self.checkpoints);
         let reopen_control = control.clone();
+        let reopen_account_control_tx = account_control_tx.clone();
+        let reopen_throttles = Arc::clone(&throttles);
+        let reopen_boundary_tx = boundary.sender();
         spawn(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -517,18 +544,19 @@ impl SyncEngine {
                         let Some(req) = req else { return; };
                         match req {
                             ReopenRequest::Recovery { scope, error } => {
-                                handle_account_error(
-                                    &reopen_factory,
-                                    &reopen_current,
-                                    &reopen_cursors,
-                                    &reopen_store,
-                                    &reopen_changes,
-                                    &reopen_aid,
-                                    &reopen_control,
-                                    scope,
-                                    error,
-                                )
-                                .await;
+                                let ctx = RecoveryContext {
+                                    factory: &reopen_factory,
+                                    current: &reopen_current,
+                                    cursors: &reopen_cursors,
+                                    store: &reopen_store,
+                                    changes_tx: &reopen_changes,
+                                    account_id: &reopen_aid,
+                                    control: &reopen_control,
+                                    account_control_tx: &reopen_account_control_tx,
+                                    throttles: &reopen_throttles,
+                                    boundary_tx: &reopen_boundary_tx,
+                                };
+                                handle_account_error(&ctx, scope, error).await;
                             }
                         }
                     }
@@ -595,6 +623,11 @@ impl SyncEngine {
             _sentinel_rx: sentinel_rx,
             workers: std::sync::Mutex::new(workers),
             bandwidth_meter,
+            account_control_tx,
+            _account_control_sentinel: account_control_sentinel,
+            subscriber_notify,
+            reopen_tx: reopen_tx.clone(),
+            throttles: Arc::clone(&throttles),
         });
 
         self.accounts.insert(account_id.clone(), slot);
@@ -748,7 +781,41 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        Ok(slot.multiplexer.changes_tx.subscribe())
+        let rx = slot.multiplexer.changes_tx.subscribe();
+        // Wake any deferred-inventory workers parked on the Notify so
+        // they observe the new subscriber without hot-polling.
+        slot.subscriber_notify.notify_waiters();
+        Ok(rx)
+    }
+
+    /// Subscribe to the per-account control stream. Engine publishes
+    /// `AccountControl::Pause(reason)` on this channel when it
+    /// auto-pauses the account (operator override, retry budget
+    /// exhausted). Consumers respond by acting on the bounded
+    /// `PauseReason` and, once resolved, calling
+    /// [`SyncEngine::resume_account`].
+    pub fn account_control_stream(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<broadcast::Receiver<AccountControl>, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        Ok(slot.account_control_tx.subscribe())
+    }
+
+    /// Consumer-driven resume. Flips the boundary back to `Run` and
+    /// publishes `AccountControl::Resume` so other subscribers observe
+    /// the transition. Idempotent.
+    pub fn resume_account(&self, account_id: &AccountId) -> Result<(), Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let _ = slot.boundary_tx.send(crate::cancel::BoundaryRequest::Run);
+        let _ = slot.account_control_tx.send(AccountControl::Resume);
+        Ok(())
     }
 
     /// Hand the consumer a clone of the engine's `InvalidationSink`
@@ -808,12 +875,21 @@ impl SyncEngine {
     /// Returns the per-batch counters aggregated across the run.
     ///
     /// Mutation accounting consumes `ItemOutcome<MutationSuccess>` and
-    /// dispatches retries from `AccountError::recovery()`:
+    /// dispatches per-item failures via [`crate::recovery::plan_recovery`]:
     ///
-    /// - `Retry::SameRequest` / `AfterAuthRefresh` queue for retry.
-    /// - `Retry::AfterStateRefresh` and `Reconcile` queue for read-back.
-    /// - `Engine(_)` blocks the campaign and signals the engine.
-    /// - terminal recovery lands in `failed_terminal`.
+    /// - `Retry { SameRequest | AfterAuthRefresh }` -> retry queue.
+    /// - `Retry { AfterStateRefresh }` and `Reconcile { CheckTarget }`
+    ///   -> read-back queue.
+    /// - `Reconcile { DedupeByClientId }` -> dedupe counter increments
+    ///   plus a `Warning::OperatorAttentionNeeded` (the dedupe itself
+    ///   lives at the consumer because the client-id space is theirs).
+    ///   (sync-D4)
+    /// - `Engine(_)` -> blocked-by-engine counter increments AND the
+    ///   directive is forwarded through `ReopenRequest::Recovery` so
+    ///   the engine's recovery dispatch handles the restart / downgrade
+    ///   / schema clear. The campaign returns with a partial outcome
+    ///   accounting for work seen so far. (sync-D5)
+    /// - terminal recovery -> `failed_terminal`.
     ///
     /// `ItemOutcome::Uncertain` is always queued for read-back.
     pub async fn bulk_set_flags(
@@ -824,6 +900,7 @@ impl SyncEngine {
         vendor: &crate::mutation::IdempotencyVendor,
         protocol: bifrost_types::ProtocolKind,
     ) -> Result<crate::mutation::MutationCounters, Error> {
+        use crate::recovery::{RecoveryPlan, plan_recovery};
         let slot = self
             .accounts
             .get(account_id)
@@ -836,9 +913,11 @@ impl SyncEngine {
         let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
         let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
         let mut readback_ids: Vec<bifrost_types::ObjectId> = Vec::new();
+        let mut dedupe_count: u64 = 0;
         let mut remaining: Vec<bifrost_types::ObjectId> = targets;
         let mut attempt: u32 = 0;
         let mut retry_advice: Option<RetryAdvice> = None;
+        let mut blocked_by_engine: bool = false;
 
         loop {
             if let Some(advice) = retry_advice.take() {
@@ -867,23 +946,36 @@ impl SyncEngine {
                                 &mut outcomes,
                                 &mut retry_ids,
                                 &mut readback_ids,
+                                &mut dedupe_count,
                             );
                         }
                     }
                     bifrost_types::SyncEvent::Terminated(err) => {
-                        // Stream-level terminating event: dispatch via
-                        // `error.recovery()`. Retry / Reconcile let
-                        // the campaign continue; Engine and terminal
-                        // bail.
-                        let recovery = err.recovery().clone();
-                        match recovery {
-                            RecoveryClass::Retry(advice) => {
+                        // Plan the recovery on the stream-level
+                        // terminating error and dispatch. Retry /
+                        // Reconcile let the campaign continue; Engine
+                        // routes through the reopen channel so the
+                        // engine performs the directive (restart,
+                        // downgrade, schema clear, etc.) and the
+                        // campaign returns the partial outcome. Clone
+                        // so the engine arm can forward the original
+                        // error through the reopen channel without
+                        // losing it to `plan_recovery`'s consume.
+                        let original = err.clone();
+                        match plan_recovery(err) {
+                            RecoveryPlan::Retry(advice) => {
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
-                            RecoveryClass::Reconcile(_) => {
-                                // Funnel every still-unresolved item
-                                // into the read-back queue.
+                            RecoveryPlan::Reconcile(advice) => {
+                                let mut wants_dedupe = false;
+                                for action in &advice.guidance.actions {
+                                    match action {
+                                        ReconcileAction::CheckTarget => {}
+                                        ReconcileAction::DedupeByClientId => wants_dedupe = true,
+                                        _ => {}
+                                    }
+                                }
                                 for id in &remaining {
                                     if !matches!(
                                         outcomes.get(id),
@@ -896,12 +988,53 @@ impl SyncEngine {
                                         readback_ids.push(id.clone());
                                     }
                                 }
+                                if wants_dedupe {
+                                    dedupe_count = dedupe_count.saturating_add(1);
+                                    let warning = bifrost_types::Warning::user_safe(
+                                        bifrost_types::WarningKind::OperatorAttentionNeeded,
+                                        "reconcile requested dedupe-by-client-id; consumer must dedupe",
+                                    );
+                                    let me = MultiplexerEvent {
+                                        scope: CursorScope::Account,
+                                        event: Arc::new(SyncEvent::Warning(warning)),
+                                        checkpoint: None,
+                                    };
+                                    let _ = slot.multiplexer.changes_tx.send(me);
+                                }
                                 break;
                             }
-                            RecoveryClass::Engine(_) => {
-                                return Err(Error::Account(err));
+                            RecoveryPlan::Engine(directive) => {
+                                let directive_scope =
+                                    crate::recovery::directive_target_scope(&directive);
+                                let _ = slot
+                                    .reopen_tx
+                                    .send(ReopenRequest::Recovery {
+                                        scope: directive_scope,
+                                        error: original,
+                                    })
+                                    .await;
+                                blocked_by_engine = true;
+                                // Every still-unresolved id is blocked
+                                // by the engine directive; record so
+                                // the partial outcome surfaces them.
+                                for id in &remaining {
+                                    if !matches!(
+                                        outcomes.get(id),
+                                        Some(
+                                            MutationBucket::Applied
+                                                | MutationBucket::Skipped
+                                                | MutationBucket::FailedTerminal
+                                        )
+                                    ) {
+                                        outcomes
+                                            .insert(id.clone(), MutationBucket::BlockedByEngine);
+                                    }
+                                }
+                                break;
                             }
-                            _ => return Err(Error::Account(err)),
+                            RecoveryPlan::Terminal(fatal) => {
+                                return Err(Error::Account(fatal.into_inner()));
+                            }
                         }
                     }
                     bifrost_types::SyncEvent::Done(_) => break,
@@ -909,6 +1042,10 @@ impl SyncEngine {
                     | bifrost_types::SyncEvent::Warning(_) => {}
                     _ => {}
                 }
+            }
+
+            if blocked_by_engine {
+                break;
             }
 
             attempt = attempt.saturating_add(1);
@@ -934,6 +1071,9 @@ impl SyncEngine {
         }
 
         let mut totals = counters_from_outcomes(&outcomes);
+        for _ in 0..dedupe_count {
+            totals.record_dedupe_by_client_id();
+        }
         if !readback_ids.is_empty() {
             let account = slot.current.load_full();
             let outcome =
@@ -990,14 +1130,23 @@ impl SyncEngine {
         scope: CursorScope,
         cursors: Arc<CursorRegistry>,
     ) -> Result<InitialScope, Error> {
-        // Check the store first - resume path.
-        if let Some(existing) = self
-            .checkpoints
-            .get_change_cursor(account_id, &scope)
-            .await?
-        {
-            cursors.put(existing);
-            return Ok(InitialScope::Ready);
+        // Check the store first - resume path. Schema-incompatible
+        // envelopes route through the recovery translator so the
+        // engine reports a typed `AccountError` whose derived
+        // `RecoveryClass` is `Engine(SchemaIncompatible)`. The reopen
+        // listener then performs the schema-clear loop. (sync-D10)
+        match self.checkpoints.get_change_cursor(account_id, &scope).await {
+            Ok(Some(existing)) => {
+                cursors.put(existing);
+                return Ok(InitialScope::Ready);
+            }
+            Ok(None) => {}
+            Err(Error::SchemaIncompatible) => {
+                return Err(Error::Account(crate::recovery::cursor_decode_failure(
+                    bifrost_types::AccountOperation::EstablishCursor,
+                )));
+            }
+            Err(other) => return Err(other),
         }
         match account
             .establish_initial_cursor(scope.clone())
@@ -1313,9 +1462,13 @@ async fn run_deferred_inventory_establishment(
     shutdown: CancellationToken,
     account_id: AccountId,
     control: crate::control::SyncControl,
+    account_control_tx: broadcast::Sender<AccountControl>,
+    throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    subscriber_notify: Arc<Notify>,
+    boundary_tx: watch::Sender<crate::cancel::BoundaryRequest>,
     scopes: Vec<CursorScope>,
 ) {
-    if !wait_for_real_subscriber(&changes_tx, &shutdown).await {
+    if !wait_for_real_subscriber(&changes_tx, &subscriber_notify, &shutdown).await {
         return;
     }
     for scope in scopes {
@@ -1353,24 +1506,19 @@ async fn run_deferred_inventory_establishment(
                 );
             }
             Ok(crate::multiplexer::FusionOutcome::Terminated(error)) => {
-                // The fusion already broadcast the terminating event.
-                // Route the error through `handle_account_error` so
-                // engine directives (RestartScope, RestartAccount,
-                // SchemaIncompatible, etc.) are dispatched, and
-                // terminal errors emit structured telemetry via the
-                // same path as every other recovery.
-                handle_account_error(
-                    &factory,
-                    &account,
-                    &cursors,
-                    &store,
-                    &changes_tx,
-                    &account_id,
-                    &control,
-                    Some(scope.clone()),
-                    error,
-                )
-                .await;
+                let ctx = RecoveryContext {
+                    factory: &factory,
+                    current: &account,
+                    cursors: &cursors,
+                    store: &store,
+                    changes_tx: &changes_tx,
+                    account_id: &account_id,
+                    control: &control,
+                    account_control_tx: &account_control_tx,
+                    throttles: &throttles,
+                    boundary_tx: &boundary_tx,
+                };
+                handle_account_error(&ctx, Some(scope.clone()), error).await;
             }
             Err(err) => {
                 tracing::warn!(
@@ -1385,19 +1533,29 @@ async fn run_deferred_inventory_establishment(
     }
 }
 
+/// Park until a real subscriber arrives on `changes_tx`.
+///
+/// The slot keeps a sentinel receiver alive so `receiver_count()`
+/// stays at 1 until a consumer calls `account_changes_stream`. We use
+/// the slot's `subscriber_notify` (fired by
+/// `SyncEngine::account_changes_stream`) so this waits without
+/// hot-polling. (sync-N3)
 async fn wait_for_real_subscriber(
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    subscriber_notify: &Notify,
     shutdown: &CancellationToken,
 ) -> bool {
     loop {
-        // One receiver is the slot's sentinel. A count above one
-        // means at least one consumer has called account_changes_stream.
         if changes_tx.receiver_count() > 1 {
             return true;
         }
         tokio::select! {
             () = shutdown.cancelled() => return false,
-            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+            () = subscriber_notify.notified() => {
+                // Loop and re-check; the notification might have been
+                // spurious or a subscriber may have left between the
+                // notify and our check.
+            }
         }
     }
 }
@@ -1490,66 +1648,76 @@ async fn persist_ack_request(
     }
 }
 
+/// Shared context bundle used by every recovery-dispatch path. Folds
+/// the per-account state most paths need into a single argument so
+/// `handle_account_error`, the engine-directive arm, and the reopen
+/// loop don't carry seven-positional argument lists.
+pub(crate) struct RecoveryContext<'a> {
+    pub factory: &'a Arc<dyn AccountFactory>,
+    pub current: &'a Arc<ArcSwap<Arc<dyn Account>>>,
+    pub cursors: &'a Arc<CursorRegistry>,
+    pub store: &'a Arc<DynCheckpointStore>,
+    pub changes_tx: &'a broadcast::Sender<MultiplexerEvent>,
+    pub account_id: &'a AccountId,
+    pub control: &'a SyncControl,
+    pub account_control_tx: &'a broadcast::Sender<AccountControl>,
+    pub throttles: &'a Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
+    pub boundary_tx: &'a watch::Sender<crate::cancel::BoundaryRequest>,
+}
+
 /// Dispatch an `AccountError` to the engine's recovery machinery.
 ///
-/// Reads `error.recovery()` and routes Retry / Reconcile / Engine /
-/// terminal verdicts to the appropriate engine path. The `scope`
-/// argument is the worker's convenience-suggested scope: scope-bound
-/// directives use the directive's own scope when present and fall
-/// back to this `scope`; account-wide directives ignore it.
-#[allow(clippy::too_many_arguments)]
-async fn handle_account_error(
-    factory: &Arc<dyn AccountFactory>,
-    current: &Arc<ArcSwap<Arc<dyn Account>>>,
-    cursors: &Arc<CursorRegistry>,
-    store: &Arc<DynCheckpointStore>,
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
-    account_id: &AccountId,
-    control: &SyncControl,
+/// Routes through `plan_recovery` so the closed `RecoveryPlan` enum
+/// drives the dispatch. The `scope` argument is the worker's
+/// convenience-suggested scope: scope-bound directives use the
+/// directive's own scope when present; account-wide directives ignore
+/// it.
+pub(crate) async fn handle_account_error(
+    ctx: &RecoveryContext<'_>,
     scope: Option<CursorScope>,
     error: AccountError,
 ) {
-    let recovery = error.recovery().clone();
-    match recovery {
-        RecoveryClass::Retry(advice) => {
+    use crate::recovery::{RecoveryPlan, plan_recovery};
+    // Clone so we can log structured fields after dispatch consumes
+    // the value.
+    let plan = plan_recovery(error.clone());
+    match plan {
+        RecoveryPlan::Retry(advice) => {
             // Sleep per advice; the per-scope poll loop and the push
             // reconciler already handle the retry sleep themselves, so
             // the reopen listener seeing a Retry verdict here means a
-            // worker chose to delegate. Honor the advice.
+            // worker chose to delegate. Honor the advice, including
+            // recording any throttle scope into the engine bucket.
+            apply_throttle(ctx, &advice);
             handle_retry(&advice).await;
         }
-        RecoveryClass::Reconcile(_advice) => {
-            // The poll loop / push reconciler do the inline reconcile;
-            // if we reach this branch via the reopen listener we trust
-            // their next pass to probe. Log for telemetry only.
+        RecoveryPlan::Reconcile(advice) => {
+            // The poll loop / push reconciler perform the actual probe;
+            // if we reach this branch via the reopen listener their
+            // next pass owns the reconcile. Surface the actions for
+            // telemetry so dropped guidance is visible.
+            log_reconcile_advice(ctx, scope.as_ref(), &error, &advice);
+        }
+        RecoveryPlan::Engine(directive) => {
+            handle_engine_directive(ctx, scope, directive, error).await;
+        }
+        RecoveryPlan::Terminal(fatal) => {
+            // Broadcast already carried the terminating event. Emit a
+            // `TelemetryView` structured log so dashboards pivot on
+            // stable fields rather than `?debug` text.
+            let err = fatal.as_ref();
+            let view = err.telemetry_fields();
             tracing::warn!(
                 target: "bifrost.sync.changes",
-                account = ?account_id,
+                account = ?ctx.account_id,
                 scope = ?scope,
-                kind = ?error.kind(),
-                message_key = error.message_key(),
-                "reconcile recovery reached reopen listener"
-            );
-        }
-        RecoveryClass::Engine(directive) => {
-            handle_engine_directive(
-                factory, current, cursors, store, changes_tx, account_id, control, scope,
-                directive, error,
-            )
-            .await;
-        }
-        // Every terminal recovery: broadcast already carried the
-        // terminating event; the engine has no automated next step.
-        // `Fatal::try_from(error)` would succeed; we keep the original
-        // around in the log for support telemetry.
-        _ => {
-            tracing::warn!(
-                target: "bifrost.sync.changes",
-                account = ?account_id,
-                scope = ?scope,
-                kind = ?error.kind(),
-                message_key = error.message_key(),
-                recovery = ?error.recovery(),
+                kind = view.kind_discriminant,
+                message_key = view.message_key,
+                recovery = view.recovery_discriminant,
+                provider = ?view.provider,
+                protocol = ?view.protocol,
+                status = ?view.status,
+                operation = ?view.operation,
                 "terminal recovery; engine takes no automated action"
             );
         }
@@ -1565,37 +1733,80 @@ async fn handle_retry(advice: &RetryAdvice) {
     tokio::time::sleep(delay).await;
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Record any provider-documented throttle scope on the engine's
+/// shared `ThrottleBucket`. `CurrentOperation` is a per-call hint and
+/// never enters the bucket (the caller delays the single work item via
+/// `handle_retry`).
+fn apply_throttle(ctx: &RecoveryContext<'_>, advice: &RetryAdvice) {
+    let Some(scope) = advice.throttle_scope else {
+        return;
+    };
+    let Some(hint) = advice.retry_hint else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let Some(key) = crate::recovery::throttle_key_for(scope, ctx.account_id, None, None, None)
+    else {
+        // CurrentOperation, or unresolvable identity; nothing to bucket.
+        return;
+    };
+    let wait_until = hint.not_before(now);
+    if let Ok(mut bucket) = ctx.throttles.lock() {
+        bucket.record(key, wait_until);
+    }
+}
+
+fn log_reconcile_advice(
+    ctx: &RecoveryContext<'_>,
+    scope: Option<&CursorScope>,
+    error: &AccountError,
+    advice: &ReconcileAdvice,
+) {
+    let actions: Vec<&'static str> = advice
+        .guidance
+        .actions
+        .iter()
+        .map(|a| match a {
+            ReconcileAction::CheckTarget => "check-target",
+            ReconcileAction::DedupeByClientId => "dedupe-by-client-id",
+            // `ReconcileAction` is `#[non_exhaustive]`; new variants
+            // are surfaced as a stable tag so dashboards don't lose
+            // signal silently.
+            _ => "unknown",
+        })
+        .collect();
+    tracing::warn!(
+        target: "bifrost.sync.changes",
+        account = ?ctx.account_id,
+        scope = ?scope,
+        kind = ?error.kind(),
+        message_key = error.message_key(),
+        reason = ?advice.reason,
+        actions = ?actions,
+        "reconcile recovery reached reopen listener"
+    );
+}
+
 async fn handle_engine_directive(
-    factory: &Arc<dyn AccountFactory>,
-    current: &Arc<ArcSwap<Arc<dyn Account>>>,
-    cursors: &Arc<CursorRegistry>,
-    store: &Arc<DynCheckpointStore>,
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
-    account_id: &AccountId,
-    control: &SyncControl,
+    ctx: &RecoveryContext<'_>,
     fallback_scope: Option<CursorScope>,
     directive: EngineDirective,
     error: AccountError,
 ) {
+    // Match exhaustively over the current `EngineDirective` variants.
+    // `EngineDirective` is `#[non_exhaustive]`; a new variant must
+    // fail to compile here rather than silently route through a
+    // catch-all to a generic warning. (sync-N1 / sync-D8.)
     match directive {
         EngineDirective::RestartScope(directive_scope) => {
-            restart_scope(
-                current,
-                cursors,
-                store,
-                changes_tx,
-                account_id,
-                directive_scope,
-            )
-            .await;
+            // Pass the directive's own scope to broadcast_warning so
+            // the multiplexer event's `scope` matches the affected
+            // scope - not the worker-suggested fallback. (sync-N4)
+            restart_scope(ctx, directive_scope).await;
         }
         EngineDirective::DowngradeCapabilityForScope(directive_scope) => {
-            // Same cursor-deletion + re-establishment path as
-            // RestartScope. Emit a warning that names the scope so
-            // telemetry can pivot on capability downgrades.
             broadcast_warning(
-                changes_tx,
+                ctx.changes_tx,
                 Some(directive_scope.clone()),
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::Other,
@@ -1603,45 +1814,14 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(format!("{directive_scope:?}"))),
             );
-            restart_scope(
-                current,
-                cursors,
-                store,
-                changes_tx,
-                account_id,
-                directive_scope,
-            )
-            .await;
+            restart_scope(ctx, directive_scope).await;
         }
         EngineDirective::RestartAccount => {
-            restart_account(factory, current, account_id, control).await;
-        }
-        EngineDirective::CapabilityChanged { delta } => {
-            // Reopen so the protocol can refresh its snapshot, then
-            // emit a warning so telemetry pivots on the delta. The
-            // engine's `AccountSlot.capabilities` is an attach-time
-            // snapshot - production workers do not consult it as the
-            // source of truth, so leaving it stale is intentional.
-            restart_account(factory, current, account_id, control).await;
-            broadcast_warning(
-                changes_tx,
-                fallback_scope.clone(),
-                bifrost_types::Warning::user_safe(
-                    bifrost_types::WarningKind::Other,
-                    "account capabilities changed",
-                )
-                .with_protocol_detail(DiagnosticText::support_only(format!("{delta:?}"))),
-            );
+            restart_account(ctx).await;
         }
         EngineDirective::DowngradeStrategy(downgrade) => {
-            // No sync-owned strategy table. Emit a warning carrying
-            // the downgrade payload in both the human-summary
-            // `message` and the support-only `protocol_detail` so
-            // neither audience loses the evidence. Then reopen so the
-            // protocol crate picks the lower strategy on the next
-            // `establish_initial_cursor`.
             broadcast_warning(
-                changes_tx,
+                ctx.changes_tx,
                 fallback_scope.clone(),
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::StrategyDowngraded,
@@ -1649,71 +1829,25 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(format!("{downgrade:?}"))),
             );
-            restart_account(factory, current, account_id, control).await;
+            restart_account(ctx).await;
             // If the originating error was scoped to a cursor, also
             // re-establish that scope so the downgrade takes effect
             // immediately rather than at the next poll.
             if let Some(ErrorScope::Cursor(scoped)) = error.scope() {
-                restart_scope(
-                    current,
-                    cursors,
-                    store,
-                    changes_tx,
-                    account_id,
-                    scoped.clone(),
-                )
-                .await;
+                restart_scope(ctx, scoped.clone()).await;
             }
         }
         EngineDirective::SchemaIncompatible => {
-            // Stop trusting durable cursor envelopes. Clear every
-            // in-memory cursor and delete every durable change cursor
-            // we know about, then re-establish each from the current
-            // account handle.
-            let scopes: Vec<CursorScope> = cursors.all_scopes();
-            for s in &scopes {
-                cursors.delete(s);
-                if let Err(err) = store.delete_change_cursor(account_id, s).await {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        account = ?account_id,
-                        scope = ?s,
-                        error = %err,
-                        "SchemaIncompatible: delete_change_cursor failed"
-                    );
-                }
-            }
-            let acc_arc = current.load_full();
-            let acc: &dyn Account = acc_arc.as_ref().as_ref();
-            for s in scopes {
-                if let Err(err) = run_establish(
-                    account_id,
-                    acc,
-                    s.clone(),
-                    Arc::clone(cursors),
-                    Arc::clone(store),
-                    changes_tx.clone(),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "bifrost.sync.changes",
-                        account = ?account_id,
-                        scope = ?s,
-                        error = %err,
-                        "SchemaIncompatible: re-establishment failed"
-                    );
-                }
-            }
+            handle_schema_incompatible(ctx).await;
         }
         EngineDirective::OperatorOverrideRequired { reason } => {
-            // No automatic reopen. Surface the original account error
-            // through the change stream so the consumer can pause /
-            // alert. The driver already pushed the terminating event;
-            // we add an `OperatorAttentionNeeded` warning carrying the
-            // reason for telemetry.
+            // Auto-pause the account: the engine no longer drives work
+            // for it until the consumer flips `AccountControl::Resume`.
+            // The reason is bounded (`PauseReason::OperatorOverrideRequired`);
+            // free-form reason text rides through the warning only.
+            // (sync-D9)
             broadcast_warning(
-                changes_tx,
+                ctx.changes_tx,
                 fallback_scope.clone(),
                 bifrost_types::Warning::user_safe(
                     bifrost_types::WarningKind::OperatorAttentionNeeded,
@@ -1721,93 +1855,249 @@ async fn handle_engine_directive(
                 )
                 .with_protocol_detail(DiagnosticText::support_only(reason)),
             );
+            engine_pause(ctx, PauseReason::OperatorOverrideRequired);
         }
-        _ => {
+        // EngineDirective is #[non_exhaustive] from bifrost-types; new
+        // variants land here unhandled and require explicit dispatch
+        // before they ship. The fallback warns rather than silently
+        // routing.
+        other => {
             tracing::warn!(
-                target: "bifrost.sync.changes",
-                account = ?account_id,
-                directive = ?directive,
-                "unknown engine directive; no automated action"
+                ?other,
+                "unhandled engine directive; defaulting to no-op until dispatch is wired"
             );
         }
     }
 }
 
-async fn restart_scope(
-    current: &Arc<ArcSwap<Arc<dyn Account>>>,
-    cursors: &Arc<CursorRegistry>,
-    store: &Arc<DynCheckpointStore>,
-    changes_tx: &broadcast::Sender<MultiplexerEvent>,
-    account_id: &AccountId,
-    scope: CursorScope,
-) {
-    cursors.delete(&scope);
-    if let Err(err) = store.delete_change_cursor(account_id, &scope).await {
+async fn handle_schema_incompatible(ctx: &RecoveryContext<'_>) {
+    // Stop trusting durable cursor envelopes. Clear every in-memory
+    // cursor and delete every durable change cursor we know about,
+    // then re-establish each from the current account handle. Failure
+    // to re-establish a single scope escalates per-scope (sync-D7):
+    // the account keeps running for the scopes that succeed.
+    let scopes: Vec<CursorScope> = ctx.cursors.all_scopes();
+    for s in &scopes {
+        ctx.cursors.delete(s);
+        if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, s).await {
+            tracing::warn!(
+                target: "bifrost.sync.changes",
+                account = ?ctx.account_id,
+                scope = ?s,
+                error = %err,
+                "SchemaIncompatible: delete_change_cursor failed"
+            );
+        }
+    }
+    for s in scopes {
+        re_establish_scope_with_backoff(ctx, s).await;
+    }
+}
+
+/// Reopen-failure budget. The engine attempts three reopens; after the
+/// third consecutive failure the account is paused with
+/// `PauseReason::RetryBudgetExhausted` and the last error is emitted
+/// verbatim as `SyncEvent::Terminated`. (sync-D6)
+const REOPEN_RETRY_BUDGET: u32 = 3;
+
+const REOPEN_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// Restart a single scope with exponential backoff and a retry budget.
+/// After three consecutive re-establishment failures the scope is
+/// abandoned, a `SyncEvent::Terminated(last_error)` is broadcast for
+/// that scope, and the operator is alerted via
+/// `Warning::OperatorAttentionNeeded`. The other scopes keep running.
+/// (sync-D6, sync-D7)
+async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+    ctx.cursors.delete(&scope);
+    if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, &scope).await {
         tracing::warn!(
             target: "bifrost.sync.changes",
-            account = ?account_id,
+            account = ?ctx.account_id,
             scope = ?scope,
             error = %err,
             "RestartScope: delete_change_cursor failed"
         );
     }
-    let acc_arc = current.load_full();
-    let acc: &dyn Account = acc_arc.as_ref().as_ref();
-    match run_establish(
-        account_id,
-        acc,
-        scope.clone(),
-        Arc::clone(cursors),
-        Arc::clone(store),
-        changes_tx.clone(),
-    )
-    .await
-    {
-        Ok(()) => {
-            if let Err(err) = link_discovered_memberships(acc, cursors).await {
+    re_establish_scope_with_backoff(ctx, scope).await;
+}
+
+async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut last_account_error: Option<AccountError> = None;
+    for attempt in 0..REOPEN_RETRY_BUDGET {
+        if attempt > 0 {
+            let sleep_for = jittered(delay);
+            tokio::time::sleep(sleep_for).await;
+            delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
+        }
+        let acc_arc = ctx.current.load_full();
+        let acc: &dyn Account = acc_arc.as_ref().as_ref();
+        match run_establish(
+            ctx.account_id,
+            acc,
+            scope.clone(),
+            Arc::clone(ctx.cursors),
+            Arc::clone(ctx.store),
+            ctx.changes_tx.clone(),
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Err(err) = link_discovered_memberships(acc, ctx.cursors).await {
+                    tracing::warn!(
+                        target: "bifrost.sync.changes",
+                        account = ?ctx.account_id,
+                        scope = ?scope,
+                        error = %err,
+                        "RestartScope: membership refresh failed"
+                    );
+                }
+                return;
+            }
+            Err(Error::Account(err) | Error::EstablishCursorTerminated(err)) => {
                 tracing::warn!(
                     target: "bifrost.sync.changes",
-                    account = ?account_id,
+                    account = ?ctx.account_id,
                     scope = ?scope,
+                    attempt,
+                    kind = ?err.kind(),
+                    message_key = err.message_key(),
+                    "RestartScope: re-establishment failed"
+                );
+                last_account_error = Some(err);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?ctx.account_id,
+                    scope = ?scope,
+                    attempt,
                     error = %err,
-                    "RestartScope: membership refresh failed"
+                    "RestartScope: re-establishment failed (engine error)"
                 );
             }
         }
-        Err(err) => {
-            tracing::warn!(
-                target: "bifrost.sync.changes",
-                account = ?account_id,
-                scope = ?scope,
-                error = %err,
-                "RestartScope: re-establishment failed"
-            );
-        }
     }
+    // Budget exhausted for this scope. Emit the last AccountError
+    // verbatim and warn that operator attention is needed. The account
+    // continues running for sibling scopes; only this scope stays
+    // unestablished.
+    if let Some(err) = last_account_error {
+        broadcast_terminated(ctx.changes_tx, scope.clone(), err);
+    }
+    broadcast_warning(
+        ctx.changes_tx,
+        Some(scope.clone()),
+        bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            "scope re-establishment retry budget exhausted",
+        )
+        .with_protocol_detail(DiagnosticText::support_only(format!(
+            "scope: {scope:?}; attempts: {REOPEN_RETRY_BUDGET}"
+        ))),
+    );
 }
 
-async fn restart_account(
-    factory: &Arc<dyn AccountFactory>,
-    current: &Arc<ArcSwap<Arc<dyn Account>>>,
-    account_id: &AccountId,
-    control: &SyncControl,
+/// Restart the whole account with exponential backoff and a retry
+/// budget. After three consecutive `factory.open` failures the account
+/// is paused with `PauseReason::RetryBudgetExhausted` and the last
+/// `AccountError` is broadcast as `SyncEvent::Terminated`. (sync-D6,
+/// sync-D7)
+async fn restart_account(ctx: &RecoveryContext<'_>) {
+    let mut delay = REOPEN_BACKOFF_INITIAL;
+    let mut last_error: Option<AccountError> = None;
+    for attempt in 0..REOPEN_RETRY_BUDGET {
+        if attempt > 0 {
+            let sleep_for = jittered(delay);
+            tokio::time::sleep(sleep_for).await;
+            delay = (delay.saturating_mul(2)).min(REOPEN_BACKOFF_CAP);
+        }
+        match ctx.factory.open(ctx.account_id.clone()).await {
+            Ok(next) => {
+                next.as_ref().set_priority(ctx.control.priority_snapshot());
+                next.as_ref()
+                    .set_bandwidth_cap(ctx.control.bandwidth_cap_snapshot());
+                ctx.current.store(Arc::new(next));
+                // Account reopen rebinds the protocol handle. Discovery
+                // (cursor scopes, memberships, push subscription) runs
+                // from scratch on the new handle by way of the
+                // multiplexer's lifecycle stream and the push
+                // reconciler's next iteration; no separate dispatch is
+                // required here. (sync-D8)
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "bifrost.sync.changes",
+                    account = ?ctx.account_id,
+                    attempt,
+                    kind = ?err.kind(),
+                    message_key = err.message_key(),
+                    "RestartAccount: factory.open failed"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    // Account-wide budget exhausted: emit Terminated + pause the
+    // account. All scopes pause as a consequence of the engine no
+    // longer driving work for this account.
+    if let Some(err) = last_error {
+        broadcast_terminated(ctx.changes_tx, CursorScope::Account, err);
+    }
+    engine_pause(ctx, PauseReason::RetryBudgetExhausted);
+}
+
+/// Engine-driven pause: publish `AccountControl::Pause(reason)` on the
+/// account's control broadcast and trip the boundary so per-scope
+/// workers park. Consumers flip `AccountControl::Resume` (engine-side
+/// helper on `SyncEngine`) to unpause.
+fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
+    let _ = ctx.account_control_tx.send(AccountControl::Pause(reason));
+    // Flip the boundary to Pause. Per-scope polls / push reconciler
+    // park on `boundary.peek() == Pause`, so this halts all engine-
+    // driven work for the account until a consumer calls
+    // `SyncEngine::resume_account` (or sends `Resume` through
+    // `Control::resume`).
+    let _ = ctx.boundary_tx.send(crate::cancel::BoundaryRequest::Pause);
+}
+
+fn jittered(base: Duration) -> Duration {
+    // Deterministic-pseudo-random ±20% jitter using nanosecond-time
+    // entropy so we don't pull in `rand`. Falls back to the base
+    // duration on clock failure.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let percent_offset = i64::from(nanos % 401) - 200; // [-200, +200] basis points
+    let base_ms = i64::try_from(base.as_millis()).unwrap_or(i64::MAX);
+    let delta_ms = (base_ms * percent_offset) / 1_000;
+    let total = u64::try_from((base_ms + delta_ms).max(0)).unwrap_or(0);
+    Duration::from_millis(total)
+}
+
+fn broadcast_terminated(
+    changes_tx: &broadcast::Sender<MultiplexerEvent>,
+    scope: CursorScope,
+    error: AccountError,
 ) {
-    match factory.open(account_id.clone()).await {
-        Ok(next) => {
-            next.as_ref().set_priority(control.priority_snapshot());
-            next.as_ref()
-                .set_bandwidth_cap(control.bandwidth_cap_snapshot());
-            current.store(Arc::new(next));
-        }
-        Err(err) => tracing::warn!(
-            target: "bifrost.sync.changes",
-            account = ?account_id,
-            error = %err,
-            "RestartAccount: factory.open failed"
-        ),
-    }
+    let me = MultiplexerEvent {
+        scope,
+        event: Arc::new(SyncEvent::Terminated(error)),
+        checkpoint: None,
+    };
+    let _ = changes_tx.send(me);
 }
 
+/// Broadcast a `Warning` on the per-account changes channel. The
+/// `scope` argument is the directive's target scope when available;
+/// the caller passes `None` only for warnings that are genuinely
+/// account-wide. The fallback is `CursorScope::Account` because the
+/// `MultiplexerEvent::scope` field is `CursorScope`, not
+/// `Option<CursorScope>`. (sync-N4)
 fn broadcast_warning(
     changes_tx: &broadcast::Sender<MultiplexerEvent>,
     scope: Option<CursorScope>,
@@ -1832,9 +2122,18 @@ async fn run_establish(
     store: Arc<DynCheckpointStore>,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
 ) -> Result<(), Error> {
-    if let Some(existing) = store.get_change_cursor(account_id, &scope).await? {
-        cursors.put(existing);
-        return Ok(());
+    match store.get_change_cursor(account_id, &scope).await {
+        Ok(Some(existing)) => {
+            cursors.put(existing);
+            return Ok(());
+        }
+        Ok(None) => {}
+        Err(Error::SchemaIncompatible) => {
+            return Err(Error::Account(crate::recovery::cursor_decode_failure(
+                bifrost_types::AccountOperation::EstablishCursor,
+            )));
+        }
+        Err(other) => return Err(other),
     }
     match account
         .establish_initial_cursor(scope.clone())
@@ -1920,7 +2219,9 @@ fn classify_item_outcome(
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
     readback_ids: &mut Vec<bifrost_types::ObjectId>,
+    dedupe_count: &mut u64,
 ) {
+    use crate::recovery::{RecoveryPlan, plan_recovery};
     match item {
         ItemOutcome::Succeeded(success) => {
             let id = bifrost_types::ObjectId(success.item.0);
@@ -1933,8 +2234,8 @@ fn classify_item_outcome(
         }
         ItemOutcome::Failed(failure) => {
             let id = bifrost_types::ObjectId(failure.item.0);
-            match failure.error.recovery() {
-                RecoveryClass::Retry(advice) => match advice.disposition {
+            match plan_recovery(failure.error) {
+                RecoveryPlan::Retry(advice) => match advice.disposition {
                     bifrost_types::RetryDisposition::AfterStateRefresh => {
                         readback_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingReadback);
@@ -1944,19 +2245,42 @@ fn classify_item_outcome(
                         retry_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingRetry);
                     }
+                    // RetryDisposition is #[non_exhaustive]; new variants
+                    // default to read-back (the safe path) and require
+                    // explicit handling here when added.
                     _ => {
                         readback_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingReadback);
                     }
                 },
-                RecoveryClass::Reconcile(_) => {
-                    readback_ids.push(id.clone());
-                    outcomes.insert(id, MutationBucket::PendingReadback);
+                RecoveryPlan::Reconcile(advice) => {
+                    let mut wants_check = false;
+                    for action in &advice.guidance.actions {
+                        match action {
+                            ReconcileAction::CheckTarget => wants_check = true,
+                            ReconcileAction::DedupeByClientId => {
+                                *dedupe_count = dedupe_count.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if wants_check {
+                        readback_ids.push(id.clone());
+                        outcomes.insert(id, MutationBucket::PendingReadback);
+                    } else {
+                        // No `CheckTarget` requested; the consumer
+                        // must dedupe before retrying, so we cannot
+                        // automatically resolve the item. Leave it as
+                        // pending-readback so the per-id state is
+                        // surfaced through the counters.
+                        readback_ids.push(id.clone());
+                        outcomes.insert(id, MutationBucket::PendingReadback);
+                    }
                 }
-                RecoveryClass::Engine(_) => {
+                RecoveryPlan::Engine(_) => {
                     outcomes.insert(id, MutationBucket::BlockedByEngine);
                 }
-                _ => {
+                RecoveryPlan::Terminal(_) => {
                     outcomes.insert(id, MutationBucket::FailedTerminal);
                 }
             }
@@ -1977,9 +2301,8 @@ fn counters_from_outcomes(
         match bucket {
             MutationBucket::Applied => counters.record_applied(),
             MutationBucket::Skipped => counters.record_skipped(),
-            MutationBucket::FailedTerminal | MutationBucket::BlockedByEngine => {
-                counters.record_failed();
-            }
+            MutationBucket::FailedTerminal => counters.record_failed(),
+            MutationBucket::BlockedByEngine => counters.record_blocked_by_engine(),
             MutationBucket::PendingRetry | MutationBucket::PendingReadback => {
                 counters.record_pending();
             }

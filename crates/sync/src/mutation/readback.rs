@@ -14,7 +14,8 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    Account, FlagOp, HydratedObject, HydratedObjectKind, ObjectId, Projection, SyncEvent,
+    Account, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome, ObjectId, Projection,
+    SyncEvent,
 };
 use futures::stream::{self, StreamExt};
 
@@ -30,6 +31,10 @@ pub struct ReadbackOutcome {
     /// Items whose state did NOT match the target. The protocol's
     /// `Failed` outcome stands.
     pub still_failed: u64,
+    /// Items the read-back could not classify because the protocol
+    /// reported `ItemOutcome::Failed` / `Uncertain` for the hydrated
+    /// fetch itself. The original mutation `Failed` outcome stands.
+    pub uncertain: u64,
 }
 
 /// Run the read-back guard against a set of ids and a target flag-op.
@@ -54,11 +59,22 @@ pub async fn run_readback_guard(
     while let Some(event) = stream.next().await {
         match event {
             SyncEvent::Batch(batch) => {
-                for hydrated in batch.items {
-                    if matches_target(&hydrated, op) {
-                        outcome.skipped = outcome.skipped.saturating_add(1);
-                    } else {
-                        outcome.still_failed = outcome.still_failed.saturating_add(1);
+                for item in batch.items {
+                    match item {
+                        ItemOutcome::Succeeded(success) => {
+                            if matches_target(&success.output, op) {
+                                outcome.skipped = outcome.skipped.saturating_add(1);
+                            } else {
+                                outcome.still_failed = outcome.still_failed.saturating_add(1);
+                            }
+                        }
+                        ItemOutcome::Failed(_) | ItemOutcome::Uncertain(_) => {
+                            // The hydration itself failed or was
+                            // ambiguous; the read-back cannot
+                            // disambiguate so the mutation's original
+                            // `Failed` outcome stands.
+                            outcome.uncertain = outcome.uncertain.saturating_add(1);
+                        }
                     }
                 }
             }

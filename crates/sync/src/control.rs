@@ -150,7 +150,8 @@ impl SyncControl {
                         ),
                     }),
                 )
-                .build());
+                .try_build()
+                .expect("valid account error classification"));
             }
         }
     }

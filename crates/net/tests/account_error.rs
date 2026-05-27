@@ -525,9 +525,11 @@ fn refresh_failed_with_deadline_propagates_to_recovery() {
     let RecoveryClass::Retry(advice) = err.recovery() else {
         panic!("expected retry recovery");
     };
-    let Some(not_before) = advice.not_before else {
-        panic!("expected retry deadline");
+    let Some(hint) = advice.retry_hint else {
+        panic!("expected retry hint");
     };
+    let now = before;
+    let not_before = hint.not_before(now);
     let lower = before
         .checked_add(Duration::from_secs(30))
         .expect("test lower bound in range");
