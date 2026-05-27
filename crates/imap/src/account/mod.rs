@@ -272,7 +272,7 @@ impl Account for ImapAccount {
     }
 
     // Account: streams folder lifecycle events from push state; direct users consume IDLE/NOTIFY.
-    fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycle> {
+    fn scope_lifecycle_stream(&self) -> AccountStream<bifrost_types::ScopeLifecycleEvent> {
         scopes::scope_lifecycle_stream(self.clone())
     }
 

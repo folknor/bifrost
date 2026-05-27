@@ -29,7 +29,7 @@ use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, Send
 use crate::container::{Container, ContainerId, ContainerKind, Label, MutationTarget};
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
-    ScopeLifecycle,
+    ScopeLifecycleEvent,
 };
 use crate::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ItemOutcome,
@@ -98,7 +98,15 @@ pub trait Account: Send + Sync {
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>>;
 
     /// Ongoing scope lifecycle events (folder created, renamed, deleted).
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle>;
+    ///
+    /// Yields `ScopeLifecycleEvent::Lifecycle(_)` for scope changes
+    /// and `ScopeLifecycleEvent::Terminated(AccountError)` when the
+    /// long-running poll cannot continue. The structured terminal
+    /// signal lets the engine escalate auth-lost or schema breaks
+    /// observed by the lifecycle poller; previously the protocol
+    /// could only sleep-and-retry silently because the stream element
+    /// type was a bare `ScopeLifecycle` with no terminal carrier.
+    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent>;
 
     /// Initial cursor establishment. The engine calls this exactly
     /// once per `(account, scope)` pair before its first

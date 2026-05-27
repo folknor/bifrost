@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bifrost_types::{
-    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, ScopeLifecycle,
+    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, ScopeLifecycleEvent, ScopeLifecycle,
     SyncEvent,
 };
 use futures::{StreamExt, stream};
@@ -101,7 +101,7 @@ pub(crate) fn scope_lifecycle_stream(
     client: Arc<GmailClient>,
     cache: ScopeCache,
     shutdown: CancellationToken,
-) -> AccountStream<ScopeLifecycle> {
+) -> AccountStream<ScopeLifecycleEvent> {
     let state = LifecycleState {
         client,
         cache,
@@ -112,7 +112,7 @@ pub(crate) fn scope_lifecycle_stream(
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.pending.pop_front() {
-                return Some((event, state));
+                return Some((ScopeLifecycleEvent::Lifecycle(event), state));
             }
             if state.shutdown.is_cancelled() {
                 return None;
@@ -132,7 +132,26 @@ pub(crate) fn scope_lifecycle_stream(
                     state.pending = diff_snapshots(&old, &new).into();
                 }
                 Err(error) => {
-                    tracing::warn!("gmail label lifecycle poll failed: {error}");
+                    // Classify: terminal / engine-action -> emit
+                    // Terminated and end the stream so the engine
+                    // escalates. Retry classes continue with the
+                    // backoff so transient hiccups don't pollute the
+                    // engine surface.
+                    let acct = super::error::into_account_error(
+                        error,
+                        super::error::GmailErrorContext::containers_list(),
+                    );
+                    if acct.recovery().is_terminal()
+                        || acct.recovery().requires_engine_action()
+                    {
+                        return Some((ScopeLifecycleEvent::Terminated(acct), state));
+                    }
+                    tracing::warn!(
+                        target: "bifrost.gmail.scope_lifecycle",
+                        kind = ?acct.kind(),
+                        message_key = acct.message_key(),
+                        "gmail label lifecycle poll: transient failure"
+                    );
                 }
             }
         }

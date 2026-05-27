@@ -56,7 +56,8 @@ pub use container::{
 // Cursor + scope types.
 pub use cursor::{
     ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
-    ObjectType, OpaqueChangeState, OpaqueProgressBytes, ProtocolKind, ScopeLifecycle, SyncStrategy,
+    ObjectType, OpaqueChangeState, OpaqueProgressBytes, ProtocolKind, ScopeLifecycle,
+    ScopeLifecycleEvent, SyncStrategy,
 };
 
 // Error + recovery vocabulary.

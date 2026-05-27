@@ -21,7 +21,7 @@ use bifrost_types::{
     CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydrationProjection,
     IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
     MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
-    Priority, Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest,
+    Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest,
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
     WatchEvent,
 };
@@ -171,7 +171,7 @@ impl Account for GmailAccount {
         scopes::discover_memberships(Arc::clone(&self.client), Arc::clone(&self.scope_cache))
     }
 
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle> {
+    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
         scopes::scope_lifecycle_stream(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),

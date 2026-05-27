@@ -9,7 +9,7 @@ use bifrost_types::{
     ErrorScope, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label,
     MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
-    Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle,
+    Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest, SubscriptionHandle,
     SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
@@ -138,7 +138,7 @@ impl Account for JmapAccount {
         discover::memberships(self.mail.clone())
     }
 
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle> {
+    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
         discover::scope_lifecycle(
             self.mail.clone(),
             self.core_limits,

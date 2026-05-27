@@ -1,5 +1,5 @@
 use bifrost_types::{
-    Batch, Checkpoint, CursorScope, MembershipScope, PageBoundary, ScopeLifecycle, SyncEvent,
+    Batch, Checkpoint, CursorScope, MembershipScope, PageBoundary, SyncEvent,
 };
 
 use super::{ImapAccount, folder_scope, iter_stream, membership_scope};
@@ -46,7 +46,7 @@ fn discovery_stream<T: Send + Unpin + 'static>(
 
 pub(crate) fn scope_lifecycle_stream(
     account: ImapAccount,
-) -> bifrost_types::AccountStream<ScopeLifecycle> {
+) -> bifrost_types::AccountStream<bifrost_types::ScopeLifecycleEvent> {
     let shutdown = account.shutdown.clone();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {

@@ -201,7 +201,28 @@ impl Multiplexer {
                     () = lifecycle_shutdown.cancelled() => return,
                     next = stream.next() => {
                         let Some(ev) = next else { return; };
-                        match ev {
+                        let lifecycle = match ev {
+                            bifrost_types::ScopeLifecycleEvent::Lifecycle(lc) => lc,
+                            bifrost_types::ScopeLifecycleEvent::Terminated(err) => {
+                                // Protocol classified an unrecoverable
+                                // failure observed by the lifecycle
+                                // poller (auth lost, schema break, etc.).
+                                // Route the structured error through the
+                                // reopen channel so the engine's
+                                // `RecoveryPlan` dispatch handles it the
+                                // same way it handles errors from any
+                                // other source.
+                                let _ = lifecycle_reopen
+                                    .send(ReopenRequest::Recovery {
+                                        scope: None,
+                                        error: err,
+                                    })
+                                    .await;
+                                return;
+                            }
+                            _ => continue,
+                        };
+                        match lifecycle {
                             ScopeLifecycle::Created(membership) => {
                                 if let Some(scope) = membership_to_cursor_scope(&membership) {
                                     // Track the new scope. The cursor

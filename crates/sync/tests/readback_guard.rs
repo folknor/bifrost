@@ -19,7 +19,7 @@ use bifrost_types::{
     ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
     MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
     PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RequestCause, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
+    RequestCause, ScopeLifecycleEvent, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
@@ -92,7 +92,7 @@ impl Account for FlagsAccount {
         Box::pin(stream::empty())
     }
 
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle> {
+    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
         Box::pin(stream::empty())
     }
 

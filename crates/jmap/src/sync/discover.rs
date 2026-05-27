@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bifrost_types::{
-    AccountStream, Batch, CursorScope, MembershipScope, PageBoundary, ScopeLifecycle, SyncEvent,
+    AccountStream, Batch, CursorScope, MembershipScope, PageBoundary, ScopeLifecycle,
+    ScopeLifecycleEvent, SyncEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -101,7 +102,7 @@ pub(crate) fn scope_lifecycle(
     mailbox_state: Arc<Mutex<Option<String>>>,
     mailbox_names: Arc<Mutex<HashMap<String, String>>>,
     shutdown: CancellationToken,
-) -> AccountStream<ScopeLifecycle> {
+) -> AccountStream<ScopeLifecycleEvent> {
     Box::pin(async_stream::stream! {
         loop {
             if shutdown.is_cancelled() {
@@ -150,9 +151,9 @@ pub(crate) fn scope_lifecycle(
                                     .any(|created_id| created_id.as_str() == id.as_str())
                                 {
                                     update_mailbox_name(&mailbox_names, id.clone(), name).await;
-                                    yield ScopeLifecycle::Created(MembershipScope::Mailbox(
+                                    yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(MembershipScope::Mailbox(
                                         bifrost_types::MailboxId(id),
-                                    ));
+                                    )));
                                 } else {
                                     let old_name = replace_mailbox_name(
                                         &mailbox_names,
@@ -164,10 +165,10 @@ pub(crate) fn scope_lifecycle(
                                         let scope = MembershipScope::Mailbox(
                                             bifrost_types::MailboxId(id),
                                         );
-                                        yield ScopeLifecycle::Renamed {
+                                        yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
                                             old: scope.clone(),
                                             new: scope,
-                                        };
+                                        });
                                     }
                                 }
                             }
@@ -176,9 +177,9 @@ pub(crate) fn scope_lifecycle(
                     for destroyed_id in destroyed {
                         let id = destroyed_id.into_string();
                         remove_mailbox_name(&mailbox_names, &id).await;
-                        yield ScopeLifecycle::Deleted(MembershipScope::Mailbox(
+                        yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Deleted(MembershipScope::Mailbox(
                             bifrost_types::MailboxId(id),
-                        ));
+                        )));
                     }
 
                     if !response.has_more_changes() {
@@ -186,23 +187,16 @@ pub(crate) fn scope_lifecycle(
                     }
                 }
                 Err(err) => {
-                    // Classify rather than swallow. Terminal classes
-                    // (auth lost, capability changed, schema break)
-                    // must not sleep-and-retry every 5 minutes; that
-                    // is a sync-engine decision, not a protocol-side
-                    // one. The previous shape (`Err(_) => sleep`)
-                    // erased the signal entirely.
-                    //
-                    // `scope_lifecycle_stream` returns `ScopeLifecycle`
-                    // not `SyncEvent<_>`, so the protocol cannot emit
-                    // `SyncEvent::Terminated(AccountError)` here in
-                    // the way the convergence plan describes for
-                    // other streams. Honoring the spirit: classify,
-                    // and on terminal recovery classes break out of
-                    // the polling loop so the engine reopens the
-                    // account instead of spinning silently. Retry
-                    // classes continue with the backoff so the engine
-                    // sees normal transient behavior.
+                    // Classify rather than swallow. Terminal or
+                    // engine-action classes (auth lost, capability
+                    // changed, schema break) emit a structured
+                    // `ScopeLifecycleEvent::Terminated(AccountError)`
+                    // so the engine can route through `plan_recovery`
+                    // (escalate to `Pause` after the reopen budget, or
+                    // route an engine directive via the reopen
+                    // channel). Retry classes still sleep-and-continue
+                    // since transient transport/server hiccups are
+                    // expected for a long-running poll.
                     let acct = super::error::into_account_error(
                         err,
                         super::error::JmapErrorContext::new(
@@ -212,6 +206,7 @@ pub(crate) fn scope_lifecycle(
                     if acct.recovery().is_terminal()
                         || acct.recovery().requires_engine_action()
                     {
+                        yield ScopeLifecycleEvent::Terminated(acct);
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(300)).await;

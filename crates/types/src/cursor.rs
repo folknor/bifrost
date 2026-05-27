@@ -130,6 +130,25 @@ pub enum ScopeLifecycle {
     Deleted(MembershipScope),
 }
 
+/// Envelope yielded by `Account::scope_lifecycle_stream`. Carries
+/// either a scope lifecycle event or a terminal classification so
+/// the engine can escalate auth-lost / schema-incompatible / etc.
+/// observed by the long-running poll.
+///
+/// A protocol's lifecycle poll terminates the stream by yielding
+/// `Terminated(AccountError)` and then dropping the producer end;
+/// the engine reads the structured error and routes via
+/// `RecoveryPlan` (terminal -> `Pause(RetryBudgetExhausted)` after
+/// the backoff budget; engine-action -> `ReopenRequest::Recovery`;
+/// retry classes typically don't reach this envelope because the
+/// protocol sleeps and continues).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ScopeLifecycleEvent {
+    Lifecycle(ScopeLifecycle),
+    Terminated(crate::error::AccountError),
+}
+
 /// Engine-facing introspection over an opaque cursor.
 ///
 /// Account-aware (not pure-cursor) because cost depends on capability

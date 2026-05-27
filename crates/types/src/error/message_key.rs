@@ -75,6 +75,7 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         AccountErrorKind::NotFound(ResourceKind::Identity) => "notfound.identity",
         AccountErrorKind::NotFound(ResourceKind::Vacation) => "notfound.vacation",
         AccountErrorKind::NotFound(ResourceKind::PushSubscription) => "notfound.push-subscription",
+        AccountErrorKind::NotFound(ResourceKind::Account) => "notfound.account",
         AccountErrorKind::Unsupported(_) => "unsupported",
         AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed) => "protocol.parse-failed",
         AccountErrorKind::Protocol(ProtocolErrorKind::MissingField) => "protocol.missing-field",

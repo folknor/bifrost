@@ -23,7 +23,7 @@ use bifrost_types::{
     BlobHandle, ByteRange, Change, ChangeCursor, CostClass, CursorDescriptor, CursorEstablishment,
     CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection, IdempotencyKey,
     InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, Page, Priority, Projection, ScopeLifecycle, SearchRequest, SendRequest,
+    ObjectId, Page, Priority, Projection, ScopeLifecycleEvent, SearchRequest, SendRequest,
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
     WatchEvent,
 };
@@ -207,8 +207,12 @@ impl Account for GraphAccount {
         sync_event_stream(scopes::discover_membership_events(self.clone()))
     }
 
-    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycle> {
-        Box::pin(stream::iter(scopes::scope_lifecycle_events()))
+    fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
+        Box::pin(stream::iter(
+            scopes::scope_lifecycle_events()
+                .into_iter()
+                .map(ScopeLifecycleEvent::Lifecycle),
+        ))
     }
 
     fn establish_initial_cursor(

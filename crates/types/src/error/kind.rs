@@ -97,6 +97,10 @@ pub enum ResourceKind {
     /// Graph webhook subscriptions, JMAP push subscriptions, and any
     /// future IMAP IDLE abstraction.
     PushSubscription,
+    /// Account-level resource (Gmail `GmailResource::Account`, Graph
+    /// service principals, etc.). Distinct from `Message` so consumers
+    /// route an account-level `NotFound` away from the message UX.
+    Account,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

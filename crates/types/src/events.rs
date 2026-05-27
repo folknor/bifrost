@@ -242,6 +242,12 @@ pub struct InventoryEntry {
 /// equivalent of [`SyncEvent::Terminated`]. `Disconnected` /
 /// `Reconnected` remain advisory: a transient transport drop emits
 /// `Disconnected` followed by `Reconnected` once the renewer succeeds.
+///
+/// `Warning(Warning)` carries a structured advisory event (renewal
+/// hiccups, throttle telemetry, etc.) without ending the stream. Push
+/// transports that classify a transient error use this rather than
+/// bare-`tracing::warn!` so consumers and the engine see a typed
+/// signal.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WatchEvent {
@@ -249,6 +255,7 @@ pub enum WatchEvent {
     Disconnected,
     Reconnected,
     Terminated(AccountError),
+    Warning(Warning),
 }
 
 /// Push payload, type-erased to a protocol-agnostic shape.
