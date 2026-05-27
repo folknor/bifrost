@@ -1,8 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use bifrost_net::{
-    AccessToken, AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy,
-    StaticTokenSource, TokenSource,
+    AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy, StaticTokenSource,
+    TokenSource,
 };
 use bifrost_types::TransmissionState;
 use bytes::Bytes;
@@ -156,13 +156,6 @@ impl GraphClient {
     #[cfg(test)]
     pub(crate) async fn access_token(&self) -> String {
         self.inner.token_source.token().as_str().to_string()
-    }
-
-    // pub: token rotation must update the shared source held by open factories and accounts.
-    pub async fn set_access_token(&self, access_token: impl Into<String>) {
-        self.inner
-            .token_source
-            .set(AccessToken::new(access_token, None));
     }
 
     pub(crate) fn api_path_prefix(&self) -> String {

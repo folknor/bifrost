@@ -388,15 +388,6 @@ impl<T: HttpTransport> Client<T> {
     pub(crate) fn authorization(&self) -> String {
         self.inner.authorization.header_value()
     }
-
-    /// Replace the bearer token used by the default HTTP and
-    /// WebSocket transports. Returns `false` for Basic-auth clients.
-    #[cfg(feature = "websockets")]
-    pub(crate) fn set_access_token(&self, token: impl Into<String>) -> bool {
-        self.inner
-            .authorization
-            .set_bearer_token(AccessToken::new(token, None))
-    }
 }
 
 impl Credentials {

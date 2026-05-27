@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_net::{AccessToken, StaticTokenSource};
+use bifrost_net::StaticTokenSource;
 use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
 };
@@ -226,18 +226,6 @@ impl JmapCredentials {
     pub fn bearer(token: impl Into<String>) -> Self {
         Self::Bearer {
             token_source: StaticTokenSource::new(token, None),
-        }
-    }
-
-    /// Replace the bearer token for every factory/client clone that
-    /// shares this credential source. Returns `false` for Basic auth.
-    pub fn set_access_token(&self, token: impl Into<String>) -> bool {
-        match self {
-            Self::Basic { .. } => false,
-            Self::Bearer { token_source } => {
-                token_source.set(AccessToken::new(token, None));
-                true
-            }
         }
     }
 

@@ -1,12 +1,7 @@
 //! Graph error helpers.
 //!
-//! The substring-matching recovery helpers that used to live here
-//! (`graph_error_to_fatal`, `recovery_for_graph_error`,
-//! `fatal_from_recovery`, `mutation_outcome_for_status`) were removed
-//! when Phase 2.2 introduced the structured Graph error boundary.
-//! Classification is now driven entirely by the typed `GraphSignal`
-//! in `crate::error` and the `into_account_error` translation in
-//! `account::graph_error`.
+//! Classification is driven by the typed `GraphSignal` in `crate::error`
+//! and the `into_account_error` translation in `account::graph_error`.
 
 use bifrost_types::{ObjectId, Warning, WarningKind};
 
