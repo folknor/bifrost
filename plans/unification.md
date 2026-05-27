@@ -340,20 +340,19 @@ Four waves; each blocks on the prior.
   variant, and updated crate descriptions and `lib.rs` doc strings
   to match the contracted surface. `brokkr check --all` is clean
   (0 errors, 0 warnings).
-- **Wave 4: error model convergence (S1-W4)**. Single agent. Lands
-  the error-model contract into Stage 1: all `Account` methods
-  return `Result<_, AccountError>`, per-protocol error types become
-  `pub(crate)` and convert at the boundary, the
-  shared HTTP error -> `RecoveryClass` adapter lands in
-  `bifrost-net`, and `bifrost-types::Error` gets whatever
-  duplication shape (derive `Clone`, `Arc`-wrap non-Clone
-  payloads, or an explicit `duplicate()` method) the reshape
-  settles on - resolving the Gmail `account_error_from_template`
-  workaround. Also folds in the S1-W3 carryover on token-rotation
-  asymmetry across the four factory shapes (see the
-  captured-but-not-decisions block below) since the convergence
-  sweep is the next time a single agent touches every credentials
-  module.
+- **Wave 4: error model convergence (S1-W4)**. **Merged.** All
+  `Account` methods return `Result<_, AccountError>`; per-protocol
+  error types are `pub(crate)` and convert at the boundary; the
+  shared HTTP error -> `RecoveryClass` adapter lives in `bifrost-net`;
+  the opaque `AccountError` + builder model replaces the Gmail
+  `account_error_from_template` workaround (no cloneability shape
+  needed - the builder produces independent values per construction).
+  The token-rotation-asymmetry S1-W3 carryover was *not* folded in
+  here; the convergence sweep was already too large, and the rotation
+  surface is orthogonal to the error model. Tracked in `TODO.md` (and
+  the captured-but-not-decisions block below) for a future pass.
+  Residual cleanup tail (per-crate nits, four sync follow-ups around
+  the `ThrottleBucket` read side) is in `TODO.md`.
 
 #### File ownership
 
@@ -364,10 +363,12 @@ Per AGENTS.md coordination rules:
 - **S1-W2-jmap, -imap, -gmail, -graph**: `crates/<protocol>/src/`
   and `crates/<protocol>/Cargo.toml` per protocol.
 - **S1-W3**: same per-protocol ownership as wave 2.
-- **S1-W4**: `crates/types/src/error.rs`, `crates/net/src/` (for
-  the recovery adapter), plus a sweep of every protocol crate's
-  error module. Single agent because changes must land coherently
-  across all four protocol crates and the two shared crates.
+- **S1-W4**: landed across `crates/types/src/error/`, `crates/net/src/`,
+  `crates/sync/src/`, and every protocol crate's error module. Shipped
+  as a multi-phase sequence (5A shared surface, 5B sync, 5C protocol
+  crates, 5D re-audit, 5G ratatoskr-blocking follow-ups) rather than a
+  single-agent sweep; the surface is too large for one agent's working
+  set.
 
 #### Exit criteria
 
@@ -528,23 +529,18 @@ Then the standard wave structure:
    streaming responses. JMAP's manual loop in
    `crates/jmap/src/transport_reqwest.rs` is deleted at the
    same time. Lands in S1-W1.
-6. **`bifrost-types::Error` should derive `Clone`** (or otherwise
-   support cheap duplication). **Deferred to S1-W4.** Gmail's
-   `account_error_from_template` workaround exists because
-   `Error` cannot be cloned, but the error model is going to be
-   reshaped dramatically in the error-convergence wave anyway -
-   structured Graph errors, shared HTTP -> recovery adapter,
-   unified taxonomy across all four protocols. Decision about
-   cloneability rolls into that broader work rather than getting
-   locked in against today's shape.
-7. **Shared HTTP error -> recovery taxonomy adapter.** Graph still
-   classifies recoveries by substring-matching HTTP text in
-   `recovery_for_graph_error`, and `GraphClient` returns
-   `Result<T, String>` rather than a structured error. A shared
-   `bifrost_net::Error -> RecoveryClass` adapter that preserves
-   `Retry-After` would let all three HTTP protocol crates (JMAP,
-   Gmail, Graph) delete their local substring classifiers. Lands
-   in S1-W4 (error model convergence).
+6. **`bifrost-types::Error` cloneability.** **Resolved in S1-W4 by
+   not needing cloneability at all.** The opaque `AccountError` +
+   `AccountErrorBuilder` model produces independent values per
+   construction; the Gmail `account_error_from_template` workaround
+   is gone because there is no template to duplicate.
+7. **Shared HTTP error -> recovery taxonomy adapter.** **Resolved in
+   S1-W4.** `bifrost-net::Error` carries structured `Cause` and the
+   shared `into_account_error` translation boundary in each HTTP
+   protocol crate (jmap, gmail, graph) routes through the
+   `AccountErrorBuilder`. `recovery_for_graph_error` substring
+   matching is gone; Graph EWS / webhooks return structured
+   `GraphError` end-to-end.
 8. **Per-protocol bandwidth metering.** IMAP stores
    `set_bandwidth_cap()` but does not enforce it or report bytes
    through `bifrost_net::MeterSink`. The HTTP protocol crates feed
@@ -633,10 +629,9 @@ agents do not re-open them:
   upload-session limitation.
 
 S1-W3 audit surfaced this finding, which the W3 visibility
-contraction made visible but does not itself address. Recorded
-here so the S1-W4 (error convergence) agent picks it up - the
-W4 sweep is the next time a single agent touches all four
-factory / credentials modules together:
+contraction made visible. S1-W4 did not absorb it (the error-model
+sweep was already at the upper end of one coordinated change); it
+remains open for a future pass:
 
 - **Token rotation is unevenly exposed across the four protocol
   factories.** JMAP routes rotation through
@@ -648,8 +643,8 @@ factory / credentials modules together:
   takes an owned `String` into a now-`pub(crate)`
   `GmailClient`, leaving the consumer no public path to rotate
   after construction. IMAP's opaque `Credentials` likewise has no
-  rotation method. S1-W4 should land on one shape across the four
-  factories - either every factory exposes a `set_access_token`
+  rotation method. A future pass should land on one shape across the
+  four factories - either every factory exposes a `set_access_token`
   (mirroring JMAP / Graph) or every factory accepts a
   `bifrost_net::StaticTokenSource` / `Arc<dyn TokenSource>` at
   construction so the consumer owns the rotation handle

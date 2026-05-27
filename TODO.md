@@ -146,6 +146,19 @@ re-auditors don't re-raise them.)
   re-exported from `lib.rs:85`). Listed as "leave alone" —
   re-auditor reminder.
 
+## Cross-cutting
+
+- **Token rotation asymmetry across factories.** Surfaced by S1-W3
+  (`plans/unification.md`'s captured-but-not-decisions block). JMAP
+  rotates through `JmapCredentials::set_access_token`, Graph through
+  `GraphClient::set_access_token`, Gmail has no public rotation path
+  after `from_access_token`, IMAP's opaque `Credentials` likewise has
+  no rotation method. Land on one shape: either every factory exposes
+  `set_access_token`, or every factory accepts a
+  `bifrost_net::StaticTokenSource` / `Arc<dyn TokenSource>` at
+  construction. The latter aligns better with the
+  `Account`-is-the-only-API non-negotiable.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

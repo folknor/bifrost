@@ -448,29 +448,14 @@ Phase 3.5 is done when all of these hold:
 
 ## Phase 4
 
-Error model convergence across `bifrost-smtp`, `bifrost-jmap`,
-`bifrost-imap`, and (now) the four account-layer error
-taxonomies in the Phase 2 work.
-
-Landed. The contract lives in code (`bifrost-types::error`) and in
-`reference/*.md`; the residual cleanup tail is tracked in `TODO.md`.
-Historical predecessors that informed the shape:
-
-- Survey the current error types in each protocol crate
-  (`bifrost-{smtp,jmap,imap,gmail,graph}`) and the recovery
-  taxonomy in `bifrost-types`. Decide what "converged" means in
-  practice - a shared trait, a shared enum, or a documented
-  pattern each crate implements independently.
-- Decide whether `bifrost-smtp`'s rich `Response`-carrying shape
-  is the target, a starting point, or out of scope (sync-layer
-  errors and SMTP submission errors may not benefit from the
-  same model).
-- Decide whether `bifrost-types::AccountError` (the account-
-  layer error already in use) is the convergence target or sits
-  alongside protocol-native errors.
-
-Once those decisions are taken, this section gets the same
-treatment as Phase 3: sequencing, file ownership, exit criteria.
+Error model convergence. **Landed.** All `Account` methods return
+`Result<_, AccountError>`; per-protocol error types are `pub(crate)`
+and convert at the boundary; the shared HTTP error -> `RecoveryClass`
+adapter lives in `bifrost-net`; `bifrost-types::AccountError` is the
+single classification surface across the four protocols. The contract
+lives in code (`bifrost-types::error`) and in `reference/*.md`. The
+residual cleanup tail (per-crate nits and four sync follow-ups around
+the `ThrottleBucket` read side) is tracked in `TODO.md`.
 
 ## Coordination rules
 
