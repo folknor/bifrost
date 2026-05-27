@@ -35,9 +35,33 @@ pub struct Reconciler {
 
 impl Reconciler {
     /// Run the reconciler loop. Returns when the channel closes or
-    /// the shutdown token trips.
+    /// the shutdown token trips. Honors the account boundary: when
+    /// the engine flips to `Pause` (e.g. `OperatorOverrideRequired`
+    /// or `RetryBudgetExhausted`), pushes park alongside polls until
+    /// the consumer flips to `Resume`. Buffered `WatchEvent`s remain
+    /// in the channel and drain on resume.
     pub async fn run(mut self, mut rx: mpsc::Receiver<WatchEvent>) {
         loop {
+            // Park while the account is paused. The boundary watch
+            // notifies on every state change; we wake when it flips
+            // back to `Run`.
+            while matches!(self.boundary.peek(), crate::cancel::BoundaryRequest::Pause) {
+                tokio::select! {
+                    () = self.shutdown.cancelled() => return,
+                    changed = self.boundary.changed() => {
+                        match changed {
+                            Some(crate::cancel::BoundaryRequest::Run) => break,
+                            // Pause / CheckpointNow / Stop all keep
+                            // the loop parked. Stop is observed via
+                            // the shutdown token; CheckpointNow is a
+                            // poll-only signal that the reconciler
+                            // ignores.
+                            Some(_) => continue,
+                            None => return,
+                        }
+                    }
+                }
+            }
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 maybe_event = rx.recv() => {

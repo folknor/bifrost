@@ -874,12 +874,14 @@ caveats. Tracked here so they don't rot in commit messages.
     only flagged the missing-etag path which is now correct.
   - **plan:** address in Phase 5E if the telemetry granularity bites.
 
-- **graph-F3.** `pim.rs::submit_write_batch` per-item scope is coarser
-  than ideal (`ErrorScope::Account` instead of `Message { id }`).
-  - **status:** original code didn't track per-item ids; the agent
-    didn't add the tracking since it would be invasive.
-  - **plan:** thread `request_ids` the way `mutate.rs` does in a
-    follow-up commit. Phase 5E candidate.
+- **graph-F3.** `[done]` New
+  `submit_write_batch_with_targets(account, requests, targets, ...)`
+  threads a parallel `&[ObjectId]` slice; per-item failures look up
+  by `BatchRequestItem::id.parse::<usize>()` and carry
+  `ErrorScope::Message { id }` instead of `ErrorScope::Account`.
+  `patch_messages`, `move_messages`, `destroy_messages` all thread
+  targets. The legacy zero-target `submit_write_batch` remains for
+  callers without per-request ids.
 
 - **graph-F4.** `mutate.rs:132` "Missing folder destination for Move"
   still uses `unsupported_account_error(BulkMove)`.
@@ -906,17 +908,12 @@ don't rot in commit messages.
     sync-internal module that can be tested in isolation. Phase
     5D's re-audit should flag this if it isn't closed.
 
-- **sync-F2.** Push reconciler does not consult the boundary pause
-  for `OperatorOverrideRequired`.
-  - **status:** the directive broadcasts
-    `AccountControl::Pause(PauseReason::OperatorOverrideRequired)`
-    for consumer observability and flips the boundary so poll loops
-    park. The push reconciler keeps running until
-    `WatchEvent::Terminated` arrives.
-  - **plan:** wire the boundary into the push reconciler so push
-    streams also park on pause. Phase 5C agents touching push paths
-    should reference this; if untouched there, Phase 5E (P2 cleanup)
-    addresses it.
+- **sync-F2.** `[done]` Push reconciler now consults the boundary
+  pause. `Reconciler::run` parks while `boundary.peek() == Pause`
+  via `boundary.changed().await`, alongside the shutdown token.
+  `AccountControl::Pause(OperatorOverrideRequired)` and
+  `Pause(RetryBudgetExhausted)` park pushes the same way they park
+  polls; buffered `WatchEvent`s drain on resume.
 
 - **sync-F3.** `Reconcile` items requesting `DedupeByClientId` only
   (no `CheckTarget`) still queue `PendingReadback`.

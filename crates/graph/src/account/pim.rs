@@ -619,6 +619,7 @@ async fn patch_messages(
 ) -> Result<(), AccountError> {
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
+    let mut targets = Vec::new();
     for (index, patch) in patches.iter().enumerate() {
         let mut headers = HashMap::new();
         headers.insert("If-Match".to_string(), patch.etag.clone());
@@ -632,8 +633,9 @@ async fn patch_messages(
             body: Some(patch.body.clone()),
             headers: Some(headers),
         });
+        targets.push(patch.id.clone());
     }
-    submit_write_batch(account, requests, false, operation).await
+    submit_write_batch_with_targets(account, requests, &targets, false, operation).await
 }
 
 async fn move_messages(
@@ -645,6 +647,7 @@ async fn move_messages(
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
+    let mut targets = Vec::new();
     for (index, value) in values.iter().enumerate() {
         let id = object_id_from_value(value)?;
         let etag = graph_etag(value).ok_or_else(|| {
@@ -666,8 +669,9 @@ async fn move_messages(
             body: Some(json!({ "destinationId": destination })),
             headers: Some(headers),
         });
+        targets.push(id);
     }
-    submit_write_batch(account, requests, false, operation).await
+    submit_write_batch_with_targets(account, requests, &targets, false, operation).await
 }
 
 async fn destroy_messages(
@@ -678,6 +682,7 @@ async fn destroy_messages(
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
+    let mut targets = Vec::new();
     for (index, value) in values.iter().enumerate() {
         let id = object_id_from_value(value)?;
         let mut headers = HashMap::new();
@@ -694,8 +699,9 @@ async fn destroy_messages(
             body: None,
             headers: (!headers.is_empty()).then_some(headers),
         });
+        targets.push(id);
     }
-    submit_write_batch(account, requests, true, operation).await
+    submit_write_batch_with_targets(account, requests, &targets, true, operation).await
 }
 
 async fn message_values_for_ids(
@@ -713,6 +719,22 @@ async fn message_values_for_ids(
 async fn submit_write_batch(
     account: &GraphAccount,
     requests: Vec<BatchRequestItem>,
+    destroy: bool,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    submit_write_batch_with_targets(account, requests, &[], destroy, operation).await
+}
+
+/// Variant of `submit_write_batch` that threads per-request target
+/// message ids so per-item failures carry `ErrorScope::Message { id }`
+/// rather than the coarser `ErrorScope::Account`. `targets[i]` is the
+/// `ObjectId` of the request whose `BatchRequestItem::id == i.to_string()`;
+/// an empty `targets` slice falls back to `ErrorScope::Account` for
+/// callers that have no per-request id.
+async fn submit_write_batch_with_targets(
+    account: &GraphAccount,
+    requests: Vec<BatchRequestItem>,
+    targets: &[ObjectId],
     destroy: bool,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
@@ -754,7 +776,17 @@ async fn submit_write_batch(
             .as_ref()
             .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
             .unwrap_or_default();
-        let scope = ErrorScope::Account;
+        // Per-item failures carry `ErrorScope::Message { id }` when
+        // the caller provided a parallel `targets` slice; otherwise
+        // we fall back to `ErrorScope::Account` (graph-F3 done for
+        // patch/move/destroy paths; remaining callers pass empty).
+        let scope = item
+            .id
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| targets.get(idx))
+            .map(|id| ErrorScope::Message { id: id.0.clone() })
+            .unwrap_or(ErrorScope::Account);
         let outcome = mutation_item_outcome(
             item.status,
             headers,
