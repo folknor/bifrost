@@ -340,10 +340,10 @@ Four waves; each blocks on the prior.
   variant, and updated crate descriptions and `lib.rs` doc strings
   to match the contracted surface. `brokkr check --all` is clean
   (0 errors, 0 warnings).
-- **Wave 4: error model convergence (S1-W4)**. Single agent. Folds
-  `plans/error-model-convergence.md` into Stage 1: all `Account`
-  methods return `Result<_, AccountError>`, per-protocol error
-  types become `pub(crate)` and convert at the boundary, the
+- **Wave 4: error model convergence (S1-W4)**. Single agent. Lands
+  the error-model contract into Stage 1: all `Account` methods
+  return `Result<_, AccountError>`, per-protocol error types become
+  `pub(crate)` and convert at the boundary, the
   shared HTTP error -> `RecoveryClass` adapter lands in
   `bifrost-net`, and `bifrost-types::Error` gets whatever
   duplication shape (derive `Clone`, `Arc`-wrap non-Clone

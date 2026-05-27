@@ -128,12 +128,11 @@ remain alongside them.
   absorbs the previously-deferred Phase 4 (error model
   convergence) as Stage 1 Wave 4. **Stage 1 W1 + W2 + W3 merged**;
   W4 (error convergence) remains.
-- **Phase 4: Error model convergence.** Absorbed into Phase 3.6
-  Stage 1 Wave 4. The open-question framing in
-  `plans/error-model-convergence.md` is now resolved by the
-  one-API-surface non-negotiable in `plans/unification.md`: all
-  `Account` methods return `Result<_, AccountError>` and
-  per-protocol error types become `pub(crate)`. No separate phase.
+- **Phase 4: Error model convergence.** Landed. The contract lives
+  in code (`bifrost-types::error`) and in `reference/*.md`; the
+  residual cleanup tail is tracked in `TODO.md`. All `Account`
+  methods return `Result<_, AccountError>` and per-protocol error
+  types are `pub(crate)`.
 
 ## Reference material
 
@@ -453,11 +452,9 @@ Error model convergence across `bifrost-smtp`, `bifrost-jmap`,
 `bifrost-imap`, and (now) the four account-layer error
 taxonomies in the Phase 2 work.
 
-Not yet planned at agent-launch depth. The open question framing
-in `plans/error-model-convergence.md` (whether to converge, and
-what convergence buys ratatoskr) needs to be resolved into a
-concrete shape before file ownership and exit criteria can be
-written. Expected predecessors of that fleshing-out:
+Landed. The contract lives in code (`bifrost-types::error`) and in
+`reference/*.md`; the residual cleanup tail is tracked in `TODO.md`.
+Historical predecessors that informed the shape:
 
 - Survey the current error types in each protocol crate
   (`bifrost-{smtp,jmap,imap,gmail,graph}`) and the recovery

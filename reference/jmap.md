@@ -293,9 +293,9 @@ Mapping highlights for the JMAP signals the central table reads:
 - `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`
   from documented JMAP behavior.
 - `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
-  `Engine(RestartAccount)` (the `EngineDirective::CapabilityChanged`
-  variant was removed in Phase 5A; capability shifts now route through
-  full account reopen).
+  `Engine(RestartAccount)`. `EngineDirective` has no
+  `CapabilityChanged` variant; capability shifts route through full
+  account reopen.
 - `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`
   -> `ProviderContractViolation`.
 - HTTP-only status fallbacks (401/403/429/5xx) on bare
