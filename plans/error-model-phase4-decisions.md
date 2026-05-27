@@ -790,4 +790,47 @@ phase.
 
 ## Open items
 
-None. Begin Phase A on confirmation.
+None blocking. Begin Phase A on confirmation.
+
+## Phase 5B follow-ups (deferred, not blocking)
+
+Items the Phase 5B sync agent landed correctly but with explicit
+caveats that need attention in a later phase. Tracked here so they
+don't rot in commit messages.
+
+- **sync-F1.** Three-failed-reopen behavior test deferred.
+  - **status:** wiring is correct (exponential backoff with three
+    attempts, then `SyncEvent::Terminated(last_error)` plus
+    `AccountControl::Pause(PauseReason::RetryBudgetExhausted)`).
+    The behavior is reachable but not pinned by a focused test
+    because constructing the necessary `Account` / `AccountFactory`
+    stub requires either ~400 lines of test scaffolding or a
+    pure-function harness around the backoff helper.
+  - **plan:** add the test in Phase 5C alongside protocol-level
+    reopen exercises, or extract the backoff helper into a
+    sync-internal module that can be tested in isolation. Phase
+    5D's re-audit should flag this if it isn't closed.
+
+- **sync-F2.** Push reconciler does not consult the boundary pause
+  for `OperatorOverrideRequired`.
+  - **status:** the directive broadcasts
+    `AccountControl::Pause(PauseReason::OperatorOverrideRequired)`
+    for consumer observability and flips the boundary so poll loops
+    park. The push reconciler keeps running until
+    `WatchEvent::Terminated` arrives.
+  - **plan:** wire the boundary into the push reconciler so push
+    streams also park on pause. Phase 5C agents touching push paths
+    should reference this; if untouched there, Phase 5E (P2 cleanup)
+    addresses it.
+
+- **sync-F3.** `Reconcile` items requesting `DedupeByClientId` only
+  (no `CheckTarget`) still queue `PendingReadback`.
+  - **status:** counters surface the case
+    (`MutationCounters::dedupe_by_client_id`) and a
+    `Warning::OperatorAttentionNeeded` fires, but the read-back guard
+    runs anyway. Plumbing is correct per sync-D4 (engine owns
+    `CheckTarget`, consumer owns `DedupeByClientId`).
+  - **plan:** at consumer write-back time, a counter check can suppress
+    the read-back for dedupe-only items if the consumer confirms the
+    client-id was deduped. Out of scope for sync; revisit when a
+    consumer (ratatoskr) starts using the counter surface.
