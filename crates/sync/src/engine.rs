@@ -1903,8 +1903,7 @@ enum MutationBucket {
 /// Classify one `ItemOutcome<MutationSuccess>` and update the
 /// per-id outcome map, retry queue, and read-back queue.
 ///
-/// Dispatch rules (per
-/// `plans/error-model-sync.md::Mutation pipeline`):
+/// Dispatch rules:
 /// - `Succeeded(Applied)` -> `Applied`.
 /// - `Succeeded(Skipped)` -> `Skipped`.
 /// - `Failed { error }` dispatches via `error.recovery()`:

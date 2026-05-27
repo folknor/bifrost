@@ -1,10 +1,36 @@
 # Error model: implementation roadmap
 
 This is the execution sequence for landing the error model
-convergence described in `plans/error-model-convergence.md`. Per-crate
-plans live in `plans/error-model-<crate>.md`. This document specifies
-*when* each piece lands; the per-crate plans specify *what* lands in
-that piece.
+convergence described in `plans/error-model-convergence.md`. This
+document specifies *when* each piece lands; the per-crate plans
+specify *what* lands in that piece.
+
+## Document index
+
+- `plans/error-model-convergence.md` - target contract. Public
+  shape, recovery model, cause taxonomy, streaming invariants,
+  batch boundary, partial-success semantics.
+- `plans/error-model-roadmap.md` - this file. Phase sequencing and
+  exit gates for the original four phases plus the post-merge
+  phase 5.
+- `plans/error-model-phase4-audit.md` - frozen evidence. Eight
+  per-crate audit findings from after Phase 4 squash-merged.
+  Triage labels (`[bug]`, `[gap]`, `[smell]`, `[nit]`) with
+  file:line citations. Per `plans/error-model-phase4-decisions.md`'s
+  doc-D2 override, this doc is *not* trimmed as items get fixed;
+  it stays as the snapshot of "what was wrong post-merge" until
+  phase 5 completes.
+- `plans/error-model-phase4-decisions.md` - locked decisions for
+  every design ambiguity surfaced in the audit. Live tracker:
+  resolved decisions get marked `[done]` inline. Drives phase 5
+  execution.
+
+The per-crate phase plans (`plans/error-model-{types,net,jmap,imap,
+smtp,gmail,graph,sync}.md`) were deleted after Phase 4 landed. The
+work they specified is captured in code and in `reference/*.md`;
+their substantive design choices that needed revision in phase 5
+are restated in the decisions doc. Git history preserves the
+originals if needed.
 
 ## Goals
 
@@ -15,9 +41,12 @@ that piece.
 - Land the change without intermediate compromise types or
   transitional shims. The convergence plan rejects transitional
   shapes; this roadmap honors that.
-- Allow multi-agent execution where it makes sense (Phase 2) and
-  single-agent execution where the work is too tightly coupled to
-  parallelize (Phases 1, 3, 4).
+- Allow multi-agent execution where it makes sense (Phase 2 and
+  phase 5C) and single-agent execution where the work is too
+  tightly coupled to parallelize (Phases 1, 3, 4, 5A, 5B).
+- Close every audit finding from phase 5 to the standard of the
+  decisions doc (no compromise adapters, no compatibility shims,
+  no stringly typed escape hatches).
 
 ## Out of scope
 
@@ -31,17 +60,24 @@ that piece.
 
 ## Branch strategy
 
-All work lands on a long-running feature branch
-`error-model/main` off `main`. Each phase commits to this branch.
-After Phase 4, the branch merges to `main` in a single squash. The
-workspace does not compile mid-branch (Phase 1 lands the new types
-before consumer crates are migrated); that is the expected state.
-`main` itself stays green throughout.
+Phases 1-4 landed on a long-running feature branch
+`error-model/main` off `main`, squash-merged at the end of Phase 4.
+The workspace did not compile mid-branch (Phase 1 landed new types
+before consumer crates were migrated); that was the expected state.
+`main` stayed green throughout.
+
+Phase 5 lands directly on `main`. The phase 5A commit intentionally
+leaves the workspace uncompilable (same shared-surface pattern as
+Phase 1); phase 5B and 5C bring it back. Because phase 5 has no
+working consumers gating the API surface, the broken-branch period
+sits on `main` rather than on a feature branch. Other branches and
+working trees should rebase against the phase-5C exit commit, not
+the intermediate phase-5A or phase-5B commits.
 
 ## Phase structure
 
-Four phases, each gating the next. Validation gates between phases
-are explicit.
+Four original phases plus phase 5 (post-merge audit + fix cycle).
+Each gates the next. Validation gates are explicit.
 
 ### Phase 1: types foundation
 
@@ -62,7 +98,8 @@ those surface migrations belong to Phase 3 (workspace integration),
 where the entire workspace migrates in one coordinated commit and
 compilation comes back.
 
-**Plan:** `plans/error-model-types.md`.
+**Plan:** captured at the time in `plans/error-model-types.md`
+(deleted; see git history for the original exit criteria).
 
 **Validation:** patch audit, not compilation. Per the types plan's
 exit criteria:
@@ -97,43 +134,28 @@ each per-crate plan's exit criteria.
 
 **Sub-phase ordering within Phase 2:**
 
-1. `bifrost-net` lands first.
-   - Plan: `plans/error-model-net.md`.
-   - Reason: it sets the `AttemptCause` emission convention that
-     `bifrost-jmap`, `bifrost-gmail`, and `bifrost-graph` rely
-     on for transmission-state evidence. Agents writing those
-     crates need to know what `bifrost-net`'s translation surface
-     looks like even though they cannot compile against it yet.
-   - Single agent, single commit.
+1. `bifrost-net` landed first. It set the `AttemptCause` emission
+   convention that `bifrost-jmap`, `bifrost-gmail`, and
+   `bifrost-graph` rely on for transmission-state evidence. Single
+   agent, single commit.
 
-2. The five consumer crates land in parallel agents:
-   - `bifrost-jmap` per `plans/error-model-jmap.md`.
-   - `bifrost-imap` per `plans/error-model-imap.md`.
-   - `bifrost-smtp` per `plans/error-model-smtp.md`.
-   - `bifrost-gmail` per `plans/error-model-gmail.md`.
-   - `bifrost-graph` per `plans/error-model-graph.md`.
+2. The five consumer crates landed in parallel agents:
+   `bifrost-jmap`, `bifrost-imap`, `bifrost-smtp`, `bifrost-gmail`,
+   `bifrost-graph`. Each agent owned only its crate's files.
 
-   Each agent owns only its crate's files. `bifrost-imap` and
-   `bifrost-smtp` do not depend on `bifrost-net` and could in
-   principle land before it, but for orchestration simplicity all
-   five run after net.
+3. `bifrost-sync` landed last. Sync consumes `RecoveryClass` and
+   `SyncEvent`; its rewrite depended on the convergence plan's
+   final shape being clear. Sync did not own any rename inside
+   `bifrost-types`; the `SyncEvent::Fatal` ->
+   `SyncEvent::Terminated(AccountError)` rename happened in Phase 3
+   inside `bifrost-types/events.rs`. Single agent, single commit.
 
-3. `bifrost-sync` lands last in Phase 2.
-   - Plan: `plans/error-model-sync.md`.
-   - Reason: sync consumes `RecoveryClass` and `SyncEvent`; its
-     own rewrite depends on the convergence plan's final shape
-     being clear. Sync does **not** own any rename inside
-     `bifrost-types`; the `SyncEvent::Fatal` →
-     `SyncEvent::Terminated(AccountError)` rename happens in
-     Phase 3 inside `bifrost-types/events.rs`. Sync's Phase 2
-     work is updating its own engine code to consume the new
-     `RecoveryClass` shape and dispatching `EngineDirective`.
-   - Single agent, single commit.
+Per-crate plans (deleted; see git history) carried the per-crate
+exit criteria.
 
-**Validation:** patch audit per crate against the relevant
-`plans/error-model-<crate>.md`. No `brokkr check`, no `brokkr
-test` at this phase. The workspace remains broken throughout
-Phase 2.
+**Validation:** patch audit per crate. No `brokkr check`, no
+`brokkr test` at this phase. The workspace remained broken
+throughout Phase 2.
 
 ### Phase 3: workspace integration
 
@@ -263,12 +285,129 @@ report results. A pass-by-inspection claim is not acceptable.
 
 ### Phase 4: merge to main
 
-**Goal:** land the feature branch on `main`.
+**Status:** landed. Squash merge `error-model/main` -> `main` shipped
+as commit `eeaa386` plus follow-ups. `Cargo.lock` updates committed
+alongside per the project rule.
 
-- Squash merge `error-model/main` → `main`.
-- Single commit message summarizing the convergence.
-- `Cargo.lock` updates committed alongside (project rule: always
-  commit lockfile changes).
+### Phase 5: post-merge audit and fix cycle
+
+**Goal:** close the gap between "the contract landed" and "the
+contract is actually wired end-to-end." The post-merge audit at
+`plans/error-model-phase4-audit.md` found that the shape landed but
+the model was not wired: every crate except `bifrost-net` had P0
+correctness bugs (double-send hazards in SMTP/Graph/Gmail/IMAP,
+structured errors flattened to strings in Graph EWS / webhooks,
+engine drops directives in sync, type-system gaps in
+`bifrost-types`). Phase 5 lands the decisions documented in
+`plans/error-model-phase4-decisions.md`.
+
+Phase 5 has five sub-phases (A-E). The decisions doc is the source
+of truth for *what* lands in each; this roadmap is the source of
+truth for *when* and *how it gates*.
+
+#### Phase 5A: shared surface
+
+Single agent, single commit. Lands every shared type and trait
+change from the decisions doc:
+
+- `types-D*` and `types-N*` items.
+- `Account::get_stream` trait signature change to
+  `SyncEvent<ItemOutcome<HydratedObject>>` (types-D17).
+- `WatchEvent::Terminated(AccountError)` variant (types-D15).
+- `AccountControl` + `PauseReason` enums (types-D16).
+- `ResourceKind` widening with `PushSubscription` (types-D13).
+- `ThrottleScope` rename + `ThrottleKey` enum type definition
+  (types-D14; the actual `ThrottleBucket` lives in Phase 5B).
+- `RetryHint` shape on `ServerCause` and `RetryAdvice` (types-D7).
+- `AccountErrorBuildError` enum + `build()` -> `try_build()` rename
+  (types-D10), with `CursorInvalidWithoutScope` as a build error
+  (types-D10b).
+- `EngineDirective::CapabilityChanged` removal + cause-payload
+  becoming `Option<CapabilityDelta>` (types-D2, types-D2b).
+- `RemediationAction` engine-action variant removal (types-D8).
+- `Fatal` field privatization (types-D1).
+- `BatchOutcomeBuilder` separating mutable construction from
+  immutable return (types-D3).
+- Convergence doc edits cascading from these decisions (doc-D3).
+- New tests: helper exclusivity (types-D11), `Fatal::try_from`
+  round-trip (types-D12).
+
+**Validation:** patch audit against the decisions doc. Phase 5A
+intentionally leaves protocol implementations uncompilable; Phase
+5B and 5C bring the workspace back to a buildable state. `brokkr
+check` does not run at this gate.
+
+#### Phase 5B: sync alone
+
+Single agent, single commit. Sync gets a dedicated phase because it
+owns the largest semantic-surface change: `RecoveryPlan` dispatch,
+`ThrottleBucket` implementation keyed by `ThrottleKey`,
+`AccountControl::Pause/Resume` plumbing, three-retry-then-
+`Terminated(last_error)` backoff with `Pause(RetryBudgetExhausted)`,
+`ReconcileAction::CheckTarget` routing to read-back, cursor-decode
+-> `SchemaIncompatible` translator, removal of the
+`EngineDirective::CapabilityChanged` arm.
+
+All `sync-D*` and `sync-N*` items. Agent prompt explicitly forbids:
+
+- compromise adapters between the old variant-direct
+  `RecoveryClass` dispatch and the new `plan_recovery` helper,
+- compatibility shims for the removed
+  `EngineDirective::CapabilityChanged`,
+- stringly pause reasons (use the `PauseReason` enum only),
+- ad-hoc `Fatal` construction (only
+  `RecoveryPlan::Terminal(Fatal)` via `Fatal::try_from`),
+- silent error swallows in any long-running loop (e.g.
+  `scope_lifecycle`, `discover_memberships`).
+
+**Validation:** patch audit against `sync-D*` / `sync-N*` items.
+Sync compiles cleanly against Phase 5A; protocol crates still do
+not. `brokkr check -p bifrost-sync` may pass; workspace-wide
+`brokkr check` does not.
+
+#### Phase 5C: five protocol crates in parallel
+
+Five agents in parallel: `bifrost-jmap`, `bifrost-imap`,
+`bifrost-smtp`, `bifrost-gmail`, `bifrost-graph`. Strict file
+ownership per AGENTS.md; no agent reads or writes outside its
+crate. Orchestrator runs `brokkr check` between agents.
+
+Each agent's prompt cites the relevant `*-D*` and `*-N*` items
+from the decisions doc. Same compromise-free discipline as Phase
+5B.
+
+**Wire-enum escape hatch:** as in Phase 2, Phase 5C agents may not
+edit `crates/types/src/error/cause.rs` for new wire variants. The
+orchestrator patches `bifrost-types` centrally on the agent's
+behalf and re-runs the affected agent.
+
+**Validation:** workspace-wide `brokkr check` clean. Every
+decision in `plans/error-model-phase4-decisions.md` is `[done]`.
+
+#### Phase 5D: re-audit
+
+Six agents (sync + five protocols) in parallel. Same per-crate
+prompt shape as the original phase 4 audit but asking "did the fix
+land cleanly; are there residual gaps; report findings labeled
+bug / gap / smell / nit." Surfaces P2 items that were deferred plus
+anything missed.
+
+**Validation:** triage the re-audit output. New `[bug]` or `[gap]`
+findings escalate back to Phase 5C for the affected crate.
+
+#### Phase 5E: P2 cleanup and doc sweep
+
+Smells and nits from the original audit plus Phase 5D residuals.
+One commit per crate, sequential.
+
+`reference/{graph,jmap,sync,gmail,imap}.md` final pass to make
+sure documentation matches the post-phase-5 code. Convergence and
+roadmap docs final edit.
+
+`plans/error-model-phase4-audit.md` deleted at the end of this
+phase. With every decision `[done]` and every audit finding either
+fixed or reclassified as out-of-scope, the audit doc's evidence
+value is spent.
 
 ## Multi-agent orchestration rules
 
@@ -329,27 +468,35 @@ struck through).
 
 | Phase | Gate | Method |
 |---|---|---|
-| 1 | new error module landed, audit clean | patch audit against `plans/error-model-types.md` exit criteria |
-| 2.1 | bifrost-net translation surface authored | patch audit against `plans/error-model-net.md` |
-| 2.2 | each consumer crate translation authored | patch audit against `plans/error-model-<crate>.md` |
-| 2.3 | bifrost-sync engine adaption authored | patch audit against `plans/error-model-sync.md` |
+| 1 | new error module landed, audit clean | patch audit against the (deleted) types plan's exit criteria |
+| 2.1 | bifrost-net translation surface authored | patch audit against the (deleted) net plan |
+| 2.2 | each consumer crate translation authored | patch audit against each (deleted) per-crate plan |
+| 2.3 | bifrost-sync engine adaption authored | patch audit against the (deleted) sync plan |
 | 3 | workspace integration complete, compiles, tests pass | `brokkr check` workspace-wide; the Phase 1 tests now execute |
 | 4 | feature branch merged | `git merge --squash` to main |
+| 5A | shared-surface decisions landed | patch audit against `plans/error-model-phase4-decisions.md` types/shared section |
+| 5B | sync engine adapted | patch audit against `plans/error-model-phase4-decisions.md` sync section; `brokkr check -p bifrost-sync` |
+| 5C | five protocol crates updated | workspace-wide `brokkr check` clean; every decision `[done]` |
+| 5D | re-audit clean | per-crate audit reports show no new `[bug]` or `[gap]` |
+| 5E | P2 cleanup + doc sweep | `reference/*.md` matches code; `plans/error-model-phase4-audit.md` deleted |
 
-Phases 1 and 2 do not run `brokkr`. The workspace is broken
-throughout. Phase 3 is the first phase that runs `brokkr check`,
-and it is also the first phase where it passes.
+Phases 1, 2, 5A, and 5B do not run workspace-wide `brokkr`. Phase 3
+and Phase 5C are the gates where the workspace must compile cleanly.
 
 ## Rollback
 
-If Phase 2 hits an unforeseen blocker on one crate, the feature
-branch holds. Phase 1 alone is not useful on `main` - workspace
-broken - so we never merge a partial state. The feature branch can
-be abandoned without affecting `main`.
+For phases 1-4 (feature-branch era): if Phase 2 hit an unforeseen
+blocker on one crate, the feature branch held. Phase 1 alone was
+not useful on `main` (workspace broken), so partial state was never
+merged. The branch could be abandoned without affecting `main`.
 
-If Phase 3 reveals that the convergence plan's trait surface choices
-are wrong, abandoning the branch costs only the work already
-committed; `main` is untouched.
+For phase 5 (on-main era): rollback is harder because phase 5A
+lands directly on `main`. If phase 5B or 5C reveals that a phase-5A
+shared-surface choice was wrong, the fix is forward: amend the
+decisions doc, re-do the affected sub-phase. Reverting phase 5A is
+a last resort because the audit findings it addresses are
+correctness bugs in the merged state, and reverting would re-
+introduce them.
 
 ## Test discipline
 
@@ -365,10 +512,29 @@ Each phase adds tests in proportion to the surface it changes:
   `RecoveryClass`. Roughly 10-20 per crate.
 - Phase 3: trait signature changes are caught by `brokkr check`;
   ItemOutcome streaming semantics get ~5 tests per bulk method.
+- Phase 5A: helper exclusivity (one test, one assertion per
+  `RecoveryClass` variant - types-D11), `Fatal::try_from` round-
+  trip (one test per terminal and non-terminal variant -
+  types-D12), `AccountErrorBuildError` coverage (one test per of
+  the four variants - types-D10), `RetryHint` accessor parity
+  (`not_before` / `min_delay` on the same hint produce consistent
+  values).
+- Phase 5B: `RecoveryPlan` dispatch exhaustiveness (compile-time),
+  `ThrottleBucket` cross-account semantics for `Tenant` /
+  `Provider` keys, `AccountControl::Pause(RetryBudgetExhausted)`
+  emission after three failed reopens, cursor-decode ->
+  `SchemaIncompatible` translator path.
+- Phase 5C: per-crate updates to existing translation tests for
+  the new shapes; new tests where the audit found classification
+  gaps (Graph webhook auth/policy failures, Gmail Pub/Sub renewer
+  classification, IMAP tagged NO/BAD `Acknowledged` attempt
+  state, SMTP LMTP DATA negative-reply per-recipient lanes).
 
 No live-server tests. No end-to-end tests. No mock servers.
 
 ## Sequencing summary
+
+Phases 1-4 (feature-branch era, landed):
 
 ```
 Phase 1: bifrost-types       [single agent, one commit]
@@ -389,3 +555,26 @@ Phase 4: merge to main       [squash merge, one commit on main]
 ```
 
 Eight commits on the feature branch, one squash commit on `main`.
+
+Phase 5 (on-main, pending):
+
+```
+Phase 5A: shared surface     [single agent, one commit on main]
+   ↓
+Phase 5B: bifrost-sync       [single agent, one commit]
+   ↓
+Phase 5C: bifrost-jmap    ─┐
+          bifrost-imap    ─┤
+          bifrost-smtp    ─┤ [five agents in parallel,
+          bifrost-gmail   ─┤  five commits, no overlap]
+          bifrost-graph   ─┘
+   ↓
+Phase 5D: re-audit           [six agents in parallel, no commits]
+   ↓
+Phase 5E: P2 cleanup +       [one commit per crate, sequential]
+          doc sweep
+```
+
+Up to twelve commits on `main` for phase 5 (1 + 1 + 5 + 0 + 5 if
+every crate produces a P2 commit; fewer if some crates have no P2
+items left).
