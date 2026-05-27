@@ -1588,13 +1588,15 @@ async fn link_discovered_memberships(
             }
             SyncEvent::Done(_) => break,
             SyncEvent::Terminated(err) => {
-                tracing::warn!(
-                    target: "bifrost.sync.changes",
-                    kind = ?err.kind(),
-                    message_key = err.message_key(),
-                    "discover_memberships terminated; continuing without index"
-                );
-                break;
+                // Surface the structured error to the caller instead
+                // of returning `Ok(())` with an empty membership index.
+                // A silent return here left the push reconciler routing
+                // hints to "every registered scope" because the index
+                // was never populated. Callers log the error and may
+                // route via `reopen_tx` for terminal / engine-action
+                // classes; auth-lost etc. then escalates rather than
+                // silently degrading routing for the session lifetime.
+                return Err(Error::Account(err));
             }
             SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
             _ => {}

@@ -828,15 +828,18 @@ in the audit reports.
     through `apply_throttle`. Coupled with sync-F4; doing F5 alone
     has no observable effect because the read side isn't wired.
 
-- **sync-F6.** `discover_memberships` terminal swallowed.
-  - **status:** `engine.rs:1581-1589` logs the kind and breaks the
-    loop, returning `Ok(())`. Push reconciler then routes hints to
-    "every registered scope" because the membership index is empty.
-    Original Phase 4 audit gap not closed by Phase 5B/5E.
-  - **plan:** match `scope_lifecycle` shape: classify-and-break on
-    terminal / engine-action classes so the engine reopens the
-    account; preserve sleep on retry classes. Same shape as
-    `jmap-D3` for the JMAP side. Small fix.
+- **sync-F6.** `[done]` `link_discovered_memberships` no longer
+  returns `Ok(())` on `SyncEvent::Terminated`. The Terminated arm
+  now returns `Err(Error::Account(err))` so the structured error
+  reaches the two callers (`establish` flow at `engine.rs:1499` and
+  the recovery-path re-establish at `engine.rs:1957`), both of which
+  already log structurally. Push reconciler no longer routes hints
+  to "every registered scope" because the index never finished
+  building; the engine surface gets the chance to act on the error
+  instead of silently degrading routing for the session lifetime.
+  Caller-side `reopen_tx` escalation for terminal/engine-action
+  classes is a separate enhancement; the immediate behavior change
+  is that the error is no longer silently swallowed.
 
 - **gmail-F3.** `scope_lifecycle_stream` and `labels_for_flags`
   swallow with `tracing::warn!`.
