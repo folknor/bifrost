@@ -126,7 +126,7 @@ fn mutation_stream(
                     let account_err = super::account_error_with(
                         err,
                         super::error::ImapErrorContext::operation(mutation_operation(&kind))
-                            .with_mailbox(&folder),
+                            .with_folder_scope(&folder),
                     );
                     if stream_terminating(&account_err) {
                         let _ = tx.send(SyncEvent::Terminated(account_err)).await;
@@ -233,7 +233,7 @@ async fn run_folder_mutation(
             super::account_error_with(
                 err,
                 super::error::ImapErrorContext::operation(mutation_operation(kind))
-                    .with_mailbox(folder),
+                    .with_folder_scope(folder),
             ),
         ),
     });
@@ -271,7 +271,7 @@ async fn run_destroy_mutation_groups(
                     super::account_error_with(
                         err,
                         super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-                            .with_mailbox(folder),
+                            .with_folder_scope(folder),
                     ),
                 ));
                 continue;
@@ -293,7 +293,7 @@ async fn run_destroy_mutation_groups(
                 super::account_error_with(
                     err,
                     super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-                        .with_mailbox(folder),
+                        .with_folder_scope(folder),
                 ),
             ));
             results.extend(mutation_results(
@@ -355,7 +355,7 @@ async fn run_flag_mutation_groups(
                     super::account_error_with(
                         err,
                         super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
-                            .with_mailbox(folder),
+                            .with_folder_scope(folder),
                     ),
                 )
             }

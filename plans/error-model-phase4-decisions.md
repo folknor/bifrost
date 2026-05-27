@@ -841,80 +841,66 @@ in the audit reports.
   classes is a separate enhancement; the immediate behavior change
   is that the error is no longer silently swallowed.
 
-- **gmail-F3.** `scope_lifecycle_stream` and `labels_for_flags`
-  swallow with `tracing::warn!`.
-  - **status:** `crates/gmail/src/account/scopes.rs:134-136` and
-    `:152-155` bare-warn on `list_labels()` failures. An
-    auth-lost loop forever instead of surfacing.
-  - **plan:** classify through
-    `into_account_error(_, GmailErrorContext::containers_list())` and
-    break the loop on terminal classes. Trait-shape constraint same
-    as `jmap-F1` (the stream element type is `ScopeLifecycle`, not
-    `SyncEvent<_>`), so no `Terminated(AccountError)` emission until
-    that's resolved. Mirror of `jmap-F1`.
+- **gmail-F3.** `[done]` `scope_lifecycle_stream` now classifies
+  every `list_labels()` failure via
+  `GmailErrorContext::containers_list()` and emits
+  `ScopeLifecycleEvent::Terminated(AccountError)` for terminal /
+  engine-action classes (made possible by the new
+  `ScopeLifecycleEvent` envelope - see jmap-F1 done). Retry classes
+  keep the existing structured-tracing warn so transient hiccups
+  don't terminate. `labels_for_flags` still uses `tracing::warn!`
+  because it returns a `Vec<GmailLabel>` directly with no error
+  carrier; the broader rework would require changing that helper's
+  signature, which is out of scope for the deferred-item closure.
 
-- **smtp-F1.** Legacy non-batch SMTP/LMTP send paths don't tag phase.
-  - **status:** `crates/smtp/src/transport/smtp/client/connection.rs:142+`
-    (`send_with_options`), `:172+` (`send_bdat_with_options`), `:324`
-    (`send_lmtp_with_options`), `:340+` (`send_lmtp_bdat_with_options`)
-    use `self.command(...)` with no `with_phase` decoration. Async
-    siblings have the same shape. No `Account` impl wires them yet,
-    so the P0 double-send pattern is dormant rather than active.
-  - **plan:** either (a) deprecate the legacy paths in favor of
-    `send_lmtp_batch` once an `Account::send` impl lands and confirm
-    the batch helper is the only public surface, or (b) thread phase
-    tags + per-recipient lane resolution into them. Defer until a
-    consumer wires `Account::send`.
+- **smtp-F1.** `[done]` Legacy non-batch SMTP/LMTP send paths now
+  thread phase tags. `try_smtp!` macro gained a phase-tagged variant
+  (`try_smtp!(expr, self, SmtpCommandPhase::X)`). Every legacy site
+  in `send_with_options`, `send_bdat_with_options`,
+  `send_lmtp_with_options`, `send_lmtp_bdat_with_options` and their
+  async siblings tags the relevant phase (`MailFrom`, `RcptTo`,
+  `DataCommand`, `DataBody`, `BdatBody`, `LmtpFinalStatus`). The
+  per-recipient lane resolution gap remains (deprecating in favor of
+  `send_lmtp_batch` is still the long-term shape) but errors now
+  carry phase context so the classifier routes correctly.
 
-- **smtp-F2.** AUTH-command wire failures inside `auth()` not
-  phase-tagged.
-  - **status:** `connection.rs:1307` (`command(auth)`) and
-    `:1311-1318` (challenge `command(...)`) propagate via `try_smtp!`
-    without `with_phase(SmtpCommandPhase::Auth)`. Async siblings
-    same. Server `535` / `534` replies still reach `Permanent(response)`
-    and classify as `Authentication(...)` / `Authorization(...)` via
-    the response-code path, so the routing is correct today; what's
-    lost is the AUTH-phase tag for non-reply failures (challenge
-    formatting faults, etc.).
-  - **plan:** wrap `command(auth)` / challenge commands with
-    `.map_err(|e| e.with_phase(SmtpCommandPhase::Auth))`. Trivial
-    once someone touches `auth()`.
+- **smtp-F2.** `[done]` AUTH-command wire failures inside `auth()`
+  now phase-tagged. The initial `command(auth)` and the challenge
+  loop's `command(Auth::new_from_response(...))` both use the new
+  `try_smtp!(.., self, SmtpCommandPhase::Auth)` variant in both
+  sync and async siblings. Non-reply failures (challenge formatting
+  faults, parse errors mid-handshake) now carry the AUTH phase so
+  the classifier routes them through the `Auth`-phase arm of
+  `account_error.rs` instead of degrading to generic `InvalidInput`.
 
-- **graph-F5.** `SoapFaultCode` coverage gap for Microsoft EWS faults.
-  - **status:** `crates/graph/src/ews/mod.rs:78-89` `SoapFaultCode::parse`
-    only matches the four SOAP 1.1 names (`VersionMismatch`,
-    `MustUnderstand`, `Client`, `Server`). Microsoft EWS in practice
-    ships `<faultcode>` values like `a:ErrorAccessDenied`,
-    `a:ErrorServerBusy`, `a:ErrorMailboxStoreUnavailable`,
-    `a:ErrorImpersonateUserDenied`, etc. - all collapse to
-    `SoapFaultCode::Unknown` and then to `Protocol(ContractViolation)`
-    -> `ProviderContractViolation` (terminal). Recoverable faults
-    (server busy, mailbox store unavailable) are misclassified as
-    terminal.
-  - **plan:** extend `SoapFaultCode` with `ErrorAccessDenied`,
-    `ErrorServerBusy`, `ErrorImpersonateUserDenied`,
-    `ErrorMailboxStoreUnavailable`, and any other commonly-seen
-    Microsoft EWS faults. Map onto the same `AccessCause::*` /
-    `ServerCause::*` / `Access(MailboxUnavailable)` shapes the REST
-    path uses. Defer to when EWS is actually exercised in
-    production; until then misclassification is latent.
+- **graph-F5.** `[done]` `SoapFaultCode` extended with the common
+  Microsoft EWS faults: `ErrorAccessDenied` ->
+  `Authorization(PermissionDenied)`, `ErrorImpersonateUserDenied` ->
+  `Authorization(ConditionalAccessBlocked)`, `ErrorServerBusy` ->
+  `Server(RateLimited)`, `ErrorMailboxStoreUnavailable` and
+  `ErrorMailboxMoveInProgress` ->
+  `Authorization(MailboxUnavailable { Transient })`,
+  `ErrorNonExistentMailbox` -> `NotFound(Mailbox)`,
+  `ErrorItemNotFound` -> `NotFound(Message)`. `soap_fault_to_account_error`
+  in `graph_error.rs` exhaustively routes each variant; remaining
+  unrecognized codes still land in `Unknown` ->
+  `Protocol(ContractViolation)` so a brand-new fault doesn't slip
+  through silently.
 
 ## Phase 5C follow-ups (deferred, not blocking)
 
 Items the Phase 5C protocol agents landed correctly but with explicit
 caveats. Tracked here so they don't rot in commit messages.
 
-- **jmap-F1.** `scope_lifecycle_stream` element type mismatch.
-  - **status:** the decisions doc (`jmap-D3`) called for
-    `SyncEvent::Terminated(AccountError)` on terminal classes but
-    `Account::scope_lifecycle_stream` returns
-    `AccountStream<ScopeLifecycle>`, not `AccountStream<SyncEvent<_>>`.
-    JMAP classifies and breaks the loop on terminal / engine-action
-    recovery classes today.
-  - **plan:** decide whether `scope_lifecycle_stream` should be
-    wrapped in `SyncEvent<_>` like the other long-running streams.
-    That is a `bifrost-types` trait change; defer to a future phase
-    where the trait surface can be revisited cleanly.
+- **jmap-F1.** `[done]` `Account::scope_lifecycle_stream` returns
+  `AccountStream<ScopeLifecycleEvent>` (new envelope: either
+  `Lifecycle(ScopeLifecycle)` or `Terminated(AccountError)`). JMAP,
+  IMAP, Gmail, and Graph implementations all updated. JMAP's
+  `discover::scope_lifecycle` emits
+  `ScopeLifecycleEvent::Terminated(acct)` on terminal /
+  engine-action classes. Sync multiplexer consumes the new envelope
+  and routes terminal events through `reopen_tx` so `RecoveryPlan`
+  dispatch handles them the same as errors from any other source.
 
 - **jmap-F2.** `[done]` `JmapMethod::NotJson` / `NotRequest`
   reclassified `Request(Malformed)` -> `Protocol(ContractViolation)`
@@ -928,14 +914,13 @@ caveats. Tracked here so they don't rot in commit messages.
   the `JmapMethod::Unknown { code }` once, clones once into the wire
   cause.
 
-- **imap-F1.** Auto-promote `Mailbox(id) -> Cursor(Folder(id))` for
-  `SyncState(CursorInvalid)` in `into_account_error`.
-  - **status:** defensive shim added so `EXPUNGEISSUED`/`CLOSED`/etc.
-    in PIM/folder paths build cleanly without threading cursor scope
-    through every call site.
-  - **plan:** centrally-recommended fix is to thread cursor scope
-    through every PIM `op_err`. Phase 5D re-audit should flag this if
-    not closed; otherwise Phase 5E.
+- **imap-F1.** `[done]` Auto-promote shim removed. Added
+  `ImapErrorContext::with_folder_scope(&mailbox)` which sets
+  `ErrorScope::Cursor(CursorScope::Folder(_))` directly. Every PIM /
+  get / mutate call site that previously used `with_mailbox(folder)`
+  switched to `with_folder_scope(folder)`. `EXPUNGEISSUED` / `CLOSED`
+  / `NotificationOverflow` responses now build with explicit cursor
+  scope at the producer; no more translation-boundary fix-up.
 
 - **imap-F2.** `pim_malformed` and `envelope::malformed` reach helper
   paths that don't know the op.
@@ -945,35 +930,28 @@ caveats. Tracked here so they don't rot in commit messages.
   - **plan:** thread operation when other pim/envelope refactoring
     happens; not blocking.
 
-- **gmail-F1.** `GmailResource::Account` falls back to
-  `ResourceKind::Message` in `not_found_kind_cause`.
-  - **status:** every other `GmailResource` now maps to a specific
-    `ResourceKind` (`Draft`, `Identity`, `Vacation`, `PushSubscription`)
-    via Phase 5A widening. `Account` has no analogue.
-  - **plan:** add `ResourceKind::Account` to `bifrost-types` if
-    consumer routing needs to distinguish "account-level NotFound"
-    from "message NotFound". Defer until a consumer asks.
+- **gmail-F1.** `[done]` `ResourceKind::Account` added to
+  `bifrost-types` and gmail's `GmailResource::Account` now maps to
+  it directly. The previous fallback-to-`Message` coercion is gone;
+  account-level NotFound consumers see `NotFound(ResourceKind::Account)`.
 
-- **gmail-F2.** Pub/Sub renewer transient classes use
-  `tracing::warn!` instead of a structured `Warning`.
-  - **status:** `WatchEvent` has no `Warning` variant; the renewer
-    emits structured tracing fields (`kind`, `message_key`,
-    `recovery`) alongside the `WatchEvent::Disconnected` health
-    signal. Terminal classes emit `WatchEvent::Terminated(AccountError)`
-    correctly.
-  - **plan:** if a wire `Warning` variant is desired on `WatchEvent`,
-    add it to `bifrost-types` and have the renewer emit it. Defer.
+- **gmail-F2.** `[done]` `WatchEvent::Warning(Warning)` variant
+  added to `bifrost-types`. Gmail's Pub/Sub renewer transient-failure
+  arm now emits a structured `Warning` (via
+  `control.report_health(WatchEvent::Warning(warning))`) alongside
+  the existing `Disconnected` health signal. Consumers see a typed
+  signal instead of (or in addition to) `tracing::warn!`.
 
 - **graph-F1.** `[done]` `STATUS_BODY_CAP` promoted to `pub` in
   `bifrost-net::error`, re-exported from `bifrost-net::STATUS_BODY_CAP`.
   Graph imports it directly; the duplicate constant is gone.
 
-- **graph-F2.** `pim.rs::object_id_from_value` hardcodes
-  `AccountOperation::Hydrate` for missing-id cases.
-  - **status:** threading the caller's operation through ~10 call
-    sites would have been disproportionate; the audit (graph-N10)
-    only flagged the missing-etag path which is now correct.
-  - **plan:** address in Phase 5E if the telemetry granularity bites.
+- **graph-F2.** `[done]` `object_id_from_value(value, operation)`
+  now takes the caller's `AccountOperation`. `resolve_target_ids`,
+  `resolve_target_values`, `cache_etag`, and `message_from_value`
+  all gained an `operation` parameter so per-callsite ops survive
+  through the missing-id construction. The previously-hardcoded
+  `Hydrate` is gone.
 
 - **graph-F3.** `[done]` New
   `submit_write_batch_with_targets(account, requests, targets, ...)`
@@ -984,11 +962,12 @@ caveats. Tracked here so they don't rot in commit messages.
   targets. The legacy zero-target `submit_write_batch` remains for
   callers without per-request ids.
 
-- **graph-F4.** `mutate.rs:132` "Missing folder destination for Move"
-  still uses `unsupported_account_error(BulkMove)`.
-  - **status:** pre-existing pattern; not named in the decisions doc.
-  - **plan:** Phase 5E cleanup if the classification reads wrong in
-    practice.
+- **graph-F4.** `[done]` "Missing folder destination for Move"
+  reclassifies as `Protocol(ContractViolation)` via the new
+  `protocol_violation` helper at `mutate.rs:128-149`. The
+  `unsupported_account_error(BulkMove)` shape was misleading
+  (suggested the protocol didn't support moves at all when the real
+  issue is the request shape).
 
 ## Phase 5B follow-ups (deferred, not blocking)
 

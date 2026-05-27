@@ -63,7 +63,7 @@ pub(crate) fn get_stream(
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::Hydrate,
                         )
-                        .with_mailbox(&folder),
+                        .with_folder_scope(&folder),
                     );
                     let uncertain: Vec<ItemOutcome<HydratedObject>> = ids
                         .into_iter()

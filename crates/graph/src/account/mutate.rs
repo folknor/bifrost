@@ -126,10 +126,25 @@ async fn submit_batch(
             continue;
         }
         let Some(request) = request_for_mutation(account, id, kind, &etags)? else {
-            // Missing folder destination for Move - emit per-item failure.
+            // `request_for_mutation` returns `Ok(None)` when the
+            // mutation cannot be built. For `Move` kinds the only
+            // reason this fires (etag is preflight-checked above) is
+            // a destination that isn't a folder - a caller-side
+            // malformed request. Classify as `Request(Malformed)` so
+            // recovery routes to `ClientBug` rather than the
+            // misleading `Unsupported(BulkMove)` shape that suggests
+            // the protocol doesn't support moves at all. (graph-F4)
             preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
                 BatchItemId(id.0.clone()),
-                super::graph_error::unsupported_account_error(operation_for_kind(kind)),
+                super::graph_error::protocol_violation(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                    operation_for_kind(kind),
+                    Some(bifrost_types::ErrorScope::Message { id: id.0.clone() }),
+                    format!(
+                        "Graph Move request for {} did not resolve to a folder destination",
+                        id.0
+                    ),
+                ),
             )));
             continue;
         };

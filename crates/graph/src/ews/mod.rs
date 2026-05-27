@@ -70,8 +70,34 @@ pub(crate) enum SoapFaultCode {
     Client,
     /// `Server` - server failed to process the request (5xx-equivalent).
     Server,
-    /// Unrecognized fault code (Microsoft EWS uses
-    /// `ErrorAccessDenied`-style strings; those land here).
+    /// Microsoft EWS: caller lacks the rights to perform the operation.
+    /// Routes to `Authorization(PermissionDenied)`.
+    ErrorAccessDenied,
+    /// Microsoft EWS: caller cannot impersonate the target user. Routes
+    /// to `Authorization(ConditionalAccessBlocked)` or
+    /// `PermissionDenied` depending on context (we use
+    /// `ConditionalAccessBlocked` since impersonation is a tenant-policy
+    /// gate).
+    ErrorImpersonateUserDenied,
+    /// Microsoft EWS: backend is throttling. Routes to
+    /// `Server(RateLimited)` so the engine respects the throttle hint.
+    ErrorServerBusy,
+    /// Microsoft EWS: target mailbox is temporarily unavailable. Routes
+    /// to `Authorization(MailboxUnavailable { Transient })` so the
+    /// engine retries.
+    ErrorMailboxStoreUnavailable,
+    /// Microsoft EWS: caller's mailbox is moving between databases.
+    /// Routes to `Authorization(MailboxUnavailable { Transient })`.
+    ErrorMailboxMoveInProgress,
+    /// Microsoft EWS: target user / mailbox cannot be found. Routes to
+    /// `NotFound(Mailbox)` so consumers route to the missing-mailbox UX.
+    ErrorNonExistentMailbox,
+    /// Microsoft EWS: the requested item no longer exists. Routes to
+    /// `NotFound(Message)`.
+    ErrorItemNotFound,
+    /// Unrecognized fault code. Microsoft EWS uses many other
+    /// `ErrorXxx` codes; the ones we don't classify explicitly land
+    /// here and route to `Protocol(ContractViolation)`.
     Unknown,
 }
 
@@ -83,6 +109,13 @@ impl SoapFaultCode {
             "MustUnderstand" => Self::MustUnderstand,
             "Client" => Self::Client,
             "Server" => Self::Server,
+            "ErrorAccessDenied" => Self::ErrorAccessDenied,
+            "ErrorImpersonateUserDenied" => Self::ErrorImpersonateUserDenied,
+            "ErrorServerBusy" => Self::ErrorServerBusy,
+            "ErrorMailboxStoreUnavailable" => Self::ErrorMailboxStoreUnavailable,
+            "ErrorMailboxMoveInProgress" => Self::ErrorMailboxMoveInProgress,
+            "ErrorNonExistentMailbox" => Self::ErrorNonExistentMailbox,
+            "ErrorItemNotFound" => Self::ErrorItemNotFound,
             _ => Self::Unknown,
         }
     }

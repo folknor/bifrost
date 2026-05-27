@@ -40,7 +40,21 @@ macro_rules! try_smtp (
                 return Err(From::from(err))
             },
         }
-    })
+    });
+    // Phase-tagged variant. Stamps the SMTP error with the given
+    // SmtpCommandPhase so the translation boundary in `account_error.rs`
+    // can route per-phase (e.g. AUTH-time failures -> PolicyBlocked,
+    // MAIL FROM phase tagged on telemetry, etc.). Use this in the
+    // legacy non-batch send paths and the AUTH command exchange.
+    ($err: expr, $client: ident, $phase: expr) => ({
+        match $err {
+            Ok(val) => val,
+            Err(err) => {
+                $client.abort();
+                return Err(From::from(err.with_phase($phase)))
+            },
+        }
+    });
 );
 
 /// Structure that implements the SMTP client
@@ -154,18 +168,20 @@ impl SmtpConnection {
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             try_smtp!(
                 self.command(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
         }
 
-        try_smtp!(self.command(Data), self);
-        let result = try_smtp!(self.message(email), self);
+        try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
+        let result = try_smtp!(self.message(email), self, SmtpCommandPhase::DataBody);
         Ok(result)
     }
 
@@ -186,17 +202,19 @@ impl SmtpConnection {
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             try_smtp!(
                 self.command(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
         }
 
-        let result = try_smtp!(self.message_bdat(email), self);
+        let result = try_smtp!(self.message_bdat(email), self, SmtpCommandPhase::BdatBody);
         Ok(result)
     }
 
@@ -289,7 +307,8 @@ impl SmtpConnection {
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
@@ -298,7 +317,8 @@ impl SmtpConnection {
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             let response = try_smtp!(
                 self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
             if response.is_positive() {
                 accepted_recipients += 1;
@@ -321,9 +341,13 @@ impl SmtpConnection {
             return Ok(rejected);
         }
 
-        try_smtp!(self.command(Data), self);
-        let mut delivery_statuses =
-            try_smtp!(self.message_lmtp(email, accepted_recipients), self).into_iter();
+        try_smtp!(self.command(Data), self, SmtpCommandPhase::DataCommand);
+        let mut delivery_statuses = try_smtp!(
+            self.message_lmtp(email, accepted_recipients),
+            self,
+            SmtpCommandPhase::LmtpFinalStatus
+        )
+        .into_iter();
 
         Ok(recipient_statuses
             .into_iter()
@@ -354,7 +378,8 @@ impl SmtpConnection {
 
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options)),
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
@@ -363,7 +388,8 @@ impl SmtpConnection {
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             let response = try_smtp!(
                 self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone())),
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
             if response.is_positive() {
                 accepted_recipients += 1;
@@ -1304,7 +1330,7 @@ impl SmtpConnection {
         // Limit challenges to avoid blocking
         let mut challenges = 10;
         let auth = Auth::new(mechanism, credentials.clone(), None)?;
-        let mut response = try_smtp!(self.command(auth), self);
+        let mut response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -1314,7 +1340,8 @@ impl SmtpConnection {
                     credentials.clone(),
                     &response,
                 )?),
-                self
+                self,
+                SmtpCommandPhase::Auth
             );
         }
 

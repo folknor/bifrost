@@ -54,9 +54,7 @@ impl GmailResource {
             // cannot be opened; classify as the parent's message kind so
             // consumer routing surfaces the message-not-found UX.
             Self::Blob => Some(ResourceKind::Message),
-            // `Account` is not a per-resource kind; the central
-            // `ResourceKind` enum doesn't have an account variant.
-            Self::Account => None,
+            Self::Account => Some(ResourceKind::Account),
         }
     }
 }
@@ -859,12 +857,10 @@ fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
     // gmail-D2: every typed `GmailResource` now maps to a real
     // `ResourceKind` (Blob -> Message because a missing blob means
     // the parent message can't be opened, PubSubWatch ->
-    // PushSubscription, etc.). The only `None` is `Account`, which
-    // has no `ResourceKind` analogue - that path falls back to
-    // `Message` because Gmail's only account-scoped 404 endpoint is
-    // `users.getProfile`, and "the account isn't there" is the
-    // closest available routing target. There is no silent coercion
-    // of non-message resources anymore.
+    // PushSubscription, Account, etc.). The fallback to `Message` only
+    // fires when no `GmailResource` was attached at all - which is a
+    // producer bug rather than a documented coercion; every `not_found`
+    // path in this crate sets `ctx.resource`.
     let what = ctx
         .resource
         .and_then(GmailResource::to_resource_kind)

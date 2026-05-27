@@ -1,6 +1,4 @@
-use bifrost_types::{
-    Batch, Checkpoint, CursorScope, MembershipScope, PageBoundary, SyncEvent,
-};
+use bifrost_types::{Batch, Checkpoint, CursorScope, MembershipScope, PageBoundary, SyncEvent};
 
 use super::{ImapAccount, folder_scope, iter_stream, membership_scope};
 

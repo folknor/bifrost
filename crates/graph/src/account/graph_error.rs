@@ -129,6 +129,7 @@ fn soap_fault_to_account_error(
     // (refused). Microsoft EWS embeds finer-grained codes in the
     // `<detail>` payload, but that is support-only diagnostics; we
     // do not branch UX on the string.
+    let resource = resource_from_scope(ctx.scope.as_ref());
     let (kind, cause) = match code {
         SoapFaultCode::Server => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
@@ -137,6 +138,45 @@ fn soap_fault_to_account_error(
         SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => (
             AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }),
             Cause::Server(ServerCause::Error { status: Some(400) }),
+        ),
+        // Microsoft EWS specific faults the convergence audit
+        // identified as recoverable but previously collapsed to
+        // ProviderContractViolation.
+        SoapFaultCode::ErrorAccessDenied => (
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource }),
+        ),
+        SoapFaultCode::ErrorImpersonateUserDenied => (
+            AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
+            Cause::Access(AccessCause::ConditionalAccessBlocked),
+        ),
+        SoapFaultCode::ErrorServerBusy => (
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+        ),
+        SoapFaultCode::ErrorMailboxStoreUnavailable | SoapFaultCode::ErrorMailboxMoveInProgress => {
+            (
+                AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
+                    kind: MailboxUnavailableKind::Transient,
+                }),
+                Cause::Access(AccessCause::MailboxUnavailable {
+                    kind: MailboxUnavailableKind::Transient,
+                }),
+            )
+        }
+        SoapFaultCode::ErrorNonExistentMailbox => (
+            AccountErrorKind::NotFound(ResourceKind::Mailbox),
+            Cause::Request(RequestCause::NotFound {
+                what: ResourceKind::Mailbox,
+                id: id_from_scope(ctx.scope.as_ref()),
+            }),
+        ),
+        SoapFaultCode::ErrorItemNotFound => (
+            AccountErrorKind::NotFound(ResourceKind::Message),
+            Cause::Request(RequestCause::NotFound {
+                what: ResourceKind::Message,
+                id: id_from_scope(ctx.scope.as_ref()),
+            }),
         ),
         SoapFaultCode::Unknown => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),

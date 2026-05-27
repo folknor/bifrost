@@ -282,13 +282,19 @@ async fn start_renewer(
                         control.report_health(WatchEvent::Terminated(account_error));
                         return;
                     }
-                    tracing::warn!(
-                        target: "bifrost_gmail::push",
-                        kind = ?account_error.kind(),
-                        message_key = account_error.message_key(),
-                        recovery = ?account_error.recovery(),
-                        "gmail Pub/Sub watch renewal transient failure; retrying",
-                    );
+                    // gmail-F2: emit a structured Warning alongside
+                    // the Disconnected health signal so consumers see
+                    // a typed transient-failure event instead of a
+                    // bare tracing log.
+                    let warning = bifrost_types::Warning::support_only(
+                        bifrost_types::WarningKind::OperatorAttentionNeeded,
+                        format!(
+                            "gmail Pub/Sub renewal transient failure: {}",
+                            account_error.message_key(),
+                        ),
+                    )
+                    .with_retry_count(1);
+                    control.report_health(WatchEvent::Warning(warning));
                     if !disconnected {
                         control.report_health(WatchEvent::Disconnected);
                         disconnected = true;

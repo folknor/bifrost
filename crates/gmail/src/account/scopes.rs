@@ -3,8 +3,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use bifrost_types::{
-    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, ScopeLifecycleEvent, ScopeLifecycle,
-    SyncEvent,
+    AccountStream, Batch, CursorScope, LabelId, MembershipScope, PageBoundary, ScopeLifecycle,
+    ScopeLifecycleEvent, SyncEvent,
 };
 use futures::{StreamExt, stream};
 use tokio_util::sync::CancellationToken;
@@ -141,9 +141,7 @@ pub(crate) fn scope_lifecycle_stream(
                         error,
                         super::error::GmailErrorContext::containers_list(),
                     );
-                    if acct.recovery().is_terminal()
-                        || acct.recovery().requires_engine_action()
-                    {
+                    if acct.recovery().is_terminal() || acct.recovery().requires_engine_action() {
                         return Some((ScopeLifecycleEvent::Terminated(acct), state));
                     }
                     tracing::warn!(

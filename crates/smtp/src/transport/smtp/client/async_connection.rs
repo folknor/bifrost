@@ -40,7 +40,19 @@ macro_rules! try_smtp (
                 return Err(From::from(err))
             },
         }
-    })
+    });
+    // Phase-tagged variant (mirrors the sync sibling). Stamps the SMTP
+    // error with the given SmtpCommandPhase so the translation
+    // boundary in `account_error.rs` can route per-phase.
+    ($err: expr, $client: ident, $phase: expr) => ({
+        match $err {
+            Ok(val) => val,
+            Err(err) => {
+                $client.abort().await;
+                return Err(From::from(err.with_phase($phase)))
+            },
+        }
+    });
 );
 
 #[derive(Clone, Copy, Debug)]
@@ -238,19 +250,25 @@ impl AsyncSmtpConnection {
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
                 .await,
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             try_smtp!(
                 self.command(Rcpt::new(to_address.clone(), rcpt_options.clone()))
                     .await,
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
         }
 
-        try_smtp!(self.command(Data).await, self);
-        let result = try_smtp!(self.message(email).await, self);
+        try_smtp!(
+            self.command(Data).await,
+            self,
+            SmtpCommandPhase::DataCommand
+        );
+        let result = try_smtp!(self.message(email).await, self, SmtpCommandPhase::DataBody);
         Ok(result)
     }
 
@@ -272,18 +290,24 @@ impl AsyncSmtpConnection {
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
                 .await,
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         for (to_address, rcpt_options) in envelope.to().iter().zip(&rcpt_options) {
             try_smtp!(
                 self.command(Rcpt::new(to_address.clone(), rcpt_options.clone()))
                     .await,
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
         }
 
-        let result = try_smtp!(self.message_bdat(email).await, self);
+        let result = try_smtp!(
+            self.message_bdat(email).await,
+            self,
+            SmtpCommandPhase::BdatBody
+        );
         Ok(result)
     }
 
@@ -396,7 +420,8 @@ impl AsyncSmtpConnection {
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
                 .await,
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
@@ -406,7 +431,8 @@ impl AsyncSmtpConnection {
             let response = try_smtp!(
                 self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone()))
                     .await,
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
             if response.is_positive() {
                 accepted_recipients += 1;
@@ -429,9 +455,17 @@ impl AsyncSmtpConnection {
             return Ok(rejected);
         }
 
-        try_smtp!(self.command(Data).await, self);
-        let mut delivery_statuses =
-            try_smtp!(self.message_lmtp(email, accepted_recipients).await, self).into_iter();
+        try_smtp!(
+            self.command(Data).await,
+            self,
+            SmtpCommandPhase::DataCommand
+        );
+        let mut delivery_statuses = try_smtp!(
+            self.message_lmtp(email, accepted_recipients).await,
+            self,
+            SmtpCommandPhase::LmtpFinalStatus
+        )
+        .into_iter();
 
         Ok(recipient_statuses
             .into_iter()
@@ -463,7 +497,8 @@ impl AsyncSmtpConnection {
         try_smtp!(
             self.command(Mail::new(envelope.from().cloned(), mail_options))
                 .await,
-            self
+            self,
+            SmtpCommandPhase::MailFrom
         );
 
         let mut recipient_statuses = Vec::with_capacity(envelope.to().len());
@@ -473,7 +508,8 @@ impl AsyncSmtpConnection {
             let response = try_smtp!(
                 self.command_accepting_status(Rcpt::new(to_address.clone(), rcpt_options.clone()))
                     .await,
-                self
+                self,
+                SmtpCommandPhase::RcptTo
             );
             if response.is_positive() {
                 accepted_recipients += 1;
@@ -1402,7 +1438,7 @@ impl AsyncSmtpConnection {
         // Limit challenges to avoid blocking
         let mut challenges: u8 = 10;
         let auth = Auth::new(mechanism, credentials.clone(), None)?;
-        let mut response = try_smtp!(self.command(auth).await, self);
+        let mut response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
@@ -1413,7 +1449,8 @@ impl AsyncSmtpConnection {
                     &response,
                 )?)
                 .await,
-                self
+                self,
+                SmtpCommandPhase::Auth
             );
         }
 

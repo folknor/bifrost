@@ -72,6 +72,23 @@ impl ImapErrorContext {
         self
     }
 
+    /// Like `with_mailbox` but produces an `ErrorScope::Cursor(Folder(_))`
+    /// instead of `Mailbox { id }`. Folder-scoped operations (STORE,
+    /// FETCH against a folder, mutation paths) use this so that the
+    /// `EXPUNGEISSUED` / `CLOSED` / `NotificationOverflow` response
+    /// codes - which classify as `SyncState(CursorInvalid)` - build a
+    /// structurally valid error. The previous shape paired
+    /// `ErrorScope::Mailbox` with `CursorInvalid` and relied on a
+    /// translation-boundary auto-promote shim to fix it up; this
+    /// helper makes the cursor scoping explicit at the producer.
+    #[must_use]
+    pub(crate) fn with_folder_scope(mut self, mailbox: &MailboxName) -> Self {
+        self.scope = Some(ErrorScope::Cursor(CursorScope::Folder(
+            bifrost_types::FolderId(mailbox.as_str().to_owned()),
+        )));
+        self
+    }
+
     #[must_use]
     pub(crate) fn with_message_id(mut self, id: impl Into<String>) -> Self {
         self.scope = Some(ErrorScope::Message { id: id.into() });
@@ -107,20 +124,11 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
     } = translation;
 
     // CursorInvalid requires a cursor scope or `try_build` rejects
-    // (CursorInvalidWithoutScope). PIM and other folder-bound paths
-    // pass `Mailbox { id }`; promote that to `Cursor(Folder(id))` so
-    // a stray `EXPUNGEISSUED` / `CLOSED` reaching one of those paths
-    // builds a structurally valid error rather than panicking inside
-    // `expect`. Other kinds keep the caller's scope verbatim.
-    let scope_for_kind = match (&kind, ctx.scope.as_ref()) {
-        (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Some(ErrorScope::Mailbox { id }),
-        ) => Some(ErrorScope::Cursor(CursorScope::Folder(
-            bifrost_types::FolderId(id.clone()),
-        ))),
-        _ => ctx.scope.clone(),
-    };
+    // (`CursorInvalidWithoutScope`). Folder-scoped producers use
+    // `ImapErrorContext::with_folder_scope(&mailbox)` so the scope
+    // is `ErrorScope::Cursor(Folder(id))` rather than
+    // `ErrorScope::Mailbox { id }`.
+    let scope_for_kind = ctx.scope.clone();
 
     let mut builder = AccountErrorBuilder::new(kind, primary_cause)
         .protocol(Protocol::Imap)

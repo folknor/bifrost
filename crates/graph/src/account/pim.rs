@@ -38,7 +38,7 @@ pub(crate) async fn add_to_container(
     target: MutationTarget,
     container: ContainerId,
 ) -> Result<(), AccountError> {
-    let ids = resolve_target_ids(&account, target).await?;
+    let ids = resolve_target_ids(&account, target, AccountOperation::AddToContainer).await?;
     move_messages(
         &account,
         &ids,
@@ -54,10 +54,16 @@ pub(crate) async fn set_category(
     category: String,
     value: bool,
 ) -> Result<(), AccountError> {
-    let values = resolve_target_values(&account, target, "id,categories,flag,changeKey").await?;
+    let values = resolve_target_values(
+        &account,
+        target,
+        "id,categories,flag,changeKey",
+        AccountOperation::SetCategory,
+    )
+    .await?;
     let mut patches = Vec::new();
     for message in values {
-        let id = object_id_from_value(&message)?;
+        let id = object_id_from_value(&message, AccountOperation::SetCategory)?;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetCategory,
@@ -97,10 +103,16 @@ pub(crate) async fn set_extended_property(
     let property_id = graph_extended_property_id(&property_id);
     match value {
         Some(value) => {
-            let values = resolve_target_values(&account, target, "id,changeKey").await?;
+            let values = resolve_target_values(
+                &account,
+                target,
+                "id,changeKey",
+                AccountOperation::SetExtendedProperty,
+            )
+            .await?;
             let mut patches = Vec::new();
             for message in values {
-                let id = object_id_from_value(&message)?;
+                let id = object_id_from_value(&message, AccountOperation::SetExtendedProperty)?;
                 let etag = graph_etag(&message).ok_or_else(|| {
                     pim_protocol_error(
                         AccountOperation::SetExtendedProperty,
@@ -127,7 +139,8 @@ pub(crate) async fn set_extended_property(
             // success and 404 if the property never existed; the
             // batch helper tolerates 404 for the clear path so a
             // partial / never-set state still resolves to Ok.
-            let ids = resolve_target_ids(&account, target).await?;
+            let ids =
+                resolve_target_ids(&account, target, AccountOperation::SetExtendedProperty).await?;
             delete_extended_property(
                 &account,
                 &ids,
@@ -168,10 +181,16 @@ pub(crate) async fn set_is_read(
     target: MutationTarget,
     is_read: bool,
 ) -> Result<(), AccountError> {
-    let values = resolve_target_values(&account, target, "id,changeKey").await?;
+    let values = resolve_target_values(
+        &account,
+        target,
+        "id,changeKey",
+        AccountOperation::SetIsRead,
+    )
+    .await?;
     let mut patches = Vec::new();
     for message in values {
-        let id = object_id_from_value(&message)?;
+        let id = object_id_from_value(&message, AccountOperation::SetIsRead)?;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetIsRead,
@@ -514,7 +533,12 @@ pub(crate) async fn delete_thread(
     thread: ThreadId,
     current: Option<ContainerId>,
 ) -> Result<(), AccountError> {
-    let ids = resolve_target_ids(&account, MutationTarget::Thread(thread)).await?;
+    let ids = resolve_target_ids(
+        &account,
+        MutationTarget::Thread(thread),
+        AccountOperation::BulkMove,
+    )
+    .await?;
     let trash = trash_container_id(&account).await;
     let already_in_trash = current
         .as_ref()
@@ -535,14 +559,18 @@ struct MessagePatch {
 async fn resolve_target_ids(
     account: &GraphAccount,
     target: MutationTarget,
+    operation: AccountOperation,
 ) -> Result<Vec<ObjectId>, AccountError> {
     match target {
         MutationTarget::Message(id) => Ok(vec![id]),
         MutationTarget::Thread(thread) => {
             let values = message_values_for_thread(account, &thread, "id").await?;
-            values.iter().map(object_id_from_value).collect()
+            values
+                .iter()
+                .map(|value| object_id_from_value(value, operation))
+                .collect()
         }
-        _ => Err(unsupported_account_error(AccountOperation::BulkMove)),
+        _ => Err(unsupported_account_error(operation)),
     }
 }
 
@@ -550,11 +578,12 @@ async fn resolve_target_values(
     account: &GraphAccount,
     target: MutationTarget,
     select: &str,
+    operation: AccountOperation,
 ) -> Result<Vec<Value>, AccountError> {
     match target {
         MutationTarget::Message(id) => Ok(vec![fetch_message_value(account, &id, select).await?]),
         MutationTarget::Thread(thread) => message_values_for_thread(account, &thread, select).await,
-        _ => Err(unsupported_account_error(AccountOperation::BulkMove)),
+        _ => Err(unsupported_account_error(operation)),
     }
 }
 
@@ -573,7 +602,7 @@ async fn fetch_message_value(
         account.client.get_json(&path).await.map_err(|e| {
             into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate))
         })?;
-    cache_etag(account, &value).await?;
+    cache_etag(account, &value, AccountOperation::Hydrate).await?;
     Ok(value)
 }
 
@@ -649,7 +678,7 @@ async fn move_messages(
     let mut requests = Vec::new();
     let mut targets = Vec::new();
     for (index, value) in values.iter().enumerate() {
-        let id = object_id_from_value(value)?;
+        let id = object_id_from_value(value, operation)?;
         let etag = graph_etag(value).ok_or_else(|| {
             pim_protocol_error(
                 operation,
@@ -684,7 +713,7 @@ async fn destroy_messages(
     let mut requests = Vec::new();
     let mut targets = Vec::new();
     for (index, value) in values.iter().enumerate() {
-        let id = object_id_from_value(value)?;
+        let id = object_id_from_value(value, operation)?;
         let mut headers = HashMap::new();
         if let Some(etag) = graph_etag(value) {
             headers.insert("If-Match".to_string(), etag);
@@ -805,27 +834,28 @@ async fn submit_write_batch_with_targets(
     Ok(())
 }
 
-async fn cache_etag(account: &GraphAccount, value: &Value) -> Result<(), AccountError> {
+async fn cache_etag(
+    account: &GraphAccount,
+    value: &Value,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
     let Some(etag) = graph_etag(value) else {
         return Ok(());
     };
-    let id = object_id_from_value(value)?;
+    let id = object_id_from_value(value, operation)?;
     account.etag_index.write().await.insert(id.0, etag);
     Ok(())
 }
 
-fn object_id_from_value(value: &Value) -> Result<ObjectId, AccountError> {
+fn object_id_from_value(
+    value: &Value,
+    operation: AccountOperation,
+) -> Result<ObjectId, AccountError> {
     value
         .get("id")
         .and_then(Value::as_str)
         .map(|id| ObjectId(id.to_string()))
-        .ok_or_else(|| {
-            pim_protocol_error(
-                AccountOperation::Hydrate,
-                None,
-                "Graph message did not include an id",
-            )
-        })
+        .ok_or_else(|| pim_protocol_error(operation, None, "Graph message did not include an id"))
 }
 
 /// Build a `Protocol(ContractViolation)` `AccountError` for pim-layer
@@ -1067,7 +1097,7 @@ async fn search_message_rows(
     .map_err(|e| into_account_error(e, ctx))?;
     let mut rows = Vec::new();
     for value in page.value {
-        let id = object_id_from_value(&value)?;
+        let id = object_id_from_value(&value, AccountOperation::Search)?;
         let thread_id = value
             .get("conversationId")
             .and_then(Value::as_str)
@@ -1210,7 +1240,7 @@ fn message_from_value(
     value: &Value,
     projection: HydrationProjection,
 ) -> Result<Message, AccountError> {
-    let id = object_id_from_value(value)?;
+    let id = object_id_from_value(value, AccountOperation::HydrateMessage)?;
     let body = value.get("body");
     let (mut body_text, mut body_html) = match body {
         Some(body) => body_parts_from_graph_body(body),
