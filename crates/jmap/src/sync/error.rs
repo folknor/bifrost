@@ -637,10 +637,16 @@ fn convert_problem(
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
             Cause::State(StateCause::CapabilityChanged { delta: None }),
         ),
+        // The server claims our request was not JSON or not a valid
+        // JMAP request envelope; the client side did send valid JSON
+        // (any deserialization issue is caught locally before the
+        // request leaves), so the server's claim is a protocol contract
+        // violation, not a client bug. Per jmap-F2.
         (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _) => (
-            AccountErrorKind::Request(RequestErrorKind::Malformed),
-            Cause::Request(RequestCause::Malformed {
-                detail: DiagnosticText::support_only(details.to_string()),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Jmap,
+                detail: Some(DiagnosticText::support_only(details.to_string())),
             }),
         ),
         (ProblemType::Other(_), Some(400 | 422)) => (
@@ -910,11 +916,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             Cause::Wire(WireCause::Jmap(JmapMethod::TooManyChanges)),
             JmapMethod::TooManyChanges,
         ),
-        MethodErrorType::Other(code) => (
-            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code: code.clone() })),
-            JmapMethod::Unknown { code: code.clone() },
-        ),
+        MethodErrorType::Other(code) => {
+            let unknown = JmapMethod::Unknown { code: code.clone() };
+            (
+                AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
+                Cause::Wire(WireCause::Jmap(unknown.clone())),
+                unknown,
+            )
+        }
     };
 
     let mut builder = build_with(&ctx, kind, primary).push_cause(Cause::Attempt(
@@ -1163,14 +1172,19 @@ mod tests {
     }
 
     #[test]
-    fn problem_not_json_maps_request_malformed() {
+    fn problem_not_json_maps_protocol_contract_violation() {
+        // jmap-F2: the server's "not JSON" / "not request" complaints
+        // describe a protocol contract violation, not a client bug. The
+        // local serializer would have caught any client-side malformed
+        // JSON before sending; if the server insists otherwise, that is
+        // a server-side conformance failure.
         let err = into_account_error(
             problem_with_status(ProblemType::JMAP(JMAPError::NotJSON), Some(400)),
             JmapErrorContext::new(AccountOperation::Send),
         );
         assert_eq!(
             err.kind(),
-            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
         );
     }
 

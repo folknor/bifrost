@@ -65,13 +65,12 @@ fn terminal_auth_lost() -> bifrost_types::AccountError {
 /// `pub(crate)`, so we exercise it indirectly: every constructed
 /// error must satisfy exactly one of the four helpers, matching the
 /// `plan_recovery` arm the engine routes through.
+type HelperCheck = fn(&RecoveryClass) -> bool;
+type DispatchCase = (&'static str, bifrost_types::AccountError, HelperCheck);
+
 #[test]
 fn plan_recovery_branches_match_recovery_class_helpers() {
-    let cases: Vec<(
-        &str,
-        bifrost_types::AccountError,
-        fn(&RecoveryClass) -> bool,
-    )> = vec![
+    let cases: Vec<DispatchCase> = vec![
         ("retry", retry_error(), RecoveryClass::is_retryable),
         (
             "reconcile",

@@ -36,7 +36,7 @@ pub use bandwidth::{AccountMeter, BandwidthMeter, MeterSink, MeterSinkHandle};
 // imports from downstream code.
 pub use bifrost_types::{AccountFuture, AccountId, ByteRange, Priority};
 pub use config::NetConfig;
-pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind};
+pub use error::{Error, FinalResponse, MalformedRedirectKind, RangeFailureKind, STATUS_BODY_CAP};
 pub use net::{AccountNet, AccountSpec, Net};
 pub use rate::{RateLimit, RateLimitGovernor, RequestCost};
 pub use redirect::{FollowRedirects, RedirectAction, RedirectPolicy, RedirectStep};

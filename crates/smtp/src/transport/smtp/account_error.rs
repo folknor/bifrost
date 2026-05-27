@@ -1131,7 +1131,7 @@ mod tests {
             ME::CannotParseFilename,
             ME::NonAsciiChars,
             ME::InvalidInput("payload".to_owned()),
-            ME::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
+            ME::Io(std::io::Error::other("io")),
         ];
         for case in cases {
             let account = message_error_to_account_error(case, Protocol::Smtp);

@@ -783,10 +783,16 @@ missed.
 
 ### Phase E - P2 cleanup
 
-Smells and nits from the original audit + Phase D residuals. One
-commit per crate, sequential. `reference/*.md` final pass.
-`plans/error-model-phase4-audit.md` deleted at the end of this
-phase.
+Smells and nits from the original audit + Phase D residuals. Done
+as a focused batch rather than per-crate-sequential. `reference/*.md`
+final pass runs alongside Phase D's re-audit reviews.
+
+**Retention override:** `plans/error-model-phase4-audit.md` deletion
+is gated on "no active `[bug]` / `[gap]` findings in the audit doc",
+not on "every decision `[done]`". Several Phase 5B/5C follow-ups are
+deferred-to-consumer-ask (gmail-F1, jmap-F1, sync-F3, etc.) and would
+never resolve under the strict reading. The audit doc deletes after
+Phase 5D confirms no live bug/gap findings remain.
 
 ## Open items
 
@@ -809,19 +815,17 @@ caveats. Tracked here so they don't rot in commit messages.
     That is a `bifrost-types` trait change; defer to a future phase
     where the trait surface can be revisited cleanly.
 
-- **jmap-F2.** `JmapMethod::NotJson` / `NotRequest` still maps to
-  `Request(Malformed) -> ClientBug`.
-  - **status:** the convergence doc describes these as
-    `Protocol(ContractViolation) -> ProviderContractViolation`. Audit
-    did not flag this as a Phase 5C item; agent left it for scope.
-  - **plan:** reclassify in Phase 5E (P2 cleanup) or fold into a
-    later targeted commit.
+- **jmap-F2.** `[done]` `JmapMethod::NotJson` / `NotRequest`
+  reclassified `Request(Malformed)` -> `Protocol(ContractViolation)`
+  with `WireCause::MalformedResponse`. The local serializer catches
+  any client-side malformed JSON before sending; if the server
+  insists otherwise, that is a server conformance failure. Test
+  `problem_not_json_maps_protocol_contract_violation` pins it.
 
-- **jmap-F3.** `MethodErrorType::Other(code)` two-clone smell.
-  - **status:** known smell at `crates/jmap/src/sync/error.rs:812-816`;
-    the dedupe needs a small refactor of the `(kind, primary, wire)`
-    tuple. Out of Phase 5C scope.
-  - **plan:** Phase 5E cleanup.
+- **jmap-F3.** `[done]` `MethodErrorType::Other(code)` two-clone
+  smell dedup at `crates/jmap/src/sync/error.rs:919-925`. Constructs
+  the `JmapMethod::Unknown { code }` once, clones once into the wire
+  cause.
 
 - **imap-F1.** Auto-promote `Mailbox(id) -> Cursor(Folder(id))` for
   `SyncState(CursorInvalid)` in `into_account_error`.
@@ -859,13 +863,9 @@ caveats. Tracked here so they don't rot in commit messages.
   - **plan:** if a wire `Warning` variant is desired on `WatchEvent`,
     add it to `bifrost-types` and have the renewer emit it. Defer.
 
-- **graph-F1.** EWS `STATUS_BODY_CAP` is duplicated as a local
-  constant.
-  - **status:** `bifrost_net::error::STATUS_BODY_CAP` is `pub(crate)`,
-    so graph re-declares `STATUS_BODY_CAP = 4096` with a comment to
-    keep in sync.
-  - **plan:** promote the constant in `bifrost-net` to `pub`. Trivial
-    follow-up.
+- **graph-F1.** `[done]` `STATUS_BODY_CAP` promoted to `pub` in
+  `bifrost-net::error`, re-exported from `bifrost-net::STATUS_BODY_CAP`.
+  Graph imports it directly; the duplicate constant is gone.
 
 - **graph-F2.** `pim.rs::object_id_from_value` hardcodes
   `AccountOperation::Hydrate` for missing-id cases.

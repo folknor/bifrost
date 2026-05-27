@@ -645,7 +645,7 @@ mod tests {
         ));
         // Recipient correlation must reach support exports.
         let support = err.support_consented();
-        let texts: Vec<&str> = support.support_text.iter().copied().collect();
+        let texts = &support.support_text;
         assert!(
             texts.iter().any(|t| t.contains("envelope recipient")),
             "expected per-recipient diagnostic in support text, got {texts:?}"
@@ -773,7 +773,7 @@ mod tests {
         let outcome = progress.resolve();
         let err = &outcome.failed()[0].error;
         let support = err.support_consented();
-        let texts: Vec<&str> = support.support_text.iter().copied().collect();
+        let texts = &support.support_text;
         assert!(
             texts.iter().any(|t| t.contains("a@x.com")),
             "expected recipient address in support text, got {texts:?}"

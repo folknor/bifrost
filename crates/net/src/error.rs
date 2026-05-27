@@ -27,7 +27,7 @@ use thiserror::Error;
 /// kept alive until the protocol crate dropped the error. 4 KB is large
 /// enough to fit a typical JSON error envelope plus stack hint while
 /// keeping the error allocation small.
-pub(crate) const STATUS_BODY_CAP: usize = 4096;
+pub const STATUS_BODY_CAP: usize = 4096;
 /// Marker appended when `Error::Status::body` was truncated. Callers
 /// that pattern-match the body for diagnostics can detect truncation
 /// without an extra field on the variant.

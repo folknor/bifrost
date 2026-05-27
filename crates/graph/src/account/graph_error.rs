@@ -568,9 +568,7 @@ const REQUEST_ID_HEADERS: &[&str] = &["request-id", "x-ms-request-id", "x-reques
 
 const SUPPORT_ONLY_HEADER_TEXT: &[&str] = &["x-ms-ags-diagnostic"];
 
-/// Cap matches `bifrost_net::STATUS_BODY_CAP`. We re-declare locally
-/// because the `bifrost-net` constant is `pub(crate)`.
-const STATUS_BODY_CAP: usize = 4096;
+use bifrost_net::STATUS_BODY_CAP;
 
 fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
     for name in names {

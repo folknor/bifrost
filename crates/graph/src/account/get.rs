@@ -121,7 +121,7 @@ async fn fetch_batch(
             let headers = item
                 .headers
                 .as_ref()
-                .map(|h| reconstruct_headers(h))
+                .map(reconstruct_headers)
                 .unwrap_or_default();
             let body = item
                 .body
