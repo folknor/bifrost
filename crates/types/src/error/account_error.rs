@@ -159,10 +159,11 @@ impl AccountError {
     /// must construct a fresh builder via `AccountErrorBuilder::new`.
     ///
     /// Derived fields (`recovery`, `remediation`, `message_key`) are
-    /// recomputed on `build()`. Builder-only overrides
-    /// (`idempotency_override`, `retry_not_before`, `throttle_scope`)
-    /// are not preserved by the round-trip and must be reapplied if
-    /// the caller needs them.
+    /// recomputed on `try_build()`. Builder-only overrides
+    /// (`idempotency_override`, `throttle_scope`) are not preserved by
+    /// the round-trip and must be reapplied if the caller needs them.
+    /// Retry hints set on a `ServerCause` survive structurally through
+    /// the chain.
     #[must_use]
     pub fn into_builder(self) -> super::builder::AccountErrorBuilder {
         let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone());
@@ -311,7 +312,8 @@ mod tests {
         )
         .text(DiagnosticText::user_safe("Check the request."))
         .text(DiagnosticText::support_only("raw provider body"))
-        .build()
+        .try_build()
+        .expect("valid account error classification")
     }
 
     #[test]
@@ -349,7 +351,10 @@ mod tests {
         let message_key_before = original.message_key();
         let chain_len_before = original.chain().iter().count();
 
-        let rebuilt = original.into_builder().build();
+        let rebuilt = original
+            .into_builder()
+            .try_build()
+            .expect("valid account error classification");
 
         assert_eq!(rebuilt.kind(), &kind_before);
         assert_eq!(rebuilt.message_key(), message_key_before);
@@ -370,7 +375,8 @@ mod tests {
             .push_cause(Cause::Attempt(AttemptCause {
                 transmission_state: TransmissionState::Unsent,
             }))
-            .build();
+            .try_build()
+            .expect("valid account error classification");
 
         assert_eq!(rebuilt.chain().iter().count(), chain_len_before + 1);
         let last_cause_is_attempt = matches!(

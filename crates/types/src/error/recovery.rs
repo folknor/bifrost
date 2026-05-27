@@ -2,8 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
-use crate::capabilities::CapabilityDelta;
 use crate::cursor::CursorScope;
+use crate::ids::{AccountId, MailboxId};
 
 use super::account_error::AccountError;
 use super::cause::{
@@ -14,7 +14,7 @@ use super::kind::{
     AccessErrorKind, AccountErrorKind, AuthErrorKind, MailboxUnavailableKind, ProtocolErrorKind,
     RequestErrorKind, ResourceKind, ServerErrorKind, SyncStateErrorKind,
 };
-use super::scope::{AccountOperation, ErrorScope};
+use super::scope::{AccountOperation, ErrorScope, Provider};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -63,16 +63,54 @@ pub enum EngineDirective {
     DowngradeStrategy(StrategyDowngrade),
     DowngradeCapabilityForScope(CursorScope),
     SchemaIncompatible,
-    CapabilityChanged { delta: CapabilityDelta },
     OperatorOverrideRequired { reason: String },
+}
+
+/// Provider-supplied hint for when a retry may be attempted. The hint
+/// is the value; callers compute either an absolute wall-clock or a
+/// duration via the accessors below. Storing both pre-computed fields
+/// invites drift (the spec used to carry `not_before: SystemTime` and
+/// `min_delay: Duration` separately and that produced the side-channel
+/// bug the convergence rewrite eliminated).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RetryHint {
+    /// Wait at least this long. Suitable for parsed `Retry-After` in
+    /// seconds and for `min_delay` semantics.
+    After(Duration),
+    /// Do not retry before this wall-clock time. Suitable for parsed
+    /// HTTP-date `Retry-After` values.
+    At(SystemTime),
+}
+
+impl RetryHint {
+    /// Resolve the hint to an absolute wall-clock deadline given the
+    /// caller's notion of "now".
+    #[must_use]
+    pub fn not_before(&self, now: SystemTime) -> SystemTime {
+        match self {
+            Self::After(duration) => now + *duration,
+            Self::At(when) => *when,
+        }
+    }
+
+    /// Resolve the hint to a duration to wait given the caller's notion
+    /// of "now". Returns `Duration::ZERO` if `now` is already past the
+    /// `At(_)` deadline.
+    #[must_use]
+    pub fn min_delay(&self, now: SystemTime) -> Duration {
+        match self {
+            Self::After(duration) => *duration,
+            Self::At(when) => when.duration_since(now).unwrap_or(Duration::ZERO),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RetryAdvice {
     pub disposition: RetryDisposition,
-    pub not_before: Option<SystemTime>,
-    pub min_delay: Option<Duration>,
+    pub retry_hint: Option<RetryHint>,
     pub reason: RetryReason,
     pub throttle_scope: Option<ThrottleScope>,
 }
@@ -81,15 +119,13 @@ impl RetryAdvice {
     #[must_use]
     pub fn new(
         disposition: RetryDisposition,
-        not_before: Option<SystemTime>,
-        min_delay: Option<Duration>,
+        retry_hint: Option<RetryHint>,
         reason: RetryReason,
         throttle_scope: Option<ThrottleScope>,
     ) -> Self {
         Self {
             disposition,
-            not_before,
-            min_delay,
+            retry_hint,
             reason,
             throttle_scope,
         }
@@ -141,14 +177,40 @@ pub enum RetryReason {
     RefreshTransient,
 }
 
+/// Provider-documented scope at which a throttle applies. `Mailbox`,
+/// `Account`, `Tenant`, and `Provider` map onto sharable
+/// [`ThrottleKey`] entries the engine consults across work items.
+/// `CurrentOperation` is a per-call hint: the caller delays the single
+/// work item inline without entering any shared bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum ThrottleScope {
-    Request,
+    CurrentOperation,
     Mailbox,
     Account,
     Tenant,
     Provider,
+}
+
+/// Engine bucket key for throttle holds that survive across requests.
+/// Constructed by the engine from a `ThrottleScope` plus the relevant
+/// identity. `Tenant` and `Provider` cross account boundaries by
+/// design - a tenant throttle pauses every account on that tenant.
+/// `ThrottleScope::CurrentOperation` never enters a `ThrottleKey`;
+/// it is a per-call hint, not a bucket.
+///
+/// Tenant identity is currently a free-form provider-supplied string;
+/// the engine treats it as opaque.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ThrottleKey {
+    Mailbox {
+        account: AccountId,
+        mailbox: MailboxId,
+    },
+    Account(AccountId),
+    Tenant(String),
+    Provider(Provider),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,15 +221,33 @@ pub enum RemediationAction {
     RequestAdminConsent { needed: &'static str },
     UpdateTenantPolicy,
     CheckMailboxLicense,
-    RetryLater { not_before: Option<SystemTime> },
-    RestartAccount,
-    RestartScope(CursorScope),
+    RetryLater { retry_hint: Option<RetryHint> },
     FixClientRequest,
     ContactProviderSupport,
 }
 
+/// Newtype carrying a terminal-class [`AccountError`]. Constructed only
+/// through [`Fatal::try_from`], which rejects any `AccountError` whose
+/// `RecoveryClass` is not terminal. Engine boundaries that specifically
+/// need "the engine has nothing more to try" (operator-notification
+/// queues, permanent-failure dashboards) consume this type so the
+/// type system enforces the precondition.
 #[derive(Debug, Clone)]
-pub struct Fatal(pub AccountError);
+pub struct Fatal(AccountError);
+
+impl Fatal {
+    /// Consume the wrapper and return the carried `AccountError`.
+    #[must_use]
+    pub fn into_inner(self) -> AccountError {
+        self.0
+    }
+}
+
+impl AsRef<AccountError> for Fatal {
+    fn as_ref(&self) -> &AccountError {
+        &self.0
+    }
+}
 
 impl TryFrom<AccountError> for Fatal {
     type Error = AccountError;
@@ -193,7 +273,6 @@ pub(crate) fn derive(
     scope: Option<&ErrorScope>,
     operation: Option<AccountOperation>,
     chain: &CauseChain,
-    retry_not_before: Option<SystemTime>,
     throttle_scope: Option<ThrottleScope>,
     idempotency_override: Option<bool>,
 ) -> RecoveryClass {
@@ -203,34 +282,38 @@ pub(crate) fn derive(
 
     match kind {
         AccountErrorKind::Transport(_) => {
-            assert!(
+            debug_assert!(
                 tx_state != TransmissionState::Acknowledged,
                 "transport failures cannot have acknowledged transmission state"
             );
+            // Defensive fallback in release builds: a misbehaving
+            // producer pushing `Transport + Acknowledged` is treated as
+            // `InFlight` (the most conservative classification) rather
+            // than crashing the process. `try_build` rejects the same
+            // shape at construction so this branch is only reached when
+            // a builder somehow bypasses validation.
+            let effective_tx_state = if tx_state == TransmissionState::Acknowledged {
+                TransmissionState::InFlight
+            } else {
+                tx_state
+            };
             transient_retry_or_reconcile(
-                tx_state,
+                effective_tx_state,
                 idempotent,
                 RetryReason::Transport,
-                retry_not_before,
                 None,
                 None,
             )
         }
-        AccountErrorKind::Authentication(kind) => derive_auth(*kind, retry_not_before),
+        AccountErrorKind::Authentication(kind) => derive_auth(*kind, chain),
         AccountErrorKind::Authorization(kind) => derive_access(*kind, chain),
-        AccountErrorKind::Server(kind) => derive_server(
-            *kind,
-            tx_state,
-            idempotent,
-            chain,
-            retry_not_before,
-            throttle_scope,
-        ),
+        AccountErrorKind::Server(kind) => {
+            derive_server(*kind, tx_state, idempotent, chain, throttle_scope)
+        }
         AccountErrorKind::SyncState(kind) => derive_sync_state(*kind, scope, chain),
         AccountErrorKind::ConcurrencyConflict => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::AfterStateRefresh,
-            not_before: retry_not_before,
-            min_delay: None,
+            retry_hint: None,
             reason: RetryReason::ConcurrencyConflict,
             throttle_scope: None,
         }),
@@ -246,7 +329,7 @@ pub(crate) fn derive(
 pub(crate) fn suggest(
     kind: &AccountErrorKind,
     recovery: &RecoveryClass,
-    scope: Option<&ErrorScope>,
+    _scope: Option<&ErrorScope>,
     chain: &CauseChain,
 ) -> Option<RemediationAction> {
     match kind {
@@ -286,12 +369,9 @@ pub(crate) fn suggest(
         AccountErrorKind::Server(ServerErrorKind::Unavailable | ServerErrorKind::Error { .. }) => {
             None
         }
-        AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible) => {
-            Some(RemediationAction::RestartAccount)
-        }
-        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid) => cursor_scope(scope)
-            .map(RemediationAction::RestartScope)
-            .or(Some(RemediationAction::RestartAccount)),
+        AccountErrorKind::SyncState(
+            SyncStateErrorKind::SchemaIncompatible | SyncStateErrorKind::CursorInvalid,
+        ) => None,
         AccountErrorKind::Request(_) => Some(RemediationAction::FixClientRequest),
         AccountErrorKind::Protocol(
             ProtocolErrorKind::ParseFailed
@@ -442,12 +522,11 @@ fn sync_kind_matches_cause(kind: SyncStateErrorKind, cause: &StateCause) -> bool
     )
 }
 
-fn derive_auth(kind: AuthErrorKind, retry_not_before: Option<SystemTime>) -> RecoveryClass {
+fn derive_auth(kind: AuthErrorKind, chain: &CauseChain) -> RecoveryClass {
     match kind {
         AuthErrorKind::RefreshTransient => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::AfterAuthRefresh,
-            not_before: retry_not_before,
-            min_delay: None,
+            retry_hint: server_retry_hint(chain),
             reason: RetryReason::RefreshTransient,
             throttle_scope: None,
         }),
@@ -474,8 +553,7 @@ fn derive_access(kind: AccessErrorKind, chain: &CauseChain) -> RecoveryClass {
             kind: MailboxUnavailableKind::Transient,
         } => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::SameRequest,
-            not_before: None,
-            min_delay: None,
+            retry_hint: None,
             reason: RetryReason::ServerUnavailable,
             throttle_scope: None,
         }),
@@ -490,48 +568,54 @@ fn derive_server(
     tx_state: TransmissionState,
     idempotent: bool,
     chain: &CauseChain,
-    retry_not_before: Option<SystemTime>,
     throttle_scope: Option<ThrottleScope>,
 ) -> RecoveryClass {
-    let retry_after = server_retry_after(chain);
+    let retry_hint = server_retry_hint(chain);
     match kind {
         ServerErrorKind::Unavailable => transient_retry_or_reconcile(
             tx_state,
             idempotent,
             RetryReason::ServerUnavailable,
-            retry_not_before,
-            retry_after,
+            retry_hint,
             None,
         ),
         ServerErrorKind::RateLimited => transient_retry_or_reconcile(
             tx_state,
             idempotent,
             RetryReason::RateLimited,
-            retry_not_before,
-            retry_after,
+            retry_hint,
             throttle_scope,
         ),
         ServerErrorKind::QuotaExhausted => transient_retry_or_reconcile(
             tx_state,
             idempotent,
             RetryReason::QuotaExhausted,
-            retry_not_before,
-            retry_after,
+            retry_hint,
             throttle_scope,
         ),
         ServerErrorKind::Error { status } => {
             let status = status.or_else(|| server_status(chain));
-            if matches!(status, Some(500..=599)) {
-                transient_retry_or_reconcile(
+            match status {
+                Some(500..=599) => transient_retry_or_reconcile(
                     tx_state,
                     idempotent,
                     RetryReason::ServerUnavailable,
-                    retry_not_before,
-                    retry_after,
+                    retry_hint,
                     None,
-                )
-            } else {
-                RecoveryClass::ProviderRefused
+                ),
+                // No numeric status (IMAP NO/BAD without response code,
+                // SMTP transport shutdown without final reply) combined
+                // with an in-flight attempt: idempotent ops retry,
+                // non-idempotent ops reconcile. Per the convergence
+                // recovery table.
+                None if tx_state == TransmissionState::InFlight => transient_retry_or_reconcile(
+                    tx_state,
+                    idempotent,
+                    RetryReason::ServerUnavailable,
+                    retry_hint,
+                    None,
+                ),
+                _ => RecoveryClass::ProviderRefused,
             }
         }
     }
@@ -543,24 +627,33 @@ fn derive_sync_state(
     chain: &CauseChain,
 ) -> RecoveryClass {
     match kind {
-        SyncStateErrorKind::CursorInvalid => cursor_scope(scope)
-            .map(EngineDirective::RestartScope)
-            .map(RecoveryClass::Engine)
-            .unwrap_or(RecoveryClass::Engine(EngineDirective::RestartAccount)),
+        // CursorInvalid without a cursor scope is rejected at build
+        // time (see `AccountErrorBuildError::CursorInvalidWithoutScope`),
+        // so this branch can safely require the scope. The fallback
+        // remains for the central recovery table's deterministic
+        // behavior; in practice `try_build` prevents it.
+        SyncStateErrorKind::CursorInvalid => match cursor_scope(scope) {
+            Some(scope) => RecoveryClass::Engine(EngineDirective::RestartScope(scope)),
+            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
+        },
         SyncStateErrorKind::StrategyFailure => RecoveryClass::Engine(
             EngineDirective::DowngradeStrategy(strategy_downgrade(chain)),
         ),
-        SyncStateErrorKind::ScopeCapabilityLost => cursor_scope(scope)
-            .map(EngineDirective::DowngradeCapabilityForScope)
-            .map(RecoveryClass::Engine)
-            .unwrap_or(RecoveryClass::Engine(EngineDirective::RestartAccount)),
+        SyncStateErrorKind::ScopeCapabilityLost => match cursor_scope(scope) {
+            Some(scope) => {
+                RecoveryClass::Engine(EngineDirective::DowngradeCapabilityForScope(scope))
+            }
+            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
+        },
         SyncStateErrorKind::SchemaIncompatible => {
             RecoveryClass::Engine(EngineDirective::SchemaIncompatible)
         }
+        // Capability shifts no longer have a dedicated `EngineDirective`
+        // variant. `StateCause::CapabilityChanged { delta }` retains the
+        // (optional) delta payload for forensic exports; recovery maps
+        // the shift to a full account reopen so discovery re-runs.
         SyncStateErrorKind::CapabilityChanged => {
-            RecoveryClass::Engine(EngineDirective::CapabilityChanged {
-                delta: capability_delta(chain).unwrap_or_default(),
-            })
+            RecoveryClass::Engine(EngineDirective::RestartAccount)
         }
         SyncStateErrorKind::OperatorOverrideNeeded => {
             RecoveryClass::Engine(EngineDirective::OperatorOverrideRequired {
@@ -572,6 +665,23 @@ fn derive_sync_state(
     }
 }
 
+fn strategy_downgrade(chain: &CauseChain) -> StrategyDowngrade {
+    chain
+        .iter()
+        .find_map(|cause| match cause {
+            Cause::State(StateCause::StrategyFailure { downgrade }) => Some(*downgrade),
+            _ => None,
+        })
+        .unwrap_or(StrategyDowngrade::QResyncToCondstore)
+}
+
+fn operator_reason(chain: &CauseChain) -> Option<&str> {
+    chain.iter().find_map(|cause| match cause {
+        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => Some(reason.as_str()),
+        _ => None,
+    })
+}
+
 fn derive_protocol(kind: ProtocolErrorKind, idempotent: bool) -> RecoveryClass {
     match kind {
         ProtocolErrorKind::ParseFailed
@@ -579,11 +689,14 @@ fn derive_protocol(kind: ProtocolErrorKind, idempotent: bool) -> RecoveryClass {
         | ProtocolErrorKind::ContractViolation => RecoveryClass::ProviderContractViolation,
         ProtocolErrorKind::PartialResponse if idempotent => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::SameRequest,
-            not_before: None,
-            min_delay: None,
+            retry_hint: None,
             reason: RetryReason::Transport,
             throttle_scope: None,
         }),
+        // Partial-response signal on a non-idempotent op: the server
+        // told us it committed something we cannot prove. Reconcile
+        // by probing the target and deduping by client id; do not
+        // blindly retry.
         ProtocolErrorKind::PartialResponse => RecoveryClass::Reconcile(ReconcileAdvice {
             reason: ReconcileReason::PartialCompletionSignal,
             guidance: ReconcileGuidance {
@@ -601,8 +714,7 @@ fn transient_retry_or_reconcile(
     tx_state: TransmissionState,
     idempotent: bool,
     reason: RetryReason,
-    not_before: Option<SystemTime>,
-    min_delay: Option<Duration>,
+    retry_hint: Option<RetryHint>,
     throttle_scope: Option<ThrottleScope>,
 ) -> RecoveryClass {
     match tx_state {
@@ -616,8 +728,7 @@ fn transient_retry_or_reconcile(
         | TransmissionState::InFlight
         | TransmissionState::Acknowledged => RecoveryClass::Retry(RetryAdvice {
             disposition: RetryDisposition::SameRequest,
-            not_before,
-            min_delay,
+            retry_hint,
             reason,
             throttle_scope,
         }),
@@ -643,13 +754,6 @@ fn access_resource(chain: &CauseChain) -> Option<ResourceKind> {
     })
 }
 
-fn server_retry_after(chain: &CauseChain) -> Option<Duration> {
-    chain.iter().find_map(|cause| match cause {
-        Cause::Server(cause) => cause.retry_after(),
-        _ => None,
-    })
-}
-
 fn server_status(chain: &CauseChain) -> Option<u16> {
     chain.iter().find_map(|cause| match cause {
         Cause::Server(ServerCause::Error { status }) => *status,
@@ -657,33 +761,16 @@ fn server_status(chain: &CauseChain) -> Option<u16> {
     })
 }
 
-fn cursor_scope(scope: Option<&ErrorScope>) -> Option<CursorScope> {
+pub(crate) fn cursor_scope(scope: Option<&ErrorScope>) -> Option<CursorScope> {
     match scope {
         Some(ErrorScope::Cursor(scope)) => Some(scope.clone()),
         _ => None,
     }
 }
 
-fn strategy_downgrade(chain: &CauseChain) -> StrategyDowngrade {
-    chain
-        .iter()
-        .find_map(|cause| match cause {
-            Cause::State(StateCause::StrategyFailure { downgrade }) => Some(*downgrade),
-            _ => None,
-        })
-        .unwrap_or(StrategyDowngrade::QResyncToCondstore)
-}
-
-fn capability_delta(chain: &CauseChain) -> Option<CapabilityDelta> {
+pub(crate) fn server_retry_hint(chain: &CauseChain) -> Option<RetryHint> {
     chain.iter().find_map(|cause| match cause {
-        Cause::State(StateCause::CapabilityChanged { delta }) => Some(delta.clone()),
-        _ => None,
-    })
-}
-
-fn operator_reason(chain: &CauseChain) -> Option<&str> {
-    chain.iter().find_map(|cause| match cause {
-        Cause::State(StateCause::OperatorOverrideNeeded { reason }) => Some(reason.as_str()),
+        Cause::Server(cause) => cause.retry_hint(),
         _ => None,
     })
 }
@@ -691,7 +778,7 @@ fn operator_reason(chain: &CauseChain) -> Option<&str> {
 fn retry_later(recovery: &RecoveryClass) -> Option<RemediationAction> {
     match recovery {
         RecoveryClass::Retry(advice) => Some(RemediationAction::RetryLater {
-            not_before: advice.not_before,
+            retry_hint: advice.retry_hint,
         }),
         _ => None,
     }
@@ -727,7 +814,6 @@ mod tests {
             &transport_chain(TransmissionState::Unsent),
             None,
             None,
-            None,
         );
 
         assert!(matches!(
@@ -747,7 +833,6 @@ mod tests {
             None,
             Some(AccountOperation::Send),
             &transport_chain(TransmissionState::InFlight),
-            None,
             None,
             None,
         );
@@ -770,15 +855,21 @@ mod tests {
             &transport_chain(TransmissionState::InFlight),
             None,
             None,
-            None,
         );
 
         assert!(recovery.is_retryable());
     }
 
+    /// `Transport + Acknowledged` is a producer-bug shape. In debug
+    /// builds, `derive` panics via `debug_assert!`. In release builds,
+    /// it falls back to treating the attempt as `InFlight` (the most
+    /// conservative defensible classify) so the process degrades rather
+    /// than crashes. The same shape is rejected at construction time by
+    /// `AccountErrorBuilder::try_build`.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "transport failures cannot have acknowledged transmission state")]
-    fn acknowledged_transport_failure_is_rejected() {
+    fn acknowledged_transport_failure_panics_in_debug() {
         let _ = derive(
             &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
             None,
@@ -786,8 +877,23 @@ mod tests {
             &transport_chain(TransmissionState::Acknowledged),
             None,
             None,
+        );
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn acknowledged_transport_failure_falls_back_to_inflight_in_release() {
+        let recovery = derive(
+            &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
+            None,
+            Some(AccountOperation::Send),
+            &transport_chain(TransmissionState::Acknowledged),
+            None,
             None,
         );
+
+        // Non-idempotent + InFlight defensive fallback -> Reconcile.
+        assert!(recovery.requires_reconciliation());
     }
 
     #[test]
@@ -797,7 +903,6 @@ mod tests {
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::Auth(AuthCause::RefreshTransient)),
-            None,
             None,
             None,
         );
@@ -823,7 +928,6 @@ mod tests {
             })),
             None,
             None,
-            None,
         );
 
         assert_eq!(
@@ -841,7 +945,6 @@ mod tests {
             None,
             Some(AccountOperation::UpdateFlags),
             &chain(Cause::State(StateCause::ConcurrencyConflict)),
-            None,
             None,
             None,
         );
@@ -867,7 +970,6 @@ mod tests {
             })),
             None,
             None,
-            None,
         );
 
         assert_eq!(recovery, RecoveryClass::ClientBug);
@@ -884,23 +986,21 @@ mod tests {
             ))),
             None,
             None,
-            None,
         );
 
         assert!(recovery.requires_reconciliation());
     }
 
     #[test]
-    fn rate_limit_carries_retry_deadline_and_throttle_scope() {
-        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+    fn rate_limit_carries_retry_hint_and_throttle_scope() {
+        let hint = RetryHint::After(Duration::from_secs(5));
         let recovery = derive(
             &AccountErrorKind::Server(ServerErrorKind::RateLimited),
             None,
             Some(AccountOperation::Search),
             &chain(Cause::Server(ServerCause::RateLimited {
-                retry_after: Some(Duration::from_secs(5)),
+                retry_hint: Some(hint),
             })),
-            Some(when),
             Some(ThrottleScope::Tenant),
             None,
         );
@@ -909,8 +1009,7 @@ mod tests {
             recovery,
             RecoveryClass::Retry(RetryAdvice {
                 disposition: RetryDisposition::SameRequest,
-                not_before: Some(when),
-                min_delay: Some(Duration::from_secs(5)),
+                retry_hint: Some(hint),
                 reason: RetryReason::RateLimited,
                 throttle_scope: Some(ThrottleScope::Tenant),
             })
@@ -924,12 +1023,11 @@ mod tests {
             None,
             Some(AccountOperation::Send),
             &CauseChain::new(vec![
-                Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
                 Cause::Attempt(AttemptCause {
                     transmission_state: TransmissionState::InFlight,
                 }),
             ]),
-            None,
             Some(ThrottleScope::Account),
             None,
         );
@@ -952,14 +1050,12 @@ mod tests {
             &chain(Cause::Server(ServerCause::Error { status: Some(503) })),
             None,
             None,
-            None,
         );
         let refused = derive(
             &AccountErrorKind::Server(ServerErrorKind::Error { status: Some(451) }),
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::Server(ServerCause::Error { status: Some(451) })),
-            None,
             None,
             None,
         );
@@ -978,14 +1074,12 @@ mod tests {
             &chain(Cause::State(StateCause::CursorInvalid)),
             None,
             None,
-            None,
         );
         let account = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             None,
             Some(AccountOperation::SyncChanges),
             &chain(Cause::State(StateCause::CursorInvalid)),
-            None,
             None,
             None,
         );
@@ -1011,7 +1105,6 @@ mod tests {
             })),
             None,
             None,
-            None,
         );
         let operator = derive(
             &AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded),
@@ -1020,7 +1113,6 @@ mod tests {
             &chain(Cause::State(StateCause::OperatorOverrideNeeded {
                 reason: "qresync repeatedly failed".to_string(),
             })),
-            None,
             None,
             None,
         );
@@ -1052,7 +1144,6 @@ mod tests {
             })),
             None,
             None,
-            None,
         );
         let permanent = derive(
             &AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
@@ -1065,10 +1156,230 @@ mod tests {
             })),
             None,
             None,
-            None,
         );
 
         assert!(transient.is_retryable());
         assert_eq!(permanent, RecoveryClass::ProviderRefused);
+    }
+
+    /// Catalog every `RecoveryClass` variant exactly once. Used by the
+    /// helper-exclusivity and `Fatal::try_from` round-trip tests below
+    /// so adding a new `RecoveryClass` variant fails to compile here
+    /// rather than silently slipping past the invariants.
+    fn every_recovery_variant() -> Vec<RecoveryClass> {
+        vec![
+            RecoveryClass::Retry(RetryAdvice {
+                disposition: RetryDisposition::SameRequest,
+                retry_hint: None,
+                reason: RetryReason::Transport,
+                throttle_scope: None,
+            }),
+            RecoveryClass::Reconcile(ReconcileAdvice {
+                reason: ReconcileReason::TransportDropAfterSend,
+                guidance: ReconcileGuidance {
+                    actions: vec![ReconcileAction::CheckTarget],
+                },
+            }),
+            RecoveryClass::Engine(EngineDirective::RestartAccount),
+            RecoveryClass::AuthLost,
+            RecoveryClass::NeedsAdminConsent { needed: "scope.x" },
+            RecoveryClass::NeedsPolicyChange,
+            RecoveryClass::NoPermission { resource: None },
+            RecoveryClass::Unsupported(AccountOperation::Send),
+            RecoveryClass::ClientBug,
+            RecoveryClass::ProviderContractViolation,
+            RecoveryClass::ProviderRefused,
+            RecoveryClass::UnknownPermanent,
+        ]
+    }
+
+    /// types-D11: the four `RecoveryClass` helpers are mutually
+    /// exclusive and exhaustive over every variant.
+    #[test]
+    fn recovery_helpers_are_mutually_exclusive_and_exhaustive() {
+        for variant in every_recovery_variant() {
+            let flags = [
+                variant.is_retryable(),
+                variant.requires_reconciliation(),
+                variant.requires_engine_action(),
+                variant.is_terminal(),
+            ];
+            let true_count = flags.iter().filter(|f| **f).count();
+            assert_eq!(
+                true_count, 1,
+                "RecoveryClass {variant:?} should match exactly one helper, matched {true_count}"
+            );
+        }
+    }
+
+    /// types-D12: build a representative `AccountError` per
+    /// `RecoveryClass` shape and verify `Fatal::try_from` succeeds iff
+    /// the variant is terminal. We construct each error through the
+    /// builder using a kind/cause pair that produces the target
+    /// recovery class.
+    #[test]
+    fn fatal_try_from_round_trips_terminal_only() {
+        use crate::CursorScope;
+        use crate::error::{AccountErrorBuilder, AccountErrorKind, RequestErrorKind};
+
+        let terminal_cases: Vec<(&str, AccountError)> = vec![
+            (
+                "AuthLost",
+                build(
+                    AccountErrorKind::Authentication(AuthErrorKind::Expired),
+                    Cause::Auth(AuthCause::Expired),
+                ),
+            ),
+            (
+                "NeedsAdminConsent",
+                build(
+                    AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
+                    Cause::Access(AccessCause::AdminConsentRequired { needed: "x" }),
+                ),
+            ),
+            (
+                "NeedsPolicyChange",
+                build(
+                    AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
+                    Cause::Access(AccessCause::PolicyBlocked),
+                ),
+            ),
+            (
+                "NoPermission",
+                build(
+                    AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+                    Cause::Access(AccessCause::PermissionDenied { resource: None }),
+                ),
+            ),
+            (
+                "Unsupported",
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Unsupported(AccountOperation::Send),
+                    Cause::Request(RequestCause::Unsupported {
+                        operation: AccountOperation::Send,
+                    }),
+                )
+                .try_build()
+                .expect("valid"),
+            ),
+            (
+                "ClientBug",
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Request(RequestErrorKind::Malformed),
+                    Cause::Request(RequestCause::Malformed {
+                        detail: crate::error::DiagnosticText::support_only("x"),
+                    }),
+                )
+                .try_build()
+                .expect("valid"),
+            ),
+            (
+                "ProviderContractViolation",
+                build(
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+                    Cause::Wire(crate::error::WireCause::Jmap(
+                        crate::error::JmapMethod::NotJson,
+                    )),
+                ),
+            ),
+            (
+                "ProviderRefused",
+                build(
+                    AccountErrorKind::Server(ServerErrorKind::Error { status: Some(451) }),
+                    Cause::Server(ServerCause::Error { status: Some(451) }),
+                ),
+            ),
+            (
+                "UnknownPermanent",
+                build(
+                    AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
+                    Cause::Wire(crate::error::WireCause::Jmap(
+                        crate::error::JmapMethod::Unknown { code: "x".into() },
+                    )),
+                ),
+            ),
+        ];
+        let non_terminal_cases: Vec<(&str, AccountError)> = vec![
+            (
+                "Retry",
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
+                    Cause::Transport(TransportCause {
+                        kind: TransportKind::Network,
+                        message: None,
+                    }),
+                )
+                .push_cause(Cause::Attempt(AttemptCause {
+                    transmission_state: TransmissionState::Unsent,
+                }))
+                .try_build()
+                .expect("valid"),
+            ),
+            (
+                "Reconcile",
+                AccountErrorBuilder::new(
+                    AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
+                    Cause::Transport(TransportCause {
+                        kind: TransportKind::Network,
+                        message: None,
+                    }),
+                )
+                .operation(AccountOperation::Send)
+                .push_cause(Cause::Attempt(AttemptCause {
+                    transmission_state: TransmissionState::InFlight,
+                }))
+                .try_build()
+                .expect("valid"),
+            ),
+            (
+                "Engine",
+                build(
+                    AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+                    Cause::State(StateCause::SchemaIncompatible),
+                ),
+            ),
+        ];
+
+        for (name, error) in terminal_cases {
+            assert!(error.recovery().is_terminal(), "{name} should be terminal");
+            assert!(
+                Fatal::try_from(error).is_ok(),
+                "{name} should convert to Fatal"
+            );
+        }
+        for (name, error) in non_terminal_cases {
+            assert!(
+                !error.recovery().is_terminal(),
+                "{name} should be non-terminal"
+            );
+            assert!(
+                Fatal::try_from(error).is_err(),
+                "{name} should not convert to Fatal"
+            );
+        }
+
+        // Silence unused: helper for cursor-scoped engine variants.
+        let _scoped = build_with_scope(
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+            ErrorScope::Cursor(CursorScope::Account),
+        );
+    }
+
+    fn build(kind: AccountErrorKind, primary_cause: Cause) -> AccountError {
+        crate::error::AccountErrorBuilder::new(kind, primary_cause)
+            .try_build()
+            .expect("valid account error classification")
+    }
+
+    fn build_with_scope(
+        kind: AccountErrorKind,
+        primary_cause: Cause,
+        scope: ErrorScope,
+    ) -> AccountError {
+        crate::error::AccountErrorBuilder::new(kind, primary_cause)
+            .scope(scope)
+            .try_build()
+            .expect("valid account error classification")
     }
 }

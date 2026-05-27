@@ -1,6 +1,5 @@
 use std::error::Error as StdError;
 use std::fmt;
-use std::time::Duration;
 
 use serde::Serialize;
 
@@ -9,7 +8,7 @@ use crate::capabilities::CapabilityDelta;
 use super::batch::BatchItemId;
 use super::diagnostic::DiagnosticText;
 use super::kind::{MailboxUnavailableKind, ResourceKind, TransportErrorKind};
-use super::recovery::StrategyDowngrade;
+use super::recovery::{RetryHint, StrategyDowngrade};
 use super::scope::{AccountOperation, Protocol};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,19 +287,19 @@ impl StdError for AccessCause {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ServerCause {
-    Unavailable { retry_after: Option<Duration> },
-    RateLimited { retry_after: Option<Duration> },
-    QuotaExhausted { retry_after: Option<Duration> },
+    Unavailable { retry_hint: Option<RetryHint> },
+    RateLimited { retry_hint: Option<RetryHint> },
+    QuotaExhausted { retry_hint: Option<RetryHint> },
     Error { status: Option<u16> },
 }
 
 impl ServerCause {
     #[must_use]
-    pub(crate) fn retry_after(&self) -> Option<Duration> {
+    pub(crate) fn retry_hint(&self) -> Option<RetryHint> {
         match self {
-            Self::Unavailable { retry_after }
-            | Self::RateLimited { retry_after }
-            | Self::QuotaExhausted { retry_after } => *retry_after,
+            Self::Unavailable { retry_hint }
+            | Self::RateLimited { retry_hint }
+            | Self::QuotaExhausted { retry_hint } => *retry_hint,
             Self::Error { .. } => None,
         }
     }
@@ -328,11 +327,21 @@ impl StdError for ServerCause {}
 #[non_exhaustive]
 pub enum StateCause {
     CursorInvalid,
-    StrategyFailure { downgrade: StrategyDowngrade },
+    StrategyFailure {
+        downgrade: StrategyDowngrade,
+    },
     ScopeCapabilityLost,
     SchemaIncompatible,
-    CapabilityChanged { delta: CapabilityDelta },
-    OperatorOverrideNeeded { reason: String },
+    /// Capability shift evidence. The optional delta payload is for
+    /// forensic exports only; producers that cannot compute a real
+    /// delta pass `None`. Recovery routes any capability shift to
+    /// `EngineDirective::RestartAccount` regardless of the payload.
+    CapabilityChanged {
+        delta: Option<CapabilityDelta>,
+    },
+    OperatorOverrideNeeded {
+        reason: String,
+    },
     ConcurrencyConflict,
 }
 
@@ -454,7 +463,7 @@ impl WireCause {
 
     fn status(&self) -> Option<u16> {
         match self {
-            Self::Smtp(code) => Some(code.code),
+            Self::Smtp(code) => Some(code.reply),
             Self::Graph(_)
             | Self::Jmap(_)
             | Self::Imap(_)
@@ -771,16 +780,19 @@ impl ImapResponseCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct EnhancedStatusCode {
-    pub code: u16,
+    /// SMTP numeric reply code (250, 550, etc.). Named `reply` to
+    /// disambiguate from the dotted enhanced status (`X.Y.Z`), which
+    /// lives in the `enhanced` field as a `DiagnosticText`.
+    pub reply: u16,
     pub enhanced: Option<DiagnosticText>,
     pub text: Option<DiagnosticText>,
 }
 
 impl EnhancedStatusCode {
     #[must_use]
-    pub fn new(code: u16, enhanced: Option<DiagnosticText>, text: Option<DiagnosticText>) -> Self {
+    pub fn new(reply: u16, enhanced: Option<DiagnosticText>, text: Option<DiagnosticText>) -> Self {
         Self {
-            code,
+            reply,
             enhanced,
             text,
         }

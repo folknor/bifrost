@@ -235,12 +235,20 @@ pub struct InventoryEntry {
 }
 
 /// Push wake-up event. Push surfaces are wake-ups, not change feeds.
+///
+/// `Terminated(AccountError)` carries a classified error when the push
+/// stream ends and cannot be reconnected without engine intervention
+/// (auth lost, subscription deleted, schema break). It is the push
+/// equivalent of [`SyncEvent::Terminated`]. `Disconnected` /
+/// `Reconnected` remain advisory: a transient transport drop emits
+/// `Disconnected` followed by `Reconnected` once the renewer succeeds.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum WatchEvent {
     Invalidated { hint: InvalidationHint },
     Disconnected,
     Reconnected,
+    Terminated(AccountError),
 }
 
 /// Push payload, type-erased to a protocol-agnostic shape.
@@ -326,4 +334,36 @@ pub enum Priority {
     Background = 2,
     /// Batch operations the user will not watch.
     Bulk = 3,
+}
+
+/// Per-account control signal exchanged between the engine and the
+/// consumer. Carried on `AccountControlEvent` channels so the consumer
+/// can pause an account (e.g. on operator-override directives) or
+/// resume it after intervention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AccountControl {
+    Pause(PauseReason),
+    Resume,
+}
+
+/// Reason an account is paused. Bounded enum, not a free-form string
+/// or `DiagnosticText`: the engine is the producer and the set of
+/// pause causes is enumerable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PauseReason {
+    /// The protocol or engine surfaced `EngineDirective::
+    /// OperatorOverrideRequired`. Consumer must resolve the underlying
+    /// issue (typically reachable through the account stream's prior
+    /// `Warning::OperatorAttentionNeeded`) before resuming.
+    OperatorOverrideRequired,
+    /// Consumer-initiated pause via `Control::pause` or equivalent.
+    ConsumerRequested,
+    /// Engine paused this account because a tenant-level throttle
+    /// covers it. Resumes automatically once the throttle clears.
+    TenantThrottle,
+    /// Engine exhausted its retry budget for a recurring failure;
+    /// consumer intervention required before further attempts.
+    RetryBudgetExhausted,
 }

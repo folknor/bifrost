@@ -141,7 +141,8 @@ pub trait Account: Send + Sync {
                     Cause::Request(RequestCause::Unsupported { operation: op }),
                 )
                 .operation(op)
-                .build();
+                .try_build()
+                .expect("valid account error classification");
                 Box::pin(futures::stream::iter([
                     SyncEvent::Terminated(error),
                     SyncEvent::Done(None),
@@ -152,11 +153,16 @@ pub trait Account: Send + Sync {
 
     /// Hydrate known ids at a chosen projection. Input ids are
     /// streamed so the engine can backpressure long fetch passes.
+    /// Per-item outcomes flow through `ItemOutcome<HydratedObject>`:
+    /// successful hydrations emit `Succeeded`, locally-invalid or
+    /// remotely-rejected ids emit `Failed`, transport drops that
+    /// leave the item state ambiguous emit `Uncertain`. This is the
+    /// same lane shape every other streaming bulk surface uses.
     fn get_stream(
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>>;
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>;
 
     /// Post-cursor diff. Yields `Change` (the sum of `ObjectChange`
     /// and `ScopeChange`).
@@ -699,5 +705,6 @@ fn unsupported_error(op: AccountOperation) -> AccountError {
         Cause::Request(RequestCause::Unsupported { operation: op }),
     )
     .operation(op)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }

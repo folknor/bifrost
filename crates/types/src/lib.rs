@@ -61,27 +61,27 @@ pub use cursor::{
 
 // Error + recovery vocabulary.
 pub use error::{
-    AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchInputInvalidItem,
-    BatchInputInvalidReason, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome, BatchSuccess,
-    BatchUncertain, Cause, CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText,
-    EngineDirective, EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal,
-    ImapResponseCode, ItemOutcome, JmapMethod, MailboxUnavailableKind, MutationSuccess, Protocol,
-    ProtocolErrorKind, Provider, ReconcileAction, ReconcileAdvice, ReconcileGuidance,
-    ReconcileReason, RecoveryClass, RemediationAction, RequestCause, RequestErrorKind,
-    ResourceKind, RetryAdvice, RetryDisposition, RetryReason, ServerCause, ServerErrorKind,
-    StateCause, StrategyDowngrade, SupportExportConsented, SupportExportInternal,
-    SupportExportMinimal, SyncStateErrorKind, TelemetryView, ThrottleScope, TransmissionState,
-    TransportCause, TransportErrorKind, TransportKind, Warning, WarningKind, WireCause,
-    validate_batch_input,
+    AccessCause, AccessErrorKind, AccountError, AccountErrorBuildError, AccountErrorBuilder,
+    AccountErrorKind, AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure,
+    BatchInputInvalidItem, BatchInputInvalidReason, BatchInvariantError, BatchItem, BatchItemId,
+    BatchItemOutcome, BatchOutcome, BatchOutcomeBuilder, BatchSuccess, BatchUncertain, Cause,
+    CauseChain, DetailVisibility, DiagnosticInfo, DiagnosticText, EngineDirective,
+    EnhancedStatusCode, ErrorScope, Fatal, GmailSignal, GraphSignal, ImapResponseCode, ItemOutcome,
+    JmapMethod, MailboxUnavailableKind, MutationSuccess, Protocol, ProtocolErrorKind, Provider,
+    ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason, RecoveryClass,
+    RemediationAction, RequestCause, RequestErrorKind, ResourceKind, RetryAdvice, RetryDisposition,
+    RetryHint, RetryReason, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
+    SupportExportConsented, SupportExportInternal, SupportExportMinimal, SyncStateErrorKind,
+    TelemetryView, ThrottleKey, ThrottleScope, TransmissionState, TransportCause,
+    TransportErrorKind, TransportKind, Warning, WarningKind, WireCause, validate_batch_input,
 };
 
 // Stream-event types.
 pub use events::{
-    BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control, HintPayload,
-    InvalidationHint, InvalidationSink, InventoryEntry, InventoryPartition, InventoryPartitioning,
-    ObjectChange, ObjectChangeKind, PageBoundary, Partition, Priority, Progress, PushSource,
-    ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
+    AccountControl, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, Control,
+    HintPayload, InvalidationHint, InvalidationSink, InventoryEntry, InventoryPartition,
+    InventoryPartitioning, ObjectChange, ObjectChangeKind, PageBoundary, Partition, PauseReason,
+    Priority, Progress, PushSource, ScopeChange, ScopeChangeKind, SyncEvent, WatchEvent,
 };
 
 // Threading + hydration types.

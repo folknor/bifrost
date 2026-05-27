@@ -90,6 +90,13 @@ pub enum ResourceKind {
     Thread,
     Calendar,
     Contact,
+    Draft,
+    Identity,
+    Vacation,
+    /// Provider-neutral push subscription. Covers Gmail Pub/Sub watch,
+    /// Graph webhook subscriptions, JMAP push subscriptions, and any
+    /// future IMAP IDLE abstraction.
+    PushSubscription,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

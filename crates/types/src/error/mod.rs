@@ -12,10 +12,10 @@ pub mod warning;
 
 pub use account_error::AccountError;
 pub use batch::{
-    BatchFailure, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome, BatchSuccess,
-    BatchUncertain, validate_batch_input,
+    BatchFailure, BatchInvariantError, BatchItem, BatchItemId, BatchItemOutcome, BatchOutcome,
+    BatchOutcomeBuilder, BatchSuccess, BatchUncertain, validate_batch_input,
 };
-pub use builder::AccountErrorBuilder;
+pub use builder::{AccountErrorBuildError, AccountErrorBuilder};
 pub use cause::{
     AccessCause, AttemptCause, AuthCause, BatchInputInvalidItem, BatchInputInvalidReason, Cause,
     CauseChain, EnhancedStatusCode, GmailSignal, GraphSignal, ImapResponseCode, JmapMethod,
@@ -32,8 +32,8 @@ pub use kind::{
 };
 pub use recovery::{
     EngineDirective, Fatal, ReconcileAction, ReconcileAdvice, ReconcileGuidance, ReconcileReason,
-    RecoveryClass, RemediationAction, RetryAdvice, RetryDisposition, RetryReason,
-    StrategyDowngrade, ThrottleScope,
+    RecoveryClass, RemediationAction, RetryAdvice, RetryDisposition, RetryHint, RetryReason,
+    StrategyDowngrade, ThrottleKey, ThrottleScope,
 };
 pub use scope::{AccountOperation, ErrorScope, Protocol, Provider};
 pub use stream::{ItemOutcome, MutationSuccess};

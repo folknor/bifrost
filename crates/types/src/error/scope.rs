@@ -182,7 +182,7 @@ impl AccountOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum Provider {
     Fastmail,

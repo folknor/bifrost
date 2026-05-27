@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 
 use super::account_error::AccountError;
 use super::cause::{BatchInputInvalidItem, BatchInputInvalidReason};
@@ -16,45 +17,37 @@ impl<I> BatchItem<I> {
     }
 }
 
+/// Returned from `Account` methods that take a `Vec<BatchItem<_>>`.
+/// Immutable: lanes are populated via `BatchOutcomeBuilder` and frozen
+/// by `finalize`. The three lanes are closed by design - adding a
+/// fourth lane is a deliberate breaking change.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct BatchOutcome<T> {
-    pub succeeded: Vec<BatchSuccess<T>>,
-    pub failed: Vec<BatchFailure>,
-    pub uncertain: Vec<BatchUncertain>,
+    succeeded: Vec<BatchSuccess<T>>,
+    failed: Vec<BatchFailure>,
+    uncertain: Vec<BatchUncertain>,
     order: Vec<BatchLane>,
 }
 
-impl<T> Default for BatchOutcome<T> {
-    fn default() -> Self {
-        Self {
-            succeeded: Vec::new(),
-            failed: Vec::new(),
-            uncertain: Vec::new(),
-            order: Vec::new(),
-        }
-    }
-}
-
 impl<T> BatchOutcome<T> {
-    pub fn push_succeeded(&mut self, item: BatchItemId, output: T) {
-        let index = self.succeeded.len();
-        self.succeeded.push(BatchSuccess::new(item, output));
-        self.order.push(BatchLane::Succeeded(index));
+    #[must_use]
+    pub fn succeeded(&self) -> &[BatchSuccess<T>] {
+        &self.succeeded
     }
 
-    pub fn push_failed(&mut self, item: BatchItemId, error: AccountError) {
-        let index = self.failed.len();
-        self.failed.push(BatchFailure::new(item, error));
-        self.order.push(BatchLane::Failed(index));
+    #[must_use]
+    pub fn failed(&self) -> &[BatchFailure] {
+        &self.failed
     }
 
-    pub fn push_uncertain(&mut self, item: BatchItemId, error: AccountError) {
-        let index = self.uncertain.len();
-        self.uncertain.push(BatchUncertain::new(item, error));
-        self.order.push(BatchLane::Uncertain(index));
+    #[must_use]
+    pub fn uncertain(&self) -> &[BatchUncertain] {
+        &self.uncertain
     }
 
+    /// Iterate over per-item outcomes in submission order (the order
+    /// the `BatchItem`s appeared in the original input vec).
     pub fn iter(&self) -> impl Iterator<Item = BatchItemOutcome<'_, T>> {
         self.order.iter().map(|lane| match lane {
             BatchLane::Succeeded(index) => BatchItemOutcome::Succeeded(
@@ -75,6 +68,135 @@ impl<T> BatchOutcome<T> {
         })
     }
 }
+
+/// Mutable builder for [`BatchOutcome`]. Protocol crates push per-item
+/// results as they classify them, then call [`finalize`](BatchOutcomeBuilder::finalize)
+/// with the original submitted ids. `finalize` validates that every
+/// submitted id appears exactly once across the three lanes and
+/// returns the immutable outcome.
+#[derive(Clone, Debug)]
+pub struct BatchOutcomeBuilder<T> {
+    succeeded: Vec<BatchSuccess<T>>,
+    failed: Vec<BatchFailure>,
+    uncertain: Vec<BatchUncertain>,
+    order: Vec<BatchLane>,
+}
+
+impl<T> Default for BatchOutcomeBuilder<T> {
+    fn default() -> Self {
+        Self {
+            succeeded: Vec::new(),
+            failed: Vec::new(),
+            uncertain: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+}
+
+impl<T> BatchOutcomeBuilder<T> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_succeeded(&mut self, item: BatchItemId, output: T) {
+        let index = self.succeeded.len();
+        self.succeeded.push(BatchSuccess::new(item, output));
+        self.order.push(BatchLane::Succeeded(index));
+    }
+
+    pub fn push_failed(&mut self, item: BatchItemId, error: AccountError) {
+        let index = self.failed.len();
+        self.failed.push(BatchFailure::new(item, error));
+        self.order.push(BatchLane::Failed(index));
+    }
+
+    pub fn push_uncertain(&mut self, item: BatchItemId, error: AccountError) {
+        let index = self.uncertain.len();
+        self.uncertain.push(BatchUncertain::new(item, error));
+        self.order.push(BatchLane::Uncertain(index));
+    }
+
+    /// Freeze the builder into an immutable [`BatchOutcome`]. Validates
+    /// that every id in `expected` appears in exactly one lane, no
+    /// unknown ids were added, and no id was duplicated across lanes.
+    /// Returns `Err(BatchInvariantError)` on any violation; protocol
+    /// crates with bugs that miscount items surface them here rather
+    /// than silently shipping a wrong outcome.
+    pub fn finalize(
+        self,
+        expected: &[BatchItemId],
+    ) -> Result<BatchOutcome<T>, BatchInvariantError> {
+        let mut seen: HashSet<&BatchItemId> = HashSet::with_capacity(expected.len());
+        let mut duplicates: Vec<BatchItemId> = Vec::new();
+        let mut unknown: Vec<BatchItemId> = Vec::new();
+
+        for id in self
+            .succeeded
+            .iter()
+            .map(|s| &s.item)
+            .chain(self.failed.iter().map(|f| &f.item))
+            .chain(self.uncertain.iter().map(|u| &u.item))
+        {
+            if !expected.iter().any(|expected_id| expected_id == id) {
+                unknown.push(id.clone());
+                continue;
+            }
+            if !seen.insert(id) {
+                duplicates.push(id.clone());
+            }
+        }
+
+        let missing: Vec<BatchItemId> = expected
+            .iter()
+            .filter(|id| !seen.contains(id))
+            .cloned()
+            .collect();
+
+        if !missing.is_empty() || !duplicates.is_empty() || !unknown.is_empty() {
+            return Err(BatchInvariantError {
+                missing,
+                duplicates,
+                unknown,
+            });
+        }
+
+        Ok(BatchOutcome {
+            succeeded: self.succeeded,
+            failed: self.failed,
+            uncertain: self.uncertain,
+            order: self.order,
+        })
+    }
+}
+
+/// Invariant violation detected by `BatchOutcomeBuilder::finalize`.
+/// Producer-bug surface: every submitted item must appear in exactly
+/// one lane. Tests inside protocol crates catch this before it ships.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BatchInvariantError {
+    /// Submitted ids that did not appear in any lane.
+    pub missing: Vec<BatchItemId>,
+    /// Ids that appeared in more than one lane.
+    pub duplicates: Vec<BatchItemId>,
+    /// Ids appearing in a lane that were not in the submitted vec.
+    pub unknown: Vec<BatchItemId>,
+}
+
+impl fmt::Display for BatchInvariantError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "BatchOutcome invariant violation: missing={} duplicates={} unknown={}",
+            self.missing.len(),
+            self.duplicates.len(),
+            self.unknown.len(),
+        )
+    }
+}
+
+impl std::error::Error for BatchInvariantError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BatchLane {
@@ -190,15 +312,22 @@ mod tests {
                 detail: DiagnosticText::support_only("bad input"),
             }),
         )
-        .build()
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    fn ids(strs: &[&str]) -> Vec<BatchItemId> {
+        strs.iter().map(|s| BatchItemId(s.to_string())).collect()
     }
 
     #[test]
     fn iter_preserves_push_order() {
-        let mut outcome = BatchOutcome::default();
-        outcome.push_failed(BatchItemId("b".to_string()), error());
-        outcome.push_succeeded(BatchItemId("a".to_string()), ());
-        outcome.push_uncertain(BatchItemId("c".to_string()), error());
+        let mut builder = BatchOutcomeBuilder::<()>::new();
+        builder.push_failed(BatchItemId("b".to_string()), error());
+        builder.push_succeeded(BatchItemId("a".to_string()), ());
+        builder.push_uncertain(BatchItemId("c".to_string()), error());
+
+        let outcome = builder.finalize(&ids(&["b", "a", "c"])).unwrap();
 
         let lanes = outcome
             .iter()
@@ -214,14 +343,30 @@ mod tests {
 
     #[test]
     fn lane_vectors_preserve_lane_order() {
-        let mut outcome = BatchOutcome::default();
-        outcome.push_succeeded(BatchItemId("a".to_string()), ());
-        outcome.push_failed(BatchItemId("b".to_string()), error());
-        outcome.push_succeeded(BatchItemId("c".to_string()), ());
+        let mut builder = BatchOutcomeBuilder::<()>::new();
+        builder.push_succeeded(BatchItemId("a".to_string()), ());
+        builder.push_failed(BatchItemId("b".to_string()), error());
+        builder.push_succeeded(BatchItemId("c".to_string()), ());
 
-        assert_eq!(outcome.succeeded[0].item.0, "a");
-        assert_eq!(outcome.succeeded[1].item.0, "c");
-        assert_eq!(outcome.failed[0].item.0, "b");
+        let outcome = builder.finalize(&ids(&["a", "b", "c"])).unwrap();
+
+        assert_eq!(outcome.succeeded()[0].item.0, "a");
+        assert_eq!(outcome.succeeded()[1].item.0, "c");
+        assert_eq!(outcome.failed()[0].item.0, "b");
+    }
+
+    #[test]
+    fn finalize_detects_missing_duplicate_and_unknown_ids() {
+        let mut builder = BatchOutcomeBuilder::<()>::new();
+        builder.push_succeeded(BatchItemId("a".to_string()), ());
+        builder.push_succeeded(BatchItemId("a".to_string()), ()); // duplicate
+        builder.push_succeeded(BatchItemId("z".to_string()), ()); // unknown
+        // missing: "b"
+
+        let err = builder.finalize(&ids(&["a", "b"])).expect_err("invalid");
+        assert_eq!(err.missing, ids(&["b"]));
+        assert_eq!(err.duplicates, ids(&["a"]));
+        assert_eq!(err.unknown, ids(&["z"]));
     }
 
     #[test]

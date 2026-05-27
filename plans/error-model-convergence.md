@@ -4,6 +4,101 @@ This document specifies the bifrost error contract. It is the target
 design, not a phased rollout. There is no "this wave" and no "later
 wave" - the shape described here is what consumers can rely on.
 
+## Phase 5 amendments (post-merge)
+
+The post-Phase-4 audit
+(`plans/error-model-phase4-audit.md`) and the locked decisions in
+`plans/error-model-phase4-decisions.md` revised several shapes
+described in this doc. Where the body below disagrees with these
+amendments, the amendments win. The decisions doc is the live tracker;
+the convergence doc retains historical context that the amendments
+modify in place.
+
+- **`RetryAdvice` carries `retry_hint: Option<RetryHint>`** instead of
+  separate `not_before` and `min_delay` fields. `RetryHint::After(Duration)`
+  and `RetryHint::At(SystemTime)` are the two carrier shapes; consumers
+  call `RetryHint::not_before(now)` and `RetryHint::min_delay(now)` to
+  derive either form. `ServerCause::{Unavailable,RateLimited,QuotaExhausted}`
+  carries `retry_hint: Option<RetryHint>` instead of `retry_after:
+  Option<Duration>`. The builder no longer has a `retry_not_before`
+  setter; the hint flows through the cause.
+- **`AccountErrorBuilder::build` is renamed to `try_build`** and
+  returns `Result<AccountError, AccountErrorBuildError>`. Variants:
+  `EmptyChain`, `KindCauseMismatch { kind, primary_cause }`,
+  `TransportAcknowledged`, `CursorInvalidWithoutScope`. The error
+  never escapes a producer; translation boundaries call
+  `.expect("valid account error classification")`.
+- **`SyncState(CursorInvalid)` without scope is a build error**
+  (`CursorInvalidWithoutScope`). The previous "falls back to
+  `RestartAccount`" rule is gone: producers must thread the cursor
+  scope from the call site.
+- **`EngineDirective::CapabilityChanged { delta }` is removed.**
+  Capability shifts map to `EngineDirective::RestartAccount` so
+  discovery re-runs. `StateCause::CapabilityChanged { delta:
+  Option<CapabilityDelta> }` retains the optional payload for forensic
+  exports only.
+- **`RemediationAction::RestartScope` and `RestartAccount` variants
+  are removed.** Engine actions are not consumer remediations.
+  `recovery::suggest` returns `None` for `SyncState(CursorInvalid)`
+  and `SchemaIncompatible`.
+- **`RemediationAction::RetryLater { not_before }` becomes
+  `RetryLater { retry_hint: Option<RetryHint> }`.**
+- **`BatchOutcome` is immutable on return; mutable construction goes
+  through `BatchOutcomeBuilder` with `push_*` setters and a
+  `finalize(expected: &[BatchItemId]) -> Result<BatchOutcome,
+  BatchInvariantError>` terminator.** Lane access is via
+  `succeeded()` / `failed()` / `uncertain()` slice accessors.
+- **`ItemOutcome` is closed** (not `#[non_exhaustive]`). Three lanes
+  are the model; adding a fourth is a deliberate breaking change.
+- **`Fatal(pub AccountError)` becomes `Fatal(AccountError)` with the
+  field private.** `Fatal::into_inner(self) -> AccountError` and
+  `impl AsRef<AccountError> for Fatal` give access. `TryFrom` is the
+  only constructor.
+- **`Protocol(Unknown)` maps to `UnknownPermanent` unconditionally**;
+  the "unless paired with higher-level retryable cause" clause is
+  gone. Producers with a retryable signal use that as the kind.
+- **Recovery table row for `Server(Error { status: None })` is
+  reinstated for both `InFlight + idempotent` (-> `Retry::SameRequest`)
+  and `InFlight + !idempotent` (-> `Reconcile {
+  TransportDropAfterSend }`).**
+- **`recovery::derive` uses `debug_assert!`** for the `Transport +
+  Acknowledged` and `kind_matches_cause` invariants. In release
+  builds, `Transport + Acknowledged` falls back to treating the
+  attempt as `InFlight` (conservative). The same invariants are
+  rejected at construction by `try_build`.
+- **`ResourceKind` widens with `Draft`, `Identity`, `Vacation`,
+  `PushSubscription`.** `PushSubscription` is provider-neutral and
+  covers Gmail Pub/Sub watch, Graph webhook subscriptions, JMAP push,
+  and any future IMAP IDLE abstraction.
+- **`ThrottleScope` gains `CurrentOperation`** as a per-call hint
+  that does not enter any shared bucket. The other four variants
+  (`Mailbox`, `Account`, `Tenant`, `Provider`) map onto sharable
+  `ThrottleKey` entries the engine consults across work items.
+- **`ThrottleKey` enum exists in `bifrost-types::error`** with
+  variants `Mailbox { account, mailbox }`, `Account(AccountId)`,
+  `Tenant(String)`, `Provider(Provider)`. `Tenant` and `Provider`
+  cross account boundaries; a tenant throttle pauses every account
+  on that tenant.
+- **`AccountControl { Pause(PauseReason), Resume }` and `PauseReason`
+  enum** are the engine pause primitive. `PauseReason` variants:
+  `OperatorOverrideRequired`, `ConsumerRequested`, `TenantThrottle`,
+  `RetryBudgetExhausted`. No free-form strings.
+- **`WatchEvent::Terminated(AccountError)` variant** added so push
+  streams terminate with a classified error when the stream cannot
+  be reconnected without engine intervention.
+- **`Account::get_stream` returns
+  `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`** so per-item
+  hydration failures surface as `ItemOutcome::Failed` /
+  `ItemOutcome::Uncertain` rather than dropped warnings.
+- **`EnhancedStatusCode::code` field is renamed to `reply`** to
+  disambiguate from the dotted enhanced status (X.Y.Z) carried in
+  the `enhanced` field.
+- **`AccountErrorBuilder::idempotency_override`** is reserved for
+  exceptional cases (e.g. a normally non-idempotent op made safe by
+  an `If-Match` etag). `AccountOperation::is_idempotent()` is the
+  authoritative source for the common case; producers reaching for
+  the override should verify their operation classification first.
+
 Revised after a three-round critique pass focused on the enterprise
 consumer surface. The contract:
 
