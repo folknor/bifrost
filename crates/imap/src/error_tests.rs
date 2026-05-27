@@ -182,6 +182,29 @@ fn with_attempt_noop_on_pure_local_errors() {
 }
 
 #[test]
+fn no_with_code_defaults_to_acknowledged_attempt() {
+    // A tagged NO is server-acknowledged by definition. Without this,
+    // the recovery row `Server(Error { status: None }) + Acknowledged
+    // -> ProviderRefused` collapses to the Unsent arm.
+    let err = Error::no_with_code("nope".into(), None);
+    assert_eq!(err.attempt(), Some(TransmissionState::Acknowledged));
+}
+
+#[test]
+fn bad_with_code_defaults_to_acknowledged_attempt() {
+    let err = Error::bad_with_code("syntax".into(), None);
+    assert_eq!(err.attempt(), Some(TransmissionState::Acknowledged));
+}
+
+#[test]
+fn with_attempt_overrides_no_attempt() {
+    // The driver and test helpers can re-stamp the attempt state if a
+    // wire-level observation says otherwise.
+    let err = Error::no_with_code("nope".into(), None).with_attempt(TransmissionState::InFlight);
+    assert_eq!(err.attempt(), Some(TransmissionState::InFlight));
+}
+
+#[test]
 fn from_io_error_via_into_yields_io_variant_without_attempt() {
     let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connect");
     let err: Error = io_err.into();

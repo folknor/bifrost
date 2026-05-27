@@ -24,16 +24,24 @@ pub(crate) fn stream(
         CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
         CursorScope::Type(ObjectType::Thread) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(CursorScope::Type(ObjectType::Thread))),
                     "JMAP thread inventory is derived from Email inventory in this implementation",
                 );
         }),
         CursorScope::Query(_) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    None,
                     "JMAP query inventory requires registered query definitions outside the v1 Account trait",
                 );
         }),
         _ => Box::pin(async_stream::stream! {
-                yield super::error::terminated_unsupported("cursor scope is not supported by JMAP");
+                yield super::error::terminated_unsupported(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    None,
+                    "cursor scope is not supported by JMAP",
+                );
         }),
     }
 }
@@ -53,6 +61,8 @@ pub(crate) fn stream_partition(
         }
         _ => Box::pin(async_stream::stream! {
             yield super::error::terminated_unsupported(
+                bifrost_types::AccountOperation::SyncInventory,
+                None,
                 "JMAP inventory partition is not supported for this cursor scope",
             );
         }),
@@ -141,7 +151,16 @@ fn email_inventory(
             let advance = match i32::try_from(batch_len) {
                 Ok(value) => value,
                 Err(_) => {
-                    yield super::error::terminated_unsupported(
+                    // Pagination shape mismatch: the server returned a
+                    // page so large that the protocol can't advance the
+                    // position. Classify as `Protocol(ContractViolation)`,
+                    // not `Unsupported` - the operation is supported,
+                    // the response shape is not.
+                    yield super::error::terminated_contract_violation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        Some(bifrost_types::ErrorScope::Cursor(
+                            CursorScope::Type(ObjectType::Email),
+                        )),
                         "JMAP inventory page was too large to advance an i32 position",
                     );
                     break;
@@ -150,7 +169,11 @@ fn email_inventory(
             position = match position.checked_add(advance) {
                 Some(next) => next,
                 None => {
-                    yield super::error::terminated_unsupported(
+                    yield super::error::terminated_contract_violation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        Some(bifrost_types::ErrorScope::Cursor(
+                            CursorScope::Type(ObjectType::Email),
+                        )),
                         "JMAP inventory position overflowed",
                     );
                     break;
@@ -176,7 +199,11 @@ fn email_inventory_page(
         let limit = match usize::try_from(to - from) {
             Ok(limit) if limit != 0 => limit,
             _ => {
-                yield super::error::terminated_unsupported(
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(
+                        CursorScope::Type(ObjectType::Email),
+                    )),
                     "JMAP inventory page range could not be converted to usize",
                 );
                 return;
@@ -185,7 +212,11 @@ fn email_inventory_page(
         let position = match i32::try_from(from) {
             Ok(position) => position,
             Err(_) => {
-                yield super::error::terminated_unsupported(
+                yield super::error::terminated_contract_violation(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(
+                        CursorScope::Type(ObjectType::Email),
+                    )),
                     "JMAP inventory page position exceeded i32",
                 );
                 return;

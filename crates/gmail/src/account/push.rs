@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::GmailClient;
 
-use super::recovery;
+use super::error;
 
 const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -126,22 +126,22 @@ pub(crate) fn push_subscribe(
                 .iter()
                 .any(|scope| !matches!(scope, CursorScope::Account))
         {
-            return Err(recovery::into_account_error(
+            return Err(error::into_account_error(
                 crate::error::Error::unsupported(AccountOperation::PushSubscribe),
-                recovery::GmailErrorContext::push_subscribe(),
+                error::GmailErrorContext::push_subscribe(),
             ));
         }
         let Some(config) = pubsub.config().cloned() else {
-            return Err(recovery::into_account_error(
+            return Err(error::into_account_error(
                 crate::error::Error::unsupported_with(
                     AccountOperation::PushSubscribe,
                     "no Pub/Sub topic configured",
                 ),
-                recovery::GmailErrorContext::push_subscribe(),
+                error::GmailErrorContext::push_subscribe(),
             ));
         };
         let response = watch_once(&client, &config).await.map_err(|error| {
-            recovery::into_account_error(error, recovery::GmailErrorContext::push_subscribe())
+            error::into_account_error(error, error::GmailErrorContext::push_subscribe())
         })?;
         pubsub.store_watch_response(&response).await;
         pubsub.report_health(WatchEvent::Reconnected);
@@ -160,12 +160,12 @@ pub(crate) fn push_subscribe(
         let handle = serde_json::to_string(&handle)
             .map(SubscriptionHandle)
             .map_err(|error| {
-                recovery::into_account_error(
+                error::into_account_error(
                     crate::error::Error::invalid_request(
                         AccountOperation::PushSubscribe,
                         format!("subscription handle encode failed: {error}"),
                     ),
-                    recovery::GmailErrorContext::push_subscribe(),
+                    error::GmailErrorContext::push_subscribe(),
                 )
             })?;
         pubsub.insert_handle(&handle).await;
@@ -181,19 +181,19 @@ pub(crate) fn push_unsubscribe(
     Box::pin(async move {
         let _decoded: GmailSubscriptionHandle =
             serde_json::from_str(&handle.0).map_err(|error| {
-                recovery::into_account_error(
+                error::into_account_error(
                     crate::error::Error::invalid_request(
                         AccountOperation::PushUnsubscribe,
                         format!("invalid gmail subscription handle: {error}"),
                     ),
-                    recovery::GmailErrorContext::push_unsubscribe(),
+                    error::GmailErrorContext::push_unsubscribe(),
                 )
             })?;
         if !pubsub.remove_handle(&handle).await {
             return Ok(());
         }
         stop_watch(&client).await.map_err(|error| {
-            recovery::into_account_error(error, recovery::GmailErrorContext::push_unsubscribe())
+            error::into_account_error(error, error::GmailErrorContext::push_unsubscribe())
         })?;
         *pubsub.expiration.lock().await = None;
         *pubsub.last_history_id.lock().await = None;
@@ -261,8 +261,34 @@ async fn start_renewer(
                         disconnected = false;
                     }
                 }
-                Err(error) => {
-                    tracing::warn!("gmail Pub/Sub watch renewal failed: {error}");
+                Err(err) => {
+                    // gmail-D3: classify every error through the
+                    // central translator and route on
+                    // `is_terminal()`. Terminal classes (auth lost,
+                    // policy, scope, account disabled, schema break)
+                    // emit `WatchEvent::Terminated(AccountError)` and
+                    // exit the renewer loop. Transient classes emit
+                    // `Disconnected` once and retry on
+                    // `RENEW_RETRY_AFTER`.
+                    let account_error =
+                        error::into_account_error(err, error::GmailErrorContext::push_subscribe());
+                    if account_error.recovery().is_terminal() {
+                        tracing::warn!(
+                            target: "bifrost_gmail::push",
+                            kind = ?account_error.kind(),
+                            message_key = account_error.message_key(),
+                            "gmail Pub/Sub watch renewal terminal failure",
+                        );
+                        control.report_health(WatchEvent::Terminated(account_error));
+                        return;
+                    }
+                    tracing::warn!(
+                        target: "bifrost_gmail::push",
+                        kind = ?account_error.kind(),
+                        message_key = account_error.message_key(),
+                        recovery = ?account_error.recovery(),
+                        "gmail Pub/Sub watch renewal transient failure; retrying",
+                    );
                     if !disconnected {
                         control.report_health(WatchEvent::Disconnected);
                         disconnected = true;

@@ -3,12 +3,10 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Address,
-    AttachmentInline, Cause, Container, ContainerId, ContainerKind, DiagnosticText, DraftHandle,
-    DraftPatch, FolderRole, HydrationProjection, Identity, IdentityId, LabelId, Message,
-    MutationTarget, ObjectId, Page, Protocol, ProtocolErrorKind, ProtocolKind, Provenance,
-    Provider, SearchFilter, SearchRequest, ServerCause, ServerErrorKind, StateCause,
-    ThreadHydration, ThreadId, VacationConfig, WireCause,
+    AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerId,
+    ContainerKind, DraftHandle, DraftPatch, ErrorScope, FolderRole, HydrationProjection, Identity,
+    IdentityId, LabelId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
+    Provenance, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -20,7 +18,10 @@ use crate::types::{
 
 use super::GraphAccount;
 use super::blob::blob_handle_from_graph_attachment;
-use super::graph_error::{GraphErrorContext, into_account_error, unsupported_account_error};
+use super::graph_error::{
+    GraphErrorContext, into_account_error, mutation_item_outcome, protocol_violation,
+    unsupported_account_error,
+};
 use super::inventory::graph_etag;
 
 const STARRED_CATEGORY: &str = "$flagged";
@@ -38,7 +39,13 @@ pub(crate) async fn add_to_container(
     container: ContainerId,
 ) -> Result<(), AccountError> {
     let ids = resolve_target_ids(&account, target).await?;
-    move_messages(&account, &ids, &container.0).await
+    move_messages(
+        &account,
+        &ids,
+        &container.0,
+        AccountOperation::AddToContainer,
+    )
+    .await
 }
 
 pub(crate) async fn set_category(
@@ -52,7 +59,11 @@ pub(crate) async fn set_category(
     for message in values {
         let id = object_id_from_value(&message)?;
         let etag = graph_etag(&message).ok_or_else(|| {
-            pim_protocol_error(format!("Graph message {} did not expose an etag", id.0))
+            pim_protocol_error(
+                AccountOperation::SetCategory,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!("Graph message {} did not expose an etag", id.0),
+            )
         })?;
         let body = if is_starred_category(&category) {
             json!({
@@ -74,7 +85,7 @@ pub(crate) async fn set_category(
         };
         patches.push(MessagePatch { id, body, etag });
     }
-    patch_messages(&account, patches).await
+    patch_messages(&account, patches, AccountOperation::SetCategory).await
 }
 
 pub(crate) async fn set_extended_property(
@@ -91,7 +102,11 @@ pub(crate) async fn set_extended_property(
             for message in values {
                 let id = object_id_from_value(&message)?;
                 let etag = graph_etag(&message).ok_or_else(|| {
-                    pim_protocol_error(format!("Graph message {} did not expose an etag", id.0))
+                    pim_protocol_error(
+                        AccountOperation::SetExtendedProperty,
+                        Some(ErrorScope::Message { id: id.0.clone() }),
+                        format!("Graph message {} did not expose an etag", id.0),
+                    )
                 })?;
                 patches.push(MessagePatch {
                     id,
@@ -104,7 +119,7 @@ pub(crate) async fn set_extended_property(
                     etag,
                 });
             }
-            patch_messages(&account, patches).await
+            patch_messages(&account, patches, AccountOperation::SetExtendedProperty).await
         }
         None => {
             // Clear: DELETE the property's navigation entry on each
@@ -113,7 +128,13 @@ pub(crate) async fn set_extended_property(
             // batch helper tolerates 404 for the clear path so a
             // partial / never-set state still resolves to Ok.
             let ids = resolve_target_ids(&account, target).await?;
-            delete_extended_property(&account, &ids, &property_id).await
+            delete_extended_property(
+                &account,
+                &ids,
+                &property_id,
+                AccountOperation::SetExtendedProperty,
+            )
+            .await
         }
     }
 }
@@ -122,6 +143,7 @@ async fn delete_extended_property(
     account: &GraphAccount,
     ids: &[ObjectId],
     property_id: &str,
+    operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
@@ -138,7 +160,7 @@ async fn delete_extended_property(
             headers: None,
         });
     }
-    submit_write_batch(account, requests, true).await
+    submit_write_batch(account, requests, true, operation).await
 }
 
 pub(crate) async fn set_is_read(
@@ -151,7 +173,11 @@ pub(crate) async fn set_is_read(
     for message in values {
         let id = object_id_from_value(&message)?;
         let etag = graph_etag(&message).ok_or_else(|| {
-            pim_protocol_error(format!("Graph message {} did not expose an etag", id.0))
+            pim_protocol_error(
+                AccountOperation::SetIsRead,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!("Graph message {} did not expose an etag", id.0),
+            )
         })?;
         patches.push(MessagePatch {
             id,
@@ -159,7 +185,7 @@ pub(crate) async fn set_is_read(
             etag,
         });
     }
-    patch_messages(&account, patches).await
+    patch_messages(&account, patches, AccountOperation::SetIsRead).await
 }
 
 pub(crate) async fn send_message(
@@ -494,9 +520,9 @@ pub(crate) async fn delete_thread(
         .as_ref()
         .is_some_and(|id| id.0 == trash.0 || id.0.eq_ignore_ascii_case(DELETED_ITEMS));
     if already_in_trash {
-        destroy_messages(&account, &ids).await
+        destroy_messages(&account, &ids, AccountOperation::BulkDestroy).await
     } else {
-        move_messages(&account, &ids, &trash.0).await
+        move_messages(&account, &ids, &trash.0, AccountOperation::BulkMove).await
     }
 }
 
@@ -589,6 +615,7 @@ async fn fetch_paged_values(
 async fn patch_messages(
     account: &GraphAccount,
     patches: Vec<MessagePatch>,
+    operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
@@ -606,13 +633,14 @@ async fn patch_messages(
             headers: Some(headers),
         });
     }
-    submit_write_batch(account, requests, false).await
+    submit_write_batch(account, requests, false, operation).await
 }
 
 async fn move_messages(
     account: &GraphAccount,
     ids: &[ObjectId],
     destination: &str,
+    operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let prefix = account.client.api_path_prefix();
@@ -620,7 +648,11 @@ async fn move_messages(
     for (index, value) in values.iter().enumerate() {
         let id = object_id_from_value(value)?;
         let etag = graph_etag(value).ok_or_else(|| {
-            pim_protocol_error(format!("Graph message {} did not expose an etag", id.0))
+            pim_protocol_error(
+                operation,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!("Graph message {} did not expose an etag", id.0),
+            )
         })?;
         let mut headers = HashMap::new();
         headers.insert("If-Match".to_string(), etag);
@@ -635,10 +667,14 @@ async fn move_messages(
             headers: Some(headers),
         });
     }
-    submit_write_batch(account, requests, false).await
+    submit_write_batch(account, requests, false, operation).await
 }
 
-async fn destroy_messages(account: &GraphAccount, ids: &[ObjectId]) -> Result<(), AccountError> {
+async fn destroy_messages(
+    account: &GraphAccount,
+    ids: &[ObjectId],
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
     let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
@@ -659,7 +695,7 @@ async fn destroy_messages(account: &GraphAccount, ids: &[ObjectId]) -> Result<()
             headers: (!headers.is_empty()).then_some(headers),
         });
     }
-    submit_write_batch(account, requests, true).await
+    submit_write_batch(account, requests, true, operation).await
 }
 
 async fn message_values_for_ids(
@@ -678,48 +714,60 @@ async fn submit_write_batch(
     account: &GraphAccount,
     requests: Vec<BatchRequestItem>,
     destroy: bool,
+    operation: AccountOperation,
 ) -> Result<(), AccountError> {
     if requests.is_empty() {
         return Ok(());
     }
-    let ctx = GraphErrorContext::graph(AccountOperation::UpdateFlags);
+    let ctx = GraphErrorContext::graph(operation);
     let response: BatchResponse = account
         .client
         .post_batch(&BatchRequest { requests })
         .await
         .map_err(|e| into_account_error(e, ctx.clone()))?;
     for item in response.responses {
-        match item.status {
-            200..=299 => {}
-            404 if destroy => {}
-            412 => {
-                return Err(AccountErrorBuilder::new(
-                    AccountErrorKind::ConcurrencyConflict,
-                    Cause::State(StateCause::ConcurrencyConflict),
-                )
-                .operation(ctx.operation)
-                .provider(Provider::Microsoft)
-                .protocol(Protocol::Graph)
-                .build());
-            }
-            status => {
-                return Err(AccountErrorBuilder::new(
-                    AccountErrorKind::Server(ServerErrorKind::Error {
-                        status: Some(status),
-                    }),
-                    Cause::Server(ServerCause::Error {
-                        status: Some(status),
-                    }),
-                )
-                .text(DiagnosticText::support_only(format!(
-                    "Graph write batch item {} failed with HTTP {status}",
-                    item.id
-                )))
-                .operation(ctx.operation)
-                .provider(Provider::Microsoft)
-                .protocol(Protocol::Graph)
-                .build());
-            }
+        // Reuse the per-item outcome projector so 4xx/5xx items
+        // build structured `AccountError`s with `Protocol::Graph`,
+        // `AttemptCause(Acknowledged)`, `WireCause::Graph(signal)`
+        // (when an envelope is present), and `Retry-After` -> throttle
+        // scope translation. Per-item 2xx and destroy-404 short-
+        // circuit as `Succeeded`; everything else surfaces as
+        // `Failed(_)` carrying the classified error which we then
+        // unwrap into the function's single-error return contract.
+        let headers = item
+            .headers
+            .map(|h| {
+                let mut hm = reqwest::header::HeaderMap::new();
+                for (k, v) in h {
+                    if let (Ok(name), Ok(val)) = (
+                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(&v),
+                    ) {
+                        hm.insert(name, val);
+                    }
+                }
+                hm
+            })
+            .unwrap_or_default();
+        let body = item
+            .body
+            .as_ref()
+            .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
+            .unwrap_or_default();
+        let scope = ErrorScope::Account;
+        let outcome = mutation_item_outcome(
+            item.status,
+            headers,
+            body,
+            destroy,
+            bifrost_types::BatchItemId(item.id.clone()),
+            operation,
+            scope,
+        );
+        match outcome {
+            bifrost_types::ItemOutcome::Succeeded(_) => {}
+            bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
+            bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
         }
     }
     Ok(())
@@ -739,23 +787,26 @@ fn object_id_from_value(value: &Value) -> Result<ObjectId, AccountError> {
         .get("id")
         .and_then(Value::as_str)
         .map(|id| ObjectId(id.to_string()))
-        .ok_or_else(|| pim_protocol_error("Graph message did not include an id"))
+        .ok_or_else(|| {
+            pim_protocol_error(
+                AccountOperation::Hydrate,
+                None,
+                "Graph message did not include an id",
+            )
+        })
 }
 
 /// Build a `Protocol(ContractViolation)` `AccountError` for pim-layer
-/// data-shape violations (missing id, missing etag, etc.).
-fn pim_protocol_error(msg: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Graph,
-            detail: Some(DiagnosticText::support_only(msg.into())),
-        }),
-    )
-    .operation(AccountOperation::Hydrate)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .build()
+/// data-shape violations (missing id, missing etag, etc.). The
+/// caller threads its `AccountOperation` and the scope of the
+/// affected resource (typically `ErrorScope::Message { id }`); both
+/// flow through into telemetry and support exports.
+fn pim_protocol_error(
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    msg: impl Into<String>,
+) -> AccountError {
+    protocol_violation(ProtocolErrorKind::ContractViolation, operation, scope, msg)
 }
 
 fn is_starred_category(category: &str) -> bool {
@@ -938,10 +989,13 @@ async fn create_draft_message(
     let created: Value = account.client.post(&path, &message).await.map_err(|e| {
         into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
     })?;
-    let id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| pim_protocol_error("Graph draft create did not return an id"))?;
+    let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
+        pim_protocol_error(
+            AccountOperation::DraftCreate,
+            None,
+            "Graph draft create did not return an id",
+        )
+    })?;
     Ok(DraftHandle(id.to_string()))
 }
 
@@ -998,7 +1052,11 @@ async fn search_message_rows(
 fn search_url(account: &GraphAccount, request: &SearchRequest) -> Result<String, AccountError> {
     if let Some(cursor) = &request.page_cursor {
         return String::from_utf8(cursor.clone()).map_err(|error| {
-            pim_protocol_error(format!("Graph search cursor is not UTF-8: {error}"))
+            pim_protocol_error(
+                AccountOperation::Search,
+                None,
+                format!("Graph search cursor is not UTF-8: {error}"),
+            )
         });
     }
     let mut params = vec![

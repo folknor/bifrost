@@ -29,6 +29,7 @@ impl Clone for Error {
                 kind: self.inner.kind.clone(),
                 source,
                 attempt: self.inner.attempt,
+                phase: self.inner.phase,
             }),
         }
     }
@@ -38,6 +39,13 @@ struct Inner {
     kind: ErrorKind,
     source: Option<BoxError>,
     attempt: Option<SmtpAttempt>,
+    /// Coarse command phase at the moment this error was constructed.
+    ///
+    /// Lives on the value (not on `SmtpErrorContext`) so a missed `with_phase`
+    /// decoration cannot silently degrade the classifier's signal. Mapping
+    /// from low-level wire failures to `AccountErrorKind` reads `phase()` and
+    /// composes it with any phase the context separately supplies.
+    phase: Option<SmtpCommandPhase>,
 }
 
 /// Wire-level transmission state for the mail-send side effect.
@@ -60,15 +68,43 @@ pub(crate) struct SmtpAttempt {
 
 /// Coarse command phase at the point an SMTP transport error was constructed.
 ///
-/// Attached to the `SmtpErrorContext` at the call site so the shared-error
-/// mapper can refine recipient-lane vs body-lane classification without
-/// leaking the public transport `ErrorKind` enum.
+/// Carried on `Error::Inner` directly: a missed `with_phase` call cannot
+/// silently degrade the classifier because the phase is part of the value,
+/// not a side-channel decoration on `SmtpErrorContext`.
+///
+/// The 16 variants cover every wire-side command boundary the bifrost SMTP
+/// driver actually crosses. `DataCommand` distinguishes the `DATA` command-
+/// write/read from the body upload (`DataBody`) and from the final reply
+/// after the dot terminator (`DataFinal`), so the LMTP DATA-command negative
+/// reply does not get misclassified as a body-side transport drop.
+///
+/// Some variants (`Connect`, `Greeting`, `Hello`, `StartTls`, `BdatBody`,
+/// `Noop`, `Vrfy`, `Expn`, `Rset`) describe phases the driver crosses but
+/// does not yet decorate with `with_phase` because the corresponding call
+/// sites currently propagate the raw `Error` upward without funneling
+/// through `into_account_error`. They are present so that future per-phase
+/// classifier refinements (e.g. tagging connect-time transport drops as
+/// `Connect`) do not require widening the enum and breaking the exhaustive
+/// match in the classifier.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SmtpCommandPhase {
+    Connect,
+    Greeting,
+    Hello,
+    StartTls,
+    Auth,
+    MailFrom,
     RcptTo,
     DataCommand,
     DataBody,
+    DataFinal,
+    BdatBody,
     LmtpFinalStatus,
+    Noop,
+    Vrfy,
+    Expn,
+    Rset,
 }
 
 impl Error {
@@ -81,6 +117,7 @@ impl Error {
                 kind,
                 source: source.map(Into::into),
                 attempt: None,
+                phase: None,
             }),
         }
     }
@@ -91,6 +128,7 @@ impl Error {
                 kind,
                 source: None,
                 attempt: None,
+                phase: None,
             }),
         }
     }
@@ -108,6 +146,18 @@ impl Error {
 
     pub(crate) fn attempt(&self) -> Option<SmtpTransmissionState> {
         self.inner.attempt.map(|a| a.transmission_state)
+    }
+
+    /// Attach a command phase to this error so the classifier can refine
+    /// per-phase routing without depending on the caller setting it on a
+    /// separate `SmtpErrorContext`.
+    pub(crate) fn with_phase(mut self, phase: SmtpCommandPhase) -> Self {
+        self.inner.phase = Some(phase);
+        self
+    }
+
+    pub(crate) fn phase(&self) -> Option<SmtpCommandPhase> {
+        self.inner.phase
     }
 
     /// Support-safe diagnostic string for the account-error mapper. AUTH paths

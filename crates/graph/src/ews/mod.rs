@@ -2,33 +2,88 @@ mod client;
 mod xml_helpers;
 
 use bifrost_net::AccountNet;
+use bifrost_types::DiagnosticText;
 
-use self::xml_helpers::*;
+pub(crate) use self::xml_helpers::*;
 
 const EWS_URL: &str = "https://outlook.office365.com/EWS/Exchange.asmx";
 
 /// Structured EWS transport or protocol error.
 ///
 /// Used by `EwsClient::execute` so callers receive structured evidence
-/// rather than a formatted string. Callers that only need a display
-/// message can call `.to_string()` via the `Display` impl.
+/// rather than a formatted string. Translated into `AccountError` via
+/// `account::graph_error::ews_error_to_account_error`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum EwsError {
-    /// The HTTP request failed or the server returned a non-success
-    /// status. Carries the formatted network message.
-    Transport(String),
-    /// The server returned a SOAP fault. `message` is the
-    /// `<faultstring>` text, or "Unknown SOAP fault" when the element
-    /// is absent.
-    SoapFault { message: String },
+    /// The HTTP request failed. Carries the underlying
+    /// `bifrost_net::Error` so the account boundary can route through
+    /// `bifrost_net::into_account_error` with `Protocol::Ews` context.
+    Transport(bifrost_net::Error),
+
+    /// The HTTP request completed with a non-success status. Carries
+    /// the status code and the response body for diagnostics.
+    HttpStatus {
+        status: reqwest::StatusCode,
+        body: bytes::Bytes,
+    },
+
+    /// The server returned a SOAP fault inside an otherwise 2xx
+    /// response. `code` carries the structured `<faultcode>` token;
+    /// `detail` carries the `<faultstring>` text (support-only).
+    SoapFault {
+        code: SoapFaultCode,
+        detail: DiagnosticText,
+    },
+
+    /// XML body could not be parsed. Surfaces at the boundary as
+    /// `WireCause::MalformedResponse { protocol: Protocol::Ews, .. }`.
+    MalformedXml(DiagnosticText),
 }
 
 impl std::fmt::Display for EwsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EwsError::Transport(msg) => write!(f, "EWS transport error: {msg}"),
-            EwsError::SoapFault { message } => write!(f, "EWS SOAP fault: {message}"),
+            Self::Transport(error) => write!(f, "EWS transport error: {error}"),
+            Self::HttpStatus { status, .. } => write!(f, "EWS HTTP {status}"),
+            Self::SoapFault { code, detail } => {
+                write!(f, "EWS SOAP fault {code:?}: {}", detail.as_str())
+            }
+            Self::MalformedXml(detail) => write!(f, "EWS malformed XML: {}", detail.as_str()),
+        }
+    }
+}
+
+/// SOAP fault code as carried in `<soap:Fault><faultcode>`. EWS uses
+/// the standard SOAP 1.1 codes plus Microsoft-specific
+/// `ErrorAccessDenied` / `ErrorServerBusy` / etc. inside `<detail>`;
+/// for classification we collapse onto the SOAP 1.1 set and keep the
+/// detail string in the carrier.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum SoapFaultCode {
+    /// `VersionMismatch` - protocol-level disagreement on SOAP version.
+    VersionMismatch,
+    /// `MustUnderstand` - a `mustUnderstand` header was not understood.
+    MustUnderstand,
+    /// `Client` - request was malformed or lacked required information.
+    Client,
+    /// `Server` - server failed to process the request (5xx-equivalent).
+    Server,
+    /// Unrecognized fault code (Microsoft EWS uses
+    /// `ErrorAccessDenied`-style strings; those land here).
+    Unknown,
+}
+
+impl SoapFaultCode {
+    pub(crate) fn parse(raw: &str) -> Self {
+        let local = raw.rsplit_once(':').map_or(raw, |(_, l)| l);
+        match local {
+            "VersionMismatch" => Self::VersionMismatch,
+            "MustUnderstand" => Self::MustUnderstand,
+            "Client" => Self::Client,
+            "Server" => Self::Server,
+            _ => Self::Unknown,
         }
     }
 }
@@ -69,11 +124,17 @@ mod tests {
 
         let result = check_soap_fault(xml);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("schema validation"),
-            "unexpected fault message: {err}"
-        );
+        match result.unwrap_err() {
+            EwsError::SoapFault { code, detail } => {
+                assert_eq!(code, SoapFaultCode::Client);
+                assert!(
+                    detail.as_str().contains("schema validation"),
+                    "unexpected fault detail: {}",
+                    detail.as_str()
+                );
+            }
+            other => panic!("expected SoapFault, got {other:?}"),
+        }
     }
 
     #[test]

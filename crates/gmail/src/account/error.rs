@@ -13,14 +13,12 @@
 //! cursor envelope failure), this module builds directly with
 //! `AccountErrorBuilder` and attaches `WireCause::Gmail(signal)`.
 
-use std::time::SystemTime;
-
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
-    GmailSignal, ItemOutcome, MutationSuccess, ObjectId, Protocol, ProtocolErrorKind, Provider,
-    RequestCause, RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause,
-    SyncStateErrorKind, ThrottleScope, WireCause,
+    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
+    ErrorScope, GmailSignal, ItemOutcome, MutationSuccess, ObjectId, Protocol, ProtocolErrorKind,
+    Provider, RequestCause, RequestErrorKind, ResourceKind, RetryHint, ServerCause,
+    ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
 };
 use bifrost_types::{BatchFailure, BatchItemId, BatchSuccess};
 
@@ -48,15 +46,17 @@ impl GmailResource {
             Self::Message => Some(ResourceKind::Message),
             Self::Thread => Some(ResourceKind::Thread),
             Self::Label => Some(ResourceKind::Mailbox),
-            // Drafts/identities/vacation/blob/pubsub/account have no
-            // direct `ResourceKind` analogue; the central kind enum is
-            // mail-centric.
-            Self::Draft
-            | Self::Identity
-            | Self::Vacation
-            | Self::Blob
-            | Self::PubSubWatch
-            | Self::Account => None,
+            Self::Draft => Some(ResourceKind::Draft),
+            Self::Identity => Some(ResourceKind::Identity),
+            Self::Vacation => Some(ResourceKind::Vacation),
+            Self::PubSubWatch => Some(ResourceKind::PushSubscription),
+            // `Blob` NotFound semantically means the parent message
+            // cannot be opened; classify as the parent's message kind so
+            // consumer routing surfaces the message-not-found UX.
+            Self::Blob => Some(ResourceKind::Message),
+            // `Account` is not a per-resource kind; the central
+            // `ResourceKind` enum doesn't have an account variant.
+            Self::Account => None,
         }
     }
 }
@@ -78,6 +78,11 @@ pub(crate) struct GmailErrorContext {
     /// this signal to route to `SyncState(CursorInvalid)` rather than
     /// `NotFound` or a generic provider refusal.
     pub(crate) history_endpoint: bool,
+    /// gmail-N2: optional secondary diagnostic identifier (currently
+    /// the Gmail attachment / blob id) that the central error model
+    /// does not represent as an `ErrorScope`. Surfaced as
+    /// `DiagnosticText::support_only` so support exports retain it.
+    pub(crate) diagnostic_id: Option<String>,
 }
 
 impl GmailErrorContext {
@@ -89,6 +94,7 @@ impl GmailErrorContext {
             throttle_scope: Some(ThrottleScope::Account),
             idempotency_override: None,
             history_endpoint: false,
+            diagnostic_id: None,
         }
     }
 
@@ -151,12 +157,15 @@ impl GmailErrorContext {
     }
 
     pub(crate) fn open_blob(id: impl Into<String>) -> Self {
+        let id = id.into();
         let mut ctx = Self::base(AccountOperation::OpenBlob);
         ctx.resource = Some(GmailResource::Blob);
-        // Blob lives below a message in Gmail; use `Message` scope to
-        // anchor diagnostics. The blob id itself is opaque to the
-        // central error model so it is not surfaced as ErrorScope.
-        let _ = id;
+        // Blob lives below a message in Gmail. Anchor diagnostics on
+        // the parent message scope so consumer routing can find the
+        // owning message; the blob id itself is preserved as a
+        // diagnostic note (gmail-N2).
+        ctx.scope = Some(ErrorScope::Message { id: id.clone() });
+        ctx.diagnostic_id = Some(id);
         ctx
     }
 
@@ -235,13 +244,21 @@ impl GmailErrorContext {
 pub(crate) fn into_account_error(error: Error, ctx: GmailErrorContext) -> AccountError {
     match error {
         Error::Net(net_error) => translate_net_error(net_error, &ctx),
+        // `Error::Response` is a terminal HTTP response; the request was
+        // acknowledged. `Error::JsonDecode` / `Error::Base64` happen
+        // post-200 (decoding a successful response body), so they are
+        // also classified as `Acknowledged`.
         Error::Response(resp) => translate_response(*resp, &ctx),
-        Error::JsonDecode { source, .. } => {
-            parse_failed(&ctx, format!("Gmail JSON decode: {source}"))
-        }
-        Error::Base64 { encoding, source } => {
-            parse_failed(&ctx, format!("Gmail {encoding} decode failed: {source}"))
-        }
+        Error::JsonDecode { source, .. } => parse_failed(
+            &ctx,
+            format!("Gmail JSON decode: {source}"),
+            Some(TransmissionState::Acknowledged),
+        ),
+        Error::Base64 { encoding, source } => parse_failed(
+            &ctx,
+            format!("Gmail {encoding} decode failed: {source}"),
+            Some(TransmissionState::Acknowledged),
+        ),
         Error::Local(local) => translate_local(local, &ctx),
     }
 }
@@ -351,7 +368,8 @@ pub(crate) fn merge_delete_fallback_error(
         .text(DiagnosticText::support_only(format!(
             "primary batchDelete failed before TRASH fallback: {primary_kind}"
         )))
-        .build()
+        .try_build()
+        .expect("valid account error classification")
 }
 
 // ---------------------------------------------------------------------
@@ -373,10 +391,11 @@ fn terminates_mutation_stream(err: &AccountError) -> bool {
         | RecoveryClass::ProviderContractViolation
         | RecoveryClass::ProviderRefused
         | RecoveryClass::UnknownPermanent => {
-            // Permanent terminal: per-id outcomes carry the same error.
-            // Only NotFound is a clean per-id lane; everything else
-            // also fans out per-id but is still terminal for the
-            // engine's retry machinery.
+            // Permanent terminal: both `NotFound` and `Server(Error{..})`
+            // fan out per-id (the batch was transmitted, every id gets
+            // a `Failed` lane carrying the same `AccountError`). Other
+            // permanent classes still terminate the stream because the
+            // engine has no per-id signal to lean on.
             !matches!(err.kind(), AccountErrorKind::NotFound(_))
                 && !matches!(
                     err.kind(),
@@ -483,7 +502,16 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
             code: status.to_string(),
         });
 
-    let (kind, cause) = classify_response(status, &signal, ctx);
+    // Retry hint is structural on `ServerCause` per Phase 5A. Wrap the
+    // parsed `Retry-After` Duration with `RetryHint::After` and inject
+    // it into the cause before classification picks the variant.
+    let retry_hint = resp
+        .headers
+        .retry_after
+        .filter(|_| is_retry_after_applicable(status, &signal))
+        .map(RetryHint::After);
+
+    let (kind, cause) = classify_response(status, &signal, ctx, retry_hint);
 
     let mut builder = AccountErrorBuilder::new(kind, cause)
         .provider(Provider::Gmail)
@@ -504,6 +532,14 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
 
     builder = builder.push_cause(Cause::Wire(WireCause::Gmail(signal.clone())));
 
+    // gmail-D1: the response was acknowledged. Push the attempt
+    // evidence so non-idempotent ops with a `Server(Error)` cause
+    // route to `Retry::SameRequest` (commit-rejection) rather than
+    // `Reconcile(TransportDropAfterSend)`.
+    builder = builder.push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::Acknowledged,
+    )));
+
     if let Some(id) = resp.headers.request_id.as_deref() {
         builder = builder.request_id(id.to_owned());
     }
@@ -520,11 +556,10 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         )));
     }
 
-    if let Some(retry_after) = resp.headers.retry_after
-        && let Some(deadline) = SystemTime::now().checked_add(retry_after)
-        && is_retry_after_applicable(status, &signal)
-    {
-        builder = builder.retry_not_before(deadline);
+    if let Some(extra) = ctx.diagnostic_id.as_deref() {
+        builder = builder.text(DiagnosticText::support_only(format!(
+            "gmail diagnostic id: {extra}"
+        )));
     }
 
     if let Some(throttle) = throttle_scope_for(status, &signal, ctx) {
@@ -535,13 +570,16 @@ fn translate_response(resp: GmailResponseError, ctx: &GmailErrorContext) -> Acco
         builder = builder.idempotency_override(idem);
     }
 
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn classify_response(
     status: u16,
     signal: &GmailSignal,
     ctx: &GmailErrorContext,
+    retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause) {
     // First, dispatch on Gmail reason (most precise).
     match signal {
@@ -565,19 +603,19 @@ fn classify_response(
         GmailSignal::QuotaExceeded => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
             );
         }
         GmailSignal::RateLimitExceeded | GmailSignal::UserRateLimitExceeded => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_after: None }),
+                Cause::Server(ServerCause::RateLimited { retry_hint }),
             );
         }
         GmailSignal::BackendError => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_after: None }),
+                Cause::Server(ServerCause::Unavailable { retry_hint }),
             );
         }
         GmailSignal::FailedPrecondition if ctx.history_endpoint => {
@@ -586,8 +624,14 @@ fn classify_response(
                 Cause::State(StateCause::CursorInvalid),
             );
         }
+        // gmail-D6: outside the history endpoint a `failedPrecondition`
+        // signals an etag/version mismatch on the targeted resource,
+        // not a malformed client request.
         GmailSignal::FailedPrecondition => {
-            return malformed_kind_cause("failedPrecondition outside history context".to_owned());
+            return (
+                AccountErrorKind::ConcurrencyConflict,
+                Cause::State(StateCause::ConcurrencyConflict),
+            );
         }
         GmailSignal::HistoryNotFound => {
             return (
@@ -619,7 +663,7 @@ fn classify_response(
         GmailSignal::PubSubSubscriptionDeleted | GmailSignal::PubSubSubscriptionExpired => {
             return (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_after: None }),
+                Cause::Server(ServerCause::Unavailable { retry_hint }),
             );
         }
         GmailSignal::Unknown { code } => {
@@ -634,7 +678,7 @@ fn classify_response(
                     return (
                         AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope),
                         Cause::Access(AccessCause::InsufficientScope {
-                            needed: "gmail.modify",
+                            needed: gmail_scope_for(ctx.operation),
                         }),
                     );
                 }
@@ -644,10 +688,10 @@ fn classify_response(
                         Cause::Access(AccessCause::PolicyBlocked),
                     );
                 }
-                "dailyLimitExceeded" => {
+                code if is_daily_limit_signal_code(code) => {
                     return (
                         AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                        Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                        Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
                     );
                 }
                 "conditionNotMet" => {
@@ -673,10 +717,14 @@ fn classify_response(
 
     // HTTP status fallback (used when no recognized Gmail reason
     // matched, e.g. an unknown reason with a stable status code).
-    classify_by_status(status, ctx)
+    classify_by_status(status, ctx, retry_hint)
 }
 
-fn classify_by_status(status: u16, ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
+fn classify_by_status(
+    status: u16,
+    ctx: &GmailErrorContext,
+    retry_hint: Option<RetryHint>,
+) -> (AccountErrorKind, Cause) {
     match status {
         400 if ctx.history_endpoint => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
@@ -709,11 +757,11 @@ fn classify_by_status(status: u16, ctx: &GmailErrorContext) -> (AccountErrorKind
         413 => malformed_kind_cause("HTTP 413 payload too large".to_owned()),
         429 => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after: None }),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
         ),
         500..=599 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint }),
         ),
         other => (
             AccountErrorKind::Server(ServerErrorKind::Error {
@@ -723,6 +771,78 @@ fn classify_by_status(status: u16, ctx: &GmailErrorContext) -> (AccountErrorKind
                 status: Some(other),
             }),
         ),
+    }
+}
+
+/// gmail-N6: `dailyLimitExceeded` lives under `GmailSignal::Unknown`
+/// (it's not in the typed signal enum). Classify the code in one place
+/// so both `classify_response` and `throttle_scope_for` agree.
+fn is_daily_limit_signal_code(code: &str) -> bool {
+    code == "dailyLimitExceeded"
+}
+
+/// gmail-D5: pick the OAuth scope `needed` for an `InsufficientScope`
+/// `AccessCause` based on which operation tripped it. Returns the
+/// shortest scope that grants the operation according to Google's
+/// documented scope matrix.
+fn gmail_scope_for(op: AccountOperation) -> &'static str {
+    match op {
+        // Composition / send flows.
+        AccountOperation::Send => "gmail.send",
+        AccountOperation::DraftCreate
+        | AccountOperation::DraftUpdate
+        | AccountOperation::DraftDiscard
+        | AccountOperation::DraftSend => "gmail.compose",
+        // Label CRUD lives under the labels scope.
+        AccountOperation::ContainerCreate
+        | AccountOperation::ContainerRename
+        | AccountOperation::ContainerMove
+        | AccountOperation::ContainerDelete
+        | AccountOperation::ContainersList => "gmail.labels",
+        // Settings (sendAs / vacation).
+        AccountOperation::IdentitiesList | AccountOperation::IdentityUpdate => {
+            "gmail.settings.basic"
+        }
+        AccountOperation::VacationGet | AccountOperation::VacationSet => "gmail.settings.basic",
+        // Read-only hydration / inventory paths.
+        AccountOperation::SyncInventory
+        | AccountOperation::SyncChanges
+        | AccountOperation::Hydrate
+        | AccountOperation::HydrateThread
+        | AccountOperation::HydrateMessage
+        | AccountOperation::OpenBlob
+        | AccountOperation::OpenBlobRange
+        | AccountOperation::Search
+        | AccountOperation::SearchMessages
+        | AccountOperation::Discover
+        | AccountOperation::EstablishCursor
+        | AccountOperation::DiscoverCursorScopes
+        | AccountOperation::DiscoverMemberships
+        | AccountOperation::ScopeLifecycle
+        | AccountOperation::QuotaGet => "gmail.readonly",
+        // Push watch CRUD requires the metadata scope at minimum;
+        // Pub/Sub still uses the user mailbox surface.
+        AccountOperation::PushSubscribe
+        | AccountOperation::PushUnsubscribe
+        | AccountOperation::PushStream => "gmail.metadata",
+        // Everything else - flag mutation, label membership, move,
+        // destroy, etc. - requires gmail.modify.
+        AccountOperation::UpdateFlags
+        | AccountOperation::BulkMove
+        | AccountOperation::BulkDestroy
+        | AccountOperation::AddToContainer
+        | AccountOperation::RemoveFromContainer
+        | AccountOperation::SetKeyword
+        | AccountOperation::SetLabelMembership
+        | AccountOperation::SetCategory
+        | AccountOperation::SetExtendedProperty
+        | AccountOperation::SetIsRead
+        | AccountOperation::AttachmentUpload
+        | AccountOperation::Close
+        | AccountOperation::Expunge => "gmail.modify",
+        // AccountOperation is #[non_exhaustive] from bifrost-types; new
+        // ops default to gmail.modify until explicit mapping is added.
+        _ => "gmail.modify",
     }
 }
 
@@ -736,6 +856,15 @@ fn malformed_kind_cause(detail: String) -> (AccountErrorKind, Cause) {
 }
 
 fn not_found_kind_cause(ctx: &GmailErrorContext) -> (AccountErrorKind, Cause) {
+    // gmail-D2: every typed `GmailResource` now maps to a real
+    // `ResourceKind` (Blob -> Message because a missing blob means
+    // the parent message can't be opened, PubSubWatch ->
+    // PushSubscription, etc.). The only `None` is `Account`, which
+    // has no `ResourceKind` analogue - that path falls back to
+    // `Message` because Gmail's only account-scoped 404 endpoint is
+    // `users.getProfile`, and "the account isn't there" is the
+    // closest available routing target. There is no silent coercion
+    // of non-message resources anymore.
     let what = ctx
         .resource
         .and_then(GmailResource::to_resource_kind)
@@ -781,7 +910,7 @@ fn throttle_scope_for(
                 | GmailSignal::UserRateLimitExceeded
                 | GmailSignal::QuotaExceeded
         )
-        || matches!(signal, GmailSignal::Unknown { code } if code == "dailyLimitExceeded");
+        || matches!(signal, GmailSignal::Unknown { code } if is_daily_limit_signal_code(code));
     if is_throttle_status {
         ctx.throttle_scope.or(Some(ThrottleScope::Account))
     } else {
@@ -789,7 +918,11 @@ fn throttle_scope_for(
     }
 }
 
-fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
+fn parse_failed(
+    ctx: &GmailErrorContext,
+    detail: String,
+    attempt: Option<TransmissionState>,
+) -> AccountError {
     let mut builder = AccountErrorBuilder::new(
         AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
         Cause::Wire(WireCause::MalformedResponse {
@@ -804,7 +937,15 @@ fn parse_failed(ctx: &GmailErrorContext, detail: String) -> AccountError {
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
-    builder.build()
+    // gmail-D1: post-200 decode failures (`JsonDecode`, `Base64`) get
+    // `Acknowledged` because the response was received before the
+    // decode failed.
+    if let Some(state) = attempt {
+        builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
+    }
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
@@ -821,7 +962,9 @@ fn malformed_request(ctx: &GmailErrorContext, detail: String) -> AccountError {
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn missing_field(ctx: &GmailErrorContext, field: &'static str, detail: String) -> AccountError {
@@ -843,7 +986,9 @@ fn missing_field(ctx: &GmailErrorContext, field: &'static str, detail: String) -
     if let Some(scope) = ctx.scope.clone() {
         builder = builder.scope(scope);
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountError {
@@ -862,7 +1007,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             if let Some(text) = detail {
                 builder = builder.text(DiagnosticText::support_only(text));
             }
-            builder.build()
+            builder
+                .try_build()
+                .expect("valid account error classification")
         }
         GmailLocalError::InvalidRequest { operation, detail } => {
             let mut new_ctx = ctx.clone();
@@ -894,7 +1041,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
                 GmailCursorFailure::SchemaMismatch => "cursor_schema_mismatch",
                 GmailCursorFailure::MalformedPayload => "cursor_malformed",
             });
-            builder.build()
+            builder
+                .try_build()
+                .expect("valid account error classification")
         }
         GmailLocalError::AccountIdentityMismatch {
             cursor_email,
@@ -911,7 +1060,8 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
         .text(DiagnosticText::support_only(format!(
             "cursor account {cursor_email} != open account {profile_email}"
         )))
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         GmailLocalError::MissingField { field, detail } => missing_field(ctx, field, detail),
         GmailLocalError::BlobRangeUnsupported { blob_id } => {
             let mut builder = AccountErrorBuilder::new(
@@ -929,7 +1079,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
-            builder.build()
+            builder
+                .try_build()
+                .expect("valid account error classification")
         }
         GmailLocalError::Internal { detail } => {
             // Internal failures classify as protocol contract violations
@@ -948,7 +1100,9 @@ fn translate_local(local: GmailLocalError, ctx: &GmailErrorContext) -> AccountEr
             if let Some(scope) = ctx.scope.clone() {
                 builder = builder.scope(scope);
             }
-            builder.build()
+            builder
+                .try_build()
+                .expect("valid account error classification")
         }
     }
 }
@@ -1428,5 +1582,225 @@ mod tests {
         // exposes it verbatim so dashboards can filter on unknown
         // reasons until the gap is closed.
         assert_eq!(acc.telemetry_fields().native_code, Some("teapot"));
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 5C decision coverage
+    // ---------------------------------------------------------------
+
+    /// gmail-D1: every HTTP `Response` carries an
+    /// `AttemptCause(Acknowledged)` so the central recovery mapping
+    /// can distinguish acknowledged-vs-unsent for non-idempotent ops.
+    #[test]
+    fn response_pushes_acknowledged_attempt_cause() {
+        let err = gmail_response(500, "x");
+        let acc = into_account_error(err, GmailErrorContext::inventory());
+        let attempt = acc
+            .chain()
+            .iter()
+            .find_map(|cause| match cause {
+                bifrost_types::Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            })
+            .expect("response carries an Attempt cause");
+        assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
+    }
+
+    /// gmail-D1: post-200 decode failures classify as Acknowledged.
+    #[test]
+    fn json_decode_pushes_acknowledged_attempt_cause() {
+        let source = serde_json::from_slice::<serde_json::Value>(b"not json").expect_err("decode");
+        let err = Error::JsonDecode {
+            service: crate::error::GmailService::GmailApi,
+            source,
+        };
+        let acc = into_account_error(err, GmailErrorContext::inventory());
+        let attempt = acc
+            .chain()
+            .iter()
+            .find_map(|cause| match cause {
+                bifrost_types::Cause::Attempt(a) => Some(a.transmission_state),
+                _ => None,
+            })
+            .expect("decode error carries an Attempt cause");
+        assert_eq!(attempt, bifrost_types::TransmissionState::Acknowledged);
+    }
+
+    /// gmail-D2: drafts route to `NotFound(Draft)`, not `Message`.
+    #[test]
+    fn not_found_draft_uses_draft_resource() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(err, GmailErrorContext::draft(AccountOperation::DraftUpdate));
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Draft)
+        ));
+    }
+
+    /// gmail-D2: identities route to `NotFound(Identity)`.
+    #[test]
+    fn not_found_identity_uses_identity_resource() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(err, GmailErrorContext::identity_update());
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Identity)
+        ));
+    }
+
+    /// gmail-D2: vacation responder routes to `NotFound(Vacation)`.
+    #[test]
+    fn not_found_vacation_uses_vacation_resource() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(err, GmailErrorContext::vacation_get());
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Vacation)
+        ));
+    }
+
+    /// gmail-D2: Pub/Sub watch routes to `NotFound(PushSubscription)`.
+    #[test]
+    fn not_found_pubsub_uses_push_subscription_resource() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(err, GmailErrorContext::push_unsubscribe());
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::PushSubscription)
+        ));
+    }
+
+    /// gmail-D5: `InsufficientScope::needed` reflects the operation.
+    #[test]
+    fn insufficient_scope_needed_for_send_is_gmail_send() {
+        let err = gmail_response(403, &body_with_reason("insufficientPermissions"));
+        let acc = into_account_error(err, GmailErrorContext::send());
+        let outermost = acc.chain().outermost();
+        match outermost {
+            bifrost_types::Cause::Access(bifrost_types::AccessCause::InsufficientScope {
+                needed,
+            }) => assert_eq!(*needed, "gmail.send"),
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insufficient_scope_needed_for_container_is_gmail_labels() {
+        let err = gmail_response(403, &body_with_reason("insufficientPermissions"));
+        let acc = into_account_error(
+            err,
+            GmailErrorContext::container(AccountOperation::ContainerCreate),
+        );
+        let outermost = acc.chain().outermost();
+        match outermost {
+            bifrost_types::Cause::Access(bifrost_types::AccessCause::InsufficientScope {
+                needed,
+            }) => assert_eq!(*needed, "gmail.labels"),
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insufficient_scope_needed_for_inventory_is_readonly() {
+        let err = gmail_response(403, &body_with_reason("insufficientPermissions"));
+        let acc = into_account_error(err, GmailErrorContext::inventory());
+        let outermost = acc.chain().outermost();
+        match outermost {
+            bifrost_types::Cause::Access(bifrost_types::AccessCause::InsufficientScope {
+                needed,
+            }) => assert_eq!(*needed, "gmail.readonly"),
+            other => panic!("expected InsufficientScope, got {other:?}"),
+        }
+    }
+
+    /// gmail-D6: `failedPrecondition` outside the history endpoint
+    /// routes to `ConcurrencyConflict`, not `Request(Malformed)`.
+    #[test]
+    fn non_history_failed_precondition_maps_to_concurrency_conflict() {
+        let err = gmail_response(412, &body_with_reason("failedPrecondition"));
+        let acc = into_account_error(
+            err,
+            GmailErrorContext::mutation(AccountOperation::UpdateFlags),
+        );
+        assert!(matches!(acc.kind(), AccountErrorKind::ConcurrencyConflict));
+        let RecoveryClass::Retry(advice) = acc.recovery() else {
+            panic!("expected retry");
+        };
+        assert_eq!(advice.disposition, RetryDisposition::AfterStateRefresh);
+        assert_eq!(advice.reason, RetryReason::ConcurrencyConflict);
+    }
+
+    /// gmail-D4: `Retry-After` flows structurally through `ServerCause`
+    /// and surfaces as `RetryAdvice::retry_hint`.
+    #[test]
+    fn retry_after_propagates_to_retry_hint() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("42"),
+        );
+        let resp_headers = crate::error::GmailResponseHeaders::from_headers(&headers);
+        let body = body_with_reason("rateLimitExceeded");
+        let resp = GmailResponseError {
+            service: crate::error::GmailService::GmailApi,
+            status: 429,
+            headers: resp_headers,
+            body: bytes::Bytes::copy_from_slice(body.as_bytes()),
+            envelope: super::parse_envelope(body.as_bytes()),
+        };
+        let acc = translate_response(resp, &GmailErrorContext::inventory());
+        let RecoveryClass::Retry(advice) = acc.recovery() else {
+            panic!("expected retry");
+        };
+        let hint = advice
+            .retry_hint
+            .expect("retry hint flows from Retry-After");
+        assert_eq!(
+            hint.min_delay(std::time::SystemTime::now()),
+            std::time::Duration::from_secs(42)
+        );
+    }
+
+    /// gmail-D3: a 401 from Pub/Sub watch translates as terminal so
+    /// the renewer can emit `WatchEvent::Terminated(AccountError)`
+    /// rather than swallowing the failure into `Disconnected`.
+    #[test]
+    fn pubsub_auth_failure_is_terminal() {
+        let err = gmail_response(401, &body_with_reason("authError"));
+        let acc = into_account_error(err, GmailErrorContext::push_subscribe());
+        assert!(acc.recovery().is_terminal());
+        assert!(matches!(acc.recovery(), RecoveryClass::AuthLost));
+    }
+
+    /// gmail-D3: a 500 from Pub/Sub watch is transient (Retry) so the
+    /// renewer keeps trying and emits `Disconnected` instead of
+    /// `Terminated`.
+    #[test]
+    fn pubsub_5xx_is_transient_retry() {
+        let err = gmail_response(503, "");
+        let acc = into_account_error(err, GmailErrorContext::push_subscribe());
+        assert!(acc.recovery().is_retryable());
+    }
+
+    /// gmail-D5: scope helper maps each gmail operation to a scope.
+    #[test]
+    fn gmail_scope_for_covers_canonical_operations() {
+        assert_eq!(gmail_scope_for(AccountOperation::Send), "gmail.send");
+        assert_eq!(
+            gmail_scope_for(AccountOperation::DraftCreate),
+            "gmail.compose"
+        );
+        assert_eq!(
+            gmail_scope_for(AccountOperation::ContainerCreate),
+            "gmail.labels"
+        );
+        assert_eq!(
+            gmail_scope_for(AccountOperation::UpdateFlags),
+            "gmail.modify"
+        );
+        assert_eq!(
+            gmail_scope_for(AccountOperation::HydrateMessage),
+            "gmail.readonly"
+        );
     }
 }

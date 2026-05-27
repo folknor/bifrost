@@ -209,6 +209,76 @@ This is what lets the central recovery mapping distinguish
 in `bifrost-types::recovery` consumes those response codes via the
 typed `ImapResponseCode` wire variants.
 
+`Error::No` and `Error::Bad` both carry `attempt:
+Option<ImapAttempt>`; constructors (`no_with_code`, `bad_with_code`)
+default this to `Some(Acknowledged)` because a tagged `NO` / `BAD` is
+by definition a server-acknowledged terminal response. Without this,
+recovery rows that key on `Acknowledged` (e.g. `Server(Error { status:
+None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent`
+arm and misclassify provider refusals as retryable transport drops.
+
+### Concurrency conflicts and UNCHANGEDSINCE
+
+IMAP diverges from the `MutationSuccess::Skipped` lane that other
+provider crates use when the engine's "already in this state" probe
+short-circuits a mutation. IMAP's MODSEQ cache is opportunistic: a
+cold-cache STORE goes out without `UNCHANGEDSINCE`, so we cannot
+observe "already in state" without a full SELECT+FETCH that would
+defeat the purpose of the guard. Concretely, `STORE UNCHANGEDSINCE
+<modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed
+{ kind: ConcurrencyConflict }` for the conflicting UIDs - never as
+`Succeeded(Skipped)`. `concurrency_conflict_error` /
+`store_failed_error` / `uidvalidity_changed_error` each take the
+caller's `AccountOperation` so flag / move / destroy paths emit
+their own op (the central recovery mapping picks
+`Retry::AfterStateRefresh` regardless, but the operation tag drives
+telemetry and per-op retry budgets).
+
+### Strategy downgrade derivation
+
+`EngineDirective::DowngradeStrategy` is reserved for the "all
+strategies exhausted" case. IMAP today never derives that directive
+at runtime: `changes.rs` handles every QRESYNC -> CONDSTORE ->
+Basic downgrade inline via `Warning::StrategyDowngraded` plus a
+direct retry on the lower strategy. The `strategy_failure` helper
+in `account/error.rs` is wired through the builder funnel and
+covered by tests so the directive is producible when needed, but
+the runtime path that reaches it does not exist while Basic remains
+the universal fallback.
+
+### Per-folder mutation failure contract
+
+`mutate::mutation_stream` does not emit a trailing global
+`SyncEvent::Terminated` once a folder fails mid-batch. A per-folder
+fatal after per-item emissions surfaces as `ItemOutcome::Uncertain`
+for every remaining target in the failing folder (carrying the
+classified `AccountError`), and the loop continues to the next
+folder. Stream-level `Terminated` is reserved for failures that
+prevent any further folder attempt - auth lost, schema /
+capability break. `stream_terminating` is the gate.
+
+### Output-channel-dropped contract
+
+Every streaming task (`inventory_stream`, `changes_stream`,
+`get_stream`, `open_blob`, `mutation_stream`) treats a `tx.send`
+failure on a dropped output receiver as silent termination: the
+task returns without synthesizing any `crate::Error` and without
+emitting a fatal `SyncEvent::Terminated`. The error funnel is
+reserved for wire failures and structural invariant breaks; a
+consumer that walks away from its stream is not an error.
+
+### Terminated-event helper
+
+`account/mod.rs` exposes a single `terminated_event::<T, _>(cause)`
+helper for surfacing fatal stream causes as
+`SyncEvent::Terminated`. It accepts any `Into<TerminatedCause>`:
+- a pre-built `AccountError` (UIDVALIDITY change, modseq reset,
+  pre-classified failures), or
+- an `(Error, ImapErrorContext)` pair to classify on the way out
+  (the legacy `fatal_event(err, ctx)` alias keeps reading naturally
+  at call sites).
+Callers do not need to choose which lane to dispatch through.
+
 ## Module layout
 
 ```

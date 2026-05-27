@@ -156,16 +156,24 @@ impl Client {
         };
 
         let mut builder = ClientBuilder::from_uri(uri)
-            .add_header(header::AUTHORIZATION, auth_value)?
+            .add_header(header::AUTHORIZATION, auth_value)
+            .map_err(crate::Error::WebSocketHandshake)?
             .add_header(
                 header::SEC_WEBSOCKET_PROTOCOL,
                 HeaderValue::from_static("jmap"),
-            )?;
+            )
+            .map_err(crate::Error::WebSocketHandshake)?;
         if let Some(ref connector) = connector {
             builder = builder.connector(connector);
         }
 
-        let (stream, response) = builder.connect().await?;
+        // Pre-handshake error: no bytes from the JMAP request itself
+        // have crossed the side-effect boundary. Classification is
+        // `Transport(Network) + Attempt(Unsent)`, not `Protocol(_)`.
+        let (stream, response) = builder
+            .connect()
+            .await
+            .map_err(crate::Error::WebSocketHandshake)?;
         validate_ws_subprotocol(&response)?;
         let (tx, mut rx) = stream.split();
 
@@ -211,7 +219,9 @@ impl Client {
                         saw_close = true;
                     }
                     Ok(_) => (),
-                    Err(err) => yield Err(err.into()),
+                    // Post-handshake runtime drop. Classification is
+                    // `Protocol(PartialResponse) + Attempt(Acknowledged)`.
+                    Err(err) => yield Err(crate::Error::WebSocketRuntime(err)),
                 }
             }
 
@@ -244,7 +254,8 @@ impl Client {
                 })
                 .unwrap_or_default(),
             ))
-            .await?;
+            .await
+            .map_err(crate::Error::WebSocketRuntime)?;
 
         Ok(request_id)
     }
@@ -269,7 +280,7 @@ impl Client {
                 .unwrap_or_default(),
             ))
             .await
-            .map_err(std::convert::Into::into)
+            .map_err(crate::Error::WebSocketRuntime)
     }
 
     pub(crate) async fn disable_push_ws(&self) -> crate::Result<()> {
@@ -286,7 +297,7 @@ impl Client {
                 .unwrap_or_default(),
             ))
             .await
-            .map_err(std::convert::Into::into)
+            .map_err(crate::Error::WebSocketRuntime)
     }
 
     pub(crate) async fn ws_ping(&self) -> crate::Result<()> {
@@ -298,7 +309,7 @@ impl Client {
             .tx
             .send(Message::ping(Bytes::new()))
             .await
-            .map_err(std::convert::Into::into)
+            .map_err(crate::Error::WebSocketRuntime)
     }
 }
 

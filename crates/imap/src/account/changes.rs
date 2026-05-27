@@ -59,9 +59,10 @@ pub(crate) fn changes_stream(
     cursor: ChangeCursor,
 ) -> bifrost_types::AccountStream<SyncEvent<Change>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
+    let scope_for_ctx = cursor.scope.clone();
     tokio::spawn(async move {
         match run_changes(account, cursor, tx.clone()).await {
-            Ok(()) => {}
+            Ok(()) | Err(ChangeError::ChannelDropped) => {}
             Err(ChangeError::Account(err)) => {
                 let _ = tx.send(terminated_event(err)).await;
             }
@@ -71,7 +72,8 @@ pub(crate) fn changes_stream(
                         err,
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::SyncChanges,
-                        ),
+                        )
+                        .with_cursor_scope(scope_for_ctx),
                     ))
                     .await;
             }
@@ -116,6 +118,10 @@ enum ChangeError {
         previous: u64,
         current: Option<u64>,
     },
+    /// The consumer dropped the output receiver. This is not an error
+    /// to escalate: per IMAP plan, dropped output channels stop the
+    /// streaming task silently and return without emitting a fatal.
+    ChannelDropped,
 }
 
 impl From<crate::Error> for ChangeError {
@@ -342,7 +348,7 @@ async fn run_qresync(
                                     let out = std::mem::take(&mut changes);
                                     tx.send(batch(out, PageBoundary::Page, None))
                                         .await
-                                        .map_err(|_| crate::Error::closed())?;
+                                        .map_err(|_| ChangeError::ChannelDropped)?;
                                     flushed_qresync_changes = true;
                                 }
                             }
@@ -362,7 +368,7 @@ async fn run_qresync(
                         let out = std::mem::take(&mut changes);
                         tx.send(batch(out, PageBoundary::Page, None))
                             .await
-                            .map_err(|_| crate::Error::closed())?;
+                            .map_err(|_| ChangeError::ChannelDropped)?;
                         flushed_qresync_changes = true;
                     }
                 }
@@ -408,11 +414,11 @@ async fn run_qresync(
     if !changes.is_empty() {
         tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| ChangeError::ChannelDropped)?;
     }
     tx.send(SyncEvent::Done(checkpoint))
         .await
-        .map_err(|_| crate::Error::closed())?;
+        .map_err(|_| ChangeError::ChannelDropped)?;
     Ok(())
 }
 
@@ -602,11 +608,11 @@ async fn finish_changes(
     if !changes.is_empty() {
         tx.send(batch(changes, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| ChangeError::ChannelDropped)?;
     }
     tx.send(SyncEvent::Done(checkpoint))
         .await
-        .map_err(|_| crate::Error::closed())?;
+        .map_err(|_| ChangeError::ChannelDropped)?;
     Ok(())
 }
 
@@ -771,7 +777,7 @@ async fn send_warning<T>(
             .with_protocol_detail(bifrost_types::DiagnosticText::support_only("imap")),
     ))
     .await
-    .map_err(|_| crate::Error::closed())?;
+    .map_err(|_| ChangeError::ChannelDropped)?;
     Ok(())
 }
 
@@ -787,7 +793,7 @@ async fn send_strategy_downgrade<T>(
         ),
     ))
     .await
-    .map_err(|_| crate::Error::closed())?;
+    .map_err(|_| ChangeError::ChannelDropped)?;
     Ok(())
 }
 

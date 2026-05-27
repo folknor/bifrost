@@ -792,6 +792,101 @@ phase.
 
 None blocking. Begin Phase A on confirmation.
 
+## Phase 5C follow-ups (deferred, not blocking)
+
+Items the Phase 5C protocol agents landed correctly but with explicit
+caveats. Tracked here so they don't rot in commit messages.
+
+- **jmap-F1.** `scope_lifecycle_stream` element type mismatch.
+  - **status:** the decisions doc (`jmap-D3`) called for
+    `SyncEvent::Terminated(AccountError)` on terminal classes but
+    `Account::scope_lifecycle_stream` returns
+    `AccountStream<ScopeLifecycle>`, not `AccountStream<SyncEvent<_>>`.
+    JMAP classifies and breaks the loop on terminal / engine-action
+    recovery classes today.
+  - **plan:** decide whether `scope_lifecycle_stream` should be
+    wrapped in `SyncEvent<_>` like the other long-running streams.
+    That is a `bifrost-types` trait change; defer to a future phase
+    where the trait surface can be revisited cleanly.
+
+- **jmap-F2.** `JmapMethod::NotJson` / `NotRequest` still maps to
+  `Request(Malformed) -> ClientBug`.
+  - **status:** the convergence doc describes these as
+    `Protocol(ContractViolation) -> ProviderContractViolation`. Audit
+    did not flag this as a Phase 5C item; agent left it for scope.
+  - **plan:** reclassify in Phase 5E (P2 cleanup) or fold into a
+    later targeted commit.
+
+- **jmap-F3.** `MethodErrorType::Other(code)` two-clone smell.
+  - **status:** known smell at `crates/jmap/src/sync/error.rs:812-816`;
+    the dedupe needs a small refactor of the `(kind, primary, wire)`
+    tuple. Out of Phase 5C scope.
+  - **plan:** Phase 5E cleanup.
+
+- **imap-F1.** Auto-promote `Mailbox(id) -> Cursor(Folder(id))` for
+  `SyncState(CursorInvalid)` in `into_account_error`.
+  - **status:** defensive shim added so `EXPUNGEISSUED`/`CLOSED`/etc.
+    in PIM/folder paths build cleanly without threading cursor scope
+    through every call site.
+  - **plan:** centrally-recommended fix is to thread cursor scope
+    through every PIM `op_err`. Phase 5D re-audit should flag this if
+    not closed; otherwise Phase 5E.
+
+- **imap-F2.** `pim_malformed` and `envelope::malformed` reach helper
+  paths that don't know the op.
+  - **status:** both produce `Request(Malformed) -> ClientBug` so
+    operation telemetry is slightly degraded, but recovery class is
+    op-independent here.
+  - **plan:** thread operation when other pim/envelope refactoring
+    happens; not blocking.
+
+- **gmail-F1.** `GmailResource::Account` falls back to
+  `ResourceKind::Message` in `not_found_kind_cause`.
+  - **status:** every other `GmailResource` now maps to a specific
+    `ResourceKind` (`Draft`, `Identity`, `Vacation`, `PushSubscription`)
+    via Phase 5A widening. `Account` has no analogue.
+  - **plan:** add `ResourceKind::Account` to `bifrost-types` if
+    consumer routing needs to distinguish "account-level NotFound"
+    from "message NotFound". Defer until a consumer asks.
+
+- **gmail-F2.** Pub/Sub renewer transient classes use
+  `tracing::warn!` instead of a structured `Warning`.
+  - **status:** `WatchEvent` has no `Warning` variant; the renewer
+    emits structured tracing fields (`kind`, `message_key`,
+    `recovery`) alongside the `WatchEvent::Disconnected` health
+    signal. Terminal classes emit `WatchEvent::Terminated(AccountError)`
+    correctly.
+  - **plan:** if a wire `Warning` variant is desired on `WatchEvent`,
+    add it to `bifrost-types` and have the renewer emit it. Defer.
+
+- **graph-F1.** EWS `STATUS_BODY_CAP` is duplicated as a local
+  constant.
+  - **status:** `bifrost_net::error::STATUS_BODY_CAP` is `pub(crate)`,
+    so graph re-declares `STATUS_BODY_CAP = 4096` with a comment to
+    keep in sync.
+  - **plan:** promote the constant in `bifrost-net` to `pub`. Trivial
+    follow-up.
+
+- **graph-F2.** `pim.rs::object_id_from_value` hardcodes
+  `AccountOperation::Hydrate` for missing-id cases.
+  - **status:** threading the caller's operation through ~10 call
+    sites would have been disproportionate; the audit (graph-N10)
+    only flagged the missing-etag path which is now correct.
+  - **plan:** address in Phase 5E if the telemetry granularity bites.
+
+- **graph-F3.** `pim.rs::submit_write_batch` per-item scope is coarser
+  than ideal (`ErrorScope::Account` instead of `Message { id }`).
+  - **status:** original code didn't track per-item ids; the agent
+    didn't add the tracking since it would be invasive.
+  - **plan:** thread `request_ids` the way `mutate.rs` does in a
+    follow-up commit. Phase 5E candidate.
+
+- **graph-F4.** `mutate.rs:132` "Missing folder destination for Move"
+  still uses `unsupported_account_error(BulkMove)`.
+  - **status:** pre-existing pattern; not named in the decisions doc.
+  - **plan:** Phase 5E cleanup if the classification reads wrong in
+    practice.
+
 ## Phase 5B follow-ups (deferred, not blocking)
 
 Items the Phase 5B sync agent landed correctly but with explicit

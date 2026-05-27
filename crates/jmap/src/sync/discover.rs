@@ -185,7 +185,35 @@ pub(crate) fn scope_lifecycle(
                         tokio::time::sleep(Duration::from_secs(300)).await;
                     }
                 }
-                Err(_) => {
+                Err(err) => {
+                    // Classify rather than swallow. Terminal classes
+                    // (auth lost, capability changed, schema break)
+                    // must not sleep-and-retry every 5 minutes; that
+                    // is a sync-engine decision, not a protocol-side
+                    // one. The previous shape (`Err(_) => sleep`)
+                    // erased the signal entirely.
+                    //
+                    // `scope_lifecycle_stream` returns `ScopeLifecycle`
+                    // not `SyncEvent<_>`, so the protocol cannot emit
+                    // `SyncEvent::Terminated(AccountError)` here in
+                    // the way the convergence plan describes for
+                    // other streams. Honoring the spirit: classify,
+                    // and on terminal recovery classes break out of
+                    // the polling loop so the engine reopens the
+                    // account instead of spinning silently. Retry
+                    // classes continue with the backoff so the engine
+                    // sees normal transient behavior.
+                    let acct = super::error::into_account_error(
+                        err,
+                        super::error::JmapErrorContext::new(
+                            bifrost_types::AccountOperation::ScopeLifecycle,
+                        ),
+                    );
+                    if acct.recovery().is_terminal()
+                        || acct.recovery().requires_engine_action()
+                    {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_secs(300)).await;
                 }
             }

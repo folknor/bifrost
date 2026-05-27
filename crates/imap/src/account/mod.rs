@@ -294,7 +294,7 @@ impl Account for ImapAccount {
         &self,
         ids: AccountStream<bifrost_types::ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         get::get_stream(self.clone(), ids, projection)
     }
 
@@ -578,15 +578,51 @@ pub(crate) fn account_error_with(err: Error, ctx: error::ImapErrorContext) -> Ac
     error::into_account_error(err, ctx)
 }
 
-/// Wrap a crate-private error as a terminal sync-stream event.
-pub(crate) fn fatal_event<T>(err: Error, ctx: error::ImapErrorContext) -> SyncEvent<T> {
-    SyncEvent::Terminated(error::into_account_error(err, ctx))
+/// Wrap a fatal stream cause as `SyncEvent::Terminated`. Accepts any
+/// `Into<TerminatedCause>`: a structured `AccountError` (already built
+/// at the account boundary) or an `(Error, ImapErrorContext)` pair to
+/// classify on the way out. Replaces the previous twin helpers
+/// `fatal_event` / `terminated_event` so call sites do not have to
+/// pick which lane to dispatch through.
+pub(crate) fn terminated_event<T, E: Into<TerminatedCause>>(cause: E) -> SyncEvent<T> {
+    SyncEvent::Terminated(cause.into().into_account_error())
 }
 
-/// Wrap a structured `AccountError` (already built by the account
-/// boundary, e.g. UIDVALIDITY change) as a terminal stream event.
-pub(crate) fn terminated_event<T>(err: AccountError) -> SyncEvent<T> {
-    SyncEvent::Terminated(err)
+/// Carrier for the two ways a stream task currently produces a fatal
+/// `AccountError`: a structured error built at the boundary, or a
+/// crate-private `crate::Error` plus the calling context to classify.
+pub(crate) enum TerminatedCause {
+    Account(AccountError),
+    Classify(Error, error::ImapErrorContext),
+}
+
+impl TerminatedCause {
+    fn into_account_error(self) -> AccountError {
+        match self {
+            Self::Account(err) => err,
+            Self::Classify(err, ctx) => error::into_account_error(err, ctx),
+        }
+    }
+}
+
+impl From<AccountError> for TerminatedCause {
+    fn from(err: AccountError) -> Self {
+        Self::Account(err)
+    }
+}
+
+impl From<(Error, error::ImapErrorContext)> for TerminatedCause {
+    fn from((err, ctx): (Error, error::ImapErrorContext)) -> Self {
+        Self::Classify(err, ctx)
+    }
+}
+
+/// Legacy alias for the classify-on-build helper. Same body as
+/// `terminated_event::<T, _>((err, ctx))` but reads naturally at
+/// call sites that still phrase the action as "fatal-event this
+/// `(Error, ImapErrorContext)`."
+pub(crate) fn fatal_event<T>(err: Error, ctx: error::ImapErrorContext) -> SyncEvent<T> {
+    terminated_event((err, ctx))
 }
 
 pub(crate) fn boxed_receiver_stream<T: Send + 'static>(

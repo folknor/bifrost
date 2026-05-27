@@ -277,12 +277,11 @@ impl GraphClient {
             "POST" => account_net.post(url),
             "PATCH" => account_net.patch(url),
             "DELETE" => account_net.delete(url),
-            _ => {
-                return Err(GraphError::Net(bifrost_net::Error::Network {
-                    message: format!("Unsupported HTTP method: {method}"),
-                    transmission_state: TransmissionState::Unsent,
-                    source: None,
-                }));
+            // pub(crate) callers route through `get_json` / `post` /
+            // `patch` / `delete` / `post_empty` only; any other token
+            // is a programmer bug rather than a runtime path.
+            other => {
+                unreachable!("unsupported HTTP method passed to GraphClient::execute: {other}")
             }
         };
 

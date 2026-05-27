@@ -51,7 +51,11 @@ pub(crate) struct GraphResponseError {
     /// `error.code` decoded into the typed signal enum. Stable
     /// Microsoft codes map onto named variants; everything else lands
     /// in `GraphSignal::Unknown { code }` carrying the verbatim token.
-    pub(crate) signal: GraphSignal,
+    /// `None` distinguishes "no Graph error envelope was parseable"
+    /// from "envelope decoded with an empty `code`"; the boundary
+    /// translates the former into `WireCause::MalformedResponse` while
+    /// the latter still flows through `GraphSignal::Unknown`.
+    pub(crate) signal: Option<GraphSignal>,
     /// `error.message`. Kept for support-only diagnostic text. Must
     /// never drive classification.
     pub(crate) message: Option<String>,
@@ -119,15 +123,9 @@ impl GraphResponseError {
                     client_request_id: ie.client_request_id,
                     date: ie.date,
                 });
-                (signal, envelope.error.message, inner)
+                (Some(signal), envelope.error.message, inner)
             }
-            None => (
-                GraphSignal::Unknown {
-                    code: String::new(),
-                },
-                None,
-                None,
-            ),
+            None => (None, None, None),
         };
 
         Self {
@@ -201,7 +199,7 @@ mod tests {
         );
         assert!(matches!(
             err.signal,
-            GraphSignal::InvalidAuthenticationToken
+            Some(GraphSignal::InvalidAuthenticationToken)
         ));
         assert_eq!(err.message.as_deref(), Some("Access token is empty."));
         let inner = err.inner.expect("inner present");
@@ -218,7 +216,7 @@ mod tests {
             body(json),
         );
         assert!(
-            matches!(err.signal, GraphSignal::InvalidDeltaToken),
+            matches!(err.signal, Some(GraphSignal::InvalidDeltaToken)),
             "expected InvalidDeltaToken, got {:?}",
             err.signal
         );
@@ -233,7 +231,7 @@ mod tests {
             body(json),
         );
         match err.signal {
-            GraphSignal::Unknown { code } => assert_eq!(code, "SomeUnknownCode"),
+            Some(GraphSignal::Unknown { code }) => assert_eq!(code, "SomeUnknownCode"),
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -245,7 +243,9 @@ mod tests {
             HeaderMap::new(),
             body("Bad Gateway\n"),
         );
-        assert!(matches!(err.signal, GraphSignal::Unknown { ref code } if code.is_empty()));
+        // No envelope decoded -> `signal: None`; the boundary turns this
+        // into `WireCause::MalformedResponse`.
+        assert!(err.signal.is_none());
         assert!(err.message.is_none());
         assert!(err.inner.is_none());
     }

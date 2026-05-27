@@ -32,7 +32,8 @@ fn schema_incompatible_search_cursor() -> AccountError {
     .text(bifrost_types::DiagnosticText::support_only(
         "search page cursor was malformed",
     ))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 use bytes::Bytes;
 use futures::StreamExt;

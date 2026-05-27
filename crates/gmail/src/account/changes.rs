@@ -1,6 +1,6 @@
 //! Gmail history-id driven change stream.
 //!
-//! All error paths route through `recovery::into_account_error`. The
+//! All error paths route through `account_error::into_account_error`. The
 //! history endpoint context maps 404 / 410 / `historyNotFound` /
 //! `failedPrecondition` to `SyncState(CursorInvalid)` with the
 //! account cursor scope, which the central recovery mapper resolves
@@ -21,7 +21,7 @@ use crate::error::{Error, GmailLocalError};
 use crate::types::{GmailHistoryItem, GmailMessage, GmailProfile};
 
 use super::cursor::{cursor_for_history, decode_gmail_state};
-use super::recovery;
+use super::error as account_error;
 
 pub(crate) fn changes_stream(
     client: Arc<GmailClient>,
@@ -53,11 +53,11 @@ pub(crate) fn changes_stream(
             let Some(cursor) = state.cursor.take() else {
                 state.finished = true;
                 state.emitted_done = true;
-                let account_error = recovery::into_account_error(
+                let account_error = account_error::into_account_error(
                     Error::Local(GmailLocalError::Internal {
                         detail: "gmail change stream missing cursor".to_string(),
                     }),
-                    recovery::GmailErrorContext::changes(),
+                    account_error::GmailErrorContext::changes(),
                 );
                 return Some((SyncEvent::Terminated(account_error), state));
             };
@@ -66,20 +66,22 @@ pub(crate) fn changes_stream(
                 Err(error) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let account_error =
-                        recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                    let account_error = account_error::into_account_error(
+                        error,
+                        account_error::GmailErrorContext::changes(),
+                    );
                     return Some((SyncEvent::Terminated(account_error), state));
                 }
             };
             if decoded.profile_email != state.profile.email_address {
                 state.finished = true;
                 state.emitted_done = true;
-                let account_error = recovery::into_account_error(
+                let account_error = account_error::into_account_error(
                     Error::Local(GmailLocalError::AccountIdentityMismatch {
                         cursor_email: decoded.profile_email,
                         profile_email: state.profile.email_address.clone(),
                     }),
-                    recovery::GmailErrorContext::changes(),
+                    account_error::GmailErrorContext::changes(),
                 );
                 return Some((SyncEvent::Terminated(account_error), state));
             }
@@ -91,20 +93,22 @@ pub(crate) fn changes_stream(
                 Ok(current) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let account_error = recovery::into_account_error(
+                    let account_error = account_error::into_account_error(
                         Error::Local(GmailLocalError::AccountIdentityMismatch {
                             cursor_email: decoded.profile_email,
                             profile_email: current.email_address,
                         }),
-                        recovery::GmailErrorContext::changes(),
+                        account_error::GmailErrorContext::changes(),
                     );
                     return Some((SyncEvent::Terminated(account_error), state));
                 }
                 Err(error) => {
                     state.finished = true;
                     state.emitted_done = true;
-                    let account_error =
-                        recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                    let account_error = account_error::into_account_error(
+                        error,
+                        account_error::GmailErrorContext::changes(),
+                    );
                     return Some((SyncEvent::Terminated(account_error), state));
                 }
             }
@@ -113,9 +117,9 @@ pub(crate) fn changes_stream(
         let Some(start_history_id) = state.start_history_id.as_deref() else {
             state.finished = true;
             state.emitted_done = true;
-            let account_error = recovery::into_account_error(
+            let account_error = account_error::into_account_error(
                 Error::missing_field("start_history_id", "gmail change stream"),
-                recovery::GmailErrorContext::changes(),
+                account_error::GmailErrorContext::changes(),
             );
             return Some((SyncEvent::Terminated(account_error), state));
         };
@@ -131,12 +135,12 @@ pub(crate) fn changes_stream(
                     Err(error) => {
                         state.finished = true;
                         state.emitted_done = true;
-                        let account_error = recovery::into_account_error(
+                        let account_error = account_error::into_account_error(
                             Error::missing_field(
                                 "historyId",
                                 format!("gmail history response invalid: {error}"),
                             ),
-                            recovery::GmailErrorContext::changes(),
+                            account_error::GmailErrorContext::changes(),
                         );
                         return Some((SyncEvent::Terminated(account_error), state));
                     }
@@ -169,8 +173,10 @@ pub(crate) fn changes_stream(
             Err(error) => {
                 state.finished = true;
                 state.emitted_done = true;
-                let account_error =
-                    recovery::into_account_error(error, recovery::GmailErrorContext::changes());
+                let account_error = account_error::into_account_error(
+                    error,
+                    account_error::GmailErrorContext::changes(),
+                );
                 Some((SyncEvent::Terminated(account_error), state))
             }
         }

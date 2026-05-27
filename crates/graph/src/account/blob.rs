@@ -111,7 +111,8 @@ fn open_blob_inner_stream(
                 .operation(AccountOperation::OpenBlob)
                 .provider(Provider::Microsoft)
                 .protocol(Protocol::Graph)
-                .build();
+                .try_build()
+                .expect("valid account error classification");
                 yield SyncEvent::Terminated(account_error);
                 yield SyncEvent::Done(None);
                 return;
@@ -138,7 +139,8 @@ fn open_blob_inner_stream(
             .provider(Provider::Microsoft)
             .protocol(Protocol::Graph)
             .scope(ErrorScope::Account)
-            .build();
+            .try_build()
+            .expect("valid account error classification");
             yield SyncEvent::Terminated(account_error);
             yield SyncEvent::Done(None);
             return;
@@ -182,7 +184,8 @@ fn open_blob_inner_stream(
                     .provider(Provider::Microsoft)
                     .protocol(Protocol::Graph)
                     .scope(ErrorScope::Account)
-                    .build();
+                    .try_build()
+                .expect("valid account error classification");
                     yield SyncEvent::Terminated(account_error);
                     break;
                 }

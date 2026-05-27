@@ -23,8 +23,8 @@ use crate::headers::find_header_value_case_insensitive;
 use crate::types::{GmailHeader, GmailLabel, GmailMessage, GmailPayload, GmailVacationSettings};
 
 use super::blobs;
+use super::error;
 use super::flags;
-use super::recovery;
 use super::scopes::{ScopeCache, labels_for_flags, refresh_scope_snapshot};
 
 const LABEL_INBOX: &str = "INBOX";
@@ -138,7 +138,7 @@ pub(crate) fn send_message(
         let message = client
             .send_message(&raw, doc.thread_id.as_deref())
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::send()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::send()))?;
         Ok(ObjectId(message.id))
     })
 }
@@ -168,9 +168,7 @@ pub(crate) fn draft_create(
             .map_err(|e| {
                 account_error_for(
                     e,
-                    recovery::GmailErrorContext::draft(
-                        bifrost_types::AccountOperation::DraftCreate,
-                    ),
+                    error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftCreate),
                 )
             })?;
         Ok(DraftHandle(draft.id))
@@ -184,7 +182,7 @@ pub(crate) fn draft_update(
     patch: DraftPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let ctx = recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
+        let ctx = error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
         let existing = client
             .get_draft(&draft.0, "full")
             .await
@@ -208,7 +206,7 @@ pub(crate) fn draft_discard(
         client.delete_draft(&draft.0).await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftDiscard),
+                error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftDiscard),
             )
         })
     })
@@ -222,7 +220,7 @@ pub(crate) fn draft_send(
         let message = client.send_draft(&draft.0).await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftSend),
+                error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftSend),
             )
         })?;
         Ok(ObjectId(message.id))
@@ -243,7 +241,7 @@ pub(crate) fn search(
         let (threads, next) = client
             .list_threads(query.as_deref(), Some(max), page_token.as_deref())
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::search()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::search()))?;
         Ok(Page {
             items: threads
                 .into_iter()
@@ -269,7 +267,7 @@ pub(crate) fn search_messages(
         let (messages, next, estimate) = client
             .list_messages(query.as_deref(), Some(max), page_token.as_deref())
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::search_messages()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::search_messages()))?;
         Ok(Page {
             items: messages
                 .into_iter()
@@ -288,7 +286,7 @@ pub(crate) fn containers_list(
     Box::pin(async move {
         let snapshot = refresh_scope_snapshot(&client, &cache)
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::containers_list()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::containers_list()))?;
         let mut containers = Vec::with_capacity(snapshot.labels.len() + 1);
         containers.push(archive_container());
         containers.extend(snapshot.labels.iter().map(container_from_label));
@@ -311,7 +309,7 @@ pub(crate) fn container_create(
         let label = client.create_label(&name, None).await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::container(
+                error::GmailErrorContext::container(
                     bifrost_types::AccountOperation::ContainerCreate,
                 ),
             )
@@ -337,7 +335,7 @@ pub(crate) fn container_rename(
             .map_err(|e| {
                 account_error_for(
                     e,
-                    recovery::GmailErrorContext::container(
+                    error::GmailErrorContext::container(
                         bifrost_types::AccountOperation::ContainerRename,
                     ),
                 )
@@ -366,7 +364,7 @@ pub(crate) fn container_delete(
         client.delete_label(&container.0).await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::container(
+                error::GmailErrorContext::container(
                     bifrost_types::AccountOperation::ContainerDelete,
                 ),
             )
@@ -381,7 +379,7 @@ pub(crate) fn identities_list(
         let identities = client
             .list_send_as()
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::identities_list()))?
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::identities_list()))?
             .into_iter()
             .map(|send_as| Identity {
                 id: IdentityId(send_as.send_as_email.clone()),
@@ -427,7 +425,7 @@ pub(crate) fn identity_update(
         client
             .patch_send_as(&identity.0, &body)
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::identity_update()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::identity_update()))?;
         Ok(())
     })
 }
@@ -439,7 +437,7 @@ pub(crate) fn vacation_get(
         let settings = client
             .get_vacation()
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::vacation_get()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::vacation_get()))?;
         Ok(Some(VacationConfig {
             is_enabled: settings.enable_auto_reply.unwrap_or(false),
             subject: settings.response_subject,
@@ -473,7 +471,7 @@ pub(crate) fn vacation_set(
         client
             .update_vacation(&settings)
             .await
-            .map_err(|e| account_error_for(e, recovery::GmailErrorContext::vacation_set()))?;
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::vacation_set()))?;
         Ok(())
     })
 }
@@ -492,7 +490,7 @@ pub(crate) fn thread_hydrate(
         let gmail_thread = client.get_thread(&thread.0, "full").await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::hydrate_thread(thread.0.clone()),
+                error::GmailErrorContext::hydrate_thread(thread.0.clone()),
             )
         })?;
         let mut messages = Vec::with_capacity(gmail_thread.messages.len());
@@ -522,7 +520,7 @@ pub(crate) fn message_hydrate(
         let gmail_message = client.get_message(&message.0, format).await.map_err(|e| {
             account_error_for(
                 e,
-                recovery::GmailErrorContext::hydrate_message(message.0.clone()),
+                error::GmailErrorContext::hydrate_message(message.0.clone()),
             )
         })?;
         message_from_gmail(&labels, &gmail_message, projection).await
@@ -576,7 +574,7 @@ pub(crate) fn delete_thread(
             return client.delete_thread(&thread.0).await.map_err(|e| {
                 account_error_for(
                     e,
-                    recovery::GmailErrorContext::mutation(
+                    error::GmailErrorContext::mutation(
                         bifrost_types::AccountOperation::BulkDestroy,
                     ),
                 )
@@ -609,13 +607,13 @@ async fn modify_target(
             client
                 .modify_message(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(|e| account_error_for(e, recovery::GmailErrorContext::base(operation)))?;
+                .map_err(|e| account_error_for(e, error::GmailErrorContext::base(operation)))?;
         }
         MutationTarget::Thread(id) => {
             client
                 .modify_thread(&id.0, &add_labels, &remove_labels)
                 .await
-                .map_err(|e| account_error_for(e, recovery::GmailErrorContext::base(operation)))?;
+                .map_err(|e| account_error_for(e, error::GmailErrorContext::base(operation)))?;
         }
         _ => return Err(unsupported(operation)),
     }
@@ -870,7 +868,7 @@ async fn attachment_inlines(
     let mut attachments = Vec::with_capacity(refs.len());
     // attachment_inlines is used during draft hydration (draft_update);
     // the error context is DraftUpdate.
-    let ctx = recovery::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
+    let ctx = error::GmailErrorContext::draft(bifrost_types::AccountOperation::DraftUpdate);
     for item in refs {
         let attachment = client
             .get_attachment(&message.id, &item.attachment_id)
@@ -1316,24 +1314,24 @@ fn non_negative_i64(value: i64) -> Option<u64> {
 }
 
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
-    recovery::into_account_error(
+    error::into_account_error(
         crate::error::Error::unsupported(op),
-        recovery::GmailErrorContext::base(op),
+        error::GmailErrorContext::base(op),
     )
 }
 
 fn other_error(op: bifrost_types::AccountOperation, detail: impl Into<String>) -> AccountError {
-    recovery::into_account_error(
+    error::into_account_error(
         crate::error::Error::invalid_request(op, detail),
-        recovery::GmailErrorContext::base(op),
+        error::GmailErrorContext::base(op),
     )
 }
 
 /// Translate a `crate::Error` into `AccountError` with the given
 /// per-call-site context. Every PIM call site uses this so the
 /// operation, scope, and resource are correct for the classification.
-fn account_error_for(error: crate::Error, ctx: recovery::GmailErrorContext) -> AccountError {
-    recovery::into_account_error(error, ctx)
+fn account_error_for(error: crate::Error, ctx: error::GmailErrorContext) -> AccountError {
+    error::into_account_error(error, ctx)
 }
 
 #[cfg(test)]

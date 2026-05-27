@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, HydratedObject, HydratedObjectKind, ObjectId, PageBoundary, Projection,
-    SyncEvent,
+    AccountStream, Batch, BatchItemId, BatchSuccess, HydratedObject, HydratedObjectKind,
+    ItemOutcome, ObjectId, PageBoundary, Projection, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -20,10 +20,12 @@ pub(crate) fn stream(
     limits: CoreLimits,
     mut ids: AccountStream<ObjectId>,
     projection: Projection,
-) -> AccountStream<SyncEvent<HydratedObject>> {
+) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     Box::pin(async_stream::stream! {
         if !matches!(projection, Projection::FlagsOnly | Projection::Metadata) {
             yield super::error::terminated_unsupported(
+                bifrost_types::AccountOperation::Hydrate,
+                None,
                 "JMAP raw-MIME hydration projections need a MIME assembly path outside this wave",
             );
             return;
@@ -69,7 +71,7 @@ async fn fetch_batch(
     mail: &MailAccount,
     projection: Projection,
     batch: &mut Vec<ObjectId>,
-) -> crate::Result<Option<Batch<HydratedObject>>> {
+) -> crate::Result<Option<Batch<ItemOutcome<HydratedObject>>>> {
     let started = Instant::now();
     let ids = batch
         .drain(..)
@@ -95,11 +97,18 @@ async fn fetch_batch(
             Projection::Metadata => HydratedObjectKind::Metadata(email_to_inventory(email, &state)),
             _ => HydratedObjectKind::FlagsOnly(HashSet::new()),
         };
-        items.push(HydratedObject {
+        // Per-item lane: every hydrated email emits
+        // `ItemOutcome::Succeeded`. The streaming bulk contract is
+        // "every pulled item produces exactly one outcome"; items the
+        // server omitted from the response surface elsewhere (the
+        // engine cross-references with the input id stream).
+        let item_id = BatchItemId(id.0.clone());
+        let hydrated = HydratedObject {
             id,
             kind,
             blobs: Vec::new(),
-        });
+        };
+        items.push(ItemOutcome::Succeeded(BatchSuccess::new(item_id, hydrated)));
     }
 
     if items.is_empty() {

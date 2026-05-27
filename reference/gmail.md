@@ -46,7 +46,8 @@ Internal modules:
   reverse `LabelPatch` translation used by mutations.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
   attachments.
-- `recovery.rs` - error classification onto `RecoveryClass`.
+- `error.rs` - translation boundary from `crate::Error` to
+  `AccountError` via the central `AccountErrorBuilder`.
 
 ## GmailAccount / GmailAccountFactory
 
@@ -287,7 +288,12 @@ boundaries are `PageBoundary::Page` for intermediate batches and
 checkpoint.
 
 `get_stream` consumes a stream of `ObjectId`s in batches of 32
-and dispatches per `Projection`:
+and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
+Per-item hydration outcomes flow as `ItemOutcome::Succeeded` for a
+hydrated message and `ItemOutcome::Failed(BatchFailure)` carrying
+the classified `AccountError` for an id that Gmail refused or that
+parsed badly. A single bad id no longer poisons the stream. The
+dispatch per `Projection` is:
 
 - `FlagsOnly` - `format=minimal` then `flag_set` over the
   label list.
@@ -339,10 +345,17 @@ The renewer task in `start_renewer`:
   the expiration timestamp from Gmail, or `DEFAULT_RENEW_AFTER`
   (six days) if no expiration was returned.
 - Re-issues `users.watch` and updates the stored expiration.
-- On failure: emits `WatchEvent::Disconnected` (once, not
-  repeatedly), retries after `RENEW_RETRY_AFTER` (five
-  minutes), and emits `WatchEvent::Reconnected` when the
-  next attempt succeeds.
+- On failure: classifies the error through
+  `error::into_account_error(_, GmailErrorContext::push_subscribe())`
+  and routes on `RecoveryClass::is_terminal()`. Terminal classes
+  (auth lost, policy block, account disabled, schema break) emit
+  `WatchEvent::Terminated(AccountError)` and exit the renewer
+  task so the engine can take over. Transient classes emit
+  `WatchEvent::Disconnected` (once, not repeatedly) and retry
+  after `RENEW_RETRY_AFTER` (five minutes); the next successful
+  attempt emits `WatchEvent::Reconnected`. The renewer no longer
+  bare-`tracing::warn!`s the underlying error: every failure goes
+  through the classifier first.
 - Selects on `shutdown.cancelled()` between every sleep and
   every watch call so `close()` cuts the loop promptly.
 
@@ -441,13 +454,13 @@ attachment id) are not surfaced as blob handles.
 
 ## Error translation
 
-`recovery.rs::into_account_error(error, ctx)` is the single
+`account/error.rs::into_account_error(error, ctx)` is the single
 boundary that converts `crate::Error` (Net / Response / JsonDecode
 / Base64 / Local) into an `AccountError`. The
-`GmailErrorContext { operation, scope, .. }` carries the calling
-operation so the central recovery mapping in
-`bifrost-types::recovery::derive` produces a precise
-`RecoveryClass`; the Gmail crate no longer has its own
+`GmailErrorContext { operation, scope, resource, history_endpoint,
+diagnostic_id, .. }` carries the calling operation so the central
+recovery mapping in `bifrost-types::recovery::derive` produces a
+precise `RecoveryClass`; the Gmail crate no longer has its own
 `classify_general_error` / `account_error_from_gmail` /
 `fatal_for_error` tables.
 
@@ -462,7 +475,14 @@ Mapping highlights:
 - Authentication failures (HTTP 401 or `authError`) ->
   `Authentication(ReauthorizationRequired)` -> `AuthLost`.
 - Authorization failures (HTTP 403 outside the quota path) ->
-  `Authorization(PermissionDenied)` -> `NoPermission`.
+  `Authorization(PermissionDenied)` -> `NoPermission`. The
+  `InsufficientScope::needed` carrier is selected per
+  `AccountOperation` via `gmail_scope_for`: `gmail.send` for
+  `Send`, `gmail.compose` for drafts, `gmail.labels` for label
+  CRUD, `gmail.modify` for mutations, `gmail.readonly` for
+  hydration / search / inventory, `gmail.metadata` for push
+  watch CRUD, `gmail.settings.basic` for identities and
+  vacation.
 - Transport network failures (DNS, TLS, timeout) ->
   `Transport(_)` with an `AttemptCause` whose
   `transmission_state` carries the wire-level evidence; the
@@ -470,10 +490,28 @@ Mapping highlights:
   and `Reconcile` for non-idempotent ops caught mid-flight.
 - 5xx and `internalError` -> `Server(Unavailable)` ->
   `Retry::SameRequest, reason: ServerUnavailable`.
+- Every `Error::Response` and every post-200 decode failure
+  (`JsonDecode`, `Base64`) pushes
+  `AttemptCause(Acknowledged)` onto the chain so the central
+  mapping never falls back to "absence treated as Unsent" for an
+  actually-acknowledged request.
+- `failedPrecondition` from the history endpoint ->
+  `SyncState(CursorInvalid)`. `failedPrecondition` elsewhere ->
+  `ConcurrencyConflict` (etag / version mismatch semantics),
+  routed through `Retry::AfterStateRefresh`.
 - 404 / 410 on the history endpoint -> `SyncState(CursorInvalid)`
   -> `Engine(RestartScope(scope))`; the cursor scope is always
   `CursorScope::Account` for Gmail, so this is effectively a
   request to reseed from `getProfile`.
+- 404 on non-message resources routes to the appropriate
+  `ResourceKind`: `Draft`, `Identity`, `Vacation`,
+  `PushSubscription` (for Pub/Sub watch). Blob 404 maps to the
+  parent message's `NotFound(Message)`.
+- `Retry-After` is wrapped with `RetryHint::After(Duration)` on
+  the originating `ServerCause::{Unavailable, RateLimited,
+  QuotaExhausted}`; the central mapping forwards it to
+  `RetryAdvice::retry_hint`. There is no separate
+  `retry_not_before` side-channel.
 - Local validation failures (`GmailLocalError::*`) ->
   `Request(Malformed)` or `Request(InvalidArgument)` ->
   `ClientBug`. The identity-mismatch and cursor-envelope

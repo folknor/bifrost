@@ -2,12 +2,12 @@ mod blobs;
 mod capabilities;
 mod changes;
 mod cursor;
+mod error;
 mod flags;
 mod inventory;
 mod mutation;
 mod pim;
 mod push;
-mod recovery;
 mod scopes;
 
 use std::sync::Arc;
@@ -101,16 +101,17 @@ impl GmailAccount {
         client: Arc<GmailClient>,
         pubsub: Option<PubSubConfig>,
     ) -> Result<Arc<Self>, AccountError> {
-        let profile = client.get_profile().await.map_err(|error| {
-            recovery::into_account_error(error, recovery::GmailErrorContext::open())
-        })?;
+        let profile = client
+            .get_profile()
+            .await
+            .map_err(|error| error::into_account_error(error, error::GmailErrorContext::open()))?;
         let history_id = profile.history_id.parse::<u64>().map_err(|error| {
-            recovery::into_account_error(
+            error::into_account_error(
                 crate::error::Error::missing_field(
                     "historyId",
                     format!("gmail profile invalid history id: {error}"),
                 ),
-                recovery::GmailErrorContext::open(),
+                error::GmailErrorContext::open(),
             )
         })?;
         let seed_state = encode_gmail_state(&GmailChangeState::new(
@@ -185,9 +186,9 @@ impl Account for GmailAccount {
         let seed = self.seed_state.clone();
         Box::pin(async move {
             if !matches!(scope, CursorScope::Account) {
-                return Err(recovery::into_account_error(
+                return Err(error::into_account_error(
                     crate::error::Error::unsupported(AccountOperation::EstablishCursor),
-                    recovery::GmailErrorContext::establish_cursor(),
+                    error::GmailErrorContext::establish_cursor(),
                 ));
             }
             Ok(CursorEstablishment::Ready(cursor_from_state(seed)))
@@ -206,7 +207,7 @@ impl Account for GmailAccount {
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         inventory::get_stream(
             Arc::clone(&self.client),
             Arc::clone(&self.scope_cache),
@@ -320,9 +321,9 @@ impl Account for GmailAccount {
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
-            Err(recovery::into_account_error(
+            Err(error::into_account_error(
                 crate::error::Error::unsupported(AccountOperation::SetKeyword),
-                recovery::GmailErrorContext::mutation(AccountOperation::SetKeyword),
+                error::GmailErrorContext::mutation(AccountOperation::SetKeyword),
             ))
         })
     }
@@ -343,9 +344,9 @@ impl Account for GmailAccount {
         _value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
-            Err(recovery::into_account_error(
+            Err(error::into_account_error(
                 crate::error::Error::unsupported(AccountOperation::SetCategory),
-                recovery::GmailErrorContext::mutation(AccountOperation::SetCategory),
+                error::GmailErrorContext::mutation(AccountOperation::SetCategory),
             ))
         })
     }
@@ -357,9 +358,9 @@ impl Account for GmailAccount {
         _value: Option<String>,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
-            Err(recovery::into_account_error(
+            Err(error::into_account_error(
                 crate::error::Error::unsupported(AccountOperation::SetExtendedProperty),
-                recovery::GmailErrorContext::mutation(AccountOperation::SetExtendedProperty),
+                error::GmailErrorContext::mutation(AccountOperation::SetExtendedProperty),
             ))
         })
     }

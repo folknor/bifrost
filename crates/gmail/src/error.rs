@@ -373,7 +373,7 @@ impl StdError for Error {
 impl From<bifrost_net::Error> for Error {
     fn from(err: bifrost_net::Error) -> Self {
         // Preserve the structured net error. The account-side
-        // translation boundary in `account/recovery.rs` is responsible
+        // translation boundary in `account/error.rs` is responsible
         // for inspecting Status bodies, retry-after, and transmission
         // state via `bifrost_net::into_account_error`. We deliberately
         // do NOT promote `Error::Status` into `Error::Response` here:

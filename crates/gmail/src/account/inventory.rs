@@ -2,9 +2,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, Checkpoint, CursorScope, Fingerprint, HydratedObject,
-    HydratedObjectKind, InventoryEntry, LabelId, MembershipScope, ObjectId, PageBoundary,
-    Projection, ServerVersion, SyncEvent, ThreadId,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchSuccess, Checkpoint,
+    CursorScope, Fingerprint, HydratedObject, HydratedObjectKind, InventoryEntry, ItemOutcome,
+    LabelId, MembershipScope, ObjectId, PageBoundary, Projection, ServerVersion, SyncEvent,
+    ThreadId,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -17,8 +18,8 @@ use crate::types::{GmailHeader, GmailLabel, GmailMessage};
 
 use super::blobs;
 use super::cursor::cursor_for_history;
+use super::error;
 use super::flags;
-use super::recovery;
 use super::scopes::{ScopeCache, snapshot};
 
 const LIST_PAGE_SIZE: u32 = 500;
@@ -43,9 +44,9 @@ pub(crate) fn inventory_stream(
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     if !matches!(scope, CursorScope::Account) {
-        let account_error = recovery::into_account_error(
+        let account_error = error::into_account_error(
             crate::error::Error::unsupported(bifrost_types::AccountOperation::SyncInventory),
-            recovery::GmailErrorContext::inventory(),
+            error::GmailErrorContext::inventory(),
         );
         return Box::pin(stream::iter([SyncEvent::Terminated(account_error)]));
     }
@@ -58,9 +59,9 @@ pub(crate) fn inventory_stream(
             let page = match list_messages_page(&client, page_token.as_deref()).await {
                 Ok(page) => page,
                 Err(error) => {
-                    let account_error = recovery::into_account_error(
+                    let account_error = error::into_account_error(
                         error,
-                        recovery::GmailErrorContext::inventory(),
+                        error::GmailErrorContext::inventory(),
                     );
                     yield SyncEvent::Terminated(account_error);
                     return;
@@ -98,9 +99,9 @@ pub(crate) fn inventory_stream(
                         }
                     }
                     Err(error) => {
-                        let account_error = recovery::into_account_error(
+                        let account_error = error::into_account_error(
                             error,
-                            recovery::GmailErrorContext::inventory(),
+                            error::GmailErrorContext::inventory(),
                         );
                         yield SyncEvent::Terminated(account_error);
                         return;
@@ -112,9 +113,9 @@ pub(crate) fn inventory_stream(
                 let checkpoint = match inventory_checkpoint(&client).await {
                     Ok(checkpoint) => checkpoint,
                     Err(error) => {
-                        let account_error = recovery::into_account_error(
+                        let account_error = error::into_account_error(
                             error,
-                            recovery::GmailErrorContext::inventory(),
+                            error::GmailErrorContext::inventory(),
                         );
                         yield SyncEvent::Terminated(account_error);
                         return;
@@ -152,7 +153,7 @@ pub(crate) fn get_stream(
     cache: ScopeCache,
     ids: AccountStream<ObjectId>,
     projection: Projection,
-) -> AccountStream<SyncEvent<HydratedObject>> {
+) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     let state = HydrateState {
         client,
         cache,
@@ -186,18 +187,31 @@ pub(crate) fn get_stream(
 
         let started = Instant::now();
         let labels = snapshot(&state.cache).labels;
-        let mut items = Vec::with_capacity(ids.len());
+        let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(ids.len());
         for id in ids {
+            // gmail-N1: clone the id so a failing hydrate can attach
+            // `ErrorScope::Message { id }` to the resulting
+            // `AccountError` (and so the per-item lane carries it as
+            // a `BatchItemId`). Previously the id was moved into
+            // `hydrate_one` and the error scope was emitted with an
+            // empty string.
+            let id_for_error = id.0.clone();
             match hydrate_one(&state.client, &labels, id, state.projection).await {
-                Ok(hydrated) => items.push(hydrated),
-                Err(error) => {
-                    let account_error = recovery::into_account_error(
-                        error,
-                        recovery::GmailErrorContext::hydrate_message(""),
+                Ok(hydrated) => {
+                    items.push(ItemOutcome::Succeeded(BatchSuccess::new(
+                        BatchItemId(id_for_error),
+                        hydrated,
+                    )));
+                }
+                Err(err) => {
+                    let account_error = error::into_account_error(
+                        err,
+                        error::GmailErrorContext::hydrate_message(id_for_error.clone()),
                     );
-                    state.finished = true;
-                    state.emitted_done = true;
-                    return Some((SyncEvent::Terminated(account_error), state));
+                    items.push(ItemOutcome::Failed(BatchFailure::new(
+                        BatchItemId(id_for_error),
+                        account_error,
+                    )));
                 }
             }
         }

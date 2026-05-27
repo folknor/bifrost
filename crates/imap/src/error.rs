@@ -58,17 +58,28 @@ pub(crate) enum Error {
     },
 
     /// Server returned a NO response to a command (RFC 3501 Section 7.1.2).
+    ///
+    /// A tagged `NO` is by definition acknowledged by the server; the
+    /// default `attempt` at construction is `Some(Acknowledged)`. The
+    /// optional shape is kept so a future caller that synthesizes a
+    /// `No` from a non-wire path (test fixtures, internal probes) can
+    /// opt out, but every production constructor stamps `Acknowledged`.
     #[error("server rejected command: {text}")]
     No {
         text: String,
         code: Option<ResponseCode>,
+        attempt: Option<ImapAttempt>,
     },
 
     /// Server returned a BAD response (RFC 3501 Section 7.1.3).
+    ///
+    /// As with `No`, a tagged `BAD` is server-acknowledged; constructors
+    /// default to `Some(Acknowledged)`.
     #[error("server reported bad command: {text}")]
     Bad {
         text: String,
         code: Option<ResponseCode>,
+        attempt: Option<ImapAttempt>,
     },
 
     /// Server sent BYE (RFC 3501 Section 7.1.5).
@@ -187,11 +198,33 @@ impl PartialEq for Error {
                     attempt: b_att,
                 },
             ) => a.kind() == b.kind() && a_att == b_att,
-            (Self::Auth { text: t1, code: c1 }, Self::Auth { text: t2, code: c2 })
-            | (Self::No { text: t1, code: c1 }, Self::No { text: t2, code: c2 })
-            | (Self::Bad { text: t1, code: c1 }, Self::Bad { text: t2, code: c2 }) => {
+            (Self::Auth { text: t1, code: c1 }, Self::Auth { text: t2, code: c2 }) => {
                 t1 == t2 && c1 == c2
             }
+            (
+                Self::No {
+                    text: t1,
+                    code: c1,
+                    attempt: a1,
+                },
+                Self::No {
+                    text: t2,
+                    code: c2,
+                    attempt: a2,
+                },
+            )
+            | (
+                Self::Bad {
+                    text: t1,
+                    code: c1,
+                    attempt: a1,
+                },
+                Self::Bad {
+                    text: t2,
+                    code: c2,
+                    attempt: a2,
+                },
+            ) => t1 == t2 && c1 == c2 && a1 == a2,
             (
                 Self::Bye {
                     text: t1,
@@ -291,10 +324,14 @@ impl Error {
         Self::DriverGone { attempt: None }
     }
 
-    /// Attach (or override) the attempt evidence on a transport-shaped error.
+    /// Attach (or override) the attempt evidence on a transport-shaped or
+    /// server-acknowledged error.
     ///
-    /// No-op for variants that do not carry attempt state (auth status,
-    /// local validation, capability gating).
+    /// No-op for variants that genuinely cannot carry an attempt state
+    /// (pure parse errors before any wire activity, local validation,
+    /// capability gating). For `No` / `Bad` this patches the (typically
+    /// already `Acknowledged`) attempt - callers may use it to override
+    /// in tests, but the constructors default to `Acknowledged`.
     #[must_use]
     pub(crate) fn with_attempt(self, state: TransmissionState) -> Self {
         let attempt = Some(ImapAttempt::new(state));
@@ -303,6 +340,16 @@ impl Error {
             Self::Timeout { .. } => Self::Timeout { attempt },
             Self::Closed { .. } => Self::Closed { attempt },
             Self::Bye { text, code, .. } => Self::Bye {
+                text,
+                code,
+                attempt,
+            },
+            Self::No { text, code, .. } => Self::No {
+                text,
+                code,
+                attempt,
+            },
+            Self::Bad { text, code, .. } => Self::Bad {
                 text,
                 code,
                 attempt,
@@ -320,20 +367,34 @@ impl Error {
             | Self::Timeout { attempt }
             | Self::Closed { attempt }
             | Self::Bye { attempt, .. }
+            | Self::No { attempt, .. }
+            | Self::Bad { attempt, .. }
             | Self::DriverPanicked { attempt, .. }
             | Self::DriverGone { attempt } => attempt.map(|a| a.transmission_state),
             _ => None,
         }
     }
 
-    /// Construct an [`Error::No`] with an optional response code.
+    /// Construct an [`Error::No`] with an optional response code. Sets
+    /// `attempt = Some(Acknowledged)`: a tagged `NO` is by definition
+    /// server-acknowledged.
     pub(crate) fn no_with_code(text: String, code: Option<ResponseCode>) -> Self {
-        Self::No { text, code }
+        Self::No {
+            text,
+            code,
+            attempt: Some(ImapAttempt::new(TransmissionState::Acknowledged)),
+        }
     }
 
-    /// Construct an [`Error::Bad`] with an optional response code.
+    /// Construct an [`Error::Bad`] with an optional response code. Sets
+    /// `attempt = Some(Acknowledged)`: a tagged `BAD` is by definition
+    /// server-acknowledged.
     pub(crate) fn bad_with_code(text: String, code: Option<ResponseCode>) -> Self {
-        Self::Bad { text, code }
+        Self::Bad {
+            text,
+            code,
+            attempt: Some(ImapAttempt::new(TransmissionState::Acknowledged)),
+        }
     }
 
     /// Construct an [`Error::Auth`] with an optional response code.

@@ -12,8 +12,12 @@ impl EwsClient {
     /// envelope, sends it, checks for SOAP faults, and returns the
     /// response body as a string.
     ///
-    /// Transport failures and non-success HTTP status codes produce
-    /// `EwsError::Transport`. SOAP faults produce `EwsError::SoapFault`.
+    /// Transport failures preserve the `bifrost_net::Error` so the
+    /// account boundary classifies them through
+    /// `bifrost_net::into_account_error` with `Protocol::Ews` context.
+    /// HTTP error statuses carry the status + raw body; SOAP faults
+    /// carry the structured `SoapFaultCode` plus `<faultstring>`
+    /// detail.
     pub(crate) async fn execute(&self, body_xml: &str) -> Result<String, EwsError> {
         let envelope = build_soap_envelope(body_xml);
         let resp = self
@@ -23,14 +27,14 @@ impl EwsClient {
             .body(bytes::Bytes::from(envelope))
             .send()
             .await
-            .map_err(|e| EwsError::Transport(format!("EWS request failed: {e}")))?;
+            .map_err(EwsError::Transport)?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = String::from_utf8_lossy(resp.body.as_ref());
-            return Err(EwsError::Transport(format!(
-                "EWS returned {status}: {body}"
-            )));
+            return Err(EwsError::HttpStatus {
+                status,
+                body: resp.body,
+            });
         }
 
         let xml = String::from_utf8_lossy(resp.body.as_ref()).into_owned();

@@ -9,7 +9,7 @@
 
 use bifrost_types::{
     AccessErrorKind, AccountErrorKind, AccountOperation, AuthErrorKind, Cause, CursorScope,
-    EngineDirective, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
+    EngineDirective, ErrorScope, FolderId, ImapResponseCode, ProtocolErrorKind, RecoveryClass,
     RequestErrorKind, ResourceKind, ServerErrorKind, StrategyDowngrade, SyncStateErrorKind,
     ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
 };
@@ -315,7 +315,8 @@ fn response_code_notification_overflow_maps_to_cursor_invalid() {
     );
     let account = into_account_error(
         err,
-        ImapErrorContext::operation(AccountOperation::PushStream),
+        ImapErrorContext::operation(AccountOperation::PushStream)
+            .with_cursor_scope(bifrost_types::CursorScope::Account),
     );
     assert!(matches!(
         account.kind(),
@@ -393,8 +394,16 @@ fn every_response_code_variant_maps_to_imap_response_code() {
     ];
     for code in codes {
         let err = Error::no_with_code("t".into(), Some(code.clone()));
-        let _account =
-            into_account_error(err, ImapErrorContext::operation(AccountOperation::Discover));
+        // Thread an account-wide cursor scope so codes that classify
+        // as `SyncState(CursorInvalid)` (e.g. NotificationOverflow,
+        // ExpungeIssued, Closed) build cleanly. The test only cares
+        // that the mapping does not panic and the wire enum survives
+        // round-trip.
+        let _account = into_account_error(
+            err,
+            ImapErrorContext::operation(AccountOperation::Discover)
+                .with_cursor_scope(bifrost_types::CursorScope::Account),
+        );
     }
 }
 
@@ -425,6 +434,10 @@ fn uidvalidity_changed_derives_restart_scope() {
         account.recovery(),
         RecoveryClass::Engine(EngineDirective::RestartScope(CursorScope::Folder(_)))
     ));
+    // imap-N2: SyncState(CursorInvalid) must carry a cursor scope or
+    // builder rejects via `CursorInvalidWithoutScope`. This succeeds
+    // structurally because `uidvalidity_changed` threads it.
+    assert!(matches!(account.scope(), Some(ErrorScope::Cursor(_))));
 }
 
 #[test]
@@ -456,6 +469,39 @@ fn condstore_to_basic_strategy_failure_derives_downgrade() {
         )) => {}
         other => panic!("expected DowngradeStrategy(CondstoreToBasic), got {other:?}"),
     }
+}
+
+#[test]
+fn tagged_no_carries_acknowledged_attempt_in_chain() {
+    // imap-D1: tagged NO/BAD is server-acknowledged by definition.
+    // Recovery rows that key on `Acknowledged` (e.g. tag-less
+    // `ServerCause::Error { status: None }` -> `ProviderRefused`)
+    // depend on the `Attempt` cause being present and set to
+    // `Acknowledged` on the chain.
+    let err = Error::no_with_code("rejected".into(), None);
+    let account = into_account_error(
+        err,
+        ImapErrorContext::operation(AccountOperation::SyncChanges),
+    );
+    let attempt = account.chain().iter().find_map(|c| match c {
+        Cause::Attempt(a) => Some(a.transmission_state),
+        _ => None,
+    });
+    assert_eq!(attempt, Some(TransmissionState::Acknowledged));
+}
+
+#[test]
+fn tagged_bad_carries_acknowledged_attempt_in_chain() {
+    let err = Error::bad_with_code("syntax".into(), None);
+    let account = into_account_error(
+        err,
+        ImapErrorContext::operation(AccountOperation::SyncChanges),
+    );
+    let attempt = account.chain().iter().find_map(|c| match c {
+        Cause::Attempt(a) => Some(a.transmission_state),
+        _ => None,
+    });
+    assert_eq!(attempt, Some(TransmissionState::Acknowledged));
 }
 
 #[test]

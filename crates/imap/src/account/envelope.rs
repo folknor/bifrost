@@ -411,6 +411,13 @@ fn parse_u32(value: Option<&str>) -> Result<u32, AccountError> {
 /// Build a `Request(Malformed)` `AccountError` for IMAP object-id or
 /// cursor decode failures. These are caller-side invalid inputs (the
 /// object id was not produced by this crate or was corrupted in transit).
+///
+/// Operation is left unset here because malformed-id detection happens
+/// outside any specific account-trait call site. Callers that decode
+/// an id while servicing a specific operation thread the operation via
+/// their own `ImapErrorContext`; this builder is only reached for
+/// `decode_object_id` / `decode_cursor` from contexts where the op
+/// isn't known.
 fn malformed(detail: &str) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -419,7 +426,8 @@ fn malformed(detail: &str) -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a `SyncState(SchemaIncompatible)` `AccountError` for IMAP
@@ -435,7 +443,8 @@ fn schema_incompatible(detail: &str) -> AccountError {
     .protocol(Protocol::Imap)
     .operation(AccountOperation::EstablishCursor)
     .text(DiagnosticText::support_only(detail.to_owned()))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 #[cfg(test)]

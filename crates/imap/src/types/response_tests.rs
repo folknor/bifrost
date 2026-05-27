@@ -1190,7 +1190,7 @@ fn tagged_no_returns_no_error_variant() {
     };
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::No { text, code } => {
+        Error::No { text, code, .. } => {
             assert_eq!(text, "mailbox not found");
             assert_eq!(code, Some(ResponseCode::NonExistent));
         }
@@ -1214,7 +1214,7 @@ fn tagged_bad_returns_bad_error() {
     };
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::Bad { text, code } => {
+        Error::Bad { text, code, .. } => {
             assert_eq!(text, "syntax error");
             assert!(code.is_none());
         }
@@ -1387,7 +1387,7 @@ fn require_ok_returns_error_on_no() {
     let result = tagged.require_ok();
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::No { text, code } => {
+        Error::No { text, code, .. } => {
             assert_eq!(text, "mailbox not found");
             assert_eq!(code, Some(ResponseCode::NonExistent));
         }
@@ -1408,7 +1408,7 @@ fn require_ok_returns_error_on_bad() {
     let result = tagged.require_ok();
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::Bad { text, code } => {
+        Error::Bad { text, code, .. } => {
             assert_eq!(text, "syntax error in command");
             assert!(code.is_none());
         }
@@ -1429,7 +1429,7 @@ fn require_ok_no_without_code() {
     let result = tagged.require_ok();
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::No { text, code } => {
+        Error::No { text, code, .. } => {
             assert_eq!(text, "operation failed");
             assert!(code.is_none());
         }
@@ -1450,7 +1450,7 @@ fn require_ok_bad_with_code() {
     let result = tagged.require_ok();
     assert!(result.is_err());
     match result.unwrap_err() {
-        Error::Bad { text, code } => {
+        Error::Bad { text, code, .. } => {
             assert_eq!(text, "invalid arguments");
             assert_eq!(code, Some(ResponseCode::ClientBug));
         }

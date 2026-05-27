@@ -1,15 +1,17 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    CursorScope, FolderId, HintPayload, InvalidationHint, ObjectType, PushSource, WatchEvent,
+    AccountOperation, CursorScope, DiagnosticText, FolderId, HintPayload, InvalidationHint,
+    ObjectType, PushSource, WatchEvent,
 };
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::ews::EwsClient;
+use crate::ews::{EwsClient, EwsError};
 
 use super::GraphAccount;
+use super::graph_error::{GraphErrorContext, ews_error_to_account_error};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -50,10 +52,14 @@ struct NotificationBuilder {
     parent_folder_change_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum StreamLoopExit {
     Disconnected,
     Shutdown,
+    /// Terminal classification (auth lost, conditional-access, etc.)
+    /// surfaced through the EWS worker. The worker exits and emits
+    /// `WatchEvent::Terminated(error)` on the push channel.
+    Terminated(bifrost_types::AccountError),
 }
 
 pub(crate) async fn run_streaming_worker(account: GraphAccount) {
@@ -82,15 +88,33 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
                 }
                 match run_get_events_loop(&ews, &account, subscription).await {
                     StreamLoopExit::Disconnected => disconnected = true,
+                    StreamLoopExit::Terminated(error) => {
+                        let _ = account.push_tx.send(WatchEvent::Terminated(error));
+                        return;
+                    }
                     StreamLoopExit::Shutdown => return,
                 }
             }
             Err(error) => {
+                let account_error = ews_error_to_account_error(
+                    error,
+                    GraphErrorContext::ews(AccountOperation::PushSubscribe),
+                );
+                if account_error.recovery().is_terminal() {
+                    let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
+                    return;
+                }
+                let telemetry = account_error.telemetry_fields();
+                tracing::warn!(
+                    target: "bifrost_graph::ews",
+                    message_key = telemetry.message_key,
+                    recovery = telemetry.recovery_discriminant,
+                    "EWS Subscribe failed"
+                );
                 if !disconnected {
                     let _ = account.push_tx.send(WatchEvent::Disconnected);
                     disconnected = true;
                 }
-                tracing::warn!("[Graph EWS] Subscribe failed: {error}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -281,14 +305,17 @@ async fn subscribe(
     ews: &EwsClient,
     account: &GraphAccount,
     scopes: &[CursorScope],
-) -> Result<EwsStreamingSubscription, String> {
+) -> Result<EwsStreamingSubscription, EwsError> {
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
-    let xml = ews.execute(&body).await.map_err(|e| e.to_string())?;
-    parse_subscribe_response(&xml)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "EWS Subscribe returned no StreamingSubscription".to_string())
+    let xml = ews.execute(&body).await?;
+    let subscriptions = parse_subscribe_response(&xml)
+        .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))?;
+    subscriptions.into_iter().next().ok_or_else(|| {
+        EwsError::MalformedXml(DiagnosticText::support_only(
+            "EWS Subscribe returned no StreamingSubscription".to_string(),
+        ))
+    })
 }
 
 async fn run_get_events_loop(
@@ -302,7 +329,7 @@ async fn run_get_events_loop(
             return StreamLoopExit::Shutdown;
         }
         let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&body).await.map_err(|e| e.to_string()) {
+        match ews.execute(&body).await {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {
@@ -314,16 +341,16 @@ async fn run_get_events_loop(
                             )
                             .await;
                         }
-                        let scope = notification
-                            .parent_folder_id
-                            .as_deref()
-                            .and_then(|folder_id| scope_for_folder(account, folder_id))
-                            .unwrap_or_else(|| CursorScope::FolderType {
-                                folder: FolderId(
-                                    notification.parent_folder_id.clone().unwrap_or_default(),
-                                ),
-                                ty: ObjectType::Email,
-                            });
+                        let scope = match notification.parent_folder_id.as_deref() {
+                            Some(folder_id) => scope_for_folder(account, folder_id).await,
+                            None => None,
+                        }
+                        .unwrap_or_else(|| CursorScope::FolderType {
+                            folder: FolderId(
+                                notification.parent_folder_id.clone().unwrap_or_default(),
+                            ),
+                            ty: ObjectType::Email,
+                        });
                         let _ = account.push_tx.send(WatchEvent::Invalidated {
                             hint: InvalidationHint {
                                 source: PushSource::EwsStreaming,
@@ -333,13 +360,31 @@ async fn run_get_events_loop(
                     }
                 }
                 Err(error) => {
-                    tracing::warn!("[Graph EWS] GetStreamingEvents parse failed: {error}");
-                    let _ = account.push_tx.send(WatchEvent::Disconnected);
-                    return StreamLoopExit::Disconnected;
+                    // Parse failures during streaming are a Graph EWS
+                    // contract violation; surface them as a typed
+                    // terminal so the engine routes through recovery.
+                    let account_error = ews_error_to_account_error(
+                        EwsError::MalformedXml(DiagnosticText::support_only(error)),
+                        GraphErrorContext::ews(AccountOperation::PushStream),
+                    );
+                    return StreamLoopExit::Terminated(account_error);
                 }
             },
             Err(error) => {
-                tracing::warn!("[Graph EWS] GetStreamingEvents failed: {error}");
+                let account_error = ews_error_to_account_error(
+                    error,
+                    GraphErrorContext::ews(AccountOperation::PushStream),
+                );
+                if account_error.recovery().is_terminal() {
+                    return StreamLoopExit::Terminated(account_error);
+                }
+                let telemetry = account_error.telemetry_fields();
+                tracing::warn!(
+                    target: "bifrost_graph::ews",
+                    message_key = telemetry.message_key,
+                    recovery = telemetry.recovery_discriminant,
+                    "EWS GetStreamingEvents failed"
+                );
                 let _ = account.push_tx.send(WatchEvent::Disconnected);
                 return StreamLoopExit::Disconnected;
             }
@@ -396,21 +441,14 @@ async fn current_subscription_id(account: &GraphAccount) -> Option<String> {
         .find_map(|state| state.ews_subscription_id.clone())
 }
 
-fn scope_for_folder(account: &GraphAccount, folder_id: &str) -> Option<CursorScope> {
-    account
-        .ews_subscriptions
-        .try_read()
-        .ok()
-        .and_then(|states| {
-            states.values().find_map(|state| {
-                state.scopes.iter().find_map(|scope| match scope {
-                    CursorScope::FolderType { folder, .. } if folder.0 == folder_id => {
-                        Some(scope.clone())
-                    }
-                    _ => None,
-                })
-            })
+async fn scope_for_folder(account: &GraphAccount, folder_id: &str) -> Option<CursorScope> {
+    let states = account.ews_subscriptions.read().await;
+    states.values().find_map(|state| {
+        state.scopes.iter().find_map(|scope| match scope {
+            CursorScope::FolderType { folder, .. } if folder.0 == folder_id => Some(scope.clone()),
+            _ => None,
         })
+    })
 }
 
 fn finish_notification(builder: &NotificationBuilder) -> Option<EwsStreamingNotification> {

@@ -4,22 +4,46 @@ use bifrost_types::{
     AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
     BatchingPolicy, BlobRangeSupport, Cause, ConvenienceShape, CursorFreshness, DiagnosticText,
     MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport, Protocol,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, StateCause, SyncStateErrorKind,
+    ProtocolErrorKind, PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, StateCause,
+    SyncStateErrorKind, WireCause,
 };
 
+/// Session document does not advertise the `urn:ietf:params:jmap:core`
+/// capability at all. This is a server-side capability change relative
+/// to whatever the session previously claimed: the engine must reopen.
 fn missing_core_capability() -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-        Cause::State(StateCause::CapabilityChanged {
-            delta: bifrost_types::CapabilityDelta::default(),
-        }),
+        Cause::State(StateCause::CapabilityChanged { delta: None }),
     )
     .protocol(Protocol::Jmap)
     .operation(AccountOperation::Discover)
     .text(DiagnosticText::support_only(
-        "JMAP session is missing or has zero-valued core limits",
+        "JMAP session does not advertise the core capability",
     ))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Server advertises the core capability but with one or more
+/// zero-valued limits (`maxCallsInRequest`, `maxObjectsInGet`,
+/// `maxObjectsInSet`, `maxSizeRequest`). That is a `Protocol(ContractViolation)`:
+/// the server claimed conformance and then lied about the lower bounds
+/// the spec requires it to advertise. It is not a capability change.
+fn zero_core_limits() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(
+                "JMAP core capability advertises zero-valued limits",
+            )),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Discover)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 use crate::core::session::Session;
@@ -50,7 +74,7 @@ pub(crate) fn build(
         || core.max_objects_in_set() == 0
         || core.max_size_request() == 0
     {
-        return Err(missing_core_capability());
+        return Err(zero_core_limits());
     }
 
     let ws_push = session
@@ -192,5 +216,53 @@ mod tests {
         assert!(caps.conveniences.forwarded_via_keyword);
         assert_eq!(limits.max_objects_in_get, 256);
         assert_eq!(limits.max_objects_in_set, 700);
+    }
+
+    /// jmap-N4: "core limits zero" is a `Protocol(ContractViolation)`,
+    /// not a `SyncState(CapabilityChanged)`. The server claimed
+    /// conformance to the core capability and then advertised
+    /// zero-valued limits, which the spec prohibits.
+    #[test]
+    fn zero_core_limit_classifies_as_contract_violation() {
+        let session = session(
+            r#"{
+                "capabilities": {
+                    "urn:ietf:params:jmap:core": {
+                        "maxSizeUpload": 1000,
+                        "maxConcurrentUpload": 2,
+                        "maxSizeRequest": 100000,
+                        "maxConcurrentRequests": 4,
+                        "maxCallsInRequest": 0,
+                        "maxObjectsInGet": 256,
+                        "maxObjectsInSet": 700,
+                        "collationAlgorithms": []
+                    },
+                    "urn:ietf:params:jmap:mail": {}
+                },
+                "accounts": {},
+                "primaryAccounts": {},
+                "username": "user",
+                "apiUrl": "https://example.test/jmap/api",
+                "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+                "uploadUrl": "https://example.test/upload/{accountId}",
+                "eventSourceUrl": "https://example.test/eventsource",
+                "state": "session-state"
+            }"#,
+        );
+
+        let err = build(
+            &session,
+            PimSupport {
+                submission: false,
+                vacation: false,
+                quota: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert!(err.recovery().is_terminal());
     }
 }

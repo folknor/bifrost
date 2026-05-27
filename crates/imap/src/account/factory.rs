@@ -10,6 +10,15 @@ use super::error::ImapErrorContext;
 use super::{ImapAccount, Pool, account_error_with, capabilities, folder_registry::FolderRegistry};
 use bifrost_types::AccountOperation;
 
+/// Account-boundary translation for every leg of `open` (connect,
+/// AUTH, ID, QRESYNC, LIST). All four are tagged `Discover` because
+/// they belong to a single discovery phase. The AUTH leg is genuinely
+/// idempotent at the protocol level (re-authenticating produces the
+/// same outcome), so an `InFlight` transport drop here is safe to
+/// retry; the central recovery mapping picks `Retry::SameRequest` for
+/// idempotent ops regardless. Splitting these into per-phase variants
+/// would not change recovery for IMAP; it would only inflate the
+/// `AccountOperation` enum surface.
 fn discover_err(err: crate::Error) -> AccountError {
     account_error_with(err, ImapErrorContext::operation(AccountOperation::Discover))
 }

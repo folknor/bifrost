@@ -38,7 +38,7 @@ pub(crate) async fn create_subscription(
     resource: &str,
     notification_url: &str,
     expiration_minutes: Option<u32>,
-) -> Result<SubscriptionResponse, String> {
+) -> Result<SubscriptionResponse, GraphError> {
     let minutes = expiration_minutes
         .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
         .min(MAX_EXPIRATION_MINUTES);
@@ -51,10 +51,7 @@ pub(crate) async fn create_subscription(
         client_state: Some(generate_client_state()?),
     };
 
-    let response: SubscriptionResponse = client
-        .post("/subscriptions", &body)
-        .await
-        .map_err(graph_error_text)?;
+    let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
     tracing::info!(
         "[Graph webhooks] Created subscription {} for resource '{}' (expires {})",
         response.id,
@@ -68,7 +65,7 @@ pub(crate) async fn renew_subscription(
     client: &GraphClient,
     subscription_id: &str,
     expiration_minutes: Option<u32>,
-) -> Result<String, String> {
+) -> Result<String, GraphError> {
     let minutes = expiration_minutes
         .unwrap_or(DEFAULT_EXPIRATION_MINUTES)
         .min(MAX_EXPIRATION_MINUTES);
@@ -79,8 +76,7 @@ pub(crate) async fn renew_subscription(
 
     client
         .patch(&format!("/subscriptions/{subscription_id}"), &body)
-        .await
-        .map_err(graph_error_text)?;
+        .await?;
     tracing::info!(
         "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {new_expiry})"
     );
@@ -90,13 +86,13 @@ pub(crate) async fn renew_subscription(
 pub(crate) async fn delete_subscription(
     client: &GraphClient,
     subscription_id: &str,
-) -> Result<(), String> {
+) -> Result<(), GraphError> {
     let server_result = client
         .delete(&format!("/subscriptions/{subscription_id}"))
         .await;
     if let Err(error) = server_result {
         if !is_not_found(&error) {
-            return Err(graph_error_text(error));
+            return Err(error);
         }
         tracing::info!(
             "[Graph webhooks] Subscription {subscription_id} already gone on server (404)"
@@ -107,14 +103,21 @@ pub(crate) async fn delete_subscription(
     Ok(())
 }
 
-fn generate_client_state() -> Result<String, String> {
+fn generate_client_state() -> Result<String, GraphError> {
     let mut buf = [0u8; CLIENT_STATE_BYTES];
-    getrandom::fill(&mut buf).map_err(|e| format!("RNG failed: {e}"))?;
+    getrandom::fill(&mut buf).map_err(|error| {
+        // RNG failure is a host-environment problem, not a Graph
+        // contract violation. Surface it as a transport "Network"
+        // failure with `transmission_state: Unsent` so the recovery
+        // mapping classifies it as a retryable client-side issue
+        // (engine reopens the account); we never sent a byte.
+        GraphError::Net(bifrost_net::Error::Network {
+            message: format!("RNG failed: {error}"),
+            transmission_state: bifrost_types::TransmissionState::Unsent,
+            source: None,
+        })
+    })?;
     Ok(hex_encode(&buf))
-}
-
-fn graph_error_text(error: GraphError) -> String {
-    format!("{error:?}")
 }
 
 fn is_not_found(error: &GraphError) -> bool {

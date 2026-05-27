@@ -62,9 +62,8 @@ concurrency.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
   attachments (`/messages/{id}/attachments/{aid}/$value`),
   including the reference-attachment short-circuit.
-- `error.rs` - `graph_error_to_fatal`,
-  `recovery_for_graph_error`, `mutation_outcome_for_status`,
-  and per-id warning helpers.
+- `error.rs` - blob-not-byte-stream warning helper.
+  Classification helpers live in `graph_error.rs`.
 
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
@@ -304,14 +303,23 @@ whose `delta_link` is the freshly minted resume point and
 
 `get_stream` is shared across projections. It chunks ids into
 `batching_policy.max_items` blocks and fires a single `/$batch`
-per chunk, then projects responses through `hydrated_from_value`:
-`FlagsOnly` returns a `HashSet<String>` of canonical flags
-(`\seen`, `\flagged`, `category:<name>`), `Metadata` re-runs
-`inventory_entry_from_value`, and the raw-MIME projections
-(`Headers`, `Preview`, `TextOnly`, `Full`, `FullWithBlobs`)
-serialize the raw JSON value as bytes inside `HydratedObjectKind::RawMime`.
-Attachment metadata is surfaced as `BlobHandle`s on the
-hydrated object.
+per chunk, returning per-id `ItemOutcome<HydratedObject>` envelopes:
+2xx -> `Succeeded(BatchSuccess { output: HydratedObject, .. })`,
+4xx/5xx -> `Failed(BatchFailure { error, .. })` carrying a structured
+`AccountError` built through `response_to_account_error_pub` so
+`Protocol::Graph`, `AttemptCause(Acknowledged)`,
+`WireCause::Graph(signal)`, and retry-hint / throttle-scope are all
+preserved. 2xx-with-no-body is also `Failed` carrying
+`Protocol(MissingField)`. Locally-invalid items emit `Failed` rather
+than poisoning the rest of the batch; transport drops on the whole
+`/$batch` request emit `SyncEvent::Terminated` at the stream level.
+The per-item projector `hydrated_from_value` produces:
+`FlagsOnly` -> a `HashSet<String>` of canonical flags
+(`\seen`, `\flagged`, `category:<name>`); `Metadata` -> re-runs
+`inventory_entry_from_value`; raw-MIME projections (`Headers`,
+`Preview`, `TextOnly`, `Full`, `FullWithBlobs`) -> serialized JSON
+inside `HydratedObjectKind::RawMime`. Attachment metadata is
+surfaced as `BlobHandle`s on the hydrated object.
 
 `scope_lifecycle_stream` currently emits an empty stream. Graph
 does not expose a folder-lifecycle change notification surface,
@@ -327,13 +335,16 @@ capability surface.
 
 `push_subscribe(scopes)` groups the requested scopes by
 `/me/mailFolders/{folder}/messages` (or `/me/events`,
-`/me/contactFolders/{folder}/contacts`) resource, issues one
-`POST /subscriptions` per resource through the
-`crate::webhooks` helpers, stores the resulting
-`(server_id, resource, client_state, expires_at)` tuples on a
-`GraphSubscriptionGroup` keyed by the returned
-`SubscriptionHandle`, and emits a `WatchEvent::Reconnected` on
-the broadcast channel.
+`/me/contactFolders/{folder}/contacts`) resource. If any requested
+scope cannot resolve to a Graph subscription resource the call
+returns `Err(AccountError { kind: Unsupported(PushSubscribe), ..
+})` rather than silently subscribing to the resolvable subset.
+Successful subscribes issue one `POST /subscriptions` per resource
+through the `crate::webhooks` helpers (now `Result<_, GraphError>`,
+classified through the same `into_account_error` boundary REST uses),
+store the resulting `(server_id, expires_at)` tuples on a
+`GraphSubscriptionGroup` keyed by the returned `SubscriptionHandle`,
+and emit a `WatchEvent::Reconnected` on the broadcast channel.
 
 `push_unsubscribe(handle)` removes the group, deletes each
 underlying server-side subscription via
@@ -347,13 +358,19 @@ sleep against the shutdown token: on each tick it walks every
 group's subscriptions, identifies any whose `expires_at` is
 within `RENEWAL_THRESHOLD_MINUTES` (30 minutes), and calls
 `renew_subscription` for each. Successful renewals update the
-in-memory `expires_at`. The worker tracks a `disconnected`
-sticky flag: the first renewal failure in a healthy run emits
-`WatchEvent::Disconnected`; the first fully successful pass
-after a failed one emits `WatchEvent::Reconnected`. Both events
-flow through the same broadcast as inbound invalidations, so the
-engine sees streaming health on a single channel. The worker
-exits cleanly on shutdown or when the subscription map drains.
+in-memory `expires_at`. Failed renewals classify through
+`graph_error::into_account_error`: terminal recovery classes
+(`AuthLost`, `NeedsPolicyChange`, `NoPermission`, etc.) emit
+`WatchEvent::Terminated(AccountError)` so the engine tears the
+subscription down. Retryable classes log structured telemetry
+(`message_key`, `recovery` discriminant) and continue. The worker
+tracks a `disconnected` sticky flag: the first renewal failure in a
+healthy run emits `WatchEvent::Disconnected`; the first fully
+successful pass after a failed one emits `WatchEvent::Reconnected`.
+All three events flow through the same broadcast as inbound
+invalidations, so the engine sees streaming health on a single
+channel. The worker exits cleanly on shutdown or when the
+subscription map drains.
 
 The webhook receiver itself is not part of this crate. Consumers
 mount an HTTPS endpoint at `PushEndpoint::webhook_url`, validate
@@ -387,11 +404,15 @@ reconnect loop:
    `WatchEvent::Invalidated { hint: { source: EwsStreaming, payload: SpecificCursorScope(...) } }`
    on the broadcast.
 
-Network or parse failures emit
-`WatchEvent::Disconnected` once per disconnect, sleep, and
-reconnect; a successful resubscribe after a disconnect emits
-`WatchEvent::Reconnected`. The worker checks `shutdown`
-between every step.
+Network or parse failures classify through
+`ews_error_to_account_error`. Terminal classes (auth lost,
+conditional-access blocked, etc.) emit
+`WatchEvent::Terminated(AccountError)` and exit the worker;
+transient classes emit `WatchEvent::Disconnected` once per
+disconnect, log structured telemetry (message_key + recovery
+discriminant), sleep, and reconnect. A successful resubscribe after
+a transient disconnect emits `WatchEvent::Reconnected`. The worker
+checks `shutdown` between every step.
 
 `push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
 wrapped in a `stream::unfold` that selects against the shutdown
@@ -418,13 +439,15 @@ still sees events.
    (mandatory for `SetFlags` / `Move`, opportunistic for
    `Destroy`).
 3. Send the `/$batch` request. Per-response status drives
-   `mutation_outcome_for_status`: 2xx -> `Succeeded(Applied)`,
-   404-on-destroy -> `Succeeded(Skipped)`, 412 (precondition
-   failed) -> `Succeeded(Skipped)`, 429 -> `Failed(BatchFailure
-   { error, .. })` carrying a rate-limited AccountError, other ->
-   `Failed(BatchFailure { error, .. })` carrying a status-derived
-   AccountError. The central recovery mapping reads
-   `Retry-After` off the cause chain into `RetryAdvice::not_before`.
+   `mutation_item_outcome`: 2xx -> `Succeeded(Applied)`,
+   404-on-destroy -> `Succeeded(Skipped)`, 412 / 429 / other failures
+   -> `Failed(BatchFailure { error, .. })` carrying a structured
+   `AccountError` built through the same `response_to_account_error`
+   path the boundary uses, so per-item failures pick up
+   `AttemptCause(Acknowledged)`, `WireCause::Graph(signal)`, and
+   `Retry-After` -> `RetryHint::After` on the `ServerCause`. The
+   central recovery mapping resolves the structured hint into
+   `RetryAdvice::retry_hint`.
 
 `bulk_set_flags` translates the `FlagOp` to a Graph PATCH body:
 `isRead` for `\\seen` / `read`, `flag.flagStatus` for
@@ -529,11 +552,20 @@ false` matches the account capability).
 ## Error translation
 
 `graph_error::into_account_error(error, ctx)` converts the
-crate-internal `Error` enum into an `AccountError` via
-`AccountErrorBuilder`. `GraphErrorContext { protocol, operation,
-scope }` threads the calling operation so `bifrost-types::recovery::
-derive` computes `RecoveryClass`; the Graph crate has no private
-recovery table.
+crate-internal `GraphError` enum into an `AccountError` via
+`AccountErrorBuilder::try_build`. `GraphErrorContext { protocol,
+operation, scope }` threads the calling operation so
+`bifrost-types::recovery::derive` computes `RecoveryClass`; the Graph
+crate has no private recovery table. `GraphErrorContext::ews(op)` is
+the matching constructor for EWS failures; the EWS-side helper
+`graph_error::ews_error_to_account_error` routes `EwsError::Transport`
+through `bifrost_net::into_account_error`, maps `EwsError::HttpStatus`
+through the same `response_to_account_error` path REST uses,
+classifies `EwsError::SoapFault { code, detail }` onto the
+`SoapFaultCode` taxonomy (Server -> Unavailable, Client/MustUnderstand/
+VersionMismatch -> 400, Unknown -> ContractViolation), and routes
+`EwsError::MalformedXml` to `Protocol(ParseFailed)`. Every produced
+error stamps `Protocol::Ews`.
 
 Known Graph vocabulary lands on typed `WireCause::Graph
 (GraphSignal::*)` variants - `InvalidAuthenticationToken`,
@@ -552,7 +584,9 @@ Mapping highlights:
 - `Gone` / 410 / `InvalidDeltaToken` / `SyncStateNotFound` ->
   `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`.
 - `TooManyRequests` / 429 -> `Server(RateLimited)` with
-  `throttle_scope: Tenant` and `not_before` from `Retry-After`.
+  `throttle_scope: Tenant` and `retry_hint: RetryHint::After(_)`
+  parsed from `Retry-After` (both integer seconds and HTTP-date forms
+  supported via `bifrost_net::parse_retry_after`).
 - 503 / 504 -> `Server(Unavailable)` ->
   `Retry::SameRequest`.
 - `InvalidAuthenticationToken` / 401 ->
@@ -570,12 +604,19 @@ Mapping highlights:
 - `PreconditionFailed` / 412 -> `ConcurrencyConflict` ->
   `Retry::AfterStateRefresh`.
 
-`mutation_outcome_for_status` projects per-id `$batch` responses
+`mutation_item_outcome` projects per-id `$batch` responses
 onto `ItemOutcome`: 2xx -> `Succeeded(Applied)`, 404-on-destroy ->
-`Succeeded(Skipped)` (idempotent delete), 412 ->
-`Succeeded(Skipped)` (etag mismatch; engine reads back), 429 and
-other failures -> `Failed(BatchFailure { error })` carrying the
-status-derived AccountError.
+`Succeeded(Skipped)` (idempotent delete), 412 -> `Failed(BatchFailure)`
+classified as `ConcurrencyConflict` (the engine reconciles via its
+read-back guard; per-item Skipped would mask a lost update against
+a deleted message), 429 and other failures -> `Failed(BatchFailure
+{ error })` carrying a structured `AccountError` with
+`Protocol::Graph`, `AttemptCause(Acknowledged)`, and the wire signal
+preserved on the cause chain. The same projector is used by
+`mutate.rs` for `bulk_*` flows, by `pim::submit_write_batch` for the
+PIM single-error contract (where per-item failures unwrap into the
+function's single `Result<(), AccountError>` return), and by
+`get.rs` for `get_stream` per-item hydration outcomes.
 
 Cursor-decode failures (`CursorProtocolMismatch`,
 `CursorEnvelopeUnknown`, `SchemaIncompatible`, malformed payload)

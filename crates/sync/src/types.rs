@@ -219,8 +219,11 @@ pub(crate) struct AccountSlot {
     /// reopen listener dispatches via `handle_engine_directive`.
     pub reopen_tx: mpsc::Sender<ReopenRequest>,
     /// Per-account throttle bucket. The recovery path records waits
-    /// keyed by `ThrottleKey`; mutation / poll loops may consult this
-    /// to pause work that maps to a busy key.
+    /// keyed by `ThrottleKey`; mutation / poll loops will consult this
+    /// to pause work that maps to a busy key. Tracked as `sync-F2`
+    /// in the decisions doc; recorded today, not yet read by the
+    /// poll/push paths.
+    #[allow(dead_code)]
     pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }
 

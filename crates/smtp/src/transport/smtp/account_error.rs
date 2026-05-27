@@ -19,10 +19,21 @@ use bifrost_types::error::{
     TransportKind, WireCause,
 };
 
+use crate::error::Error as MessageError;
 use crate::transport::smtp::error::{
     Error as SmtpError, ErrorKind, SmtpCommandPhase, SmtpTransmissionState,
 };
 use crate::transport::smtp::response::{EnhancedStatusCode as WireEnhancedStatusCode, Response};
+
+/// Single funnel for every `AccountErrorBuilder::try_build` site in this
+/// translation boundary. Protocol crates `expect(...)` on construction
+/// errors because an invalid kind+cause combination is a library bug, not
+/// recoverable state. Centralizing the call keeps the message stable.
+fn finish(builder: AccountErrorBuilder) -> AccountError {
+    builder
+        .try_build()
+        .expect("valid account error classification")
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct SmtpErrorContext {
@@ -71,7 +82,11 @@ impl SmtpErrorContext {
 /// Convert a low-level SMTP transport `Error` into an `AccountError`.
 pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> AccountError {
     let attempt_state = error.attempt().or(ctx.transmission_state);
-    let phase = ctx.phase;
+    // Phase carried on the error takes precedence over the context's phase:
+    // the value is where the wire-side knowledge actually lives. The context
+    // phase is a back-compat fallback for call sites that decorate the
+    // context but pass an error without a phase attached.
+    let phase = error.phase().or(ctx.phase);
     let diagnostic = error.diagnostic_text();
 
     match error.kind() {
@@ -86,6 +101,20 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
+        ErrorKind::InvalidInput if matches!(phase, Some(SmtpCommandPhase::Auth)) => {
+            // "No compatible authentication mechanism" and other local AUTH
+            // refusals must surface as Authorization(PolicyBlocked) so
+            // consumers route to a policy/reauth UX instead of "malformed
+            // request" -> ClientBug (internal telemetry).
+            build_basic(
+                &ctx,
+                AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked),
+                Cause::Access(AccessCause::PolicyBlocked),
+                attempt_state,
+                diagnostic.as_deref(),
+                None,
+            )
+        }
         ErrorKind::InvalidInput => build_basic(
             &ctx,
             AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -170,7 +199,7 @@ fn build_basic(
     if let Some(text) = diagnostic {
         builder = builder.text(DiagnosticText::support_only(text.to_owned()));
     }
-    builder.build()
+    finish(builder)
 }
 
 fn build_transport(
@@ -199,7 +228,7 @@ fn build_transport(
     if let Some(text) = diagnostic {
         builder = builder.text(DiagnosticText::support_only(text.to_owned()));
     }
-    builder.build()
+    finish(builder)
 }
 
 fn apply_context(mut builder: AccountErrorBuilder, ctx: &SmtpErrorContext) -> AccountErrorBuilder {
@@ -276,7 +305,7 @@ pub(crate) fn response_to_account_error(
     if builder_kind_is_rate_or_quota(response, phase) {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
-    builder.build()
+    finish(builder)
 }
 
 fn builder_kind_is_rate_or_quota(response: &Response, phase: Option<SmtpCommandPhase>) -> bool {
@@ -355,7 +384,7 @@ fn classify_enhanced(
         )),
         (_, 2, 2) => Some((
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
         )),
         (_, 2, 3) => Some(malformed(response)),
         (_, 2, 4) => None,
@@ -363,11 +392,11 @@ fn classify_enhanced(
         (_, 3, 0) => None,
         (_, 3, 1) => Some((
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
         )),
         (_, 3, 2) => Some((
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         )),
         (_, 3, 3) => Some(unsupported_send()),
         (_, 3, 4) => Some(malformed(response)),
@@ -376,14 +405,14 @@ fn classify_enhanced(
         (_, 4, 0) => Some(if class == 4 {
             (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_after: None }),
+                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
             )
         } else {
             server_error(u16::from(response.code()))
         }),
         (_, 4, 1..=3) => Some((
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         )),
         (_, 4, 4) if class == 5 && is_recipient_lane => Some((
             AccountErrorKind::NotFound(ResourceKind::Mailbox),
@@ -394,17 +423,17 @@ fn classify_enhanced(
         )),
         (_, 4, 4) => Some((
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         )),
         (_, 4, 5) => Some((
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after: None }),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         )),
         (_, 4, 6) => Some(server_error(u16::from(response.code()))),
         (_, 4, 7) => Some(if class == 4 {
             (
                 AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_after: None }),
+                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
             )
         } else {
             server_error(u16::from(response.code()))
@@ -414,7 +443,7 @@ fn classify_enhanced(
         (_, 5, 2) => Some(malformed(response)),
         (_, 5, 3) => Some((
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after: None }),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         )),
         (_, 5, 4) => Some(malformed(response)),
         (_, 5, 5) => Some(unsupported_send()),
@@ -446,14 +475,14 @@ fn classify_enhanced(
         (_, 7, 17 | 18) => Some(permission_denied()),
         (_, 7, 19) => Some((
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         )),
         (_, 7, 20..=22) => Some(malformed(response)),
         (_, 7, 23..=26) => Some(policy_blocked()),
         (_, 7, 27) => Some(malformed(response)),
         (_, 7, 28) => Some((
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after: None }),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         )),
         (_, 7, 29) => Some(malformed(response)),
         (_, 7, 30) => Some(policy_blocked()),
@@ -465,12 +494,12 @@ fn classify_enhanced(
             Some(if throttled {
                 (
                     AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                    Cause::Server(ServerCause::RateLimited { retry_after: None }),
+                    Cause::Server(ServerCause::RateLimited { retry_hint: None }),
                 )
             } else {
                 (
                     AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                    Cause::Server(ServerCause::Unavailable { retry_after: None }),
+                    Cause::Server(ServerCause::Unavailable { retry_hint: None }),
                 )
             })
         }
@@ -488,20 +517,20 @@ fn classify_status(
     match status {
         421 | 450 | 451 | 455 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         ),
         432 => auth_refresh_transient(),
         452 => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
         ),
         454 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         ),
         400..=499 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         ),
         500 | 501 => malformed(response),
         502 | 504 => unsupported_send(),
@@ -533,7 +562,7 @@ fn classify_status(
             if text.contains("mailbox") || text.contains("storage") || text.contains("quota") {
                 (
                     AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                    Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                    Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
                 )
             } else {
                 malformed(response)
@@ -619,6 +648,108 @@ fn server_error(status: u16) -> (AccountErrorKind, Cause) {
             status: Some(status),
         }),
     )
+}
+
+/// Boundary translation: map a message-builder `crate::error::Error` into the
+/// shared `AccountError` shape. Account-oriented callers that construct a
+/// `Message` (downstream send pipelines, drafts, future `Account` impls) feed
+/// validation failures through this function so the single-translation-
+/// boundary rule holds. Every variant of `MessageError` is exhaustively
+/// matched - adding a variant to `MessageError` forces a refresh here.
+#[allow(dead_code)]
+pub(crate) fn message_error_to_account_error(
+    error: MessageError,
+    protocol: Protocol,
+) -> AccountError {
+    let (kind, cause, detail): (AccountErrorKind, Cause, String) = match &error {
+        MessageError::MissingFrom => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "missing source address, invalid envelope".to_owned(),
+                ),
+            }),
+            "missing source address, invalid envelope".to_owned(),
+        ),
+        MessageError::MissingTo => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "missing destination address, invalid envelope".to_owned(),
+                ),
+            }),
+            "missing destination address, invalid envelope".to_owned(),
+        ),
+        MessageError::TooManyFrom => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "there can only be one source address".to_owned(),
+                ),
+            }),
+            "there can only be one source address".to_owned(),
+        ),
+        MessageError::EmailMissingAt => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only("missing @ in email address".to_owned()),
+            }),
+            "missing @ in email address".to_owned(),
+        ),
+        MessageError::EmailMissingLocalPart => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "missing local part in email address".to_owned(),
+                ),
+            }),
+            "missing local part in email address".to_owned(),
+        ),
+        MessageError::EmailMissingDomain => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only("missing domain in email address".to_owned()),
+            }),
+            "missing domain in email address".to_owned(),
+        ),
+        MessageError::CannotParseFilename => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    "could not parse attachment filename".to_owned(),
+                ),
+            }),
+            "could not parse attachment filename".to_owned(),
+        ),
+        MessageError::NonAsciiChars => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only("contains non-ASCII chars".to_owned()),
+            }),
+            "contains non-ASCII chars".to_owned(),
+        ),
+        MessageError::InvalidInput(message) => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(message.clone()),
+            }),
+            message.clone(),
+        ),
+        MessageError::Io(io) => (
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(io.to_string()),
+            }),
+            io.to_string(),
+        ),
+    };
+
+    let builder = AccountErrorBuilder::new(kind, cause)
+        .protocol(protocol)
+        .operation(AccountOperation::Send)
+        .idempotency_override(false)
+        .text(DiagnosticText::support_only(detail));
+    finish(builder)
 }
 
 #[cfg(test)]
@@ -923,6 +1054,94 @@ mod tests {
             account.kind(),
             AccountErrorKind::Unsupported(AccountOperation::Send)
         ));
+    }
+
+    #[test]
+    fn auth_no_compatible_mechanism_routes_to_policy_blocked() {
+        // smtp-D2: an InvalidInput error originating from the AUTH path
+        // (e.g. server advertises no compatible mechanism for our
+        // credentials) must surface as Authorization(PolicyBlocked), not
+        // Request(Malformed) -> ClientBug. Consumer UX must offer reauth/
+        // policy-change, not "library bug, see internal telemetry".
+        let err = crate::transport::smtp::error::invalid_input(
+            "No compatible authentication mechanism was found",
+        )
+        .with_phase(SmtpCommandPhase::Auth);
+        let account = into_account_error(err, ctx_smtp_send());
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+    }
+
+    #[test]
+    fn invalid_input_without_phase_stays_malformed() {
+        // Phase-less InvalidInput keeps the original Request(Malformed)
+        // routing; only the Auth-tagged path elevates to PolicyBlocked.
+        let err = crate::transport::smtp::error::invalid_input("bad SIZE parameter");
+        let account = into_account_error(err, ctx_smtp_send());
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
+
+    #[test]
+    fn error_phase_takes_precedence_over_context_phase() {
+        // Phase carried on the error is the authoritative value (smtp-D4):
+        // a missed `with_phase` call cannot silently degrade because phase
+        // is part of the value, not a context-time decoration. When both
+        // are set, the error wins.
+        let err =
+            crate::transport::smtp::error::invalid_input("x").with_phase(SmtpCommandPhase::Auth);
+        // Context says MailFrom; error says Auth - we must route as Auth.
+        let ctx = ctx_smtp_send().with_phase(SmtpCommandPhase::MailFrom);
+        let account = into_account_error(err, ctx);
+        assert!(matches!(
+            account.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        ));
+    }
+
+    #[test]
+    fn message_error_missing_from_is_malformed() {
+        let err = message_error_to_account_error(crate::error::Error::MissingFrom, Protocol::Smtp);
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
+    }
+
+    #[test]
+    fn message_error_every_variant_maps() {
+        // smtp-D6 contract: every MessageError variant maps to AccountError
+        // without panicking. If a new variant is added to MessageError, the
+        // match in message_error_to_account_error becomes non-exhaustive
+        // and this test catches the gap at compile time via the boundary
+        // function. Here we just exercise each constructor.
+        use crate::error::Error as ME;
+        let cases: Vec<ME> = vec![
+            ME::MissingFrom,
+            ME::MissingTo,
+            ME::TooManyFrom,
+            ME::EmailMissingAt,
+            ME::EmailMissingLocalPart,
+            ME::EmailMissingDomain,
+            ME::CannotParseFilename,
+            ME::NonAsciiChars,
+            ME::InvalidInput("payload".to_owned()),
+            ME::Io(std::io::Error::new(std::io::ErrorKind::Other, "io")),
+        ];
+        for case in cases {
+            let account = message_error_to_account_error(case, Protocol::Smtp);
+            // All map to Request(Malformed) today; ClientBug recovery.
+            assert!(matches!(
+                account.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            ));
+            assert!(account.recovery().is_terminal());
+        }
     }
 
     #[test]

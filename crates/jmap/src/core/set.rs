@@ -99,61 +99,76 @@ where
     properties: Option<Vec<U>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum SetErrorType {
-    #[serde(rename = "forbidden")]
     Forbidden,
-    #[serde(rename = "overQuota")]
     OverQuota,
-    #[serde(rename = "tooLarge")]
     TooLarge,
-    #[serde(rename = "rateLimit")]
     RateLimit,
-    #[serde(rename = "notFound")]
     NotFound,
-    #[serde(rename = "invalidPatch")]
     InvalidPatch,
-    #[serde(rename = "willDestroy")]
     WillDestroy,
-    #[serde(rename = "invalidProperties")]
     InvalidProperties,
-    #[serde(rename = "singleton")]
     Singleton,
-    #[serde(rename = "mailboxHasChild")]
     MailboxHasChild,
-    #[serde(rename = "mailboxHasEmail")]
     MailboxHasEmail,
-    #[serde(rename = "blobNotFound")]
     BlobNotFound,
-    #[serde(rename = "tooManyKeywords")]
     TooManyKeywords,
-    #[serde(rename = "tooManyMailboxes")]
     TooManyMailboxes,
-    #[serde(rename = "forbiddenFrom")]
     ForbiddenFrom,
-    #[serde(rename = "invalidEmail")]
     InvalidEmail,
-    #[serde(rename = "tooManyRecipients")]
     TooManyRecipients,
-    #[serde(rename = "noRecipients")]
     NoRecipients,
-    #[serde(rename = "invalidRecipients")]
     InvalidRecipients,
-    #[serde(rename = "forbiddenMailFrom")]
     ForbiddenMailFrom,
-    #[serde(rename = "forbiddenToSend")]
     ForbiddenToSend,
-    #[serde(rename = "cannotUnsend")]
     CannotUnsend,
-    #[serde(rename = "alreadyExists")]
     AlreadyExists,
-    #[serde(rename = "invalidScript")]
     InvalidScript,
-    #[serde(rename = "scriptIsActive")]
     ScriptIsActive,
-    #[serde(other)]
-    Other,
+    /// Unknown wire code. Carries the actual code string so the
+    /// `into_account_error` boundary can surface it through
+    /// `JmapMethod::Unknown { code }` rather than synthesizing a
+    /// placeholder `"other"` literal the server never sent.
+    Other(String),
+}
+
+impl<'de> serde::Deserialize<'de> for SetErrorType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "forbidden" => Self::Forbidden,
+            "overQuota" => Self::OverQuota,
+            "tooLarge" => Self::TooLarge,
+            "rateLimit" => Self::RateLimit,
+            "notFound" => Self::NotFound,
+            "invalidPatch" => Self::InvalidPatch,
+            "willDestroy" => Self::WillDestroy,
+            "invalidProperties" => Self::InvalidProperties,
+            "singleton" => Self::Singleton,
+            "mailboxHasChild" => Self::MailboxHasChild,
+            "mailboxHasEmail" => Self::MailboxHasEmail,
+            "blobNotFound" => Self::BlobNotFound,
+            "tooManyKeywords" => Self::TooManyKeywords,
+            "tooManyMailboxes" => Self::TooManyMailboxes,
+            "forbiddenFrom" => Self::ForbiddenFrom,
+            "invalidEmail" => Self::InvalidEmail,
+            "tooManyRecipients" => Self::TooManyRecipients,
+            "noRecipients" => Self::NoRecipients,
+            "invalidRecipients" => Self::InvalidRecipients,
+            "forbiddenMailFrom" => Self::ForbiddenMailFrom,
+            "forbiddenToSend" => Self::ForbiddenToSend,
+            "cannotUnsend" => Self::CannotUnsend,
+            "alreadyExists" => Self::AlreadyExists,
+            "invalidScript" => Self::InvalidScript,
+            "scriptIsActive" => Self::ScriptIsActive,
+            _ => Self::Other(value),
+        })
+    }
 }
 
 impl<O: SetObject> SetRequest<O> {
@@ -468,7 +483,7 @@ impl Display for SetErrorType {
             SetErrorType::AlreadyExists => write!(f, "alreadyExists"),
             SetErrorType::InvalidScript => write!(f, "invalidScript"),
             SetErrorType::ScriptIsActive => write!(f, "scriptIsActive"),
-            SetErrorType::Other => write!(f, "other"),
+            SetErrorType::Other(code) => write!(f, "{code}"),
         }
     }
 }

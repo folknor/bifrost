@@ -220,6 +220,7 @@ async fn reader_loop(
                 let _ = tx.send(WatchEvent::Reconnected);
                 backoff = policy.initial;
 
+                let mut terminal_err: Option<bifrost_types::AccountError> = None;
                 while let Some(message) = futures::StreamExt::next(&mut ws).await {
                     if shutdown.is_cancelled() {
                         break;
@@ -229,13 +230,47 @@ async fn reader_loop(
                             emit_push(push, &tx);
                         }
                         Ok(crate::client_ws::WebSocketMessage::Response(_)) => {}
-                        Err(_) => break,
+                        Err(err) => {
+                            // Classify every exit error so consumers
+                            // learn whether the loop ended for an
+                            // auth-lost / schema-mismatch reason or for
+                            // a transient drop. The previous shape
+                            // (`Err(_) => break`) erased the signal.
+                            let acct = super::error::into_account_error(
+                                err,
+                                super::error::JmapErrorContext::new(AccountOperation::PushStream),
+                            );
+                            if acct.recovery().is_terminal() {
+                                terminal_err = Some(acct);
+                            }
+                            break;
+                        }
                     }
+                }
+
+                if let Some(err) = terminal_err {
+                    // Terminal class: emit `Terminated(AccountError)`
+                    // and stop the reader. The engine reads
+                    // `recovery()` and decides what to do next.
+                    let _ = tx.send(WatchEvent::Terminated(err));
+                    break;
                 }
 
                 let _ = tx.send(WatchEvent::Disconnected);
             }
-            Err(_) => {
+            Err(err) => {
+                // Pre-handshake failure (`Error::WebSocketHandshake` or
+                // any other connect-time error). Classify and emit
+                // `Terminated` for terminal classes (auth lost, etc.)
+                // so consumers see what stopped the push reader.
+                let acct = super::error::into_account_error(
+                    err,
+                    super::error::JmapErrorContext::new(AccountOperation::PushStream),
+                );
+                if acct.recovery().is_terminal() {
+                    let _ = tx.send(WatchEvent::Terminated(acct));
+                    break;
+                }
                 let _ = tx.send(WatchEvent::Disconnected);
             }
         }

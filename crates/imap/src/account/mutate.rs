@@ -11,8 +11,7 @@ use futures::StreamExt;
 use crate::types::{Flag, MailboxName, ResponseCode, StoreOperation};
 
 use super::{
-    DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id, fatal_event,
-    uid_set_from_u32,
+    DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id, uid_set_from_u32,
 };
 
 pub(crate) fn bulk_set_flags(
@@ -45,6 +44,24 @@ enum MutationKind {
     Flags(FlagOp),
     Move(MembershipScope),
     Destroy,
+}
+
+/// True when a folder-level mutation failure must collapse the entire
+/// stream rather than surfacing per-item `Uncertain` for the failing
+/// folder. Reserved for failures that prevent any further folder
+/// attempt: authentication / authorization loss, schema / capability
+/// breaks. Per-folder transient failures (transport, rate limit, mailbox
+/// unavailable) emit per-item `Uncertain` and continue.
+fn stream_terminating(err: &AccountError) -> bool {
+    matches!(
+        err.kind(),
+        AccountErrorKind::Authentication(_)
+            | AccountErrorKind::Authorization(_)
+            | AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::SchemaIncompatible
+                    | bifrost_types::SyncStateErrorKind::CapabilityChanged
+            )
+    )
 }
 
 fn mutation_operation(kind: &MutationKind) -> AccountOperation {
@@ -85,19 +102,46 @@ fn mutation_stream(
             }
         }
 
+        // Per-folder failure semantics:
+        // - A folder error after per-item emissions in any prior folder
+        //   must NOT collapse those items by emitting a global
+        //   `SyncEvent::Terminated`. The failing folder's items surface
+        //   as `ItemOutcome::Uncertain` carrying the classified error
+        //   (the engine cannot tell, post-hoc, whether the mutation
+        //   landed).
+        // - Stream-level `Terminated` is reserved for failures that
+        //   prevent any further folder attempts at all (auth lost,
+        //   schema break, capability shift). Those classify as
+        //   terminal or as an engine directive; we surface them with
+        //   `Terminated` and stop.
+        // - Anything else (transient transport, rate limit, per-folder
+        //   server error) emits per-item `Uncertain` for the failing
+        //   folder and continues to the next folder.
         for (_name, (folder, ids)) in grouped {
-            match run_folder_mutation(&account, &folder, ids, &kind).await {
+            match run_folder_mutation(&account, &folder, ids.clone(), &kind).await {
                 Ok(results) => {
                     let _ = tx.send(batch(results, PageBoundary::Page, None)).await;
                 }
                 Err(err) => {
-                    let _ = tx
-                        .send(fatal_event(
-                            err,
-                            super::error::ImapErrorContext::operation(mutation_operation(&kind)),
-                        ))
-                        .await;
-                    return;
+                    let account_err = super::account_error_with(
+                        err,
+                        super::error::ImapErrorContext::operation(mutation_operation(&kind))
+                            .with_mailbox(&folder),
+                    );
+                    if stream_terminating(&account_err) {
+                        let _ = tx.send(SyncEvent::Terminated(account_err)).await;
+                        return;
+                    }
+                    let uncertain = ids
+                        .into_iter()
+                        .map(|id| {
+                            let item = BatchItemId(
+                                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                            );
+                            ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
+                        })
+                        .collect();
+                    let _ = tx.send(batch(uncertain, PageBoundary::Page, None)).await;
                 }
             }
         }
@@ -133,7 +177,10 @@ async fn run_folder_mutation(
         }
     }
     let (valid, stale) = split_by_uidvalidity(ids, uidvalidity);
-    let stale_results = failed_all(stale, uidvalidity_changed_error());
+    let stale_results = failed_all(
+        stale,
+        uidvalidity_changed_error(mutation_operation(kind), folder),
+    );
     if let MutationKind::Flags(op) = kind {
         let mut results = stale_results;
         results.extend(
@@ -179,13 +226,14 @@ async fn run_folder_mutation(
     results.extend(match outcome {
         Ok(outcome) => {
             account.folders.clear_modseqs(folder, uidvalidity, &uids);
-            mutation_results(valid, &uids, outcome)
+            mutation_results(valid, &uids, outcome, mutation_operation(kind), folder)
         }
         Err(err) => failed_all(
             valid,
             super::account_error_with(
                 err,
-                super::error::ImapErrorContext::operation(mutation_operation(kind)),
+                super::error::ImapErrorContext::operation(mutation_operation(kind))
+                    .with_mailbox(folder),
             ),
         ),
     });
@@ -222,7 +270,8 @@ async fn run_destroy_mutation_groups(
                     ids,
                     super::account_error_with(
                         err,
-                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
+                            .with_mailbox(folder),
                     ),
                 ));
                 continue;
@@ -243,13 +292,26 @@ async fn run_destroy_mutation_groups(
                 expunging_ids,
                 super::account_error_with(
                     err,
-                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy),
+                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
+                        .with_mailbox(folder),
                 ),
             ));
-            results.extend(mutation_results(remaining_ids, &uids, outcome));
+            results.extend(mutation_results(
+                remaining_ids,
+                &uids,
+                outcome,
+                AccountOperation::BulkDestroy,
+                folder,
+            ));
             continue;
         }
-        results.extend(mutation_results(ids, &uids, outcome));
+        results.extend(mutation_results(
+            ids,
+            &uids,
+            outcome,
+            AccountOperation::BulkDestroy,
+            folder,
+        ));
     }
     Ok(results)
 }
@@ -282,7 +344,7 @@ async fn run_flag_mutation_groups(
                 account
                     .folders
                     .clear_modseqs(folder, uidvalidity, &changed_uids);
-                mutation_results(ids, &uids, outcome)
+                mutation_results(ids, &uids, outcome, AccountOperation::UpdateFlags, folder)
             }
             Err(err) => {
                 if matches!(op, FlagOp::Patch { .. }) {
@@ -292,7 +354,8 @@ async fn run_flag_mutation_groups(
                     ids,
                     super::account_error_with(
                         err,
-                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags),
+                        super::error::ImapErrorContext::operation(AccountOperation::UpdateFlags)
+                            .with_mailbox(folder),
                     ),
                 )
             }
@@ -452,8 +515,10 @@ fn modified_uids(code: Option<&ResponseCode>) -> Option<Vec<u32>> {
 
 fn mutation_results(
     ids: Vec<DecodedObjectId>,
-    requested_uids: &[u32],
+    _requested_uids: &[u32],
     outcome: StoreWireOutcome,
+    operation: AccountOperation,
+    folder: &MailboxName,
 ) -> Vec<ItemOutcome<MutationSuccess>> {
     match outcome {
         StoreWireOutcome::Applied => ids
@@ -470,7 +535,10 @@ fn mutation_results(
                 let item =
                     BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
                 if modified.contains(&id.uid) {
-                    ItemOutcome::Failed(BatchFailure::new(item, concurrency_conflict_error()))
+                    ItemOutcome::Failed(BatchFailure::new(
+                        item,
+                        concurrency_conflict_error(operation, folder),
+                    ))
                 } else {
                     ItemOutcome::Succeeded(BatchSuccess::new(item, MutationSuccess::Applied))
                 }
@@ -485,13 +553,19 @@ fn mutation_results(
                 let item =
                     BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
                 if modified.contains(&id.uid) {
-                    ItemOutcome::Uncertain(BatchUncertain::new(item, concurrency_conflict_error()))
+                    ItemOutcome::Uncertain(BatchUncertain::new(
+                        item,
+                        concurrency_conflict_error(operation, folder),
+                    ))
                 } else {
-                    ItemOutcome::Failed(BatchFailure::new(item, store_failed_error()))
+                    ItemOutcome::Failed(BatchFailure::new(
+                        item,
+                        store_failed_error(operation, folder),
+                    ))
                 }
             })
             .collect(),
-        StoreWireOutcome::Failed => failed_all_by_uids(ids, requested_uids),
+        StoreWireOutcome::Failed => failed_all(ids, store_failed_error(operation, folder)),
     }
 }
 
@@ -504,26 +578,27 @@ fn failed_all(ids: Vec<DecodedObjectId>, error: AccountError) -> Vec<ItemOutcome
         .collect()
 }
 
-fn failed_all_by_uids(
-    ids: Vec<DecodedObjectId>,
-    _requested_uids: &[u32],
-) -> Vec<ItemOutcome<MutationSuccess>> {
-    failed_all(ids, store_failed_error())
-}
-
-/// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE conflicts.
-fn concurrency_conflict_error() -> AccountError {
+/// Build a `ConcurrencyConflict` `AccountError` for STORE UNCHANGEDSINCE
+/// conflicts. Takes the caller's `AccountOperation` so flag, move, and
+/// destroy paths each surface their own operation - the central recovery
+/// mapping needs the correct op to pick `Retry::AfterStateRefresh` for
+/// the right kind of work.
+fn concurrency_conflict_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::ConcurrencyConflict,
         Cause::State(StateCause::ConcurrencyConflict),
     )
     .protocol(Protocol::Imap)
-    .operation(AccountOperation::UpdateFlags)
-    .build()
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Mailbox {
+        id: folder.as_str().to_owned(),
+    })
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a generic `Request(Malformed)` for UIDVALIDITY mismatch before mutation.
-fn uidvalidity_changed_error() -> AccountError {
+fn uidvalidity_changed_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::Malformed {
@@ -531,12 +606,18 @@ fn uidvalidity_changed_error() -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
-    .build()
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Mailbox {
+        id: folder.as_str().to_owned(),
+    })
+    .try_build()
+    .expect("valid account error classification")
 }
 
-/// Build a generic transport/protocol error for a STORE command failure
-/// without a specific per-item response code.
-fn store_failed_error() -> AccountError {
+/// Build a generic protocol error for a STORE command failure without a
+/// specific per-item response code. Takes the caller's `AccountOperation`
+/// so move / destroy / flag mutations each carry their own op.
+fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
         Cause::Request(RequestCause::Malformed {
@@ -546,7 +627,12 @@ fn store_failed_error() -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
-    .build()
+    .operation(operation)
+    .scope(bifrost_types::ErrorScope::Mailbox {
+        id: folder.as_str().to_owned(),
+    })
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn split_by_uidvalidity(
@@ -630,6 +716,81 @@ mod tests {
                 .is_empty()
         );
         assert!(applied_uids_after_store(&[1], &StoreWireOutcome::Failed).is_empty());
+    }
+
+    #[test]
+    fn concurrency_conflict_error_reports_callers_operation() {
+        // imap-N3: concurrency_conflict_error / store_failed_error /
+        // uidvalidity_changed_error must surface the caller's op so
+        // recovery routes correctly for non-idempotent paths.
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        for op in [
+            AccountOperation::UpdateFlags,
+            AccountOperation::BulkMove,
+            AccountOperation::BulkDestroy,
+        ] {
+            let err = concurrency_conflict_error(op, &folder);
+            assert_eq!(err.operation(), Some(op));
+            // Mailbox scope must thread too (imap-N2).
+            assert!(matches!(
+                err.scope(),
+                Some(bifrost_types::ErrorScope::Mailbox { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn store_failed_error_reports_callers_operation() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let err = store_failed_error(AccountOperation::BulkDestroy, &folder);
+        assert_eq!(err.operation(), Some(AccountOperation::BulkDestroy));
+        assert!(matches!(
+            err.scope(),
+            Some(bifrost_types::ErrorScope::Mailbox { .. })
+        ));
+    }
+
+    #[test]
+    fn uidvalidity_changed_error_reports_callers_operation() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let err = uidvalidity_changed_error(AccountOperation::BulkMove, &folder);
+        assert_eq!(err.operation(), Some(AccountOperation::BulkMove));
+    }
+
+    #[test]
+    fn stream_terminating_only_for_auth_and_schema() {
+        use bifrost_types::{
+            AccountErrorBuilder, AuthCause, AuthErrorKind, StateCause, SyncStateErrorKind,
+        };
+        let auth = AccountErrorBuilder::new(
+            AccountErrorKind::Authentication(AuthErrorKind::Expired),
+            Cause::Auth(AuthCause::Expired),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("auth error");
+        assert!(stream_terminating(&auth));
+
+        let schema = AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
+            Cause::State(StateCause::SchemaIncompatible),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("schema error");
+        assert!(stream_terminating(&schema));
+
+        let transient = AccountErrorBuilder::new(
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::Unavailable),
+            Cause::Server(bifrost_types::ServerCause::Unavailable { retry_hint: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::UpdateFlags)
+        .try_build()
+        .expect("server error");
+        assert!(!stream_terminating(&transient));
     }
 
     #[test]

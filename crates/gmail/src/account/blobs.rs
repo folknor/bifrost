@@ -4,7 +4,7 @@
 //! do not support HTTP byte ranges. `open_blob_range` thus always
 //! returns `Unsupported(OpenBlobRange)` per capabilities.
 //!
-//! Errors funnel through `recovery::into_account_error` and
+//! Errors funnel through `error::into_account_error` and
 //! terminate streams with `SyncEvent::Terminated(AccountError)`.
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crate::encoding::decode_base64url_nopad;
 use crate::error::GmailLocalError;
 use crate::types::{GmailMessage, GmailPayload};
 
-use super::recovery;
+use super::error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GmailBlobKey {
@@ -62,11 +62,11 @@ pub(crate) fn open_blob_range(
     // contract requires `Unsupported(OpenBlobRange)` rather than a
     // range-not-supported terminal error.
     if !handle.capabilities.supports_range {
-        let error = recovery::into_account_error(
+        let error = error::into_account_error(
             crate::error::Error::Local(GmailLocalError::BlobRangeUnsupported {
                 blob_id: handle.id.0.clone(),
             }),
-            recovery::GmailErrorContext::open_blob_range(),
+            error::GmailErrorContext::open_blob_range(),
         );
         return Box::pin(stream::iter([terminate_blob(error)]));
     }
@@ -146,16 +146,16 @@ fn decode_blob_id(id: &BlobId) -> Result<GmailBlobKey, BlobError> {
 
 fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
     match error {
-        BlobError::InvalidId(detail) => recovery::into_account_error(
+        BlobError::InvalidId(detail) => error::into_account_error(
             crate::error::Error::invalid_request(
                 AccountOperation::OpenBlob,
                 format!("invalid gmail blob id: {detail}"),
             ),
-            recovery::GmailErrorContext::open_blob(blob_id.0.clone()),
+            error::GmailErrorContext::open_blob(blob_id.0.clone()),
         ),
-        BlobError::Gmail(error) => recovery::into_account_error(
+        BlobError::Gmail(error) => error::into_account_error(
             error,
-            recovery::GmailErrorContext::open_blob(blob_id.0.clone()),
+            error::GmailErrorContext::open_blob(blob_id.0.clone()),
         ),
     }
 }

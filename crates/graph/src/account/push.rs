@@ -4,14 +4,14 @@ use std::time::Duration;
 use bifrost_types::WatchEvent;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    DiagnosticText, ObjectType, Protocol, ProtocolErrorKind, Provider, RequestCause,
-    SubscriptionHandle, WireCause,
+    ObjectType, Protocol, Provider, RequestCause, SubscriptionHandle, TransmissionState,
 };
 
 use crate::webhooks::{
     create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
 };
 
+use super::graph_error::{GraphErrorContext, into_account_error};
 use super::{GraphAccount, PushMode};
 
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -70,21 +70,8 @@ fn unsupported_push_error() -> AccountError {
     .operation(AccountOperation::PushSubscribe)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
-    .build()
-}
-
-fn transport_string_error(op: AccountOperation, message: impl Into<String>) -> AccountError {
-    AccountErrorBuilder::new(
-        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
-        Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Graph,
-            detail: Some(DiagnosticText::support_only(message.into())),
-        }),
-    )
-    .operation(op)
-    .provider(Provider::Microsoft)
-    .protocol(Protocol::Graph)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 async fn subscribe_graph(
@@ -94,10 +81,17 @@ async fn subscribe_graph(
     let Some(endpoint) = account.push_endpoint.clone() else {
         return Err(unsupported_push_error());
     };
+    // Graph webhooks reject any subscription whose `resource` we
+    // cannot construct. Resolving partial subsets silently and
+    // returning success would mask consumer-side bugs where the
+    // engine asked for a scope we can never serve. Fail loudly.
     let mut grouped: HashMap<String, Vec<CursorScope>> = HashMap::new();
     for scope in scopes {
-        if let Some(resource) = resource_for_scope(&account, &scope) {
-            grouped.entry(resource).or_default().push(scope);
+        match resource_for_scope(&account, &scope) {
+            Some(resource) => {
+                grouped.entry(resource).or_default().push(scope);
+            }
+            None => return Err(unsupported_push_error()),
         }
     }
 
@@ -105,7 +99,9 @@ async fn subscribe_graph(
     for (resource, _) in grouped {
         let response = create_subscription(&account.client, &resource, &endpoint.webhook_url, None)
             .await
-            .map_err(|e| transport_string_error(AccountOperation::PushSubscribe, e))?;
+            .map_err(|e| {
+                into_account_error(e, GraphErrorContext::graph(AccountOperation::PushSubscribe))
+            })?;
         subscriptions.push(GraphSubscriptionState {
             server_id: response.id,
             expires_at: response.expiration_date_time,
@@ -133,7 +129,12 @@ async fn unsubscribe_graph(
     for state in group.subscriptions {
         delete_subscription(&account.client, &state.server_id)
             .await
-            .map_err(|e| transport_string_error(AccountOperation::PushUnsubscribe, e))?;
+            .map_err(|e| {
+                into_account_error(
+                    e,
+                    GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
+                )
+            })?;
     }
     if account.graph_subscriptions.read().await.is_empty()
         && let Some(worker) = account.graph_worker.lock().await.take()
@@ -201,9 +202,33 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        "[Graph webhooks] Failed to renew subscription {server_id}: {error}"
+                    let account_error = into_account_error(
+                        error,
+                        GraphErrorContext::graph(AccountOperation::PushSubscribe),
                     );
+                    // Terminal recovery classes (AuthLost,
+                    // NeedsPolicyChange, NoPermission, etc.) cannot
+                    // be recovered without engine intervention.
+                    // Surface them on the push channel so the engine
+                    // tears the subscription down. Retryable classes
+                    // ride out the next renewal tick - we log
+                    // structured telemetry instead of formatted text
+                    // so the dashboard can group on kind / message-key.
+                    {
+                        let telemetry = account_error.telemetry_fields();
+                        tracing::warn!(
+                            target: "bifrost_graph::webhooks",
+                            provider = ?telemetry.provider,
+                            protocol = ?telemetry.protocol,
+                            message_key = telemetry.message_key,
+                            recovery = telemetry.recovery_discriminant,
+                            server_id = %server_id,
+                            "Graph webhook renewal failed"
+                        );
+                    }
+                    if account_error.recovery().is_terminal() {
+                        let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
+                    }
                     had_error = true;
                 }
             }
@@ -268,7 +293,19 @@ fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<Str
 fn new_handle() -> Result<SubscriptionHandle, AccountError> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| {
-        transport_string_error(AccountOperation::PushSubscribe, error.to_string())
+        // RNG failure is a host-environment problem. Surface it as a
+        // transport "Network" failure with `transmission_state:
+        // Unsent` (no bytes left the process) so the recovery mapping
+        // classifies it as a retryable client-side issue.
+        let net = bifrost_net::Error::Network {
+            message: format!("RNG failed: {error}"),
+            transmission_state: TransmissionState::Unsent,
+            source: None,
+        };
+        into_account_error(
+            crate::error::GraphError::Net(net),
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
+        )
     })?;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -312,5 +349,29 @@ mod tests {
             resource_for_scope(&account, &scope).as_deref(),
             Some("/me/events")
         );
+    }
+
+    /// `subscribe_graph` must fail loudly when any requested scope
+    /// cannot resolve to a Graph resource. Silently subscribing to
+    /// the resolvable subset returns `Ok` while quietly losing
+    /// coverage of the unresolved scopes; tests pin
+    /// `Unsupported(PushSubscribe)` instead.
+    #[tokio::test]
+    async fn subscribe_partial_resolve_returns_unsupported() {
+        let mut account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        account.push_endpoint = Some(PushEndpoint {
+            webhook_url: "https://example.test/webhook".to_string(),
+        });
+        // CursorScope::Account is not a `FolderType` and so cannot
+        // be mapped to a Graph subscription resource. This must
+        // surface as Unsupported(PushSubscribe), not as an
+        // empty-success.
+        let result = subscribe_graph(account, vec![CursorScope::Account]).await;
+        let err = result.expect_err("expected Unsupported");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
     }
 }

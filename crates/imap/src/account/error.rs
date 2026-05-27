@@ -18,10 +18,9 @@
 use bifrost_types::{
     AccessCause, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
     AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText, ErrorScope,
-    ImapResponseCode, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause,
-    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade,
-    SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
-    TransportKind, WireCause,
+    ImapResponseCode, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
+    ResourceKind, ServerCause, ServerErrorKind, StateCause, StrategyDowngrade, SyncStateErrorKind,
+    ThrottleScope, TransmissionState, TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 
 use crate::Error;
@@ -80,12 +79,6 @@ impl ImapErrorContext {
     }
 
     #[must_use]
-    pub(crate) fn with_thread_id(mut self, id: impl Into<String>) -> Self {
-        self.scope = Some(ErrorScope::Thread { id: id.into() });
-        self
-    }
-
-    #[must_use]
     pub(crate) fn with_transmission_state(mut self, state: TransmissionState) -> Self {
         self.transmission_state = Some(state);
         self
@@ -113,11 +106,27 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         skip_attempt_cause,
     } = translation;
 
+    // CursorInvalid requires a cursor scope or `try_build` rejects
+    // (CursorInvalidWithoutScope). PIM and other folder-bound paths
+    // pass `Mailbox { id }`; promote that to `Cursor(Folder(id))` so
+    // a stray `EXPUNGEISSUED` / `CLOSED` reaching one of those paths
+    // builds a structurally valid error rather than panicking inside
+    // `expect`. Other kinds keep the caller's scope verbatim.
+    let scope_for_kind = match (&kind, ctx.scope.as_ref()) {
+        (
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Some(ErrorScope::Mailbox { id }),
+        ) => Some(ErrorScope::Cursor(CursorScope::Folder(
+            bifrost_types::FolderId(id.clone()),
+        ))),
+        _ => ctx.scope.clone(),
+    };
+
     let mut builder = AccountErrorBuilder::new(kind, primary_cause)
         .protocol(Protocol::Imap)
         .operation(ctx.operation);
 
-    if let Some(scope) = ctx.scope.clone() {
+    if let Some(scope) = scope_for_kind {
         builder = builder.scope(scope);
     }
     if let Some(provider) = ctx.provider {
@@ -149,7 +158,9 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         builder = builder.push_cause(Cause::Attempt(AttemptCause::new(state)));
     }
 
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Build an `AccountError` for a locally detected `Unsupported` PIM
@@ -162,7 +173,8 @@ pub(crate) fn unsupported(operation: AccountOperation) -> AccountError {
     )
     .protocol(Protocol::Imap)
     .operation(operation)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a fatal-stream error for UIDVALIDITY change on a folder cursor.
@@ -184,7 +196,8 @@ pub(crate) fn uidvalidity_changed(
         expected,
         actual,
     )))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a fatal-stream error for HIGHESTMODSEQ regression on a folder cursor.
@@ -206,7 +219,8 @@ pub(crate) fn modseq_reset(
         previous,
         current,
     )))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Build a fatal-stream error for a terminal QRESYNC/CONDSTORE strategy
@@ -219,7 +233,8 @@ pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrad
     .protocol(Protocol::Imap)
     .operation(AccountOperation::SyncChanges)
     .scope(ErrorScope::Cursor(super::folder_scope(folder)))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 // ---------------------------------------------------------------------
@@ -313,8 +328,12 @@ fn classify(error: &Error, ctx: &ImapErrorContext) -> Translation {
             ));
             t
         }
-        Error::No { text, code } => classify_status(text, code.as_ref(), StatusFallback::No, ctx),
-        Error::Bad { text, code } => classify_status(text, code.as_ref(), StatusFallback::Bad, ctx),
+        Error::No { text, code, .. } => {
+            classify_status(text, code.as_ref(), StatusFallback::No, ctx)
+        }
+        Error::Bad { text, code, .. } => {
+            classify_status(text, code.as_ref(), StatusFallback::Bad, ctx)
+        }
         Error::Bye { text, code, .. } => {
             classify_status(text, code.as_ref(), StatusFallback::Bye, ctx)
         }
@@ -469,7 +488,7 @@ fn fallback_status(_text: &str, fallback: &StatusFallback) -> Translation {
         ),
         StatusFallback::Bye => Translation::new(
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         ),
     }
 }
@@ -494,7 +513,9 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         _ => ThrottleScope::Account,
     };
 
-    let mut t = match code {
+    let t = match code {
+        // Each arm produces an owned Translation. Some arms below mutate
+        // it locally before yielding; the outer binding stays immutable.
         // Auth / policy
         ResponseCode::AuthenticationFailed => Translation::new(
             AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
@@ -527,7 +548,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::Corruption
         | ResponseCode::TempFail(_) => Translation::new(
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
         ),
         ResponseCode::ServerBug => Translation::new(
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -581,7 +602,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         ResponseCode::OverQuota => {
             let mut t = Translation::new(
                 AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
             );
             t.throttle_scope = Some(ThrottleScope::Account);
             t
@@ -589,7 +610,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         ResponseCode::Limit => {
             let mut t = Translation::new(
                 AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_after: None }),
+                Cause::Server(ServerCause::RateLimited { retry_hint: None }),
             );
             t.throttle_scope = Some(mailbox_throttle());
             t
@@ -597,7 +618,7 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         ResponseCode::MetadataTooMany => {
             let mut t = Translation::new(
                 AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-                Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
             );
             t.throttle_scope = Some(ThrottleScope::Account);
             t
@@ -747,8 +768,6 @@ fn classify_response_code(code: &ResponseCode, ctx: &ImapErrorContext) -> Option
         | ResponseCode::MetadataLongEntries(_) => return None,
     };
 
-    // Unused capture - `t.diagnostic_text` is set in classify_status if missing.
-    let _ = &mut t;
     Some(t)
 }
 
@@ -924,16 +943,6 @@ fn response_code_payload(code: &ResponseCode) -> Option<DiagnosticText> {
     };
     Some(DiagnosticText::support_only(value))
 }
-
-// Used by the kind/cause classifier in `MailboxUnavailableKind` paths.
-// Currently unreferenced; reserved for a future server-driven retry
-// classification on `Bye` codes that distinguish transient from
-// permanent unavailability.
-#[allow(dead_code)]
-const _MAILBOX_UNAVAILABLE_KINDS: [MailboxUnavailableKind; 2] = [
-    MailboxUnavailableKind::Transient,
-    MailboxUnavailableKind::Permanent,
-];
 
 #[cfg(test)]
 #[path = "error_tests.rs"]

@@ -19,9 +19,9 @@ use bifrost_net::{NetErrorContext, into_account_error as net_into_account_error}
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, BatchFailure, BatchItemId,
-    BatchSuccess, CapabilityDelta, Cause, CursorScope, DiagnosticText, ErrorScope, ItemOutcome,
-    JmapMethod, MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause,
-    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, SyncEvent,
+    BatchSuccess, Cause, CursorScope, DiagnosticText, ErrorScope, ItemOutcome, JmapMethod,
+    MutationSuccess, Protocol, ProtocolErrorKind, Provider, RequestCause, RequestErrorKind,
+    ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncEvent,
     SyncStateErrorKind, ThrottleScope, TransmissionState, TransportCause, TransportErrorKind,
     TransportKind, WireCause,
 };
@@ -94,7 +94,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::ResponseDecode(err) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
             Cause::Wire(WireCause::MalformedResponse {
@@ -103,7 +104,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::CallNotFound(id) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
             Cause::Wire(WireCause::MalformedResponse {
@@ -114,7 +116,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::IdNotFound(id) => convert_id_not_found(id, ctx),
         crate::Error::NotParsable(detail) => build(
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
@@ -124,7 +127,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::InvalidUrl(detail) => build(
             AccountErrorKind::Request(RequestErrorKind::Malformed),
             Cause::Request(RequestCause::InvalidArgument {
@@ -133,20 +137,22 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         crate::Error::NoPrimaryAccount { capability } => build(
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
             &ctx,
         )
         .text(DiagnosticText::support_only(format!(
             "session lists no primary account for capability {capability}"
         )))
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         #[cfg(feature = "websockets")]
-        crate::Error::WebSocket(err) => websocket_runtime_error(err.to_string(), ctx),
+        crate::Error::WebSocketHandshake(err) => websocket_handshake_error(err.to_string(), ctx),
+        #[cfg(feature = "websockets")]
+        crate::Error::WebSocketRuntime(err) => websocket_runtime_error(err.to_string(), ctx),
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketClosed => {
             websocket_runtime_error("WebSocket connection closed by peer".to_string(), ctx)
@@ -159,7 +165,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
             }),
             &ctx,
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         #[cfg(feature = "websockets")]
         crate::Error::WebSocketSetup(setup) => match setup {
             crate::WebSocketSetupError::Tls(message) => build(
@@ -171,7 +178,8 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
                 &ctx,
             )
             .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
-            .build(),
+            .try_build()
+            .expect("valid account error classification"),
             crate::WebSocketSetupError::InvalidHeader(message) => build(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::InvalidArgument {
@@ -180,16 +188,16 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
                 }),
                 &ctx,
             )
-            .build(),
+            .try_build()
+            .expect("valid account error classification"),
             crate::WebSocketSetupError::Subprotocol(message) => build(
                 AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-                Cause::State(StateCause::CapabilityChanged {
-                    delta: CapabilityDelta::default(),
-                }),
+                Cause::State(StateCause::CapabilityChanged { delta: None }),
                 &ctx,
             )
             .text(DiagnosticText::support_only(message))
-            .build(),
+            .try_build()
+            .expect("valid account error classification"),
         },
     }
 }
@@ -237,12 +245,57 @@ pub(crate) fn unsupported_error(
     if let Some(scope) = scope {
         builder = builder.scope(scope);
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
+/// Convenience for stream call sites that need to emit a
+/// `SyncEvent::Terminated(Unsupported(op))`. Callers pass the
+/// operation the stream is performing; the helper previously
+/// hard-coded `AccountOperation::Discover` for every caller,
+/// which mis-classified inventory / hydrate / blob-range streams
+/// and produced consumer-visible "discovery unsupported" copy for
+/// operations that have nothing to do with discovery.
 #[must_use]
-pub(crate) fn terminated_unsupported<T>(message: impl Into<String>) -> SyncEvent<T> {
-    terminated(unsupported_error(AccountOperation::Discover, None, message))
+pub(crate) fn terminated_unsupported<T>(
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    message: impl Into<String>,
+) -> SyncEvent<T> {
+    terminated(unsupported_error(operation, scope, message))
+}
+
+/// Stream-side variant for protocol-shape failures that are
+/// `Protocol(ContractViolation)`, not `Unsupported`. Pagination
+/// overflows, response-shape mismatches, and similar producer-side
+/// limits that the protocol cannot represent in a request live here.
+/// `Discover`-coded `Unsupported` was the wrong consumer-facing
+/// classification - the server is not refusing the operation; the
+/// library cannot encode the request shape.
+#[must_use]
+pub(crate) fn terminated_contract_violation<T>(
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    message: impl Into<String>,
+) -> SyncEvent<T> {
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Jmap,
+            detail: Some(DiagnosticText::support_only(message)),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation);
+    if let Some(scope) = scope {
+        builder = builder.scope(scope);
+    }
+    terminated(
+        builder
+            .try_build()
+            .expect("valid account error classification"),
+    )
 }
 
 /// Per-item classification for `Email/set` outcomes. Returns
@@ -300,11 +353,11 @@ pub(crate) fn set_error_to_account_error(
         ),
         SetErrorType::OverQuota => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after: None }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
         ),
         SetErrorType::RateLimit => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after: None }),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
         ),
         SetErrorType::NotFound | SetErrorType::BlobNotFound => {
             let wire = if matches!(set_error.error_type(), &SetErrorType::BlobNotFound) {
@@ -319,8 +372,14 @@ pub(crate) fn set_error_to_account_error(
                     Cause::Request(RequestCause::NotFound { what: resource, id }),
                 )
             } else {
+                // No scope tells us what was missing. Classify as a
+                // typed protocol-shape error so the kind/cause pair
+                // matches the strict builder invariants. Without the
+                // resource scope the previous shape was
+                // `Server(Error { status: None }) + Cause::Wire(_)`,
+                // which doesn't pass `kind_matches_cause`.
                 (
-                    AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
                     Cause::Wire(WireCause::Jmap(wire)),
                 )
             }
@@ -344,35 +403,42 @@ pub(crate) fn set_error_to_account_error(
                 detail: DiagnosticText::support_only(set_error.to_string()),
             }),
         ),
+        // The following set-error variants are legitimate JMAP wire
+        // responses describing protocol-shape state conflicts (id is
+        // on the destroy list, singleton already exists, mailbox has
+        // children, etc.). They classify under `Protocol(Unknown)`
+        // paired with a typed `Cause::Wire(JmapMethod::*)` so the
+        // strict `kind_matches_cause` rule holds. Recovery for
+        // `Protocol(Unknown)` is `UnknownPermanent`, which is the
+        // right consumer-facing outcome: the operation cannot retry
+        // and the engine has no automatic remediation.
         SetErrorType::WillDestroy => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::WillDestroy)),
         ),
         SetErrorType::Singleton => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::Singleton)),
         ),
         SetErrorType::ScriptIsActive => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::ScriptIsActive)),
         ),
         SetErrorType::CannotUnsend => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::CannotUnsend)),
         ),
         SetErrorType::MailboxHasChild => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasChild)),
         ),
         SetErrorType::MailboxHasEmail => (
-            AccountErrorKind::Server(ServerErrorKind::Error { status: None }),
+            AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
             Cause::Wire(WireCause::Jmap(JmapMethod::MailboxHasEmail)),
         ),
-        SetErrorType::Other => (
+        SetErrorType::Other(code) => (
             AccountErrorKind::Protocol(ProtocolErrorKind::Unknown),
-            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown {
-                code: "other".to_string(),
-            })),
+            Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })),
         ),
     };
 
@@ -389,13 +455,13 @@ pub(crate) fn set_error_to_account_error(
     // the primary is an Access/Server cause and we add the wire signal.
     let primary_was_wire = matches!(
         set_error.error_type(),
-        &SetErrorType::WillDestroy
-            | &SetErrorType::Singleton
-            | &SetErrorType::ScriptIsActive
-            | &SetErrorType::CannotUnsend
-            | &SetErrorType::MailboxHasChild
-            | &SetErrorType::MailboxHasEmail
-            | &SetErrorType::Other
+        SetErrorType::WillDestroy
+            | SetErrorType::Singleton
+            | SetErrorType::ScriptIsActive
+            | SetErrorType::CannotUnsend
+            | SetErrorType::MailboxHasChild
+            | SetErrorType::MailboxHasEmail
+            | SetErrorType::Other(_)
     );
     if !primary_was_wire
         && let Some(wire) = set_error_type_to_jmap_method(set_error.error_type().clone())
@@ -411,7 +477,9 @@ pub(crate) fn set_error_to_account_error(
     if let Some(scope) = item_scope {
         builder = builder.scope(scope);
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Map a `SetErrorType` to the corresponding typed `JmapMethod` wire
@@ -443,8 +511,16 @@ fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod>
         SetErrorType::NoRecipients => Some(JmapMethod::NoRecipients),
         // WillDestroy/Singleton/ScriptIsActive/CannotUnsend/MailboxHasChild/
         // MailboxHasEmail primary IS the WireCause; callers skip these.
-        // Other has no stable code.
-        _ => None,
+        // Other(code) carries the unknown wire code already as the
+        // primary `Cause::Wire(JmapMethod::Unknown { code })`; no
+        // forensic duplicate is added.
+        SetErrorType::WillDestroy
+        | SetErrorType::Singleton
+        | SetErrorType::ScriptIsActive
+        | SetErrorType::CannotUnsend
+        | SetErrorType::MailboxHasChild
+        | SetErrorType::MailboxHasEmail
+        | SetErrorType::Other(_) => None,
     }
 }
 
@@ -481,6 +557,11 @@ fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
         }
         ErrorScope::Contact { .. } | ErrorScope::ContactCollection => Some(ResourceKind::Contact),
         ErrorScope::Account | ErrorScope::Cursor(_) => None,
+        // `ErrorScope` is `#[non_exhaustive]` in `bifrost-types`, so
+        // this catch-all is required for the crate to compile after a
+        // new variant lands upstream. Any new variant must be handled
+        // explicitly above with the appropriate `ResourceKind` mapping
+        // (or an explicit `None`) before relying on this fall-through.
         _ => None,
     }
 }
@@ -496,6 +577,8 @@ fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
         | ErrorScope::Cursor(_)
         | ErrorScope::CalendarCollection
         | ErrorScope::ContactCollection => None,
+        // `ErrorScope` is `#[non_exhaustive]`; see `resource_from_scope`
+        // for the explicit-handling discipline new variants must follow.
         _ => None,
     }
 }
@@ -525,7 +608,8 @@ fn convert_transport(
             )),
             &ctx,
         )
-        .build()
+        .try_build()
+        .expect("valid account error classification")
     }
 }
 
@@ -539,20 +623,19 @@ fn convert_problem(
         .and_then(|t| status_from_net(t.net.as_ref()));
     let status_u32 = details.status().or(net_status);
     let status_u16 = status_u32.and_then(|s| u16::try_from(s).ok());
-    let retry_after = transport
+    let retry_hint = transport
         .as_ref()
-        .and_then(|t| retry_after_from_net(t.net.as_ref()));
+        .and_then(|t| retry_after_from_net(t.net.as_ref()))
+        .map(RetryHint::After);
 
     let (kind, primary) = match (details.error(), status_u16) {
         (ProblemType::JMAP(JMAPError::Limit), _) => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after }),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
         ),
         (ProblemType::JMAP(JMAPError::UnknownCapability), _) => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
         ),
         (ProblemType::JMAP(JMAPError::NotJSON | JMAPError::NotRequest), _) => (
             AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -600,11 +683,11 @@ fn convert_problem(
         ),
         (ProblemType::Other(_), Some(429)) => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after }),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
         ),
         (ProblemType::Other(_), Some(status)) if (500..=599).contains(&status) => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after }),
+            Cause::Server(ServerCause::Unavailable { retry_hint }),
         ),
         (ProblemType::Other(_), Some(status)) => (
             AccountErrorKind::Server(ServerErrorKind::Error {
@@ -646,7 +729,9 @@ fn convert_problem(
     if matches!(details.error(), ProblemType::Other(_)) && matches!(status_u16, Some(429)) {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn wire_for_problem(error: &ProblemType) -> WireCause {
@@ -684,15 +769,24 @@ fn retry_after_from_net(net: Option<&bifrost_net::Error>) -> Option<Duration> {
 
 fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext) -> AccountError {
     let method_type = method.error_type();
+    // A `SyncState(CursorInvalid)` kind requires an `ErrorScope::Cursor`
+    // per the post-Phase-5 builder contract. JMAP method-level cursor
+    // errors (`cannotCalculateChanges`, `anchorNotFound`,
+    // `tooManyChanges`) classify as `CursorInvalid` only when the caller
+    // threaded a cursor scope through `JmapErrorContext::cursor(...)`;
+    // otherwise the server returned a cursor-specific error for a
+    // non-cursored request, which is a contract violation and routes
+    // there instead.
+    let has_cursor_scope = matches!(ctx.scope, Some(ErrorScope::Cursor(_)));
     let (kind, primary, wire) = match method_type {
         MethodErrorType::ServerUnavailable => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
             JmapMethod::ServerUnavailable,
         ),
         MethodErrorType::ServerFail => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after: None }),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
             JmapMethod::ServerFail,
         ),
         MethodErrorType::ServerPartialFail => (
@@ -730,30 +824,22 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
         ),
         MethodErrorType::AccountNotFound => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::AccountNotFound,
         ),
         MethodErrorType::FromAccountNotFound => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::FromAccountNotFound,
         ),
         MethodErrorType::AccountNotSupportedByMethod => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::AccountNotSupportedByMethod,
         ),
         MethodErrorType::FromAccountNotSupportedByMethod => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged {
-                delta: CapabilityDelta::default(),
-            }),
+            Cause::State(StateCause::CapabilityChanged { delta: None }),
             JmapMethod::FromAccountNotSupportedByMethod,
         ),
         MethodErrorType::AccountReadOnly => (
@@ -770,9 +856,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             }),
             JmapMethod::RequestTooLarge,
         ),
-        MethodErrorType::CannotCalculateChanges => (
+        MethodErrorType::CannotCalculateChanges if has_cursor_scope => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Cause::State(StateCause::CursorInvalid),
+            JmapMethod::CannotCalculateChanges,
+        ),
+        MethodErrorType::CannotCalculateChanges => (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::Jmap(JmapMethod::CannotCalculateChanges)),
             JmapMethod::CannotCalculateChanges,
         ),
         MethodErrorType::StateMismatch => (
@@ -785,9 +876,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             Cause::State(StateCause::ConcurrencyConflict),
             JmapMethod::AlreadyExists,
         ),
-        MethodErrorType::AnchorNotFound => (
+        MethodErrorType::AnchorNotFound if has_cursor_scope => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Cause::State(StateCause::CursorInvalid),
+            JmapMethod::AnchorNotFound,
+        ),
+        MethodErrorType::AnchorNotFound => (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::Jmap(JmapMethod::AnchorNotFound)),
             JmapMethod::AnchorNotFound,
         ),
         MethodErrorType::UnsupportedSort => (
@@ -804,9 +900,14 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
             }),
             JmapMethod::UnsupportedFilter,
         ),
-        MethodErrorType::TooManyChanges => (
+        MethodErrorType::TooManyChanges if has_cursor_scope => (
             AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
             Cause::State(StateCause::CursorInvalid),
+            JmapMethod::TooManyChanges,
+        ),
+        MethodErrorType::TooManyChanges => (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::Jmap(JmapMethod::TooManyChanges)),
             JmapMethod::TooManyChanges,
         ),
         MethodErrorType::Other(code) => (
@@ -829,7 +930,9 @@ fn convert_method(method: crate::core::error::MethodError, ctx: JmapErrorContext
     if !primary_was_wire {
         builder = builder.push_cause(Cause::Wire(WireCause::Jmap(wire)));
     }
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
@@ -842,7 +945,8 @@ fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
             }),
             &ctx,
         )
-        .build()
+        .try_build()
+        .expect("valid account error classification")
     } else {
         build(
             AccountErrorKind::Protocol(ProtocolErrorKind::MissingField),
@@ -854,7 +958,8 @@ fn convert_id_not_found(id: String, ctx: JmapErrorContext) -> AccountError {
             }),
             &ctx,
         )
-        .build()
+        .try_build()
+        .expect("valid account error classification")
     }
 }
 
@@ -876,7 +981,29 @@ fn websocket_runtime_error(message: String, ctx: JmapErrorContext) -> AccountErr
     .push_cause(Cause::Attempt(AttemptCause::new(
         TransmissionState::Acknowledged,
     )))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Pre-handshake WebSocket failure. Classification is
+/// `Transport(Network) + Attempt(Unsent)` - no bytes from the JMAP
+/// request itself crossed the side-effect boundary. The blanket
+/// `From<tokio_websockets::Error>` impl that previously routed every
+/// websocket error through `websocket_runtime_error` mis-classified
+/// handshake-time TCP/TLS drops.
+#[cfg(feature = "websockets")]
+fn websocket_handshake_error(message: String, ctx: JmapErrorContext) -> AccountError {
+    build(
+        AccountErrorKind::Transport(TransportErrorKind::Network),
+        Cause::Transport(TransportCause::new(
+            TransportKind::Network,
+            Some(DiagnosticText::support_only(message)),
+        )),
+        &ctx,
+    )
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
+    .try_build()
+    .expect("valid account error classification")
 }
 
 #[cfg(test)]
@@ -936,12 +1063,21 @@ mod tests {
     }
 
     #[test]
-    fn cannot_calculate_changes_without_scope_restarts_account() {
+    fn cannot_calculate_changes_without_scope_is_contract_violation() {
+        // Post-Phase-5: `SyncState(CursorInvalid)` requires an
+        // `ErrorScope::Cursor`. A `cannotCalculateChanges` arriving on a
+        // context that lacks the cursor scope means the server returned
+        // a cursor-specific error for a non-cursored request, which is
+        // a `Protocol(ContractViolation)`, not a cursor restart.
         let err = into_account_error(
             method_error("cannotCalculateChanges"),
             JmapErrorContext::new(AccountOperation::SyncChanges),
         );
-        assert!(err.recovery().requires_engine_action());
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        );
+        assert!(err.recovery().is_terminal());
     }
 
     #[test]
@@ -1131,5 +1267,141 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// jmap-N2: `SetErrorType::Other` carries the actual wire code so
+    /// `JmapMethod::Unknown { code }` reflects what the server sent,
+    /// instead of synthesizing a placeholder `"other"` literal.
+    #[test]
+    fn set_error_other_preserves_wire_code() {
+        let set: SetError<String> = serde_json::from_str(r#"{"type":"someNovelCode"}"#).unwrap();
+        let err = set_error_to_account_error(
+            set,
+            JmapErrorContext::new(AccountOperation::UpdateFlags),
+            None,
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::Unknown)
+        );
+        let mut saw_real_code = false;
+        for cause in err.chain().iter() {
+            if let Cause::Wire(WireCause::Jmap(JmapMethod::Unknown { code })) = cause {
+                saw_real_code = true;
+                assert_eq!(code, "someNovelCode");
+                assert_ne!(code, "other", "must not synthesize the 'other' placeholder");
+            }
+        }
+        assert!(
+            saw_real_code,
+            "Unknown wire cause with the real code missing"
+        );
+    }
+
+    /// jmap-N1: `terminated_unsupported(op, scope, msg)` carries the
+    /// caller's operation. The pre-fix helper hard-coded
+    /// `AccountOperation::Discover`, mis-classifying every stream that
+    /// emitted an unsupported event.
+    #[test]
+    fn terminated_unsupported_threads_operation() {
+        let event = terminated_unsupported::<()>(
+            AccountOperation::SyncInventory,
+            Some(ErrorScope::Cursor(CursorScope::Type(
+                bifrost_types::ObjectType::Thread,
+            ))),
+            "JMAP thread inventory is derived from Email inventory",
+        );
+        match event {
+            SyncEvent::Terminated(err) => {
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::Unsupported(AccountOperation::SyncInventory)
+                );
+                assert_eq!(err.operation(), Some(AccountOperation::SyncInventory));
+            }
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
+
+    /// jmap-N1 follow-on: pagination overflows reclassify as
+    /// `Protocol(ContractViolation)` because the server response shape
+    /// is incompatible with the request; "unsupported" was the wrong
+    /// consumer-facing classification.
+    #[test]
+    fn terminated_contract_violation_classifies_pagination_overflow() {
+        let event = terminated_contract_violation::<()>(
+            AccountOperation::SyncInventory,
+            Some(ErrorScope::Cursor(CursorScope::Type(
+                bifrost_types::ObjectType::Email,
+            ))),
+            "JMAP inventory position overflowed",
+        );
+        match event {
+            SyncEvent::Terminated(err) => {
+                assert_eq!(
+                    err.kind(),
+                    &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+                );
+                assert!(err.recovery().is_terminal());
+            }
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
+
+    /// jmap-D1: WebSocket pre-handshake failures classify as
+    /// `Transport(Network)` with `Attempt(Unsent)`, not
+    /// `Protocol(PartialResponse) + Acknowledged`.
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn websocket_handshake_classifies_as_transport_network_unsent() {
+        // Construct a `tokio_websockets::Error` indirectly via a known
+        // failure path. We can't easily build one directly, so synthesize
+        // the classification helper and assert its shape.
+        let ctx = JmapErrorContext::new(AccountOperation::PushSubscribe);
+        let err = websocket_handshake_error("handshake aborted".to_string(), ctx);
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Transport(TransportErrorKind::Network)
+        );
+        let mut saw_unsent = false;
+        for cause in err.chain().iter() {
+            if let Cause::Attempt(attempt) = cause
+                && attempt.transmission_state == TransmissionState::Unsent
+            {
+                saw_unsent = true;
+            }
+        }
+        assert!(saw_unsent, "expected Attempt(Unsent) on the chain");
+        match err.recovery() {
+            RecoveryClass::Retry(advice) => {
+                assert_eq!(advice.disposition, RetryDisposition::SameRequest);
+            }
+            other => panic!("expected Retry::SameRequest, got {other:?}"),
+        }
+    }
+
+    /// jmap-D1: WebSocket post-handshake (runtime) failures classify as
+    /// `Protocol(PartialResponse)` with `Attempt(Acknowledged)`.
+    #[cfg(feature = "websockets")]
+    #[test]
+    fn websocket_runtime_classifies_as_protocol_partial_response_acknowledged() {
+        let ctx = JmapErrorContext::new(AccountOperation::PushSubscribe);
+        let err = websocket_runtime_error("stream dropped".to_string(), ctx);
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+        );
+        let mut saw_acknowledged = false;
+        for cause in err.chain().iter() {
+            if let Cause::Attempt(attempt) = cause
+                && attempt.transmission_state == TransmissionState::Acknowledged
+            {
+                saw_acknowledged = true;
+            }
+        }
+        assert!(
+            saw_acknowledged,
+            "expected Attempt(Acknowledged) on the chain"
+        );
     }
 }

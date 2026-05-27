@@ -4,7 +4,7 @@ use quick_xml::events::{BytesRef, Event};
 
 // SOAP envelope.
 
-pub(super) fn build_soap_envelope(body_xml: &str) -> String {
+pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -31,12 +31,18 @@ fn strip_ns(name: &str) -> &str {
 
 // SOAP fault check.
 
-pub(super) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
+pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
+    use super::SoapFaultCode;
+    use bifrost_types::DiagnosticText;
+
     let mut reader = Reader::from_str(xml);
     let mut in_fault = false;
     let mut in_faultstring = false;
+    let mut in_faultcode = false;
     let mut fault_message = String::new();
+    let mut fault_code_raw = String::new();
     let mut buf = String::new();
+    let mut xml_error: Option<String> = None;
 
     loop {
         match reader.read_event() {
@@ -48,6 +54,9 @@ pub(super) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
                 }
                 if in_fault && local == "faultstring" {
                     in_faultstring = true;
+                }
+                if in_fault && local == "faultcode" {
+                    in_faultcode = true;
                 }
                 buf.clear();
             }
@@ -66,23 +75,45 @@ pub(super) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
                     fault_message = buf.trim().to_string();
                     in_faultstring = false;
                 }
+                if in_faultcode && local == "faultcode" {
+                    fault_code_raw = buf.trim().to_string();
+                    in_faultcode = false;
+                }
                 if local == "Fault" {
                     break;
                 }
                 buf.clear();
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(error) => {
+                xml_error = Some(error.to_string());
+                break;
+            }
             _ => {}
         }
     }
 
-    if in_fault || !fault_message.is_empty() {
-        let message = if fault_message.is_empty() {
+    if let Some(error) = xml_error {
+        return Err(super::EwsError::MalformedXml(DiagnosticText::support_only(
+            format!("EWS SOAP fault parse failed: {error}"),
+        )));
+    }
+
+    if in_fault || !fault_message.is_empty() || !fault_code_raw.is_empty() {
+        let code = if fault_code_raw.is_empty() {
+            SoapFaultCode::Unknown
+        } else {
+            SoapFaultCode::parse(&fault_code_raw)
+        };
+        let detail_text = if fault_message.is_empty() {
             "Unknown SOAP fault".to_string()
         } else {
             fault_message
         };
-        return Err(super::EwsError::SoapFault { message });
+        return Err(super::EwsError::SoapFault {
+            code,
+            detail: DiagnosticText::support_only(detail_text),
+        });
     }
 
     Ok(())

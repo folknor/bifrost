@@ -50,20 +50,28 @@ pub(crate) fn open_range(
         if let (Some(total), start) = (handle.size, range.start)
             && start >= total
         {
-            yield super::error::terminated_unsupported(format!(
-                "JMAP blob range starts past the known blob size (start {start}, total {total})",
-            ));
+            yield super::error::terminated_unsupported(
+                AccountOperation::OpenBlobRange,
+                None,
+                format!(
+                    "JMAP blob range starts past the known blob size (start {start}, total {total})",
+                ),
+            );
             return;
         }
 
         if !handle.capabilities.supports_range {
             yield super::error::terminated_unsupported(
+                AccountOperation::OpenBlobRange,
+                None,
                 "JMAP blob handle does not support range fetches",
             );
             return;
         }
 
         yield super::error::terminated_unsupported(
+            AccountOperation::OpenBlobRange,
+            None,
             "JMAP ranged blob download needs a Range-capable transport hook",
         );
     })

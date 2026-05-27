@@ -3,15 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
-    Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountFuture, AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Cause,
-    ChangeCursor, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition,
-    InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, Priority, Projection, Protocol, QuotaInfo, RequestCause,
-    ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
+    AttachmentHandle, BlobHandle, ByteRange, ChangeCursor, Container, ContainerId, ContainerKind,
+    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
+    ErrorScope, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
+    Projection, QuotaInfo, ScopeLifecycle, SearchRequest, SendRequest, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -154,17 +153,20 @@ impl Account for JmapAccount {
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
         let seed = self.seed_states.get(&scope).cloned();
+        let scope_for_err = scope.clone();
         Box::pin(async move {
             let server_state = seed.ok_or_else(|| {
-                AccountErrorBuilder::new(
-                    AccountErrorKind::Unsupported(AccountOperation::EstablishCursor),
-                    Cause::Request(RequestCause::Unsupported {
-                        operation: AccountOperation::EstablishCursor,
-                    }),
+                // Go through the shared `unsupported_error` helper so
+                // every `Unsupported` AccountError in this crate flows
+                // through a single construction path. The inline
+                // `AccountErrorBuilder::new(...)` that used to live
+                // here drifted from the helper's invariants (no scope
+                // attached, no diagnostic text).
+                super::error::unsupported_error(
+                    AccountOperation::EstablishCursor,
+                    Some(ErrorScope::Cursor(scope_for_err)),
+                    "JMAP did not seed a cursor for this scope",
                 )
-                .operation(AccountOperation::EstablishCursor)
-                .protocol(Protocol::Jmap)
-                .build()
             })?;
             Ok(CursorEstablishment::Ready(ChangeCursor {
                 scope,
@@ -203,7 +205,7 @@ impl Account for JmapAccount {
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         hydrate::stream(self.mail.clone(), self.core_limits, ids, projection)
     }
 

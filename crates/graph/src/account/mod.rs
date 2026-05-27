@@ -237,7 +237,7 @@ impl Account for GraphAccount {
         &self,
         ids: AccountStream<ObjectId>,
         projection: Projection,
-    ) -> AccountStream<SyncEvent<HydratedObject>> {
+    ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
         get::get_stream(self.clone(), ids, projection)
     }
 
@@ -320,7 +320,7 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
             Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::BulkMove,
+                bifrost_types::AccountOperation::RemoveFromContainer,
             ))
         })
     }
@@ -333,7 +333,7 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
             Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::UpdateFlags,
+                bifrost_types::AccountOperation::SetKeyword,
             ))
         })
     }
@@ -346,7 +346,7 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
             Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::UpdateFlags,
+                bifrost_types::AccountOperation::SetLabelMembership,
             ))
         })
     }

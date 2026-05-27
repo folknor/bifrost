@@ -53,7 +53,8 @@ pub(crate) fn stream(
                     .text(bifrost_types::DiagnosticText::support_only(
                         "failed to decode JMAP change cursor",
                     ))
-                    .build(),
+                    .try_build()
+                    .expect("valid account error classification"),
                 );
             });
         }

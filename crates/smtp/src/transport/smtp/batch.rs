@@ -164,32 +164,47 @@ impl SendProgress {
     /// Build the `BatchOutcome<()>` from the recorded progress. Lane order
     /// follows input order.
     pub(crate) fn resolve(self) -> BatchOutcome<()> {
-        let mut outcome = BatchOutcome::default();
+        let mut builder = bifrost_types::BatchOutcomeBuilder::<()>::new();
         let protocol = self.protocol;
         let smtp_final = self.data_response.clone();
+        let ids: Vec<_> = self.recipients.iter().map(|r| r.id.clone()).collect();
         for rec in self.recipients {
             match rec.rcpt {
                 RcptProgress::Accepted => {
                     // SMTP: all accepted recipients share the DATA-final
                     // outcome. LMTP: per-recipient final reply is required;
-                    // an Accepted-without-Final at resolve time is a bug, but
-                    // be defensive and mark uncertain.
+                    // an Accepted-without-Final at resolve time is a
+                    // programming bug (the LMTP final-status drain should
+                    // have transitioned every Accepted to Final or
+                    // Uncertain). debug_assert! catches the bug in tests
+                    // and the defensive partial-completion fallback keeps
+                    // the lane from silently disappearing in release.
                     if let Some(resp) = &smtp_final {
                         if resp.is_positive() {
-                            outcome.push_succeeded(rec.id, ());
+                            builder.push_succeeded(rec.id, ());
                         } else {
+                            // Negative final reply after a successful body
+                            // upload: classify under `DataFinal`, not
+                            // `DataBody`. A future phase-aware rule can
+                            // then distinguish a body-side transport drop
+                            // from a server-rejected final reply.
                             let err = response_to_account_error(
                                 resp,
                                 &SmtpErrorContext::send(protocol)
-                                    .with_phase(SmtpCommandPhase::DataBody),
-                                Some(SmtpCommandPhase::DataBody),
+                                    .with_phase(SmtpCommandPhase::DataFinal),
+                                Some(SmtpCommandPhase::DataFinal),
                                 Some(SmtpTransmissionState::Acknowledged),
                             );
-                            outcome.push_failed(rec.id, with_recipient_text(err, &rec.address));
+                            builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
                         }
                     } else {
+                        debug_assert!(
+                            protocol == Protocol::Smtp,
+                            "LMTP Accepted without Final at resolve time: missing \
+                             per-recipient transition in the final-status drain"
+                        );
                         let err = partial_completion_error(protocol, &rec.address);
-                        outcome.push_uncertain(rec.id, err);
+                        builder.push_uncertain(rec.id, with_recipient_text(err, &rec.address));
                     }
                 }
                 RcptProgress::Rejected(resp) => {
@@ -199,11 +214,11 @@ impl SendProgress {
                         Some(SmtpCommandPhase::RcptTo),
                         Some(SmtpTransmissionState::Acknowledged),
                     );
-                    outcome.push_failed(rec.id, with_recipient_text(err, &rec.address));
+                    builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
                 }
                 RcptProgress::Final(resp) => {
                     if resp.is_positive() {
-                        outcome.push_succeeded(rec.id, ());
+                        builder.push_succeeded(rec.id, ());
                     } else {
                         let err = response_to_account_error(
                             &resp,
@@ -212,17 +227,17 @@ impl SendProgress {
                             Some(SmtpCommandPhase::LmtpFinalStatus),
                             Some(SmtpTransmissionState::Acknowledged),
                         );
-                        outcome.push_failed(rec.id, with_recipient_text(err, &rec.address));
+                        builder.push_failed(rec.id, with_recipient_text(err, &rec.address));
                     }
                 }
                 RcptProgress::Uncertain(err) => {
-                    outcome.push_uncertain(rec.id, with_recipient_text(err, &rec.address));
+                    builder.push_uncertain(rec.id, with_recipient_text(err, &rec.address));
                 }
                 RcptProgress::Pending => {
                     // Pending at resolve time means the drain never reached
                     // this recipient. Surface as uncertain so no item is
                     // silently dropped.
-                    outcome.push_uncertain(
+                    builder.push_uncertain(
                         rec.id,
                         with_recipient_text(
                             partial_completion_error(protocol, &rec.address),
@@ -232,18 +247,26 @@ impl SendProgress {
                 }
             }
         }
-        outcome
+        builder
+            .finalize(&ids)
+            .expect("smtp resolve produces exactly one outcome per submitted recipient")
     }
 }
 
-fn with_recipient_text(error: AccountError, _address: &Address) -> AccountError {
-    // AccountError is opaque after build; the address-bearing support text is
-    // attached at the original construction site (the wire-cause classifier
-    // already adds the response's first line, which RFC-compliant servers
-    // include the recipient address in for RCPT-related codes). A richer
-    // attach-recipient-text path requires either a rebuild API on
-    // AccountErrorBuilder or threading the recipient through the lane constructors.
+fn with_recipient_text(error: AccountError, address: &Address) -> AccountError {
+    // Per-recipient correlation: the DATA-final-negative fanout to N
+    // accepted recipients shares the same wire response text, and the
+    // RcptTo-rejection text may or may not embed the address. Attach the
+    // address explicitly as a support-only diagnostic so support exports
+    // can correlate a lane back to its envelope recipient without parsing
+    // the response text.
     error
+        .into_builder()
+        .text(DiagnosticText::support_only(format!(
+            "envelope recipient {address}"
+        )))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountError {
@@ -265,7 +288,8 @@ fn partial_completion_error(protocol: Protocol, address: &Address) -> AccountErr
     .text(DiagnosticText::support_only(format!(
         "recipient {address} uncertain after body write"
     )))
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 pub(crate) fn batch_input_invalid_error(
@@ -279,7 +303,8 @@ pub(crate) fn batch_input_invalid_error(
     .protocol(protocol)
     .operation(AccountOperation::Send)
     .idempotency_override(false)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Convert a fatal transport-level `SmtpError` that aborted the batch into the
@@ -382,9 +407,9 @@ mod tests {
         progress.set_data_response(positive_data_final());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.succeeded.len(), 2);
-        assert_eq!(outcome.failed.len(), 0);
-        assert_eq!(outcome.uncertain.len(), 0);
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert_eq!(outcome.failed().len(), 0);
+        assert_eq!(outcome.uncertain().len(), 0);
     }
 
     #[test]
@@ -405,11 +430,11 @@ mod tests {
         progress.set_data_response(positive_data_final());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.succeeded.len(), 2);
-        assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.failed[0].item.0, "b");
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "b");
         assert!(matches!(
-            outcome.failed[0].error.kind(),
+            outcome.failed()[0].error.kind(),
             AccountErrorKind::NotFound(ResourceKind::Mailbox)
         ));
     }
@@ -424,9 +449,9 @@ mod tests {
         progress.record_rcpt_rejected(1, rcpt_reject());
         // No DATA/body. Resolve must not panic and must produce 2 failures.
         let outcome = progress.resolve();
-        assert_eq!(outcome.failed.len(), 2);
-        assert_eq!(outcome.succeeded.len(), 0);
-        assert_eq!(outcome.uncertain.len(), 0);
+        assert_eq!(outcome.failed().len(), 2);
+        assert_eq!(outcome.succeeded().len(), 0);
+        assert_eq!(outcome.uncertain().len(), 0);
     }
 
     #[test]
@@ -442,8 +467,8 @@ mod tests {
         progress.set_data_response(negative_data_final());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.failed.len(), 2);
-        assert_eq!(outcome.succeeded.len(), 0);
+        assert_eq!(outcome.failed().len(), 2);
+        assert_eq!(outcome.succeeded().len(), 0);
     }
 
     #[test]
@@ -457,9 +482,9 @@ mod tests {
         progress.set_body_started();
         // No data_response: connection dropped after body write.
         let outcome = progress.resolve();
-        assert_eq!(outcome.uncertain.len(), 2);
+        assert_eq!(outcome.uncertain().len(), 2);
         // Recovery is Reconcile(PartialCompletionSignal) because non-idempotent Send.
-        let r = outcome.uncertain[0].error.recovery();
+        let r = outcome.uncertain()[0].error.recovery();
         assert!(matches!(
             r,
             RecoveryClass::Reconcile(advice) if matches!(advice.reason, ReconcileReason::PartialCompletionSignal)
@@ -480,10 +505,10 @@ mod tests {
         progress.set_data_response(positive_data_final());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.succeeded.len(), 1);
-        assert_eq!(outcome.failed[0].item.0, "a");
-        assert_eq!(outcome.succeeded[0].item.0, "b");
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.succeeded().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "a");
+        assert_eq!(outcome.succeeded()[0].item.0, "b");
     }
 
     #[test]
@@ -505,7 +530,7 @@ mod tests {
         });
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.uncertain.len(), 3);
+        assert_eq!(outcome.uncertain().len(), 3);
     }
 
     #[test]
@@ -528,9 +553,9 @@ mod tests {
         progress.record_lmtp_final(2, positive_data_final());
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.succeeded.len(), 2);
-        assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.failed[0].item.0, "b");
+        assert_eq!(outcome.succeeded().len(), 2);
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "b");
         let lane_order: Vec<_> = outcome
             .iter()
             .map(|item| match item {
@@ -563,9 +588,9 @@ mod tests {
         });
 
         let outcome = progress.resolve();
-        assert_eq!(outcome.succeeded.len(), 1);
-        assert_eq!(outcome.uncertain.len(), 2);
-        assert_eq!(outcome.succeeded[0].item.0, "a");
+        assert_eq!(outcome.succeeded().len(), 1);
+        assert_eq!(outcome.uncertain().len(), 2);
+        assert_eq!(outcome.succeeded()[0].item.0, "a");
     }
 
     #[test]
@@ -591,5 +616,167 @@ mod tests {
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::Send)
         ));
+    }
+
+    #[test]
+    fn smtp_data_final_negative_uses_data_final_phase() {
+        // DATA-final-negative reply (the server reads the body, then rejects)
+        // must classify under SmtpCommandPhase::DataFinal, not DataBody. A
+        // body-side phase tag would conflate this with a transport drop
+        // mid-body in any future phase-aware classifier.
+        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        progress.record_rcpt_accepted(0);
+        progress.set_body_started();
+        progress.set_body_finished();
+        progress.set_data_response(negative_data_final());
+
+        let outcome = progress.resolve();
+        assert_eq!(outcome.failed().len(), 1);
+        // The error must be acknowledged (server replied) and carry a
+        // request scope that surfaces the recipient. The dotted enhanced
+        // status (5.5.4 transaction failed) is class-5 subject-5 detail-4
+        // which classifies as Request(Malformed) per the enhanced table -
+        // pin the kind so a regression in classify_enhanced cannot pretend
+        // DataFinal worked while changing the routed kind.
+        let err = &outcome.failed()[0].error;
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        // Recipient correlation must reach support exports.
+        let support = err.support_consented();
+        let texts: Vec<&str> = support.support_text.iter().copied().collect();
+        assert!(
+            texts.iter().any(|t| t.contains("envelope recipient")),
+            "expected per-recipient diagnostic in support text, got {texts:?}"
+        );
+    }
+
+    #[test]
+    fn lmtp_accepted_without_final_at_resolve_is_uncertain_in_release() {
+        // Defensive fallback: if the LMTP final-status drain failed to
+        // transition an Accepted recipient to Final, resolve() must not
+        // silently drop the lane. In debug builds the debug_assert!
+        // catches the programming bug. We exercise the fallback shape
+        // here directly by skipping the final-status drain.
+        //
+        // The test is only meaningful in release builds (debug_assert!
+        // would panic). Skip when debug_assertions is on so the regression
+        // test of the fallback path stays exercised on release CI without
+        // breaking debug-build CI.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut progress = SendProgress::new(Protocol::Lmtp, vec![recip("a", "a@x.com")]);
+        progress.record_rcpt_accepted(0);
+        progress.set_body_started();
+        // No record_lmtp_final, no mark_uncertain_unresolved: bug path.
+        let outcome = progress.resolve();
+        assert_eq!(outcome.uncertain().len(), 1);
+    }
+
+    #[test]
+    fn lmtp_data_command_negative_reply_marks_recipients_failed() {
+        // smtp-D1 / P0 regression: LMTP DATA-command negative reply after
+        // RCPT acceptances must produce per-recipient `Failed` lanes and a
+        // succeeded outcome at the batch boundary, NEVER a batch-level
+        // `Err`. The previous shape returned `Err((Network+Unsent,
+        // progress))` after RCPT acceptances; the engine then classified
+        // `Send` as `Retry::SameRequest` and resent the entire non-
+        // idempotent message to every recipient after the server already
+        // rejected it.
+        let mut progress = SendProgress::new(
+            Protocol::Lmtp,
+            vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
+        );
+        progress.record_rcpt_accepted(0);
+        progress.record_rcpt_accepted(1);
+        // Now the LMTP DATA command returns a negative reply; this is the
+        // shape `mark_accepted_rejected_with_response` produces. No body
+        // was sent; no LMTP final-status drain ran.
+        progress.mark_accepted_rejected_with_response(negative_data_final());
+
+        let outcome = progress.resolve();
+        assert_eq!(outcome.succeeded().len(), 0);
+        assert_eq!(outcome.uncertain().len(), 0);
+        assert_eq!(outcome.failed().len(), 2);
+        // The recovery class must be terminal-or-retry, never Reconcile
+        // (Reconcile would indicate non-idempotent uncertain). Since the
+        // server explicitly rejected, recovery must be acknowledged.
+        for failed in outcome.failed() {
+            let recovery = failed.error.recovery();
+            assert!(
+                !recovery.requires_reconciliation(),
+                "LMTP DATA-command negative reply must not produce a Reconcile lane: {recovery:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lmtp_data_command_transport_drop_marks_recipients_uncertain_inflight() {
+        // smtp-D1: transport drop on the LMTP DATA-command write/read uses
+        // `InFlight` + `DataCommand`. Accepted recipients become
+        // `Uncertain` with recovery `Reconcile(TransportDropAfterSend)`
+        // because Send is non-idempotent.
+        use crate::transport::smtp::account_error::{SmtpErrorContext, into_account_error};
+        use crate::transport::smtp::error::{Error as SmtpError, ErrorKind};
+        let mut progress = SendProgress::new(
+            Protocol::Lmtp,
+            vec![recip("a", "a@x.com"), recip("b", "b@x.com")],
+        );
+        progress.record_rcpt_accepted(0);
+        progress.record_rcpt_accepted(1);
+        // Simulate the call site building the AccountError for a
+        // DataCommand-phase transport drop.
+        let smtp_err = SmtpError::new(
+            ErrorKind::Network,
+            Some(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            )),
+        )
+        .with_attempt(SmtpTransmissionState::InFlight)
+        .with_phase(SmtpCommandPhase::DataCommand);
+        let ae = into_account_error(
+            smtp_err,
+            SmtpErrorContext::send(Protocol::Lmtp).with_phase(SmtpCommandPhase::DataCommand),
+        );
+        let ae2 = ae.clone();
+        progress.mark_accepted_uncertain(|| ae2.clone());
+
+        let outcome = progress.resolve();
+        assert_eq!(outcome.uncertain().len(), 2);
+        assert_eq!(outcome.succeeded().len(), 0);
+        assert_eq!(outcome.failed().len(), 0);
+        for unc in outcome.uncertain() {
+            let recovery = unc.error.recovery();
+            assert!(
+                matches!(
+                    recovery,
+                    RecoveryClass::Reconcile(advice)
+                        if matches!(advice.reason, ReconcileReason::TransportDropAfterSend)
+                ),
+                "LMTP DataCommand transport drop must be Reconcile(TransportDropAfterSend): {recovery:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rcpt_failed_lane_carries_recipient_text() {
+        // Per-recipient correlation requirement: failed lanes from a RCPT-
+        // rejected reply must surface the envelope recipient as
+        // support-only diagnostic text. Sharing only the wire response
+        // text loses correlation when a DATA-final-negative fanout
+        // produces N lanes with identical response text.
+        let mut progress = SendProgress::new(Protocol::Smtp, vec![recip("a", "a@x.com")]);
+        progress.record_rcpt_rejected(0, rcpt_reject());
+        let outcome = progress.resolve();
+        let err = &outcome.failed()[0].error;
+        let support = err.support_consented();
+        let texts: Vec<&str> = support.support_text.iter().copied().collect();
+        assert!(
+            texts.iter().any(|t| t.contains("a@x.com")),
+            "expected recipient address in support text, got {texts:?}"
+        );
     }
 }

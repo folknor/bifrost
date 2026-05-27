@@ -1,27 +1,28 @@
 //! Graph account error boundary.
 //!
 //! Every Graph-side failure that leaves a streaming helper or
-//! `Account` method passes through `into_account_error`. Transport
-//! variants delegate to `bifrost_net::into_account_error` with Graph
-//! provider/protocol context. Graph response variants build the
-//! `AccountError` directly through `AccountErrorBuilder`, classified
-//! by the typed `GraphSignal`. No path in this module looks at
-//! `error.message` text for control flow.
+//! `Account` method passes through `into_account_error` (REST) or
+//! `ews_error_to_account_error` (EWS). Transport variants delegate to
+//! `bifrost_net::into_account_error` with Graph provider/protocol
+//! context. Graph response variants build the `AccountError` directly
+//! through `AccountErrorBuilder`, classified by the typed
+//! `GraphSignal`. No path in this module looks at `error.message` text
+//! for control flow.
 
-use std::time::{Duration, SystemTime};
-
-use bifrost_net::NetErrorContext;
+use bifrost_net::error::cap_status_body;
+use bifrost_net::{NetErrorContext, parse_retry_after};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText, ErrorScope,
     GraphSignal, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause,
-    ResourceKind, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind, ThrottleScope,
-    TransmissionState, WireCause,
+    ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind,
+    ThrottleScope, TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
 
 use crate::error::{GraphError, GraphInnerError, GraphResponseError};
+use crate::ews::{EwsError, SoapFaultCode};
 
 /// Context every Graph (or EWS-fallback) error needs before the
 /// account boundary. `protocol` selects `Protocol::Graph` for REST
@@ -38,6 +39,19 @@ impl GraphErrorContext {
     pub(crate) fn graph(operation: AccountOperation) -> Self {
         Self {
             protocol: Protocol::Graph,
+            operation,
+            scope: None,
+        }
+    }
+
+    /// EWS context. Used by the EWS streaming worker and any other
+    /// helper whose wire boundary is the Exchange Web Services SOAP
+    /// endpoint. Every `AccountError` constructed with this context
+    /// stamps `Protocol::Ews`.
+    #[must_use]
+    pub(crate) fn ews(operation: AccountOperation) -> Self {
+        Self {
+            protocol: Protocol::Ews,
             operation,
             scope: None,
         }
@@ -61,7 +75,7 @@ impl GraphErrorContext {
 
 /// Convert a structured `GraphError` into the opaque
 /// `bifrost_types::AccountError`. The only entry point any account
-/// layer call site should use.
+/// layer call site should use for Graph REST failures.
 #[must_use]
 pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> AccountError {
     match error {
@@ -69,6 +83,72 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
         GraphError::Response(response) => response_to_account_error(response, &ctx),
         GraphError::Json { message, body } => json_parse_to_account_error(&message, body, &ctx),
     }
+}
+
+/// Convert a structured `EwsError` into the opaque `AccountError`.
+/// Stamps `Protocol::Ews` on every produced error and delegates
+/// transport variants to `bifrost_net::into_account_error` with the
+/// EWS context so the recovery taxonomy is identical to REST.
+#[must_use]
+pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext) -> AccountError {
+    debug_assert!(matches!(ctx.protocol, Protocol::Ews));
+    match error {
+        EwsError::Transport(net) => bifrost_net::into_account_error(net, ctx.to_net_ctx()),
+        EwsError::HttpStatus { status, body } => {
+            // Wrap the raw HTTP failure as a Graph-style response so
+            // the standard status-fallback classification applies,
+            // but stamp the protocol as EWS via the context.
+            let response =
+                GraphResponseError::from_response(status, HeaderMap::new(), cap_status_body(body));
+            response_to_account_error(response, &ctx)
+        }
+        EwsError::SoapFault { code, detail } => soap_fault_to_account_error(code, detail, &ctx),
+        EwsError::MalformedXml(detail) => {
+            let builder = base_builder(
+                &ctx,
+                AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed),
+                Cause::Wire(WireCause::MalformedResponse {
+                    protocol: ctx.protocol,
+                    detail: Some(detail.clone()),
+                }),
+            )
+            .text(detail);
+            let builder = push_attempt(builder, TransmissionState::Acknowledged);
+            finish(builder, &ctx)
+        }
+    }
+}
+
+fn soap_fault_to_account_error(
+    code: SoapFaultCode,
+    detail: DiagnosticText,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    // SOAP 1.1 fault codes map onto the same recovery taxonomy as
+    // HTTP statuses: `Server` ~ 5xx (unavailable), `Client` ~ 4xx
+    // (refused). Microsoft EWS embeds finer-grained codes in the
+    // `<detail>` payload, but that is support-only diagnostics; we
+    // do not branch UX on the string.
+    let (kind, cause) = match code {
+        SoapFaultCode::Server => (
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+        ),
+        SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => (
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }),
+            Cause::Server(ServerCause::Error { status: Some(400) }),
+        ),
+        SoapFaultCode::Unknown => (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(detail.clone()),
+            }),
+        ),
+    };
+    let builder = base_builder(ctx, kind, cause).text(detail);
+    let builder = push_attempt(builder, TransmissionState::Acknowledged);
+    finish(builder, ctx)
 }
 
 fn json_parse_to_account_error(
@@ -99,6 +179,20 @@ fn json_parse_to_account_error(
     finish(builder, ctx)
 }
 
+/// Crate-internal alias so other account modules can route a
+/// `GraphResponseError` through the boundary classifier with their
+/// own scope/operation context (per-item batch failures, for
+/// example). The single classifier path keeps `AttemptCause`,
+/// `WireCause::Graph`, retry-hint, and throttle-scope wiring
+/// consistent across REST, EWS HTTP-status, PIM batch, and
+/// `get_stream` per-item paths.
+pub(crate) fn response_to_account_error_pub(
+    response: GraphResponseError,
+    ctx: &GraphErrorContext,
+) -> AccountError {
+    response_to_account_error(response, ctx)
+}
+
 fn response_to_account_error(
     response: GraphResponseError,
     ctx: &GraphErrorContext,
@@ -113,19 +207,25 @@ fn response_to_account_error(
     } = response;
 
     let code = status.as_u16();
-    let retry_after = parse_retry_after_header(&headers);
+    let retry_hint = parse_retry_after_header(&headers);
 
-    let (kind, cause, throttle) = classify(ctx, code, &signal, retry_after);
-    let apply_retry_deadline = retry_deadline_applies(&kind);
+    // `signal == None` means we could not decode a Graph error
+    // envelope; that is provider contract violation territory unless
+    // the status code itself carries enough information (5xx with no
+    // body is plenty; 400 with no body is malformed-response).
+    let (kind, cause, throttle) = match signal.as_ref() {
+        Some(signal) => classify(ctx, code, signal, retry_hint),
+        None => classify_no_envelope(ctx, code, retry_hint, &body),
+    };
 
-    let primary_cause = wire_or_specific(cause.clone(), &signal, ctx.protocol);
-
-    let mut builder = base_builder(ctx, kind, primary_cause);
+    let mut builder = base_builder(ctx, kind, cause.clone());
     // Attach the GraphSignal as an inner wire cause whenever the
     // primary cause is not itself a wire cause, so support tooling
     // can read the typed provider code regardless of which semantic
     // bucket the kind landed in.
-    if !matches!(cause, Cause::Wire(_)) {
+    if !matches!(cause, Cause::Wire(_))
+        && let Some(signal) = signal.as_ref()
+    {
         builder = builder.push_cause(Cause::Wire(WireCause::Graph(signal.clone())));
     }
     builder = push_attempt(builder, TransmissionState::Acknowledged);
@@ -152,171 +252,152 @@ fn response_to_account_error(
         }
     }
 
-    if apply_retry_deadline && let Some(deadline) = retry_deadline(retry_after) {
-        builder = builder.retry_not_before(deadline);
-    }
+    // The retry hint already lives structurally on `ServerCause`; no
+    // builder side-channel is needed. `throttle_scope` annotation
+    // applies only on rate-limit / quota / 503 paths.
     if throttle && let Some(scope) = throttle_scope_for(ctx) {
         builder = builder.throttle_scope(scope);
     }
     finish(builder, ctx)
 }
 
-/// Replace a `Cause::Wire` primary with one that carries the actual
-/// `GraphSignal`, so the chain's outermost cause stays kind-matched
-/// when the kind side is `Protocol(...)`.
-fn wire_or_specific(cause: Cause, signal: &GraphSignal, _protocol: Protocol) -> Cause {
-    if matches!(
-        cause,
-        Cause::Wire(WireCause::MalformedResponse { .. } | WireCause::Graph(_))
-    ) {
-        Cause::Wire(WireCause::Graph(signal.clone()))
-    } else {
-        cause
-    }
-}
-
 /// Classification rules. All decisions are made on `GraphSignal` plus
-/// HTTP status; no path inspects the `error.message` string.
+/// HTTP status; no path inspects the `error.message` string. The
+/// match is exhaustive over `GraphSignal` so adding a wire-enum
+/// variant fails to compile here.
 fn classify(
     ctx: &GraphErrorContext,
     code: u16,
     signal: &GraphSignal,
-    retry_after: Option<Duration>,
+    retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause, bool) {
-    // 1) Typed Graph signals - these win over status-only mapping
-    //    because Microsoft sometimes returns the same status for
-    //    semantically different conditions (400 InvalidDeltaToken vs.
-    //    400 Malformed body).
     match signal {
-        GraphSignal::InvalidAuthenticationToken => {
-            return (
-                AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
-                Cause::Auth(AuthCause::ReauthorizationRequired),
-                false,
-            );
-        }
-        GraphSignal::AccessDenied | GraphSignal::Forbidden => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
-                Cause::Access(AccessCause::PermissionDenied {
-                    resource: resource_from_scope(ctx.scope.as_ref()),
-                }),
-                false,
-            );
-        }
-        GraphSignal::AccessRestricted | GraphSignal::ConditionalAccessBlocked => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
-                Cause::Access(AccessCause::ConditionalAccessBlocked),
-                false,
-            );
-        }
-        GraphSignal::AdminConsentRequired => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
-                Cause::Access(AccessCause::AdminConsentRequired {
-                    needed: "admin-consent",
-                }),
-                false,
-            );
-        }
-        GraphSignal::MailboxNotEnabledForRestApi => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::MailboxNotLicensed),
-                Cause::Access(AccessCause::MailboxNotLicensed),
-                false,
-            );
-        }
-        GraphSignal::MailboxStoreUnavailable => {
-            return (
-                AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
-                    kind: MailboxUnavailableKind::Transient,
-                }),
-                Cause::Access(AccessCause::MailboxUnavailable {
-                    kind: MailboxUnavailableKind::Transient,
-                }),
-                false,
-            );
-        }
-        GraphSignal::ResyncRequired => {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-                false,
-            );
-        }
-        GraphSignal::TooManyRequests => {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::RateLimited),
-                Cause::Server(ServerCause::RateLimited { retry_after }),
-                true,
-            );
-        }
-        GraphSignal::GenericFileError => {
-            return (
-                AccountErrorKind::Server(ServerErrorKind::Unavailable),
-                Cause::Server(ServerCause::Unavailable { retry_after }),
-                false,
-            );
-        }
-        GraphSignal::PreconditionFailed => {
-            return (
-                AccountErrorKind::ConcurrencyConflict,
-                Cause::State(StateCause::ConcurrencyConflict),
-                false,
-            );
-        }
+        GraphSignal::InvalidAuthenticationToken => (
+            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
+            Cause::Auth(AuthCause::ReauthorizationRequired),
+            false,
+        ),
+        GraphSignal::AccessDenied | GraphSignal::Forbidden => (
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied {
+                resource: resource_from_scope(ctx.scope.as_ref()),
+            }),
+            false,
+        ),
+        GraphSignal::AccessRestricted | GraphSignal::ConditionalAccessBlocked => (
+            AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
+            Cause::Access(AccessCause::ConditionalAccessBlocked),
+            false,
+        ),
+        GraphSignal::AdminConsentRequired => (
+            AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired),
+            Cause::Access(AccessCause::AdminConsentRequired {
+                needed: "admin-consent",
+            }),
+            false,
+        ),
+        GraphSignal::MailboxNotEnabledForRestApi => (
+            AccountErrorKind::Authorization(AccessErrorKind::MailboxNotLicensed),
+            Cause::Access(AccessCause::MailboxNotLicensed),
+            false,
+        ),
+        GraphSignal::MailboxStoreUnavailable => (
+            AccountErrorKind::Authorization(AccessErrorKind::MailboxUnavailable {
+                kind: MailboxUnavailableKind::Transient,
+            }),
+            Cause::Access(AccessCause::MailboxUnavailable {
+                kind: MailboxUnavailableKind::Transient,
+            }),
+            false,
+        ),
+        GraphSignal::ResyncRequired
+        | GraphSignal::InvalidDeltaToken
+        | GraphSignal::SyncStateNotFound => cursor_invalid_or_protocol(ctx),
+        GraphSignal::TooManyRequests => (
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
+            true,
+        ),
+        GraphSignal::GenericFileError => (
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint }),
+            false,
+        ),
+        GraphSignal::PreconditionFailed => (
+            AccountErrorKind::ConcurrencyConflict,
+            Cause::State(StateCause::ConcurrencyConflict),
+            false,
+        ),
         GraphSignal::Gone => {
             // 410 Gone on a cursor scope is the canonical
-            // SyncState(CursorInvalid) → Engine(RestartScope) signal.
+            // SyncState(CursorInvalid) -> Engine(RestartScope) signal.
+            // Outside cursor context, 410 is a permanent server error.
             if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
-                return (
-                    AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                    Cause::State(StateCause::CursorInvalid),
-                    false,
-                );
+                cursor_invalid_or_protocol(ctx)
+            } else {
+                server_error_tuple(410)
             }
-            // 410 outside cursor context is a provider-refused server
-            // error; we keep the HTTP status to disambiguate.
-            return (
-                AccountErrorKind::Server(ServerErrorKind::Error { status: Some(410) }),
-                Cause::Server(ServerCause::Error { status: Some(410) }),
+        }
+        GraphSignal::NotFound => match resource_from_scope(ctx.scope.as_ref()) {
+            Some(resource) => (
+                AccountErrorKind::NotFound(resource),
+                Cause::Request(RequestCause::NotFound {
+                    what: resource,
+                    id: id_from_scope(ctx.scope.as_ref()),
+                }),
                 false,
-            );
-        }
-        GraphSignal::NotFound => {
-            return match resource_from_scope(ctx.scope.as_ref()) {
-                Some(resource) => (
-                    AccountErrorKind::NotFound(resource),
-                    Cause::Request(RequestCause::NotFound {
-                        what: resource,
-                        id: id_from_scope(ctx.scope.as_ref()),
-                    }),
-                    false,
-                ),
-                None => server_error_tuple(404),
-            };
-        }
-        GraphSignal::InvalidDeltaToken | GraphSignal::SyncStateNotFound => {
-            return (
-                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-                Cause::State(StateCause::CursorInvalid),
-                false,
-            );
-        }
-        GraphSignal::Unknown { .. } => {}
-        _ => {}
+            ),
+            None => server_error_tuple(404),
+        },
+        GraphSignal::Unknown { .. } => classify_by_status(ctx, code, retry_hint),
+        // GraphSignal is #[non_exhaustive] from bifrost-types; new
+        // variants land here unhandled and fall through to status-based
+        // classification until explicit dispatch is added.
+        _ => classify_by_status(ctx, code, retry_hint),
     }
+}
 
-    // 2) Status-only fallback when the GraphSignal carries no
-    //    actionable code.
-    classify_by_status(ctx, code, retry_after)
+/// CursorInvalid producer. Requires the caller to thread an
+/// `ErrorScope::Cursor(_)` through the context: without it the
+/// builder rejects the error at construction time
+/// (`AccountErrorBuildError::CursorInvalidWithoutScope`). Producers
+/// that hit this path without a cursor scope have a bug; we
+/// down-route to `Protocol(ContractViolation)` so the audit surfaces
+/// the producer rather than crashing in `try_build`.
+fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause, bool) {
+    if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
+        (
+            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+            Cause::State(StateCause::CursorInvalid),
+            false,
+        )
+    } else {
+        // Should be unreachable in correctly-wired call sites. Keep
+        // the producer surface honest: classify as a contract
+        // violation so the engine routes terminal but the audit
+        // captures the missing scope through telemetry.
+        debug_assert!(
+            false,
+            "Graph CursorInvalid signal raised without ErrorScope::Cursor (op={:?})",
+            ctx.operation,
+        );
+        (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(DiagnosticText::support_only(
+                    "Graph CursorInvalid signal raised outside cursor scope".to_string(),
+                )),
+            }),
+            false,
+        )
+    }
 }
 
 fn classify_by_status(
     ctx: &GraphErrorContext,
     code: u16,
-    retry_after: Option<Duration>,
+    retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause, bool) {
     match code {
         400 | 422 => (
@@ -354,29 +435,63 @@ fn classify_by_status(
             Cause::State(StateCause::ConcurrencyConflict),
             false,
         ),
-        410 if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => (
-            AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
-            Cause::State(StateCause::CursorInvalid),
-            false,
-        ),
+        410 if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => cursor_invalid_or_protocol(ctx),
         410 => server_error_tuple(code),
         408 | 502 | 503 | 504 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
-            Cause::Server(ServerCause::Unavailable { retry_after }),
+            Cause::Server(ServerCause::Unavailable { retry_hint }),
             false,
         ),
         429 => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
-            Cause::Server(ServerCause::RateLimited { retry_after }),
+            Cause::Server(ServerCause::RateLimited { retry_hint }),
             true,
         ),
         507 => (
             AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
-            Cause::Server(ServerCause::QuotaExhausted { retry_after }),
+            Cause::Server(ServerCause::QuotaExhausted { retry_hint }),
             true,
         ),
-        500..=599 => server_error_tuple(code),
         _ => server_error_tuple(code),
+    }
+}
+
+/// `signal == None`: the body did not decode as a Graph error
+/// envelope. For 5xx the status is enough to classify as
+/// `Server(Unavailable)`. For 4xx without a typed code we treat the
+/// response as a provider-contract violation since Graph documents
+/// every error code it ships.
+fn classify_no_envelope(
+    ctx: &GraphErrorContext,
+    code: u16,
+    retry_hint: Option<RetryHint>,
+    body: &bytes::Bytes,
+) -> (AccountErrorKind, Cause, bool) {
+    // 500-class without an envelope is still a server problem.
+    // 4xx/other land on the existing status fallback, which will pick
+    // the appropriate Auth/Authorization/etc. mapping based on the
+    // code itself. The malformed-response cause is attached only
+    // when the body is non-empty (a non-empty body that did not parse
+    // as JSON is an actual contract violation; an empty 503 is
+    // routine).
+    if code >= 500 || !body.is_empty() {
+        if body.is_empty() {
+            return classify_by_status(ctx, code, retry_hint);
+        }
+        // Non-empty body that did not parse as a Graph error
+        // envelope -> protocol contract violation.
+        (
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: ctx.protocol,
+                detail: Some(DiagnosticText::support_only(format!(
+                    "HTTP {code} with non-envelope body",
+                ))),
+            }),
+            false,
+        )
+    } else {
+        classify_by_status(ctx, code, retry_hint)
     }
 }
 
@@ -385,20 +500,6 @@ fn server_error_tuple(code: u16) -> (AccountErrorKind, Cause, bool) {
         AccountErrorKind::Server(ServerErrorKind::Error { status: Some(code) }),
         Cause::Server(ServerCause::Error { status: Some(code) }),
         false,
-    )
-}
-
-fn retry_deadline_applies(kind: &AccountErrorKind) -> bool {
-    matches!(
-        kind,
-        AccountErrorKind::Server(
-            ServerErrorKind::Unavailable
-                | ServerErrorKind::RateLimited
-                | ServerErrorKind::QuotaExhausted
-                | ServerErrorKind::Error {
-                    status: Some(500..=599)
-                },
-        )
     )
 }
 
@@ -418,7 +519,9 @@ fn finish(builder: AccountErrorBuilder, ctx: &GraphErrorContext) -> AccountError
         Some(scope) => builder.scope(scope.clone()),
         None => builder,
     };
-    builder.build()
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn push_attempt(
@@ -465,6 +568,10 @@ const REQUEST_ID_HEADERS: &[&str] = &["request-id", "x-ms-request-id", "x-reques
 
 const SUPPORT_ONLY_HEADER_TEXT: &[&str] = &["x-ms-ags-diagnostic"];
 
+/// Cap matches `bifrost_net::STATUS_BODY_CAP`. We re-declare locally
+/// because the `bifrost-net` constant is `pub(crate)`.
+const STATUS_BODY_CAP: usize = 4096;
+
 fn first_header(headers: &HeaderMap, names: &[&str]) -> Option<String> {
     for name in names {
         if let Some(value) = header_text(headers, name) {
@@ -485,64 +592,64 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
     }
 }
 
+/// Cap response-body diagnostics at `STATUS_BODY_CAP` bytes so a
+/// multi-megabyte error page does not become a multi-megabyte
+/// `DiagnosticText` retained across the lifetime of the error.
 fn body_diagnostic(body: &bytes::Bytes) -> Option<DiagnosticText> {
     if body.is_empty() {
         return None;
     }
+    let capped = if body.len() > STATUS_BODY_CAP {
+        let mut buf = String::from_utf8_lossy(&body[..STATUS_BODY_CAP]).into_owned();
+        buf.push_str(" ... (truncated)");
+        buf
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    };
     Some(DiagnosticText::support_only(format!(
-        "response body: {}",
-        String::from_utf8_lossy(body)
+        "response body: {capped}"
     )))
 }
 
-fn parse_retry_after_header(headers: &HeaderMap) -> Option<Duration> {
+/// Parse the `Retry-After` header into a structured `RetryHint`.
+/// Microsoft Graph emits both integer-seconds and HTTP-date forms;
+/// `bifrost_net::request::parse_retry_after` already handles both, so
+/// we delegate and wrap the resulting `Duration` in
+/// `RetryHint::After`. HTTP-date values that have already elapsed
+/// (clock skew, slow client) collapse to `Duration::ZERO`, which is
+/// the engine's signal to retry immediately.
+fn parse_retry_after_header(headers: &HeaderMap) -> Option<RetryHint> {
     let value = headers.get(RETRY_AFTER)?;
-    let text = value.to_str().ok()?.trim();
-    if let Ok(secs) = text.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    None
-}
-
-fn retry_deadline(retry_after: Option<Duration>) -> Option<SystemTime> {
-    retry_after.and_then(|duration| SystemTime::now().checked_add(duration))
+    parse_retry_after(Some(value)).map(RetryHint::After)
 }
 
 fn resource_from_scope(scope: Option<&ErrorScope>) -> Option<ResourceKind> {
-    match scope {
-        Some(ErrorScope::Message { .. }) => Some(ResourceKind::Message),
-        Some(ErrorScope::Mailbox { .. }) => Some(ResourceKind::Mailbox),
-        Some(ErrorScope::Thread { .. }) => Some(ResourceKind::Thread),
-        Some(ErrorScope::Calendar { .. }) => Some(ResourceKind::Calendar),
-        Some(ErrorScope::Contact { .. }) => Some(ResourceKind::Contact),
-        Some(
-            ErrorScope::Account
-            | ErrorScope::Cursor(_)
-            | ErrorScope::CalendarCollection
-            | ErrorScope::ContactCollection,
-        )
-        | Some(_)
-        | None => None,
+    match scope? {
+        ErrorScope::Message { .. } => Some(ResourceKind::Message),
+        ErrorScope::Mailbox { .. } => Some(ResourceKind::Mailbox),
+        ErrorScope::Thread { .. } => Some(ResourceKind::Thread),
+        ErrorScope::Calendar { .. } => Some(ResourceKind::Calendar),
+        ErrorScope::Contact { .. } => Some(ResourceKind::Contact),
+        ErrorScope::Account
+        | ErrorScope::Cursor(_)
+        | ErrorScope::CalendarCollection
+        | ErrorScope::ContactCollection => None,
+        _ => None,
     }
 }
 
 fn id_from_scope(scope: Option<&ErrorScope>) -> Option<String> {
-    match scope {
-        Some(
-            ErrorScope::Message { id }
-            | ErrorScope::Mailbox { id }
-            | ErrorScope::Thread { id }
-            | ErrorScope::Calendar { id }
-            | ErrorScope::Contact { id },
-        ) => Some(id.clone()),
-        Some(
-            ErrorScope::Account
-            | ErrorScope::Cursor(_)
-            | ErrorScope::CalendarCollection
-            | ErrorScope::ContactCollection,
-        )
-        | Some(_)
-        | None => None,
+    match scope? {
+        ErrorScope::Message { id }
+        | ErrorScope::Mailbox { id }
+        | ErrorScope::Thread { id }
+        | ErrorScope::Calendar { id }
+        | ErrorScope::Contact { id } => Some(id.clone()),
+        ErrorScope::Account
+        | ErrorScope::Cursor(_)
+        | ErrorScope::CalendarCollection
+        | ErrorScope::ContactCollection => None,
+        _ => None,
     }
 }
 
@@ -562,7 +669,8 @@ pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountE
     .operation(operation)
     .provider(Provider::Microsoft)
     .protocol(Protocol::Graph)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 /// Translate a `CursorError` into the account-boundary `AccountError`.
@@ -587,7 +695,8 @@ pub(crate) fn cursor_error_to_account_error(
             Cause::State(StateCause::SchemaIncompatible),
         )
         .text(DiagnosticText::support_only(error.to_string()))
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         CursorError::Unsupported => base_builder(
             &ctx,
             AccountErrorKind::Unsupported(ctx.operation),
@@ -595,7 +704,8 @@ pub(crate) fn cursor_error_to_account_error(
                 operation: ctx.operation,
             }),
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
         CursorError::Encode(msg) => base_builder(
             &ctx,
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -604,15 +714,49 @@ pub(crate) fn cursor_error_to_account_error(
                 detail: Some(DiagnosticText::support_only(msg)),
             }),
         )
-        .build(),
+        .try_build()
+        .expect("valid account error classification"),
     }
+}
+
+/// Build a typed `Protocol(_)` `AccountError` for graph-side
+/// data-shape violations (missing id, missing etag, etc.). Used by
+/// pim.rs and mutate.rs for the produce-without-attempting-the-wire
+/// path. `scope` carries the affected resource so support exports
+/// can pinpoint the message; the caller's `operation` is preserved
+/// rather than coerced into `Hydrate`.
+#[must_use]
+pub(crate) fn protocol_violation(
+    inner: ProtocolErrorKind,
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    detail: impl Into<String>,
+) -> AccountError {
+    let detail = DiagnosticText::support_only(detail.into());
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(inner),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Graph,
+            detail: Some(detail.clone()),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .text(detail);
+    if let Some(scope) = scope {
+        builder = builder.scope(scope);
+    }
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Translate a single `$batch` response item into an
 /// `ItemOutcome<MutationSuccess>`. Centralizes the mutation outcome
-/// rules from the plan: 2xx → applied, destroy-404 → skipped, 404 → not
-/// found, 409 / 412 → concurrency conflict (never `Skipped`), 429 →
-/// rate limited with retry-after + throttle scope, 5xx → unavailable.
+/// rules from the plan: 2xx -> applied, destroy-404 -> skipped, 404 -> not
+/// found, 409 / 412 -> concurrency conflict (never `Skipped`), 429 ->
+/// rate limited with retry-after + throttle scope, 5xx -> unavailable.
 #[must_use]
 pub(crate) fn mutation_item_outcome(
     status: u16,
@@ -825,8 +969,6 @@ mod tests {
 
     #[test]
     fn sync_state_not_found_maps_to_cursor_invalid() {
-        // Microsoft ships both SyncStateNotFound and syncStateNotFound; both
-        // must classify as CursorInvalid via the typed variant.
         for code in ["SyncStateNotFound", "syncStateNotFound"] {
             let err = classify(
                 StatusCode::BAD_REQUEST,
@@ -860,8 +1002,24 @@ mod tests {
         match err.recovery() {
             RecoveryClass::Retry(advice) => {
                 assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
-                assert!(advice.not_before.is_some());
+                assert!(advice.retry_hint.is_some());
             }
+            other => panic!("expected Retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_after_http_date_parses() {
+        // RFC 7231 IMF-fixdate format. Use a date deep in the future
+        // so the resulting hint is non-zero even on slow CI clocks.
+        let err = classify(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"TooManyRequests"}}"#,
+            graph_ctx(AccountOperation::SyncChanges),
+            &[("retry-after", "Wed, 21 Oct 2099 07:28:00 GMT")],
+        );
+        match err.recovery() {
+            RecoveryClass::Retry(advice) => assert!(advice.retry_hint.is_some()),
             other => panic!("expected Retry, got {other:?}"),
         }
     }
@@ -889,10 +1047,6 @@ mod tests {
             &[],
         );
         assert!(matches!(err.kind(), AccountErrorKind::ConcurrencyConflict));
-        // ConcurrencyConflict derives a Retry(AfterStateRefresh) recovery,
-        // not a Reconcile remediation. Lock that down here so a future
-        // change to the recovery table cannot silently weaken the
-        // If-Match guarantee.
         match err.recovery() {
             RecoveryClass::Retry(_) => {}
             other => panic!("expected Retry recovery, got {other:?}"),
@@ -983,12 +1137,41 @@ mod tests {
             graph_ctx(AccountOperation::SyncInventory),
             &[],
         );
+        // Non-empty 5xx body that does not parse as an envelope is
+        // classified as a contract violation rather than a server
+        // error, so the support team can flag Microsoft.
         match err.kind() {
-            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(500) }) => {}
-            other => panic!("expected Server(Error 500), got {other:?}"),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation) => {}
+            other => panic!("expected Protocol(ContractViolation), got {other:?}"),
         }
         let support: Vec<_> = err.support_consented().support_text.into_iter().collect();
         assert!(support.iter().any(|t| t.contains("definitely not JSON")));
+    }
+
+    #[test]
+    fn body_diagnostic_caps_large_bodies() {
+        let large = "x".repeat(STATUS_BODY_CAP * 4);
+        let err = classify(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &large,
+            graph_ctx(AccountOperation::SyncInventory),
+            &[],
+        );
+        let support: Vec<&str> = err.support_consented().support_text;
+        let body_text = support
+            .iter()
+            .find(|t| t.contains("response body"))
+            .expect("body diagnostic present");
+        assert!(
+            body_text.len() < large.len(),
+            "body diagnostic was not capped: {} >= {}",
+            body_text.len(),
+            large.len(),
+        );
+        assert!(
+            body_text.contains("(truncated)"),
+            "missing truncation marker"
+        );
     }
 
     #[test]
@@ -1008,6 +1191,56 @@ mod tests {
         ));
         assert_eq!(err.protocol(), Some(Protocol::Graph));
         assert_eq!(err.provider(), Some(Provider::Microsoft));
+    }
+
+    #[test]
+    fn ews_soap_fault_classifies_to_account_error_with_ews_protocol() {
+        let ctx = GraphErrorContext::ews(AccountOperation::PushStream);
+        let detail = DiagnosticText::support_only("ErrorAccessDenied".to_string());
+        let err = ews_error_to_account_error(
+            EwsError::SoapFault {
+                code: SoapFaultCode::Client,
+                detail,
+            },
+            ctx,
+        );
+        assert_eq!(err.protocol(), Some(Protocol::Ews));
+        assert_eq!(err.provider(), Some(Provider::Microsoft));
+        match err.kind() {
+            AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }) => {}
+            other => panic!("expected Server(Error 400), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ews_transport_classifies_via_net_conversion() {
+        let net = bifrost_net::Error::Network {
+            message: "connection reset".to_string(),
+            transmission_state: TransmissionState::InFlight,
+            source: None,
+        };
+        let err = ews_error_to_account_error(
+            EwsError::Transport(net),
+            GraphErrorContext::ews(AccountOperation::PushStream),
+        );
+        assert_eq!(err.protocol(), Some(Protocol::Ews));
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+        ));
+    }
+
+    #[test]
+    fn ews_malformed_xml_is_protocol_parse_failed() {
+        let err = ews_error_to_account_error(
+            EwsError::MalformedXml(DiagnosticText::support_only("bad xml".to_string())),
+            GraphErrorContext::ews(AccountOperation::PushStream),
+        );
+        assert_eq!(err.protocol(), Some(Protocol::Ews));
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
+        ));
     }
 
     #[test]
@@ -1097,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_429_carries_retry_after_and_throttle_scope() {
+    fn mutation_429_carries_retry_hint_and_throttle_scope() {
         let outcome = mutation_item_outcome(
             429,
             headers(&[("retry-after", "10")]),
@@ -1118,12 +1351,37 @@ mod tests {
                 match failure.error.recovery() {
                     RecoveryClass::Retry(advice) => {
                         assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
-                        assert!(advice.not_before.is_some());
+                        assert!(advice.retry_hint.is_some());
                     }
                     other => panic!("expected Retry, got {other:?}"),
                 }
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mutation_429_routes_non_idempotent_with_retry_classification() {
+        // Bulk-move per-item 429: with `AttemptCause(Acknowledged)`
+        // pushed at the response boundary, recovery resolves to
+        // `Retry::SameRequest` rather than `ProviderRefused`.
+        let outcome = mutation_item_outcome(
+            429,
+            HeaderMap::new(),
+            Bytes::new(),
+            false,
+            bifrost_types::BatchItemId("m1".to_string()),
+            AccountOperation::BulkMove,
+            ErrorScope::Message {
+                id: "m1".to_string(),
+            },
+        );
+        let bifrost_types::ItemOutcome::Failed(failure) = outcome else {
+            panic!("expected Failed");
+        };
+        match failure.error.recovery() {
+            RecoveryClass::Retry(_) => {}
+            other => panic!("expected Retry, got {other:?}"),
         }
     }
 

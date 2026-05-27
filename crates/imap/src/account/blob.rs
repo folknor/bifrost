@@ -32,10 +32,15 @@ fn open_blob_inner(
     range: Option<ByteRange>,
 ) -> bifrost_types::AccountStream<SyncEvent<Bytes>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
+    let scope_id = handle.id.0.clone();
     tokio::spawn(async move {
         match run_blob(account, handle, range, &tx).await {
             Ok(()) => {
                 let _ = tx.send(SyncEvent::Done(None::<Checkpoint>)).await;
+            }
+            Err(BlobError::ChannelDropped) => {
+                // Consumer dropped the receiver; stop silently per the
+                // streaming output-channel contract.
             }
             Err(BlobError::Account(err)) => {
                 let _ = tx.send(terminated_event(err)).await;
@@ -46,7 +51,8 @@ fn open_blob_inner(
                         err,
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::OpenBlob,
-                        ),
+                        )
+                        .with_message_id(scope_id),
                     ))
                     .await;
             }
@@ -58,6 +64,7 @@ fn open_blob_inner(
 enum BlobError {
     Account(AccountError),
     Imap(crate::Error),
+    ChannelDropped,
 }
 
 impl From<AccountError> for BlobError {
@@ -92,7 +99,8 @@ async fn run_blob(
                 )
                 .protocol(Protocol::Imap)
                 .operation(bifrost_types::AccountOperation::OpenBlobRange)
-                .build(),
+                .try_build()
+                .expect("valid account error classification"),
             ));
         }
         if let Some(total) = handle.size
@@ -110,7 +118,8 @@ async fn run_blob(
                 )
                 .protocol(Protocol::Imap)
                 .operation(bifrost_types::AccountOperation::OpenBlobRange)
-                .build(),
+                .try_build()
+                .expect("valid account error classification"),
             ));
         }
     }
@@ -137,7 +146,11 @@ async fn run_blob(
             )
             .protocol(Protocol::Imap)
             .operation(bifrost_types::AccountOperation::OpenBlob)
-            .build(),
+            .scope(bifrost_types::ErrorScope::Mailbox {
+                id: decoded.folder.as_str().to_owned(),
+            })
+            .try_build()
+            .expect("valid account error classification"),
         ));
     }
     let Some(uid_set) = uid_set_from_u32(&[decoded.uid]) else {
@@ -161,7 +174,7 @@ async fn run_blob(
                     None::<Checkpoint>,
                 ))
                 .await
-                .map_err(|_| crate::Error::closed())?;
+                .map_err(|_| BlobError::ChannelDropped)?;
             }
         }
     }

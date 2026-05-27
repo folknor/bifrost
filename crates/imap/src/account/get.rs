@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use bifrost_types::{
-    AccountStream, HydratedObject, HydratedObjectKind, PageBoundary, Projection, SyncEvent,
+    AccountStream, BatchFailure, BatchItemId, BatchSuccess, BatchUncertain, HydratedObject,
+    HydratedObjectKind, ItemOutcome, PageBoundary, Projection, SyncEvent,
 };
 use futures::StreamExt;
 
@@ -10,14 +11,14 @@ use crate::types::{FetchAttr, FetchResponse, MailboxName};
 use super::inventory::{fetch_to_inventory, flags_set};
 use super::{
     BATCH_ITEMS, DecodedObjectId, ImapAccount, batch, boxed_receiver_stream, decode_object_id,
-    fatal_event, uid_set_from_u32,
+    uid_set_from_u32,
 };
 
 pub(crate) fn get_stream(
     account: ImapAccount,
     mut ids: AccountStream<bifrost_types::ObjectId>,
     projection: Projection,
-) -> AccountStream<SyncEvent<HydratedObject>> {
+) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         let mut grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)> = HashMap::new();
@@ -31,27 +32,50 @@ pub(crate) fn get_stream(
                         .push(decoded);
                 }
                 Err(err) => {
-                    let _ = tx
-                        .send(SyncEvent::Warning(bifrost_types::Warning::support_only(
-                            bifrost_types::WarningKind::Other,
-                            err.to_string(),
-                        )))
-                        .await;
+                    // Locally-invalid id: surface as per-item Failed
+                    // rather than a free-form Warning. Drops the id (a
+                    // bifrost-shaped value that the caller will fail to
+                    // hydrate elsewhere anyway) into the structured
+                    // failure lane.
+                    let item_id = BatchItemId(id.0.clone());
+                    let outcome = ItemOutcome::Failed(BatchFailure::new(item_id, err));
+                    if tx
+                        .send(batch(vec![outcome], PageBoundary::Page, None))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
 
         for (_key, (folder, ids)) in grouped {
-            if let Err(err) = run_folder_get(&account, &folder, ids, projection, &tx).await {
-                let _ = tx
-                    .send(fatal_event(
+            match run_folder_get(&account, &folder, ids.clone(), projection, &tx).await {
+                Ok(()) => {}
+                Err(GetError::ChannelDropped) => return,
+                Err(GetError::Imap(err)) => {
+                    // Per-folder failure does not collapse the stream:
+                    // remaining items in this folder surface as
+                    // `Uncertain`, the next folder still runs.
+                    let account_err = super::account_error_with(
                         err,
                         super::error::ImapErrorContext::operation(
                             bifrost_types::AccountOperation::Hydrate,
-                        ),
-                    ))
-                    .await;
-                return;
+                        )
+                        .with_mailbox(&folder),
+                    );
+                    let uncertain: Vec<ItemOutcome<HydratedObject>> = ids
+                        .into_iter()
+                        .map(|id| {
+                            let item = BatchItemId(
+                                super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0,
+                            );
+                            ItemOutcome::Uncertain(BatchUncertain::new(item, account_err.clone()))
+                        })
+                        .collect();
+                    let _ = tx.send(batch(uncertain, PageBoundary::Page, None)).await;
+                }
             }
         }
         let _ = tx.send(SyncEvent::Done(None)).await;
@@ -59,13 +83,26 @@ pub(crate) fn get_stream(
     boxed_receiver_stream(rx)
 }
 
+/// Per-folder hydration failure: either an IMAP wire error to classify
+/// per-item, or a dropped output channel (silent return).
+enum GetError {
+    Imap(crate::Error),
+    ChannelDropped,
+}
+
+impl From<crate::Error> for GetError {
+    fn from(value: crate::Error) -> Self {
+        Self::Imap(value)
+    }
+}
+
 async fn run_folder_get(
     account: &ImapAccount,
     folder: &MailboxName,
     ids: Vec<DecodedObjectId>,
     projection: Projection,
-    tx: &tokio::sync::mpsc::Sender<SyncEvent<HydratedObject>>,
-) -> Result<(), crate::Error> {
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
+) -> Result<(), GetError> {
     let mut conn = account.checkout_for_folder(folder).await?;
     let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
     let selected = account
@@ -92,7 +129,7 @@ async fn run_folder_get(
             account.command_timeout(),
         )
         .await?;
-    let mut out = Vec::with_capacity(BATCH_ITEMS);
+    let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
     for fetch in fetches {
         if let (Some(uid), Some(modseq)) = (fetch.uid, fetch.mod_seq) {
             account
@@ -100,18 +137,19 @@ async fn run_folder_get(
                 .record_modseq(folder, uidvalidity, uid, modseq)?;
         }
         if let Some(object) = fetch_to_hydrated(folder, uidvalidity, fetch, projection) {
-            out.push(object);
+            let item = BatchItemId(object.id.0.clone());
+            out.push(ItemOutcome::Succeeded(BatchSuccess::new(item, object)));
             if out.len() >= BATCH_ITEMS {
                 tx.send(batch(std::mem::take(&mut out), PageBoundary::Page, None))
                     .await
-                    .map_err(|_| crate::Error::closed())?;
+                    .map_err(|_| GetError::ChannelDropped)?;
             }
         }
     }
     if !out.is_empty() {
         tx.send(batch(out, PageBoundary::Page, None))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| GetError::ChannelDropped)?;
     }
     Ok(())
 }
@@ -202,6 +240,24 @@ fn fetch_to_hydrated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::{AccountErrorKind, ObjectId, RequestErrorKind};
+
+    #[test]
+    fn locally_invalid_object_id_classifies_as_request_malformed() {
+        // imap-D4: get_stream emits ItemOutcome::Failed carrying a
+        // structured `AccountError` for locally-invalid ids (rather
+        // than dropping the failure as a free-form Warning). The
+        // streaming wrapper plumbs the structured failure straight
+        // through; this test pins the classification of the failure
+        // that `decode_object_id` produces - if that classification
+        // changes, the lane's `AccountError` changes with it.
+        let bad = ObjectId("not-a-valid-imap-id".into());
+        let err = super::super::decode_object_id(&bad).expect_err("invalid id should not decode");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+    }
 
     #[test]
     fn metadata_projection_requests_modseq_only_when_available() {

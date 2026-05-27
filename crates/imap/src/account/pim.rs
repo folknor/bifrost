@@ -844,6 +844,7 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
     Ok(CriteriaPart { criteria, folder })
 }
 
+#[allow(clippy::unwrap_in_result)]
 fn merge_folder(
     current: Option<MailboxName>,
     next: Option<MailboxName>,
@@ -868,7 +869,8 @@ fn merge_folder(
             )
             .protocol(Protocol::Imap)
             .operation(bifrost_types::AccountOperation::SearchMessages)
-            .build())
+            .try_build()
+            .expect("valid account error classification"))
         }
         (Some(a), _) => Ok(Some(a)),
         (_, Some(b)) => Ok(Some(b)),
@@ -1272,6 +1274,12 @@ fn sanitize_header(value: &str) -> String {
 
 /// Build a `Request(Malformed)` `AccountError` for local PIM failures
 /// where the caller provided invalid or internally inconsistent state.
+///
+/// Operation is intentionally absent: `pim_malformed` is used from
+/// helpers (decode_thread_id, mailbox-name validation, container-id
+/// shape) that may be reached from multiple PIM ops. Each public PIM
+/// surface threads its operation through `op_err` on wire errors;
+/// these locally-malformed cases land in `ClientBug` regardless of op.
 fn pim_malformed(detail: impl Into<String>) -> AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Request(RequestErrorKind::Malformed),
@@ -1280,7 +1288,8 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
         }),
     )
     .protocol(Protocol::Imap)
-    .build()
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn format_addresses(addresses: &[Address]) -> String {

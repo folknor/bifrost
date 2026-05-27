@@ -19,14 +19,9 @@ use bifrost_types::{
 fn retry_error() -> bifrost_types::AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: None,
-        }),
+        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
     )
-    .push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: TransmissionState::Unsent,
-    }))
+    .push_cause(Cause::Attempt(AttemptCause::new(TransmissionState::Unsent)))
     .operation(AccountOperation::SyncChanges)
     .try_build()
     .expect("valid")
@@ -35,15 +30,12 @@ fn retry_error() -> bifrost_types::AccountError {
 fn reconcile_error() -> bifrost_types::AccountError {
     AccountErrorBuilder::new(
         AccountErrorKind::Transport(TransportErrorKind::Network),
-        Cause::Transport(TransportCause {
-            kind: TransportKind::Network,
-            message: None,
-        }),
+        Cause::Transport(TransportCause::new(TransportKind::Network, None)),
     )
     .operation(AccountOperation::Send)
-    .push_cause(Cause::Attempt(AttemptCause {
-        transmission_state: TransmissionState::InFlight,
-    }))
+    .push_cause(Cause::Attempt(AttemptCause::new(
+        TransmissionState::InFlight,
+    )))
     .try_build()
     .expect("valid")
 }

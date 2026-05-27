@@ -254,8 +254,18 @@ pub(crate) enum Error {
         capability: &'static str,
     },
     #[cfg(feature = "websockets")]
-    /// WebSocket transport error.
-    WebSocket(tokio_websockets::Error),
+    /// WebSocket handshake failure raised by `tokio_websockets` before
+    /// the connection is established. Classifies as
+    /// `Transport(Network)` + `Attempt(Unsent)` - no bytes have crossed
+    /// the side-effect boundary at this point. Distinct from
+    /// [`Error::WebSocketRuntime`] which models post-handshake
+    /// stream failures.
+    WebSocketHandshake(tokio_websockets::Error),
+    #[cfg(feature = "websockets")]
+    /// WebSocket stream-level failure raised after the handshake
+    /// completed. Classifies as `Protocol(PartialResponse)` +
+    /// `Attempt(Acknowledged)`.
+    WebSocketRuntime(tokio_websockets::Error),
     #[cfg(feature = "websockets")]
     /// WebSocket peer closed the connection.
     WebSocketClosed,
@@ -314,12 +324,13 @@ impl From<SetError<String>> for Error {
     }
 }
 
-#[cfg(feature = "websockets")]
-impl From<tokio_websockets::Error> for Error {
-    fn from(e: tokio_websockets::Error) -> Self {
-        Error::WebSocket(e)
-    }
-}
+// No blanket `From<tokio_websockets::Error> for Error` impl: call sites
+// must distinguish pre-handshake (`WebSocketHandshake`) from post-
+// handshake (`WebSocketRuntime`) failures so the conversion boundary
+// can attach the correct `TransportCause` / `AttemptCause` pair. The
+// blanket impl previously mis-routed every websocket error through
+// `Protocol(PartialResponse) + Attempt(Acknowledged)`, hiding handshake-
+// time TCP/TLS drops behind the wrong recovery class.
 
 #[cfg(feature = "websockets")]
 impl Error {
@@ -367,7 +378,9 @@ impl Display for Error {
                 "Session lists no primary account for capability {capability}"
             ),
             #[cfg(feature = "websockets")]
-            Error::WebSocket(e) => write!(f, "WebSocket error: {e}"),
+            Error::WebSocketHandshake(e) => write!(f, "WebSocket handshake error: {e}"),
+            #[cfg(feature = "websockets")]
+            Error::WebSocketRuntime(e) => write!(f, "WebSocket runtime error: {e}"),
             #[cfg(feature = "websockets")]
             Error::WebSocketClosed => write!(f, "WebSocket connection closed"),
             #[cfg(feature = "websockets")]

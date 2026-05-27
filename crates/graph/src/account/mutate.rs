@@ -4,7 +4,7 @@ use std::time::Duration;
 use bifrost_types::{
     AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, Checkpoint, ErrorScope,
     FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
-    SyncEvent, Warning, WarningKind,
+    ProtocolErrorKind, SyncEvent,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -13,7 +13,9 @@ use crate::types::{BatchRequest, BatchRequestItem, BatchResponse};
 
 use super::GraphAccount;
 use super::get::folder_destination;
-use super::graph_error::{GraphErrorContext, into_account_error, mutation_item_outcome};
+use super::graph_error::{
+    GraphErrorContext, into_account_error, mutation_item_outcome, protocol_violation,
+};
 use super::inventory::graph_etag;
 
 enum MutationKind {
@@ -225,21 +227,23 @@ async fn refresh_missing_etags(
                     etags.insert(id.0.clone(), etag.clone());
                     refreshed.push((id.0.clone(), etag));
                 } else {
+                    // Missing etag after a refresh is a Graph
+                    // contract violation (`Protocol(MissingField)`),
+                    // not an `Unsupported` op. Surface it on the
+                    // failed lane so the consumer sees structured
+                    // evidence rather than a misclassified terminal.
                     failed.push(ItemOutcome::Failed(BatchFailure::new(
                         BatchItemId(id.0.clone()),
-                        super::graph_error::unsupported_account_error(operation_for_kind(kind)),
-                    )));
-                    // Emit a warning as a side-channel so the engine
-                    // can surface the missing-etag condition in
-                    // support exports without treating the batch as
-                    // terminated.
-                    let _warning = Warning::support_only(
-                        WarningKind::Other,
-                        format!(
-                            "Graph message {} did not expose an etag after refresh",
-                            id.0
+                        protocol_violation(
+                            ProtocolErrorKind::MissingField,
+                            operation_for_kind(kind),
+                            Some(ErrorScope::Message { id: id.0.clone() }),
+                            format!(
+                                "Graph message {} did not expose an etag after refresh",
+                                id.0
+                            ),
                         ),
-                    );
+                    )));
                 }
             }
             Err(error) => {

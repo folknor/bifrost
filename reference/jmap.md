@@ -223,19 +223,19 @@ Supported scopes for `inventory_stream` and `changes_stream`:
 
 Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The change loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done(Some(Checkpoint::Change(...)))`. Shared `Mutex<Option<String>>` state caches are advanced compare-and-swap style so a stale writer does not clobber a newer state.
 
-`get_stream` (hydration) supports `Projection::FlagsOnly` and `Projection::Metadata` for Email. Raw-MIME projections emit a fatal-unsupported event - MIME assembly is outside this wave. Batches are sized at `max_objects_in_get`.
+`get_stream` (hydration) supports `Projection::FlagsOnly` and `Projection::Metadata` for Email. Raw-MIME projections emit a fatal-unsupported event - MIME assembly is outside this wave. Batches are sized at `max_objects_in_get`. Per-item lane: every hydrated email is emitted as `ItemOutcome::Succeeded(BatchSuccess { item, output: HydratedObject })` so the return type matches the unified `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>` trait signature. Locally-invalid input ids or transport-drop ambiguity flow through `ItemOutcome::Failed` / `Uncertain` on the same channel rather than terminating the entire stream.
 
 ### Push and reconnect
 
 Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. The task connects to the JMAP WebSocket endpoint (`Client::connect_ws`, `dep:tokio-websockets/native-tls`), validates that the server accepted `Sec-WebSocket-Protocol: jmap`, re-applies the union of currently subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` notifications as `WatchEvent::Invalidated { hint: InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::SpecificCursorScope(...) } }`. Per-message disconnects (and stream-level errors) emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
 
-`ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff. Each successful reconnect resets `backoff` to `initial`; failures double `backoff` (saturating) up to `max`.
+`ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff. Each successful reconnect resets `backoff` to `initial`; failures double `backoff` (saturating) up to `max`. Every exit error from the reader (connect failure or mid-stream drop) is classified through `into_account_error(_, JmapErrorContext::new(PushStream))`. Terminal-class errors (auth lost, capability changed, schema break) emit `WatchEvent::Terminated(AccountError)` and stop the reader so the engine reopens the account; retry-class errors emit `WatchEvent::Disconnected` and continue with the backoff loop. The previous shape (`Err(_) => break`/`disconnected`) erased every classification signal.
 
 `push_stream` is a thin broadcast subscriber. A `Lagged` broadcast slot emits a coalesced `WatchEvent::Invalidated { source: PushSource::Coalesced, payload: Unknown }` so the engine triggers a full re-poll rather than silently losing notifications.
 
 `subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
 
-`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Destroyed` for membership scope churn.
+`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Destroyed` for membership scope churn. Errors from the poll are classified through `into_account_error`; terminal classes (or engine-action classes) break out of the polling loop so the engine reopens the account, instead of the previous sleep-and-retry-silently behavior. The stream's element type is `ScopeLifecycle` (not `SyncEvent<_>`), so the protocol cannot emit a typed `Terminated(AccountError)` on this channel - ending the stream is the protocol-side signal the engine has to act on.
 
 ### Mutation pipeline
 
@@ -299,11 +299,21 @@ Mapping highlights for the JMAP signals the central table reads:
 - HTTP-only status fallbacks (401/403/429/5xx) on bare
   `Problem` -> `Authentication` / `Server(RateLimited)` /
   `Server(Unavailable)` per the central rules.
-- `Transport(_)` and `WebSocket(_)` -> `Transport(Network)` with
+- `Transport(_)` -> `Transport(Network)` with
   `AttemptCause::transmission_state` derived from where the wire
   failure occurred; the central mapping picks `Retry::SameRequest`
   for idempotent ops and `Reconcile` for non-idempotent ops
   caught mid-flight.
+- WebSocket errors split by handshake position. The crate carries
+  `Error::WebSocketHandshake(tokio_websockets::Error)` for
+  pre-handshake failures from `Client::connect_ws` and
+  `Error::WebSocketRuntime(tokio_websockets::Error)` for post-
+  handshake stream failures. There is no blanket
+  `From<tokio_websockets::Error>` impl; call sites map explicitly
+  so the conversion boundary can attach the right `TransportCause` +
+  `AttemptCause` pair. `WebSocketHandshake` -> `Transport(Network)` +
+  `Attempt(Unsent)`; `WebSocketRuntime` -> `Protocol(PartialResponse)`
+  + `Attempt(Acknowledged)`.
 - `NoPrimaryAccount` -> `Authentication(ReauthorizationRequired)`
   -> `AuthLost`.
 - Local shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`,
@@ -319,9 +329,21 @@ Known JMAP `SetErrorType` vocabulary lands on typed
 `WireCause::Jmap(JmapMethod::*)` variants
 (`StateMismatch`, `MailboxHasChild`, `MailboxHasEmail`,
 `OverQuota`, `RateLimit`, ...). `SetErrorType::Other(code)` is the
-only path to `JmapMethod::Unknown { code }`; matching unknown
+only path to `JmapMethod::Unknown { code }`; the variant carries the
+actual wire code (manual `Deserialize` impl mirrors
+`MethodErrorType::Other(String)`), so the conversion boundary never
+synthesizes a placeholder `"other"` literal. Matching unknown
 vocabulary via string comparison is forbidden by the convergence
 plan's gate-5 invariant.
+
+The `sync/error.rs` boundary exposes two stream-side terminator
+helpers: `terminated_unsupported(operation, scope, msg)` for
+`Unsupported(op)` kinds, and `terminated_contract_violation(operation,
+scope, msg)` for `Protocol(ContractViolation)` kinds. Pagination
+overflows and other response-shape mismatches use the latter; the
+former is reserved for operations the JMAP account genuinely cannot
+perform. Both take the caller's `AccountOperation` so the kind is
+not hard-coded to `Discover`.
 
 ### Known limitations
 

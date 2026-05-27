@@ -3,7 +3,7 @@
 //! The driver translates the operation once per stream, posts batches
 //! against `users.messages.batchModify` / `batchDelete`, and emits
 //! per-id `ItemOutcome<MutationSuccess>` lanes for transmitted batches.
-//! Errors funnel through `recovery::into_account_error`; the driver
+//! Errors funnel through `account_error::into_account_error`; the driver
 //! never reaches for `RecoveryClass` directly.
 //!
 //! The trait signature is `AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>`.
@@ -24,11 +24,12 @@ use crate::client::GmailClient;
 use crate::error::Error as GmailError;
 
 use super::capabilities::GMAIL_BATCH_MODIFY_LIMIT;
-use super::flags::{LabelPatch, translate_flag_op};
-use super::recovery::{
-    self, GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
+use super::error as account_error;
+use super::error::{
+    GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
     merge_delete_fallback_error, mutation_error, skipped_outcomes,
 };
+use super::flags::{LabelPatch, translate_flag_op};
 use super::scopes::{ScopeCache, labels_for_flags};
 
 pub(crate) fn bulk_set_flags(
@@ -213,10 +214,12 @@ async fn apply_destroy(
     match post_empty_json(client, "/messages/batchDelete", &body, key).await {
         Ok(()) => MutationApply::Batch(applied_outcomes(ids)),
         Err(error) if is_batch_delete_scope_failure(&error) => {
-            // Translate the primary failure once so we can attach it
-            // diagnostically if the fallback also fails.
-            let primary = recovery::into_account_error(
-                shallow_clone(&error),
+            // gmail-N5: translate the primary failure once and consume
+            // it. The original `Error` is not used after this point;
+            // the fallback diagnostic attaches the primary's outermost
+            // cause via `merge_delete_fallback_error`.
+            let primary = account_error::into_account_error(
+                error,
                 GmailErrorContext::mutation(AccountOperation::BulkDestroy),
             );
             let fallback = LabelPatch {
@@ -240,30 +243,6 @@ async fn apply_destroy(
             Ok(outcomes) => MutationApply::Batch(outcomes),
             Err(account_error) => MutationApply::Terminate(account_error),
         },
-    }
-}
-
-/// `GmailError` does not implement `Clone` (it wraps non-Clone net /
-/// serde / base64 sources). Where the TRASH-fallback path needs to
-/// translate the primary failure for diagnostic attachment, we read
-/// the structured fields directly into a synthetic `GmailError` so
-/// the recovery mapper sees the same shape twice.
-fn shallow_clone(error: &GmailError) -> GmailError {
-    match error {
-        GmailError::Response(resp) => GmailError::response_from_parts(
-            resp.service,
-            resp.status,
-            resp.headers.clone(),
-            resp.body.clone(),
-        ),
-        // For non-Response variants we fall back to a synthetic
-        // Internal-flavored error: the fallback diagnostic only needs
-        // enough evidence for the support export. `is_batch_delete_scope_failure`
-        // only returns true for Response variants, so this branch is
-        // never hit in practice.
-        _ => GmailError::Local(crate::error::GmailLocalError::Internal {
-            detail: error.to_string(),
-        }),
     }
 }
 

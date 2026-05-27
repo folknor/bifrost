@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::GmailClient;
 use crate::types::GmailLabel;
 
-use super::recovery;
+use super::error;
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const SCOPE_CACHE_STALE_AFTER: Duration = Duration::from_secs(300);
@@ -85,9 +85,9 @@ pub(crate) fn discover_memberships(
                     vec![batch, SyncEvent::Done(None)]
                 }
                 Err(error) => {
-                    let account_error = recovery::into_account_error(
+                    let account_error = error::into_account_error(
                         error,
-                        recovery::GmailErrorContext::containers_list(),
+                        error::GmailErrorContext::containers_list(),
                     );
                     vec![SyncEvent::Terminated(account_error)]
                 }

@@ -29,25 +29,53 @@ pub(crate) fn inventory_stream(
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
-        if let Err(err) = run_inventory(account, scope, tx.clone()).await {
-            let _ = tx
-                .send(fatal_event(
-                    err,
-                    super::error::ImapErrorContext::operation(
-                        bifrost_types::AccountOperation::SyncInventory,
-                    ),
-                ))
-                .await;
+        match run_inventory(account, scope.clone(), tx.clone()).await {
+            Ok(()) | Err(InventoryError::ChannelDropped) => {}
+            Err(InventoryError::Imap(err)) => {
+                let _ = tx
+                    .send(fatal_event(
+                        err,
+                        super::error::ImapErrorContext::operation(
+                            bifrost_types::AccountOperation::SyncInventory,
+                        )
+                        .with_cursor_scope(scope),
+                    ))
+                    .await;
+            }
         }
     });
     boxed_receiver_stream(rx)
+}
+
+/// Marker for an output-channel-dropped send failure. Per the IMAP plan,
+/// a dropped consumer is not an error to escalate: the streaming task
+/// just returns. We model it as a separate variant so the spawn handler
+/// can distinguish "consumer left" (silent return) from "wire failed"
+/// (`fatal_event`).
+struct ChannelDropped;
+
+enum InventoryError {
+    Imap(crate::Error),
+    ChannelDropped,
+}
+
+impl From<crate::Error> for InventoryError {
+    fn from(value: crate::Error) -> Self {
+        Self::Imap(value)
+    }
+}
+
+impl From<ChannelDropped> for InventoryError {
+    fn from(_: ChannelDropped) -> Self {
+        Self::ChannelDropped
+    }
 }
 
 async fn run_inventory(
     account: ImapAccount,
     scope: CursorScope,
     tx: tokio::sync::mpsc::Sender<SyncEvent<InventoryEntry>>,
-) -> Result<(), crate::Error> {
+) -> Result<(), InventoryError> {
     if let Some(reason) = account.take_qresync_negotiation_warning() {
         tx.send(SyncEvent::Warning(
             Warning::support_only(WarningKind::StrategyDowngraded, reason).with_protocol_detail(
@@ -59,7 +87,7 @@ async fn run_inventory(
             ),
         ))
         .await
-        .map_err(|_| crate::Error::closed())?;
+        .map_err(|_| ChannelDropped)?;
     }
     let folder = folder_from_scope(&scope, bifrost_types::AccountOperation::SyncInventory)
         .map_err(|e| crate::Error::Protocol(e.to_string()))?;
@@ -103,11 +131,11 @@ async fn run_inventory(
                             batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch));
                             if batch_items.len() >= BATCH_ITEMS {
                                 let out = std::mem::take(&mut batch_items);
-                                tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| crate::Error::closed())?;
+                                tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| ChannelDropped)?;
                             }
                         }
                     }
-                    Some(Err(err)) => return Err(err),
+                    Some(Err(err)) => return Err(err.into()),
                     None => {
                         if let Some(result) = fetch_result.take() {
                             result?;
@@ -129,14 +157,14 @@ async fn run_inventory(
     if batch_items.is_empty() {
         tx.send(SyncEvent::Done(checkpoint))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| ChannelDropped)?;
     } else {
         tx.send(batch(batch_items, PageBoundary::Final, checkpoint.clone()))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| ChannelDropped)?;
         tx.send(SyncEvent::Done(checkpoint))
             .await
-            .map_err(|_| crate::Error::closed())?;
+            .map_err(|_| ChannelDropped)?;
     }
     Ok(())
 }
