@@ -3,9 +3,9 @@ use std::time::Duration;
 use bifrost_types::{
     AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation,
     BatchingPolicy, BlobRangeSupport, Cause, ConvenienceShape, CursorFreshness, DiagnosticText,
-    MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport, Protocol,
-    ProtocolErrorKind, PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape, StateCause,
-    SyncStateErrorKind, WireCause,
+    FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
+    PimMethodSupport, Protocol, ProtocolErrorKind, PushCapability, QuotaSignal, RateLimitClass,
+    StarredFlagShape, StateCause, SyncStateErrorKind, WireCause,
 };
 
 /// Session document does not advertise the `urn:ietf:params:jmap:core`
@@ -59,6 +59,7 @@ pub(crate) struct PimSupport {
     pub(crate) submission: bool,
     pub(crate) vacation: bool,
     pub(crate) quota: bool,
+    pub(crate) sieve: bool,
 }
 
 pub(crate) fn build(
@@ -135,6 +136,16 @@ pub(crate) fn build(
             quota_get: support.quota,
             thread_hydrate: true,
             message_hydrate: true,
+            filters_list: support.sieve,
+            filter_create: support.sieve,
+            filter_update: support.sieve,
+            filter_delete: support.sieve,
+            filter_validate: support.sieve,
+        },
+        filter_rule_shape: if support.sieve {
+            FilterRuleShape::Scripts
+        } else {
+            FilterRuleShape::None
         },
         conveniences: ConvenienceShape {
             starred: StarredFlagShape::Keyword,
@@ -199,6 +210,7 @@ mod tests {
                 submission: true,
                 vacation: true,
                 quota: true,
+                sieve: true,
             },
         )
         .unwrap();
@@ -211,6 +223,9 @@ mod tests {
         assert!(caps.pim_methods.add_to_container);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.set_label_membership);
+        assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
+        assert!(caps.pim_methods.filters_list);
+        assert!(caps.pim_methods.filter_validate);
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Keyword);
         assert!(caps.conveniences.replied_via_keyword);
         assert!(caps.conveniences.forwarded_via_keyword);
@@ -256,6 +271,7 @@ mod tests {
                 submission: false,
                 vacation: false,
                 quota: false,
+                sieve: false,
             },
         )
         .unwrap_err();

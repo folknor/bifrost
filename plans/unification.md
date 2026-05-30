@@ -236,8 +236,9 @@ shapes (JSCalendar) are translated in protocol impls.
 
 Sieve, Gmail filters, Outlook rules. Bifrost exposes:
 
-- `FilterRule { conditions: Vec<Condition>, actions: Vec<Action> }`
-  primitive - the typed intersection of provider operators.
+- `FilterRule { condition, actions }` primitive - `condition` is a
+  boolean tree (`And` / `Or` / `Not` over typed leaves), the typed
+  intersection of provider operators.
 - `FilterScript { language: ScriptLanguage, body: String }`
   primitive - for accounts that accept literal Sieve.
 
@@ -399,9 +400,56 @@ Stage 1 is done when all of these hold:
 
 Adds `filters_*` primitives plus the `FilterRule` / `FilterScript`
 shapes. No conveniences - filter rules are too divergent for a
-ratatoskr-canonical wrapper. Three waves: trait surface (W1),
-protocol impls (W2), protocol crate contraction (W3). No error
-convergence wave - that landed in S1-W4 and applies workspace-wide.
+ratatoskr-canonical wrapper. No error convergence wave - that landed
+in S1-W4 and applies workspace-wide.
+
+#### Sequencing
+
+- **Wave 1: trait surface (S2-W1)**. **Merged.** `bifrost-types` grew
+  a `filter` module: `FilterRuleShape`
+  (`None | Rules | Scripts | RulesAndScripts`), the `ServerFilter` /
+  `ServerFilterCreate` / `ServerFilterPatch` enums splitting typed
+  `Rule` from literal `Script`, the typed `FilterRule` /
+  `FilterCondition` / `FilterAction` model, `FilterScript` /
+  `ScriptLanguage`, and `FilterValidation` / `FilterDiagnostic`. The
+  condition model landed as a boolean tree (`FilterCondition::{And,
+  Or, Not, ...}`) rather than the flat `Vec<Condition>` the scope
+  sketch first showed - the tree expresses every provider's nesting
+  without flattening. `Account` gained five required primitives
+  (`filters_list`, `filter_create`, `filter_update`, `filter_delete`,
+  `filter_validate`); `AccountCapabilities` grew `filter_rule_shape`
+  plus five `PimMethodSupport` flags; `AccountOperation` grew the five
+  matching variants (`FilterCreate` / `Update` / `Delete` classified
+  mutating, `FiltersList` / `FilterValidate` not). Every protocol impl
+  and the `crates/sync` test double implement the new required
+  methods.
+- **Wave 2: protocol impls (S2-W2)**. **In progress.** JMAP landed
+  first and alone - rather than the four-agent-parallel shape Stage 1
+  used - because Sieve is the only model ready. `crates/jmap/src/sync/
+  filters.rs` maps the `Script` primitives onto JMAP Sieve:
+  `SieveScript/query` + `/get` + blob download for list; blob upload +
+  `SieveScript/set` with `onSuccessActivateScript` /
+  `onSuccessDeactivateScript` for create/update; `SieveScript/validate`
+  mapped to `FilterValidation` diagnostics for validate. JMAP
+  advertises `filter_rule_shape: Scripts` with all five method flags
+  true when the session has a primary Sieve account; typed `Rule`
+  payloads return `Unsupported`. Gmail, Graph, and IMAP remain
+  `Unsupported` stubs advertising `filter_rule_shape: None` and all
+  flags false - their slices (Gmail settings filters and Graph inbox
+  rules as typed `Rules`, IMAP-via-Sieve as `Scripts`) are the
+  remaining W2 work.
+- **Wave 3: protocol crate contraction (S2-W3)**. **Pending.** Same
+  shape as S1-W3 - keep only the factory / config surface public once
+  the filter code settles.
+
+#### Exit criteria
+
+- `filters_*` primitives exist on `Account` with real implementations
+  wherever the provider exposes a filter model; `Unsupported` only
+  where it genuinely does not.
+- `AccountCapabilities::filter_rule_shape` and the per-method flags
+  match real behaviour per provider.
+- `brokkr check` is clean workspace-wide.
 
 ### Stage 3: Contacts
 

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal,
-    RateLimitClass, StarredFlagShape,
+    AccountCapabilities, BatchingPolicy, BlobRangeSupport, CursorFreshness, FilterRuleShape,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
+    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
 use super::PushMode;
@@ -59,7 +59,13 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             quota_get: false,
             thread_hydrate: true,
             message_hydrate: true,
+            filters_list: false,
+            filter_create: false,
+            filter_update: false,
+            filter_delete: false,
+            filter_validate: false,
         },
+        filter_rule_shape: FilterRuleShape::None,
         conveniences: bifrost_types::ConvenienceShape {
             starred: StarredFlagShape::Category,
             replied_via_keyword: false,
@@ -128,6 +134,8 @@ mod tests {
         assert!(!caps.pim_methods.attachment_upload);
         assert!(caps.pim_methods.vacation_get);
         assert!(!caps.pim_methods.quota_get);
+        assert_eq!(caps.filter_rule_shape, FilterRuleShape::None);
+        assert!(!caps.pim_methods.filters_list);
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Category);
         assert!(caps.conveniences.replied_via_extended_property);
         assert!(caps.conveniences.forwarded_via_extended_property);

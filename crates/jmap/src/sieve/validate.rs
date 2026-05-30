@@ -37,10 +37,7 @@ impl SieveScriptValidateRequest {
 }
 
 impl SieveScriptValidateResponse {
-    pub(crate) fn unwrap_error(self) -> crate::Result<()> {
-        match self.error {
-            Some(err) => Err(err.into()),
-            None => Ok(()),
-        }
+    pub(crate) fn into_error(self) -> Option<SetError<String>> {
+        self.error
     }
 }

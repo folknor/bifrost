@@ -14,12 +14,13 @@ use bifrost_types::{
     AccountFuture, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
     BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, Container, ContainerId,
     ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
-    CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydratedObjectKind,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
-    MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
-    PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RequestCause, ScopeLifecycleEvent, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
+    CursorScope, DraftHandle, DraftPatch, FilterRuleShape, FilterValidation, FlagOp,
+    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
+    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
+    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
+    RateLimitClass, RequestCause, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
@@ -67,6 +68,7 @@ fn caps() -> AccountCapabilities {
         historyid_expires_after: None,
         delta_token_expires_after: None,
         pim_methods: PimMethodSupport::default(),
+        filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
     }
 }
@@ -407,6 +409,36 @@ impl Account for FlagsAccount {
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::QuotaGet)) })
+    }
+
+    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FiltersList)) })
+    }
+
+    fn filter_create(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterCreate)) })
+    }
+
+    fn filter_update(
+        &self,
+        _filter: ServerFilterId,
+        _patch: ServerFilterPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterUpdate)) })
+    }
+
+    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterDelete)) })
+    }
+
+    fn filter_validate(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterValidate)) })
     }
 
     fn thread_hydrate(

@@ -801,7 +801,13 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         AccountOperation::IdentitiesList | AccountOperation::IdentityUpdate => {
             "gmail.settings.basic"
         }
-        AccountOperation::VacationGet | AccountOperation::VacationSet => "gmail.settings.basic",
+        AccountOperation::VacationGet
+        | AccountOperation::VacationSet
+        | AccountOperation::FiltersList
+        | AccountOperation::FilterCreate
+        | AccountOperation::FilterUpdate
+        | AccountOperation::FilterDelete
+        | AccountOperation::FilterValidate => "gmail.settings.basic",
         // Read-only hydration / inventory paths.
         AccountOperation::SyncInventory
         | AccountOperation::SyncChanges

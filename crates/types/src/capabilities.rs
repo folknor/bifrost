@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use crate::filter::FilterRuleShape;
+
 /// How the cursor's identity is established.
 ///
 /// - `ServerIssued`: cursor bytes are minted by the server and we
@@ -174,6 +176,12 @@ pub struct PimMethodSupport {
     // Hydration primitives.
     pub thread_hydrate: bool,
     pub message_hydrate: bool,
+    // Server-side filter primitives.
+    pub filters_list: bool,
+    pub filter_create: bool,
+    pub filter_update: bool,
+    pub filter_delete: bool,
+    pub filter_validate: bool,
 }
 
 /// Mapping from each provider's flag namespace onto the canonical
@@ -258,6 +266,8 @@ pub struct AccountCapabilities {
     /// Per-method support flags. The convenience layer and ratatoskr
     /// both read this to disable UI affordances per account.
     pub pim_methods: PimMethodSupport,
+    /// Server-side filter model this account exposes.
+    pub filter_rule_shape: FilterRuleShape,
     /// Dispatch hints for convenience default impls. Lets the
     /// convenience layer pick the right primitive without matching
     /// on `ProtocolKind`.

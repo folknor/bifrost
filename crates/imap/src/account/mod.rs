@@ -10,11 +10,12 @@ use std::time::Duration;
 use bifrost_types::{
     Account, AccountError, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
     Change, ChangeCursor, Container, ContainerId, ContainerKind, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
-    Projection, QuotaInfo, SearchRequest, SendRequest, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, FilterValidation, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
+    Priority, Projection, QuotaInfo, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use futures::stream::Stream;
 use tokio_util::sync::CancellationToken;
@@ -528,6 +529,56 @@ impl Account for ImapAccount {
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
         pim::quota_get(self.clone())
+    }
+
+    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
+        Box::pin(async {
+            Err(error::unsupported(
+                bifrost_types::AccountOperation::FiltersList,
+            ))
+        })
+    }
+
+    fn filter_create(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+        Box::pin(async {
+            Err(error::unsupported(
+                bifrost_types::AccountOperation::FilterCreate,
+            ))
+        })
+    }
+
+    fn filter_update(
+        &self,
+        _filter: ServerFilterId,
+        _patch: ServerFilterPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(error::unsupported(
+                bifrost_types::AccountOperation::FilterUpdate,
+            ))
+        })
+    }
+
+    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(error::unsupported(
+                bifrost_types::AccountOperation::FilterDelete,
+            ))
+        })
+    }
+
+    fn filter_validate(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
+        Box::pin(async {
+            Err(error::unsupported(
+                bifrost_types::AccountOperation::FilterValidate,
+            ))
+        })
     }
 
     fn thread_hydrate(

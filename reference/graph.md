@@ -181,6 +181,9 @@ that selects against the same shutdown token.
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, and
   `quota_get`.
+- Stage 2 filter methods are present on `Account` but Graph inbox
+  rules are not wired yet: `filter_rule_shape: None`, every filter
+  method flag false, and calls return `Unsupported`.
 - `conveniences`: `starred = Category`, implemented by treating the
   reserved `$flagged` category input as Graph `flag.flagStatus`.
   Replied and forwarded conveniences dispatch to
@@ -662,3 +665,5 @@ referenceAttachment in a mixed batch.
 - `send_message` / `draft_create` / `draft_update` accept inline
   base64 `fileAttachment` via `graph_attachment_from_inline` but
   reject pre-uploaded `AttachmentHandle`s with `Unsupported`.
+- Server-side Graph inbox-rule CRUD is not wired yet; the Stage 2
+  Account methods currently return `Unsupported`.

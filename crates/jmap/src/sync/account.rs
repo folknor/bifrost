@@ -6,11 +6,12 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
     AttachmentHandle, BlobHandle, ByteRange, ChangeCursor, Container, ContainerId, ContainerKind,
     CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    ErrorScope, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
-    Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ErrorScope, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
+    IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
+    Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +20,7 @@ use crate::client::Client;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
-use super::{blob, changes, discover, hydrate, inventory, mutation, pim, push, state};
+use super::{blob, changes, discover, filters, hydrate, inventory, mutation, pim, push, state};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
@@ -29,6 +30,7 @@ pub(crate) struct JmapAccount {
     pub(crate) submission: Option<MailAccount>,
     pub(crate) vacation: Option<MailAccount>,
     pub(crate) quota: Option<MailAccount>,
+    pub(crate) sieve: Option<MailAccount>,
     pub(crate) caps: AccountCapabilities,
     pub(crate) core_limits: CoreLimits,
     pub(crate) seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
@@ -51,6 +53,7 @@ impl JmapAccount {
         submission: Option<MailAccount>,
         vacation: Option<MailAccount>,
         quota: Option<MailAccount>,
+        sieve: Option<MailAccount>,
         caps: AccountCapabilities,
         core_limits: CoreLimits,
         seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
@@ -67,6 +70,7 @@ impl JmapAccount {
             submission,
             vacation,
             quota,
+            sieve,
             caps,
             core_limits,
             seed_states,
@@ -549,6 +553,36 @@ impl Account for JmapAccount {
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
         pim::quota_get(self.quota.clone())
+    }
+
+    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
+        filters::list(self.sieve.clone())
+    }
+
+    fn filter_create(
+        &self,
+        filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+        filters::create(self.sieve.clone(), filter)
+    }
+
+    fn filter_update(
+        &self,
+        filter: ServerFilterId,
+        patch: ServerFilterPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        filters::update(self.sieve.clone(), filter, patch)
+    }
+
+    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        filters::delete(self.sieve.clone(), filter)
+    }
+
+    fn filter_validate(
+        &self,
+        filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
+        filters::validate(self.sieve.clone(), filter)
     }
 
     fn thread_hydrate(

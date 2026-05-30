@@ -12,6 +12,7 @@ mod changes;
 mod discover;
 mod error;
 mod factory;
+mod filters;
 mod hydrate;
 mod inventory;
 mod mutation;

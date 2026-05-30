@@ -170,6 +170,11 @@ Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is op
 
 Unsupported PIM methods return `Error::Unsupported` and have false capability flags: SMTP send, attachment upload, draft update/send, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
 
+The Stage 2 server-side filter surface is present on the shared
+`Account` trait, but IMAP advertises `filter_rule_shape: None` and
+all filter method flags false until a Sieve-capable account
+configuration exists. The current methods return `Unsupported`.
+
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread` and `delete_thread` override the trait defaults: they use the crate's cloneable account handle to do add-then-remove, and delete moves to the Trash role unless the current container is already Trash, in which case it expunges the thread from that mailbox.
 
 Containers use native mailbox paths as primitive ids and provenance-native ids. `containers_list` maps SPECIAL-USE attributes to `FolderRole` (`\Sent`, `\Drafts`, `\Archive`, `\Trash`, `\Junk`, and custom `\Inbox`) and falls back to name-based INBOX / Sent / Drafts / Archive / Trash / Spam detection for servers without SPECIAL-USE.

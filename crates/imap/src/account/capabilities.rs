@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use bifrost_types::{
     AccountCapabilities, BatchingPolicy, BlobRangeSupport, ConvenienceShape, CursorFreshness,
-    MutationCapabilities, MutationConcurrency, MutationReplaySafety, PimMethodSupport,
-    PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
+    FilterRuleShape, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
+    PimMethodSupport, PushCapability, QuotaSignal, RateLimitClass, StarredFlagShape,
 };
 
 use crate::types::{Capability, MailboxAttribute, MailboxInfo, ServerProfile};
@@ -77,7 +77,13 @@ pub(crate) fn build_capabilities(
             quota_get: profile.supports(Capability::Quota),
             thread_hydrate: has_thread_references,
             message_hydrate: true,
+            filters_list: false,
+            filter_create: false,
+            filter_update: false,
+            filter_delete: false,
+            filter_validate: false,
         },
+        filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape {
             starred: StarredFlagShape::Keyword,
             replied_via_keyword: true,
@@ -104,6 +110,8 @@ mod tests {
         assert_eq!(caps.push, PushCapability::InProcess);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
+        assert_eq!(caps.filter_rule_shape, FilterRuleShape::None);
+        assert!(!caps.pim_methods.filters_list);
         assert!(caps.requires_uidvalidity_recheck);
     }
 

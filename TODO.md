@@ -47,7 +47,7 @@ re-auditors don't re-raise them.)
   pim/envelope refactoring happens.
 - **imap-N1.** AUTH leg of `factory::open`: keep
   `AccountOperation::Discover`. AUTH is protocol-level idempotent.
-  (Listed as "leave alone" — re-auditor reminder.)
+  (Listed as "leave alone" - re-auditor reminder.)
 - **imap-N2.** Boundary builders that attach scope: thread
   `Mailbox(folder)` / `Cursor(scope)` per the IMAP plan's table.
 - **imap-N3.** `concurrency_conflict_error` / `store_failed_error`:
@@ -143,7 +143,7 @@ re-auditors don't re-raise them.)
 - **sync-N6.** Terminal-arm logging: emit `TelemetryView` structured
   fields rather than `?debug` format.
 - **sync-N7.** `ReopenRequest` keeps `#[non_exhaustive]` (it is `pub`,
-  re-exported from `lib.rs:85`). Listed as "leave alone" —
+  re-exported from `lib.rs:85`). Listed as "leave alone" -
   re-auditor reminder.
 
 ## Cross-cutting
@@ -167,4 +167,4 @@ re-auditors don't re-raise them.)
   tail.
 - F-items came from phase 5B/5C/5D re-audits; N-items came from the
   original post-phase-4 audit. Both are intentionally tracked at the
-  same level here — none are blocking ratatoskr.
+  same level here - none are blocking ratatoskr.

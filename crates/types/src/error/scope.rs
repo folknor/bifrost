@@ -154,6 +154,11 @@ pub enum AccountOperation {
     VacationGet,
     VacationSet,
     QuotaGet,
+    FiltersList,
+    FilterCreate,
+    FilterUpdate,
+    FilterDelete,
+    FilterValidate,
     Close,
     Expunge,
 }
@@ -178,6 +183,9 @@ impl AccountOperation {
                 | Self::ContainerDelete
                 | Self::IdentityUpdate
                 | Self::VacationSet
+                | Self::FilterCreate
+                | Self::FilterUpdate
+                | Self::FilterDelete
         )
     }
 }

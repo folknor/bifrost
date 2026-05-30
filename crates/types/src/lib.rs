@@ -22,6 +22,7 @@ pub mod container;
 pub mod cursor;
 pub mod error;
 pub mod events;
+pub mod filter;
 pub mod hydration;
 pub mod ids;
 pub mod mutation;
@@ -41,6 +42,14 @@ pub use capabilities::{
     CapabilityKey, CapabilityValue, ConvenienceShape, CursorFreshness, MutationCapabilities,
     MutationConcurrency, MutationReplaySafety, PimMethodSupport, PushCapability, QuotaSignal,
     RateLimitClass, StarredFlagShape,
+};
+
+// Server-side filter rules and scripts.
+pub use filter::{
+    FilterAction, FilterCondition, FilterDiagnostic, FilterDiagnosticSeverity, FilterRule,
+    FilterRuleCreate, FilterRulePatch, FilterRuleShape, FilterScript, FilterScriptCreate,
+    FilterScriptPatch, FilterValidation, ScriptLanguage, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch,
 };
 
 // Mail composition types.

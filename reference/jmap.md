@@ -155,15 +155,16 @@ crates/jmap/src/sync/
   mutation.rs      - bulk_set_flags / bulk_move / bulk_destroy pipeline
   pim.rs           - unified PIM primitives: mail mutations, send,
                      drafts, search, containers, settings, hydration
+  filters.rs       - SieveScript-backed server-side filter scripts
   blob.rs          - open_blob / open_blob_range
   error.rs         - to_recovery / to_account_error mapping
 ```
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` is the consumer-registered factory. It carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic` or `JmapCredentials::Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, bandwidth caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`, `VacationResponse`, and `Quota` accounts, reads the session, builds `AccountCapabilities` and `CoreLimits`, and probes initial `Email` / `Mailbox` / `Thread` state strings to seed cursors. It spawns the WebSocket reader task with a `CancellationToken` and returns `Arc<dyn Account>`.
+`JmapAccountFactory` is the consumer-registered factory. It carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic` or `JmapCredentials::Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, bandwidth caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`, `VacationResponse`, `Quota`, and `Sieve` accounts, reads the session, builds `AccountCapabilities` and `CoreLimits`, and probes initial `Email` / `Mailbox` / `Thread` state strings to seed cursors. It spawns the WebSocket reader task with a `CancellationToken` and returns `Arc<dyn Account>`.
 
-`JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail`-capability `Account` handle, optional account handles for `Submission`, `VacationResponse`, and `Quota`, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. `set_priority` and `set_bandwidth_cap` delegate to the underlying `bifrost-net::AccountNet` rather than storing local atomics; the transport owns the canonical knobs.
+`JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail`-capability `Account` handle, optional account handles for `Submission`, `VacationResponse`, `Quota`, and `Sieve`, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. `set_priority` and `set_bandwidth_cap` delegate to the underlying `bifrost-net::AccountNet` rather than storing local atomics; the transport owns the canonical knobs.
 
 Reopen is delegated to the engine: when an account drops or `close()` returns, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (which terminates the WebSocket reader loop and any in-flight streams), then awaits a clean teardown. The `closed` flag short-circuits subsequent calls. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!` in the push stream; no `Account` method holds non-cancel-safe state across an await.
 
@@ -184,6 +185,9 @@ Reopen is delegated to the engine: when an account drops or `close()` returns, t
 - `requires_uidvalidity_recheck: false`.
 - `historyid_expires_after: None` and `delta_token_expires_after: None` - JMAP state strings are not time-bound.
 - `pim_methods` advertises real JMAP support for mailbox membership add/remove, keyword mutation, read-state mutation, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update when `Submission` is open, vacation get/set when `VacationResponse` is open, quota get when `Quota` is open, and thread/message hydration. Gmail labels, Graph categories, and Graph extended properties are false and return `Error::Unsupported`.
+- `filter_rule_shape: Scripts` and every filter method flag is true
+  when the session has a primary Sieve account. Without Sieve they
+  are false and the shape is `None`.
 - `conveniences` declares `starred = Keyword`, `replied_via_keyword = true`, `forwarded_via_keyword = true`, and both extended-property routes false. The default `set_starred`, `mark_replied`, and `mark_forwarded` therefore map to JMAP `$flagged`, `$answered`, and `$forwarded`.
 
 `CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` rejects a session whose advertised core limits (including `maxCallsInRequest` and `maxSizeRequest`) are zero, even though those latter two are validated and discarded.
@@ -260,6 +264,30 @@ Container CRUD is `Mailbox/get` / `Mailbox/set`. JMAP mailboxes are surfaced as 
 Settings primitives use `Identity/get` / `Identity/set`, `VacationResponse/get` / `set` on the `singleton` id, and `Quota/get` when the corresponding JMAP capability has a primary account. `identity_update` supports name, signatures, and reply-to; setting a default identity is unsupported because JMAP has no matching writeable field.
 
 `thread_hydrate` performs `Thread/get` followed by `Email/get` in thread order. `message_hydrate` selects headers, preview, or full body-value projections and returns attachment blob handles without pre-downloading bytes. `move_thread` and `delete_thread` are overridden because the trait defaults are unsupported: JMAP can add to the target mailbox and then remove from the source with the crate's owned handle; deleting from Trash destroys the thread's emails.
+
+### Server-side filter scripts
+
+`filters.rs` maps Stage 2 filter primitives onto JMAP Sieve:
+
+- `filters_list` runs `SieveScript/query`, hydrates script metadata
+  with `SieveScript/get`, then downloads each script blob through the
+  account's download URL and returns `ServerFilter::Script`.
+- `filter_create` uploads the script body as `application/sieve`,
+  creates a `SieveScript` with that blob id, and uses
+  `onSuccessActivateScript` when the shared create payload asks for
+  an active script.
+- `filter_update` patches name and body through `SieveScript/set`;
+  body changes upload a fresh script blob first. `is_active` toggles
+  through `onSuccessActivateScript` /
+  `onSuccessDeactivateScript`.
+- `filter_delete` destroys the `SieveScript` id. Active-script
+  delete failures surface as normal JMAP set errors.
+- `filter_validate` uploads the script body and calls
+  `SieveScript/validate`; returned set errors become
+  `FilterValidation` error diagnostics instead of storing a script.
+
+Typed `ServerFilterCreate::Rule` and `ServerFilterPatch::Rule` are
+not supported by JMAP and return `Unsupported`.
 
 ### HTTP redirect handling
 
@@ -359,3 +387,5 @@ not hard-coded to `Discover`.
 - Gmail label membership, Graph categories, and Graph extended properties are intentionally unsupported in JMAP.
 - Identity default selection cannot be updated through JMAP.
 - JMAP attachment handles preserve blob id and MIME type, but uploaded attachment filenames are not represented by the shared `AttachmentHandle` type.
+- Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve
+  scripts through the Account filter surface instead.

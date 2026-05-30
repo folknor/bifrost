@@ -156,6 +156,9 @@ on the same cancellation token.
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `attachment_upload`,
     `container_move`, `quota_get`.
+- Stage 2 filter methods are on the trait but not wired to Gmail
+  settings filters yet: `filter_rule_shape: None`, every filter
+  method flag false, and calls return `Unsupported`.
 - `conveniences.starred: LabelMembership`. The default
   `set_starred` convenience dispatches to Gmail's `STARRED` label.
   Replied and forwarded convenience flags are false because Gmail
@@ -555,3 +558,5 @@ so the per-id clones share storage.
   `quota_get` is unsupported.
 - Replied and forwarded state are not writeable Gmail flags through
   this API. The corresponding convenience dispatch flags are false.
+- Server-side Gmail filter CRUD is not wired yet; the Stage 2
+  Account methods currently return `Unsupported`.

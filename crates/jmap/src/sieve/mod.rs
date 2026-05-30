@@ -1,5 +1,7 @@
-// Stage 2 (server-side filter rules) will wire SieveScript/* into the
-// Account impl; until then the module is fully built but unused.
+// SieveScript/* is wired into the Account filter surface in
+// `sync/filters.rs`. Parts of the full Sieve CRUD scaffolding here are
+// not yet exercised by that path, so the module keeps a dead-code
+// allowance for the upcoming Sieve work.
 #![allow(dead_code)]
 
 pub(crate) mod get;

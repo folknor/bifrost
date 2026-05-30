@@ -18,10 +18,11 @@ use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
     AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Change, ChangeCursor,
     Container, ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, FlagOp, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
-    Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    CursorScope, DraftHandle, DraftPatch, FilterValidation, FlagOp, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId,
+    OpaqueChangeState, Page, Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
     SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
     WatchEvent,
 };
@@ -487,6 +488,61 @@ impl Account for GmailAccount {
 
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>> {
         pim::quota_get()
+    }
+
+    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::FiltersList),
+                error::GmailErrorContext::base(AccountOperation::FiltersList),
+            ))
+        })
+    }
+
+    fn filter_create(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::FilterCreate),
+                error::GmailErrorContext::base(AccountOperation::FilterCreate),
+            ))
+        })
+    }
+
+    fn filter_update(
+        &self,
+        _filter: ServerFilterId,
+        _patch: ServerFilterPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::FilterUpdate),
+                error::GmailErrorContext::base(AccountOperation::FilterUpdate),
+            ))
+        })
+    }
+
+    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::FilterDelete),
+                error::GmailErrorContext::base(AccountOperation::FilterDelete),
+            ))
+        })
+    }
+
+    fn filter_validate(
+        &self,
+        _filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<FilterValidation, AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::FilterValidate),
+                error::GmailErrorContext::base(AccountOperation::FilterValidate),
+            ))
+        })
     }
 
     fn thread_hydrate(

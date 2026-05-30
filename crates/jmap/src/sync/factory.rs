@@ -121,11 +121,13 @@ impl AccountFactory for JmapAccountFactory {
                 .primary_account::<capability::VacationResponseCap>()
                 .ok();
             let quota = client.primary_account::<capability::Quota>().ok();
+            let sieve = client.primary_account::<capability::Sieve>().ok();
             let session = client.session();
             let support = capabilities::PimSupport {
                 submission: submission.is_some(),
                 vacation: vacation.is_some(),
                 quota: quota.is_some(),
+                sieve: sieve.is_some(),
             };
             let (caps, limits) = capabilities::build(&session, support)?;
 
@@ -191,6 +193,7 @@ impl AccountFactory for JmapAccountFactory {
                 submission,
                 vacation,
                 quota,
+                sieve,
                 caps,
                 limits,
                 seed_states,

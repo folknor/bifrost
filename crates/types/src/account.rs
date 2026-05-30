@@ -39,6 +39,9 @@ use crate::events::{
     Change, InventoryEntry, InventoryPartition, InventoryPartitioning, Priority, SyncEvent,
     WatchEvent,
 };
+use crate::filter::{
+    FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+};
 use crate::hydration::{HydrationProjection, Message, ThreadHydration};
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
@@ -439,6 +442,39 @@ pub trait Account: Send + Sync {
 
     /// Read the storage quota readout, when supported.
     fn quota_get(&self) -> AccountFuture<Result<Option<QuotaInfo>, AccountError>>;
+
+    // ------------------------------------------------------------
+    // Server-side filter primitives (S2-W1)
+    //
+    // Accounts advertise the supported model through
+    // `capabilities().filter_rule_shape` and per-method support
+    // through `capabilities().pim_methods`.
+    // ------------------------------------------------------------
+
+    /// List server-side filter rules or scripts.
+    fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>>;
+
+    /// Create a server-side filter rule or script.
+    fn filter_create(
+        &self,
+        filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<ServerFilterId, AccountError>>;
+
+    /// Update a server-side filter rule or script.
+    fn filter_update(
+        &self,
+        filter: ServerFilterId,
+        patch: ServerFilterPatch,
+    ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Delete a server-side filter rule or script.
+    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Validate a server-side filter payload without storing it.
+    fn filter_validate(
+        &self,
+        filter: ServerFilterCreate,
+    ) -> AccountFuture<Result<FilterValidation, AccountError>>;
 
     // ------------------------------------------------------------
     // Threading + hydration primitives (S1-W1)
