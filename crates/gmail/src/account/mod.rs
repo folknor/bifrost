@@ -3,6 +3,7 @@ mod capabilities;
 mod changes;
 mod cursor;
 mod error;
+mod filters;
 mod flags;
 mod inventory;
 mod mutation;
@@ -491,24 +492,14 @@ impl Account for GmailAccount {
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::FiltersList),
-                error::GmailErrorContext::base(AccountOperation::FiltersList),
-            ))
-        })
+        filters::list(Arc::clone(&self.client))
     }
 
     fn filter_create(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::FilterCreate),
-                error::GmailErrorContext::base(AccountOperation::FilterCreate),
-            ))
-        })
+        filters::create(Arc::clone(&self.client), filter)
     }
 
     fn filter_update(
@@ -524,25 +515,15 @@ impl Account for GmailAccount {
         })
     }
 
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::FilterDelete),
-                error::GmailErrorContext::base(AccountOperation::FilterDelete),
-            ))
-        })
+    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        filters::delete(Arc::clone(&self.client), filter)
     }
 
     fn filter_validate(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        Box::pin(async {
-            Err(error::into_account_error(
-                crate::error::Error::unsupported(AccountOperation::FilterValidate),
-                error::GmailErrorContext::base(AccountOperation::FilterValidate),
-            ))
-        })
+        filters::validate(filter)
     }
 
     fn thread_hydrate(

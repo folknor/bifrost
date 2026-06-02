@@ -711,6 +711,25 @@ pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountE
     .expect("valid account error classification")
 }
 
+/// Build an `AccountError` for malformed Account-level input.
+#[must_use]
+pub(crate) fn invalid_account_error(
+    operation: AccountOperation,
+    detail: impl Into<String>,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: DiagnosticText::support_only(detail.into()),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Translate a `CursorError` into the account-boundary `AccountError`.
 ///
 /// `CursorProtocolMismatch`, `CursorEnvelopeUnknown`, and

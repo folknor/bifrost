@@ -11,6 +11,7 @@ use crate::types::{Capability, MailboxAttribute, MailboxInfo, ServerProfile};
 pub(crate) fn build_capabilities(
     profile: &ServerProfile,
     folders: &[MailboxInfo],
+    has_sieve: bool,
 ) -> AccountCapabilities {
     let has_drafts = folders.iter().any(|folder| {
         folder
@@ -77,13 +78,17 @@ pub(crate) fn build_capabilities(
             quota_get: profile.supports(Capability::Quota),
             thread_hydrate: has_thread_references,
             message_hydrate: true,
-            filters_list: false,
-            filter_create: false,
-            filter_update: false,
-            filter_delete: false,
-            filter_validate: false,
+            filters_list: has_sieve,
+            filter_create: has_sieve,
+            filter_update: has_sieve,
+            filter_delete: has_sieve,
+            filter_validate: has_sieve,
         },
-        filter_rule_shape: FilterRuleShape::None,
+        filter_rule_shape: if has_sieve {
+            FilterRuleShape::Scripts
+        } else {
+            FilterRuleShape::None
+        },
         conveniences: ConvenienceShape {
             starred: StarredFlagShape::Keyword,
             replied_via_keyword: true,
@@ -104,7 +109,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[]);
+        let caps = build_capabilities(&profile, &[], false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -118,7 +123,19 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[]);
+        let caps = build_capabilities(&profile, &[], false);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
+    }
+
+    #[test]
+    fn capability_builder_advertises_sieve_when_configured() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let caps = build_capabilities(&profile, &[], true);
+        assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
+        assert!(caps.pim_methods.filters_list);
+        assert!(caps.pim_methods.filter_create);
+        assert!(caps.pim_methods.filter_update);
+        assert!(caps.pim_methods.filter_delete);
+        assert!(caps.pim_methods.filter_validate);
     }
 }

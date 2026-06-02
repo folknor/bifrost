@@ -69,6 +69,62 @@ pub(crate) struct GmailLabel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct GmailFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
+    pub(crate) criteria: GmailFilterCriteria,
+    pub(crate) action: GmailFilterAction,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GmailFilterCriteria {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) negated_query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) has_attachment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exclude_chats: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) size_comparison: Option<GmailFilterSizeComparison>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GmailFilterSizeComparison {
+    Smaller,
+    Larger,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GmailFilterAction {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) add_label_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) remove_label_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) forward: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ListFiltersResponse {
+    #[serde(default)]
+    pub(crate) filter: Vec<GmailFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct GmailHistoryResponse {
     #[serde(default)]
     pub(crate) history: Vec<GmailHistoryItem>,

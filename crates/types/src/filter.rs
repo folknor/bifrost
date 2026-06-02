@@ -8,6 +8,7 @@
 use std::time::SystemTime;
 
 use crate::container::ContainerId;
+use crate::error::Provider;
 
 /// Which server-side filter model an account supports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,6 +135,10 @@ pub enum FilterCondition {
     DateRange {
         after: Option<SystemTime>,
         before: Option<SystemTime>,
+    },
+    ProviderExpression {
+        provider: Provider,
+        expression: String,
     },
     And(Vec<FilterCondition>),
     Or(Vec<FilterCondition>),

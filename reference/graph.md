@@ -59,6 +59,8 @@ concurrency.
   conveniences: message move / read / category / extended-property
   writes, send/drafts, search, mail folder CRUD, identity snapshot,
   automatic replies, and typed hydration.
+- `filters.rs` - Stage 2 Inbox `messageRules` typed-rule
+  list/create/update/delete plus local validation.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
   attachments (`/messages/{id}/attachments/{aid}/$value`),
   including the reference-attachment short-circuit.
@@ -181,9 +183,10 @@ that selects against the same shutdown token.
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, and
   `quota_get`.
-- Stage 2 filter methods are present on `Account` but Graph inbox
-  rules are not wired yet: `filter_rule_shape: None`, every filter
-  method flag false, and calls return `Unsupported`.
+- `filter_rule_shape: Rules`; all five filter method flags are
+  true. Graph Inbox `messageRules` are wired for
+  list/create/update/delete, and `filter_validate` performs local
+  shape validation before writes.
 - `conveniences`: `starred = Category`, implemented by treating the
   reserved `$flagged` category input as Graph `flag.flagStatus`.
   Replied and forwarded conveniences dispatch to
@@ -198,57 +201,21 @@ that selects against the same shutdown token.
 (currently `1`). `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
 `ChangeCursor.envelope_version`.
 
-`GraphCursorPayload` carries:
+`GraphCursorPayload` carries a delta kind, final
+`@odata.deltaLink`, issue timestamp, and optional page marker for
+mid-walk checkpoints. Encoding stores the payload in
+`OpaqueChangeState::bytes`; page markers also land in
+`ChangeCursor::advanced_through`.
 
-- `kind: GraphCursorKind`. One of `MessagesDelta { folder_id }`,
-  `EventsDelta { calendar_id }`, or `ContactsDelta { folder_id }`.
-- `delta_link: String`. The `@odata.deltaLink` returned by the
-  final page; this is the resume point for the next changes pass.
-- `issued_at_unix_secs: u64`. Stamped at envelope construction
-  for observability.
-- `advanced_through: Option<GraphPageMarker>`. Set when the
-  cursor was checkpointed mid-walk. The marker carries the
-  `@odata.nextLink` and an optional `last_seen_id` so a resumed
-  walk continues at the same page boundary.
-
-`encode_cursor(scope, payload)` serializes the payload to JSON in
-`OpaqueChangeState::bytes`. If `advanced_through` is set, it is
-also encoded into the outer `ChangeCursor::advanced_through` as
-`OpaqueProgressBytes`.
-
-`decode_cursor` validates in order:
-
-- Wrong `ProtocolKind` returns `Error::CursorProtocolMismatch`.
-- `envelope_version > GRAPH_CURSOR_ENVELOPE_VERSION` returns
-  `Error::CursorEnvelopeUnknown`.
-- `envelope_version < GRAPH_CURSOR_ENVELOPE_VERSION` returns
-  `Error::SchemaIncompatible` (no migration path defined).
-- JSON deserialization failure on either the payload or the
-  page-marker progress bytes returns `Error::Other`.
-
-`scope_matches_payload` is an additional cross-check in
-`changes_stream`: if the decoded payload's `GraphCursorKind`
-projects to a `CursorScope` that does not match
-`cursor.scope`, the stream emits a `SyncEvent::Terminated
-(AccountError)` whose kind is `SyncState(SchemaIncompatible)` -
-the central mapping resolves that to
-`Engine(SchemaIncompatible)` and exits.
-
-`establish_initial_cursor(scope)` calls `kind_for_scope(&scope)`
-to validate that the scope shape is one of the three
-delta-eligible variants, then returns
-`CursorEstablishment::EstablishViaInventory` so the engine runs
-`inventory_stream` to mint the first cursor. Scopes outside the
-`FolderType { folder, ty }` shape return `Error::Unsupported`;
-within `FolderType`, types other than `Email`, `Event` /
-`CalendarEvent`, and `Contact` also return `Error::Unsupported`.
-
-`describe_cursor` validates the cursor via `decode_cursor`. On
-success it reports `cost_class: Cheap`, `strategy: ServerCursor`,
-and `freshness: Some(Instant::now())`. On failure (wrong
-protocol, unknown envelope version, malformed payload) it
-reports `cost_class: Expensive`, `strategy: None`, and
-`freshness: None` so the engine reseeds via inventory.
+`decode_cursor` rejects wrong protocol, newer envelope versions,
+older incompatible envelopes, and malformed JSON. `changes_stream`
+also cross-checks that payload kind projects back to `cursor.scope`;
+mismatches terminate with `SyncState(SchemaIncompatible)`.
+`establish_initial_cursor` accepts only delta-eligible
+`FolderType` scopes (email, event/calendar event, contact) and asks
+the engine to mint the first cursor through inventory. Successful
+`describe_cursor` is cheap/server-cursor/fresh; invalid cursors are
+expensive and reseeded through inventory.
 
 ## Per-scope inventory, changes, hydration
 
@@ -336,44 +303,19 @@ capability surface.
 
 ### Webhook mode (`PushMode::GraphSubscriptions`)
 
-`push_subscribe(scopes)` groups the requested scopes by
-`/me/mailFolders/{folder}/messages` (or `/me/events`,
-`/me/contactFolders/{folder}/contacts`) resource. If any requested
-scope cannot resolve to a Graph subscription resource the call
-returns `Err(AccountError { kind: Unsupported(PushSubscribe), ..
-})` rather than silently subscribing to the resolvable subset.
-Successful subscribes issue one `POST /subscriptions` per resource
-through the `crate::webhooks` helpers (now `Result<_, GraphError>`,
-classified through the same `into_account_error` boundary REST uses),
-store the resulting `(server_id, expires_at)` tuples on a
-`GraphSubscriptionGroup` keyed by the returned `SubscriptionHandle`,
-and emit a `WatchEvent::Reconnected` on the broadcast channel.
+`push_subscribe(scopes)` groups scopes by Graph subscription
+resource (`mailFolders/{folder}/messages`, `events`, or
+`contactFolders/{folder}/contacts`) and rejects the whole request if
+any scope is not subscribable. Successful subscribes create one
+server subscription per resource, store `(server_id, expires_at)` in
+a `GraphSubscriptionGroup`, and emit `WatchEvent::Reconnected`.
 
-`push_unsubscribe(handle)` removes the group, deletes each
-underlying server-side subscription via
-`DELETE /subscriptions/{id}`, and if the subscription map is
-empty after removal also aborts the renewal worker.
-
-`ensure_graph_worker` starts the renewal health worker on the
-first subscribe and re-arms it if a previous handle has finished.
-The worker loops on a `RENEWAL_CHECK_INTERVAL` (10 minutes)
-sleep against the shutdown token: on each tick it walks every
-group's subscriptions, identifies any whose `expires_at` is
-within `RENEWAL_THRESHOLD_MINUTES` (30 minutes), and calls
-`renew_subscription` for each. Successful renewals update the
-in-memory `expires_at`. Failed renewals classify through
-`graph_error::into_account_error`: terminal recovery classes
-(`AuthLost`, `NeedsPolicyChange`, `NoPermission`, etc.) emit
-`WatchEvent::Terminated(AccountError)` so the engine tears the
-subscription down. Retryable classes log structured telemetry
-(`message_key`, `recovery` discriminant) and continue. The worker
-tracks a `disconnected` sticky flag: the first renewal failure in a
-healthy run emits `WatchEvent::Disconnected`; the first fully
-successful pass after a failed one emits `WatchEvent::Reconnected`.
-All three events flow through the same broadcast as inbound
-invalidations, so the engine sees streaming health on a single
-channel. The worker exits cleanly on shutdown or when the
-subscription map drains.
+`push_unsubscribe(handle)` deletes each server subscription and
+aborts the renewal worker when no groups remain. The renewal worker
+wakes every 10 minutes, renews subscriptions inside the 30 minute
+threshold, emits `Disconnected` on the first retryable renewal
+failure, `Reconnected` after recovery, and `Terminated(AccountError)`
+for terminal auth / policy / permission failures.
 
 The webhook receiver itself is not part of this crate. Consumers
 mount an HTTPS endpoint at `PushEndpoint::webhook_url`, validate
@@ -384,44 +326,19 @@ invalidations from the webhook receiver do not flow through it.
 
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
-`push_subscribe` installs an `EwsSubscriptionState`
-(scopes plus empty subscription id / watermark) keyed by a new
-`SubscriptionHandle` and starts the EWS worker via
-`push_stream::ensure_ews_worker`. `push_unsubscribe` drops the
-state entry.
+`push_subscribe` installs an `EwsSubscriptionState` carrying scopes
+and the latest subscription id / watermark, then starts the EWS
+worker. The worker subscribes to the union of active folders,
+long-polls `GetStreamingEvents`, records watermarks, maps
+notifications back to cursor scopes, and emits
+`WatchEvent::Invalidated` on the account broadcast. EWS failures use
+`ews_error_to_account_error`: terminal classes terminate the stream;
+transient classes emit `Disconnected`, sleep, reconnect, then emit
+`Reconnected`.
 
-`run_streaming_worker` (in `ews_stream.rs`) runs an outer
-reconnect loop:
-
-1. Read the union of currently subscribed scopes.
-2. Send an EWS `Subscribe` request carrying the folder ids plus
-   the most recent watermark. Parse the response.
-3. Record the returned `SubscriptionId` and `Watermark` against
-   every active state.
-4. Enter `run_get_events_loop`: long-poll
-   `GetStreamingEvents` (30 minute timeout). Parse notifications,
-   record the per-notification `Watermark`, project each
-   notification's `ParentFolderId` to a `CursorScope::FolderType`
-   (falling back to a synthetic Email scope when the scope is
-   not in the subscribed set), and emit
-   `WatchEvent::Invalidated { hint: { source: EwsStreaming, payload: SpecificCursorScope(...) } }`
-   on the broadcast.
-
-Network or parse failures classify through
-`ews_error_to_account_error`. Terminal classes (auth lost,
-conditional-access blocked, etc.) emit
-`WatchEvent::Terminated(AccountError)` and exit the worker;
-transient classes emit `WatchEvent::Disconnected` once per
-disconnect, log structured telemetry (message_key + recovery
-discriminant), sleep, and reconnect. A successful resubscribe after
-a transient disconnect emits `WatchEvent::Reconnected`. The worker
-checks `shutdown` between every step.
-
-`push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
-wrapped in a `stream::unfold` that selects against the shutdown
-token. The EWS branch additionally re-spawns the worker on
-demand so a consumer that subscribes to `push_stream` lazily
-still sees events.
+`push_stream` is a `broadcast::Receiver<WatchEvent>` adapter that
+selects against shutdown. The EWS branch re-spawns its worker on
+demand so lazy consumers still receive events.
 
 ## Mutation pipeline
 
@@ -665,5 +582,8 @@ referenceAttachment in a mixed batch.
 - `send_message` / `draft_create` / `draft_update` accept inline
   base64 `fileAttachment` via `graph_attachment_from_inline` but
   reject pre-uploaded `AttachmentHandle`s with `Unsupported`.
-- Server-side Graph inbox-rule CRUD is not wired yet; the Stage 2
-  Account methods currently return `Unsupported`.
+- Graph inbox rules are conjunction-shaped. `FilterCondition::And`
+  maps to Graph conditions, `Not(...)` maps to Graph exceptions,
+  and `Or`, date ranges, provider expressions, remove-label,
+  mark-unread, star/unstar, keyword, and reject actions are rejected
+  by local validation.

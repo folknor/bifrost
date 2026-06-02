@@ -7,6 +7,7 @@ use crate::connection::ImapConfig;
 use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};
 
 use super::error::ImapErrorContext;
+use super::sieve::ManageSieveConfig;
 use super::{ImapAccount, Pool, account_error_with, capabilities, folder_registry::FolderRegistry};
 use bifrost_types::AccountOperation;
 
@@ -38,6 +39,7 @@ pub struct ImapAccountConfig {
     pub mutation_batch_size: usize,
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     pub meter_sink: Option<Arc<dyn bifrost_net::MeterSink>>,
+    pub sieve: Option<ManageSieveConfig>,
 }
 
 impl ImapAccountConfig {
@@ -54,6 +56,7 @@ impl ImapAccountConfig {
             mutation_batch_size: 1024,
             bandwidth_meter: None,
             meter_sink: None,
+            sieve: None,
         }
     }
 
@@ -64,6 +67,11 @@ impl ImapAccountConfig {
 
     pub fn with_meter_sink(mut self, sink: Arc<dyn bifrost_net::MeterSink>) -> Self {
         self.meter_sink = Some(sink);
+        self
+    }
+
+    pub fn with_manage_sieve(mut self, config: ManageSieveConfig) -> Self {
+        self.sieve = Some(config);
         self
     }
 }
@@ -111,7 +119,7 @@ impl AccountFactory for ImapAccountFactory {
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
                 .map_err(discover_err)?;
-            let caps = capabilities::build_capabilities(&profile, &folders);
+            let caps = capabilities::build_capabilities(&profile, &folders, cfg.sieve.is_some());
             let registry = Arc::new(FolderRegistry::from_list(folders));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
             let pool = Arc::new(Pool::new(

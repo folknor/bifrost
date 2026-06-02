@@ -42,6 +42,8 @@ Internal modules:
   thread label mutations, MIME send and drafts, search translation,
   container CRUD, identities, vacation responder, and typed
   message/thread hydration.
+- `filters.rs` - Gmail settings filter list/create/delete and
+  typed-rule mapping.
 - `flags.rs` - Gmail-label-to-IMAP-flag canonicalization and the
   reverse `LabelPatch` translation used by mutations.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
@@ -156,9 +158,10 @@ on the same cancellation token.
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `attachment_upload`,
     `container_move`, `quota_get`.
-- Stage 2 filter methods are on the trait but not wired to Gmail
-  settings filters yet: `filter_rule_shape: None`, every filter
-  method flag false, and calls return `Unsupported`.
+- `filter_rule_shape: Rules`. Gmail settings filters are wired for
+  list/create/delete plus local validation. `filter_update` remains
+  unsupported because the Gmail API exposes no update or replace
+  endpoint for existing filters.
 - `conveniences.starred: LabelMembership`. The default
   `set_starred` convenience dispatches to Gmail's `STARRED` label.
   Replied and forwarded convenience flags are false because Gmail
@@ -558,5 +561,9 @@ so the per-id clones share storage.
   `quota_get` is unsupported.
 - Replied and forwarded state are not writeable Gmail flags through
   this API. The corresponding convenience dispatch flags are false.
-- Server-side Gmail filter CRUD is not wired yet; the Stage 2
-  Account methods currently return `Unsupported`.
+- Server-side Gmail filters map to typed rules. Gmail stores direct
+  criteria (`from`, `to`, `subject`, attachment, size) plus native
+  Gmail query strings; native query criteria surface as
+  `FilterCondition::ProviderExpression { provider: Gmail, ... }`.
+  Writes reject names, disabled rules, stop-processing, and actions
+  Gmail cannot store. `filter_update` is unsupported.

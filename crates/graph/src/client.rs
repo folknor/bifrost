@@ -224,6 +224,15 @@ impl GraphClient {
         check_response_status(response)
     }
 
+    pub(crate) async fn patch_json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, GraphError> {
+        let url = self.api_url(path);
+        self.request(&url, "PATCH", Some(body)).await
+    }
+
     pub(crate) async fn delete(&self, path: &str) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "DELETE", None::<&()>).await?;

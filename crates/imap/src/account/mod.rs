@@ -38,9 +38,11 @@ mod pim;
 mod pool;
 mod push;
 mod scopes;
+mod sieve;
 
 // pub: consumers register this factory with bifrost-sync without naming ImapAccount.
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
+pub use sieve::ManageSieveConfig;
 
 pub(crate) use envelope::{
     DecodedObjectId, FolderCursor, decode_blob_id, decode_cursor, decode_object_id,
@@ -532,53 +534,33 @@ impl Account for ImapAccount {
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::FiltersList,
-            ))
-        })
+        sieve::filters_list(self.clone())
     }
 
     fn filter_create(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::FilterCreate,
-            ))
-        })
+        sieve::filter_create(self.clone(), filter)
     }
 
     fn filter_update(
         &self,
-        _filter: ServerFilterId,
-        _patch: ServerFilterPatch,
+        filter: ServerFilterId,
+        patch: ServerFilterPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::FilterUpdate,
-            ))
-        })
+        sieve::filter_update(self.clone(), filter, patch)
     }
 
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::FilterDelete,
-            ))
-        })
+    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        sieve::filter_delete(self.clone(), filter)
     }
 
     fn filter_validate(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::FilterValidate,
-            ))
-        })
+        sieve::filter_validate(self.clone(), filter)
     }
 
     fn thread_hydrate(

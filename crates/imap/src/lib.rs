@@ -21,7 +21,7 @@ mod connection;
 mod error;
 mod types;
 
-pub use account::{ImapAccountConfig, ImapAccountFactory};
+pub use account::{ImapAccountConfig, ImapAccountFactory, ManageSieveConfig};
 pub use connection::ImapConfig;
 pub use types::{AuthPolicy, Credentials};
 

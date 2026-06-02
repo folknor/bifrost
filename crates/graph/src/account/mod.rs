@@ -4,6 +4,7 @@ mod changes;
 mod cursor;
 mod error;
 mod ews_stream;
+mod filters;
 mod get;
 mod graph_error;
 mod inventory;
@@ -523,53 +524,37 @@ impl Account for GraphAccount {
     }
 
     fn filters_list(&self) -> AccountFuture<Result<Vec<ServerFilter>, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::FiltersList,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { filters::list(account).await })
     }
 
     fn filter_create(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<ServerFilterId, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::FilterCreate,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { filters::create(account, filter).await })
     }
 
     fn filter_update(
         &self,
-        _filter: ServerFilterId,
-        _patch: ServerFilterPatch,
+        filter: ServerFilterId,
+        patch: ServerFilterPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::FilterUpdate,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { filters::update(account, filter, patch).await })
     }
 
-    fn filter_delete(&self, _filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::FilterDelete,
-            ))
-        })
+    fn filter_delete(&self, filter: ServerFilterId) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { filters::delete(account, filter).await })
     }
 
     fn filter_validate(
         &self,
-        _filter: ServerFilterCreate,
+        filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::FilterValidate,
-            ))
-        })
+        Box::pin(async move { filters::validate(filter) })
     }
 
     fn thread_hydrate(

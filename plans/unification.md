@@ -415,7 +415,9 @@ in S1-W4 and applies workspace-wide.
   condition model landed as a boolean tree (`FilterCondition::{And,
   Or, Not, ...}`) rather than the flat `Vec<Condition>` the scope
   sketch first showed - the tree expresses every provider's nesting
-  without flattening. `Account` gained five required primitives
+  without flattening; S2-W2 added `ProviderExpression` for native
+  provider query leaves such as Gmail filter criteria. `Account` gained
+  five required primitives
   (`filters_list`, `filter_create`, `filter_update`, `filter_delete`,
   `filter_validate`); `AccountCapabilities` grew `filter_rule_shape`
   plus five `PimMethodSupport` flags; `AccountOperation` grew the five
@@ -423,24 +425,29 @@ in S1-W4 and applies workspace-wide.
   mutating, `FiltersList` / `FilterValidate` not). Every protocol impl
   and the `crates/sync` test double implement the new required
   methods.
-- **Wave 2: protocol impls (S2-W2)**. **In progress.** JMAP landed
-  first and alone - rather than the four-agent-parallel shape Stage 1
-  used - because Sieve is the only model ready. `crates/jmap/src/sync/
-  filters.rs` maps the `Script` primitives onto JMAP Sieve:
-  `SieveScript/query` + `/get` + blob download for list; blob upload +
-  `SieveScript/set` with `onSuccessActivateScript` /
-  `onSuccessDeactivateScript` for create/update; `SieveScript/validate`
-  mapped to `FilterValidation` diagnostics for validate. JMAP
-  advertises `filter_rule_shape: Scripts` with all five method flags
-  true when the session has a primary Sieve account; typed `Rule`
-  payloads return `Unsupported`. Gmail, Graph, and IMAP remain
-  `Unsupported` stubs advertising `filter_rule_shape: None` and all
-  flags false - their slices (Gmail settings filters and Graph inbox
-  rules as typed `Rules`, IMAP-via-Sieve as `Scripts`) are the
-  remaining W2 work.
-- **Wave 3: protocol crate contraction (S2-W3)**. **Pending.** Same
-  shape as S1-W3 - keep only the factory / config surface public once
-  the filter code settles.
+- **Wave 2: protocol impls (S2-W2)**. **Merged.** JMAP maps
+  `Script` primitives onto JMAP Sieve via `SieveScript/query`, `/get`,
+  blob download/upload, `SieveScript/set`, and `SieveScript/validate`;
+  typed `Rule` payloads return `Unsupported`. Gmail maps settings
+  filters to typed `Rules`: list/create/delete and local validation
+  are supported, while `filter_update` remains `Unsupported` because
+  the Gmail API has no filter update or replace endpoint. Native Gmail
+  query criteria surface as
+  `FilterCondition::ProviderExpression { provider: Gmail, ... }`.
+  Graph maps Inbox `messageRules` to typed `Rules`: list/create/update
+  /delete and local validation are supported, with `And` as Graph
+  conditions and `Not` as Graph exceptions. IMAP support is conditional
+  on `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)`;
+  configured accounts advertise `Scripts` and implement list/create/
+  update/delete/validate through a crate-private ManageSieve client
+  using STARTTLS or TLS plus SASL PLAIN / XOAUTH2. Unconfigured IMAP
+  accounts continue to advertise `None` and return `Unsupported`.
+- **Wave 3: protocol crate contraction (S2-W3)**. **Merged.** No raw
+  filter clients were exposed. Gmail and Graph added crate-private
+  filter DTOs and mappers only. IMAP publishes `ManageSieveConfig` as
+  account-factory configuration, while the ManageSieve client and wire
+  parser remain crate-private. The public protocol-crate surfaces stay
+  at factory / config plus `Arc<dyn Account>`.
 
 #### Exit criteria
 

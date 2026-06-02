@@ -4,10 +4,11 @@ Current architecture of the IMAP client crate. Daaki-derived. Tokio + native-tls
 
 The public consumer surface is intentionally small after S1-W3:
 `ImapAccountFactory`, `ImapAccountConfig`, `ImapConfig`,
-`Credentials`, and `AuthPolicy`. Consumers construct the factory and
-use it through `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP
-connections, parser types, command types, protocol errors, and sync
-helpers are crate-internal implementation detail.
+`ManageSieveConfig`, `Credentials`, and `AuthPolicy`. Consumers
+construct the factory and use it through
+`Arc<dyn bifrost_types::AccountFactory>`; raw IMAP, ManageSieve,
+parser, command, protocol-error, and sync helper surfaces are
+crate-internal implementation detail.
 
 ## Driver-owned I/O
 
@@ -109,10 +110,11 @@ AuthOutcome)` inside the crate only.
 
 The shared `bifrost_types::Account` implementation lives under `crates/imap/src/account/`. `ImapAccountFactory::open(account_id)` opens a connection pool, lists folders, builds capabilities, and threads the engine account id into optional raw-socket bandwidth metering. `ImapAccount` backs both the sync methods and the Stage 1 PIM primitives.
 
-The public account module re-exports only `ImapAccountFactory` and
-`ImapAccountConfig`, preserving the existing conformance-test path
-`bifrost_imap::account::{...}`. The crate root also re-exports the
-factory and config types directly. `ImapAccount` itself is
+The public account module re-exports only `ImapAccountFactory`,
+`ImapAccountConfig`, and `ManageSieveConfig`, preserving the
+existing conformance-test path `bifrost_imap::account::{...}`. The
+crate root also re-exports the factory and config types directly.
+`ImapAccount` itself is
 `pub(crate)`.
 
 Submodules:
@@ -123,6 +125,8 @@ Submodules:
 - `envelope.rs` - `FolderCursor` (QResync / Condstore / Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
 - `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group.
 - `pim.rs` - Stage 1 mail action surface: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, and IMAP-specific thread move/delete conveniences.
+- `sieve.rs` - optional ManageSieve client plus Stage 2 literal
+  script filter list/create/update/delete/validate.
 
 ### CONDSTORE / QRESYNC strategy
 
@@ -170,10 +174,13 @@ Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is op
 
 Unsupported PIM methods return `Error::Unsupported` and have false capability flags: SMTP send, attachment upload, draft update/send, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
 
-The Stage 2 server-side filter surface is present on the shared
-`Account` trait, but IMAP advertises `filter_rule_shape: None` and
-all filter method flags false until a Sieve-capable account
-configuration exists. The current methods return `Unsupported`.
+When `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)` is
+set, IMAP advertises `filter_rule_shape: Scripts` and all five
+filter method flags true. `sieve.rs` speaks ManageSieve over
+implicit TLS, STARTTLS, or plaintext, reuses the account credentials
+with SASL PLAIN or XOAUTH2, and maps scripts to
+`FilterScript { language: Sieve }`. Without ManageSieve config, the
+filter flags remain false and calls return `Unsupported`.
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread` and `delete_thread` override the trait defaults: they use the crate's cloneable account handle to do add-then-remove, and delete moves to the Trash role unless the current container is already Trash, in which case it expunges the thread from that mailbox.
 
@@ -315,6 +322,7 @@ crates/imap/src/
 |   |-- pim.rs             - unified PIM primitives + conveniences
 |   |-- pool.rs            - per-folder connection checkout
 |   |-- push.rs            - IDLE-driven WatchEvents
+|   |-- sieve.rs           - ManageSieve script filters
 |   `-- scopes.rs          - folder discovery, lifecycle stream
 |-- types/           - internal protocol types plus public Credentials / AuthPolicy
 `-- error.rs         - internal Error, ErrorCategory, Recovery

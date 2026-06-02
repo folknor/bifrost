@@ -3,9 +3,10 @@ use serde_json::json;
 use crate::Result;
 use crate::client::GmailClient;
 use crate::types::{
-    GmailAttachmentData, GmailDraft, GmailHistoryResponse, GmailLabel, GmailMessage, GmailProfile,
-    GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings, ListLabelsResponse,
-    ListMessagesResponse, ListSendAsResponse, ListThreadsResponse,
+    GmailAttachmentData, GmailDraft, GmailFilter, GmailHistoryResponse, GmailLabel, GmailMessage,
+    GmailProfile, GmailSendAs, GmailThread, GmailThreadStub, GmailVacationSettings,
+    ListFiltersResponse, ListLabelsResponse, ListMessagesResponse, ListSendAsResponse,
+    ListThreadsResponse,
 };
 
 impl GmailClient {
@@ -58,6 +59,20 @@ impl GmailClient {
 
     pub(crate) async fn delete_label(&self, label_id: &str) -> Result<()> {
         self.delete(&format!("/labels/{label_id}")).await
+    }
+
+    pub(crate) async fn list_filters(&self) -> Result<Vec<GmailFilter>> {
+        let resp: ListFiltersResponse = self.get("/settings/filters").await?;
+        Ok(resp.filter)
+    }
+
+    pub(crate) async fn create_filter(&self, filter: &GmailFilter) -> Result<GmailFilter> {
+        self.post("/settings/filters", filter).await
+    }
+
+    pub(crate) async fn delete_filter(&self, filter_id: &str) -> Result<()> {
+        let encoded = bifrost_net::url::encode_component(filter_id);
+        self.delete(&format!("/settings/filters/{encoded}")).await
     }
 
     pub(crate) async fn list_threads(
