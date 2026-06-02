@@ -20,7 +20,7 @@ const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
-/// Gmail Cloud Pub/Sub watch configuration for `GmailAccountFactory`.
+/// Gmail Cloud Pub/Sub watch configuration for `GoogleAccountFactory`.
 #[derive(Debug, Clone)]
 pub struct PubSubConfig {
     /// Full Pub/Sub topic name passed to Gmail `users.watch`.
@@ -274,7 +274,7 @@ async fn start_renewer(
                         error::into_account_error(err, error::GmailErrorContext::push_subscribe());
                     if account_error.recovery().is_terminal() {
                         tracing::warn!(
-                            target: "bifrost_gmail::push",
+                            target: "bifrost_google::push",
                             kind = ?account_error.kind(),
                             message_key = account_error.message_key(),
                             "gmail Pub/Sub watch renewal terminal failure",

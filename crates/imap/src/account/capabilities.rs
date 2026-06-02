@@ -83,6 +83,14 @@ pub(crate) fn build_capabilities(
             filter_update: has_sieve,
             filter_delete: has_sieve,
             filter_validate: has_sieve,
+            address_books_list: false,
+            contacts_list: false,
+            contact_get: false,
+            contact_create: false,
+            contact_update: false,
+            contact_delete: false,
+            contact_search: false,
+            contact_autocomplete: false,
         },
         filter_rule_shape: if has_sieve {
             FilterRuleShape::Scripts
@@ -117,6 +125,14 @@ mod tests {
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::None);
         assert!(!caps.pim_methods.filters_list);
+        assert!(!caps.pim_methods.address_books_list);
+        assert!(!caps.pim_methods.contacts_list);
+        assert!(!caps.pim_methods.contact_get);
+        assert!(!caps.pim_methods.contact_create);
+        assert!(!caps.pim_methods.contact_update);
+        assert!(!caps.pim_methods.contact_delete);
+        assert!(!caps.pim_methods.contact_search);
+        assert!(!caps.pim_methods.contact_autocomplete);
         assert!(caps.requires_uidvalidity_recheck);
     }
 

@@ -17,15 +17,16 @@ use std::time::Instant;
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
-    AccountOperation, AccountStream, AttachmentHandle, BlobHandle, ByteRange, Change, ChangeCursor,
-    Container, ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, FilterValidation, FlagOp, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId,
-    OpaqueChangeState, Page, Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle,
+    ByteRange, Change, ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch,
+    ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
+    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, FilterValidation, FlagOp,
+    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo, ScopeLifecycleEvent,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -42,13 +43,13 @@ use self::cursor::{
 use self::push::PubSubControl;
 use self::scopes::{ScopeCache, ScopeSnapshot};
 
-/// Factory for opening Gmail accounts through the shared `Account` API.
-pub struct GmailAccountFactory {
+/// Factory for opening Google accounts through the shared `Account` API.
+pub struct GoogleAccountFactory {
     client: Arc<GmailClient>,
     pubsub: Option<PubSubConfig>,
 }
 
-impl GmailAccountFactory {
+impl GoogleAccountFactory {
     fn from_client(client: GmailClient) -> Self {
         Self {
             client: Arc::new(client),
@@ -56,7 +57,7 @@ impl GmailAccountFactory {
         }
     }
 
-    /// Construct a Gmail factory from a bearer access token.
+    /// Construct a Google factory from a bearer access token.
     #[must_use]
     pub fn from_access_token(access_token: impl Into<String>) -> Self {
         Self::from_client(GmailClient::new(access_token))
@@ -76,18 +77,18 @@ impl GmailAccountFactory {
     }
 }
 
-impl AccountFactory for GmailAccountFactory {
+impl AccountFactory for GoogleAccountFactory {
     fn open(&self, account_id: AccountId) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
         let client = Arc::new(self.client.for_account(account_id));
         let pubsub = self.pubsub.clone();
         Box::pin(async move {
-            let account = GmailAccount::open(client, pubsub).await?;
+            let account = GoogleAccount::open(client, pubsub).await?;
             Ok(account as Arc<dyn Account>)
         })
     }
 }
 
-struct GmailAccount {
+struct GoogleAccount {
     client: Arc<GmailClient>,
     capabilities: AccountCapabilities,
     profile: GmailProfile,
@@ -98,7 +99,7 @@ struct GmailAccount {
     closed: AtomicBool,
 }
 
-impl GmailAccount {
+impl GoogleAccount {
     async fn open(
         client: Arc<GmailClient>,
         pubsub: Option<PubSubConfig>,
@@ -133,7 +134,18 @@ impl GmailAccount {
     }
 }
 
-impl Account for GmailAccount {
+fn unsupported_future<T: Send + 'static>(
+    operation: AccountOperation,
+) -> AccountFuture<Result<T, AccountError>> {
+    Box::pin(async move {
+        Err(error::into_account_error(
+            crate::error::Error::unsupported(operation),
+            error::GmailErrorContext::base(operation),
+        ))
+    })
+}
+
+impl Account for GoogleAccount {
     fn capabilities(&self) -> &AccountCapabilities {
         &self.capabilities
     }
@@ -524,6 +536,48 @@ impl Account for GmailAccount {
         filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
         filters::validate(filter)
+    }
+
+    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
+        unsupported_future(AccountOperation::AddressBooksList)
+    }
+
+    fn contacts_list(
+        &self,
+        _address_book: Option<AddressBookId>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        unsupported_future(AccountOperation::ContactsList)
+    }
+
+    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        unsupported_future(AccountOperation::ContactGet)
+    }
+
+    fn contact_create(
+        &self,
+        _contact: ContactCreate,
+    ) -> AccountFuture<Result<ContactId, AccountError>> {
+        unsupported_future(AccountOperation::ContactCreate)
+    }
+
+    fn contact_update(
+        &self,
+        _contact: ContactId,
+        _patch: ContactPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        unsupported_future(AccountOperation::ContactUpdate)
+    }
+
+    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        unsupported_future(AccountOperation::ContactDelete)
+    }
+
+    fn contact_search(
+        &self,
+        _request: ContactSearchRequest,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        unsupported_future(AccountOperation::ContactSearch)
     }
 
     fn thread_hydrate(

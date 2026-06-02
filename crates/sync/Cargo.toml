@@ -36,5 +36,5 @@ arc-swap = { workspace = true }
 [dev-dependencies]
 bifrost-imap = { path = "../imap" }
 bifrost-jmap = { path = "../jmap", features = ["sync"] }
-bifrost-gmail = { path = "../gmail" }
+bifrost-google = { path = "../google" }
 bifrost-graph = { path = "../graph" }

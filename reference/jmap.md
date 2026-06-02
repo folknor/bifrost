@@ -291,7 +291,11 @@ not supported by JMAP and return `Unsupported`.
 
 ### HTTP redirect handling
 
-`ReqwestTransport` no longer carries a local redirect loop. It configures `bifrost-net` with `NetConfig::follow_redirects(FollowRedirects::Enabled(...))`, preserving JMAP's trusted-host allowlist and the old five-hop limit while using the shared RFC 7231 method-aware redirect implementation. The factory-provided engine account id is used when attaching the transport to `bifrost-net`. `bifrost-net` strips `Authorization` on every cross-host hop regardless of allowlist membership, so the Basic-auth header that `ReqwestTransport` injects directly into the request `HeaderMap` (rather than through the bearer-token source) is no longer at risk of crossing a host boundary even when the consumer trusts the destination host.
+`ReqwestTransport` delegates redirects to `bifrost-net` with JMAP's
+trusted-host allowlist and five-hop limit. The factory-provided engine
+account id tags the attached transport. `bifrost-net` strips
+`Authorization` on every cross-host hop, including Basic-auth headers
+that `ReqwestTransport` injects directly into the request `HeaderMap`.
 
 ### Error translation
 

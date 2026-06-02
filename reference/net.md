@@ -6,7 +6,7 @@ Scope: HTTP/2 connection pool, OAuth bearer-token refresh, retry
 budget, per-host rate limiting, per-account bandwidth metering,
 native-tls, W3C `traceparent` injection, URL component-encoding
 helpers shared by the HTTP protocol crates. Used by `bifrost-jmap`,
-`bifrost-gmail`, `bifrost-graph`. Not used by `bifrost-imap` or
+`bifrost-google`, `bifrost-graph`. Not used by `bifrost-imap` or
 `bifrost-smtp` (those carry their own TCP/TLS stacks); IMAP/SMTP
 report bytes-in/out through `MeterSink` for unified bandwidth
 accounting.

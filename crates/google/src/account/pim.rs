@@ -1287,7 +1287,7 @@ fn boundary(kind: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    format!("bifrost-gmail-{kind}-{nanos}-{sequence}")
+    format!("bifrost-google-{kind}-{nanos}-{sequence}")
 }
 
 fn system_time_to_millis_string(time: SystemTime) -> String {

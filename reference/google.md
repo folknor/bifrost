@@ -1,12 +1,13 @@
-# bifrost-gmail reference
+# bifrost-google reference
 
-Current architecture of the Gmail Account-layer code under
-`crates/gmail/src/account/`. The public crate surface is
-`bifrost_gmail::account::{GmailAccountFactory, PubSubConfig}`;
+Current architecture of the Google Account-layer code under
+`crates/google/src/account/`. The public crate surface is
+`bifrost_google::account::{GoogleAccountFactory, PubSubConfig}`;
 everything else is crate-private implementation detail behind
-`Account` / `AccountFactory`. Internally, a `GmailClient` wraps the
-Gmail REST API and drives history-id-based sync, Cloud Pub/Sub push,
-and Gmail-specific flag canonicalization.
+`Account` / `AccountFactory`. Internally, the current mail path still
+uses a `GmailClient` for Gmail REST API history-id sync, Cloud Pub/Sub
+push, and Gmail-specific flag canonicalization. Stage 3 adds Google
+People API contacts alongside that mail path.
 
 Gmail has no UID model and no mailbox-scoped server state. A
 single `historyId` walks the account-wide change log, and labels
@@ -19,15 +20,15 @@ that route through `messages.batchModify` / `batchDelete`.
 
 Public modules:
 
-- `account` - public `GmailAccountFactory` and `PubSubConfig`; the
+- `account` - public `GoogleAccountFactory` and `PubSubConfig`; the
   opened account itself is returned as `Arc<dyn Account>`.
 
 Internal modules:
 
-`crates/gmail/src/account/`:
+`crates/google/src/account/`:
 
-- `mod.rs` - crate-private `GmailAccount`, public
-  `GmailAccountFactory`, `impl Account`.
+- `mod.rs` - crate-private `GoogleAccount`, public
+  `GoogleAccountFactory`, `impl Account`.
 - `capabilities.rs` - `AccountCapabilities` builder.
 - `cursor.rs` - `GmailChangeState`, envelope encode/decode,
   `cursor_from_state`.
@@ -51,21 +52,21 @@ Internal modules:
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 
-## GmailAccount / GmailAccountFactory
+## GoogleAccount / GoogleAccountFactory
 
-Consumers construct `GmailAccountFactory` with
+Consumers construct `GoogleAccountFactory` with
 `from_access_token(token)`, then optionally attach a
 `PubSubConfig` with `with_pubsub_config` or `with_pubsub_topic`.
-The factory is the only public Gmail entry point; the raw
+The factory is the only public Google entry point; the raw
 `GmailClient`, Gmail wire DTOs, and crate-local `Error` are
 `pub(crate)`.
 
-`GmailAccountFactory` carries an internal `Arc<GmailClient>` and an
+`GoogleAccountFactory` carries an internal `Arc<GmailClient>` and an
 optional `PubSubConfig`. `open(account_id)` first asks the client for
 an account-scoped clone attached to `bifrost-net` under the engine
 supplied `AccountId`, then does one `users.getProfile` round-trip,
 parses `profile.historyId` into a `u64`, and stores the resulting
-`GmailChangeState` as `seed_state`. The opened `GmailAccount`
+`GmailChangeState` as `seed_state`. The opened `GoogleAccount`
 retains:
 
 - `client: Arc<GmailClient>` (crate-private REST wrapper).
@@ -93,7 +94,7 @@ use the factory and the shared `Account` trait.
 `AccountFactory::open(account_id)` returns `Arc<dyn Account>`.
 `reopen` flows from the engine: the engine drops the previous
 `Arc` and calls the factory again with the same `AccountId`. The
-factory holds the credentials and client, so the new `GmailAccount`
+factory holds the credentials and client, so the new `GoogleAccount`
 carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile
 at open time.
@@ -157,7 +158,8 @@ on the same cancellation token.
     `vacation_set`, `thread_hydrate`, `message_hydrate`.
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `attachment_upload`,
-    `container_move`, `quota_get`.
+    `container_move`, `quota_get`, and all contact primitives until
+    the Stage 3 People API implementation wires them in.
 - `filter_rule_shape: Rules`. Gmail settings filters are wired for
   list/create/delete plus local validation. `filter_update` remains
   unsupported because the Gmail API exposes no update or replace

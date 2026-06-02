@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use bifrost_gmail::account::GmailAccountFactory;
+use bifrost_google::account::GoogleAccountFactory;
 use bifrost_graph::account::{GraphAccountFactory, GraphClient};
 use bifrost_imap::{
     AuthPolicy, Credentials, ImapConfig,
@@ -58,8 +58,8 @@ fn jmap_factory() -> Arc<dyn AccountFactory> {
     )
 }
 
-fn gmail_factory() -> Arc<dyn AccountFactory> {
-    Arc::new(GmailAccountFactory::from_access_token("test-token"))
+fn google_factory() -> Arc<dyn AccountFactory> {
+    Arc::new(GoogleAccountFactory::from_access_token("test-token"))
 }
 
 fn graph_factory() -> Arc<dyn AccountFactory> {
@@ -89,9 +89,9 @@ fn jmap_factory_composes_with_engine() {
 }
 
 #[test]
-fn gmail_factory_composes_with_engine() {
+fn google_factory_composes_with_engine() {
     let engine = sync_engine();
-    let factory: Arc<dyn AccountFactory> = gmail_factory();
+    let factory: Arc<dyn AccountFactory> = google_factory();
     _account_factory_is_object_safe(factory.as_ref());
     _assert_attach_accepts(&engine, &factory);
 }
@@ -110,7 +110,7 @@ fn all_four_factories_share_engine_signature() {
     let factories: Vec<Arc<dyn AccountFactory>> = vec![
         imap_factory(),
         jmap_factory(),
-        gmail_factory(),
+        google_factory(),
         graph_factory(),
     ];
 

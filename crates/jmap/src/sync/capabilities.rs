@@ -141,6 +141,14 @@ pub(crate) fn build(
             filter_update: support.sieve,
             filter_delete: support.sieve,
             filter_validate: support.sieve,
+            address_books_list: false,
+            contacts_list: false,
+            contact_get: false,
+            contact_create: false,
+            contact_update: false,
+            contact_delete: false,
+            contact_search: false,
+            contact_autocomplete: false,
         },
         filter_rule_shape: if support.sieve {
             FilterRuleShape::Scripts

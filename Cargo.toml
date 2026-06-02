@@ -1,6 +1,7 @@
 [workspace]
 members = [
-    "crates/gmail",
+    "crates/carddav",
+    "crates/google",
     "crates/graph",
     "crates/imap",
     "crates/jmap",

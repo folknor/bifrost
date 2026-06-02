@@ -1,6 +1,6 @@
 [package]
-name = "bifrost-gmail"
-description = "Gmail Account implementation for bifrost"
+name = "bifrost-google"
+description = "Google Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/folknor/bifrost"
-keywords = ["email", "gmail", "google", "mail"]
+keywords = ["email", "gmail", "google", "contacts", "mail"]
 categories = ["email", "network-programming", "asynchronous"]
 
 [lib]

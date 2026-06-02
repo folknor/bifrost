@@ -87,8 +87,9 @@ rationale is not obvious from the code alone.
     would let the engine assume UNCHANGEDSINCE is always wired
     up when it is not. The engine's read-back-after-retry path
     remains the lost-update safety net.
-  - **P2-A3** (`crates/gmail/` Account impl): shipped.
-    `GmailAccount` + `GmailAccountFactory` with cached
+  - **P2-A3** (`crates/google/` Account impl, formerly the Gmail
+    crate): shipped. `GoogleAccount` +
+    `GoogleAccountFactory` with cached
     `getProfile` historyId seed, history-based changes,
     inventory, hydration, watch/stop push, mutations, blobs,
     recovery mapping, and Gmail flag canonicalization.
@@ -227,10 +228,10 @@ that tree settles.
   mutation-concurrency rationale. Conformance test additions
   inside `crates/imap/src/account/` modules are still
   outstanding.
-- **P3-A3 (gmail)**: merged. `reference/gmail.md` covers the
+- **P3-A3 (google)**: merged. `reference/google.md` covers the
   history-id seeded sync, Cloud Pub/Sub push with renewer task,
   and the recovery-taxonomy error mapping. Conformance tests
-  added across `crates/gmail/src/account/{cursor,capabilities,
+  added across `crates/google/src/account/{cursor,capabilities,
   recovery,inventory}.rs` cover cursor round-trip, capability
   shape, error classification, and scope-to-method wiring.
 - **P3-A4 (graph)**: merged. `reference/graph.md` covers the
@@ -411,7 +412,7 @@ exports and add new ones in one pass.
 
 - **P3.5-A0 (imap)**: `crates/imap/src/` and `crates/imap/Cargo.toml`.
 - **P3.5-A1 (jmap)**: `crates/jmap/src/` and `crates/jmap/Cargo.toml`.
-- **P3.5-A2 (gmail)**: `crates/gmail/src/` and `crates/gmail/Cargo.toml`.
+- **P3.5-A2 (google)**: `crates/google/src/` and `crates/google/Cargo.toml`.
 - **P3.5-A3 (graph)**: `crates/graph/src/` and `crates/graph/Cargo.toml`.
 - **P3.5-A4 (smtp)**: `crates/smtp/src/` and `crates/smtp/Cargo.toml`.
   Smaller scope: bifrost-smtp was not modified by the Account

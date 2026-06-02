@@ -182,6 +182,15 @@ pub struct PimMethodSupport {
     pub filter_update: bool,
     pub filter_delete: bool,
     pub filter_validate: bool,
+    // Contact primitives and conveniences.
+    pub address_books_list: bool,
+    pub contacts_list: bool,
+    pub contact_get: bool,
+    pub contact_create: bool,
+    pub contact_update: bool,
+    pub contact_delete: bool,
+    pub contact_search: bool,
+    pub contact_autocomplete: bool,
 }
 
 /// Mapping from each provider's flag namespace onto the canonical

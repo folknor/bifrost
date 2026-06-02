@@ -85,6 +85,7 @@ pub fn default_salt_factory() -> Box<dyn Fn(ProtocolKind) -> ProtocolSalt + Send
         ProtocolKind::Gmail => ProtocolSalt::Gmail(String::new()),
         ProtocolKind::Graph => ProtocolSalt::Graph(String::new()),
         ProtocolKind::Imap => ProtocolSalt::Imap,
+        ProtocolKind::CardDav => ProtocolSalt::CardDav,
         // `ProtocolKind` is `#[non_exhaustive]`; fall back to the IMAP
         // salt for unknown future protocols. The salt is engine
         // bookkeeping; it never travels on the wire so this is safe.

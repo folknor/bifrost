@@ -61,6 +61,14 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             filter_update: false,
             filter_delete: true,
             filter_validate: true,
+            address_books_list: false,
+            contacts_list: false,
+            contact_get: false,
+            contact_create: false,
+            contact_update: false,
+            contact_delete: false,
+            contact_search: false,
+            contact_autocomplete: false,
         },
         filter_rule_shape: FilterRuleShape::Rules,
         conveniences: bifrost_types::ConvenienceShape {
@@ -134,6 +142,14 @@ mod tests {
         assert!(!caps.pim_methods.filter_update);
         assert!(caps.pim_methods.filter_delete);
         assert!(caps.pim_methods.filter_validate);
+        assert!(!caps.pim_methods.address_books_list);
+        assert!(!caps.pim_methods.contacts_list);
+        assert!(!caps.pim_methods.contact_get);
+        assert!(!caps.pim_methods.contact_create);
+        assert!(!caps.pim_methods.contact_update);
+        assert!(!caps.pim_methods.contact_delete);
+        assert!(!caps.pim_methods.contact_search);
+        assert!(!caps.pim_methods.contact_autocomplete);
     }
 
     #[test]

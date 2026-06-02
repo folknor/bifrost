@@ -43,7 +43,7 @@ wins.
   `#[doc(hidden)]`, not hidden behind a feature.
 - **One API surface.** `Account` and `AccountFactory` are the
   bifrost public API. Protocol crates (`bifrost-jmap`,
-  `bifrost-imap`, `bifrost-gmail`, `bifrost-graph`, `bifrost-smtp`)
+  `bifrost-imap`, `bifrost-google`, `bifrost-graph`, `bifrost-smtp`)
   are implementation detail: everything `pub(crate)` except the
   factory and its config types. No raw protocol surfaces alongside
   the trait. A consumer wanting "the only good Graph client in the
@@ -463,18 +463,19 @@ in S1-W4 and applies workspace-wide.
 Adds address-book and contact-card primitives, plus conveniences for
 ratatoskr's contact-list UI.
 
-**First action (W1 prep):** rename `bifrost-gmail` to `bifrost-google`
+**First action (W1 prep):** **Merged.** Rename `bifrost-gmail` to `bifrost-google`
 (the crate stops being mail-only here), and create the `bifrost-carddav`
 skeleton crate. Workspace `Cargo.toml`, dependent crates, and reference
-docs updated to match. Lands as the leading patch of W1 rather than its
-own wave - too small to warrant separate sequencing.
+docs updated to match.
 
 Then the standard wave structure:
 
-- **W1: trait surface.** Contacts primitives in `bifrost-types::Account`
+- **W1: trait surface.** **Merged.** Contacts primitives in `bifrost-types::Account`
   (`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
   `contact_update`, `contact_delete`, `contact_search`), plus conveniences.
-  `AccountCapabilities` grows the contacts-support flags.
+  `AccountCapabilities` grows the contacts-support flags. Provider
+  implementations return structured `Unsupported` until W2 wires the
+  real backends.
 - **W2: protocol impls** (four agents in parallel):
   - JMAP: native via the JMAP contacts draft already wired into
     bifrost-jmap.
@@ -636,7 +637,7 @@ but are worth recording so Stage 1 agents do not rediscover them:
   concurrency. If Stage 1 grows a per-account request concurrency
   limiter in `bifrost-net` or `bifrost-sync`, the local Semaphore
   is deleted.
-- **`reference/jmap.md`, `reference/gmail.md`, `reference/graph.md`,
+- **`reference/jmap.md`, `reference/google.md`, `reference/graph.md`,
   `reference/smtp.md` were updated** during the Phase 3.5
   commits to match the new visibility and shape. Stage 1 work
   that touches these surfaces should refresh them again at the

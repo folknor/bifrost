@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
-    AttachmentHandle, BlobHandle, ByteRange, ChangeCursor, Container, ContainerId, ContainerKind,
-    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    ErrorScope, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, ChangeCursor, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, ErrorScope, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey,
+    Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
     ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
     Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
@@ -583,6 +584,83 @@ impl Account for JmapAccount {
         filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
         filters::validate(self.sieve.clone(), filter)
+    }
+
+    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::AddressBooksList,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contacts_list(
+        &self,
+        _address_book: Option<AddressBookId>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactsList,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactGet,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contact_create(
+        &self,
+        _contact: ContactCreate,
+    ) -> AccountFuture<Result<ContactId, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactCreate,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contact_update(
+        &self,
+        _contact: ContactId,
+        _patch: ContactPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactUpdate,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactDelete,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn contact_search(
+        &self,
+        _request: ContactSearchRequest,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::ContactSearch,
+            None,
+            "JMAP contacts Account dispatch is not wired yet",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn thread_hydrate(

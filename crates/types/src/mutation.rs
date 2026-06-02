@@ -149,6 +149,9 @@ pub enum ProtocolSalt {
     /// IMAP carries no replay token; engine relies on the read-back
     /// guard after retry.
     Imap,
+    /// CardDAV carries no replay token; consumers use etags where
+    /// available and the engine keeps idempotency local.
+    CardDav,
 }
 
 /// Bulk flag mutation. Carries both the operation and the flag set

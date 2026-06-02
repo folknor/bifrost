@@ -26,6 +26,10 @@ use futures::stream::Stream;
 use crate::blob::{BlobHandle, ByteRange};
 use crate::capabilities::{AccountCapabilities, StarredFlagShape};
 use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest};
+use crate::contact::{
+    AddressBook, AddressBookId, ContactCard, ContactCreate, ContactId, ContactPatch,
+    ContactSearchRequest,
+};
 use crate::container::{Container, ContainerId, ContainerKind, Label, MutationTarget};
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
@@ -477,6 +481,51 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<FilterValidation, AccountError>>;
 
     // ------------------------------------------------------------
+    // Contact primitives (S3-W1)
+    //
+    // Providers advertise support through
+    // `capabilities().pim_methods`. Accounts without a native or
+    // configured contacts backend return `Err(Unsupported)`.
+    // ------------------------------------------------------------
+
+    /// List address books or contact folders.
+    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>>;
+
+    /// List contacts, optionally scoped to one address book. Pagination
+    /// cursor bytes are provider-owned and should be passed back from
+    /// the previous `Page::next_cursor`.
+    fn contacts_list(
+        &self,
+        address_book: Option<AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
+
+    /// Fetch one contact card by engine-facing id.
+    fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>>;
+
+    /// Create one contact card.
+    fn contact_create(
+        &self,
+        contact: ContactCreate,
+    ) -> AccountFuture<Result<ContactId, AccountError>>;
+
+    /// Partially update one contact card.
+    fn contact_update(
+        &self,
+        contact: ContactId,
+        patch: ContactPatch,
+    ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Delete one contact card.
+    fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Provider-side contact search.
+    fn contact_search(
+        &self,
+        request: ContactSearchRequest,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
+
+    // ------------------------------------------------------------
     // Threading + hydration primitives (S1-W1)
     // ------------------------------------------------------------
 
@@ -647,6 +696,20 @@ pub trait Account: Send + Sync {
             );
         }
         Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+    }
+
+    /// Contact autocomplete convenience for recipient and attendee
+    /// pickers. Default implementation returns the first page of
+    /// `contact_search`.
+    fn contact_autocomplete(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> AccountFuture<Result<Vec<ContactCard>, AccountError>> {
+        let mut request = ContactSearchRequest::new(query);
+        request.limit = Some(limit);
+        let future = self.contact_search(request);
+        Box::pin(async move { future.await.map(|page| page.items) })
     }
 
     /// Move a thread to Trash, or delete-permanently if already in

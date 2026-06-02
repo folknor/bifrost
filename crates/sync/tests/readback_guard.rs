@@ -12,17 +12,19 @@ use bifrost_sync::run_readback_guard;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
-    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, Container, ContainerId,
-    ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
-    CursorScope, DraftHandle, DraftPatch, FilterRuleShape, FilterValidation, FlagOp,
-    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
+    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, ContactCard, ContactCreate,
+    ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
+    ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
+    DraftHandle, DraftPatch, FilterRuleShape, FilterValidation, FlagOp, HydratedObject,
+    HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
     MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
     PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
     RateLimitClass, RequestCause, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
+use bifrost_types::{AddressBook, AddressBookId};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
@@ -439,6 +441,52 @@ impl Account for FlagsAccount {
         _filter: ServerFilterCreate,
     ) -> AccountFuture<Result<FilterValidation, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::FilterValidate)) })
+    }
+
+    fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::AddressBooksList,
+            ))
+        })
+    }
+
+    fn contacts_list(
+        &self,
+        _address_book: Option<AddressBookId>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactsList)) })
+    }
+
+    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactGet)) })
+    }
+
+    fn contact_create(
+        &self,
+        _contact: ContactCreate,
+    ) -> AccountFuture<Result<ContactId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactCreate)) })
+    }
+
+    fn contact_update(
+        &self,
+        _contact: ContactId,
+        _patch: ContactPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactUpdate)) })
+    }
+
+    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactDelete)) })
+    }
+
+    fn contact_search(
+        &self,
+        _request: ContactSearchRequest,
+    ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactSearch)) })
     }
 
     fn thread_hydrate(

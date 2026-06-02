@@ -18,6 +18,7 @@ pub mod account;
 pub mod blob;
 pub mod capabilities;
 pub mod compose;
+pub mod contact;
 pub mod container;
 pub mod cursor;
 pub mod error;
@@ -60,6 +61,12 @@ pub use compose::{
 // Container / label / mutation-target types.
 pub use container::{
     Container, ContainerId, ContainerKind, FolderRole, Label, MutationTarget, Provenance,
+};
+
+// Address book and contact-card primitives.
+pub use contact::{
+    AddressBook, AddressBookId, ContactCard, ContactCreate, ContactEmail, ContactId,
+    ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
 };
 
 // Cursor + scope types.

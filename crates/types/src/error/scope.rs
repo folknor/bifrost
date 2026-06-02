@@ -159,6 +159,14 @@ pub enum AccountOperation {
     FilterUpdate,
     FilterDelete,
     FilterValidate,
+    AddressBooksList,
+    ContactsList,
+    ContactGet,
+    ContactCreate,
+    ContactUpdate,
+    ContactDelete,
+    ContactSearch,
+    ContactAutocomplete,
     Close,
     Expunge,
 }
@@ -186,6 +194,9 @@ impl AccountOperation {
                 | Self::FilterCreate
                 | Self::FilterUpdate
                 | Self::FilterDelete
+                | Self::ContactCreate
+                | Self::ContactUpdate
+                | Self::ContactDelete
         )
     }
 }
@@ -206,6 +217,7 @@ pub enum Provider {
 pub enum Protocol {
     Jmap,
     Imap,
+    CardDav,
     Smtp,
     Lmtp,
     Gmail,
