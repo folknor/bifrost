@@ -1,11 +1,6 @@
 # bifrost-jmap reference
 
-Current architecture of the JMAP implementation crate. The only
-external surface is `bifrost_jmap::sync` with the account factory and
-its config types. The protocol client, typed wire objects, transport,
-method macros, error type, and helper facade are internal to the crate.
-Examples live in `crates/jmap/examples/` and demonstrate the
-`AccountFactory` / `Account` surface only.
+Current architecture of the JMAP implementation crate. The only external surface is `bifrost_jmap::sync` (account factory + config types). The protocol client, typed wire objects, transport, method macros, error type, and helper facade are crate-internal. Examples in `crates/jmap/examples/` demonstrate the `AccountFactory` / `Account` surface only.
 
 ## Public surface
 
@@ -17,11 +12,7 @@ With the `sync` feature enabled, consumers may use:
   factory.
 - `sync::ReconnectPolicy` - WebSocket reconnect backoff config.
 
-Everything else in `crates/jmap/src/` is `pub(crate)` or narrower.
-There are no public raw JMAP client APIs, public method macros, public
-wire model modules, or public transport types. Consumers reach JMAP by
-constructing the factory, opening an `Arc<dyn Account>`, and calling
-methods from `bifrost-types::Account`.
+Everything else in `crates/jmap/src/` is `pub(crate)` or narrower: no public raw client APIs, method macros, wire model modules, or transport types. Consumers reach JMAP by constructing the factory, opening an `Arc<dyn Account>`, and calling `bifrost-types::Account` methods.
 
 ## Internal method dispatch
 
@@ -110,35 +101,30 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 - PushObject/PushNotification variants.
 - Test modules.
 
-The Account layer under `crates/jmap/src/sync/` wires optional PIM
-capabilities at open time. `contacts.rs` maps JMAP AddressBook and
-ContactCard methods onto the shared contact primitives, including
-JSContact postal addresses. `calendar_ops.rs` maps JMAP Calendar and
-CalendarEvent methods onto the shared calendar primitives, including
-list/range/get/create/update/delete/RSVP/search.
-Range queries send a server-side `AND(inCalendar, after, before)` filter
-and still apply the local overlap predicate after hydration as a defensive
-guard.
+The Account layer under `crates/jmap/src/sync/` wires optional PIM capabilities at open time. `contacts.rs` maps JMAP AddressBook/ContactCard methods onto the shared contact primitives (incl. JSContact postal addresses). `calendar_ops.rs` maps JMAP Calendar/CalendarEvent methods onto the shared calendar primitives: list/range/get/create/update/delete/RSVP/search.
+Create payloads stamp the mandatory top-level `@type` (`Card` / `Event`)
+and the `@type` on the nested objects the RFCs define (Name,
+EmailAddress, Phone, Organization, Address, Note; Participant,
+Location, RecurrenceRule, NDay). JSContact photo media is written with
+`kind: "photo"` (the resource role, not a URI marker) so self-written
+photos read back; the read path filters on that kind.
+Range queries send a server-side `AND(inCalendar, after, before)` filter and reapply the local overlap predicate after hydration as a guard.
 Calendar recurrence maps common RRULE fields to JSCalendar
 `recurrenceRules` objects and back. Simple shared RDATE/EXDATE values map
 through JSCalendar `recurrenceOverrides`. Unsupported outbound RRULE
 parts are rejected before Set payload construction; modified recurrence
 overrides and less common JSCalendar recurrence features remain outside
-the shared mapping.
-Calendar privacy maps between JSCalendar `privacy` and shared event
-visibility, with JSCalendar `secret` exposed as `Confidential`.
-Lifecycle status maps between shared `EventStatus` and JSCalendar
-`status` on read, create, and update.
-Shared event organizers map to and from JSCalendar owner participants;
-created events write the organizer as an `owner` participant.
-JSCalendar `freeBusyStatus` standardizes `free` and `busy`; shared
-Tentative and OutOfOffice availability therefore serialize as busy.
-RSVP resolves authenticated email aliases from Basic credentials and
-RFC 9670 Principal/get when available, then patches the matching
-participant's `participationStatus` by dotted path. If no authenticated
-email is known, it falls back to the single non-owner attendee heuristic;
-ambiguous events without an identity match return unsupported rather than
-guessing.
+the shared mapping. JSCalendar `until` is a LocalDateTime, so a UTC
+RFC 5545 `UNTIL=...Z` (which would need the event timeZone to normalize)
+is rejected with the other unsupported parts; floating and date-only
+UNTIL pass through unchanged.
+Event time updates: JSCalendar derives the end from `start` + `duration`,
+so a patch must carry both `start` and `end` (the patch recomputes
+`duration`). A patch with only one bound cannot be applied losslessly
+without reading the current event and is rejected as Unsupported rather
+than silently dropping the change or keeping a stale duration.
+Privacy maps between JSCalendar `privacy` and shared visibility (`secret` -> `Confidential`); status maps `EventStatus` <-> JSCalendar `status` on read/create/update. Organizers map to/from JSCalendar owner participants; created events write the organizer as an `owner` participant. `freeBusyStatus` standardizes `free`/`busy`, so shared Tentative/OutOfOffice serialize as busy.
+RSVP resolves authenticated email aliases from Basic credentials and RFC 9670 Principal/get when available, then patches the matching participant's `participationStatus` by dotted path. Without a known email it falls back to the single non-owner attendee; ambiguous events without an identity match return unsupported rather than guessing.
 If the server lacks the relevant JMAP capability, the method flags are
 false and calls return JMAP-stamped `Unsupported`.
 
@@ -165,9 +151,9 @@ RFC 8620: `null` removes map keys, not `false`. Email `patch` field uses `HashMa
 
 ## Account layer
 
-The `bifrost_types::Account` implementation lives under `crates/jmap/src/sync/`, gated behind the `sync` feature. It is intentionally engine-facing only: the sync tree depends on `bifrost-types`, not on `bifrost-sync`. The implementation wraps the existing JMAP client (`Client<ReqwestTransport>` plus a `Mail`-capability `Account` handle) and maps every method on the `Account` trait onto one or more JMAP method calls.
+The `bifrost_types::Account` impl under `crates/jmap/src/sync/` (gated on `sync`) is engine-facing only: the sync tree depends on `bifrost-types`, not `bifrost-sync`. It wraps the JMAP client (`Client<ReqwestTransport>` + a `Mail`-capability `Account` handle) and maps each `Account` trait method onto one or more JMAP calls.
 
-Cursors are encoded as protocol-tagged opaque bytes via a hand-rolled length-prefixed format, scope-aware in both establishment and change streams. Push uses the JMAP WebSocket subprotocol with a single reader task and a broadcast fan-out.
+Cursors are protocol-tagged opaque bytes (hand-rolled length-prefixed format), scope-aware in establishment and change streams. Push uses the JMAP WebSocket subprotocol with a single reader task and broadcast fan-out.
 
 ### Module layout
 
@@ -194,33 +180,32 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` is the consumer-registered factory. It carries a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic` or `JmapCredentials::Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, bandwidth caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`, `VacationResponse`, `Quota`, and `Sieve` accounts, reads the session, builds `AccountCapabilities` and `CoreLimits`, and probes initial `Email` / `Mailbox` / `Thread` state strings to seed cursors. It spawns the WebSocket reader task with a `CancellationToken` and returns `Arc<dyn Account>`.
+`JmapAccountFactory` is the consumer-registered factory, carrying a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, bandwidth caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, probes initial `Email`/`Mailbox`/`Thread` state strings to seed cursors, spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
 
-`JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail`-capability `Account` handle, optional account handles for `Submission`, `VacationResponse`, `Quota`, and `Sieve`, the built capabilities, the per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`, `mailbox`, and `thread`. `set_priority` and `set_bandwidth_cap` delegate to the underlying `bifrost-net::AccountNet` rather than storing local atomics; the transport owns the canonical knobs.
+`JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail` `Account` handle, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`/`mailbox`/`thread`. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet` rather than local atomics; the transport owns the canonical knobs.
 
-Reopen is delegated to the engine: when an account drops or `close()` returns, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (which terminates the WebSocket reader loop and any in-flight streams), then awaits a clean teardown. The `closed` flag short-circuits subsequent calls. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!` in the push stream; no `Account` method holds non-cancel-safe state across an await.
+Reopen is engine-delegated: on drop or `close()`, the engine calls `JmapAccountFactory::open` again. `close()` cancels the shutdown token (terminating the WebSocket reader and in-flight streams) then awaits teardown; the `closed` flag short-circuits later calls. Cancellation safety relies on the shared `CancellationToken` plus `tokio::select!` in the push stream; no `Account` method holds non-cancel-safe state across an await.
 
 ### Capabilities advertised
 
 `capabilities::build` reads `session.core_capabilities()` and `session.websocket_capabilities()` to construct `AccountCapabilities`:
 
-- `cursor_freshness: ServerIssued` - JMAP `state` strings are server-issued tokens; the engine can persist them and resume.
-- `blob_range: BlobRangeSupport::No` - the existing JMAP transport exposes whole-blob downloads only. Range support would need a request hook for the HTTP `Range` header.
-- `blob_digest_pre_download: false` - JMAP does not surface a content digest before download.
+- `cursor_freshness: ServerIssued` - `state` strings are server-issued tokens; the engine persists them and resumes.
+- `blob_range: BlobRangeSupport::No` - whole-blob downloads only; range support would need an HTTP `Range` request hook.
+- `blob_digest_pre_download: false` - no content digest before download.
 - `push: PushCapability::InProcess` when the session advertises `urn:ietf:params:jmap:websocket` with `supportsPush: true`, otherwise `PushCapability::None`.
-- `mutation.concurrency: MutationConcurrency::StateBased` - the pipeline gates every `Email/set` with `ifInState`, which forces the server to reject the set on a state mismatch.
-- `mutation.replay_safety: MutationReplaySafety::None` - JMAP has no wire replay token; the engine's read-back guard is the lost-update safety net.
+- `mutation.concurrency: MutationConcurrency::StateBased` - the pipeline gates every `Email/set` with `ifInState`, so the server rejects on a state mismatch.
+- `mutation.replay_safety: MutationReplaySafety::None` - no wire replay token; the read-back guard is the lost-update safety net.
 - `batching_policy.max_items` - `core.maxObjectsInSet`, clamped to `[1, 500]`.
 - `batching_policy.max_wait: 100ms`, `flush_on_input_close: true`.
-- `rate_limit_class: RateLimitClass::Generous` - JMAP servers typically rate-limit per request size and per session rather than per second.
-- `quota_signal: QuotaSignal::None` - JMAP quota is exposed through `quota_get` when available, but it does not feed a retry or scheduler signal.
-- `requires_uidvalidity_recheck: false`.
-- `historyid_expires_after: None` and `delta_token_expires_after: None` - JMAP state strings are not time-bound.
-- `pim_methods` advertises real JMAP support for mailbox membership add/remove, keyword mutation, read-state mutation, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update when `Submission` is open, vacation get/set when `VacationResponse` is open, quota get when `Quota` is open, and thread/message hydration. Gmail labels, Graph categories, and Graph extended properties are false and return `Error::Unsupported`.
+- `rate_limit_class: RateLimitClass::Generous` - JMAP rate-limits per request size/session, not per second.
+- `quota_signal: QuotaSignal::None` - quota is exposed via `quota_get` but feeds no retry/scheduler signal.
+- `requires_uidvalidity_recheck: false`; `historyid_expires_after`/`delta_token_expires_after: None` (state strings not time-bound).
+- `pim_methods` advertises real JMAP support for mailbox membership add/remove, keyword/read-state mutation, attachment upload, draft lifecycle, search, mailbox CRUD, identity list/update (when `Submission` open), vacation get/set (when `VacationResponse` open), quota get (when `Quota` open), and thread/message hydration. Gmail labels, Graph categories, and Graph extended properties are false (`Error::Unsupported`).
 - `filter_rule_shape: Scripts` and every filter method flag is true
   when the session has a primary Sieve account. Without Sieve they
   are false and the shape is `None`.
-- `conveniences` declares `starred = Keyword`, `replied_via_keyword = true`, `forwarded_via_keyword = true`, and both extended-property routes false. The default `set_starred`, `mark_replied`, and `mark_forwarded` therefore map to JMAP `$flagged`, `$answered`, and `$forwarded`.
+- `conveniences` declares `starred = Keyword`, `replied_via_keyword`/`forwarded_via_keyword` true, both extended-property routes false. So `set_starred`/`mark_replied`/`mark_forwarded` map to JMAP `$flagged`/`$answered`/`$forwarded`.
 
 `CoreLimits` holds `maxObjectsInGet` and `maxObjectsInSet` - the only two limits the JMAP `Account` impl actually reads. `build` rejects a session whose advertised core limits (including `maxCallsInRequest` and `maxSizeRequest`) are zero, even though those latter two are validated and discarded.
 
@@ -252,10 +237,10 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory paginates via `Email/query` sorted by `receivedAt` descending then hydrates with `Email/get` using a fixed property set (`Id`, `MailboxIds`, `ThreadId`, `BlobId`, `Size`, `Keywords`, `MessageId`, `References`, `InReplyTo`, `ReceivedAt`). Changes use `Email/changes` against the cached state string and emit `Created` / `Updated` / `Destroyed` `ObjectChange`s. `inventory_partitioning` exposes a `Page { from, to }` partition for Email only.
-- `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` call with the inventory properties (`Id`, `Name`, `ParentId`, `Role`, `SortOrder`, totals, unread counts, `IsSubscribed`). Changes use `Mailbox/changes`.
-- `CursorScope::Type(ObjectType::Thread)` - changes use `Thread/changes`. Inventory is not implemented and emits a fatal-unsupported event explaining that thread inventory derives from email inventory.
-- `CursorScope::Query(_)` - changes use `Email/queryChanges` and surface `ScopeChange` events; inventory emits a fatal-unsupported event because registered query definitions are out of scope for the v1 trait.
+- `CursorScope::Type(ObjectType::Email)` - inventory paginates via `Email/query` (sorted `receivedAt` desc) then hydrates with `Email/get` using a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` against the cached state and emit Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes a `Page { from, to }` partition for Email only.
+- `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). Changes use `Mailbox/changes`.
+- `CursorScope::Type(ObjectType::Thread)` - changes use `Thread/changes`; inventory fatals (thread inventory derives from email inventory).
+- `CursorScope::Query(_)` - changes use `Email/queryChanges` and surface `ScopeChange` events; inventory fatals (registered query definitions are out of scope for the v1 trait).
 
 Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The change loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done(Some(Checkpoint::Change(...)))`. Shared `Mutex<Option<String>>` state caches are advanced compare-and-swap style so a stale writer does not clobber a newer state.
 
@@ -263,82 +248,59 @@ Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)
 
 ### Push and reconnect
 
-Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. The task connects to the JMAP WebSocket endpoint (`Client::connect_ws`, `dep:tokio-websockets/native-tls`), validates that the server accepted `Sec-WebSocket-Protocol: jmap`, re-applies the union of currently subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` notifications as `WatchEvent::Invalidated { hint: InvalidationHint { source: PushSource::JmapStateChange, payload: HintPayload::SpecificCursorScope(...) } }`. Per-message disconnects (and stream-level errors) emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
+Push runs through a single reader task spawned at factory `open()` when the session advertises WebSocket push. It connects via `Client::connect_ws` (`dep:tokio-websockets/native-tls`), validates `Sec-WebSocket-Protocol: jmap`, re-applies the union of subscribed `DataType`s, emits `WatchEvent::Reconnected`, and forwards `PushObject::StateChange` as `WatchEvent::Invalidated` with `PushSource::JmapStateChange` + `HintPayload::SpecificCursorScope(...)`. Per-message and stream-level errors emit `WatchEvent::Disconnected` and fall through to the reconnect loop.
 
-`ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff. Each successful reconnect resets `backoff` to `initial`; failures double `backoff` (saturating) up to `max`. Every exit error from the reader (connect failure or mid-stream drop) is classified through `into_account_error(_, JmapErrorContext::new(PushStream))`. Terminal-class errors (auth lost, capability changed, schema break) emit `WatchEvent::Terminated(AccountError)` and stop the reader so the engine reopens the account; retry-class errors emit `WatchEvent::Disconnected` and continue with the backoff loop. The previous shape (`Err(_) => break`/`disconnected`) erased every classification signal.
+`ReconnectPolicy { initial: 1s, max: 60s }` controls exponential backoff (reset on success, saturating-double on failure). Every reader exit error (connect failure or mid-stream drop) is classified through `into_account_error(_, JmapErrorContext::new(PushStream))`. Terminal-class errors (auth lost, capability changed, schema break) emit `WatchEvent::Terminated(AccountError)` and stop the reader so the engine reopens; retry-class errors emit `WatchEvent::Disconnected` and continue the backoff loop.
 
 `push_stream` is a thin broadcast subscriber. A `Lagged` broadcast slot emits a coalesced `WatchEvent::Invalidated { source: PushSource::Coalesced, payload: Unknown }` so the engine triggers a full re-poll rather than silently losing notifications.
 
 `subscribe` and `unsubscribe` build the union of all live `SubscriptionHandle` -> `DataTypeSet` mappings and call `Client::enable_push_ws` / `disable_push_ws`. `WebSocketNotConnected` maps to `Error::Unsupported` to signal the engine that push is unavailable.
 
-`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Deleted` for membership scope churn. Errors from the poll are classified through `into_account_error`; terminal classes (or engine-action classes) break out of the polling loop so the engine reopens the account, instead of the previous sleep-and-retry-silently behavior. The stream's element type is `ScopeLifecycle` (not `SyncEvent<_>`), so the protocol cannot emit a typed `Terminated(AccountError)` on this channel - ending the stream is the protocol-side signal the engine has to act on.
+`scope_lifecycle_stream` polls `Mailbox/changes` against the cached mailbox state and emits `ScopeLifecycle::Created` / `Renamed { old, new }` / `Deleted` for membership scope churn. Poll errors are classified through `into_account_error`; terminal/engine-action classes break the polling loop so the engine reopens. The element type is `ScopeLifecycle` (not `SyncEvent<_>`), so there is no typed `Terminated` on this channel - ending the stream is the protocol-side signal.
 
 ### Mutation pipeline
 
-`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets are accumulated into batches sized at `max_objects_in_set` clamped to `[1, 500]`. Each batch is sent as a single `Email/set` call gated by `ifInState(current_state)`. On a `stateMismatch` method error the pipeline probes the current state via `Email/get` (empty ids), updates the cached state, and retries the same batch once. Other errors abort the stream with `SyncEvent::Terminated(AccountError)`.
+`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets batch at `max_objects_in_set` clamped to `[1, 500]`; each batch is one `Email/set` gated by `ifInState(current_state)`. On `stateMismatch` the pipeline probes current state via `Email/get` (empty ids), updates the cache, and retries the batch once. Other errors abort with `SyncEvent::Terminated(AccountError)`.
 
-`IdempotencyKey` is currently accepted on the API surface but not used at the wire level - JMAP exposes no idempotency token, so replay safety stays `MutationReplaySafety::None` and the engine's read-back guard is the protection against double-apply.
+`IdempotencyKey` is accepted on the API surface but unused at the wire level (JMAP has no idempotency token), so replay safety stays `MutationReplaySafety::None`; the engine's read-back guard protects against double-apply.
 
-Per-id outcomes flow from `SetResponse::updated` / `destroyed`. An `ItemOutcome::Failed` with `AccountErrorKind::ConcurrencyConflict` is emitted when a `stateMismatch` survives the retry; other JMAP errors are mapped through `into_account_error` and surfaced as `ItemOutcome::Failed(BatchFailure { error, .. })`.
+Per-id outcomes flow from `SetResponse::updated` / `destroyed`. A `stateMismatch` surviving the retry emits `ItemOutcome::Failed` with `AccountErrorKind::ConcurrencyConflict`; other errors map through `into_account_error` into `ItemOutcome::Failed(BatchFailure { error, .. })`.
 
 `bulk_move` only accepts `MembershipScope::Mailbox`; other membership shapes emit a fatal-unsupported event before any wire write.
 
 ### PIM primitives and conveniences
 
-`pim.rs` implements the Stage 1 unified mail surface on the same JMAP client. Message and thread mutation primitives resolve `MutationTarget::Thread` through `Thread/get`, then issue `Email/set` patches against `mailboxIds`, `keywords`, or `$seen`; the set call is guarded with the cached `Email` state and retries once after `stateMismatch`. JMAP cannot express Gmail label membership, Graph categories, or Graph extended properties, so those primitives return `Error::Unsupported` and their capability flags are false.
+`pim.rs` implements the Stage 1 unified mail surface on the same JMAP client. Message/thread mutation resolves `MutationTarget::Thread` through `Thread/get`, then issues `Email/set` patches against `mailboxIds`, `keywords`, or `$seen`, guarded by the cached `Email` state with one `stateMismatch` retry. Gmail labels, Graph categories, and Graph extended properties return `Error::Unsupported` (flags false).
 
-Composition uses JMAP's native object model. `attachment_upload` stores bytes through the account upload URL and returns an opaque JMAP blob handle. `draft_create`, `draft_update`, and `draft_discard` use `Email/set` against the Drafts mailbox. `send_message` creates the draft `Email` and `EmailSubmission` in one JMAP request using a result reference, then either moves the message to Sent through `onSuccessUpdateEmail` or destroys it through `onSuccessDestroyEmail` when `save_to_sent == Some(false)`. `draft_send` submits an existing draft and moves it to Sent on success.
+Composition uses JMAP's native object model. `attachment_upload` stores bytes through the account upload URL and returns an opaque blob handle. `draft_create`/`draft_update`/`draft_discard` use `Email/set` against Drafts. `send_message` creates the draft `Email` and `EmailSubmission` in one request via a result reference, then moves it to Sent (`onSuccessUpdateEmail`) or destroys it (`onSuccessDestroyEmail`, when `save_to_sent == Some(false)`). `draft_send` submits an existing draft and moves it to Sent on success.
 
-Search maps the shared `SearchRequest` AST to `Email/query`; provider-specific query text is submitted as a JMAP `text` filter. `search_messages` returns native email ids. `search` uses `collapseThreads = true`, hydrates the returned emails' `threadId`, and returns thread ids. Page cursors are opaque position bytes.
+Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. Page cursors are opaque position bytes.
 
-Container CRUD is `Mailbox/get` / `Mailbox/set`. JMAP mailboxes are surfaced as `ContainerKind::Folder`, `ContainerId` and `native_id` are the native mailbox id, and `Mailbox.role` maps to `FolderRole` as: `inbox` -> INBOX, `sent` -> SENT, `drafts` -> DRAFT, `archive` -> archive, `trash` -> TRASH, `junk` -> SPAM. `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty mailbox deletion fails instead of silently dropping messages.
+Container CRUD is `Mailbox/get` / `Mailbox/set`. Mailboxes surface as `ContainerKind::Folder`; `ContainerId`/`native_id` are the native mailbox id; `Mailbox.role` maps to `FolderRole`: `inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `archive`->archive, `trash`->TRASH, `junk`->SPAM. `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than silently dropping messages.
 
-Settings primitives use `Identity/get` / `Identity/set`, `VacationResponse/get` / `set` on the `singleton` id, and `Quota/get` when the corresponding JMAP capability has a primary account. `identity_update` supports name, signatures, and reply-to; setting a default identity is unsupported because JMAP has no matching writeable field.
+Settings primitives use `Identity/get`/`set`, `VacationResponse/get`/`set` on the `singleton` id, and `Quota/get` when the capability has a primary account. `identity_update` supports name, signatures, and reply-to; default-identity selection is unsupported (no writeable JMAP field).
 
-`thread_hydrate` performs `Thread/get` followed by `Email/get` in thread order. `message_hydrate` selects headers, preview, or full body-value projections and returns attachment blob handles without pre-downloading bytes. `move_thread` and `delete_thread` are overridden because the trait defaults are unsupported: JMAP can add to the target mailbox and then remove from the source with the crate's owned handle; deleting from Trash destroys the thread's emails.
+`thread_hydrate` does `Thread/get` then `Email/get` in thread order. `message_hydrate` selects headers, preview, or full body-value projections and returns attachment blob handles without pre-downloading. `move_thread` and `delete_thread` override the unsupported trait defaults: add to the target mailbox then remove from the source; deleting from Trash destroys the thread's emails.
 
 ### Server-side filter scripts
 
 `filters.rs` maps Stage 2 filter primitives onto JMAP Sieve:
 
-- `filters_list` runs `SieveScript/query`, hydrates script metadata
-  with `SieveScript/get`, then downloads each script blob through the
-  account's download URL and returns `ServerFilter::Script`.
-- `filter_create` uploads the script body as `application/sieve`,
-  creates a `SieveScript` with that blob id, and uses
-  `onSuccessActivateScript` when the shared create payload asks for
-  an active script.
-- `filter_update` patches name and body through `SieveScript/set`;
-  body changes upload a fresh script blob first. `is_active` toggles
-  through `onSuccessActivateScript` /
-  `onSuccessDeactivateScript`.
-- `filter_delete` destroys the `SieveScript` id. Active-script
-  delete failures surface as normal JMAP set errors.
-- `filter_validate` uploads the script body and calls
-  `SieveScript/validate`; returned set errors become
-  `FilterValidation` error diagnostics instead of storing a script.
+- `filters_list` runs `SieveScript/query`, hydrates with `SieveScript/get`, downloads each blob via the download URL, returns `ServerFilter::Script`.
+- `filter_create` uploads the body as `application/sieve`, creates a `SieveScript` with that blob id, and uses `onSuccessActivateScript` when the create asks for an active script.
+- `filter_update` patches name and body through `SieveScript/set` (body changes upload a fresh blob first); `is_active` toggles via `onSuccessActivateScript` / `onSuccessDeactivateScript`.
+- `filter_delete` destroys the `SieveScript` id; active-script delete failures surface as normal set errors.
+- `filter_validate` uploads the body and calls `SieveScript/validate`; set errors become `FilterValidation` diagnostics instead of storing a script.
 
-Typed `ServerFilterCreate::Rule` and `ServerFilterPatch::Rule` are
-not supported by JMAP and return `Unsupported`.
+Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` are unsupported and return `Unsupported`.
 
 ### HTTP redirect handling
 
-`ReqwestTransport` delegates redirects to `bifrost-net` with JMAP's
-trusted-host allowlist and five-hop limit. The factory-provided engine
-account id tags the attached transport. `bifrost-net` strips
-`Authorization` on every cross-host hop, including Basic-auth headers
-that `ReqwestTransport` injects directly into the request `HeaderMap`.
+`ReqwestTransport` delegates redirects to `bifrost-net` with JMAP's trusted-host allowlist and five-hop limit; the factory-provided engine account id tags the attached transport. `bifrost-net` strips `Authorization` on every cross-host hop, including Basic-auth headers `ReqwestTransport` injects directly into the request `HeaderMap`.
 
 ### Error translation
 
-`sync/error.rs::into_account_error(error, ctx)` is the single
-translation boundary: it consumes `crate::Error` plus a
-`JmapErrorContext { operation, scope, .. }` and emits an
-`AccountError` via `AccountErrorBuilder`. The builder routes
-`(AccountErrorKind, Cause)` plus operation, scope, and any
-`AttemptCause` through `bifrost-types::recovery::derive` so the
-final `RecoveryClass` is computed centrally - the JMAP crate
-no longer carries a private `to_recovery` table.
+`sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`. The builder routes `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive`, so `RecoveryClass` is computed centrally (no private `to_recovery` table).
 
 Mapping highlights for the JMAP signals the central table reads:
 
@@ -357,39 +319,26 @@ Mapping highlights for the JMAP signals the central table reads:
 - `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`
   from documented JMAP behavior.
 - `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
-  `Engine(RestartAccount)`. `EngineDirective` has no
-  `CapabilityChanged` variant; capability shifts route through full
-  account reopen.
+  `Engine(RestartAccount)` (no `CapabilityChanged` directive; shifts route through full reopen).
 - `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`
   -> `ProviderContractViolation`.
 - HTTP-only status fallbacks (401/403/429/5xx) on bare
   `Problem` -> `Authentication` / `Server(RateLimited)` /
   `Server(Unavailable)` per the central rules.
-- `Transport(_)` -> `Transport(Network)` with
-  `AttemptCause::transmission_state` derived from where the wire
-  failure occurred; the central mapping picks `Retry::SameRequest`
-  for idempotent ops and `Reconcile` for non-idempotent ops
-  caught mid-flight.
-- WebSocket errors split by handshake position. The crate carries
-  `Error::WebSocketHandshake(tokio_websockets::Error)` for
-  pre-handshake failures from `Client::connect_ws` and
-  `Error::WebSocketRuntime(tokio_websockets::Error)` for post-
-  handshake stream failures. There is no blanket
-  `From<tokio_websockets::Error>` impl; call sites map explicitly
-  so the conversion boundary can attach the right `TransportCause` +
-  `AttemptCause` pair. `WebSocketHandshake` -> `Transport(Network)` +
-  `Attempt(Unsent)`; `WebSocketRuntime` -> `Protocol(PartialResponse)`
-  + `Attempt(Acknowledged)`.
+- `Transport(_)` -> `Transport(Network)` with `AttemptCause::transmission_state` from where the wire failure occurred; the central mapping picks `Retry::SameRequest` for idempotent ops and `Reconcile` for non-idempotent ops caught mid-flight.
+- WebSocket errors split by handshake position: `Error::WebSocketHandshake`
+  (pre-handshake, from `Client::connect_ws`) -> `Transport(Network)` +
+  `Attempt(Unsent)`; `Error::WebSocketRuntime` (post-handshake stream) ->
+  `Protocol(PartialResponse)` + `Attempt(Acknowledged)`. No blanket
+  `From<tokio_websockets::Error>` impl; call sites map explicitly to attach
+  the right `TransportCause` + `AttemptCause`.
 - `NoPrimaryAccount` -> `Authentication(ReauthorizationRequired)`
   -> `AuthLost`.
 - Local shape errors (`Parse`, `Set`, `CallNotFound`, `IdNotFound`,
   `EmptyResponse`, `NotParsable`, `InvalidUrl`) -> `Request
   (Malformed)` -> `ClientBug`.
 
-Cursor-decode failures from `cursor::envelope` (protocol mismatch,
-unknown envelope, malformed payload) build their own AccountError
-with `SyncState(SchemaIncompatible)`, which the central mapping
-routes to `Engine(SchemaIncompatible)`.
+Cursor-decode failures from `cursor::envelope` (protocol mismatch, unknown envelope, malformed payload) build their own AccountError with `SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`.
 
 Known JMAP `SetErrorType` vocabulary lands on typed
 `WireCause::Jmap(JmapMethod::*)` variants
@@ -416,12 +365,9 @@ not hard-coded to `Discover`.
 - `Thread` and `Query` inventory are not implemented and emit fatal-unsupported events. Thread changes and query changes are supported.
 - Raw-MIME hydration projections are not supported; only `Projection::FlagsOnly` and `Projection::Metadata` work.
 - Push is only available via the JMAP WebSocket subprotocol. There is no HTTP push or EventSource fallback in the account layer.
-- `BlobRangeSupport::No` and `blob_digest_pre_download: false`. `open_blob_range` returns a fatal `Error::Unsupported` even when the handle advertises range support, because the existing transport has no `Range` header hook.
-- `MutationReplaySafety::None` and `IdempotencyKey` is currently a no-op on the wire. The engine's read-back guard is the only lost-update protection.
-- `bulk_move` only supports `MembershipScope::Mailbox`.
-- `inventory_partitioning` only supports `Page { from, to }` for `Email`; all other scope/partition combinations fatal as unsupported.
-- Gmail label membership, Graph categories, and Graph extended properties are intentionally unsupported in JMAP.
-- Identity default selection cannot be updated through JMAP.
-- JMAP attachment handles preserve blob id and MIME type, but uploaded attachment filenames are not represented by the shared `AttachmentHandle` type.
-- Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve
-  scripts through the Account filter surface instead.
+- `BlobRangeSupport::No`, `blob_digest_pre_download: false`. `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (transport has no `Range` hook).
+- `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op. The read-back guard is the only lost-update protection.
+- `bulk_move` only supports `MembershipScope::Mailbox`; `inventory_partitioning` only `Page { from, to }` for `Email` (others fatal).
+- Gmail labels, Graph categories/extended properties, and identity-default selection are unsupported in JMAP.
+- Attachment handles keep blob id + MIME type, but uploaded filenames are not represented by `AttachmentHandle`.
+- Typed filter-rule CRUD is unsupported; JMAP exposes literal Sieve scripts through the Account filter surface instead.

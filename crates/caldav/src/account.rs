@@ -773,8 +773,13 @@ impl Account for CalDavAccount {
             };
             let reply = rsvp_reply_ical(&current, status, &rsvp_email)
                 .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;
+            let organizer_email = current
+                .organizer
+                .as_ref()
+                .map(|organizer| organizer.email.clone())
+                .ok_or_else(|| unsupported_error(AccountOperation::EventRsvp))?;
             client
-                .post_schedule_reply(&schedule_outbox_url, reply)
+                .post_schedule_reply(&schedule_outbox_url, &rsvp_email, &organizer_email, reply)
                 .await?;
             let patch = rsvp_patch(&current, status, &rsvp_email)
                 .map_err(|_| unsupported_error(AccountOperation::EventRsvp))?;

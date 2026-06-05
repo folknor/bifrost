@@ -149,8 +149,9 @@ pub(crate) fn update(
             validate_shared_recurrence(recurrence, AccountOperation::EventUpdate)?;
         }
         let id = CalendarEventId::new(event.0);
+        let jmap_patch = jmap_patch_from_event_patch(&patch, AccountOperation::EventUpdate)?;
         let mut set = CalendarEventSet::new();
-        set.update_item(id.clone(), jmap_patch_from_event_patch(&patch));
+        set.update_item(id.clone(), jmap_patch);
         let mut response = calendars
             .call(set)
             .await
@@ -378,7 +379,10 @@ fn jmap_create_from_event(event: &EventCreate) -> CalendarEventCreate {
     create
 }
 
-fn jmap_patch_from_event_patch(patch: &EventPatch) -> CalendarEventPatch {
+fn jmap_patch_from_event_patch(
+    patch: &EventPatch,
+    operation: AccountOperation,
+) -> Result<CalendarEventPatch, AccountError> {
     let mut out = CalendarEventPatch::default();
     if let Some(calendar) = &patch.calendar_id {
         out.calendar_ids([calendar.0.clone()]);
@@ -413,9 +417,25 @@ fn jmap_patch_from_event_patch(patch: &EventPatch) -> CalendarEventPatch {
             }
         }
     }
-    if let Some(start) = &patch.start {
-        out.start(jmap_time_from_shared(start, false));
-        out.time_zone(start.timezone.clone());
+    // JSCalendar models the end as `start` + `duration`; there is no
+    // standalone end property. Recomputing one bound requires the other, so a
+    // patch carrying only `start` or only `end` cannot be applied losslessly
+    // without reading the current event. Reject rather than silently keep a
+    // stale duration (start-only) or drop the change entirely (end-only).
+    match (&patch.start, &patch.end) {
+        (Some(start), Some(end)) => {
+            let all_day = patch.is_all_day.unwrap_or(false);
+            out.start(jmap_time_from_shared(start, all_day));
+            out.time_zone(start.timezone.clone());
+            out.duration(duration(&start.value, &end.value));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(unsupported(
+                operation,
+                "JMAP event time patches must set both start and end; JSCalendar derives the end from start + duration",
+            ));
+        }
+        (None, None) => {}
     }
     if let Some(is_all_day) = patch.is_all_day {
         out.show_without_time(is_all_day);
@@ -449,7 +469,7 @@ fn jmap_patch_from_event_patch(patch: &EventPatch) -> CalendarEventPatch {
             out.recurrence_overrides(overrides);
         }
     }
-    out
+    Ok(out)
 }
 
 fn jmap_rsvp_patch_from_participants(
@@ -514,6 +534,7 @@ fn rsvp_participant_id<'a>(
 }
 
 fn write_event_create(target: &mut CalendarEventCreate, event: &EventCreate) {
+    target.set_property("@type", json!("Event"));
     target.calendar_ids([event.calendar_id.0.clone()]);
     if let Some(title) = &event.title {
         target.title(title.clone());
@@ -600,6 +621,7 @@ fn validate_shared_recurrence(
 
 fn jmap_recurrence_rule_from_rrule(rrule: &str) -> Option<Value> {
     let mut object = Map::new();
+    object.insert("@type".to_string(), json!("RecurrenceRule"));
     for part in rrule.split(';') {
         let (key, value) = part.split_once('=')?;
         match key.to_ascii_uppercase().as_str() {
@@ -616,6 +638,16 @@ fn jmap_recurrence_rule_from_rrule(rrule: &str) -> Option<Value> {
                 object.insert("count".to_string(), json!(value.parse::<u64>().ok()?));
             }
             "UNTIL" => {
+                // JSCalendar `until` is a LocalDateTime: no `Z`, no offset.
+                // An RFC 5545 UTC `UNTIL=...Z` cannot be normalized to local
+                // time without the event's timeZone, which this mapper does
+                // not see, so reject it (caught by `validate_shared_recurrence`
+                // before payload construction) rather than emit a non-conformant
+                // `Z`-suffixed `until`. Floating (no-`Z`) and date-only forms
+                // pass through unchanged.
+                if value.ends_with('Z') || value.ends_with('z') {
+                    return None;
+                }
                 object.insert("until".to_string(), Value::String(value.to_string()));
             }
             "BYDAY" => {
@@ -669,6 +701,7 @@ fn jmap_by_day(value: &str) -> Option<Vec<Value>> {
         .map(|day| {
             let (nth, day) = split_by_day(day)?;
             let mut object = Map::new();
+            object.insert("@type".to_string(), json!("NDay"));
             object.insert("day".to_string(), Value::String(day.to_ascii_lowercase()));
             if let Some(nth) = nth {
                 object.insert("nthOfPeriod".to_string(), json!(nth));
@@ -729,6 +762,7 @@ fn participants_from_attendees(attendees: &[EventAttendee]) -> Map<String, Value
         .enumerate()
         .map(|(index, attendee)| {
             let mut value = Map::new();
+            value.insert("@type".to_string(), json!("Participant"));
             value.insert("email".to_string(), json!(attendee.email));
             if let Some(name) = &attendee.name {
                 value.insert("name".to_string(), json!(name));
@@ -749,6 +783,7 @@ fn participants_from_event_create(event: &EventCreate) -> Map<String, Value> {
     let mut participants = Map::new();
     if let Some(organizer) = &event.organizer {
         let mut value = Map::new();
+        value.insert("@type".to_string(), json!("Participant"));
         value.insert("email".to_string(), json!(organizer.email));
         if let Some(name) = &organizer.name {
             value.insert("name".to_string(), json!(name));
@@ -766,7 +801,6 @@ fn roles_from_attendee(role: AttendeeRole) -> Option<Map<String, Value>> {
         AttendeeRole::Optional => "optional",
         AttendeeRole::Resource => "resource",
         AttendeeRole::Chair => "chair",
-        AttendeeRole::Unknown => return None,
         _ => return None,
     };
     let mut roles = Map::new();
@@ -1021,7 +1055,6 @@ fn jmap_event_status(value: EventStatus) -> &'static str {
     match value {
         EventStatus::Tentative => "tentative",
         EventStatus::Cancelled => "cancelled",
-        EventStatus::Confirmed | EventStatus::Unknown => "confirmed",
         _ => "confirmed",
     }
 }
@@ -1037,9 +1070,6 @@ fn availability(value: Option<&str>) -> EventAvailability {
 fn jmap_availability(value: EventAvailability) -> &'static str {
     match value {
         EventAvailability::Free => "free",
-        EventAvailability::Busy | EventAvailability::Tentative | EventAvailability::OutOfOffice => {
-            "busy"
-        }
         _ => "busy",
     }
 }
@@ -1299,13 +1329,119 @@ mod tests {
     }
 
     #[test]
-    fn event_patch_clears_nullable_fields_with_null() {
-        let patch = jmap_patch_from_event_patch(&EventPatch {
-            title: Some(None),
-            description: Some(None),
-            location: Some(None),
-            ..EventPatch::default()
+    fn create_payload_stamps_jscalendar_types() {
+        let create = jmap_create_from_event(&EventCreate {
+            calendar_id: CalendarId("cal".to_string()),
+            title: None,
+            description: None,
+            location: Some("Room".to_string()),
+            start: time("2026-06-02T12:00:00Z"),
+            end: time("2026-06-02T13:00:00Z"),
+            is_all_day: false,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            organizer: None,
+            attendees: vec![EventAttendee {
+                email: "a@example.test".to_string(),
+                name: None,
+                role: AttendeeRole::Required,
+                status: RsvpStatus::NeedsAction,
+            }],
+            recurrence: EventRecurrence {
+                rrule: Some("FREQ=WEEKLY;BYDAY=MO".to_string()),
+                rdate: Vec::new(),
+                exdate: Vec::new(),
+                recurrence_id: None,
+            },
         });
+
+        assert_eq!(create.properties.get("@type"), Some(&json!("Event")));
+        assert_eq!(
+            create.properties["locations"]["loc1"]["@type"],
+            json!("Location")
+        );
+        assert_eq!(
+            create.properties["participants"]["p0"]["@type"],
+            json!("Participant")
+        );
+        assert_eq!(
+            create.properties["recurrenceRules"][0]["@type"],
+            json!("RecurrenceRule")
+        );
+        assert_eq!(
+            create.properties["recurrenceRules"][0]["byDay"][0]["@type"],
+            json!("NDay")
+        );
+    }
+
+    #[test]
+    fn event_patch_recomputes_duration_from_both_bounds() {
+        let patch = jmap_patch_from_event_patch(
+            &EventPatch {
+                start: Some(time("2026-06-02T12:00:00Z")),
+                end: Some(time("2026-06-02T13:30:00Z")),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("patch");
+
+        assert_eq!(
+            patch.properties.get("start").and_then(Value::as_str),
+            Some("2026-06-02T12:00:00")
+        );
+        assert_eq!(
+            patch.properties.get("duration").and_then(Value::as_str),
+            Some("PT5400S")
+        );
+    }
+
+    #[test]
+    fn event_patch_rejects_single_bound_time_change() {
+        for patch in [
+            EventPatch {
+                start: Some(time("2026-06-02T12:00:00Z")),
+                ..EventPatch::default()
+            },
+            EventPatch {
+                end: Some(time("2026-06-02T13:00:00Z")),
+                ..EventPatch::default()
+            },
+        ] {
+            let error = jmap_patch_from_event_patch(&patch, AccountOperation::EventUpdate)
+                .expect_err("single-bound time patch should reject");
+            assert!(matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+            ));
+        }
+    }
+
+    #[test]
+    fn recurrence_rule_rejects_utc_until() {
+        assert!(jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101T000000Z").is_none());
+        // Floating and date-only UNTIL pass through unchanged.
+        let floating = jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101T000000")
+            .expect("floating until");
+        assert_eq!(floating["until"].as_str(), Some("20260101T000000"));
+        let date_only =
+            jmap_recurrence_rule_from_rrule("FREQ=DAILY;UNTIL=20260101").expect("date until");
+        assert_eq!(date_only["until"].as_str(), Some("20260101"));
+    }
+
+    #[test]
+    fn event_patch_clears_nullable_fields_with_null() {
+        let patch = jmap_patch_from_event_patch(
+            &EventPatch {
+                title: Some(None),
+                description: Some(None),
+                location: Some(None),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("patch");
 
         assert_eq!(patch.properties.get("title"), Some(&Value::Null));
         assert_eq!(patch.properties.get("description"), Some(&Value::Null));
@@ -1347,25 +1483,33 @@ mod tests {
 
     #[test]
     fn recurrence_patch_clears_or_writes_recurrence_rules() {
-        let clear = jmap_patch_from_event_patch(&EventPatch {
-            recurrence: Some(EventRecurrence::default()),
-            ..EventPatch::default()
-        });
+        let clear = jmap_patch_from_event_patch(
+            &EventPatch {
+                recurrence: Some(EventRecurrence::default()),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("patch");
         assert_eq!(clear.properties.get("recurrenceRules"), Some(&Value::Null));
         assert_eq!(
             clear.properties.get("recurrenceOverrides"),
             Some(&Value::Null)
         );
 
-        let write = jmap_patch_from_event_patch(&EventPatch {
-            recurrence: Some(EventRecurrence {
-                rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
-                rdate: vec!["2026-06-03T12:00:00".to_string()],
-                exdate: vec!["2026-06-04T12:00:00".to_string()],
-                recurrence_id: None,
-            }),
-            ..EventPatch::default()
-        });
+        let write = jmap_patch_from_event_patch(
+            &EventPatch {
+                recurrence: Some(EventRecurrence {
+                    rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
+                    rdate: vec!["2026-06-03T12:00:00".to_string()],
+                    exdate: vec!["2026-06-04T12:00:00".to_string()],
+                    recurrence_id: None,
+                }),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("patch");
         let rules = write.properties["recurrenceRules"]
             .as_array()
             .expect("rules array");
@@ -1624,11 +1768,15 @@ mod tests {
         assert_eq!(visibility(Some("secret")), EventVisibility::Confidential);
         assert_eq!(jmap_visibility(EventVisibility::Confidential), "secret");
 
-        let patch = jmap_patch_from_event_patch(&EventPatch {
-            visibility: Some(EventVisibility::Private),
-            status: Some(EventStatus::Cancelled),
-            ..EventPatch::default()
-        });
+        let patch = jmap_patch_from_event_patch(
+            &EventPatch {
+                visibility: Some(EventVisibility::Private),
+                status: Some(EventStatus::Cancelled),
+                ..EventPatch::default()
+            },
+            AccountOperation::EventUpdate,
+        )
+        .expect("patch");
         assert_eq!(patch.properties.get("privacy"), Some(&json!("private")));
         assert_eq!(patch.properties.get("status"), Some(&json!("cancelled")));
     }

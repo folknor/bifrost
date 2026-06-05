@@ -352,14 +352,25 @@ impl CalDavClient {
     pub(crate) async fn post_schedule_reply(
         &self,
         outbox_url: &str,
+        originator: &str,
+        recipient: &str,
         body: String,
     ) -> Result<(), AccountError> {
-        let request = self
+        // RFC 6638 outbox POSTs route iTIP via the `Originator` (the
+        // replying calendar user) and `Recipient` (the organizer) headers;
+        // servers reject the POST without them.
+        let mut request = self
             .http
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers())
-            .body(body);
+            .headers(self.auth_headers());
+        if let Ok(value) = HeaderValue::from_str(&schedule_address(originator)) {
+            request = request.header("Originator", value);
+        }
+        if let Ok(value) = HeaderValue::from_str(&schedule_address(recipient)) {
+            request = request.header("Recipient", value);
+        }
+        let request = request.body(body);
         self.send_status_request(request, AccountOperation::EventRsvp)
             .await
     }
@@ -493,6 +504,16 @@ fn mailto_email(href: &str) -> Option<String> {
         .or_else(|| href.strip_prefix("MAILTO:"))
         .filter(|email| email.contains('@'))
         .map(str::to_ascii_lowercase)
+}
+
+fn schedule_address(address: &str) -> String {
+    // iTIP calendar-user addresses are URIs; bare emails (the form both
+    // discovery and the organizer field carry) become `mailto:` URIs.
+    if address.contains(':') {
+        address.to_string()
+    } else {
+        format!("mailto:{address}")
+    }
 }
 
 fn calendar_query_body(start: Option<&str>, end: Option<&str>) -> String {
@@ -890,5 +911,18 @@ mod tests {
             Some("ada@example.test")
         );
         assert_eq!(mailto_email("/principals/ada"), None);
+    }
+
+    #[test]
+    fn schedule_address_wraps_bare_email_as_mailto_uri() {
+        assert_eq!(
+            schedule_address("ada@example.test"),
+            "mailto:ada@example.test"
+        );
+        assert_eq!(
+            schedule_address("mailto:ada@example.test"),
+            "mailto:ada@example.test"
+        );
+        assert_eq!(schedule_address("urn:uuid:ada"), "urn:uuid:ada");
     }
 }

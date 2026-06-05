@@ -71,8 +71,8 @@ pub(crate) fn event_from_ical(
         end,
         is_all_day,
         status: event_status(props.first("STATUS")),
-        availability: EventAvailability::Unknown,
-        visibility: EventVisibility::Default,
+        availability: event_availability(props.first("TRANSP")),
+        visibility: event_visibility(props.first("CLASS")),
         self_response: RsvpStatus::Unknown,
         organizer,
         attendees,
@@ -177,6 +177,16 @@ pub(crate) fn patch_to_ical(
     if let Some(status) = patch.status {
         replacements.push(format!("STATUS:{}", ical_event_status(status)));
         replace_names.push("STATUS");
+    }
+    if patch.availability.is_some() {
+        replacements.push(format!("TRANSP:{}", transparency(merged.availability)));
+        replace_names.push("TRANSP");
+    }
+    if patch.visibility.is_some() {
+        if let Some(classification) = classification(merged.visibility) {
+            replacements.push(format!("CLASS:{classification}"));
+        }
+        replace_names.push("CLASS");
     }
     if patch.recurrence.is_some() {
         push_recurrence(&mut replacements, &merged.recurrence);
@@ -637,6 +647,23 @@ fn push_recurrence(lines: &mut Vec<String>, recurrence: &EventRecurrence) {
     }
 }
 
+fn event_availability(value: Option<&str>) -> EventAvailability {
+    match value.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "TRANSPARENT" => EventAvailability::Free,
+        "OPAQUE" => EventAvailability::Busy,
+        _ => EventAvailability::Unknown,
+    }
+}
+
+fn event_visibility(value: Option<&str>) -> EventVisibility {
+    match value.unwrap_or_default().to_ascii_uppercase().as_str() {
+        "PUBLIC" => EventVisibility::Public,
+        "PRIVATE" => EventVisibility::Private,
+        "CONFIDENTIAL" => EventVisibility::Confidential,
+        _ => EventVisibility::Default,
+    }
+}
+
 fn transparency(availability: EventAvailability) -> &'static str {
     match availability {
         EventAvailability::Free => "TRANSPARENT",
@@ -730,11 +757,15 @@ fn fold_ical_lines(lines: Vec<String>) -> String {
     let mut folded = String::new();
     for line in lines {
         let mut current = String::new();
+        let mut prefix = 0;
         for ch in line.chars() {
-            if current.len() + ch.len_utf8() > 75 {
+            if prefix + current.len() + ch.len_utf8() > 75 {
                 folded.push_str(&current);
                 folded.push_str("\r\n ");
                 current.clear();
+                // The folding space occupies one octet of the 75-octet
+                // budget on every continuation line.
+                prefix = 1;
             }
             current.push(ch);
         }
@@ -1126,6 +1157,89 @@ mod tests {
     }
 
     #[test]
+    fn parses_transparency_and_classification() {
+        let event = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nTRANSP:TRANSPARENT\r\nCLASS:CONFIDENTIAL\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.availability, EventAvailability::Free);
+        assert_eq!(event.visibility, EventVisibility::Confidential);
+    }
+
+    #[test]
+    fn missing_transparency_and_classification_default_to_unknown_and_default() {
+        let event = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.availability, EventAvailability::Unknown);
+        assert_eq!(event.visibility, EventVisibility::Default);
+    }
+
+    #[test]
+    fn patch_replaces_transparency_and_classification() {
+        let current = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            Some("e1".to_string()),
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Keep\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nTRANSP:OPAQUE\r\nCLASS:PUBLIC\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                availability: Some(EventAvailability::Free),
+                visibility: Some(EventVisibility::Private),
+                ..EventPatch::default()
+            },
+        )
+        .expect("availability/visibility patch should serialize");
+
+        assert!(body.contains("TRANSP:TRANSPARENT"));
+        assert!(!body.contains("TRANSP:OPAQUE"));
+        assert!(body.contains("CLASS:PRIVATE"));
+        assert!(!body.contains("CLASS:PUBLIC"));
+        assert!(body.contains("SUMMARY:Keep"));
+
+        // Round-trips back to the modeled values written by the patch.
+        let updated = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &body,
+        );
+        assert_eq!(updated.availability, EventAvailability::Free);
+        assert_eq!(updated.visibility, EventVisibility::Private);
+    }
+
+    #[test]
+    fn patch_clearing_visibility_to_default_strips_class() {
+        let current = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nCLASS:PRIVATE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                visibility: Some(EventVisibility::Default),
+                ..EventPatch::default()
+            },
+        )
+        .expect("visibility clear should serialize");
+
+        assert!(!body.contains("CLASS:"));
+    }
+
+    #[test]
     fn patch_clear_removes_only_targeted_scalar_property() {
         let current = event_from_ical(
             "/cal/one.ics".to_string(),
@@ -1309,7 +1423,19 @@ mod tests {
         );
 
         assert!(body.contains("\r\n "));
+        // Every physical line, including space-prefixed continuation
+        // lines, stays within the RFC 5545 75-octet budget.
         assert!(body.lines().all(|line| line.len() <= 75));
+        assert!(body.lines().filter(|line| line.starts_with(' ')).count() >= 1);
+    }
+
+    #[test]
+    fn fold_counts_continuation_space_in_octet_budget() {
+        // 200 'A's forces multiple continuation lines; each continuation
+        // line's leading space must count toward the 75-octet limit.
+        let folded = fold_ical_lines(vec![format!("SUMMARY:{}", "A".repeat(200))]);
+        assert!(folded.lines().all(|line| line.len() <= 75));
+        assert!(folded.lines().filter(|line| line.starts_with(' ')).count() >= 2);
     }
 
     #[test]

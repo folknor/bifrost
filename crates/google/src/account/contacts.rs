@@ -185,10 +185,10 @@ async fn update_contact_photo(
 }
 
 fn update_contact_photo_url(encoded_resource_name: &str) -> String {
-    format!(
-        "{PEOPLE_API_BASE}/{encoded_resource_name}:updateContactPhoto?personFields={}",
-        bifrost_net::url::encode_component(PERSON_FIELDS)
-    )
+    // `updateContactPhoto` takes its field mask in the request body, not the
+    // query string; the response is discarded here, so no `personFields`
+    // query param is needed.
+    format!("{PEOPLE_API_BASE}/{encoded_resource_name}:updateContactPhoto")
 }
 
 fn delete_contact_photo_url(encoded_resource_name: &str) -> String {

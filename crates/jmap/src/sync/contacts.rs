@@ -354,7 +354,7 @@ fn jmap_patch_from_contact_patch(
         match photo_url {
             Some(url) => {
                 let mut media = Map::new();
-                media.insert("photo".to_string(), json!({"kind": "uri", "uri": url}));
+                media.insert("photo".to_string(), photo_media_object(url));
                 out.set_property("media", Value::Object(media));
             }
             None => {
@@ -366,6 +366,7 @@ fn jmap_patch_from_contact_patch(
 }
 
 fn write_contact_create(target: &mut Map<String, Value>, contact: &ContactCreate) {
+    target.insert("@type".to_string(), Value::String("Card".to_string()));
     target.insert("kind".to_string(), Value::String("individual".to_string()));
     if let Some(address_book_id) = &contact.address_book_id {
         target.insert(
@@ -404,15 +405,22 @@ fn write_contact_create(target: &mut Map<String, Value>, contact: &ContactCreate
         target.insert("notes".to_string(), Value::Object(notes_object(notes)));
     }
     if let Some(url) = &contact.photo_url {
-        target.insert(
-            "media".to_string(),
-            json!({"photo": {"kind": "uri", "uri": url}}),
-        );
+        let mut media = Map::new();
+        media.insert("photo".to_string(), photo_media_object(url));
+        target.insert("media".to_string(), Value::Object(media));
     }
+}
+
+/// JSContact (RFC 9610) media resource for a photo. `kind` is the resource
+/// role (`photo`), not a URI marker; the read path filters on it, so a wrong
+/// value reads back as no photo.
+fn photo_media_object(url: &str) -> Value {
+    json!({"@type": "Media", "kind": "photo", "uri": url})
 }
 
 fn name_object(display_name: &str) -> Map<String, Value> {
     let mut name = Map::new();
+    name.insert("@type".to_string(), json!("Name"));
     name.insert("full".to_string(), Value::String(display_name.to_string()));
     name
 }
@@ -425,6 +433,7 @@ fn email_object(emails: &[ContactEmail]) -> Map<String, Value> {
             (
                 format!("e{idx}"),
                 json!({
+                    "@type": "EmailAddress",
                     "address": email.value,
                     "contexts": context_object(email.kind.as_deref()),
                     "pref": email.is_primary.then_some(1),
@@ -443,6 +452,7 @@ fn phone_object(phones: &[ContactPhone]) -> Map<String, Value> {
             (
                 format!("p{idx}"),
                 json!({
+                    "@type": "Phone",
                     "number": phone.value,
                     "contexts": contexts,
                     "features": features,
@@ -460,6 +470,7 @@ fn organization_object(orgs: &[ContactOrganization]) -> Map<String, Value> {
             (
                 format!("o{idx}"),
                 json!({
+                    "@type": "Organization",
                     "name": org.name,
                     "title": org.title,
                 }),
@@ -476,6 +487,7 @@ fn address_object(addresses: &[ContactAddress]) -> Map<String, Value> {
             (
                 format!("a{idx}"),
                 json!({
+                    "@type": "Address",
                     "contexts": context_object(address.kind.as_deref()),
                     "pref": address.is_primary.then_some(1),
                     "full": address.formatted.clone(),
@@ -492,7 +504,7 @@ fn address_object(addresses: &[ContactAddress]) -> Map<String, Value> {
 
 fn notes_object(notes: &str) -> Map<String, Value> {
     let mut out = Map::new();
-    out.insert("n0".to_string(), json!({"note": notes}));
+    out.insert("n0".to_string(), json!({"@type": "Note", "note": notes}));
     out
 }
 
@@ -761,6 +773,58 @@ mod tests {
         assert_eq!(
             contact.photo_url.as_deref(),
             Some("https://example.test/a.jpg")
+        );
+    }
+
+    #[test]
+    fn contact_create_writes_card_type_and_photo_kind() {
+        let create = jmap_create_from_contact(&ContactCreate {
+            display_name: Some("Ada".to_string()),
+            photo_url: Some("https://example.test/a.jpg".to_string()),
+            ..ContactCreate::default()
+        });
+
+        assert_eq!(create.properties.get("@type"), Some(&json!("Card")));
+        assert_eq!(create.properties["name"]["@type"], json!("Name"));
+        let media = create.properties["media"]["photo"]
+            .as_object()
+            .expect("photo media object");
+        assert_eq!(media.get("kind"), Some(&json!("photo")));
+        assert_eq!(media.get("uri"), Some(&json!("https://example.test/a.jpg")));
+    }
+
+    #[test]
+    fn contact_photo_round_trips_through_write_path() {
+        // Exercise the write output through the read path rather than
+        // hand-crafted JSON, so a wrong `kind` would surface as None.
+        let create = jmap_create_from_contact(&ContactCreate {
+            photo_url: Some("https://example.test/a.jpg".to_string()),
+            ..ContactCreate::default()
+        });
+        let media = create
+            .properties
+            .get("media")
+            .and_then(Value::as_object)
+            .expect("media object");
+
+        assert_eq!(
+            photo_url(Some(media)).as_deref(),
+            Some("https://example.test/a.jpg")
+        );
+
+        let patch = jmap_patch_from_contact_patch(
+            &ContactPatch {
+                photo_url: Some(Some("https://example.test/b.jpg".to_string())),
+                ..ContactPatch::default()
+            },
+            None,
+        );
+        let media = patch.properties["media"]
+            .as_object()
+            .expect("patch media object");
+        assert_eq!(
+            photo_url(Some(media)).as_deref(),
+            Some("https://example.test/b.jpg")
         );
     }
 

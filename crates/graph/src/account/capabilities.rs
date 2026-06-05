@@ -165,6 +165,15 @@ mod tests {
         assert!(caps.pim_methods.contact_delete);
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
+        assert!(caps.pim_methods.calendars_list);
+        assert!(caps.pim_methods.events_in_range);
+        assert!(caps.pim_methods.event_get);
+        assert!(caps.pim_methods.event_create);
+        assert!(caps.pim_methods.event_update);
+        assert!(caps.pim_methods.event_delete);
+        assert!(caps.pim_methods.event_rsvp);
+        assert!(caps.pim_methods.event_search);
+        assert!(caps.pim_methods.event_autocomplete);
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Category);
         assert!(caps.conveniences.replied_via_extended_property);
         assert!(caps.conveniences.forwarded_via_extended_property);

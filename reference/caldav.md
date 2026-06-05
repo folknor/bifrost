@@ -50,9 +50,12 @@ Supported calendar primitives:
 - `event_update` - fetches the current event, applies the shared
   `EventPatch`, and writes the replacement resource with `If-Match`
   when an etag was present. When the current resource carried raw
-  iCalendar data, updates replace only modeled VEVENT properties present
-  in the patch so untouched properties such as organizer, status,
-  transparency, and class are preserved. Non-VEVENT components such as
+  iCalendar data, updates rewrite each VEVENT property the patch carries -
+  summary, description, location, start/end, status, transparency
+  (TRANSP), class (CLASS), recurrence, and attendees - while preserving
+  untouched properties such as organizer. A `visibility` patch that
+  resolves to `Default` strips any existing CLASS rather than writing one,
+  matching the create path. Non-VEVENT components such as
   VTIMEZONE are preserved on raw-backed updates. Multi-VEVENT recurrence
   override components are preserved for scalar patches, but recurrence
   replacement is rejected for resources with override VEVENTs because the
@@ -62,9 +65,12 @@ Supported calendar primitives:
   discovered from the principal's `calendar-user-address-set`, to rewrite
   the matching attendee's participation status. When the principal
   exposes `schedule-outbox-URL`, RSVP first posts an iTIP `METHOD:REPLY`
-  to that outbox and then applies the same raw-preserving replacement
-  path to the local resource. Accounts without an identifiable attendee
-  or schedule outbox return `Unsupported`.
+  to that outbox - with the RFC 6638 `Originator` (the replying user's
+  calendar address) and `Recipient` (the organizer's address) headers,
+  each normalized to a `mailto:` URI when bare - and then applies the same
+  raw-preserving replacement path to the local resource. Accounts without
+  an identifiable attendee, organizer, or schedule outbox return
+  `Unsupported`.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, then keep local filtering as a

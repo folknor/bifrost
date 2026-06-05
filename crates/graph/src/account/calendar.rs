@@ -13,6 +13,14 @@ use super::GraphAccount;
 use super::graph_error::{self, GraphErrorContext};
 
 const DEFAULT_CALENDAR_ID: &str = "calendar";
+/// Sentinel calendar segment for composite `EventId`s whose hosting
+/// calendar is unknown. Graph event ids are mailbox-unique, so such ids
+/// address through `/me/events/{id}` instead of
+/// `/me/calendars/{cal}/events/{id}`. The Graph Search API spans the
+/// whole mailbox without reporting each hit's calendar, so search hits
+/// are minted with this segment to keep `event_get`/`update`/`delete`
+/// routing honest.
+const MAILBOX_SCOPE: &str = "$mailbox";
 const EVENT_ID_SEPARATOR: &str = "::";
 const EVENT_SELECT: &str = "id,subject,body,location,start,end,isAllDay,showAs,sensitivity,organizer,attendees,seriesMasterId,webLink,categories,responseStatus,isCancelled,changeKey,recurrence";
 const EVENT_TIMEZONE_PREFER: &str = "outlook.timezone=\"UTC\"";
@@ -68,7 +76,7 @@ pub(crate) async fn events_in_range(
             "{prefix}/calendars/{calendar}/calendarView?startDateTime={}&endDateTime={}&$select={EVENT_SELECT}&$top={}",
             bifrost_net::url::encode_component(&range.start.value),
             bifrost_net::url::encode_component(&range.end.value),
-            range.limit.unwrap_or(250).min(250)
+            range.limit.unwrap_or(250).clamp(1, 250)
         )
     });
     let page: ODataCollection<GraphEvent> =
@@ -103,6 +111,7 @@ pub(crate) async fn create(
     event: EventCreate,
 ) -> Result<EventId, AccountError> {
     reject_create_organizer(&event)?;
+    reject_unwritable_status(event.status, AccountOperation::EventCreate)?;
     validate_event_create_timezones(&event)?;
     let calendar_id = event.calendar_id.0.clone();
     let prefix = account.client.api_path_prefix();
@@ -124,6 +133,25 @@ fn reject_create_organizer(event: &EventCreate) -> Result<(), AccountError> {
         ));
     }
     Ok(())
+}
+
+/// Graph has no writable event status: `isCancelled` is server-derived
+/// from cancellation actions, and there is no confirmed/tentative knob.
+/// Accept only `Confirmed` (the state a freshly created or patched Graph
+/// event reports) and reject any other requested status before payload
+/// construction, mirroring the organizer-on-create rejection rather than
+/// silently writing a confirmed event.
+fn reject_unwritable_status(
+    status: EventStatus,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if matches!(status, EventStatus::Confirmed) {
+        return Ok(());
+    }
+    Err(local_error(
+        operation,
+        "Graph event status is server-derived; only Confirmed can be expressed".to_string(),
+    ))
 }
 
 fn validate_event_create_timezones(event: &EventCreate) -> Result<(), AccountError> {
@@ -150,6 +178,9 @@ pub(crate) async fn update(
     patch: EventPatch,
 ) -> Result<(), AccountError> {
     validate_event_patch_timezones(&patch)?;
+    if let Some(status) = patch.status {
+        reject_unwritable_status(status, AccountOperation::EventUpdate)?;
+    }
     let current = get(account.clone(), event.clone()).await?;
     let calendar_id = patch
         .calendar_id
@@ -293,7 +324,7 @@ async fn search_with_graph_api(
         .flat_map(|set| set.hits_containers)
         .flat_map(|container| container.hits)
         .filter_map(|hit| hit.resource)
-        .map(|event| event_from_graph(DEFAULT_CALENDAR_ID.to_string(), event))
+        .map(|event| event_from_graph(MAILBOX_SCOPE.to_string(), event))
         .collect();
     Ok(Page {
         items,
@@ -530,11 +561,17 @@ fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
 
 fn event_url(account: &GraphAccount, calendar_id: &str, event_id: &str) -> String {
     let prefix = account.client.api_path_prefix();
-    format!(
-        "{prefix}/calendars/{}/events/{}",
-        bifrost_net::url::encode_component(calendar_id),
-        bifrost_net::url::encode_component(event_id)
-    )
+    let event = bifrost_net::url::encode_component(event_id);
+    if calendar_id == MAILBOX_SCOPE {
+        // Graph event ids are mailbox-unique; the mailbox-scoped path
+        // resolves the hit without knowing its hosting calendar.
+        format!("{prefix}/events/{event}")
+    } else {
+        format!(
+            "{prefix}/calendars/{}/events/{event}",
+            bifrost_net::url::encode_component(calendar_id),
+        )
+    }
 }
 
 fn event_search_path(prefix: &str, calendar_id: Option<&CalendarId>) -> String {
@@ -809,6 +846,17 @@ fn graph_recurrence_from_rrule(rrule: &str, start_date: String) -> Option<GraphR
         pattern.interval = Some(1);
     }
     if pattern.days_of_week.as_ref().is_some_and(Vec::is_empty) {
+        return None;
+    }
+    // Graph relative monthly/yearly patterns require daysOfWeek; an
+    // RRULE with neither BYMONTHDAY (which would have selected the
+    // absolute kind) nor BYDAY cannot build a valid pattern, and Graph
+    // rejects it with 400. Reject locally before payload construction.
+    if matches!(
+        pattern.kind.as_deref(),
+        Some("relativeMonthly" | "relativeYearly")
+    ) && pattern.days_of_week.is_none()
+    {
         return None;
     }
     if parsed.value("BYSETPOS").is_some() && pattern.index.is_none() {
@@ -1448,6 +1496,25 @@ mod tests {
     }
 
     #[test]
+    fn graph_event_status_rejects_unwritable_values() {
+        assert!(
+            reject_unwritable_status(EventStatus::Confirmed, AccountOperation::EventCreate).is_ok()
+        );
+        for status in [
+            EventStatus::Cancelled,
+            EventStatus::Tentative,
+            EventStatus::Unknown,
+        ] {
+            let error = reject_unwritable_status(status, AccountOperation::EventCreate)
+                .expect_err("status should be unsupported");
+            assert!(matches!(
+                error.kind(),
+                bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+            ));
+        }
+    }
+
+    #[test]
     fn graph_time_zone_maps_common_iana_names_to_windows() {
         assert_eq!(
             graph_time_zone(Some("Europe/Oslo")),
@@ -1709,6 +1776,15 @@ mod tests {
     }
 
     #[test]
+    fn graph_recurrence_rejects_relative_monthly_without_byday() {
+        assert!(graph_recurrence_from_rrule("FREQ=MONTHLY", "2026-06-02".to_string()).is_none());
+        assert!(
+            graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6", "2026-06-02".to_string())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn graph_event_create_writes_relative_yearly_recurrence() {
         let patch = graph_event_from_create(&EventCreate {
             calendar_id: CalendarId("calendar".to_string()),
@@ -1746,6 +1822,58 @@ mod tests {
         assert_eq!(pattern.index.as_deref(), Some("last"));
         assert_eq!(range.kind.as_deref(), Some("endDate"));
         assert_eq!(range.end_date.as_deref(), Some("2029-06-02"));
+    }
+
+    #[test]
+    fn search_hit_id_round_trips_through_mailbox_scope() {
+        let event = event_from_graph(
+            MAILBOX_SCOPE.to_string(),
+            GraphEvent {
+                id: "e1".to_string(),
+                subject: Some("Planning".to_string()),
+                body: None,
+                location: None,
+                start: Some(graph_time("2026-06-02T12:00:00")),
+                end: Some(graph_time("2026-06-02T13:00:00")),
+                is_all_day: Some(false),
+                show_as: None,
+                sensitivity: None,
+                organizer: None,
+                attendees: None,
+                series_master_id: None,
+                recurrence: None,
+                web_link: None,
+                response_status: None,
+                is_cancelled: None,
+                change_key: None,
+            },
+        );
+
+        let (calendar_id, event_id) =
+            split_event_id(&event.id.0, AccountOperation::EventGet).expect("split");
+        assert_eq!(calendar_id, MAILBOX_SCOPE);
+        assert_eq!(event_id, "e1");
+
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            crate::account::PushMode::GraphSubscriptions,
+        );
+        assert_eq!(
+            event_url(&account, &calendar_id, &event_id),
+            "/me/events/e1"
+        );
+    }
+
+    #[test]
+    fn event_url_routes_calendar_scoped_ids_through_calendar_collection() {
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            crate::account::PushMode::GraphSubscriptions,
+        );
+        assert_eq!(
+            event_url(&account, "calendar", "e1"),
+            "/me/calendars/calendar/events/e1"
+        );
     }
 
     #[test]

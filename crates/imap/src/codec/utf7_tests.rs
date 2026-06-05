@@ -65,7 +65,7 @@ fn mixed_ascii_non_ascii() {
 /// Supplementary plane characters (surrogate pairs in UTF-16).
 #[test]
 fn supplementary_plane() {
-    let name = "Emoji\u{1F4E7}Folder"; // 
+    let name = "Emoji\u{1F4E7}Folder"; // U+1F4E7 E-MAIL SYMBOL
     let encoded = encode_utf7(name);
     let decoded = decode_utf7(encoded.as_bytes());
     assert_eq!(decoded, name);

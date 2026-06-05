@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn non_ascii_headername() {
-        assert!(HeaderName::new_from_ascii(String::new()).is_err());
+        assert!(HeaderName::new_from_ascii(String::from("\u{1F30E}")).is_err());
     }
 
     #[test]
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn const_non_ascii_headername() {
-        let _ = HeaderName::new_from_ascii_str("");
+        let _ = HeaderName::new_from_ascii_str("\u{1F30E}");
     }
 
     #[test]
@@ -604,18 +604,21 @@ mod tests {
         let mut headers = Headers::new();
         headers.insert_raw(HeaderValue::new(
             HeaderName::new_from_ascii_str("To"),
-            " <world@example.com>".to_owned(),
+            "\u{1F30E} <world@example.com>".to_owned(),
         ));
 
-        assert_eq!(headers.to_string(), "To:  <world@example.com>\r\n");
+        assert_eq!(
+            headers.to_string(),
+            "To: =?utf-8?b?8J+Mjg==?= <world@example.com>\r\n"
+        );
     }
 
     #[test]
     fn format_special_with_folding() {
         let mut headers = Headers::new();
         let to = To::from(Mailboxes::from_iter([
-            " <world@example.com>".parse().unwrap(),
-            " Everywhere <ducks@example.com>".parse().unwrap(),
+            "\u{1F30D} <world@example.com>".parse().unwrap(),
+            "\u{1F986} Everywhere <ducks@example.com>".parse().unwrap(),
             "Иванов Иван Иванович <ivanov@example.com>".parse().unwrap(),
             "Jānis Bērziņš <janis@example.com>".parse().unwrap(),
             "Seán Ó Rudaí <sean@example.com>".parse().unwrap(),
@@ -625,8 +628,9 @@ mod tests {
         assert_eq!(
             headers.to_string(),
             concat!(
-                "To: world@example.com, Everywhere <ducks@example.com>, =?utf-8?b?0JjQstCw?=\r\n",
-                " =?utf-8?b?0L3QvtCyINCY0LLQsNC9INCY0LLQsNC90L7QstC40Yc=?= <ivanov@example.com>,\r\n",
+                "To: =?utf-8?b?8J+MjQ==?= <world@example.com>, =?utf-8?b?8J+mhiBFdmVyeXdo?=\r\n",
+                " =?utf-8?b?ZXJl?= <ducks@example.com>, =?utf-8?b?0JjQstCw0L3QvtCyINCY0LI=?=\r\n",
+                " =?utf-8?b?0LDQvSDQmNCy0LDQvdC+0LLQuNGH?= <ivanov@example.com>,\r\n",
                 " =?utf-8?b?SsSBbmlzIELEk3J6acWGxaE=?= <janis@example.com>, =?utf-8?b?U2U=?=\r\n",
                 " =?utf-8?b?w6FuIMOTIFJ1ZGHDrQ==?= <sean@example.com>\r\n",
             )
@@ -638,16 +642,17 @@ mod tests {
         let mut headers = Headers::new();
         headers.insert_raw(HeaderValue::new(
             HeaderName::new_from_ascii_str("To"),
-            " <world@example.com>,  Everywhere <ducks@example.com>, Иванов Иван Иванович <ivanov@example.com>, Jānis Bērziņš <janis@example.com>, Seán Ó Rudaí <sean@example.com>".to_owned(),
+            "\u{1F30D} <world@example.com>, \u{1F986} Everywhere <ducks@example.com>, Иванов Иван Иванович <ivanov@example.com>, Jānis Bērziņš <janis@example.com>, Seán Ó Rudaí <sean@example.com>".to_owned(),
         ));
 
         assert_eq!(
             headers.to_string(),
             concat!(
-                "To:  <world@example.com>,  Everywhere <ducks@example.com>, =?utf-8?b?0Jg=?=\r\n",
-                " =?utf-8?b?0LLQsNC90L7QsiDQmNCy0LDQvSDQmNCy0LDQvdC+0LLQuNGH?=\r\n",
-                " <ivanov@example.com>, =?utf-8?b?SsSBbmlzIELEk3J6acWGxaE=?=\r\n",
-                " <janis@example.com>, =?utf-8?b?U2XDoW4gw5MgUnVkYcOt?= <sean@example.com>\r\n",
+                "To: =?utf-8?b?8J+MjQ==?= <world@example.com>, =?utf-8?b?8J+mhg==?=\r\n",
+                " Everywhere <ducks@example.com>, =?utf-8?b?0JjQstCw0L3QvtCyINCY0LLQsNC9?=\r\n",
+                " =?utf-8?b?INCY0LLQsNC90L7QstC40Yc=?= <ivanov@example.com>,\r\n",
+                " =?utf-8?b?SsSBbmlzIELEk3J6acWGxaE=?= <janis@example.com>, =?utf-8?b?U2U=?=\r\n",
+                " =?utf-8?b?w6FuIMOTIFJ1ZGHDrQ==?= <sean@example.com>\r\n",
             )
         );
     }
@@ -657,10 +662,20 @@ mod tests {
         let mut headers = Headers::new();
         headers.insert_raw(HeaderValue::new(
             HeaderName::new_from_ascii_str("Subject"),
-            String::new(),
+            "\u{1F973}".repeat(60),
         ));
 
-        assert_eq!(headers.to_string(), "Subject: \r\n");
+        assert_eq!(
+            headers.to_string(),
+            concat!(
+                "Subject: =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz?=\r\n",
+                " =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbM=?=\r\n",
+                " =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbM=?=\r\n",
+                " =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbM=?=\r\n",
+                " =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+ls/CfpbM=?=\r\n",
+                " =?utf-8?b?8J+ls/CfpbPwn6Wz8J+ls/CfpbPwn6Wz8J+lsw==?=\r\n"
+            )
+        );
     }
 
     #[test]
@@ -668,12 +683,12 @@ mod tests {
         let mut headers = Headers::new();
         headers.insert_raw(HeaderValue::new(
             HeaderName::new_from_ascii_str("Subject"),
-            "Hello! \r\n This is \" bad \0. ".to_owned(),
+            "Hello! \r\n This is \" bad \0. \u{1F44B}".to_owned(),
         ));
 
         assert_eq!(
             headers.to_string(),
-            "Subject: Hello! =?utf-8?b?DQo=?= This is \" bad =?utf-8?b?AC4=?= \r\n"
+            "Subject: Hello! =?utf-8?b?DQo=?= This is \" bad =?utf-8?b?AC4g8J+Riw==?=\r\n"
         );
     }
 
@@ -689,7 +704,7 @@ mod tests {
         headers.insert_raw(
             HeaderValue::new(
             HeaderName::new_from_ascii_str("To"),
-            " <world@example.com>,  Everywhere <ducks@example.com>, Иванов Иван Иванович <ivanov@example.com>, Jānis Bērziņš <janis@example.com>, Seán Ó Rudaí <sean@example.com>".to_owned(),
+            "\u{1F30D} <world@example.com>, \u{1F986} Everywhere <ducks@example.com>, Иванов Иван Иванович <ivanov@example.com>, Jānis Bērziņš <janis@example.com>, Seán Ó Rudaí <sean@example.com>".to_owned(),
             )
         );
         headers.insert_raw(HeaderValue::new(
@@ -707,10 +722,11 @@ mod tests {
                 "Subject: Hello! This is bifrost_smtp, and this\r\n",
                 " IsAVeryLongLineDoYouKnowWhatsGoingToHappenIGuessWeAreGoingToFindOut. Ok I\r\n",
                 " guess that's it!\r\n",
-                "To:  <world@example.com>,  Everywhere <ducks@example.com>, =?utf-8?b?0Jg=?=\r\n",
-                " =?utf-8?b?0LLQsNC90L7QsiDQmNCy0LDQvSDQmNCy0LDQvdC+0LLQuNGH?=\r\n",
-                " <ivanov@example.com>, =?utf-8?b?SsSBbmlzIELEk3J6acWGxaE=?=\r\n",
-                " <janis@example.com>, =?utf-8?b?U2XDoW4gw5MgUnVkYcOt?= <sean@example.com>\r\n",
+                "To: =?utf-8?b?8J+MjQ==?= <world@example.com>, =?utf-8?b?8J+mhg==?=\r\n",
+                " Everywhere <ducks@example.com>, =?utf-8?b?0JjQstCw0L3QvtCyINCY0LLQsNC9?=\r\n",
+                " =?utf-8?b?INCY0LLQsNC90L7QstC40Yc=?= <ivanov@example.com>,\r\n",
+                " =?utf-8?b?SsSBbmlzIELEk3J6acWGxaE=?= <janis@example.com>, =?utf-8?b?U2U=?=\r\n",
+                " =?utf-8?b?w6FuIMOTIFJ1ZGHDrQ==?= <sean@example.com>\r\n",
                 "From: Someone <somewhere@example.com>\r\n",
                 "Content-Transfer-Encoding: quoted-printable\r\n",
             )

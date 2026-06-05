@@ -4,6 +4,7 @@ use bifrost_types::{
     ContactProvenance, ContactSearchRequest, ErrorScope, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::types::ODataCollection;
 
@@ -129,11 +130,10 @@ pub(crate) async fn update(
     }
     let current = get(account.clone(), contact.clone()).await?;
     let etag = current.etag.clone();
-    let merged = merge_patch(current, &patch);
     let prefix = account.client.api_path_prefix();
     let encoded = bifrost_net::url::encode_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
-    let body = graph_contact_from_create(&merged);
+    let body = graph_contact_from_patch(&patch);
     let result = if let Some(etag) = etag.as_deref() {
         account.client.patch_if_match(&path, etag, &body).await
     } else {
@@ -475,17 +475,94 @@ fn graph_address(address: &ContactAddress) -> GraphPhysicalAddress {
     }
 }
 
-fn merge_patch(current: ContactCard, patch: &ContactPatch) -> ContactCreate {
-    ContactCreate {
-        address_book_id: patch.address_book_id.clone().or(current.address_book_id),
-        display_name: patch.display_name.clone().unwrap_or(current.display_name),
-        emails: patch.emails.clone().unwrap_or(current.emails),
-        phones: patch.phones.clone().unwrap_or(current.phones),
-        organizations: patch.organizations.clone().unwrap_or(current.organizations),
-        addresses: patch.addresses.clone().unwrap_or(current.addresses),
-        notes: patch.notes.clone().unwrap_or(current.notes),
-        photo_url: patch.photo_url.clone().unwrap_or(current.photo_url),
+/// Build a sparse Graph PATCH body from a `ContactPatch`.
+///
+/// Graph PATCH leaves omitted properties untouched. A `None` field on
+/// the patch is omitted; a `Some(None)` scalar clear emits JSON `null`
+/// so the server actually drops the old value; a present repeated field
+/// replaces the corresponding Graph property (or properties) wholesale,
+/// emitting `null` / `[]` for buckets the new collection leaves empty.
+fn graph_contact_from_patch(patch: &ContactPatch) -> GraphContactPatchBody {
+    let mut body = GraphContactPatchBody::default();
+    if let Some(display_name) = &patch.display_name {
+        body.display_name = Some(scalar_or_null(display_name.clone()));
     }
+    if let Some(notes) = &patch.notes {
+        body.personal_notes = Some(scalar_or_null(notes.clone()));
+    }
+    if let Some(emails) = &patch.emails {
+        let addresses = emails
+            .iter()
+            .map(|email| GraphContactEmail {
+                name: email.kind.clone(),
+                address: Some(email.value.clone()),
+            })
+            .collect::<Vec<_>>();
+        body.email_addresses = Some(json!(addresses));
+    }
+    if let Some(phones) = &patch.phones {
+        body.business_phones = Some(json!(
+            phones
+                .iter()
+                .filter(|phone| !matches!(phone.kind.as_deref(), Some("mobile") | Some("home")))
+                .map(|phone| phone.value.clone())
+                .collect::<Vec<_>>()
+        ));
+        body.home_phones = Some(json!(
+            phones
+                .iter()
+                .filter(|phone| phone.kind.as_deref() == Some("home"))
+                .map(|phone| phone.value.clone())
+                .collect::<Vec<_>>()
+        ));
+        body.mobile_phone = Some(
+            phones
+                .iter()
+                .find(|phone| phone.kind.as_deref() == Some("mobile"))
+                .map(|phone| Value::String(phone.value.clone()))
+                .unwrap_or(Value::Null),
+        );
+    }
+    if let Some(organizations) = &patch.organizations {
+        let first = organizations.first();
+        body.company_name = Some(
+            first
+                .map(|org| Value::String(org.name.clone()))
+                .unwrap_or(Value::Null),
+        );
+        body.job_title = Some(
+            first
+                .and_then(|org| org.title.clone())
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+    }
+    if let Some(addresses) = &patch.addresses {
+        body.home_address = Some(address_bucket(addresses, "home"));
+        body.business_address = Some(address_bucket(addresses, "work"));
+        body.other_address = Some(
+            addresses
+                .iter()
+                .find(|address| !matches!(address.kind.as_deref(), Some("home" | "work")))
+                .map(graph_address)
+                .map(|address| json!(address))
+                .unwrap_or(Value::Null),
+        );
+    }
+    body
+}
+
+fn scalar_or_null(value: Option<String>) -> Value {
+    value.map(Value::String).unwrap_or(Value::Null)
+}
+
+fn address_bucket(addresses: &[ContactAddress], kind: &str) -> Value {
+    addresses
+        .iter()
+        .find(|address| address.kind.as_deref() == Some(kind))
+        .map(graph_address)
+        .map(|address| json!(address))
+        .unwrap_or(Value::Null)
 }
 
 fn non_empty<T>(iter: impl Iterator<Item = T>) -> Option<Vec<T>> {
@@ -618,6 +695,39 @@ struct GraphContactPatch {
     personal_notes: Option<String>,
 }
 
+/// Sparse PATCH body for contact updates.
+///
+/// Distinct from `GraphContactPatch` (used on create) because update
+/// must express scalar clears as JSON `null`. `None` omits the property
+/// from the PATCH (untouched); `Some(Value::Null)` clears it on the
+/// server; any other `Some` sets it.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphContactPatchBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_addresses: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_phones: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_phones: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mobile_phone: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_address: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    business_address: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    other_address: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    company_name: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_title: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    personal_notes: Option<Value>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +824,69 @@ mod tests {
         );
         assert_eq!(payload.home_phones.unwrap()[0], "+123");
         assert_eq!(payload.personal_notes.as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn graph_contact_patch_emits_null_for_scalar_clears() {
+        let body = graph_contact_from_patch(&ContactPatch {
+            display_name: Some(None),
+            notes: Some(None),
+            organizations: Some(Vec::new()),
+            ..ContactPatch::default()
+        });
+        let value = serde_json::to_value(&body).expect("patch json");
+
+        assert!(value.get("displayName").is_some_and(Value::is_null));
+        assert!(value.get("personalNotes").is_some_and(Value::is_null));
+        assert!(value.get("companyName").is_some_and(Value::is_null));
+        assert!(value.get("jobTitle").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn graph_contact_patch_omits_untouched_fields() {
+        let body = graph_contact_from_patch(&ContactPatch {
+            display_name: Some(Some("Ada".to_string())),
+            ..ContactPatch::default()
+        });
+        let value = serde_json::to_value(&body).expect("patch json");
+
+        assert_eq!(
+            value.get("displayName").and_then(Value::as_str),
+            Some("Ada")
+        );
+        assert!(value.get("personalNotes").is_none());
+        assert!(value.get("emailAddresses").is_none());
+        assert!(value.get("mobilePhone").is_none());
+    }
+
+    #[test]
+    fn graph_contact_patch_replaces_collections_and_clears_empty_buckets() {
+        let body = graph_contact_from_patch(&ContactPatch {
+            emails: Some(vec![ContactEmail {
+                value: "ada@example.test".to_string(),
+                kind: Some("work".to_string()),
+                is_primary: false,
+            }]),
+            phones: Some(vec![ContactPhone {
+                value: "+123".to_string(),
+                kind: Some("home".to_string()),
+                is_primary: false,
+            }]),
+            addresses: Some(Vec::new()),
+            ..ContactPatch::default()
+        });
+        let value = serde_json::to_value(&body).expect("patch json");
+
+        assert_eq!(
+            value["emailAddresses"][0]["address"].as_str(),
+            Some("ada@example.test")
+        );
+        assert_eq!(value["homePhones"][0].as_str(), Some("+123"));
+        assert_eq!(value["businessPhones"], json!([]));
+        assert!(value.get("mobilePhone").is_some_and(Value::is_null));
+        assert!(value.get("homeAddress").is_some_and(Value::is_null));
+        assert!(value.get("businessAddress").is_some_and(Value::is_null));
+        assert!(value.get("otherAddress").is_some_and(Value::is_null));
     }
 
     #[test]

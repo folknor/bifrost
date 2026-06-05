@@ -150,6 +150,7 @@ pub(crate) fn update(
         if !event_patch_has_non_move_fields(&patch) {
             return Ok(());
         }
+        reject_unexpressible_all_day_patch(&patch)?;
         let url = event_url(&calendar_id, &native_event_id);
         let _: GoogleEvent = client
             .patch(&url, &google_event_from_patch(&patch))
@@ -229,7 +230,14 @@ pub(crate) fn search(
             .min(2500);
         let mut items = Vec::new();
         while let Some(calendar_id) = calendar_ids.get(index) {
-            let remaining = limit.saturating_sub(items.len()).max(1);
+            let remaining = limit.saturating_sub(items.len());
+            if remaining == 0 {
+                return Ok(Page {
+                    items,
+                    next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &[])),
+                    estimated_total: None,
+                });
+            }
             let page = search_one_calendar(
                 &client,
                 calendar_id.clone(),
@@ -238,8 +246,19 @@ pub(crate) fn search(
                 page_token.take(),
             )
             .await?;
-            items.extend(page.items);
-            if let Some(next_token) = page.next_cursor {
+            // Google honours `maxResults`, but guard the cap defensively so
+            // a loose page can never push the aggregate over the request
+            // limit. Any clipped tail is recoverable: the page carried a
+            // next_cursor only when more remained, and the boundary cursor
+            // re-enters this calendar otherwise.
+            let next_token = page.next_cursor;
+            for item in page.items {
+                if items.len() >= limit {
+                    break;
+                }
+                items.push(item);
+            }
+            if let Some(next_token) = next_token {
                 return Ok(Page {
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
@@ -485,7 +504,14 @@ fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
             .attendees
             .as_ref()
             .map(|attendees| attendees.iter().map(google_attendee).collect()),
-        recurrence: patch.recurrence.as_ref().and_then(recurrence_lines),
+        // A present recurrence patch always emits the key. An empty
+        // `EventRecurrence` produces an empty array, which is how the
+        // Google API clears an existing RRULE/RDATE/EXDATE; an absent
+        // patch omits the key and leaves the server value untouched.
+        recurrence: patch
+            .recurrence
+            .as_ref()
+            .map(|recurrence| recurrence_lines(recurrence).unwrap_or_default()),
         visibility: patch.visibility.map(|visibility| match visibility {
             EventVisibility::Private => "private".to_string(),
             EventVisibility::Public => "public".to_string(),
@@ -639,6 +665,26 @@ fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
         || patch.visibility.is_some()
         || patch.attendees.is_some()
         || patch.recurrence.is_some()
+}
+
+// Google Calendar carries the timed/all-day distinction in the shape of
+// the `start`/`end` objects (`date` vs `dateTime`), not in a standalone
+// flag. An `is_all_day` flip can only be expressed when the patch also
+// carries the start/end values to re-emit under the new shape. A patch
+// that sets `is_all_day` without both bounds would issue a PATCH that
+// silently never converts the event, so reject it rather than accept a
+// no-op (reject-not-drop).
+fn reject_unexpressible_all_day_patch(patch: &EventPatch) -> Result<(), AccountError> {
+    if patch.is_all_day.is_some() && !(patch.start.is_some() && patch.end.is_some()) {
+        return Err(error::into_account_error(
+            crate::error::Error::unsupported_with(
+                AccountOperation::EventUpdate,
+                "Google Calendar all-day conversion requires both start and end in the same patch",
+            ),
+            GmailErrorContext::calendar_collection(AccountOperation::EventUpdate),
+        ));
+    }
+    Ok(())
 }
 
 fn join_event_id(calendar_id: &str, event_id: &str) -> String {
@@ -843,7 +889,6 @@ struct GoogleEvent {
     organizer: Option<GoogleOrganizer>,
     attendees: Option<Vec<GoogleAttendee>>,
     recurrence: Option<Vec<String>>,
-    recurring_event_id: Option<String>,
     original_start_time: Option<GoogleEventTime>,
     transparency: Option<String>,
     html_link: Option<String>,
@@ -930,7 +975,6 @@ mod tests {
                 start: Some(timed("2026-06-02T12:00:00Z")),
                 end: Some(timed("2026-06-02T13:00:00Z")),
                 transparency: Some("transparent".to_string()),
-                recurring_event_id: Some("master".to_string()),
                 original_start_time: Some(timed("2026-06-01T12:00:00Z")),
                 ..GoogleEvent::default()
             },
@@ -1179,6 +1223,80 @@ mod tests {
                 .and_then(|start| start.get("dateTime"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn google_event_patch_clears_recurrence_with_empty_array() {
+        let patch = google_event_from_patch(&EventPatch {
+            recurrence: Some(EventRecurrence::default()),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+
+        assert_eq!(
+            value
+                .get("recurrence")
+                .and_then(serde_json::Value::as_array),
+            Some(&Vec::new())
+        );
+    }
+
+    #[test]
+    fn google_event_patch_omits_recurrence_when_absent() {
+        let patch = google_event_from_patch(&EventPatch {
+            title: Some(Some("Planning".to_string())),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+
+        assert!(value.get("recurrence").is_none());
+    }
+
+    #[test]
+    fn google_event_patch_emits_recurrence_lines_when_present() {
+        let patch = google_event_from_patch(&EventPatch {
+            recurrence: Some(EventRecurrence {
+                rrule: Some("FREQ=WEEKLY".to_string()),
+                ..EventRecurrence::default()
+            }),
+            ..EventPatch::default()
+        });
+
+        assert_eq!(
+            patch.recurrence.as_deref(),
+            Some(["RRULE:FREQ=WEEKLY".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn all_day_only_patch_is_rejected_as_unsupported() {
+        let error = reject_unexpressible_all_day_patch(&EventPatch {
+            is_all_day: Some(true),
+            ..EventPatch::default()
+        })
+        .expect_err("all-day-only patch should be rejected");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventUpdate)
+        ));
+    }
+
+    #[test]
+    fn all_day_patch_with_both_bounds_is_accepted() {
+        reject_unexpressible_all_day_patch(&EventPatch {
+            is_all_day: Some(true),
+            start: Some(EventTime {
+                value: "2026-06-02".to_string(),
+                timezone: None,
+            }),
+            end: Some(EventTime {
+                value: "2026-06-03".to_string(),
+                timezone: None,
+            }),
+            ..EventPatch::default()
+        })
+        .expect("all-day patch carrying both bounds is expressible");
     }
 
     #[test]
