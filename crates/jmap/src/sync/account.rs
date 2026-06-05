@@ -4,15 +4,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
-    AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, ChangeCursor, ContactCard,
-    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, ErrorScope, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey,
+    AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent,
+    ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    Container, ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment,
+    CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch, EventRange,
+    EventSearchRequest, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey,
     Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
     ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
-    Priority, Projection, QuotaInfo, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -21,7 +22,10 @@ use crate::client::Client;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
-use super::{blob, changes, discover, filters, hydrate, inventory, mutation, pim, push, state};
+use super::{
+    blob, calendar_ops, changes, contacts, discover, filters, hydrate, inventory, mutation, pim,
+    push, state,
+};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
@@ -32,6 +36,9 @@ pub(crate) struct JmapAccount {
     pub(crate) vacation: Option<MailAccount>,
     pub(crate) quota: Option<MailAccount>,
     pub(crate) sieve: Option<MailAccount>,
+    pub(crate) contacts: Option<MailAccount>,
+    pub(crate) calendars: Option<MailAccount>,
+    pub(crate) self_emails: Vec<String>,
     pub(crate) caps: AccountCapabilities,
     pub(crate) core_limits: CoreLimits,
     pub(crate) seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
@@ -55,6 +62,9 @@ impl JmapAccount {
         vacation: Option<MailAccount>,
         quota: Option<MailAccount>,
         sieve: Option<MailAccount>,
+        contacts: Option<MailAccount>,
+        calendars: Option<MailAccount>,
+        self_emails: Vec<String>,
         caps: AccountCapabilities,
         core_limits: CoreLimits,
         seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
@@ -72,6 +82,9 @@ impl JmapAccount {
             vacation,
             quota,
             sieve,
+            contacts,
+            calendars,
+            self_emails,
             caps,
             core_limits,
             seed_states,
@@ -587,80 +600,96 @@ impl Account for JmapAccount {
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::AddressBooksList,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+        contacts::address_books_list(self.contacts.clone())
     }
 
     fn contacts_list(
         &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        address_book: Option<AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactsList,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+        contacts::list(self.contacts.clone(), address_book, page_cursor)
     }
 
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactGet,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+    fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        contacts::get(self.contacts.clone(), contact)
     }
 
     fn contact_create(
         &self,
-        _contact: ContactCreate,
+        contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactCreate,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+        contacts::create(self.contacts.clone(), contact)
     }
 
     fn contact_update(
         &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
+        contact: ContactId,
+        patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactUpdate,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+        contacts::update(self.contacts.clone(), contact, patch)
     }
 
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactDelete,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+    fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        contacts::delete(self.contacts.clone(), contact)
     }
 
     fn contact_search(
         &self,
-        _request: ContactSearchRequest,
+        request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        let err = super::error::unsupported_error(
-            AccountOperation::ContactSearch,
-            None,
-            "JMAP contacts Account dispatch is not wired yet",
-        );
-        Box::pin(async move { Err(err) })
+        contacts::search(self.contacts.clone(), request)
+    }
+
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+        calendar_ops::calendars_list(self.calendars.clone())
+    }
+
+    fn events_in_range(
+        &self,
+        range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        calendar_ops::events_in_range(self.calendars.clone(), range)
+    }
+
+    fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+        calendar_ops::get(self.calendars.clone(), event)
+    }
+
+    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+        calendar_ops::create(self.calendars.clone(), event)
+    }
+
+    fn event_update(
+        &self,
+        event: EventId,
+        patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar_ops::update(self.calendars.clone(), event, patch)
+    }
+
+    fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
+        calendar_ops::delete(self.calendars.clone(), event)
+    }
+
+    fn event_rsvp(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar_ops::rsvp(
+            self.calendars.clone(),
+            self.self_emails.clone(),
+            event,
+            status,
+        )
+    }
+
+    fn event_search(
+        &self,
+        request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        calendar_ops::search(self.calendars.clone(), request)
     }
 
     fn thread_hydrate(

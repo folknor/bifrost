@@ -24,6 +24,10 @@ use futures::future::Future;
 use futures::stream::Stream;
 
 use crate::blob::{BlobHandle, ByteRange};
+use crate::calendar::{
+    Calendar, CalendarEvent, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    RsvpStatus,
+};
 use crate::capabilities::{AccountCapabilities, StarredFlagShape};
 use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest};
 use crate::contact::{
@@ -526,6 +530,52 @@ pub trait Account: Send + Sync {
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
 
     // ------------------------------------------------------------
+    // Calendar primitives (S4-W1)
+    //
+    // Providers advertise support through
+    // `capabilities().pim_methods`. Accounts without a native or
+    // configured calendar backend return `Err(Unsupported)`.
+    // ------------------------------------------------------------
+
+    /// List calendars exposed by this account.
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>>;
+
+    /// List events in a provider-side time range.
+    fn events_in_range(
+        &self,
+        range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>>;
+
+    /// Fetch one event by engine-facing id.
+    fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>>;
+
+    /// Create one event.
+    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>>;
+
+    /// Partially update one event.
+    fn event_update(
+        &self,
+        event: EventId,
+        patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Delete one event.
+    fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Update the authenticated user's RSVP status for one event.
+    fn event_rsvp(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Provider-side event search.
+    fn event_search(
+        &self,
+        request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>>;
+
+    // ------------------------------------------------------------
     // Threading + hydration primitives (S1-W1)
     // ------------------------------------------------------------
 
@@ -709,6 +759,19 @@ pub trait Account: Send + Sync {
         let mut request = ContactSearchRequest::new(query);
         request.limit = Some(limit);
         let future = self.contact_search(request);
+        Box::pin(async move { future.await.map(|page| page.items) })
+    }
+
+    /// Event autocomplete convenience for calendar search boxes.
+    /// Default implementation returns the first page of `event_search`.
+    fn event_autocomplete(
+        &self,
+        query: String,
+        limit: u32,
+    ) -> AccountFuture<Result<Vec<CalendarEvent>, AccountError>> {
+        let mut request = EventSearchRequest::new(query);
+        request.limit = Some(limit);
+        let future = self.event_search(request);
         Box::pin(async move { future.await.map(|page| page.items) })
     }
 

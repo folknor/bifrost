@@ -7,8 +7,10 @@
 
 mod account;
 mod blob;
+mod calendar_ops;
 mod capabilities;
 mod changes;
+mod contacts;
 mod discover;
 mod error;
 mod factory;

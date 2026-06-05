@@ -167,6 +167,15 @@ pub enum AccountOperation {
     ContactDelete,
     ContactSearch,
     ContactAutocomplete,
+    CalendarsList,
+    EventsInRange,
+    EventGet,
+    EventCreate,
+    EventUpdate,
+    EventDelete,
+    EventRsvp,
+    EventSearch,
+    EventAutocomplete,
     Close,
     Expunge,
 }
@@ -197,6 +206,10 @@ impl AccountOperation {
                 | Self::ContactCreate
                 | Self::ContactUpdate
                 | Self::ContactDelete
+                | Self::EventCreate
+                | Self::EventUpdate
+                | Self::EventDelete
+                | Self::EventRsvp
         )
     }
 }
@@ -223,4 +236,5 @@ pub enum Protocol {
     Gmail,
     Graph,
     Ews,
+    CalDav,
 }

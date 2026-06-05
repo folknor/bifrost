@@ -8,15 +8,16 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bifrost_types::{
-    Account, AccountError, AccountFuture, AccountStream, AttachmentHandle, BlobHandle, ByteRange,
-    Change, ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, Container, ContainerId, ContainerKind, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, FilterValidation, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
-    Priority, Projection, QuotaInfo, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    Account, AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentHandle,
+    BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
+    ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -76,32 +77,40 @@ pub(crate) struct ImapAccountInner {
     pub(crate) priority: AtomicU8,
     pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) push: push::PushState,
+    pub(crate) contacts: Option<Arc<dyn Account>>,
+    pub(crate) calendars: Option<Arc<dyn Account>>,
+}
+
+pub(crate) struct ImapAccountParts {
+    pub(crate) config: Arc<ImapAccountConfig>,
+    pub(crate) capabilities: bifrost_types::AccountCapabilities,
+    pub(crate) pool: Arc<Pool>,
+    pub(crate) folders: Arc<FolderRegistry>,
+    pub(crate) qresync_enabled: bool,
+    pub(crate) qresync_negotiation_warning: Option<String>,
+    pub(crate) bandwidth_cap: Arc<AtomicU64>,
+    pub(crate) contacts: Option<Arc<dyn Account>>,
+    pub(crate) calendars: Option<Arc<dyn Account>>,
 }
 
 impl ImapAccount {
-    pub(crate) fn new(
-        config: Arc<ImapAccountConfig>,
-        capabilities: bifrost_types::AccountCapabilities,
-        pool: Arc<Pool>,
-        folders: Arc<FolderRegistry>,
-        qresync_enabled: bool,
-        qresync_negotiation_warning: Option<String>,
-        bandwidth_cap: Arc<AtomicU64>,
-    ) -> Self {
+    pub(crate) fn new(parts: ImapAccountParts) -> Self {
         Self {
             inner: Arc::new(ImapAccountInner {
-                config,
-                capabilities,
-                pool,
-                folders,
-                qresync_enabled: AtomicBool::new(qresync_enabled),
-                qresync_negotiation_warning,
+                config: parts.config,
+                capabilities: parts.capabilities,
+                pool: parts.pool,
+                folders: parts.folders,
+                qresync_enabled: AtomicBool::new(parts.qresync_enabled),
+                qresync_negotiation_warning: parts.qresync_negotiation_warning,
                 qresync_negotiation_warning_sent: AtomicBool::new(false),
                 shutdown: CancellationToken::new(),
                 closed: AtomicBool::new(false),
                 priority: AtomicU8::new(Priority::Normal as u8),
-                bandwidth_cap,
+                bandwidth_cap: parts.bandwidth_cap,
                 push: push::PushState::new(),
+                contacts: parts.contacts,
+                calendars: parts.calendars,
             }),
         }
     }
@@ -566,73 +575,136 @@ impl Account for ImapAccount {
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::AddressBooksList,
-            ))
-        })
+        if let Some(contacts) = &self.contacts {
+            return contacts.address_books_list();
+        }
+        unsupported_future(AccountOperation::AddressBooksList)
     }
 
     fn contacts_list(
         &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        address_book: Option<AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactsList,
-            ))
-        })
+        if let Some(contacts) = &self.contacts {
+            return contacts.contacts_list(address_book, page_cursor);
+        }
+        unsupported_future(AccountOperation::ContactsList)
     }
 
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactGet,
-            ))
-        })
+    fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_get(contact);
+        }
+        unsupported_future(AccountOperation::ContactGet)
     }
 
     fn contact_create(
         &self,
-        _contact: ContactCreate,
+        contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactCreate,
-            ))
-        })
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_create(contact);
+        }
+        unsupported_future(AccountOperation::ContactCreate)
     }
 
     fn contact_update(
         &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
+        contact: ContactId,
+        patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactUpdate,
-            ))
-        })
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_update(contact, patch);
+        }
+        unsupported_future(AccountOperation::ContactUpdate)
     }
 
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactDelete,
-            ))
-        })
+    fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_delete(contact);
+        }
+        unsupported_future(AccountOperation::ContactDelete)
     }
 
     fn contact_search(
         &self,
-        _request: ContactSearchRequest,
+        request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async {
-            Err(error::unsupported(
-                bifrost_types::AccountOperation::ContactSearch,
-            ))
-        })
+        if let Some(contacts) = &self.contacts {
+            return contacts.contact_search(request);
+        }
+        unsupported_future(AccountOperation::ContactSearch)
+    }
+
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.calendars_list();
+        }
+        unsupported_future(AccountOperation::CalendarsList)
+    }
+
+    fn events_in_range(
+        &self,
+        range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.events_in_range(range);
+        }
+        unsupported_future(AccountOperation::EventsInRange)
+    }
+
+    fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_get(event);
+        }
+        unsupported_future(AccountOperation::EventGet)
+    }
+
+    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_create(event);
+        }
+        unsupported_future(AccountOperation::EventCreate)
+    }
+
+    fn event_update(
+        &self,
+        event: EventId,
+        patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_update(event, patch);
+        }
+        unsupported_future(AccountOperation::EventUpdate)
+    }
+
+    fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_delete(event);
+        }
+        unsupported_future(AccountOperation::EventDelete)
+    }
+
+    fn event_rsvp(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_rsvp(event, status);
+        }
+        unsupported_future(AccountOperation::EventRsvp)
+    }
+
+    fn event_search(
+        &self,
+        request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        if let Some(calendars) = &self.calendars {
+            return calendars.event_search(request);
+        }
+        unsupported_future(AccountOperation::EventSearch)
     }
 
     fn thread_hydrate(
@@ -671,6 +743,12 @@ impl Account for ImapAccount {
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
         close::close(self.clone())
     }
+}
+
+fn unsupported_future<T: Send + 'static>(
+    operation: AccountOperation,
+) -> AccountFuture<Result<T, AccountError>> {
+    Box::pin(async move { Err(error::unsupported(operation)) })
 }
 
 /// Convert a crate-private `crate::Error` into a public `AccountError`

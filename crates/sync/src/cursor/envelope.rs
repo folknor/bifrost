@@ -323,6 +323,7 @@ const PROTOCOL_IMAP: u8 = 1;
 const PROTOCOL_GMAIL: u8 = 2;
 const PROTOCOL_GRAPH: u8 = 3;
 const PROTOCOL_CARDDAV: u8 = 4;
+const PROTOCOL_CALDAV: u8 = 5;
 
 fn encode_protocol(p: ProtocolKind) -> u8 {
     match p {
@@ -330,6 +331,7 @@ fn encode_protocol(p: ProtocolKind) -> u8 {
         ProtocolKind::Imap => PROTOCOL_IMAP,
         ProtocolKind::Gmail => PROTOCOL_GMAIL,
         ProtocolKind::CardDav => PROTOCOL_CARDDAV,
+        ProtocolKind::CalDav => PROTOCOL_CALDAV,
         ProtocolKind::Graph => PROTOCOL_GRAPH,
         // `ProtocolKind` is `#[non_exhaustive]`; future variants
         // surface as the reserved 0xFF tag so decoding fails loudly.
@@ -343,6 +345,7 @@ fn decode_protocol(tag: u8) -> Result<ProtocolKind, Error> {
         PROTOCOL_IMAP => Ok(ProtocolKind::Imap),
         PROTOCOL_GMAIL => Ok(ProtocolKind::Gmail),
         PROTOCOL_CARDDAV => Ok(ProtocolKind::CardDav),
+        PROTOCOL_CALDAV => Ok(ProtocolKind::CalDav),
         PROTOCOL_GRAPH => Ok(ProtocolKind::Graph),
         other => Err(Error::Other(format!(
             "cursor envelope: unknown protocol tag {other}"

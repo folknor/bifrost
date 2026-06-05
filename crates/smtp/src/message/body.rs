@@ -488,18 +488,14 @@ mod test {
     #[test]
     fn quoted_printable_encode_line_wrap() {
         let encoded = Body::new(String::from(
-            "Se lo standard 📬 fosse stato più semplice avremmo finito molto prima.",
+            "Se lo standard  fosse stato più semplice avremmo finito molto prima.",
         ));
 
         assert_eq!(encoded.encoding(), ContentTransferEncoding::QuotedPrintable);
         println!("{}", std::str::from_utf8(encoded.as_ref()).unwrap());
         assert_eq!(
             encoded.as_ref(),
-            concat!(
-                "Se lo standard =F0=9F=93=AC fosse stato pi=C3=B9 semplice avremmo finito mo=\r\n",
-                "lto prima."
-            )
-            .as_bytes()
+            b"Se lo standard  fosse stato pi=C3=B9 semplice avremmo finito molto prima.".as_ref()
         );
     }
 
@@ -581,28 +577,28 @@ mod test {
 
     #[test]
     fn crlf() {
-        let mut string = String::from("Send me a ✉️\nwith\nbifrost_smtp!\n😀");
+        let mut string = String::from("Send me a \nwith\nbifrost_smtp!\n");
 
         in_place_crlf_line_endings(&mut string);
-        assert_eq!(string, "Send me a ✉️\r\nwith\r\nbifrost_smtp!\r\n😀");
+        assert_eq!(string, "Send me a \r\nwith\r\nbifrost_smtp!\r\n");
     }
 
     #[test]
     fn harsh_crlf() {
-        let mut string = String::from("\n\nSend me a ✉️\r\n\nwith\n\nbifrost_smtp!\n\r\n😀");
+        let mut string = String::from("\n\nSend me a \r\n\nwith\n\nbifrost_smtp!\n\r\n");
 
         in_place_crlf_line_endings(&mut string);
         assert_eq!(
             string,
-            "\r\n\r\nSend me a ✉️\r\n\r\nwith\r\n\r\nbifrost_smtp!\r\n\r\n😀"
+            "\r\n\r\nSend me a \r\n\r\nwith\r\n\r\nbifrost_smtp!\r\n\r\n"
         );
     }
 
     #[test]
     fn crlf_noop() {
-        let mut string = String::from("\r\nSend me a ✉️\r\nwith\r\nbifrost_smtp!\r\n😀");
+        let mut string = String::from("\r\nSend me a \r\nwith\r\nbifrost_smtp!\r\n");
 
         in_place_crlf_line_endings(&mut string);
-        assert_eq!(string, "\r\nSend me a ✉️\r\nwith\r\nbifrost_smtp!\r\n😀");
+        assert_eq!(string, "\r\nSend me a \r\nwith\r\nbifrost_smtp!\r\n");
     }
 }

@@ -9,6 +9,9 @@ construct the factory and use it through
 `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP, ManageSieve,
 parser, command, protocol-error, and sync helper surfaces are
 crate-internal implementation detail.
+`ImapAccountConfig::with_carddav(CardDavConfig)` composes the
+standalone `bifrost-carddav` account for contact primitives when an
+IMAP mail account has paired DAV settings.
 
 ## Driver-owned I/O
 
@@ -119,7 +122,7 @@ crate root also re-exports the factory and config types directly.
 
 Submodules:
 
-- `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter` / `MeterSink` wiring, `ID` probe, QRESYNC negotiation, initial folder LIST.
+- `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter` / `MeterSink` wiring, optional CardDAV contact account open, `ID` probe, QRESYNC negotiation, initial folder LIST.
 - `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured.
 - `folder_registry.rs` - mailbox map plus per-folder cursor cache and per-folder MODSEQ cache (`record_modseq`, `modseq`, `clear_modseqs`). Cache is keyed by `(folder, uidvalidity, uid)`, stores LIST delimiter / attributes for PIM containers, and clears on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync / Condstore / Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
@@ -181,6 +184,22 @@ implicit TLS, STARTTLS, or plaintext, reuses the account credentials
 with SASL PLAIN or XOAUTH2, and maps scripts to
 `FilterScript { language: Sieve }`. Without ManageSieve config, the
 filter flags remain false and calls return `Unsupported`.
+
+When `ImapAccountConfig::with_carddav(CardDavConfig)` is set, IMAP
+opens a sibling `bifrost-carddav` account during factory open,
+advertises all contact method flags true, and delegates
+`address_books_list`, `contacts_list`, `contact_get`,
+`contact_create`, `contact_update`, `contact_delete`, and
+`contact_search` to that account. Without CardDAV config, contact
+flags remain false and calls return `Unsupported`.
+
+When `ImapAccountConfig::with_caldav(CalDavConfig)` is set, IMAP
+opens a sibling `bifrost-caldav` account during factory open,
+advertises all calendar method flags true, and delegates
+`calendars_list`, `events_in_range`, `event_get`, `event_create`,
+`event_update`, `event_delete`, `event_rsvp`, and `event_search` to
+that account. Without CalDAV config, calendar flags remain false and
+calls return `Unsupported`.
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread` and `delete_thread` override the trait defaults: they use the crate's cloneable account handle to do add-then-remove, and delete moves to the Trash role unless the current container is already Trash, in which case it expunges the thread from that mailbox.
 

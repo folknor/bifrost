@@ -1,6 +1,8 @@
 mod blob;
+mod calendar;
 mod capabilities;
 mod changes;
+mod contacts;
 mod cursor;
 mod error;
 mod ews_stream;
@@ -21,14 +23,15 @@ use std::time::Instant;
 
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountStream,
-    AddressBook, AddressBookId, BlobHandle, ByteRange, Change, ChangeCursor, ContactCard,
-    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, FilterValidation, HydratedObject,
-    HydrationProjection, IdempotencyKey, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    AddressBook, AddressBookId, BlobHandle, ByteRange, Calendar, CalendarEvent, Change,
+    ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
+    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HydratedObject, HydrationProjection, IdempotencyKey, InventoryEntry, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
+    Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -559,73 +562,106 @@ impl Account for GraphAccount {
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::AddressBooksList,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { contacts::address_books_list(account).await })
     }
 
     fn contacts_list(
         &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        address_book: Option<AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactsList,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { contacts::list(account, address_book, page_cursor).await })
     }
 
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactGet,
-            ))
-        })
+    fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { contacts::get(account, contact).await })
     }
 
     fn contact_create(
         &self,
-        _contact: ContactCreate,
+        contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactCreate,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { contacts::create(account, contact).await })
     }
 
     fn contact_update(
         &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
+        contact: ContactId,
+        patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactUpdate,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { contacts::update(account, contact, patch).await })
     }
 
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactDelete,
-            ))
-        })
+    fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { contacts::delete(account, contact).await })
     }
 
     fn contact_search(
         &self,
-        _request: ContactSearchRequest,
+        request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        Box::pin(async {
-            Err(graph_error::unsupported_account_error(
-                bifrost_types::AccountOperation::ContactSearch,
-            ))
-        })
+        let account = self.clone();
+        Box::pin(async move { contacts::search(account, request).await })
+    }
+
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::calendars_list(account).await })
+    }
+
+    fn events_in_range(
+        &self,
+        range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::events_in_range(account, range).await })
+    }
+
+    fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::get(account, event).await })
+    }
+
+    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::create(account, event).await })
+    }
+
+    fn event_update(
+        &self,
+        event: EventId,
+        patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::update(account, event, patch).await })
+    }
+
+    fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::delete(account, event).await })
+    }
+
+    fn event_rsvp(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::rsvp(account, event, status).await })
+    }
+
+    fn event_search(
+        &self,
+        request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { calendar::search(account, request).await })
     }
 
     fn thread_hydrate(

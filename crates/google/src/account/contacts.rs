@@ -1,0 +1,1243 @@
+use std::sync::Arc;
+
+use base64::Engine;
+use bifrost_types::{
+    AccountError, AccountFuture, AccountOperation, AddressBook, AddressBookId, ContactCard,
+    ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone,
+    ContactProvenance, ContactSearchRequest, Page, ProtocolKind,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::client::GmailClient;
+
+use super::error::{self, GmailErrorContext};
+use super::non_empty;
+
+const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
+const CONTACTS_BOOK_ID: &str = "google:contacts";
+const PERSON_FIELDS: &str = "names,emailAddresses,phoneNumbers,addresses,organizations,photos,biographies,memberships,metadata";
+
+pub(crate) fn address_books_list(
+    client: Arc<GmailClient>,
+) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
+    Box::pin(async move {
+        let mut books = vec![AddressBook {
+            id: AddressBookId(CONTACTS_BOOK_ID.to_string()),
+            native_id: CONTACTS_BOOK_ID.to_string(),
+            name: "Google Contacts".to_string(),
+            provenance: ContactProvenance {
+                provider: ProtocolKind::Gmail,
+                native: CONTACTS_BOOK_ID.to_string(),
+                address_book_native: None,
+            },
+            is_default: true,
+            can_create_contacts: true,
+            can_update_contacts: true,
+            can_delete_contacts: true,
+        }];
+        let mut page_token = None;
+        loop {
+            let response: ContactGroupsResponse = client
+                .get(&contact_groups_url(page_token.as_deref()))
+                .await
+                .map_err(|error| collection_error(error, AccountOperation::AddressBooksList))?;
+            books.extend(
+                response
+                    .contact_groups
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(address_book_from_group),
+            );
+            let Some(next) = response.next_page_token else {
+                break;
+            };
+            page_token = Some(next);
+        }
+        Ok(books)
+    })
+}
+
+pub(crate) fn list(
+    client: Arc<GmailClient>,
+    address_book: Option<AddressBookId>,
+    page_cursor: Option<Vec<u8>>,
+) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+    Box::pin(async move {
+        validate_address_book(address_book.as_ref(), AccountOperation::ContactsList)?;
+        let group_filter = contact_group_filter(address_book.as_ref());
+        let page_token = page_cursor
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
+        let mut url = format!(
+            "{PEOPLE_API_BASE}/people/me/connections?personFields={}&pageSize=1000",
+            bifrost_net::url::encode_component(PERSON_FIELDS)
+        );
+        if let Some(token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&bifrost_net::url::encode_component(&token));
+        }
+        let response: PeopleConnectionsResponse = client
+            .get(&url)
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::ContactsList))?;
+        Ok(page_from_people(
+            response.connections.unwrap_or_default(),
+            response.next_page_token,
+            group_filter,
+        ))
+    })
+}
+
+pub(crate) fn get(
+    client: Arc<GmailClient>,
+    contact: ContactId,
+) -> AccountFuture<Result<ContactCard, AccountError>> {
+    Box::pin(async move {
+        let person = get_person(&client, &contact, AccountOperation::ContactGet).await?;
+        Ok(contact_from_person(person))
+    })
+}
+
+pub(crate) fn create(
+    client: Arc<GmailClient>,
+    contact: ContactCreate,
+) -> AccountFuture<Result<ContactId, AccountError>> {
+    Box::pin(async move {
+        validate_address_book(
+            contact.address_book_id.as_ref(),
+            AccountOperation::ContactCreate,
+        )?;
+        let person = person_from_create(&contact);
+        let url = format!(
+            "{PEOPLE_API_BASE}/people:createContact?personFields={}",
+            bifrost_net::url::encode_component(PERSON_FIELDS)
+        );
+        let person: Person = client
+            .post(&url, &person)
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::ContactCreate))?;
+        Ok(ContactId(person.resource_name.unwrap_or_default()))
+    })
+}
+
+pub(crate) fn update(
+    client: Arc<GmailClient>,
+    contact: ContactId,
+    patch: ContactPatch,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
+        let etag = require_person_etag(&person)?;
+        validate_address_book(
+            patch.address_book_id.as_ref(),
+            AccountOperation::ContactUpdate,
+        )?;
+        reject_photo_url_patch(&patch)?;
+        let update_fields = update_fields_for_patch(&patch);
+        if !update_fields.is_empty() {
+            apply_patch_to_person(&mut person, &patch);
+            person.resource_name = Some(contact.0.clone());
+            person.etag = Some(etag);
+            let encoded = bifrost_net::url::encode_component(&contact.0);
+            let url = format!(
+                "{PEOPLE_API_BASE}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
+                bifrost_net::url::encode_component(&update_fields),
+                bifrost_net::url::encode_component(PERSON_FIELDS)
+            );
+            let _: Person = client.patch(&url, &person).await.map_err(|error| {
+                contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
+            })?;
+        }
+        if let Some(photo) = patch.photo {
+            update_contact_photo(&client, &contact, photo).await?;
+        }
+        Ok(())
+    })
+}
+
+async fn update_contact_photo(
+    client: &GmailClient,
+    contact: &ContactId,
+    photo: Option<bifrost_types::ContactPhoto>,
+) -> Result<(), AccountError> {
+    let encoded = bifrost_net::url::encode_component(&contact.0);
+    if let Some(photo) = photo {
+        let url = update_contact_photo_url(&encoded);
+        let _: Person = client
+            .post(&url, &update_contact_photo_request(photo))
+            .await
+            .map_err(|error| {
+                contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
+            })?;
+    } else {
+        let url = delete_contact_photo_url(&encoded);
+        let _: Person = client
+            .delete(&url)
+            .await
+            .map(|_| Person::default())
+            .map_err(|error| {
+                contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
+            })?;
+    }
+    Ok(())
+}
+
+fn update_contact_photo_url(encoded_resource_name: &str) -> String {
+    format!(
+        "{PEOPLE_API_BASE}/{encoded_resource_name}:updateContactPhoto?personFields={}",
+        bifrost_net::url::encode_component(PERSON_FIELDS)
+    )
+}
+
+fn delete_contact_photo_url(encoded_resource_name: &str) -> String {
+    format!(
+        "{PEOPLE_API_BASE}/{encoded_resource_name}:deleteContactPhoto?personFields={}",
+        bifrost_net::url::encode_component(PERSON_FIELDS)
+    )
+}
+
+fn update_contact_photo_request(photo: bifrost_types::ContactPhoto) -> UpdateContactPhotoRequest {
+    UpdateContactPhotoRequest {
+        photo_bytes: base64::engine::general_purpose::STANDARD.encode(photo.data),
+    }
+}
+
+async fn get_person(
+    client: &GmailClient,
+    contact: &ContactId,
+    operation: AccountOperation,
+) -> Result<Person, AccountError> {
+    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let url = format!(
+        "{PEOPLE_API_BASE}/{encoded}?personFields={}",
+        bifrost_net::url::encode_component(PERSON_FIELDS)
+    );
+    client
+        .get(&url)
+        .await
+        .map_err(|error| contact_error(error, operation, contact.0.clone()))
+}
+
+pub(crate) fn delete(
+    client: Arc<GmailClient>,
+    contact: ContactId,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let encoded = bifrost_net::url::encode_component(&contact.0);
+        let url = format!("{PEOPLE_API_BASE}/{encoded}:deleteContact");
+        client
+            .delete(&url)
+            .await
+            .map_err(|error| contact_error(error, AccountOperation::ContactDelete, contact.0))
+    })
+}
+
+pub(crate) fn search(
+    client: Arc<GmailClient>,
+    request: ContactSearchRequest,
+) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
+    Box::pin(async move {
+        validate_address_book(
+            request.address_book_id.as_ref(),
+            AccountOperation::ContactSearch,
+        )?;
+        let _: PeopleSearchResponse = client
+            .get(&search_warmup_url())
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::ContactSearch))?;
+        let url = search_url(&request)?;
+        let response: PeopleSearchResponse = client
+            .get(&url)
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::ContactSearch))?;
+        let group_filter = contact_group_filter(request.address_book_id.as_ref());
+        let items = response
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|result| person_in_group(&result.person, group_filter))
+            .map(|result| contact_from_person(result.person))
+            .collect();
+        Ok(Page {
+            items,
+            next_cursor: response.next_page_token.map(String::into_bytes),
+            estimated_total: None,
+        })
+    })
+}
+
+fn reject_photo_url_patch(patch: &ContactPatch) -> Result<(), AccountError> {
+    if patch.photo_url.is_some() {
+        return Err(error::into_account_error(
+            crate::error::Error::unsupported_with(
+                AccountOperation::ContactUpdate,
+                "Google People contact photos require updateContactPhoto with image bytes; ContactPatch.photo_url is read-only",
+            ),
+            GmailErrorContext::contact_collection(AccountOperation::ContactUpdate),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_address_book(
+    address_book: Option<&AddressBookId>,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    if address_book.is_some_and(|address_book| {
+        address_book.0 != CONTACTS_BOOK_ID && !address_book.0.starts_with("contactGroups/")
+    }) {
+        return Err(local_error(
+            operation,
+            "Google People supports google:contacts or contactGroups/* address books".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn contact_groups_url(page_token: Option<&str>) -> String {
+    let mut url = format!(
+        "{PEOPLE_API_BASE}/contactGroups?groupFields={}&pageSize=1000",
+        bifrost_net::url::encode_component("metadata,name")
+    );
+    if let Some(token) = page_token {
+        url.push_str("&pageToken=");
+        url.push_str(&bifrost_net::url::encode_component(token));
+    }
+    url
+}
+
+fn search_warmup_url() -> String {
+    format!(
+        "{PEOPLE_API_BASE}/people:searchContacts?query=&readMask={}",
+        bifrost_net::url::encode_component(PERSON_FIELDS)
+    )
+}
+
+fn search_url(request: &ContactSearchRequest) -> Result<String, AccountError> {
+    let mut url = format!(
+        "{PEOPLE_API_BASE}/people:searchContacts?query={}&readMask={}",
+        bifrost_net::url::encode_component(&request.query),
+        bifrost_net::url::encode_component(PERSON_FIELDS)
+    );
+    if let Some(limit) = request.limit {
+        url.push_str("&pageSize=");
+        url.push_str(&limit.min(30).to_string());
+    }
+    if let Some(cursor) = request.page_cursor.as_ref() {
+        let token = std::str::from_utf8(cursor)
+            .map_err(|error| local_error(AccountOperation::ContactSearch, error.to_string()))?;
+        url.push_str("&pageToken=");
+        url.push_str(&bifrost_net::url::encode_component(token));
+    }
+    Ok(url)
+}
+
+fn page_from_people(
+    people: Vec<Person>,
+    next_page_token: Option<String>,
+    group_filter: Option<&str>,
+) -> Page<ContactCard> {
+    Page {
+        items: people
+            .into_iter()
+            .filter(|person| person_in_group(person, group_filter))
+            .map(contact_from_person)
+            .collect(),
+        next_cursor: next_page_token.map(String::into_bytes),
+        estimated_total: None,
+    }
+}
+
+fn address_book_from_group(group: ContactGroup) -> Option<AddressBook> {
+    let native = group.resource_name?;
+    Some(AddressBook {
+        id: AddressBookId(native.clone()),
+        native_id: native.clone(),
+        name: group.name.unwrap_or_else(|| native.clone()),
+        provenance: ContactProvenance {
+            provider: ProtocolKind::Gmail,
+            native,
+            address_book_native: None,
+        },
+        is_default: false,
+        can_create_contacts: true,
+        can_update_contacts: true,
+        can_delete_contacts: true,
+    })
+}
+
+fn contact_group_filter(address_book: Option<&AddressBookId>) -> Option<&str> {
+    address_book
+        .map(|address_book| address_book.0.as_str())
+        .filter(|address_book| address_book.starts_with("contactGroups/"))
+}
+
+fn person_in_group(person: &Person, group: Option<&str>) -> bool {
+    let Some(group) = group else {
+        return true;
+    };
+    person
+        .memberships
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|membership| {
+            membership
+                .contact_group_membership
+                .as_ref()
+                .and_then(|membership| membership.contact_group_resource_name.as_deref())
+                == Some(group)
+        })
+}
+
+fn contact_from_person(person: Person) -> ContactCard {
+    let native = person.resource_name.unwrap_or_default();
+    let display_name = person
+        .names
+        .as_ref()
+        .and_then(|names| names.first())
+        .and_then(|name| name.display_name.clone());
+    ContactCard {
+        id: ContactId(native.clone()),
+        address_book_id: Some(AddressBookId(CONTACTS_BOOK_ID.to_string())),
+        native_id: native.clone(),
+        etag: person.etag,
+        provenance: ContactProvenance {
+            provider: ProtocolKind::Gmail,
+            native,
+            address_book_native: Some(CONTACTS_BOOK_ID.to_string()),
+        },
+        display_name,
+        emails: person
+            .email_addresses
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|email| {
+                Some(ContactEmail {
+                    value: email.value?,
+                    kind: people_kind(email.kind, email.formatted_type),
+                    is_primary: email
+                        .metadata
+                        .and_then(|meta| meta.primary)
+                        .unwrap_or(false),
+                })
+            })
+            .collect(),
+        phones: person
+            .phone_numbers
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|phone| {
+                Some(ContactPhone {
+                    value: phone.value?,
+                    kind: people_kind(phone.kind, phone.formatted_type),
+                    is_primary: phone
+                        .metadata
+                        .and_then(|meta| meta.primary)
+                        .unwrap_or(false),
+                })
+            })
+            .collect(),
+        organizations: person
+            .organizations
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|org| {
+                Some(ContactOrganization {
+                    name: org.name?,
+                    title: org.title,
+                })
+            })
+            .collect(),
+        addresses: person
+            .addresses
+            .unwrap_or_default()
+            .into_iter()
+            .map(address_from_people)
+            .collect(),
+        notes: person
+            .biographies
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|bio| bio.value),
+        photo_url: person
+            .photos
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|photo| photo.url),
+        photo: None,
+    }
+}
+
+fn person_from_create(contact: &ContactCreate) -> Person {
+    Person {
+        resource_name: None,
+        etag: None,
+        names: contact
+            .display_name
+            .as_ref()
+            .map(|display_name| vec![name_from_display_name(display_name)]),
+        email_addresses: non_empty(contact.emails.iter().map(|email| EmailAddress {
+            value: Some(email.value.clone()),
+            kind: people_type(email.kind.as_deref()).map(ToString::to_string),
+            formatted_type: people_formatted_type(email.kind.as_deref()).map(ToString::to_string),
+            metadata: email.is_primary.then_some(FieldMetadata {
+                primary: Some(true),
+            }),
+        })),
+        phone_numbers: non_empty(contact.phones.iter().map(|phone| PhoneNumber {
+            value: Some(phone.value.clone()),
+            kind: people_type(phone.kind.as_deref()).map(ToString::to_string),
+            formatted_type: people_formatted_type(phone.kind.as_deref()).map(ToString::to_string),
+            metadata: phone.is_primary.then_some(FieldMetadata {
+                primary: Some(true),
+            }),
+        })),
+        organizations: non_empty(contact.organizations.iter().map(|org| Organization {
+            name: Some(org.name.clone()),
+            title: org.title.clone(),
+        })),
+        addresses: non_empty(contact.addresses.iter().map(address_to_people)),
+        photos: None,
+        biographies: contact.notes.as_ref().map(|notes| {
+            vec![Biography {
+                value: Some(notes.clone()),
+            }]
+        }),
+        memberships: contact_group_filter(contact.address_book_id.as_ref()).map(|group| {
+            vec![Membership {
+                contact_group_membership: Some(ContactGroupMembership {
+                    contact_group_resource_name: Some(group.to_string()),
+                }),
+            }]
+        }),
+    }
+}
+
+fn name_from_display_name(display_name: &str) -> Name {
+    let mut parts = display_name.split_whitespace().collect::<Vec<_>>();
+    let family_name = (parts.len() > 1).then(|| parts.pop().unwrap_or_default().to_string());
+    let given_name = (!parts.is_empty()).then(|| parts.join(" "));
+    Name {
+        display_name: None,
+        given_name,
+        family_name,
+        extra: Map::new(),
+    }
+}
+
+fn apply_patch_to_person(person: &mut Person, patch: &ContactPatch) {
+    if let Some(display_name) = &patch.display_name {
+        person.names = display_name
+            .as_deref()
+            .map(|display_name| patched_names(person.names.take(), display_name));
+    }
+    if let Some(emails) = &patch.emails {
+        person.email_addresses = non_empty(emails.iter().map(|email| EmailAddress {
+            value: Some(email.value.clone()),
+            kind: people_type(email.kind.as_deref()).map(ToString::to_string),
+            formatted_type: people_formatted_type(email.kind.as_deref()).map(ToString::to_string),
+            metadata: email.is_primary.then_some(FieldMetadata {
+                primary: Some(true),
+            }),
+        }));
+    }
+    if let Some(phones) = &patch.phones {
+        person.phone_numbers = non_empty(phones.iter().map(|phone| PhoneNumber {
+            value: Some(phone.value.clone()),
+            kind: people_type(phone.kind.as_deref()).map(ToString::to_string),
+            formatted_type: people_formatted_type(phone.kind.as_deref()).map(ToString::to_string),
+            metadata: phone.is_primary.then_some(FieldMetadata {
+                primary: Some(true),
+            }),
+        }));
+    }
+    if let Some(organizations) = &patch.organizations {
+        person.organizations = non_empty(organizations.iter().map(|org| Organization {
+            name: Some(org.name.clone()),
+            title: org.title.clone(),
+        }));
+    }
+    if let Some(addresses) = &patch.addresses {
+        person.addresses = non_empty(addresses.iter().map(address_to_people));
+    }
+    if let Some(notes) = &patch.notes {
+        person.biographies = notes.as_ref().map(|notes| {
+            vec![Biography {
+                value: Some(notes.clone()),
+            }]
+        });
+    }
+}
+
+fn patched_names(names: Option<Vec<Name>>, display_name: &str) -> Vec<Name> {
+    let replacement = name_from_display_name(display_name);
+    if let Some(mut names) = names
+        && let Some(first) = names.first_mut()
+    {
+        first.display_name = None;
+        first.given_name = replacement.given_name;
+        first.family_name = replacement.family_name;
+        return names;
+    }
+    vec![replacement]
+}
+
+fn require_person_etag(person: &Person) -> Result<String, AccountError> {
+    person.etag.clone().ok_or_else(|| {
+        local_error_with_field(
+            AccountOperation::ContactUpdate,
+            "contactEtag",
+            "Google People updateContact requires an etag".to_string(),
+        )
+    })
+}
+
+fn update_fields_for_patch(patch: &ContactPatch) -> String {
+    let mut fields = Vec::new();
+    if patch.display_name.is_some() {
+        fields.push("names");
+    }
+    if patch.emails.is_some() {
+        fields.push("emailAddresses");
+    }
+    if patch.phones.is_some() {
+        fields.push("phoneNumbers");
+    }
+    if patch.organizations.is_some() {
+        fields.push("organizations");
+    }
+    if patch.addresses.is_some() {
+        fields.push("addresses");
+    }
+    if patch.notes.is_some() {
+        fields.push("biographies");
+    }
+    fields.join(",")
+}
+
+fn people_kind(kind: Option<String>, formatted_type: Option<String>) -> Option<String> {
+    match (kind.as_deref(), formatted_type) {
+        (Some("custom"), Some(label)) if !label.is_empty() => Some(label),
+        _ => kind,
+    }
+}
+
+fn people_type(kind: Option<&str>) -> Option<&str> {
+    kind.map(|kind| match kind {
+        "home" | "work" | "other" | "mobile" | "main" | "homeFax" | "workFax" | "pager" => kind,
+        _ => "custom",
+    })
+}
+
+fn people_formatted_type(kind: Option<&str>) -> Option<&str> {
+    kind.filter(|kind| people_type(Some(kind)) == Some("custom"))
+}
+
+fn address_from_people(address: PeopleAddress) -> bifrost_types::ContactAddress {
+    bifrost_types::ContactAddress {
+        kind: people_kind(address.kind, address.formatted_type),
+        formatted: address.formatted_value,
+        street: address
+            .street_address
+            .map(|street| street.lines().map(ToString::to_string).collect())
+            .unwrap_or_default(),
+        locality: address.city,
+        region: address.region,
+        postal_code: address.postal_code,
+        country: address.country,
+        is_primary: address
+            .metadata
+            .and_then(|meta| meta.primary)
+            .unwrap_or(false),
+    }
+}
+
+fn address_to_people(address: &bifrost_types::ContactAddress) -> PeopleAddress {
+    PeopleAddress {
+        formatted_value: address.formatted.clone(),
+        street_address: (!address.street.is_empty()).then(|| address.street.join("\n")),
+        city: address.locality.clone(),
+        region: address.region.clone(),
+        postal_code: address.postal_code.clone(),
+        country: address.country.clone(),
+        kind: people_type(address.kind.as_deref()).map(ToString::to_string),
+        formatted_type: people_formatted_type(address.kind.as_deref()).map(ToString::to_string),
+        metadata: address.is_primary.then_some(FieldMetadata {
+            primary: Some(true),
+        }),
+    }
+}
+
+fn collection_error(error: crate::Error, operation: AccountOperation) -> AccountError {
+    error::into_account_error(error, GmailErrorContext::contact_collection(operation))
+}
+
+fn contact_error(error: crate::Error, operation: AccountOperation, id: String) -> AccountError {
+    error::into_account_error(error, GmailErrorContext::contact(operation, id))
+}
+
+fn local_error(operation: AccountOperation, message: String) -> AccountError {
+    local_error_with_field(operation, "contactPageToken", message)
+}
+
+fn local_error_with_field(
+    operation: AccountOperation,
+    field: &'static str,
+    message: String,
+) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::missing_field(field, message),
+        GmailErrorContext::contact_collection(operation),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct Person {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    names: Option<Vec<Name>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_addresses: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phone_numbers: Option<Vec<PhoneNumber>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addresses: Option<Vec<PeopleAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organizations: Option<Vec<Organization>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    photos: Option<Vec<Photo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    biographies: Option<Vec<Biography>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memberships: Option<Vec<Membership>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeopleConnectionsResponse {
+    connections: Option<Vec<Person>>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateContactPhotoRequest {
+    photo_bytes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContactGroupsResponse {
+    contact_groups: Option<Vec<ContactGroup>>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContactGroup {
+    resource_name: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeopleSearchResponse {
+    results: Option<Vec<SearchResult>>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchResult {
+    person: Person,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Name {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    given_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    family_name: Option<String>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formatted_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<FieldMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PhoneNumber {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formatted_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<FieldMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeopleAddress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formatted_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    street_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postal_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    country: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    formatted_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<FieldMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Organization {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Photo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Biography {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Membership {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_group_membership: Option<ContactGroupMembership>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContactGroupMembership {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contact_group_resource_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn person_maps_to_contact_card() {
+        let person = Person {
+            resource_name: Some("people/c1".to_string()),
+            etag: Some("etag".to_string()),
+            names: Some(vec![Name {
+                display_name: Some("Ada Lovelace".to_string()),
+                given_name: None,
+                family_name: None,
+                extra: Map::new(),
+            }]),
+            email_addresses: Some(vec![
+                EmailAddress {
+                    value: Some("ada@example.test".to_string()),
+                    kind: Some("work".to_string()),
+                    formatted_type: None,
+                    metadata: Some(FieldMetadata {
+                        primary: Some(true),
+                    }),
+                },
+                EmailAddress {
+                    value: Some("lab@example.test".to_string()),
+                    kind: Some("custom".to_string()),
+                    formatted_type: Some("lab".to_string()),
+                    metadata: None,
+                },
+            ]),
+            phone_numbers: Some(vec![PhoneNumber {
+                value: Some("+123".to_string()),
+                kind: Some("mobile".to_string()),
+                formatted_type: None,
+                metadata: None,
+            }]),
+            organizations: Some(vec![Organization {
+                name: Some("Analytical Engines".to_string()),
+                title: Some("Programmer".to_string()),
+            }]),
+            addresses: Some(vec![PeopleAddress {
+                formatted_value: Some("1 Example St, London".to_string()),
+                street_address: Some("1 Example St\nUnit 2".to_string()),
+                city: Some("London".to_string()),
+                region: Some("England".to_string()),
+                postal_code: Some("N1".to_string()),
+                country: Some("UK".to_string()),
+                kind: Some("home".to_string()),
+                formatted_type: None,
+                metadata: Some(FieldMetadata {
+                    primary: Some(true),
+                }),
+            }]),
+            photos: Some(vec![Photo {
+                url: Some("https://example.test/a.jpg".to_string()),
+            }]),
+            biographies: Some(vec![Biography {
+                value: Some("notes".to_string()),
+            }]),
+            memberships: None,
+        };
+
+        let card = contact_from_person(person);
+        assert_eq!(card.id.0, "people/c1");
+        assert_eq!(card.display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(card.emails[0].kind.as_deref(), Some("work"));
+        assert_eq!(card.emails[1].kind.as_deref(), Some("lab"));
+        assert!(card.emails[0].is_primary);
+        assert_eq!(card.phones[0].kind.as_deref(), Some("mobile"));
+        assert_eq!(card.addresses[0].kind.as_deref(), Some("home"));
+        assert_eq!(card.addresses[0].street, vec!["1 Example St", "Unit 2"]);
+        assert!(card.addresses[0].is_primary);
+        assert_eq!(card.organizations[0].title.as_deref(), Some("Programmer"));
+        assert_eq!(card.notes.as_deref(), Some("notes"));
+        assert_eq!(
+            card.photo_url.as_deref(),
+            Some("https://example.test/a.jpg")
+        );
+    }
+
+    #[test]
+    fn create_maps_contact_fields_to_person_payload() {
+        let payload = person_from_create(&ContactCreate {
+            display_name: Some("Ada".to_string()),
+            photo_url: Some("https://example.test/a.jpg".to_string()),
+            emails: vec![ContactEmail {
+                value: "ada@example.test".to_string(),
+                kind: Some("home".to_string()),
+                is_primary: true,
+            }],
+            addresses: vec![bifrost_types::ContactAddress {
+                kind: Some("work".to_string()),
+                formatted: None,
+                street: vec!["1 Analytical Way".to_string()],
+                locality: Some("London".to_string()),
+                region: None,
+                postal_code: Some("N1".to_string()),
+                country: Some("UK".to_string()),
+                is_primary: false,
+            }],
+            ..ContactCreate::default()
+        });
+
+        let name = &payload.names.unwrap()[0];
+        assert_eq!(name.display_name.as_deref(), None);
+        assert_eq!(name.given_name.as_deref(), Some("Ada"));
+        assert_eq!(name.family_name.as_deref(), None);
+        assert!(payload.photos.is_none());
+        let email = &payload.email_addresses.unwrap()[0];
+        assert_eq!(email.value.as_deref(), Some("ada@example.test"));
+        assert_eq!(email.kind.as_deref(), Some("home"));
+        assert_eq!(email.formatted_type.as_deref(), None);
+        assert_eq!(
+            email.metadata.as_ref().and_then(|meta| meta.primary),
+            Some(true)
+        );
+        let address = &payload.addresses.unwrap()[0];
+        assert_eq!(address.kind.as_deref(), Some("work"));
+        assert_eq!(address.street_address.as_deref(), Some("1 Analytical Way"));
+    }
+
+    #[test]
+    fn create_maps_custom_labels_to_formatted_type() {
+        let payload = person_from_create(&ContactCreate {
+            emails: vec![ContactEmail {
+                value: "ada@example.test".to_string(),
+                kind: Some("lab".to_string()),
+                is_primary: false,
+            }],
+            phones: vec![ContactPhone {
+                value: "+123".to_string(),
+                kind: Some("radio".to_string()),
+                is_primary: false,
+            }],
+            ..ContactCreate::default()
+        });
+        let email = &payload.email_addresses.unwrap()[0];
+        let phone = &payload.phone_numbers.unwrap()[0];
+
+        assert_eq!(email.kind.as_deref(), Some("custom"));
+        assert_eq!(email.formatted_type.as_deref(), Some("lab"));
+        assert_eq!(phone.kind.as_deref(), Some("custom"));
+        assert_eq!(phone.formatted_type.as_deref(), Some("radio"));
+    }
+
+    #[test]
+    fn name_from_display_name_splits_given_and_family() {
+        let name = name_from_display_name("Ada Byron Lovelace");
+        assert_eq!(name.display_name.as_deref(), None);
+        assert_eq!(name.given_name.as_deref(), Some("Ada Byron"));
+        assert_eq!(name.family_name.as_deref(), Some("Lovelace"));
+    }
+
+    #[test]
+    fn display_name_patch_preserves_unmodeled_name_fields() {
+        let mut extra = Map::new();
+        extra.insert("middleName".to_string(), serde_json::json!("Byron"));
+        extra.insert("phoneticGivenName".to_string(), serde_json::json!("Ada"));
+        let mut person = Person {
+            etag: Some("etag".to_string()),
+            names: Some(vec![
+                Name {
+                    display_name: Some("Ada Byron Lovelace".to_string()),
+                    given_name: Some("Ada".to_string()),
+                    family_name: Some("Lovelace".to_string()),
+                    extra,
+                },
+                Name {
+                    display_name: Some("Ada King".to_string()),
+                    given_name: None,
+                    family_name: None,
+                    extra: Map::new(),
+                },
+            ]),
+            ..Person::default()
+        };
+
+        apply_patch_to_person(
+            &mut person,
+            &ContactPatch {
+                display_name: Some(Some("Augusta Ada King".to_string())),
+                ..ContactPatch::default()
+            },
+        );
+
+        let names = person.names.expect("names");
+        assert_eq!(names[0].given_name.as_deref(), Some("Augusta Ada"));
+        assert_eq!(names[0].family_name.as_deref(), Some("King"));
+        assert_eq!(names[0].extra["middleName"].as_str(), Some("Byron"));
+        assert_eq!(names[0].extra["phoneticGivenName"].as_str(), Some("Ada"));
+        assert_eq!(names[1].display_name.as_deref(), Some("Ada King"));
+    }
+
+    #[test]
+    fn scalar_clear_patch_removes_modeled_people_fields() {
+        let mut person = Person {
+            etag: Some("etag".to_string()),
+            biographies: Some(vec![Biography {
+                value: Some("notes".to_string()),
+            }]),
+            ..Person::default()
+        };
+
+        apply_patch_to_person(
+            &mut person,
+            &ContactPatch {
+                notes: Some(None),
+                photo_url: Some(None),
+                ..ContactPatch::default()
+            },
+        );
+
+        assert!(person.biographies.is_none());
+        assert!(person.photos.is_none());
+    }
+
+    #[test]
+    fn photo_url_patch_is_rejected_as_unsupported() {
+        let error = reject_photo_url_patch(&ContactPatch {
+            photo_url: Some(Some("https://example.test/a.jpg".to_string())),
+            ..ContactPatch::default()
+        })
+        .expect_err("photo url patch should be unsupported");
+
+        assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::ContactUpdate)
+        ));
+    }
+
+    #[test]
+    fn contact_photo_patch_uses_people_photo_endpoint_payload() {
+        let encoded = bifrost_net::url::encode_component("people/c1");
+        assert!(update_contact_photo_url(&encoded).contains("people%2Fc1:updateContactPhoto"));
+        assert!(delete_contact_photo_url(&encoded).contains("people%2Fc1:deleteContactPhoto"));
+
+        let payload = update_contact_photo_request(bifrost_types::ContactPhoto {
+            data: vec![1, 2, 3, 4],
+            media_type: Some("image/jpeg".to_string()),
+        });
+        let value = serde_json::to_value(payload).expect("photo payload");
+        assert_eq!(
+            value.get("photoBytes").and_then(Value::as_str),
+            Some("AQIDBA==")
+        );
+    }
+
+    #[test]
+    fn update_fields_follow_present_patch_fields() {
+        assert_eq!(
+            update_fields_for_patch(&ContactPatch {
+                emails: Some(Vec::new()),
+                notes: Some(None),
+                ..ContactPatch::default()
+            }),
+            "emailAddresses,biographies"
+        );
+        assert_eq!(
+            update_fields_for_patch(&ContactPatch {
+                photo_url: Some(None),
+                photo: Some(None),
+                address_book_id: Some(AddressBookId(CONTACTS_BOOK_ID.to_string())),
+                ..ContactPatch::default()
+            }),
+            ""
+        );
+    }
+
+    #[test]
+    fn validate_address_book_accepts_google_book_and_contact_groups() {
+        validate_address_book(None, AccountOperation::ContactsList).expect("default book");
+        validate_address_book(
+            Some(&AddressBookId(CONTACTS_BOOK_ID.to_string())),
+            AccountOperation::ContactsList,
+        )
+        .expect("google contacts book");
+        validate_address_book(
+            Some(&AddressBookId("contactGroups/friends".to_string())),
+            AccountOperation::ContactsList,
+        )
+        .expect("google contact group");
+
+        let error = validate_address_book(
+            Some(&AddressBookId("people/contactGroups/friends".to_string())),
+            AccountOperation::ContactsList,
+        )
+        .expect_err("unsupported book should fail");
+
+        assert_eq!(error.operation(), Some(AccountOperation::ContactsList));
+    }
+
+    #[test]
+    fn contact_groups_url_includes_fields_and_page_token() {
+        let url = contact_groups_url(Some("next token"));
+
+        assert!(url.contains("contactGroups?groupFields=metadata%2Cname"));
+        assert!(url.contains("pageSize=1000"));
+        assert!(url.contains("pageToken=next%20token"));
+    }
+
+    #[test]
+    fn contact_group_maps_to_address_book() {
+        let book = address_book_from_group(ContactGroup {
+            resource_name: Some("contactGroups/friends".to_string()),
+            name: Some("Friends".to_string()),
+        })
+        .expect("address book");
+
+        assert_eq!(book.id.0, "contactGroups/friends");
+        assert_eq!(book.name, "Friends");
+        assert!(!book.is_default);
+    }
+
+    #[test]
+    fn create_payload_writes_contact_group_membership() {
+        let payload = person_from_create(&ContactCreate {
+            address_book_id: Some(AddressBookId("contactGroups/friends".to_string())),
+            ..ContactCreate::default()
+        });
+
+        let memberships = payload.memberships.expect("memberships");
+        assert_eq!(
+            memberships[0]
+                .contact_group_membership
+                .as_ref()
+                .and_then(|membership| membership.contact_group_resource_name.as_deref()),
+            Some("contactGroups/friends")
+        );
+    }
+
+    #[test]
+    fn person_in_group_matches_contact_group_membership() {
+        let person = Person {
+            memberships: Some(vec![Membership {
+                contact_group_membership: Some(ContactGroupMembership {
+                    contact_group_resource_name: Some("contactGroups/friends".to_string()),
+                }),
+            }]),
+            ..Person::default()
+        };
+
+        assert!(person_in_group(&person, Some("contactGroups/friends")));
+        assert!(!person_in_group(&person, Some("contactGroups/coworkers")));
+        assert!(person_in_group(&person, None));
+    }
+
+    #[test]
+    fn search_url_includes_page_token_and_capped_page_size() {
+        let url = search_url(&ContactSearchRequest {
+            query: "Ada Lovelace".to_string(),
+            address_book_id: None,
+            page_cursor: Some(b"next token".to_vec()),
+            limit: Some(100),
+        })
+        .expect("search url");
+
+        assert!(url.contains("query=Ada%20Lovelace"));
+        assert!(url.contains("pageSize=30"));
+        assert!(url.contains("pageToken=next%20token"));
+    }
+
+    #[test]
+    fn search_warmup_url_uses_empty_query_and_read_mask() {
+        let url = search_warmup_url();
+
+        assert!(url.contains("people:searchContacts?query=&readMask="));
+        assert!(url.contains("names%2CemailAddresses"));
+        assert!(!url.contains("pageSize="));
+    }
+
+    #[test]
+    fn require_person_etag_rejects_missing_etag() {
+        let error = require_person_etag(&Person::default()).expect_err("missing etag should fail");
+
+        assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+    }
+}

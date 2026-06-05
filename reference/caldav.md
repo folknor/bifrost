@@ -1,0 +1,85 @@
+# bifrost-caldav reference
+
+Current Stage 4 standalone CalDAV account implementation.
+
+## Public surface
+
+- `CalDavCredentials` - Basic or bearer credentials.
+- `CalDavConfig` - base URL plus credentials.
+- `CalDavAccountFactory` - implements `AccountFactory`.
+
+`CalDavAccountFactory::open(account_id)` discovers the CalDAV calendar
+home, caches the default calendar URL, and returns an `Arc<dyn Account>`.
+The raw DAV client, XML parser, and iCalendar projection stay
+crate-private; consumers use only the factory and the shared `Account`
+calendar primitives.
+
+## Module layout
+
+- `lib.rs` - public config / credentials / factory.
+- `account.rs` - crate-private calendar-only `Account` impl.
+- `client.rs` - crate-private reqwest CalDAV client: discovery,
+  `PROPFIND`, `REPORT`, `GET`, `PUT`, and `DELETE`.
+- `parse.rs` - XML response parsers for calendar discovery, event
+  listing, multiget hydration, and nested href properties. Calendar
+  collection metadata is staged per `propstat` and committed only for
+  successful 2xx propstat statuses. Event listing and multiget parsers
+  use element-stack parent checks so nested same-name properties do not
+  overwrite response-level hrefs or propstat status.
+- `ical.rs` - small iCalendar projection between DAV resources and
+  `bifrost-types` calendar events.
+- `capabilities.rs` - calendar-only `AccountCapabilities`.
+
+## Account behavior
+
+Supported calendar primitives:
+
+- `calendars_list` - `PROPFIND` depth 1 on the discovered calendar
+  home, filtering `resourcetype` entries that contain `calendar`.
+- `events_in_range` - `calendar-query` `REPORT` with a CalDAV
+  `time-range` filter and calendar-data hydration, followed by local
+  overlap filtering as a defensive guard.
+- `event_get` - direct `GET` of the event resource.
+- `event_create` - creates a VEVENT resource with a UUID-backed
+  `.ics` path using `PUT`, including STATUS from shared lifecycle status,
+  TRANSP from shared availability, CLASS from shared visibility when
+  present, ORGANIZER from the shared organizer field, and VTIMEZONE
+  components for TZID-bearing start/end times. The generated VTIMEZONE
+  components are conservative fixed-offset stubs, not full timezone
+  transition-rule definitions.
+- `event_update` - fetches the current event, applies the shared
+  `EventPatch`, and writes the replacement resource with `If-Match`
+  when an etag was present. When the current resource carried raw
+  iCalendar data, updates replace only modeled VEVENT properties present
+  in the patch so untouched properties such as organizer, status,
+  transparency, and class are preserved. Non-VEVENT components such as
+  VTIMEZONE are preserved on raw-backed updates. Multi-VEVENT recurrence
+  override components are preserved for scalar patches, but recurrence
+  replacement is rejected for resources with override VEVENTs because the
+  shared recurrence model cannot rewrite those instances losslessly.
+- `event_delete` - deletes the DAV resource.
+- `event_rsvp` - uses an email-like Basic username, or a mailto address
+  discovered from the principal's `calendar-user-address-set`, to rewrite
+  the matching attendee's participation status. When the principal
+  exposes `schedule-outbox-URL`, RSVP first posts an iTIP `METHOD:REPLY`
+  to that outbox and then applies the same raw-preserving replacement
+  path to the local resource. Accounts without an identifiable attendee
+  or schedule outbox return `Unsupported`.
+- `event_search` / `event_autocomplete` - non-empty searches issue
+  CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
+  description, location, and attendee, then keep local filtering as a
+  defensive guard. Empty search lists the collection to preserve
+  match-all behavior.
+
+Cursor support is calendar-event only. `discover_cursor_scopes` returns
+`CursorScope::Type(ObjectType::CalendarEvent)`. `establish_initial_cursor`
+builds a hybrid cursor from the calendar URL, the collection
+`sync-token` when present, and a sorted href/etag snapshot.
+`changes_stream` uses WebDAV `sync-collection` when the cursor carries a
+sync token, applies returned href/etag/status entries to the snapshot,
+and emits created/updated/destroyed event changes. Calendars without a
+sync token fall back to polling snapshot diffs. `inventory_stream` emits
+event inventory entries with ETag fingerprints for the same cursor scope.
+
+All mail, contact, filter, blob, push, and settings methods return
+`AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

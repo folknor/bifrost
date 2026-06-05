@@ -110,6 +110,38 @@ Per-RFC features: `mail`, `calendars`, `contacts`, `blob`, `quota`. Each gates:
 - PushObject/PushNotification variants.
 - Test modules.
 
+The Account layer under `crates/jmap/src/sync/` wires optional PIM
+capabilities at open time. `contacts.rs` maps JMAP AddressBook and
+ContactCard methods onto the shared contact primitives, including
+JSContact postal addresses. `calendar_ops.rs` maps JMAP Calendar and
+CalendarEvent methods onto the shared calendar primitives, including
+list/range/get/create/update/delete/RSVP/search.
+Range queries send a server-side `AND(inCalendar, after, before)` filter
+and still apply the local overlap predicate after hydration as a defensive
+guard.
+Calendar recurrence maps common RRULE fields to JSCalendar
+`recurrenceRules` objects and back. Simple shared RDATE/EXDATE values map
+through JSCalendar `recurrenceOverrides`. Unsupported outbound RRULE
+parts are rejected before Set payload construction; modified recurrence
+overrides and less common JSCalendar recurrence features remain outside
+the shared mapping.
+Calendar privacy maps between JSCalendar `privacy` and shared event
+visibility, with JSCalendar `secret` exposed as `Confidential`.
+Lifecycle status maps between shared `EventStatus` and JSCalendar
+`status` on read, create, and update.
+Shared event organizers map to and from JSCalendar owner participants;
+created events write the organizer as an `owner` participant.
+JSCalendar `freeBusyStatus` standardizes `free` and `busy`; shared
+Tentative and OutOfOffice availability therefore serialize as busy.
+RSVP resolves authenticated email aliases from Basic credentials and
+RFC 9670 Principal/get when available, then patches the matching
+participant's `participationStatus` by dotted path. If no authenticated
+email is known, it falls back to the single non-owner attendee heuristic;
+ambiguous events without an identity match return unsupported rather than
+guessing.
+If the server lacks the relevant JMAP capability, the method flags are
+false and calls return JMAP-stamped `Unsupported`.
+
 ## Error model
 
 The crate-internal JMAP error type uses structured variants. No

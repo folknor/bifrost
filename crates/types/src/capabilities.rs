@@ -20,6 +20,8 @@ use crate::filter::FilterRuleShape;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CursorFreshness {
+    /// The account does not expose a cursor or changes primitive.
+    None,
     ServerIssued,
     Hybrid,
 }
@@ -133,14 +135,18 @@ pub enum QuotaSignal {
     None,
 }
 
-/// Per-method support advertisement for the PIM trait surface.
+/// Per-method dispatch advertisement for the PIM trait surface.
 ///
 /// Each field corresponds to a primitive or convenience on `Account`.
-/// `true` means the implementation handles the method; `false` means
-/// it returns `Err(Error::Unsupported)`. The convenience layer's
-/// default impls inspect this flag set to decide whether to dispatch
-/// into a primitive or short-circuit. New flags are added with
-/// `false` defaults so growing the trait surface stays additive.
+/// `true` means the implementation handles the method instead of
+/// always returning `Err(Error::Unsupported)`. It does not promise a
+/// lossless provider model, native server-side filtering, or support
+/// for every optional field that can appear on that provider's wire
+/// object. `false` means the method is unsupported and should
+/// short-circuit. The convenience layer's default impls inspect this
+/// flag set to decide whether to dispatch into a primitive or return
+/// unsupported. New flags are added with `false` defaults so growing
+/// the trait surface stays additive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PimMethodSupport {
     // Mail mutation primitives.
@@ -191,6 +197,16 @@ pub struct PimMethodSupport {
     pub contact_delete: bool,
     pub contact_search: bool,
     pub contact_autocomplete: bool,
+    // Calendar primitives and conveniences.
+    pub calendars_list: bool,
+    pub events_in_range: bool,
+    pub event_get: bool,
+    pub event_create: bool,
+    pub event_update: bool,
+    pub event_delete: bool,
+    pub event_rsvp: bool,
+    pub event_search: bool,
+    pub event_autocomplete: bool,
 }
 
 /// Mapping from each provider's flag namespace onto the canonical

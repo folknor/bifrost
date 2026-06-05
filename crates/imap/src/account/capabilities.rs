@@ -12,6 +12,8 @@ pub(crate) fn build_capabilities(
     profile: &ServerProfile,
     folders: &[MailboxInfo],
     has_sieve: bool,
+    has_carddav: bool,
+    has_caldav: bool,
 ) -> AccountCapabilities {
     let has_drafts = folders.iter().any(|folder| {
         folder
@@ -83,14 +85,23 @@ pub(crate) fn build_capabilities(
             filter_update: has_sieve,
             filter_delete: has_sieve,
             filter_validate: has_sieve,
-            address_books_list: false,
-            contacts_list: false,
-            contact_get: false,
-            contact_create: false,
-            contact_update: false,
-            contact_delete: false,
-            contact_search: false,
-            contact_autocomplete: false,
+            address_books_list: has_carddav,
+            contacts_list: has_carddav,
+            contact_get: has_carddav,
+            contact_create: has_carddav,
+            contact_update: has_carddav,
+            contact_delete: has_carddav,
+            contact_search: has_carddav,
+            contact_autocomplete: has_carddav,
+            calendars_list: has_caldav,
+            events_in_range: has_caldav,
+            event_get: has_caldav,
+            event_create: has_caldav,
+            event_update: has_caldav,
+            event_delete: has_caldav,
+            event_rsvp: has_caldav,
+            event_search: has_caldav,
+            event_autocomplete: has_caldav,
         },
         filter_rule_shape: if has_sieve {
             FilterRuleShape::Scripts
@@ -117,7 +128,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[], false);
+        let caps = build_capabilities(&profile, &[], false, false, false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -139,19 +150,33 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false);
+        let caps = build_capabilities(&profile, &[], false, false, false);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
     }
 
     #[test]
     fn capability_builder_advertises_sieve_when_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], true);
+        let caps = build_capabilities(&profile, &[], true, false, false);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);
         assert!(caps.pim_methods.filter_update);
         assert!(caps.pim_methods.filter_delete);
         assert!(caps.pim_methods.filter_validate);
+    }
+
+    #[test]
+    fn capability_builder_advertises_contacts_when_carddav_configured() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let caps = build_capabilities(&profile, &[], false, true, false);
+        assert!(caps.pim_methods.address_books_list);
+        assert!(caps.pim_methods.contacts_list);
+        assert!(caps.pim_methods.contact_get);
+        assert!(caps.pim_methods.contact_create);
+        assert!(caps.pim_methods.contact_update);
+        assert!(caps.pim_methods.contact_delete);
+        assert!(caps.pim_methods.contact_search);
+        assert!(caps.pim_methods.contact_autocomplete);
     }
 }

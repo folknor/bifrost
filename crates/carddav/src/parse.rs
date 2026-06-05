@@ -1,0 +1,604 @@
+use quick_xml::Reader;
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CardDavContactEntry {
+    pub(crate) uri: String,
+    pub(crate) etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CardDavFetchedVCard {
+    pub(crate) uri: String,
+    pub(crate) etag: Option<String>,
+    pub(crate) data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AddressBookCollection {
+    pub(crate) href: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) ctag: Option<String>,
+}
+
+pub(crate) fn parse_addressbook_collections(
+    xml: &str,
+) -> Result<Vec<AddressBookCollection>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut collections = Vec::new();
+    let mut current = ResponseParts::default();
+    let mut stack = Vec::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "response" {
+                    current = ResponseParts::default();
+                    current.in_response = true;
+                }
+                if current.in_response && name == "propstat" {
+                    current.begin_propstat();
+                }
+                if current.in_response && name == "addressbook" {
+                    current.mark_addressbook();
+                }
+                stack.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(value)) => {
+                push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if current.in_response && name == "addressbook" {
+                    current.mark_addressbook();
+                }
+            }
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if current.in_response {
+                    match (parent, name.as_str()) {
+                        (Some("response"), "href") => current.href = trimmed(&text),
+                        (Some("prop"), "displayname") => {
+                            current.propstat_display_name = trimmed(&text);
+                        }
+                        (Some("prop"), "getctag") => {
+                            current.propstat_ctag = trimmed(&text);
+                        }
+                        (Some("propstat"), "status") => {
+                            current.propstat_success = Some(is_success_status(&text));
+                        }
+                        _ => {}
+                    }
+                }
+                if name == "propstat" {
+                    current.commit_propstat();
+                }
+                if name == "response" {
+                    current.in_response = false;
+                    if let Some(collection) = current.as_addressbook_collection() {
+                        collections.push(collection);
+                    }
+                }
+                stack.pop();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(collections)
+}
+
+pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<Vec<CardDavContactEntry>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut entries = Vec::new();
+    let mut current = ResponseParts::default();
+    let mut stack = Vec::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "response" {
+                    current = ResponseParts::default();
+                    current.in_response = true;
+                }
+                if current.in_response && name == "propstat" {
+                    current.begin_propstat();
+                }
+                stack.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(value)) => {
+                push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if current.in_response {
+                    match (parent, name.as_str()) {
+                        (Some("response"), "href") => current.href = trimmed(&text),
+                        (Some("prop"), "getetag") => current.propstat_etag = normalize_etag(&text),
+                        (Some("prop"), "getcontenttype") => {
+                            current.propstat_content_type = trimmed(&text);
+                        }
+                        (Some("propstat"), "status") => {
+                            current.propstat_success = Some(is_success_status(&text));
+                        }
+                        _ => {}
+                    }
+                }
+                if name == "propstat" {
+                    current.commit_propstat();
+                }
+                if name == "response" {
+                    current.in_response = false;
+                    if let Some(entry) = current.as_contact_entry() {
+                        entries.push(entry);
+                    }
+                }
+                stack.pop();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(entries)
+}
+
+pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut results = Vec::new();
+    let mut current = ResponseParts::default();
+    let mut stack = Vec::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == "response" {
+                    current = ResponseParts::default();
+                    current.in_response = true;
+                }
+                if current.in_response && name == "propstat" {
+                    current.begin_propstat();
+                }
+                stack.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(value)) => {
+                push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if current.in_response {
+                    match (parent, name.as_str()) {
+                        (Some("response"), "href") => current.href = trimmed(&text),
+                        (Some("prop"), "getetag") => current.propstat_etag = normalize_etag(&text),
+                        (Some("prop"), "address-data") => {
+                            current.propstat_address_data = trimmed(&text);
+                        }
+                        (Some("propstat"), "status") => {
+                            current.propstat_success = Some(is_success_status(&text));
+                        }
+                        _ => {}
+                    }
+                }
+                if name == "propstat" {
+                    current.commit_propstat();
+                }
+                if name == "response" {
+                    current.in_response = false;
+                    if let Some(card) = current.as_fetched_vcard() {
+                        results.push(card);
+                    }
+                }
+                stack.pop();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(results)
+}
+
+pub(crate) fn extract_href_property(
+    xml: &str,
+    property_name: &str,
+) -> Result<Option<String>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut in_property = false;
+    let mut current_tag = String::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                let name = local_name(element.name().as_ref());
+                if name == property_name {
+                    in_property = true;
+                }
+                current_tag = name;
+                text.clear();
+            }
+            Ok(Event::Text(value)) => {
+                push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                if in_property
+                    && current_tag == "href"
+                    && let Some(href) = trimmed(&text)
+                {
+                    return Ok(Some(href));
+                }
+                if name == property_name {
+                    in_property = false;
+                }
+                current_tag.clear();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(None)
+}
+
+fn push_text(target: &mut String, raw: &[u8]) -> Result<(), String> {
+    let raw =
+        std::str::from_utf8(raw).map_err(|error| format!("XML text is not UTF-8: {error}"))?;
+    let text = unescape(raw).map_err(|error| format!("XML text escape error: {error}"))?;
+    target.push_str(&text);
+    Ok(())
+}
+
+fn trimmed(text: &str) -> Option<String> {
+    let value = text.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn is_success_status(value: &str) -> bool {
+    value
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code.starts_with('2'))
+}
+
+fn normalize_etag(text: &str) -> Option<String> {
+    trimmed(text).map(|value| value.trim_matches('"').to_string())
+}
+
+fn is_vcard_resource(href: &str, content_type: &Option<String>) -> bool {
+    content_type
+        .as_deref()
+        .is_some_and(|ty| ty.to_ascii_lowercase().contains("text/vcard"))
+        || href.to_ascii_lowercase().ends_with(".vcf")
+}
+
+fn local_name(raw: &[u8]) -> String {
+    let full = String::from_utf8_lossy(raw);
+    match full.rfind(':') {
+        Some(index) => full[index + 1..].to_string(),
+        None => full.to_string(),
+    }
+}
+
+#[derive(Default)]
+struct ResponseParts {
+    in_response: bool,
+    in_propstat: bool,
+    propstat_success: Option<bool>,
+    has_success_propstat: bool,
+    is_addressbook: bool,
+    propstat_is_addressbook: bool,
+    href: Option<String>,
+    etag: Option<String>,
+    propstat_etag: Option<String>,
+    content_type: Option<String>,
+    propstat_content_type: Option<String>,
+    address_data: Option<String>,
+    propstat_address_data: Option<String>,
+    display_name: Option<String>,
+    propstat_display_name: Option<String>,
+    ctag: Option<String>,
+    propstat_ctag: Option<String>,
+}
+
+impl ResponseParts {
+    fn begin_propstat(&mut self) {
+        self.in_propstat = true;
+        self.propstat_success = None;
+        self.propstat_is_addressbook = false;
+        self.propstat_etag = None;
+        self.propstat_content_type = None;
+        self.propstat_address_data = None;
+        self.propstat_display_name = None;
+        self.propstat_ctag = None;
+    }
+
+    fn mark_addressbook(&mut self) {
+        if self.in_propstat {
+            self.propstat_is_addressbook = true;
+        } else {
+            self.is_addressbook = true;
+        }
+    }
+
+    fn commit_propstat(&mut self) {
+        if self.propstat_success.unwrap_or(true) {
+            self.has_success_propstat = true;
+            self.is_addressbook |= self.propstat_is_addressbook;
+            if self.propstat_etag.is_some() {
+                self.etag = self.propstat_etag.take();
+            }
+            if self.propstat_content_type.is_some() {
+                self.content_type = self.propstat_content_type.take();
+            }
+            if self.propstat_address_data.is_some() {
+                self.address_data = self.propstat_address_data.take();
+            }
+            if self.propstat_display_name.is_some() {
+                self.display_name = self.propstat_display_name.take();
+            }
+            if self.propstat_ctag.is_some() {
+                self.ctag = self.propstat_ctag.take();
+            }
+        }
+        self.in_propstat = false;
+        self.propstat_success = None;
+        self.propstat_is_addressbook = false;
+        self.propstat_etag = None;
+        self.propstat_content_type = None;
+        self.propstat_address_data = None;
+        self.propstat_display_name = None;
+        self.propstat_ctag = None;
+    }
+
+    fn as_addressbook_collection(&self) -> Option<AddressBookCollection> {
+        if !self.is_addressbook {
+            return None;
+        }
+        let href = self.href.as_ref()?;
+        Some(AddressBookCollection {
+            href: href.clone(),
+            display_name: self.display_name.clone(),
+            ctag: self.ctag.clone(),
+        })
+    }
+
+    fn as_contact_entry(&self) -> Option<CardDavContactEntry> {
+        let href = self.href.as_ref()?;
+        if !self.has_success_propstat {
+            return None;
+        }
+        if !is_vcard_resource(href, &self.content_type) {
+            return None;
+        }
+        Some(CardDavContactEntry {
+            uri: href.clone(),
+            etag: self.etag.clone(),
+        })
+    }
+
+    fn as_fetched_vcard(&self) -> Option<CardDavFetchedVCard> {
+        Some(CardDavFetchedVCard {
+            uri: self.href.as_ref()?.clone(),
+            etag: self.etag.clone(),
+            data: self.address_data.as_ref()?.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propfind_contacts_extracts_vcards_and_etags() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/contacts/card-1.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"abc"</D:getetag>
+        <D:getcontenttype>text/vcard; charset=utf-8</D:getcontenttype>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/contacts/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"collection"</D:getetag>
+        <D:getcontenttype>httpd/unix-directory</D:getcontenttype>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let entries = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(
+            entries,
+            vec![CardDavContactEntry {
+                uri: "/contacts/card-1.vcf".to_string(),
+                etag: Some("abc".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn propfind_contacts_ignores_failed_propstat_values() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/contacts/card-1.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"missing"</D:getetag>
+        <D:getcontenttype>text/vcard</D:getcontenttype>
+      </D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let entries = parse_propfind_contacts(xml).expect("valid XML");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn propfind_contacts_ignores_nested_href_properties() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/card-1.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:owner><D:href>/principals/ada/</D:href></D:owner>
+        <D:getetag>"abc"</D:getetag>
+        <D:getcontenttype>text/vcard</D:getcontenttype>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let entries = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(entries[0].uri, "/contacts/card-1.vcf");
+    }
+
+    #[test]
+    fn multiget_extracts_href_etag_and_vcard() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/card-1.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"abc"</D:getetag>
+        <C:address-data>BEGIN:VCARD
+FN:Ada Lovelace
+END:VCARD</C:address-data>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let cards = parse_multiget_report(xml).expect("valid XML");
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].uri, "/contacts/card-1.vcf");
+        assert_eq!(cards[0].etag.as_deref(), Some("abc"));
+        assert!(cards[0].data.contains("FN:Ada Lovelace"));
+    }
+
+    #[test]
+    fn multiget_ignores_failed_propstat_values() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/card-1.vcf</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"abc"</D:getetag>
+        <C:address-data>BEGIN:VCARD
+FN:Ada Lovelace
+END:VCARD</C:address-data>
+      </D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let cards = parse_multiget_report(xml).expect("valid XML");
+        assert!(cards.is_empty());
+    }
+
+    #[test]
+    fn extract_href_property_finds_nested_href() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:propstat>
+      <D:prop>
+        <D:current-user-principal>
+          <D:href>/principals/user/</D:href>
+        </D:current-user-principal>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let href = extract_href_property(xml, "current-user-principal").expect("valid XML");
+        assert_eq!(href.as_deref(), Some("/principals/user/"));
+    }
+
+    #[test]
+    fn addressbook_collections_read_display_names() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+        <D:displayname>Personal</D:displayname>
+        <CS:getctag>42</CS:getctag>
+      </D:prop>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let books = parse_addressbook_collections(xml).expect("valid XML");
+        assert_eq!(
+            books,
+            vec![AddressBookCollection {
+                href: "/contacts/personal/".to_string(),
+                display_name: Some("Personal".to_string()),
+                ctag: Some("42".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn addressbook_collections_ignore_failed_propstat_values() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+        <D:displayname>Personal</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let books = parse_addressbook_collections(xml).expect("valid XML");
+        assert!(books.is_empty());
+    }
+}

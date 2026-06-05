@@ -75,6 +75,28 @@ pub struct ContactOrganization {
     pub title: Option<String>,
 }
 
+/// Postal address on a contact card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactAddress {
+    /// Provider-native label such as `home`, `work`, or `other`.
+    pub kind: Option<String>,
+    pub formatted: Option<String>,
+    pub street: Vec<String>,
+    pub locality: Option<String>,
+    pub region: Option<String>,
+    pub postal_code: Option<String>,
+    pub country: Option<String>,
+    pub is_primary: bool,
+}
+
+/// Inline binary photo data on a contact card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactPhoto {
+    pub data: Vec<u8>,
+    /// Provider-native media type or image type hint, when present.
+    pub media_type: Option<String>,
+}
+
 /// Unified contact card returned by contact primitives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactCard {
@@ -93,8 +115,10 @@ pub struct ContactCard {
     pub emails: Vec<ContactEmail>,
     pub phones: Vec<ContactPhone>,
     pub organizations: Vec<ContactOrganization>,
+    pub addresses: Vec<ContactAddress>,
     pub notes: Option<String>,
     pub photo_url: Option<String>,
+    pub photo: Option<ContactPhoto>,
 }
 
 /// Contact creation payload.
@@ -105,6 +129,7 @@ pub struct ContactCreate {
     pub emails: Vec<ContactEmail>,
     pub phones: Vec<ContactPhone>,
     pub organizations: Vec<ContactOrganization>,
+    pub addresses: Vec<ContactAddress>,
     pub notes: Option<String>,
     pub photo_url: Option<String>,
 }
@@ -121,8 +146,10 @@ pub struct ContactPatch {
     pub emails: Option<Vec<ContactEmail>>,
     pub phones: Option<Vec<ContactPhone>>,
     pub organizations: Option<Vec<ContactOrganization>>,
+    pub addresses: Option<Vec<ContactAddress>>,
     pub notes: Option<Option<String>>,
     pub photo_url: Option<Option<String>>,
+    pub photo: Option<Option<ContactPhoto>>,
 }
 
 /// Search request for provider-side contact lookup.

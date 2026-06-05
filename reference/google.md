@@ -155,11 +155,16 @@ on the same cancellation token.
     `search`, `search_messages`, `containers_list`,
     `container_create`, `container_rename`, `container_delete`,
     `identities_list`, `identity_update`, `vacation_get`,
-    `vacation_set`, `thread_hydrate`, `message_hydrate`.
+    `vacation_set`, `thread_hydrate`, `message_hydrate`,
+    `address_books_list`, `contacts_list`, `contact_get`,
+    `contact_create`, `contact_update`, `contact_delete`,
+    `contact_search`, `contact_autocomplete`, `calendars_list`,
+    `events_in_range`, `event_get`, `event_create`,
+    `event_update`, `event_delete`, `event_rsvp`, `event_search`,
+    and `event_autocomplete`.
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `attachment_upload`,
-    `container_move`, `quota_get`, and all contact primitives until
-    the Stage 3 People API implementation wires them in.
+    `container_move`, and `quota_get`.
 - `filter_rule_shape: Rules`. Gmail settings filters are wired for
   list/create/delete plus local validation. `filter_update` remains
   unsupported because the Gmail API exposes no update or replace
@@ -232,6 +237,11 @@ the requested `HydrationProjection`, parses common address and
 threading headers, maps label ids to containers and canonical flags,
 and surfaces attachment blob handles for `FullWithBlobs`.
 
+Google Calendar maps shared lifecycle status, availability,
+visibility, attendees, and recurrence on create/update. Organizer is
+server-derived for created events; create payloads that include a shared
+organizer are rejected as unsupported instead of being silently dropped.
+
 The Gmail overrides for multi-call conveniences are:
 
 - `move_thread` adds the target container first, then removes the
@@ -245,6 +255,39 @@ Other conveniences inherit the trait default. `set_starred` routes
 through `set_label_membership` because capabilities advertise
 `LabelMembership`. `apply_label` and `remove_label` use the default
 provenance dispatch for Gmail label ids.
+
+People contacts use `people/me/connections`, `people:get`,
+`people:createContact`, `people:updateContact`, and
+`people:deleteContact`. Update fetches the raw People `Person`, requires
+the server ETag, and replaces only fields named by the shared
+`ContactPatch`. Display-name updates rewrite the first modeled name's
+given/family split while preserving unmodeled People name fields and
+additional name entries from the raw payload. Custom email and phone
+labels use People `type=custom` plus `formattedType`; People postal
+addresses map through the shared `ContactAddress` model. Contact search
+sends the People API empty-query warmup request before the requested
+`searchContacts` query so the search cache is populated after mutations.
+The account exposes the synthetic `google:contacts` address book plus
+People `contactGroups.list` groups as shared address books. Contact
+list/search accept no id, `google:contacts`, or `contactGroups/*` ids;
+group-scoped list/search filters returned People contacts by
+`contactGroupMembership`. Contact creates into a group include the
+matching People membership. Contact photos are read-only through the shared
+`photo_url`; URL update attempts return unsupported because People
+`updateContactPhoto` requires image bytes, not a URL. Raw
+`ContactPatch.photo` updates call `updateContactPhoto`, and clearing that
+field calls `deleteContactPhoto`.
+
+Google Calendar RSVP fetches the raw event, updates only the matching
+account attendee's `responseStatus`, and sends the attendee array back
+with unmodeled attendee fields preserved from the raw payload. Event
+status maps through Google Calendar `status` on read, create, and update.
+Event
+search uses the requested calendar when supplied; otherwise it walks the
+calendar list and searches each calendar, using an internal cursor that
+records the calendar id plus the provider page token. Calendar update
+uses `events.move` when `EventPatch.calendar_id` targets a different
+calendar, then applies any remaining field patch against the destination.
 
 ## Cursor envelope
 

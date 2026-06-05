@@ -86,6 +86,10 @@ impl CalendarEvent {
         self.properties.get("freeBusyStatus")?.as_str()
     }
 
+    pub(crate) fn privacy(&self) -> Option<&str> {
+        self.properties.get("privacy")?.as_str()
+    }
+
     pub(crate) fn recurrence_id(&self) -> Option<&str> {
         self.properties.get("recurrenceId")?.as_str()
     }

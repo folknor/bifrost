@@ -31,14 +31,15 @@ Crates present:
 
 - `crates/jmap/` → `bifrost-jmap` - JMAP client. RFC 8620 / 8621 / 8887 / 9404 / 9425 / 9610 / 9670, calendars draft-26, sieve draft-14.
 - `crates/imap/` → `bifrost-imap` - IMAP client. Daaki-derived driver-task model. Tokio + native-tls only.
-- `crates/google/` → `bifrost-google` - Google account client. Gmail mail is wired; People contacts are staged for Stage 3.
+- `crates/google/` → `bifrost-google` - Google account client. Gmail mail, People contacts, and Google Calendar are wired.
 - `crates/graph/` → `bifrost-graph` - Microsoft Graph account client.
-- `crates/carddav/` → `bifrost-carddav` - staged CardDAV account crate for Stage 3 contacts.
+- `crates/carddav/` → `bifrost-carddav` - CardDAV account crate for contacts.
+- `crates/caldav/` → `bifrost-caldav` - CalDAV account crate for calendars.
 - `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Native-tls only.
 
 All crates are pre-1.0, API stabilization phase.
 
-CalDAV is planned for Stage 4.
+CalDAV composes into IMAP-shaped accounts when configured.
 
 ## Rules
 
@@ -112,9 +113,10 @@ Per-crate architecture and conventions. Single source of truth for current code 
 
 - `reference/jmap.md` - bifrost-jmap dispatch, transport, module pattern, capabilities, error model, and the `Account` impl under `crates/jmap/src/sync/` (cursor envelope, inventory / changes / hydration, WebSocket push, mutation pipeline, recovery taxonomy).
 - `reference/imap.md` - bifrost-imap driver model, cancellation safety, streaming FETCH, typed IDs, auth, and the account layer under `crates/imap/src/account/` (QRESYNC / CONDSTORE / Basic cursor strategy, per-folder modseq cache, opportunistic `STORE UNCHANGEDSINCE`).
-- `reference/google.md` - bifrost-google `Account` impl: Gmail history-id seeded sync, Cloud Pub/Sub push with renewer and health stream, mutation pipeline with flag canonicalization and TRASH fallback, and Google contacts staging.
+- `reference/google.md` - bifrost-google `Account` impl: Gmail history-id seeded sync, Cloud Pub/Sub push with renewer and health stream, mutation pipeline with flag canonicalization and TRASH fallback, and Google People contacts.
 - `reference/graph.md` - bifrost-graph `Account` impl: Microsoft Graph delta-token sync, webhook push with renewal health worker plus EWS streaming fallback, cursor envelope and validation, `If-Match` etag mutations, error mapping.
-- `reference/carddav.md` - bifrost-carddav Stage 3 skeleton and planned CardDAV Account wiring.
+- `reference/carddav.md` - bifrost-carddav standalone contact Account implementation.
+- `reference/caldav.md` - bifrost-caldav standalone calendar Account implementation.
 - `reference/smtp.md` - bifrost-smtp transport types, PIPELINING, DSN, message builder, LMTP.
 - `reference/net.md` - bifrost-net shared HTTP transport: retry, rate-limiting, observability.
 - `reference/sync.md` - bifrost-sync engine: scheduler, multiplexer, partitioned backfill, push reconciler, mutation pipeline, checkpoint envelope versioning, scope lifecycle.

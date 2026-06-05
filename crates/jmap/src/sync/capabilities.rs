@@ -60,6 +60,8 @@ pub(crate) struct PimSupport {
     pub(crate) vacation: bool,
     pub(crate) quota: bool,
     pub(crate) sieve: bool,
+    pub(crate) contacts: bool,
+    pub(crate) calendar: bool,
 }
 
 pub(crate) fn build(
@@ -141,14 +143,23 @@ pub(crate) fn build(
             filter_update: support.sieve,
             filter_delete: support.sieve,
             filter_validate: support.sieve,
-            address_books_list: false,
-            contacts_list: false,
-            contact_get: false,
-            contact_create: false,
-            contact_update: false,
-            contact_delete: false,
-            contact_search: false,
-            contact_autocomplete: false,
+            address_books_list: support.contacts,
+            contacts_list: support.contacts,
+            contact_get: support.contacts,
+            contact_create: support.contacts,
+            contact_update: support.contacts,
+            contact_delete: support.contacts,
+            contact_search: support.contacts,
+            contact_autocomplete: support.contacts,
+            calendars_list: support.calendar,
+            events_in_range: support.calendar,
+            event_get: support.calendar,
+            event_create: support.calendar,
+            event_update: support.calendar,
+            event_delete: support.calendar,
+            event_rsvp: support.calendar,
+            event_search: support.calendar,
+            event_autocomplete: support.calendar,
         },
         filter_rule_shape: if support.sieve {
             FilterRuleShape::Scripts
@@ -219,6 +230,8 @@ mod tests {
                 vacation: true,
                 quota: true,
                 sieve: true,
+                contacts: true,
+                calendar: false,
             },
         )
         .unwrap();
@@ -280,6 +293,8 @@ mod tests {
                 vacation: false,
                 quota: false,
                 sieve: false,
+                contacts: false,
+                calendar: false,
             },
         )
         .unwrap_err();

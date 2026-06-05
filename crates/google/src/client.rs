@@ -11,6 +11,10 @@ use serde::de::DeserializeOwned;
 use crate::{Error, Result};
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
+const GOOGLE_API_QUOTA_PER_SECOND: f64 = 250.0;
+const GOOGLE_API_BURST: u32 = 250;
+const PEOPLE_API_QUOTA_PER_SECOND: f64 = 1.5;
+const PEOPLE_API_BURST: u32 = 30;
 
 #[derive(Clone)]
 pub(crate) struct GmailClient {
@@ -225,12 +229,20 @@ fn default_account_net(
     net.attach_account(
         uniquify_account_id(account),
         AccountSpec {
-            hosts: vec![RateLimit {
-                host: host.into(),
-                quota_per_second: 250.0,
-                cost_default: 1,
-                burst: 250,
-            }],
+            hosts: vec![
+                RateLimit {
+                    host: host.into(),
+                    quota_per_second: GOOGLE_API_QUOTA_PER_SECOND,
+                    cost_default: 1,
+                    burst: GOOGLE_API_BURST,
+                },
+                RateLimit {
+                    host: "people.googleapis.com".to_string(),
+                    quota_per_second: PEOPLE_API_QUOTA_PER_SECOND,
+                    cost_default: 1,
+                    burst: PEOPLE_API_BURST,
+                },
+            ],
             token_source,
             default_retry: RetryPolicy::default(),
         },

@@ -15,16 +15,18 @@ use bifrost_types::{
     BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, ContactCard, ContactCreate,
     ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
     ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
-    DraftHandle, DraftPatch, FilterRuleShape, FilterValidation, FlagOp, HydratedObject,
-    HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, RequestCause, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterRuleShape, FilterValidation, FlagOp, HydratedObject, HydratedObjectKind,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
+    MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
+    PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
+    RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
+use bifrost_types::{Calendar, CalendarEvent};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
@@ -487,6 +489,52 @@ impl Account for FlagsAccount {
         _request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactSearch)) })
+    }
+
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::CalendarsList)) })
+    }
+
+    fn events_in_range(
+        &self,
+        _range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventsInRange)) })
+    }
+
+    fn event_get(&self, _event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventGet)) })
+    }
+
+    fn event_create(&self, _event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventCreate)) })
+    }
+
+    fn event_update(
+        &self,
+        _event: EventId,
+        _patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventUpdate)) })
+    }
+
+    fn event_delete(&self, _event: EventId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventDelete)) })
+    }
+
+    fn event_rsvp(
+        &self,
+        _event: EventId,
+        _status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventRsvp)) })
+    }
+
+    fn event_search(
+        &self,
+        _request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::EventSearch)) })
     }
 
     fn thread_hydrate(

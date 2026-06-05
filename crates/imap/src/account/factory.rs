@@ -3,12 +3,18 @@ use std::time::Duration;
 
 use bifrost_types::{Account, AccountError, AccountFactory, AccountFuture, AccountId};
 
+use bifrost_caldav::{CalDavAccountFactory, CalDavConfig};
+use bifrost_carddav::{CardDavAccountFactory, CardDavConfig};
+
 use crate::connection::ImapConfig;
 use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};
 
 use super::error::ImapErrorContext;
 use super::sieve::ManageSieveConfig;
-use super::{ImapAccount, Pool, account_error_with, capabilities, folder_registry::FolderRegistry};
+use super::{
+    ImapAccount, ImapAccountParts, Pool, account_error_with, capabilities,
+    folder_registry::FolderRegistry,
+};
 use bifrost_types::AccountOperation;
 
 /// Account-boundary translation for every leg of `open` (connect,
@@ -40,6 +46,8 @@ pub struct ImapAccountConfig {
     pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     pub meter_sink: Option<Arc<dyn bifrost_net::MeterSink>>,
     pub sieve: Option<ManageSieveConfig>,
+    pub carddav: Option<CardDavConfig>,
+    pub caldav: Option<CalDavConfig>,
 }
 
 impl ImapAccountConfig {
@@ -57,6 +65,8 @@ impl ImapAccountConfig {
             bandwidth_meter: None,
             meter_sink: None,
             sieve: None,
+            carddav: None,
+            caldav: None,
         }
     }
 
@@ -72,6 +82,16 @@ impl ImapAccountConfig {
 
     pub fn with_manage_sieve(mut self, config: ManageSieveConfig) -> Self {
         self.sieve = Some(config);
+        self
+    }
+
+    pub fn with_carddav(mut self, config: CardDavConfig) -> Self {
+        self.carddav = Some(config);
+        self
+    }
+
+    pub fn with_caldav(mut self, config: CalDavConfig) -> Self {
+        self.caldav = Some(config);
         self
     }
 }
@@ -95,7 +115,7 @@ impl AccountFactory for ImapAccountFactory {
             let bandwidth_cap = Arc::new(std::sync::atomic::AtomicU64::new(
                 super::UNLIMITED_BANDWIDTH,
             ));
-            let meter = meter_handle(&cfg, account_id);
+            let meter = meter_handle(&cfg, account_id.clone());
             let (conn, _auth) = cfg
                 .imap
                 .connect_authenticated_metered(
@@ -119,7 +139,15 @@ impl AccountFactory for ImapAccountFactory {
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
                 .map_err(discover_err)?;
-            let caps = capabilities::build_capabilities(&profile, &folders, cfg.sieve.is_some());
+            let contacts = open_carddav(&cfg, account_id.clone()).await?;
+            let calendars = open_caldav(&cfg, account_id.clone()).await?;
+            let caps = capabilities::build_capabilities(
+                &profile,
+                &folders,
+                cfg.sieve.is_some(),
+                contacts.is_some(),
+                calendars.is_some(),
+            );
             let registry = Arc::new(FolderRegistry::from_list(folders));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
             let pool = Arc::new(Pool::new(
@@ -129,18 +157,46 @@ impl AccountFactory for ImapAccountFactory {
                 meter,
                 Arc::clone(&bandwidth_cap),
             ));
-            let account = ImapAccount::new(
-                cfg,
-                caps,
+            let account = ImapAccount::new(ImapAccountParts {
+                config: cfg,
+                capabilities: caps,
                 pool,
-                registry,
-                qresync.enabled,
-                qresync.warning,
+                folders: registry,
+                qresync_enabled: qresync.enabled,
+                qresync_negotiation_warning: qresync.warning,
                 bandwidth_cap,
-            );
+                contacts,
+                calendars,
+            });
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
     }
+}
+
+async fn open_carddav(
+    cfg: &ImapAccountConfig,
+    account_id: AccountId,
+) -> Result<Option<Arc<dyn Account>>, AccountError> {
+    let Some(config) = cfg.carddav.clone() else {
+        return Ok(None);
+    };
+    CardDavAccountFactory::new(config)
+        .open(account_id)
+        .await
+        .map(Some)
+}
+
+async fn open_caldav(
+    cfg: &ImapAccountConfig,
+    account_id: AccountId,
+) -> Result<Option<Arc<dyn Account>>, AccountError> {
+    let Some(config) = cfg.caldav.clone() else {
+        return Ok(None);
+    };
+    CalDavAccountFactory::new(config)
+        .open(account_id)
+        .await
+        .map(Some)
 }
 
 fn meter_handle(

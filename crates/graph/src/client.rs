@@ -186,6 +186,10 @@ impl GraphClient {
         self.inner.mailbox_id.is_some()
     }
 
+    pub(crate) fn uses_default_mailbox(&self) -> bool {
+        self.inner.mailbox_id.is_none()
+    }
+
     #[cfg(test)]
     pub(crate) fn mailbox_id(&self) -> Option<&str> {
         self.inner.mailbox_id.as_deref()
@@ -196,11 +200,29 @@ impl GraphClient {
         self.request::<T, ()>(&url, "GET", None).await
     }
 
+    pub(crate) async fn get_json_prefer<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        prefer: &str,
+    ) -> Result<T, GraphError> {
+        let url = self.api_url(path);
+        self.request_prefer::<T, ()>(&url, "GET", prefer, None)
+            .await
+    }
+
     pub(crate) async fn get_absolute<T: DeserializeOwned>(
         &self,
         url: &str,
     ) -> Result<T, GraphError> {
         self.request::<T, ()>(url, "GET", None).await
+    }
+
+    pub(crate) async fn get_absolute_prefer<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        prefer: &str,
+    ) -> Result<T, GraphError> {
+        self.request_prefer::<T, ()>(url, "GET", prefer, None).await
     }
 
     pub(crate) async fn post<T: DeserializeOwned, B: Serialize>(
@@ -218,9 +240,32 @@ impl GraphClient {
         check_response_status(response)
     }
 
+    pub(crate) async fn post_no_response<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), GraphError> {
+        let url = self.api_url(path);
+        let response = self.execute(&url, "POST", Some(body)).await?;
+        check_response_status(response)
+    }
+
     pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "PATCH", Some(body)).await?;
+        check_response_status(response)
+    }
+
+    pub(crate) async fn patch_if_match<B: Serialize>(
+        &self,
+        path: &str,
+        etag: &str,
+        body: &B,
+    ) -> Result<(), GraphError> {
+        let url = self.api_url(path);
+        let response = self
+            .execute_if_match(&url, "PATCH", etag, Some(body))
+            .await?;
         check_response_status(response)
     }
 
@@ -236,6 +281,14 @@ impl GraphClient {
     pub(crate) async fn delete(&self, path: &str) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "DELETE", None::<&()>).await?;
+        check_response_status(response)
+    }
+
+    pub(crate) async fn delete_if_match(&self, path: &str, etag: &str) -> Result<(), GraphError> {
+        let url = self.api_url(path);
+        let response = self
+            .execute_if_match(&url, "DELETE", etag, None::<&()>)
+            .await?;
         check_response_status(response)
     }
 
@@ -260,10 +313,45 @@ impl GraphClient {
         parse_json_response(response)
     }
 
+    async fn request_prefer<T: DeserializeOwned, B: Serialize>(
+        &self,
+        url: &str,
+        method: &str,
+        prefer: &str,
+        body: Option<&B>,
+    ) -> Result<T, GraphError> {
+        let response = self
+            .execute_request(url, method, None, Some(prefer), body)
+            .await?;
+        parse_json_response(response)
+    }
+
     async fn execute<B: Serialize>(
         &self,
         url: &str,
         method: &str,
+        body: Option<&B>,
+    ) -> Result<Response, GraphError> {
+        self.execute_request(url, method, None, None, body).await
+    }
+
+    async fn execute_if_match<B: Serialize>(
+        &self,
+        url: &str,
+        method: &str,
+        etag: &str,
+        body: Option<&B>,
+    ) -> Result<Response, GraphError> {
+        self.execute_request(url, method, Some(etag), None, body)
+            .await
+    }
+
+    async fn execute_request<B: Serialize>(
+        &self,
+        url: &str,
+        method: &str,
+        if_match: Option<&str>,
+        prefer: Option<&str>,
         body: Option<&B>,
     ) -> Result<Response, GraphError> {
         let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
@@ -295,6 +383,12 @@ impl GraphClient {
         };
 
         builder = builder.header("Content-Type", "application/json");
+        if let Some(etag) = if_match {
+            builder = builder.header("If-Match", etag);
+        }
+        if let Some(prefer) = prefer {
+            builder = builder.header("Prefer", prefer);
+        }
 
         if let Some(b) = body {
             builder = builder.json(b);

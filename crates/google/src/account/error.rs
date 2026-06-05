@@ -38,6 +38,8 @@ pub(crate) enum GmailResource {
     Vacation,
     Blob,
     PubSubWatch,
+    Calendar,
+    Contact,
 }
 
 impl GmailResource {
@@ -50,6 +52,8 @@ impl GmailResource {
             Self::Identity => Some(ResourceKind::Identity),
             Self::Vacation => Some(ResourceKind::Vacation),
             Self::PubSubWatch => Some(ResourceKind::PushSubscription),
+            Self::Calendar => Some(ResourceKind::Calendar),
+            Self::Contact => Some(ResourceKind::Contact),
             // `Blob` NotFound semantically means the parent message
             // cannot be opened; classify as the parent's message kind so
             // consumer routing surfaces the message-not-found UX.
@@ -231,6 +235,34 @@ impl GmailErrorContext {
     pub(crate) fn vacation_set() -> Self {
         let mut ctx = Self::base(AccountOperation::VacationSet);
         ctx.resource = Some(GmailResource::Vacation);
+        ctx
+    }
+
+    pub(crate) fn calendar_collection(operation: AccountOperation) -> Self {
+        let mut ctx = Self::base(operation);
+        ctx.scope = Some(ErrorScope::CalendarCollection);
+        ctx.resource = Some(GmailResource::Calendar);
+        ctx
+    }
+
+    pub(crate) fn calendar_event(operation: AccountOperation, id: impl Into<String>) -> Self {
+        let mut ctx = Self::base(operation);
+        ctx.scope = Some(ErrorScope::Calendar { id: id.into() });
+        ctx.resource = Some(GmailResource::Calendar);
+        ctx
+    }
+
+    pub(crate) fn contact_collection(operation: AccountOperation) -> Self {
+        let mut ctx = Self::base(operation);
+        ctx.scope = Some(ErrorScope::ContactCollection);
+        ctx.resource = Some(GmailResource::Contact);
+        ctx
+    }
+
+    pub(crate) fn contact(operation: AccountOperation, id: impl Into<String>) -> Self {
+        let mut ctx = Self::base(operation);
+        ctx.scope = Some(ErrorScope::Contact { id: id.into() });
+        ctx.resource = Some(GmailResource::Contact);
         ctx
     }
 }
@@ -1670,6 +1702,50 @@ mod tests {
             acc.kind(),
             AccountErrorKind::NotFound(ResourceKind::PushSubscription)
         ));
+    }
+
+    #[test]
+    fn not_found_calendar_event_uses_calendar_resource_and_scope_id() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(
+            err,
+            GmailErrorContext::calendar_event(AccountOperation::EventGet, "calendar::event"),
+        );
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Calendar)
+        ));
+        assert!(acc.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                Cause::Request(RequestCause::NotFound {
+                    what: ResourceKind::Calendar,
+                    id: Some(id),
+                }) if id == "calendar::event"
+            )
+        }));
+    }
+
+    #[test]
+    fn not_found_contact_uses_contact_resource_and_scope_id() {
+        let err = gmail_response(404, &body_with_reason("notFound"));
+        let acc = into_account_error(
+            err,
+            GmailErrorContext::contact(AccountOperation::ContactGet, "people/c1"),
+        );
+        assert!(matches!(
+            acc.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Contact)
+        ));
+        assert!(acc.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                Cause::Request(RequestCause::NotFound {
+                    what: ResourceKind::Contact,
+                    id: Some(id),
+                }) if id == "people/c1"
+            )
+        }));
     }
 
     /// gmail-D5: `InsufficientScope::needed` reflects the operation.

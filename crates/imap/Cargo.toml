@@ -25,6 +25,8 @@ default = []
 base64 = { workspace = true }
 bifrost-types = { path = "../types" }
 bifrost-net = { path = "../net" }
+bifrost-caldav = { path = "../caldav" }
+bifrost-carddav = { path = "../carddav" }
 bytes = { workspace = true }
 chrono = { workspace = true }
 encoding_rs = "0.8"

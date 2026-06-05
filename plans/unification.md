@@ -476,7 +476,7 @@ Then the standard wave structure:
   `AccountCapabilities` grows the contacts-support flags. Provider
   implementations return structured `Unsupported` until W2 wires the
   real backends.
-- **W2: protocol impls** (four agents in parallel):
+- **W2: protocol impls.** **Merged.**
   - JMAP: native via the JMAP contacts draft already wired into
     bifrost-jmap.
   - Google (formerly bifrost-gmail): adds Google People API support
@@ -493,7 +493,7 @@ Then the standard wave structure:
     `bifrost-carddav` is sourced from ratatoskr's existing CardDAV
     code; this is a one-time code transfer happening inside the W2
     bifrost-carddav agent, not a separate wave.
-- **W3: protocol crate contraction.** Same as Stage 1 W3, now
+- **W3: protocol crate contraction.** **Merged.** Same as Stage 1 W3, now
   including the two newly-touched crates (`bifrost-google`,
   `bifrost-carddav`).
 
@@ -504,16 +504,16 @@ Recurrence canonicalised to RFC 5545 (RRULE + RDATE + EXDATE +
 recurrence-id overrides). JSCalendar / iCalendar / Google translation
 happens inside protocol impls.
 
-**First action (W1 prep):** create the `bifrost-caldav` skeleton crate.
-Workspace `Cargo.toml` and reference docs updated. Same shape as Stage 3's
-prep, leading patch of W1.
+**First action (W1 prep):** **Merged.** Created the `bifrost-caldav`
+crate. Workspace `Cargo.toml` and reference docs updated. Same shape
+as Stage 3's prep, leading patch of W1.
 
 Then the standard wave structure:
 
-- **W1: trait surface.** Calendar primitives (`calendars_list`,
+- **W1: trait surface.** **Merged.** Calendar primitives (`calendars_list`,
   `events_in_range`, `event_get`, `event_create`, `event_update`,
   `event_delete`, `event_rsvp`, `event_search`), plus conveniences.
-- **W2: protocol impls** (four agents in parallel):
+- **W2: protocol impls.** **Merged.**
   - JMAP: native via the JMAP calendar draft already wired into
     bifrost-jmap.
   - Google: adds Google Calendar API support alongside the existing
@@ -524,7 +524,7 @@ Then the standard wave structure:
     `CalDavAccountFactory` is published for DAV-only consumers. The
     initial implementation is sourced from ratatoskr's existing
     CalDAV code, same one-time code transfer pattern as Stage 3.
-- **W3: protocol crate contraction.** Same as Stage 1 W3, plus
+- **W3: protocol crate contraction.** **Merged.** Same as Stage 1 W3, plus
   `bifrost-caldav`.
 
 ## Decision points the user needs to resolve before launch

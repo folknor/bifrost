@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/caldav",
     "crates/carddav",
     "crates/google",
     "crates/graph",

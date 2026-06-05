@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, Credentials};
 use crate::core::capability;
+use crate::principal::PrincipalGet;
 use crate::thread::ThreadId;
 
 use super::account::JmapAccount;
@@ -122,12 +123,17 @@ impl AccountFactory for JmapAccountFactory {
                 .ok();
             let quota = client.primary_account::<capability::Quota>().ok();
             let sieve = client.primary_account::<capability::Sieve>().ok();
+            let contacts = client.primary_account::<capability::Contacts>().ok();
+            let calendars = client.primary_account::<capability::Calendars>().ok();
             let session = client.session();
+            let self_emails = fetch_self_emails(&client, &config.credentials).await;
             let support = capabilities::PimSupport {
                 submission: submission.is_some(),
                 vacation: vacation.is_some(),
                 quota: quota.is_some(),
                 sieve: sieve.is_some(),
+                contacts: contacts.is_some(),
+                calendar: calendars.is_some(),
             };
             let (caps, limits) = capabilities::build(&session, support)?;
 
@@ -194,6 +200,9 @@ impl AccountFactory for JmapAccountFactory {
                 vacation,
                 quota,
                 sieve,
+                contacts,
+                calendars,
+                self_emails,
                 caps,
                 limits,
                 seed_states,
@@ -207,6 +216,69 @@ impl AccountFactory for JmapAccountFactory {
 
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
+    }
+}
+
+async fn fetch_self_emails(client: &Client, credentials: &JmapCredentials) -> Vec<String> {
+    let mut emails = Vec::new();
+    if let Some(email) = credentials.configured_email() {
+        push_email_alias(&mut emails, email);
+    }
+
+    let Some(principal_id) = client
+        .session()
+        .principals_capabilities()
+        .and_then(|capabilities| capabilities.current_user_principal_id().cloned())
+        .or_else(|| {
+            client
+                .session()
+                .principals_owner_capabilities()
+                .and_then(|capabilities| capabilities.principal_id().cloned())
+        })
+    else {
+        return emails;
+    };
+
+    let Some(principals) = principal_account(client) else {
+        return emails;
+    };
+    let Ok(response) = principals
+        .call(PrincipalGet::new().ids([principal_id]))
+        .await
+    else {
+        return emails;
+    };
+    for principal in response.into_list() {
+        if let Some(email) = principal.email() {
+            push_email_alias(&mut emails, email);
+        }
+        if let Some(aliases) = principal.aliases() {
+            for alias in aliases {
+                push_email_alias(&mut emails, alias);
+            }
+        }
+    }
+    emails
+}
+
+fn principal_account(
+    client: &Client,
+) -> Option<crate::account::Account<crate::transport_reqwest::ReqwestTransport>> {
+    client
+        .session()
+        .principals_owner_capabilities()
+        .and_then(|capabilities| capabilities.account_id_for_principal().cloned())
+        .map(|account_id| crate::account::Account::new(client.clone(), account_id))
+        .or_else(|| client.primary_account::<capability::Principals>().ok())
+}
+
+fn push_email_alias(emails: &mut Vec<String>, email: &str) {
+    if !email.contains('@') {
+        return;
+    }
+    let normalized = email.to_ascii_lowercase();
+    if !emails.iter().any(|existing| existing == &normalized) {
+        emails.push(normalized);
     }
 }
 
@@ -232,6 +304,13 @@ impl JmapCredentials {
         }
     }
 
+    fn configured_email(&self) -> Option<&str> {
+        match self {
+            Self::Basic { username, .. } if username.contains('@') => Some(username),
+            _ => None,
+        }
+    }
+
     fn into_client_credentials(self) -> Credentials {
         match self {
             Self::Basic { username, password } => Credentials::basic(&username, &password),
@@ -247,4 +326,38 @@ async fn probe_thread_state(
         .call(crate::thread::ThreadGet::new().ids(Vec::<ThreadId>::new()))
         .await?
         .into_state())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_email_uses_basic_email_username_only() {
+        let basic = JmapCredentials::Basic {
+            username: "Ada@Example.Test".to_string(),
+            password: "secret".to_string(),
+        };
+        assert_eq!(basic.configured_email(), Some("Ada@Example.Test"));
+
+        let non_email = JmapCredentials::Basic {
+            username: "ada".to_string(),
+            password: "secret".to_string(),
+        };
+        assert_eq!(non_email.configured_email(), None);
+
+        let bearer = JmapCredentials::bearer("token");
+        assert_eq!(bearer.configured_email(), None);
+    }
+
+    #[test]
+    fn push_email_alias_normalizes_and_deduplicates() {
+        let mut emails = Vec::new();
+
+        push_email_alias(&mut emails, "Ada@Example.Test");
+        push_email_alias(&mut emails, "ada@example.test");
+        push_email_alias(&mut emails, "not-an-email");
+
+        assert_eq!(emails, vec!["ada@example.test"]);
+    }
 }

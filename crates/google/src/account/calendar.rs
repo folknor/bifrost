@@ -1,0 +1,1242 @@
+use std::sync::Arc;
+
+use bifrost_types::{
+    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
+    EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
+    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, Page,
+    ProtocolKind, RsvpStatus,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+
+use crate::client::GmailClient;
+
+use super::error::{self, GmailErrorContext};
+use super::non_empty;
+use bifrost_types::{AccountError, AccountFuture, AccountOperation};
+
+const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
+const EVENT_ID_SEPARATOR: &str = "::";
+
+pub(crate) fn calendars_list(
+    client: Arc<GmailClient>,
+) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+    Box::pin(async move {
+        let url = format!("{CALENDAR_API_BASE}/users/me/calendarList");
+        let response: CalendarListResponse = client
+            .get(&url)
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::CalendarsList))?;
+        Ok(response
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(calendar_from_google)
+            .collect())
+    })
+}
+
+pub(crate) fn events_in_range(
+    client: Arc<GmailClient>,
+    range: EventRange,
+) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+    Box::pin(async move {
+        let page_token = range
+            .page_cursor
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|error| {
+                local_error_with_field(
+                    AccountOperation::EventsInRange,
+                    "eventPageToken",
+                    error.to_string(),
+                )
+            })?;
+        let calendar_id = range.calendar_id.0;
+        let encoded = bifrost_net::url::encode_component(&calendar_id);
+        let time_min = google_range_bound(&range.start, "timeMin")?;
+        let time_max = google_range_bound(&range.end, "timeMax")?;
+        let mut url = format!(
+            "{CALENDAR_API_BASE}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
+            bifrost_net::url::encode_component(&time_min),
+            bifrost_net::url::encode_component(&time_max)
+        );
+        if let Some(limit) = range.limit {
+            url.push_str("&maxResults=");
+            url.push_str(&limit.min(2500).to_string());
+        }
+        if let Some(token) = page_token {
+            url.push_str("&pageToken=");
+            url.push_str(&bifrost_net::url::encode_component(&token));
+        }
+        let response: EventsResponse = client
+            .get(&url)
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::EventsInRange))?;
+        page_from_events(calendar_id, response, AccountOperation::EventsInRange)
+    })
+}
+
+pub(crate) fn get(
+    client: Arc<GmailClient>,
+    event: EventId,
+) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+    Box::pin(async move {
+        let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventGet)?;
+        let url = event_url(&calendar_id, &event_id);
+        let event: GoogleEvent = client
+            .get(&url)
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventGet, event.0.clone()))?;
+        event_from_google(calendar_id, event, AccountOperation::EventGet)
+    })
+}
+
+pub(crate) fn create(
+    client: Arc<GmailClient>,
+    event: EventCreate,
+) -> AccountFuture<Result<EventId, AccountError>> {
+    Box::pin(async move {
+        reject_create_organizer(&event)?;
+        let calendar_id = event.calendar_id.0.clone();
+        let encoded = bifrost_net::url::encode_component(&calendar_id);
+        let url = format!("{CALENDAR_API_BASE}/calendars/{encoded}/events");
+        let created: GoogleEvent = client
+            .post(&url, &google_event_from_create(&event))
+            .await
+            .map_err(|error| collection_error(error, AccountOperation::EventCreate))?;
+        let id = created
+            .id
+            .ok_or_else(|| local_error(AccountOperation::EventCreate, "missing event id".into()))?;
+        Ok(EventId(join_event_id(&calendar_id, &id)))
+    })
+}
+
+fn reject_create_organizer(event: &EventCreate) -> Result<(), AccountError> {
+    if event.organizer.is_some() {
+        return Err(error::into_account_error(
+            crate::error::Error::unsupported_with(
+                AccountOperation::EventCreate,
+                "Google Calendar organizer is server-derived on event creation",
+            ),
+            GmailErrorContext::calendar_collection(AccountOperation::EventCreate),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn update(
+    client: Arc<GmailClient>,
+    event: EventId,
+    patch: EventPatch,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let (mut calendar_id, native_event_id) =
+            split_event_id(&event.0, AccountOperation::EventUpdate)?;
+        if let Some(target_calendar) = patch.calendar_id.as_ref()
+            && target_calendar.0 != calendar_id
+        {
+            let _: GoogleEvent = client
+                .post(
+                    &event_move_url(&calendar_id, &native_event_id, &target_calendar.0),
+                    &json!({}),
+                )
+                .await
+                .map_err(|error| {
+                    event_error(error, AccountOperation::EventUpdate, event.0.clone())
+                })?;
+            calendar_id = target_calendar.0.clone();
+        }
+        if !event_patch_has_non_move_fields(&patch) {
+            return Ok(());
+        }
+        let url = event_url(&calendar_id, &native_event_id);
+        let _: GoogleEvent = client
+            .patch(&url, &google_event_from_patch(&patch))
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventUpdate, event.0.clone()))?;
+        Ok(())
+    })
+}
+
+pub(crate) fn delete(
+    client: Arc<GmailClient>,
+    event: EventId,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventDelete)?;
+        client
+            .delete(&event_url(&calendar_id, &event_id))
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventDelete, event.0.clone()))
+    })
+}
+
+pub(crate) fn rsvp(
+    client: Arc<GmailClient>,
+    self_email: String,
+    event: EventId,
+    status: RsvpStatus,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let (calendar_id, event_id) = split_event_id(&event.0, AccountOperation::EventRsvp)?;
+        let mut current: GoogleEvent = client
+            .get(&event_url(&calendar_id, &event_id))
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
+        rsvp_google_attendees_for_self(&mut current.attendees, &self_email, status)?;
+        let _: GoogleEvent = client
+            .patch(
+                &event_url(&calendar_id, &event_id),
+                &GoogleEventPatch {
+                    attendees: current.attendees,
+                    ..GoogleEventPatch::default()
+                },
+            )
+            .await
+            .map_err(|error| event_error(error, AccountOperation::EventRsvp, event.0.clone()))?;
+        Ok(())
+    })
+}
+
+pub(crate) fn search(
+    client: Arc<GmailClient>,
+    request: EventSearchRequest,
+) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+    Box::pin(async move {
+        if let Some(calendar_id) = request.calendar_id {
+            return search_one_calendar(
+                &client,
+                calendar_id.0,
+                &request.query,
+                request.limit,
+                decode_page_token(request.page_cursor, AccountOperation::EventSearch)?,
+            )
+            .await;
+        }
+
+        let calendars = calendars_list(Arc::clone(&client)).await?;
+        let calendar_ids = calendars
+            .into_iter()
+            .map(|calendar| calendar.id.0)
+            .collect::<Vec<_>>();
+        let (mut index, mut page_token) =
+            decode_cross_calendar_cursor(request.page_cursor, &calendar_ids)?;
+        let limit = request
+            .limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(250)
+            .min(2500);
+        let mut items = Vec::new();
+        while let Some(calendar_id) = calendar_ids.get(index) {
+            let remaining = limit.saturating_sub(items.len()).max(1);
+            let page = search_one_calendar(
+                &client,
+                calendar_id.clone(),
+                &request.query,
+                Some(u32::try_from(remaining).unwrap_or(2500)),
+                page_token.take(),
+            )
+            .await?;
+            items.extend(page.items);
+            if let Some(next_token) = page.next_cursor {
+                return Ok(Page {
+                    items,
+                    next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
+                    estimated_total: None,
+                });
+            }
+            index += 1;
+            if items.len() >= limit {
+                return Ok(Page {
+                    items,
+                    next_cursor: calendar_ids
+                        .get(index)
+                        .map(|calendar_id| encode_cross_calendar_cursor(calendar_id, &[])),
+                    estimated_total: None,
+                });
+            }
+        }
+        Ok(Page {
+            items,
+            next_cursor: None,
+            estimated_total: None,
+        })
+    })
+}
+
+async fn search_one_calendar(
+    client: &GmailClient,
+    calendar_id: String,
+    query: &str,
+    limit: Option<u32>,
+    page_token: Option<String>,
+) -> Result<Page<CalendarEvent>, AccountError> {
+    let encoded = bifrost_net::url::encode_component(&calendar_id);
+    let mut url = format!(
+        "{CALENDAR_API_BASE}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
+        bifrost_net::url::encode_component(query)
+    );
+    if let Some(limit) = limit {
+        url.push_str("&maxResults=");
+        url.push_str(&limit.min(2500).to_string());
+    }
+    if let Some(token) = page_token {
+        url.push_str("&pageToken=");
+        url.push_str(&bifrost_net::url::encode_component(&token));
+    }
+    let response: EventsResponse = client
+        .get(&url)
+        .await
+        .map_err(|error| collection_error(error, AccountOperation::EventSearch))?;
+    page_from_events(calendar_id, response, AccountOperation::EventSearch)
+}
+
+fn page_from_events(
+    calendar_id: String,
+    response: EventsResponse,
+    operation: AccountOperation,
+) -> Result<Page<CalendarEvent>, AccountError> {
+    let items = response
+        .items
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event_from_google(calendar_id.clone(), event, operation))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Page {
+        items,
+        next_cursor: response.next_page_token.map(String::into_bytes),
+        estimated_total: None,
+    })
+}
+
+fn decode_page_token(
+    page_cursor: Option<Vec<u8>>,
+    operation: AccountOperation,
+) -> Result<Option<String>, AccountError> {
+    page_cursor
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|error| local_error_with_field(operation, "eventPageToken", error.to_string()))
+}
+
+fn encode_cross_calendar_cursor(calendar_id: &str, page_token: &[u8]) -> Vec<u8> {
+    let mut cursor = calendar_id.as_bytes().to_vec();
+    cursor.push(b'\n');
+    cursor.extend_from_slice(page_token);
+    cursor
+}
+
+fn decode_cross_calendar_cursor(
+    page_cursor: Option<Vec<u8>>,
+    calendar_ids: &[String],
+) -> Result<(usize, Option<String>), AccountError> {
+    let Some(cursor) = decode_page_token(page_cursor, AccountOperation::EventSearch)? else {
+        return Ok((0, None));
+    };
+    let (calendar_id, page_token) = cursor.split_once('\n').ok_or_else(|| {
+        local_error_with_field(
+            AccountOperation::EventSearch,
+            "eventPageToken",
+            "cross-calendar search cursor is missing calendar id".to_string(),
+        )
+    })?;
+    let index = calendar_ids
+        .iter()
+        .position(|candidate| candidate == calendar_id)
+        .ok_or_else(|| {
+            local_error_with_field(
+                AccountOperation::EventSearch,
+                "eventPageToken",
+                "cross-calendar search cursor references an unknown calendar".to_string(),
+            )
+        })?;
+    let page_token = (!page_token.is_empty()).then(|| page_token.to_string());
+    Ok((index, page_token))
+}
+
+fn calendar_from_google(calendar: GoogleCalendarListEntry) -> Calendar {
+    let native = calendar.id.unwrap_or_default();
+    let access = calendar.access_role.unwrap_or_default();
+    let can_write = matches!(access.as_str(), "owner" | "writer");
+    Calendar {
+        id: CalendarId(native.clone()),
+        native_id: native.clone(),
+        name: calendar.summary.unwrap_or_else(|| "Calendar".to_string()),
+        color: calendar.background_color,
+        provenance: CalendarProvenance {
+            provider: ProtocolKind::Gmail,
+            native,
+            calendar_native: None,
+        },
+        is_default: calendar.primary.unwrap_or(false),
+        can_create_events: can_write,
+        can_update_events: can_write,
+        can_delete_events: can_write,
+    }
+}
+
+fn event_from_google(
+    calendar_id: String,
+    event: GoogleEvent,
+    operation: AccountOperation,
+) -> Result<CalendarEvent, AccountError> {
+    let event_id = event.id.unwrap_or_default();
+    let native = join_event_id(&calendar_id, &event_id);
+    let is_all_day = event
+        .start
+        .as_ref()
+        .is_some_and(|time| time.date.is_some() && time.date_time.is_none());
+    let start = event.start.map(event_time).ok_or_else(|| {
+        local_error_with_field(operation, "start", "Google event missing start".to_string())
+    })?;
+    let end = event.end.map(event_time).ok_or_else(|| {
+        local_error_with_field(operation, "end", "Google event missing end".to_string())
+    })?;
+    Ok(CalendarEvent {
+        id: EventId(native.clone()),
+        calendar_id: CalendarId(calendar_id.clone()),
+        native_id: native.clone(),
+        uid: event.i_cal_uid,
+        etag: event.etag,
+        provenance: CalendarProvenance {
+            provider: ProtocolKind::Gmail,
+            native,
+            calendar_native: Some(calendar_id),
+        },
+        title: event.summary,
+        description: event.description,
+        location: event.location,
+        start,
+        end,
+        is_all_day,
+        status: event_status(event.status.as_deref()),
+        availability: availability(event.transparency.as_deref()),
+        visibility: visibility(event.visibility.as_deref()),
+        self_response: RsvpStatus::Unknown,
+        organizer: event.organizer.and_then(|organizer| {
+            Some(EventOrganizer {
+                email: organizer.email?,
+                name: organizer.display_name,
+            })
+        }),
+        attendees: event
+            .attendees
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(attendee_from_google)
+            .collect(),
+        recurrence: EventRecurrence {
+            rrule: event
+                .recurrence
+                .as_ref()
+                .and_then(|values| values.iter().find_map(|value| value.strip_prefix("RRULE:")))
+                .map(ToString::to_string),
+            rdate: prefixed_values(event.recurrence.as_deref(), "RDATE:"),
+            exdate: prefixed_values(event.recurrence.as_deref(), "EXDATE:"),
+            recurrence_id: event
+                .original_start_time
+                .map(event_time)
+                .map(|time| time.value),
+        },
+        html_link: event.html_link,
+        raw_ical: None,
+    })
+}
+
+fn google_event_from_create(event: &EventCreate) -> GoogleEventPatch {
+    GoogleEventPatch {
+        summary: event.title.clone().map(Some),
+        description: event.description.clone().map(Some),
+        location: event.location.clone().map(Some),
+        start: Some(google_time(&event.start, event.is_all_day)),
+        end: Some(google_time(&event.end, event.is_all_day)),
+        status: Some(google_event_status(event.status).to_string()),
+        attendees: non_empty(event.attendees.iter().map(google_attendee)),
+        recurrence: recurrence_lines(&event.recurrence),
+        visibility: Some(match event.visibility {
+            EventVisibility::Private => "private".to_string(),
+            EventVisibility::Public => "public".to_string(),
+            EventVisibility::Confidential => "confidential".to_string(),
+            EventVisibility::Default => "default".to_string(),
+            _ => "default".to_string(),
+        }),
+        transparency: Some(transparency(event.availability).to_string()),
+    }
+}
+
+fn google_event_from_patch(patch: &EventPatch) -> GoogleEventPatch {
+    GoogleEventPatch {
+        summary: patch.title.clone(),
+        description: patch.description.clone(),
+        location: patch.location.clone(),
+        start: patch
+            .start
+            .as_ref()
+            .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
+        end: patch
+            .end
+            .as_ref()
+            .map(|time| google_time(time, patch.is_all_day.unwrap_or(is_ymd_date(&time.value)))),
+        status: patch
+            .status
+            .map(|status| google_event_status(status).to_string()),
+        attendees: patch
+            .attendees
+            .as_ref()
+            .map(|attendees| attendees.iter().map(google_attendee).collect()),
+        recurrence: patch.recurrence.as_ref().and_then(recurrence_lines),
+        visibility: patch.visibility.map(|visibility| match visibility {
+            EventVisibility::Private => "private".to_string(),
+            EventVisibility::Public => "public".to_string(),
+            EventVisibility::Confidential => "confidential".to_string(),
+            EventVisibility::Default => "default".to_string(),
+            _ => "default".to_string(),
+        }),
+        transparency: patch
+            .availability
+            .map(|availability| transparency(availability).to_string()),
+    }
+}
+
+fn attendee_from_google(attendee: GoogleAttendee) -> Option<EventAttendee> {
+    Some(EventAttendee {
+        email: attendee.email?,
+        name: attendee.display_name,
+        role: attendee.resource.map_or_else(
+            || {
+                attendee
+                    .optional
+                    .map_or(AttendeeRole::Required, |optional| {
+                        if optional {
+                            AttendeeRole::Optional
+                        } else {
+                            AttendeeRole::Required
+                        }
+                    })
+            },
+            |resource| {
+                if resource {
+                    AttendeeRole::Resource
+                } else {
+                    AttendeeRole::Required
+                }
+            },
+        ),
+        status: rsvp_status(attendee.response_status.as_deref()),
+    })
+}
+
+fn google_attendee(attendee: &EventAttendee) -> GoogleAttendee {
+    GoogleAttendee {
+        email: Some(attendee.email.clone()),
+        display_name: attendee.name.clone(),
+        response_status: Some(rsvp_value(attendee.status).to_string()),
+        optional: Some(matches!(attendee.role, AttendeeRole::Optional)),
+        resource: matches!(attendee.role, AttendeeRole::Resource).then_some(true),
+        extra: Map::new(),
+    }
+}
+
+fn google_time(time: &EventTime, all_day: bool) -> GoogleEventTime {
+    if all_day {
+        GoogleEventTime {
+            date: Some(time.value.clone()),
+            date_time: None,
+            time_zone: time.timezone.clone(),
+        }
+    } else {
+        GoogleEventTime {
+            date: None,
+            date_time: Some(time.value.clone()),
+            time_zone: time.timezone.clone(),
+        }
+    }
+}
+
+fn google_range_bound(time: &EventTime, field: &'static str) -> Result<String, AccountError> {
+    if is_ymd_date(&time.value) {
+        return Ok(format!("{}T00:00:00Z", time.value));
+    }
+    if has_rfc3339_offset(&time.value) {
+        return Ok(time.value.clone());
+    }
+    if time
+        .timezone
+        .as_deref()
+        .is_some_and(|timezone| matches!(timezone, "UTC" | "Etc/UTC" | "Etc/GMT"))
+    {
+        return Ok(format!("{}Z", time.value));
+    }
+    Err(local_error_with_field(
+        AccountOperation::EventsInRange,
+        field,
+        "Google Calendar range bound requires an RFC 3339 offset".to_string(),
+    ))
+}
+
+fn is_ymd_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+}
+
+fn has_rfc3339_offset(value: &str) -> bool {
+    if value.ends_with('Z') {
+        return true;
+    }
+    let Some(time_index) = value.find('T') else {
+        return false;
+    };
+    let Some(offset) = value.get(value.len().saturating_sub(6)..) else {
+        return false;
+    };
+    value.len() > time_index + 6
+        && (offset.starts_with('+') || offset.starts_with('-'))
+        && offset.as_bytes()[3] == b':'
+        && offset
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| index == 0 || index == 3 || byte.is_ascii_digit())
+}
+
+fn event_time(time: GoogleEventTime) -> EventTime {
+    EventTime {
+        value: time.date_time.or(time.date).unwrap_or_default(),
+        timezone: time.time_zone,
+    }
+}
+
+fn event_url(calendar_id: &str, event_id: &str) -> String {
+    format!(
+        "{CALENDAR_API_BASE}/calendars/{}/events/{}",
+        bifrost_net::url::encode_component(calendar_id),
+        bifrost_net::url::encode_component(event_id)
+    )
+}
+
+fn event_move_url(calendar_id: &str, event_id: &str, target_calendar_id: &str) -> String {
+    format!(
+        "{}/move?destination={}",
+        event_url(calendar_id, event_id),
+        bifrost_net::url::encode_component(target_calendar_id)
+    )
+}
+
+fn event_patch_has_non_move_fields(patch: &EventPatch) -> bool {
+    patch.title.is_some()
+        || patch.description.is_some()
+        || patch.location.is_some()
+        || patch.start.is_some()
+        || patch.end.is_some()
+        || patch.is_all_day.is_some()
+        || patch.availability.is_some()
+        || patch.visibility.is_some()
+        || patch.attendees.is_some()
+        || patch.recurrence.is_some()
+}
+
+fn join_event_id(calendar_id: &str, event_id: &str) -> String {
+    format!("{calendar_id}{EVENT_ID_SEPARATOR}{event_id}")
+}
+
+fn split_event_id(
+    value: &str,
+    operation: AccountOperation,
+) -> Result<(String, String), AccountError> {
+    value
+        .split_once(EVENT_ID_SEPARATOR)
+        .map(|(calendar, event)| (calendar.to_string(), event.to_string()))
+        .ok_or_else(|| {
+            local_error(
+                operation,
+                "Google event id is missing calendar id".to_string(),
+            )
+        })
+}
+
+fn recurrence_lines(recurrence: &EventRecurrence) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    if let Some(rrule) = &recurrence.rrule {
+        lines.push(format!("RRULE:{rrule}"));
+    }
+    lines.extend(
+        recurrence
+            .rdate
+            .iter()
+            .map(|value| format!("RDATE:{value}")),
+    );
+    lines.extend(
+        recurrence
+            .exdate
+            .iter()
+            .map(|value| format!("EXDATE:{value}")),
+    );
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn prefixed_values(values: Option<&[String]>, prefix: &str) -> Vec<String> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| value.strip_prefix(prefix).map(ToString::to_string))
+        .collect()
+}
+
+fn event_status(value: Option<&str>) -> EventStatus {
+    match value.unwrap_or_default() {
+        "confirmed" => EventStatus::Confirmed,
+        "tentative" => EventStatus::Tentative,
+        "cancelled" => EventStatus::Cancelled,
+        _ => EventStatus::Unknown,
+    }
+}
+
+fn google_event_status(value: EventStatus) -> &'static str {
+    match value {
+        EventStatus::Tentative => "tentative",
+        EventStatus::Cancelled => "cancelled",
+        EventStatus::Confirmed | EventStatus::Unknown => "confirmed",
+        _ => "confirmed",
+    }
+}
+
+fn visibility(value: Option<&str>) -> EventVisibility {
+    match value.unwrap_or_default() {
+        "private" => EventVisibility::Private,
+        "public" => EventVisibility::Public,
+        "confidential" => EventVisibility::Confidential,
+        _ => EventVisibility::Default,
+    }
+}
+
+fn availability(value: Option<&str>) -> EventAvailability {
+    match value.unwrap_or_default() {
+        "transparent" => EventAvailability::Free,
+        "opaque" => EventAvailability::Busy,
+        _ => EventAvailability::Unknown,
+    }
+}
+
+fn transparency(value: EventAvailability) -> &'static str {
+    match value {
+        EventAvailability::Free => "transparent",
+        EventAvailability::Busy | EventAvailability::Tentative | EventAvailability::OutOfOffice => {
+            "opaque"
+        }
+        EventAvailability::Unknown => "opaque",
+        _ => "opaque",
+    }
+}
+
+fn rsvp_status(value: Option<&str>) -> RsvpStatus {
+    match value.unwrap_or_default() {
+        "accepted" => RsvpStatus::Accepted,
+        "declined" => RsvpStatus::Declined,
+        "tentative" => RsvpStatus::Tentative,
+        "needsAction" => RsvpStatus::NeedsAction,
+        _ => RsvpStatus::Unknown,
+    }
+}
+
+fn rsvp_value(value: RsvpStatus) -> &'static str {
+    match value {
+        RsvpStatus::Accepted => "accepted",
+        RsvpStatus::Declined => "declined",
+        RsvpStatus::Tentative => "tentative",
+        RsvpStatus::NeedsAction | RsvpStatus::Unknown => "needsAction",
+        RsvpStatus::Delegated => "needsAction",
+        _ => "needsAction",
+    }
+}
+
+fn rsvp_google_attendees_for_self(
+    attendees: &mut Option<Vec<GoogleAttendee>>,
+    self_email: &str,
+    status: RsvpStatus,
+) -> Result<(), AccountError> {
+    let Some(attendees) = attendees.as_mut() else {
+        return Err(local_error(
+            AccountOperation::EventRsvp,
+            "Google Calendar event does not contain the account attendee".to_string(),
+        ));
+    };
+    let Some(attendee) = attendees.iter_mut().find(|attendee| {
+        attendee
+            .email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(self_email))
+    }) else {
+        return Err(local_error(
+            AccountOperation::EventRsvp,
+            "Google Calendar event does not contain the account attendee".to_string(),
+        ));
+    };
+    attendee.response_status = Some(rsvp_value(status).to_string());
+    Ok(())
+}
+
+fn collection_error(error: crate::Error, operation: AccountOperation) -> AccountError {
+    error::into_account_error(error, GmailErrorContext::calendar_collection(operation))
+}
+
+fn event_error(error: crate::Error, operation: AccountOperation, id: String) -> AccountError {
+    error::into_account_error(error, GmailErrorContext::calendar_event(operation, id))
+}
+
+fn local_error(operation: AccountOperation, message: String) -> AccountError {
+    local_error_with_field(operation, "calendar", message)
+}
+
+fn local_error_with_field(
+    operation: AccountOperation,
+    field: &'static str,
+    message: String,
+) -> AccountError {
+    error::into_account_error(
+        crate::error::Error::missing_field(field, message),
+        GmailErrorContext::calendar_collection(operation),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalendarListResponse {
+    items: Option<Vec<GoogleCalendarListEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleCalendarListEntry {
+    id: Option<String>,
+    summary: Option<String>,
+    background_color: Option<String>,
+    primary: Option<bool>,
+    access_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventsResponse {
+    items: Option<Vec<GoogleEvent>>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GoogleEvent {
+    id: Option<String>,
+    etag: Option<String>,
+    i_cal_uid: Option<String>,
+    summary: Option<String>,
+    description: Option<String>,
+    location: Option<String>,
+    start: Option<GoogleEventTime>,
+    end: Option<GoogleEventTime>,
+    status: Option<String>,
+    visibility: Option<String>,
+    organizer: Option<GoogleOrganizer>,
+    attendees: Option<Vec<GoogleAttendee>>,
+    recurrence: Option<Vec<String>>,
+    recurring_event_id: Option<String>,
+    original_start_time: Option<GoogleEventTime>,
+    transparency: Option<String>,
+    html_link: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct GoogleEventPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<GoogleEventTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<GoogleEventTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attendees: Option<Vec<GoogleAttendee>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recurrence: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transparency: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleEventTime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date: Option<String>,
+    #[serde(rename = "dateTime", skip_serializing_if = "Option::is_none")]
+    date_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleOrganizer {
+    email: Option<String>,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleAttendee {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optional: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<bool>,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timed(value: &str) -> GoogleEventTime {
+        GoogleEventTime {
+            date: None,
+            date_time: Some(value.to_string()),
+            time_zone: None,
+        }
+    }
+
+    #[test]
+    fn google_event_maps_transparency_and_original_start_time() {
+        let event = event_from_google(
+            "primary".to_string(),
+            GoogleEvent {
+                id: Some("e1".to_string()),
+                start: Some(timed("2026-06-02T12:00:00Z")),
+                end: Some(timed("2026-06-02T13:00:00Z")),
+                transparency: Some("transparent".to_string()),
+                recurring_event_id: Some("master".to_string()),
+                original_start_time: Some(timed("2026-06-01T12:00:00Z")),
+                ..GoogleEvent::default()
+            },
+            AccountOperation::EventGet,
+        )
+        .expect("valid event");
+
+        assert_eq!(event.availability, EventAvailability::Free);
+        assert_eq!(
+            event.recurrence.recurrence_id.as_deref(),
+            Some("2026-06-01T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn google_event_rejects_missing_times() {
+        let error = event_from_google(
+            "primary".to_string(),
+            GoogleEvent {
+                id: Some("e1".to_string()),
+                end: Some(timed("2026-06-02T13:00:00Z")),
+                ..GoogleEvent::default()
+            },
+            AccountOperation::EventGet,
+        )
+        .expect_err("missing start should fail");
+
+        assert_eq!(error.operation(), Some(AccountOperation::EventGet));
+    }
+
+    #[test]
+    fn cross_calendar_search_cursor_round_trips_calendar_and_token() {
+        let calendars = vec!["primary".to_string(), "work".to_string()];
+        let cursor = encode_cross_calendar_cursor("work", b"next-token");
+
+        let (index, token) =
+            decode_cross_calendar_cursor(Some(cursor), &calendars).expect("cursor");
+
+        assert_eq!(index, 1);
+        assert_eq!(token.as_deref(), Some("next-token"));
+    }
+
+    #[test]
+    fn cross_calendar_search_cursor_can_resume_at_calendar_boundary() {
+        let calendars = vec!["primary".to_string(), "work".to_string()];
+        let cursor = encode_cross_calendar_cursor("work", b"");
+
+        let (index, token) =
+            decode_cross_calendar_cursor(Some(cursor), &calendars).expect("cursor");
+
+        assert_eq!(index, 1);
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn event_move_url_encodes_destination_calendar() {
+        let url = event_move_url("primary", "event/1", "work calendar");
+
+        assert!(url.contains("/calendars/primary/events/event%2F1/move"));
+        assert!(url.ends_with("destination=work%20calendar"));
+    }
+
+    #[test]
+    fn event_patch_detects_non_move_fields() {
+        assert!(!event_patch_has_non_move_fields(&EventPatch {
+            calendar_id: Some(CalendarId("work".to_string())),
+            ..EventPatch::default()
+        }));
+        assert!(event_patch_has_non_move_fields(&EventPatch {
+            title: Some(Some("Planning".to_string())),
+            ..EventPatch::default()
+        }));
+    }
+
+    #[test]
+    fn google_attendee_maps_resource_role() {
+        let attendee = attendee_from_google(GoogleAttendee {
+            email: Some("room@example.test".to_string()),
+            display_name: None,
+            response_status: Some("accepted".to_string()),
+            optional: Some(false),
+            resource: Some(true),
+            extra: Map::new(),
+        })
+        .expect("attendee");
+
+        assert_eq!(attendee.role, AttendeeRole::Resource);
+        assert_eq!(attendee.status, RsvpStatus::Accepted);
+
+        let google = google_attendee(&EventAttendee {
+            email: "room@example.test".to_string(),
+            name: None,
+            role: AttendeeRole::Resource,
+            status: RsvpStatus::Accepted,
+        });
+        assert_eq!(google.resource, Some(true));
+        assert_eq!(google.optional, Some(false));
+    }
+
+    #[test]
+    fn rsvp_updates_matching_google_attendee_without_dropping_extra_fields() {
+        let mut extra = Map::new();
+        extra.insert("comment".to_string(), serde_json::json!("bring notes"));
+        let mut attendees = Some(vec![
+            GoogleAttendee {
+                email: Some("other@example.test".to_string()),
+                display_name: None,
+                response_status: Some("needsAction".to_string()),
+                optional: None,
+                resource: None,
+                extra: Map::new(),
+            },
+            GoogleAttendee {
+                email: Some("SELF@example.test".to_string()),
+                display_name: None,
+                response_status: Some("needsAction".to_string()),
+                optional: None,
+                resource: None,
+                extra,
+            },
+        ]);
+
+        rsvp_google_attendees_for_self(&mut attendees, "self@example.test", RsvpStatus::Accepted)
+            .expect("matching attendee");
+        let attendees = attendees.expect("attendees");
+        assert_eq!(attendees[0].response_status.as_deref(), Some("needsAction"));
+        assert_eq!(attendees[1].response_status.as_deref(), Some("accepted"));
+        assert_eq!(attendees[1].extra["comment"].as_str(), Some("bring notes"));
+
+        assert!(
+            rsvp_google_attendees_for_self(&mut None, "self@example.test", RsvpStatus::Accepted)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn google_event_create_writes_transparency() {
+        let patch = google_event_from_create(&EventCreate {
+            calendar_id: CalendarId("primary".to_string()),
+            title: None,
+            description: None,
+            location: None,
+            start: EventTime {
+                value: "2026-06-02T12:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: EventTime {
+                value: "2026-06-02T13:00:00Z".to_string(),
+                timezone: None,
+            },
+            is_all_day: false,
+            status: EventStatus::Tentative,
+            availability: EventAvailability::Free,
+            visibility: EventVisibility::Default,
+            organizer: None,
+            attendees: Vec::new(),
+            recurrence: EventRecurrence::default(),
+        });
+
+        assert_eq!(patch.transparency.as_deref(), Some("transparent"));
+        assert_eq!(patch.status.as_deref(), Some("tentative"));
+    }
+
+    #[test]
+    fn google_event_create_organizer_is_rejected() {
+        let error = reject_create_organizer(&EventCreate {
+            calendar_id: CalendarId("primary".to_string()),
+            title: None,
+            description: None,
+            location: None,
+            start: EventTime {
+                value: "2026-06-02T12:00:00Z".to_string(),
+                timezone: None,
+            },
+            end: EventTime {
+                value: "2026-06-02T13:00:00Z".to_string(),
+                timezone: None,
+            },
+            is_all_day: false,
+            status: EventStatus::Confirmed,
+            availability: EventAvailability::Busy,
+            visibility: EventVisibility::Default,
+            organizer: Some(EventOrganizer {
+                email: "owner@example.test".to_string(),
+                name: None,
+            }),
+            attendees: Vec::new(),
+            recurrence: EventRecurrence::default(),
+        })
+        .expect_err("organizer should be unsupported");
+
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::EventCreate)
+        ));
+    }
+
+    #[test]
+    fn google_event_patch_serializes_clears_as_null_and_omits_absent_fields() {
+        let patch = google_event_from_patch(&EventPatch {
+            title: Some(None),
+            description: None,
+            location: Some(Some("Room 1".to_string())),
+            status: Some(EventStatus::Cancelled),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+
+        assert!(value.get("summary").is_some_and(serde_json::Value::is_null));
+        assert!(value.get("description").is_none());
+        assert_eq!(
+            value.get("location").and_then(serde_json::Value::as_str),
+            Some("Room 1")
+        );
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn google_event_patch_keeps_all_day_date_shape() {
+        let patch = google_event_from_patch(&EventPatch {
+            start: Some(EventTime {
+                value: "2026-06-02".to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            end: Some(EventTime {
+                value: "2026-06-03".to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+
+        assert_eq!(
+            value
+                .get("start")
+                .and_then(|start| start.get("date"))
+                .and_then(serde_json::Value::as_str),
+            Some("2026-06-02")
+        );
+        assert!(
+            value
+                .get("start")
+                .and_then(|start| start.get("dateTime"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn google_range_bound_expands_all_day_dates() {
+        assert_eq!(
+            google_range_bound(
+                &EventTime {
+                    value: "2026-06-02".to_string(),
+                    timezone: None,
+                },
+                "timeMin"
+            )
+            .unwrap(),
+            "2026-06-02T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn google_range_bound_keeps_existing_offsets() {
+        assert_eq!(
+            google_range_bound(
+                &EventTime {
+                    value: "2026-06-02T12:00:00+02:00".to_string(),
+                    timezone: Some("Europe/Oslo".to_string()),
+                },
+                "timeMin"
+            )
+            .unwrap(),
+            "2026-06-02T12:00:00+02:00"
+        );
+    }
+
+    #[test]
+    fn google_range_bound_adds_utc_offset_when_timezone_is_utc() {
+        assert_eq!(
+            google_range_bound(
+                &EventTime {
+                    value: "2026-06-02T12:00:00".to_string(),
+                    timezone: Some("UTC".to_string()),
+                },
+                "timeMin"
+            )
+            .unwrap(),
+            "2026-06-02T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn google_range_bound_rejects_offsetless_non_utc_datetime() {
+        assert!(
+            google_range_bound(
+                &EventTime {
+                    value: "2026-06-02T12:00:00".to_string(),
+                    timezone: Some("Europe/Oslo".to_string()),
+                },
+                "timeMin",
+            )
+            .is_err()
+        );
+    }
+}

@@ -65,6 +65,7 @@ pub enum ProtocolKind {
     Imap,
     Gmail,
     CardDav,
+    CalDav,
     Graph,
 }
 

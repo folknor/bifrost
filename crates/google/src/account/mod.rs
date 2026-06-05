@@ -1,6 +1,8 @@
 mod blobs;
+mod calendar;
 mod capabilities;
 mod changes;
+mod contacts;
 mod cursor;
 mod error;
 mod filters;
@@ -18,15 +20,16 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
     AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle,
-    ByteRange, Change, ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch,
-    ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, FilterValidation, FlagOp,
+    ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, ContactCard, ContactCreate,
+    ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
+    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
     HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
     InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +45,11 @@ use self::cursor::{
 };
 use self::push::PubSubControl;
 use self::scopes::{ScopeCache, ScopeSnapshot};
+
+fn non_empty<T>(iter: impl Iterator<Item = T>) -> Option<Vec<T>> {
+    let values = iter.collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
+}
 
 /// Factory for opening Google accounts through the shared `Account` API.
 pub struct GoogleAccountFactory {
@@ -132,17 +140,6 @@ impl GoogleAccount {
             closed: AtomicBool::new(false),
         }))
     }
-}
-
-fn unsupported_future<T: Send + 'static>(
-    operation: AccountOperation,
-) -> AccountFuture<Result<T, AccountError>> {
-    Box::pin(async move {
-        Err(error::into_account_error(
-            crate::error::Error::unsupported(operation),
-            error::GmailErrorContext::base(operation),
-        ))
-    })
 }
 
 impl Account for GoogleAccount {
@@ -539,45 +536,96 @@ impl Account for GoogleAccount {
     }
 
     fn address_books_list(&self) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
-        unsupported_future(AccountOperation::AddressBooksList)
+        contacts::address_books_list(Arc::clone(&self.client))
     }
 
     fn contacts_list(
         &self,
-        _address_book: Option<AddressBookId>,
-        _page_cursor: Option<Vec<u8>>,
+        address_book: Option<AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        unsupported_future(AccountOperation::ContactsList)
+        contacts::list(Arc::clone(&self.client), address_book, page_cursor)
     }
 
-    fn contact_get(&self, _contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
-        unsupported_future(AccountOperation::ContactGet)
+    fn contact_get(&self, contact: ContactId) -> AccountFuture<Result<ContactCard, AccountError>> {
+        contacts::get(Arc::clone(&self.client), contact)
     }
 
     fn contact_create(
         &self,
-        _contact: ContactCreate,
+        contact: ContactCreate,
     ) -> AccountFuture<Result<ContactId, AccountError>> {
-        unsupported_future(AccountOperation::ContactCreate)
+        contacts::create(Arc::clone(&self.client), contact)
     }
 
     fn contact_update(
         &self,
-        _contact: ContactId,
-        _patch: ContactPatch,
+        contact: ContactId,
+        patch: ContactPatch,
     ) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContactUpdate)
+        contacts::update(Arc::clone(&self.client), contact, patch)
     }
 
-    fn contact_delete(&self, _contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
-        unsupported_future(AccountOperation::ContactDelete)
+    fn contact_delete(&self, contact: ContactId) -> AccountFuture<Result<(), AccountError>> {
+        contacts::delete(Arc::clone(&self.client), contact)
     }
 
     fn contact_search(
         &self,
-        _request: ContactSearchRequest,
+        request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
-        unsupported_future(AccountOperation::ContactSearch)
+        contacts::search(Arc::clone(&self.client), request)
+    }
+
+    fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
+        calendar::calendars_list(Arc::clone(&self.client))
+    }
+
+    fn events_in_range(
+        &self,
+        range: EventRange,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        calendar::events_in_range(Arc::clone(&self.client), range)
+    }
+
+    fn event_get(&self, event: EventId) -> AccountFuture<Result<CalendarEvent, AccountError>> {
+        calendar::get(Arc::clone(&self.client), event)
+    }
+
+    fn event_create(&self, event: EventCreate) -> AccountFuture<Result<EventId, AccountError>> {
+        calendar::create(Arc::clone(&self.client), event)
+    }
+
+    fn event_update(
+        &self,
+        event: EventId,
+        patch: EventPatch,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar::update(Arc::clone(&self.client), event, patch)
+    }
+
+    fn event_delete(&self, event: EventId) -> AccountFuture<Result<(), AccountError>> {
+        calendar::delete(Arc::clone(&self.client), event)
+    }
+
+    fn event_rsvp(
+        &self,
+        event: EventId,
+        status: RsvpStatus,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        calendar::rsvp(
+            Arc::clone(&self.client),
+            self.profile.email_address.clone(),
+            event,
+            status,
+        )
+    }
+
+    fn event_search(
+        &self,
+        request: EventSearchRequest,
+    ) -> AccountFuture<Result<Page<CalendarEvent>, AccountError>> {
+        calendar::search(Arc::clone(&self.client), request)
     }
 
     fn thread_hydrate(

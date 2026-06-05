@@ -67,6 +67,37 @@ concurrency.
 - `error.rs` - blob-not-byte-stream warning helper.
   Classification helpers live in `graph_error.rs`.
 
+Calendar/contact primitives live in `calendar.rs` and `contacts.rs`.
+Graph calendar `color` is a provider enum token, not a CSS color value,
+so it is not projected into the shared `Calendar.color` string.
+Calendar reads request `Prefer: outlook.timezone="UTC"` so Graph event
+date-times do not leak Windows timezone names on read. Calendar recurrence
+maps common daily, weekly, monthly, and yearly Graph patterns to shared
+RRULE strings and back. Unsupported outbound RRULE parts reject Graph
+recurrence serialization instead of being written partially; unsupported
+Graph recurrence shapes are still omitted on read. Outbound event times map a conservative table of
+common IANA timezone names to Graph Windows timezone names, pass
+already-Windows names through, and reject unknown IANA ids before
+create/update payload construction instead of silently writing UTC.
+Event-level `responseStatus` maps into shared `CalendarEvent.self_response`.
+Graph RSVP uses the native
+`accept` / `decline` / `tentativelyAccept` actions. Calendar and contact
+update/delete fetch the current item and send `If-Match` when the
+response carried a change key or ETag. Calendar updates send sparse
+PATCH bodies, so absent fields are left untouched and scalar clears are
+encoded as JSON nulls. Graph event organizer is server-derived on create;
+create payloads with a shared organizer are rejected as unsupported.
+Graph contact home/work/other physical addresses map through the shared
+`ContactAddress` model. Event search uses Graph Search API for
+unscoped, non-empty default-mailbox searches, and falls back to local
+filtering over Graph list pages for specific calendars, shared mailboxes,
+empty searches, and cursor resumes. Contact search uses Graph's
+documented exact email-address `$filter` for email-shaped queries, and
+otherwise remains local filtering over Graph list pages because the
+contacts endpoint only documents exact address filtering. Local search
+paths scan pages until the requested number of matches is collected or
+the server page chain ends.
+
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
 The `account` module path remains public because the cross-crate
@@ -179,7 +210,8 @@ that selects against the same shutdown token.
 - `pim_methods`: true for `add_to_container`, `set_category`,
   `set_extended_property`, `set_is_read`, send/draft lifecycle,
   search, mail folder CRUD, `identities_list`, vacation get/set,
-  and typed thread/message hydration. False for
+  typed thread/message hydration, contact primitives, and calendar
+  primitives. False for
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, and
   `quota_get`.

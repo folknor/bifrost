@@ -1,6 +1,6 @@
 [package]
-name = "bifrost-carddav"
-description = "CardDAV Account implementation for bifrost"
+name = "bifrost-caldav"
+description = "CalDAV Account implementation for bifrost"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/folknor/bifrost"
-keywords = ["contacts", "carddav", "vcard", "webdav"]
+keywords = ["calendar", "caldav", "icalendar", "webdav"]
 categories = ["email", "network-programming", "asynchronous"]
 
 [lib]
@@ -21,6 +21,7 @@ workspace = true
 base64 = { workspace = true }
 bifrost-types = { path = "../types" }
 bytes = { workspace = true }
+chrono = { workspace = true }
 futures = { workspace = true }
 quick-xml = "0.40.1"
 reqwest = { workspace = true, features = ["native-tls"] }

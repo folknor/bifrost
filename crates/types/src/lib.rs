@@ -16,6 +16,7 @@
 
 pub mod account;
 pub mod blob;
+pub mod calendar;
 pub mod capabilities;
 pub mod compose;
 pub mod contact;
@@ -45,6 +46,13 @@ pub use capabilities::{
     RateLimitClass, StarredFlagShape,
 };
 
+// Calendar primitives.
+pub use calendar::{
+    AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
+    EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
+    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, RsvpStatus,
+};
+
 // Server-side filter rules and scripts.
 pub use filter::{
     FilterAction, FilterCondition, FilterDiagnostic, FilterDiagnosticSeverity, FilterRule,
@@ -65,8 +73,9 @@ pub use container::{
 
 // Address book and contact-card primitives.
 pub use contact::{
-    AddressBook, AddressBookId, ContactCard, ContactCreate, ContactEmail, ContactId,
-    ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
+    AddressBook, AddressBookId, ContactAddress, ContactCard, ContactCreate, ContactEmail,
+    ContactId, ContactOrganization, ContactPatch, ContactPhone, ContactPhoto, ContactProvenance,
+    ContactSearchRequest,
 };
 
 // Cursor + scope types.

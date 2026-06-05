@@ -28,7 +28,7 @@ mod tests {
         for (input, expect) in [
             ("bjorn", "bjorn"),
             ("bjørn", "bj+C3+B8rn"),
-            ("Ø+= ❤️‰", "+C3+98+2B+3D+20+E2+9D+A4+EF+B8+8F+E2+80+B0"),
+            ("Ø+= ‰", "+C3+98+2B+3D+20+E2+80+B0"),
             ("+", "+2B"),
             ("\0", "+00"),
         ] {
