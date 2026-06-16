@@ -411,7 +411,8 @@ impl ImapConnection {
     ) -> Result<(), Error> {
         use super::dispatch::AuthenticateScramConsumer;
 
-        self.require_auth_mechanism(mechanism.mechanism_name())?;
+        // Non-PLUS path: channel binding is a later step.
+        self.require_auth_mechanism(mechanism.mechanism_name(bifrost_sasl::ChannelBinding::None))?;
         let has_sasl_ir = {
             let snap = self.state_rx.borrow();
             snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap)
@@ -427,7 +428,9 @@ impl ImapConnection {
         );
         let initial_response = has_sasl_ir.then(|| consumer.initial_response());
         let cmd = Command::Authenticate {
-            mechanism: mechanism.mechanism_name().to_owned(),
+            mechanism: mechanism
+                .mechanism_name(bifrost_sasl::ChannelBinding::None)
+                .to_owned(),
             initial_response,
         };
 

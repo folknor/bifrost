@@ -1,6 +1,6 @@
 use bifrost_sasl::{
-    ScramHash, cram_md5_response, decode_continuation, escape_username, scram_client_final,
-    verify_server_final,
+    ScramChannelBinding, ScramHash, cram_md5_response, decode_continuation, escape_username,
+    scram_client_final, verify_server_final,
 };
 
 use crate::connection::NotifyFlags;
@@ -423,12 +423,15 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
             }
             ScramState::AwaitServerFirst => {
                 let server_first = decode_continuation(&cont.data)?;
+                // Non-PLUS path: GS2 header `n,,`, no channel binding. PLUS
+                // consumers are a later step.
                 let (client_final, server_signature) = scram_client_final(
                     self.mechanism,
                     &self.pass,
                     &self.client_nonce,
                     &self.client_first_bare,
                     &server_first,
+                    &ScramChannelBinding::None,
                 )?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramState::AwaitServerFinal;
