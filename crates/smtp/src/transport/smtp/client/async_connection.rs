@@ -1496,7 +1496,7 @@ impl AsyncSmtpConnection {
         let (username, password) = credentials.password_parts()?;
         let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
 
-        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None, None)?;
         let response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
         if !response.has_code(334) {
             self.abort().await;
@@ -1557,9 +1557,25 @@ impl AsyncSmtpConnection {
         mechanism: Mechanism,
         credentials: &Credentials,
     ) -> Result<Response, Error> {
+        // Resolve the OAuth access token from the shared source once, up
+        // front, so the same token frames the initial response and any
+        // OAUTHBEARER error-continuation round. Awaiting `current()` here
+        // is the single rotation read point; a token refreshed on the
+        // source is presented on this (re)connect.
+        let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
+            Some(try_smtp!(
+                credentials.oauth2_token().await,
+                self,
+                SmtpCommandPhase::Auth
+            ))
+        } else {
+            None
+        };
+        let oauth_token = oauth_token.as_ref().map(|(_, token)| token.as_str());
+
         // Limit challenges to avoid blocking
         let mut challenges: u8 = 10;
-        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None, oauth_token)?;
         let mut response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
 
         while challenges > 0 && response.has_code(334) {
@@ -1569,6 +1585,7 @@ impl AsyncSmtpConnection {
                     mechanism,
                     credentials.clone(),
                     &response,
+                    oauth_token,
                 )?)
                 .await,
                 self,

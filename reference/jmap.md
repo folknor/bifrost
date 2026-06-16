@@ -1,6 +1,6 @@
 # bifrost-jmap reference
 
-Current architecture of the JMAP implementation crate. The only external surface is `bifrost_jmap::sync` (account factory + config types). The protocol client, typed wire objects, transport, method macros, error type, and helper facade are crate-internal. Examples in `crates/jmap/examples/` demonstrate the `AccountFactory` / `Account` surface only.
+Current architecture of the JMAP implementation crate. The only external surface is `bifrost_jmap::sync` (account factory + config types). The protocol client, typed wire objects, transport, method macros, error type, and helper facade are crate-internal.
 
 ## Public surface
 
@@ -8,8 +8,10 @@ With the `sync` feature enabled, consumers may use:
 
 - `sync::JmapAccountFactory` - registered as `Arc<dyn AccountFactory>`.
 - `sync::JmapAccountFactoryBuilder` - open-time factory builder.
-- `sync::JmapCredentials` - Basic or bearer credentials passed to the
-  factory.
+- `sync::JmapCredentials` - Basic or bearer credentials. `bearer(token)`
+  / `bearer_source(Arc<dyn TokenSource>)`; the source threads through
+  `account_token_source()` into bifrost-net, read live per request.
+  `Clone`, hand-written `Debug`, no `PartialEq`/`Eq`.
 - `sync::ReconnectPolicy` - WebSocket reconnect backoff config.
 
 Everything else in `crates/jmap/src/` is `pub(crate)` or narrower: no public raw client APIs, method macros, wire model modules, or transport types. Consumers reach JMAP by constructing the factory, opening an `Arc<dyn Account>`, and calling `bifrost-types::Account` methods.
@@ -180,7 +182,7 @@ crates/jmap/src/sync/
 
 ### `JmapAccount` / `JmapAccountFactory` shape and lifecycle
 
-`JmapAccountFactory` is the consumer-registered factory, carrying a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, bandwidth caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, probes initial `Email`/`Mailbox`/`Thread` state strings to seed cursors, spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
+`JmapAccountFactory` is the consumer-registered factory, carrying a `JmapAccountFactoryBuilder` config (URL, `JmapCredentials::Basic`/`Bearer`, optional timeout, `accept_invalid_certs`, `ReconnectPolicy`). `AccountFactory::open(account_id)` connects a `Client` and passes the engine account id into the `bifrost-net` attachment used by `ReqwestTransport`, so metering, priority, caps, and trace correlation use the real engine key on every reopen. Open resolves the primary `Mail` account plus optional `Submission`/`VacationResponse`/`Quota`/`Sieve`, reads the session, builds `AccountCapabilities` + `CoreLimits`, probes initial `Email`/`Mailbox`/`Thread` state to seed cursors, spawns the WebSocket reader with a `CancellationToken`, and returns `Arc<dyn Account>`.
 
 `JmapAccount` (`pub(crate)`) owns the `Client`, the `Mail` `Account` handle, optional `Submission`/`VacationResponse`/`Quota`/`Sieve` handles, the built capabilities, per-scope cursor seed states, the `WsState`, a subscription registry, and shared `Mutex<Option<String>>` state caches for `email`/`mailbox`/`thread`. `set_priority`/`set_bandwidth_cap` delegate to `bifrost-net::AccountNet` rather than local atomics; the transport owns the canonical knobs.
 
@@ -276,11 +278,11 @@ Composition uses JMAP's native object model. `attachment_upload` stores bytes th
 
 Search maps the shared `SearchRequest` AST to `Email/query` (query text as a JMAP `text` filter). `search_messages` returns native email ids; `search` uses `collapseThreads = true`, hydrates the emails' `threadId`, returns thread ids. Page cursors are opaque position bytes.
 
-Container CRUD is `Mailbox/get` / `Mailbox/set`. Mailboxes surface as `ContainerKind::Folder`; `ContainerId`/`native_id` are the native mailbox id; `Mailbox.role` maps to `FolderRole`: `inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `archive`->archive, `trash`->TRASH, `junk`->SPAM. `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than silently dropping messages.
+Container CRUD is `Mailbox/get` / `Mailbox/set`. Mailboxes surface as `ContainerKind::Folder`; `ContainerId`/`native_id` are the native mailbox id; `Mailbox.role` maps to `FolderRole` (`inbox`->INBOX, `sent`->SENT, `drafts`->DRAFT, `archive`->archive, `trash`->TRASH, `junk`->SPAM). `container_delete` leaves `onDestroyRemoveEmails = false`, so non-empty deletion fails rather than silently dropping messages.
 
-Settings primitives use `Identity/get`/`set`, `VacationResponse/get`/`set` on the `singleton` id, and `Quota/get` when the capability has a primary account. `identity_update` supports name, signatures, and reply-to; default-identity selection is unsupported (no writeable JMAP field).
+Settings primitives use `Identity/get`/`set`, `VacationResponse/get`/`set` on the `singleton` id, and `Quota/get` when the capability has a primary account. `identity_update` supports name, signatures, and reply-to; default-identity selection is unsupported (no writeable field).
 
-`thread_hydrate` does `Thread/get` then `Email/get` in thread order. `message_hydrate` selects headers, preview, or full body-value projections and returns attachment blob handles without pre-downloading. `move_thread` and `delete_thread` override the unsupported trait defaults: add to the target mailbox then remove from the source; deleting from Trash destroys the thread's emails.
+`thread_hydrate` does `Thread/get` then `Email/get` in thread order. `message_hydrate` selects headers, preview, or full body-value projections and returns attachment blob handles without pre-downloading. `move_thread`/`delete_thread` add to the target mailbox then remove from the source; deleting from Trash destroys the thread's emails.
 
 ### Server-side filter scripts
 
@@ -296,11 +298,11 @@ Typed `ServerFilterCreate::Rule` / `ServerFilterPatch::Rule` are unsupported and
 
 ### HTTP redirect handling
 
-`ReqwestTransport` delegates redirects to `bifrost-net` with JMAP's trusted-host allowlist and five-hop limit; the factory-provided engine account id tags the attached transport. `bifrost-net` strips `Authorization` on every cross-host hop, including Basic-auth headers `ReqwestTransport` injects directly into the request `HeaderMap`.
+`ReqwestTransport` delegates redirects to `bifrost-net` with JMAP's trusted-host allowlist and five-hop limit; the engine account id tags the attached transport. `bifrost-net` strips `Authorization` on every cross-host hop, including Basic headers `ReqwestTransport` injects into the `HeaderMap`. The bearer path routes through bifrost-net; only Basic and the WebSocket handshake build a header via async `header_value()` (awaits `current()`).
 
 ### Error translation
 
-`sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`. The builder routes `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive`, so `RecoveryClass` is computed centrally (no private `to_recovery` table).
+`sync/error.rs::into_account_error(error, ctx)` is the single translation boundary: it consumes `crate::Error` plus a `JmapErrorContext { operation, scope, .. }` and emits an `AccountError` via `AccountErrorBuilder`, routing `(AccountErrorKind, Cause)` plus operation, scope, and any `AttemptCause` through `bifrost-types::recovery::derive` (central `RecoveryClass`; no private `to_recovery` table).
 
 Mapping highlights for the JMAP signals the central table reads:
 
@@ -310,18 +312,15 @@ Mapping highlights for the JMAP signals the central table reads:
   `State(CursorInvalid)` -> `Engine(RestartScope)` when scope is
   known, otherwise `Engine(RestartAccount)`.
 - `Method(serverUnavailable | serverFail | serverPartialFail)` ->
-  `Server(Unavailable)` -> `Retry::SameRequest, reason:
-  ServerUnavailable`.
+  `Server(Unavailable)` -> `Retry::SameRequest`.
 - `Method(requestTooLarge | tooManyChanges)` -> `SyncState
   (CursorInvalid)` or `Request(Malformed)` depending on context.
 - `Method(forbidden)` -> `Authorization(PermissionDenied)` ->
   `NoPermission`.
-- `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`
-  from documented JMAP behavior.
+- `Problem(limit)` -> `Server(RateLimited)` with `throttle_scope`.
 - `Problem(unknownCapability)` -> `SyncState(CapabilityChanged)` ->
-  `Engine(RestartAccount)` (no `CapabilityChanged` directive; shifts route through full reopen).
-- `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`
-  -> `ProviderContractViolation`.
+  `Engine(RestartAccount)` (no directive; routes through full reopen).
+- `Problem(notJSON | notRequest)` -> `Protocol(ContractViolation)`.
 - HTTP-only status fallbacks (401/403/429/5xx) on bare
   `Problem` -> `Authentication` / `Server(RateLimited)` /
   `Server(Unavailable)` per the central rules.

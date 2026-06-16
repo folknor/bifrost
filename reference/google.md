@@ -54,19 +54,18 @@ Internal modules:
 ## GoogleAccount / GoogleAccountFactory
 
 Consumers construct `GoogleAccountFactory` with
-`from_access_token(token)`, then optionally attach a
-`PubSubConfig` with `with_pubsub_config` or `with_pubsub_topic`.
-The factory is the only public Google entry point; the raw
-`GmailClient`, Gmail wire DTOs, and crate-local `Error` are
-`pub(crate)`.
+`from_access_token(token)` (raw) or `from_token_source(Arc<dyn
+TokenSource>)` (shared source, read live per request), then optionally
+attach a `PubSubConfig` via `with_pubsub_config`/`with_pubsub_topic`.
+The factory is the only public entry point; the raw `GmailClient`,
+Gmail wire DTOs, and crate-local `Error` are `pub(crate)`.
 
 `GoogleAccountFactory` carries an internal `Arc<GmailClient>` and an
 optional `PubSubConfig`. `open(account_id)` first asks the client for
 an account-scoped clone attached to `bifrost-net` under the engine
-supplied `AccountId`, then does one `users.getProfile` round-trip,
+`AccountId`, then does one `users.getProfile` round-trip,
 parses `profile.historyId` into a `u64`, and stores the resulting
-`GmailChangeState` as `seed_state`. The opened `GoogleAccount`
-retains:
+`GmailChangeState` as `seed_state`. The opened `GoogleAccount` retains:
 
 - `client: Arc<GmailClient>` (crate-private REST wrapper).
 - `capabilities: AccountCapabilities` snapshotted at open.
@@ -81,22 +80,19 @@ retains:
 - `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the label list.
 - `shutdown: CancellationToken` for the renewer and the
   lifecycle stream.
-- `set_priority` and `set_bandwidth_cap` delegate to the
-  underlying `AccountNet`; the transport owns the canonical knobs.
+- `set_priority` / `set_bandwidth_cap` delegate to the underlying
+  `AccountNet`; the transport owns the knobs.
 
-Clients constructed through `from_access_token` retain their parent
-`Net`, so `open(account_id)` mints a fresh `AccountNet` under the
-engine id on every reopen. There is no public custom-`Net`
-constructor in this crate after S1-W3; callers that need Gmail access
-use the factory and the shared `Account` trait.
+Clients (`from_access_token` or `from_token_source`) retain their parent
+`Net`, so `open(account_id)` mints a fresh `AccountNet` under the engine
+id on every reopen. There is no public custom-`Net` constructor after
+S1-W3; callers use the factory and the shared `Account` trait.
 
-`AccountFactory::open(account_id)` returns `Arc<dyn Account>`.
-`reopen` flows from the engine: the engine drops the previous
-`Arc` and calls the factory again with the same `AccountId`. The
-factory holds the credentials and client, so the new `GoogleAccount`
-carries a fresh
-`shutdown`/`pubsub`/`scope_cache` and reads the current profile
-at open time.
+`AccountFactory::open(account_id)` returns `Arc<dyn Account>`. `reopen`
+flows from the engine: it drops the previous `Arc` and calls the factory
+again with the same `AccountId`. The factory holds the credentials and
+client, so the new `GoogleAccount` carries a fresh
+`shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
 
 `close()` is idempotent. It marks `closed`, cancels `shutdown`,
 and aborts the Pub/Sub renewer task. The renewer task selects on

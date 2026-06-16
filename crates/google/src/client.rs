@@ -25,7 +25,7 @@ struct ClientInner {
     net: AccountNet,
     parent_net: Net,
     api_base: String,
-    token_source: StaticTokenSource,
+    token_source: Arc<dyn TokenSource>,
 }
 
 impl GmailClient {
@@ -34,13 +34,28 @@ impl GmailClient {
     }
 
     fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
-        let token_source = StaticTokenSource::new(access_token, None);
+        let token_source: Arc<dyn TokenSource> =
+            Arc::new(StaticTokenSource::new(access_token, None));
+        Self::with_api_base_and_source(api_base, token_source)
+    }
+
+    // Source-accepting constructor. ratatoskr hands in a shared
+    // `Arc<dyn TokenSource>` so a refreshed-and-persisted token is read
+    // live at every wire authentication without reopening the client.
+    pub(crate) fn with_source(source: Arc<dyn TokenSource>) -> Self {
+        Self::with_api_base_and_source(GMAIL_API_BASE, source)
+    }
+
+    fn with_api_base_and_source(
+        api_base: impl Into<String>,
+        token_source: Arc<dyn TokenSource>,
+    ) -> Self {
         let parent_net = Net::shared_default();
         let net = default_account_net(
             &parent_net,
             AccountId("gmail-direct".to_string()),
             "www.googleapis.com",
-            token_source.clone(),
+            Arc::clone(&token_source),
         );
         Self {
             inner: Arc::new(ClientInner {
@@ -57,14 +72,14 @@ impl GmailClient {
             &self.inner.parent_net,
             account_id,
             "www.googleapis.com",
-            self.inner.token_source.clone(),
+            Arc::clone(&self.inner.token_source),
         );
         Self {
             inner: Arc::new(ClientInner {
                 net,
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
-                token_source: self.inner.token_source.clone(),
+                token_source: Arc::clone(&self.inner.token_source),
             }),
         }
     }
@@ -75,6 +90,17 @@ impl GmailClient {
 
     pub(crate) fn api_base(&self) -> &str {
         &self.inner.api_base
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn access_token(&self) -> String {
+        self.inner
+            .token_source
+            .current()
+            .await
+            .expect("static token source is infallible")
+            .as_str()
+            .to_string()
     }
 
     pub(crate) async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -223,9 +249,8 @@ fn default_account_net(
     net: &Net,
     account: AccountId,
     host: impl Into<String>,
-    token_source: StaticTokenSource,
+    token_source: Arc<dyn TokenSource>,
 ) -> AccountNet {
-    let token_source: Arc<dyn TokenSource> = Arc::new(token_source);
     net.attach_account(
         uniquify_account_id(account),
         AccountSpec {
@@ -266,5 +291,16 @@ mod tests {
     async fn trims_api_base() {
         let client = GmailClient::with_api_base("https://example.test/base/", "token");
         assert_eq!(client.api_base(), "https://example.test/base");
+    }
+
+    #[tokio::test]
+    async fn rotated_token_source_is_read() {
+        use bifrost_net::AccessToken;
+
+        let source = StaticTokenSource::new("old-token", None);
+        let client = GmailClient::with_source(Arc::new(source.clone()));
+        assert_eq!(client.access_token().await, "old-token");
+        source.set(AccessToken::new("new-token", None));
+        assert_eq!(client.access_token().await, "new-token");
     }
 }

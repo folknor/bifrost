@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bifrost-net = { path = "../net" }
 bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -26,3 +27,6 @@ futures = { workspace = true }
 quick-xml = "0.40.1"
 reqwest = { workspace = true, features = ["native-tls"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

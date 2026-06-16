@@ -4,8 +4,14 @@ Current Stage 3 W2 standalone CardDAV account implementation.
 
 ## Public surface
 
-- `CardDavCredentials` - Basic or bearer credentials.
-- `CardDavConfig` - base URL plus credentials.
+- `CardDavCredentials` - Basic or bearer credentials. `bearer(token)`
+  wraps a raw string; `bearer_source(Arc<dyn TokenSource>)` takes a
+  shared rotation source. The bearer token is read via `current().await`
+  per DAV request (in `auth_headers`), so a token rotated mid-sync is
+  honored on the next request without reopen. `Clone` only, hand-written
+  `Debug` redacting the source; no `PartialEq`/`Eq`.
+- `CardDavConfig` - base URL plus credentials (`Debug`/`Clone`, no
+  `PartialEq`/`Eq`).
 - `CardDavAccountFactory` - implements `AccountFactory`.
 
 `CardDavAccountFactory::open(account_id)` discovers the CardDAV

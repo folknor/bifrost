@@ -210,7 +210,7 @@ impl CardDavClient {
             .http
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/vcard; charset=utf-8")
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -232,7 +232,7 @@ impl CardDavClient {
         let request = self
             .http
             .request(Method::DELETE, url)
-            .headers(self.auth_headers());
+            .headers(self.auth_headers(operation).await?);
         self.send_status_request(request, operation).await
     }
 
@@ -266,7 +266,7 @@ impl CardDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -284,7 +284,7 @@ impl CardDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", "1")
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -336,7 +336,10 @@ impl CardDavClient {
         }
     }
 
-    fn auth_headers(&self) -> HeaderMap {
+    /// Build the per-request auth headers. The bearer token is read from
+    /// the shared source on every call, so a token rotated mid-sync is
+    /// honored on the next DAV request without reopening the account.
+    async fn auth_headers(&self, operation: AccountOperation) -> Result<HeaderMap, AccountError> {
         let mut headers = HeaderMap::new();
         match &self.credentials {
             CardDavCredentials::Basic { username, password } => {
@@ -346,13 +349,19 @@ impl CardDavClient {
                     headers.insert(AUTHORIZATION, value);
                 }
             }
-            CardDavCredentials::Bearer { access_token } => {
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {access_token}")) {
+            CardDavCredentials::Bearer { token_source } => {
+                let token = token_source.current().await.map_err(|error| {
+                    transport_error(
+                        operation,
+                        format!("failed to read OAuth access token: {error}"),
+                    )
+                })?;
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
                     headers.insert(AUTHORIZATION, value);
                 }
             }
         }
-        headers
+        Ok(headers)
     }
 }
 
@@ -609,9 +618,7 @@ mod tests {
         let client = CardDavClient {
             http: reqwest::Client::new(),
             base_url: "not a url".to_string(),
-            credentials: CardDavCredentials::Bearer {
-                access_token: "token".to_string(),
-            },
+            credentials: CardDavCredentials::bearer("token"),
         };
 
         assert_eq!(

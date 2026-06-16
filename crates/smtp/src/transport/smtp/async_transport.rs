@@ -705,6 +705,22 @@ impl AsyncSmtpTransportBuilder {
         self.credentials(Credentials::oauth2(identity, access_token))
     }
 
+    /// Set OAuth 2.0 bearer-token credentials from a shared token source.
+    ///
+    /// ratatoskr supplies one `Arc<dyn TokenSource>` it drives rotation
+    /// on; the token is read live at each connect, so a refreshed token
+    /// is presented on reconnect without rebuilding the transport.
+    pub fn oauth2_source<I>(
+        self,
+        identity: I,
+        token_source: Arc<dyn bifrost_net::TokenSource>,
+    ) -> Self
+    where
+        I: Into<String>,
+    {
+        self.credentials(Credentials::oauth2_source(identity, token_source))
+    }
+
     /// Set the authentication mechanism to use
     pub fn authentication(mut self, mechanisms: Vec<Mechanism>) -> Self {
         self.info.set_authentication(mechanisms);
@@ -840,6 +856,22 @@ impl AsyncLmtpTransportBuilder {
         T: IntoSecretString,
     {
         self.credentials(Credentials::oauth2(identity, access_token))
+    }
+
+    /// Set OAuth 2.0 bearer-token credentials from a shared token source.
+    ///
+    /// ratatoskr supplies one `Arc<dyn TokenSource>` it drives rotation
+    /// on; the token is read live at each connect, so a refreshed token
+    /// is presented on reconnect without rebuilding the transport.
+    pub fn oauth2_source<I>(
+        self,
+        identity: I,
+        token_source: Arc<dyn bifrost_net::TokenSource>,
+    ) -> Self
+    where
+        I: Into<String>,
+    {
+        self.credentials(Credentials::oauth2_source(identity, token_source))
     }
 
     /// Set the authentication mechanism to use

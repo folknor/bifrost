@@ -43,8 +43,7 @@ impl ReqwestTransport {
         };
         let net = Net::new(config)
             .map_err(|e| TransportError::with_source("Failed to build HTTP transport", e))?;
-        let token_source: Arc<dyn bifrost_net::TokenSource> =
-            Arc::new(authorization.account_token_source());
+        let token_source = authorization.account_token_source();
         let net = net.attach_account(
             account_id,
             AccountSpec {
@@ -105,10 +104,14 @@ impl ReqwestTransport {
             request = request.header(name.as_str(), value);
         }
         if self.authorization.uses_bearer_pipeline() {
-            // AccountNet injects the bearer token from its
-            // StaticTokenSource.
+            // AccountNet injects the bearer token from the shared
+            // token source on every request attempt.
         } else {
-            let value = self.authorization.header_value();
+            let value = self
+                .authorization
+                .header_value()
+                .await
+                .map_err(TransportError::from_net)?;
             request = request
                 .without_bearer_auth()
                 .header(header::AUTHORIZATION.as_str(), &value);
@@ -186,7 +189,11 @@ impl SseTransport for ReqwestTransport {
         }
         if self.authorization.uses_bearer_pipeline() {
         } else {
-            let value = self.authorization.header_value();
+            let value = self
+                .authorization
+                .header_value()
+                .await
+                .map_err(TransportError::from_net)?;
             request = request
                 .without_bearer_auth()
                 .header(header::AUTHORIZATION.as_str(), &value);

@@ -570,6 +570,23 @@ impl SmtpTransportBuilder {
         self.credentials(Credentials::oauth2(identity, access_token))
     }
 
+    /// Set OAuth 2.0 bearer-token credentials from a shared token source.
+    ///
+    /// The blocking transport reads the token by polling the source once;
+    /// a `StaticTokenSource` (or an already-fresh `OAuthRefresher`)
+    /// resolves immediately. A source needing a network refresh requires
+    /// the async transport.
+    pub fn oauth2_source<I>(
+        self,
+        identity: I,
+        token_source: Arc<dyn bifrost_net::TokenSource>,
+    ) -> Self
+    where
+        I: Into<String>,
+    {
+        self.credentials(Credentials::oauth2_source(identity, token_source))
+    }
+
     /// Set the authentication mechanism to use
     pub fn authentication(mut self, mechanisms: Vec<Mechanism>) -> Self {
         self.info.set_authentication(mechanisms);
@@ -698,6 +715,23 @@ impl LmtpTransportBuilder {
         T: IntoSecretString,
     {
         self.credentials(Credentials::oauth2(identity, access_token))
+    }
+
+    /// Set OAuth 2.0 bearer-token credentials from a shared token source.
+    ///
+    /// The blocking transport reads the token by polling the source once;
+    /// a `StaticTokenSource` (or an already-fresh `OAuthRefresher`)
+    /// resolves immediately. A source needing a network refresh requires
+    /// the async transport.
+    pub fn oauth2_source<I>(
+        self,
+        identity: I,
+        token_source: Arc<dyn bifrost_net::TokenSource>,
+    ) -> Self
+    where
+        I: Into<String>,
+    {
+        self.credentials(Credentials::oauth2_source(identity, token_source))
     }
 
     /// Set the authentication mechanism to use
@@ -951,13 +985,11 @@ mod tests {
             SmtpTransport::from_url("smtps://username:password@smtp.example.com:465").unwrap();
 
         assert_eq!(builder.info.port, 465);
-        assert_eq!(
+        assert!(matches!(
             builder.info.credentials,
-            Some(Credentials::password(
-                "username".to_owned(),
-                "password".to_owned()
-            ))
-        );
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
         assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
         assert_eq!(builder.info.server, "smtp.example.com");
 
@@ -967,13 +999,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(builder.info.port, 465);
-        assert_eq!(
+        assert!(matches!(
             builder.info.credentials,
-            Some(Credentials::password(
-                "user@example.com".to_owned(),
-                "pa$$word?\"!".to_owned()
-            ))
-        );
+            Some(Credentials::Password { ref username, ref password })
+                if username == "user@example.com" && password.as_str() == "pa$$word?\"!"
+        ));
         assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
         assert_eq!(builder.info.server, "smtp.example.com");
 
@@ -982,13 +1012,11 @@ mod tests {
                 .unwrap();
 
         assert_eq!(builder.info.port, 587);
-        assert_eq!(
+        assert!(matches!(
             builder.info.credentials,
-            Some(Credentials::password(
-                "username".to_owned(),
-                "password".to_owned()
-            ))
-        );
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
         assert!(matches!(builder.info.tls, Tls::Required(_)));
 
         let builder = SmtpTransport::from_url(
@@ -1002,7 +1030,7 @@ mod tests {
         let builder = SmtpTransport::from_url("smtps://smtp.example.com").unwrap();
 
         assert_eq!(builder.info.port, 465);
-        assert_eq!(builder.info.credentials, None);
+        assert!(builder.info.credentials.is_none());
         assert!(matches!(builder.info.tls, Tls::Wrapper(_)));
     }
 
@@ -1011,13 +1039,11 @@ mod tests {
         let builder =
             SmtpTransport::builder_dangerous("smtp.example.com").password("username", "password");
 
-        assert_eq!(
+        assert!(matches!(
             builder.info.credentials,
-            Some(Credentials::password(
-                "username".to_owned(),
-                "password".to_owned()
-            ))
-        );
+            Some(Credentials::Password { ref username, ref password })
+                if username == "username" && password.as_str() == "password"
+        ));
         assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
         // Pin the grown default-construction surface explicitly: SCRAM is now
         // offered out of the box (strongest first), LOGIN is opt-in only.
@@ -1039,13 +1065,11 @@ mod tests {
         let builder = SmtpTransport::builder_dangerous("smtp.example.com")
             .oauth2("user@example.com", "token");
 
-        assert_eq!(
+        assert!(matches!(
             builder.info.credentials,
-            Some(Credentials::oauth2(
-                "user@example.com".to_owned(),
-                "token".to_owned()
-            ))
-        );
+            Some(Credentials::OAuth2 { ref identity, .. })
+                if identity == "user@example.com"
+        ));
         assert_eq!(builder.info.authentication, OAUTH2_MECHANISMS);
         assert_eq!(
             builder.info.authentication,

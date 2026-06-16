@@ -1441,9 +1441,7 @@ mod tests {
     fn sync_report_updates_snapshot_and_classifies_changes() {
         let client = CalDavClient::new(&CalDavConfig {
             base_url: "https://dav.example.test".to_string(),
-            credentials: CalDavCredentials::Bearer {
-                access_token: "token".to_string(),
-            },
+            credentials: CalDavCredentials::bearer("token"),
         })
         .expect("client");
         let mut snapshot = EventSnapshot {

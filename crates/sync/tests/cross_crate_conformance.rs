@@ -16,7 +16,6 @@ use bifrost_imap::{
     account::{ImapAccountConfig, ImapAccountFactory},
 };
 use bifrost_jmap::sync::{JmapAccountFactory, JmapCredentials};
-use bifrost_net::StaticTokenSource;
 use bifrost_sync::SyncEngine;
 use bifrost_types::{Account, AccountFactory, AccountId};
 
@@ -50,9 +49,7 @@ fn jmap_factory() -> Arc<dyn AccountFactory> {
     Arc::new(
         JmapAccountFactory::builder(
             "https://jmap.example.test/session",
-            JmapCredentials::Bearer {
-                token_source: StaticTokenSource::new("test-token", None),
-            },
+            JmapCredentials::bearer("test-token"),
         )
         .build(),
     )

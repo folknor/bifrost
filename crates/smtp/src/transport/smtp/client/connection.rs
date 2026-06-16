@@ -1396,7 +1396,7 @@ impl SmtpConnection {
         // Bare `AUTH <mechanism>`: SCRAM has no initial response, so
         // `Mechanism::response` is never invoked and `Display` emits the bare
         // command.
-        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None, None)?;
         let response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
         // Server's first 334 (empty challenge): send client-first.
         if !response.has_code(334) {
@@ -1460,9 +1460,25 @@ impl SmtpConnection {
         mechanism: Mechanism,
         credentials: &Credentials,
     ) -> Result<Response, Error> {
+        // The blocking transport has no async context, so it resolves the
+        // OAuth token by polling the source once (see
+        // `oauth2_token_blocking`): a `StaticTokenSource` or an
+        // already-fresh `OAuthRefresher` resolves immediately; a source
+        // needing a network refresh is rejected with a clear error.
+        let oauth_token = if matches!(mechanism, Mechanism::Xoauth2 | Mechanism::OAuthBearer) {
+            Some(try_smtp!(
+                credentials.oauth2_token_blocking(),
+                self,
+                SmtpCommandPhase::Auth
+            ))
+        } else {
+            None
+        };
+        let oauth_token = oauth_token.as_ref().map(|(_, token)| token.as_str());
+
         // Limit challenges to avoid blocking
         let mut challenges = 10;
-        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let auth = Auth::new(mechanism, credentials.clone(), None, oauth_token)?;
         let mut response = try_smtp!(self.command(auth), self, SmtpCommandPhase::Auth);
 
         while challenges > 0 && response.has_code(334) {
@@ -1472,6 +1488,7 @@ impl SmtpConnection {
                     mechanism,
                     credentials.clone(),
                     &response,
+                    oauth_token,
                 )?),
                 self,
                 SmtpCommandPhase::Auth

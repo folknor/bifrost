@@ -34,6 +34,8 @@ use bifrost_types::{
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use bifrost_net::TokenSource;
+
 use crate::client::GmailClient;
 use crate::types::GmailProfile;
 
@@ -69,6 +71,15 @@ impl GoogleAccountFactory {
     #[must_use]
     pub fn from_access_token(access_token: impl Into<String>) -> Self {
         Self::from_client(GmailClient::new(access_token))
+    }
+
+    /// Construct a Google factory from a shared token source. ratatoskr
+    /// supplies an `Arc<dyn TokenSource>` (typically an `OAuthRefresher`
+    /// over its own refresh-token store) so a refreshed-and-persisted
+    /// token is read live at every Gmail/People request without reopen.
+    #[must_use]
+    pub fn from_token_source(source: Arc<dyn TokenSource>) -> Self {
+        Self::from_client(GmailClient::with_source(source))
     }
 
     /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.

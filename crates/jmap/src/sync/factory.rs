@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bifrost_net::StaticTokenSource;
+use bifrost_net::{StaticTokenSource, TokenSource};
 use bifrost_types::{
     Account, AccountError, AccountFactory, AccountFuture, AccountId, CursorScope, ObjectType,
 };
@@ -38,11 +38,34 @@ pub struct JmapAccountFactoryBuilder {
 }
 
 // pub: caller-supplied auth material for constructing a JMAP AccountFactory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum JmapCredentials {
     Basic { username: String, password: String },
-    Bearer { token_source: StaticTokenSource },
+    // The bearer source is shared: ratatoskr hands in one
+    // `Arc<dyn TokenSource>` (typically an `OAuthRefresher` over its own
+    // refresh-token store) and a token it refreshes and persists is read
+    // live at every wire authentication without reopening the account.
+    Bearer { token_source: Arc<dyn TokenSource> },
+}
+
+// `Arc<dyn TokenSource>` is not `Debug`; redact the bearer source so the
+// derived `Debug` on the surrounding factory structs keeps working
+// without leaking token material.
+impl std::fmt::Debug for JmapCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token_source", &"<token-source>")
+                .finish(),
+        }
+    }
 }
 
 impl JmapAccountFactory {
@@ -300,7 +323,18 @@ impl JmapCredentials {
     #[must_use]
     pub fn bearer(token: impl Into<String>) -> Self {
         Self::Bearer {
-            token_source: StaticTokenSource::new(token, None),
+            token_source: Arc::new(StaticTokenSource::new(token, None)),
+        }
+    }
+
+    /// Construct bearer credentials from a shared token source.
+    /// ratatoskr supplies one `Arc<dyn TokenSource>` it also drives
+    /// rotation on, so a rotated token is visible to JMAP through this
+    /// single object with no reopen.
+    #[must_use]
+    pub fn bearer_source(source: Arc<dyn TokenSource>) -> Self {
+        Self::Bearer {
+            token_source: source,
         }
     }
 
@@ -348,6 +382,39 @@ mod tests {
 
         let bearer = JmapCredentials::bearer("token");
         assert_eq!(bearer.configured_email(), None);
+    }
+
+    #[tokio::test]
+    async fn bearer_source_threads_token_source() {
+        use crate::client::Authorization;
+        use bifrost_net::AccessToken;
+
+        let source = StaticTokenSource::new("old-token", None);
+        let creds = JmapCredentials::bearer_source(Arc::new(source.clone()));
+        // The shared source threads through to the client credential and
+        // the account-net token source unchanged.
+        let client_creds = creds.into_client_credentials();
+        let authorization = Authorization::from_credentials_for_test(client_creds);
+        let threaded = authorization.account_token_source();
+        assert_eq!(
+            threaded
+                .current()
+                .await
+                .expect("static source infallible")
+                .as_str(),
+            "old-token"
+        );
+        // A token rotated on the original source is visible through the
+        // threaded source with no reopen.
+        source.set(AccessToken::new("new-token", None));
+        assert_eq!(
+            threaded
+                .current()
+                .await
+                .expect("static source infallible")
+                .as_str(),
+            "new-token"
+        );
     }
 
     #[test]

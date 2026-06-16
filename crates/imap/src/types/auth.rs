@@ -1,6 +1,9 @@
 //! Authentication policy and credential types.
 
 use std::fmt;
+use std::sync::Arc;
+
+use bifrost_net::{StaticTokenSource, TokenSource};
 
 use super::SecretString;
 
@@ -8,13 +11,20 @@ use super::SecretString;
 ///
 /// This models the common single-identity flows. Delegated access with a
 /// distinct SASL authorization identity is not represented here yet.
+//
+// `Credentials` deliberately drops the `PartialEq`/`Eq` it once derived:
+// the OAuth variant now holds a live `Arc<dyn TokenSource>` instead of a
+// frozen token string, and a token source is not `Eq`. Nothing in the
+// crate compares credentials for equality. Unlike SMTP's `Credentials`,
+// the IMAP type was never serde-derived, so this is the whole of the
+// derive fallout here.
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Credentials {
     kind: CredentialsKind,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) enum CredentialsKind {
     /// Username and password credentials.
     Password {
@@ -27,8 +37,11 @@ pub(crate) enum CredentialsKind {
     OAuth2 {
         /// Authorization identity, usually the email address being accessed.
         identity: String,
-        /// OAuth 2.0 access token.
-        access_token: SecretString,
+        /// Live source of the OAuth 2.0 access token. Read at each
+        /// connect (and every reconnect) so a token rotated on the
+        /// shared source is presented without rebuilding the account -
+        /// closing the stale-token-on-reconnect path.
+        token_source: Arc<dyn TokenSource>,
     },
 }
 
@@ -43,18 +56,47 @@ impl Credentials {
         }
     }
 
-    /// Create OAuth 2.0 bearer-token credentials.
+    /// Create OAuth 2.0 bearer-token credentials from a raw token string.
+    /// Convenience wrapper: the token is held in a `StaticTokenSource` so
+    /// existing call sites keep their string ergonomics.
     pub fn oauth2(identity: impl Into<String>, access_token: impl Into<String>) -> Self {
+        Self::oauth2_source(
+            identity,
+            Arc::new(StaticTokenSource::new(access_token.into(), None)),
+        )
+    }
+
+    /// Create OAuth 2.0 bearer-token credentials from a shared token
+    /// source. ratatoskr supplies one `Arc<dyn TokenSource>` it also
+    /// drives rotation on; the token is read fresh at every connect and
+    /// reconnect, so a refreshed token is presented without reopening.
+    pub fn oauth2_source(identity: impl Into<String>, source: Arc<dyn TokenSource>) -> Self {
         Self {
             kind: CredentialsKind::OAuth2 {
                 identity: identity.into(),
-                access_token: SecretString::from(access_token.into()),
+                token_source: source,
             },
         }
     }
 
     pub(crate) fn kind(&self) -> &CredentialsKind {
         &self.kind
+    }
+}
+
+impl CredentialsKind {
+    /// Read the OAuth access token the auth path would present right now.
+    /// This is the exact per-connect read point reused on every
+    /// reconnect, so a value swapped on the shared source between two
+    /// reads proves a rotated token is re-read rather than frozen.
+    #[cfg(test)]
+    pub(crate) async fn current_token(&self) -> Option<String> {
+        match self {
+            CredentialsKind::OAuth2 { token_source, .. } => {
+                Some(token_source.current().await.ok()?.as_str().to_owned())
+            }
+            CredentialsKind::Password { .. } => None,
+        }
     }
 }
 
@@ -69,7 +111,7 @@ impl fmt::Debug for Credentials {
             CredentialsKind::OAuth2 { identity, .. } => f
                 .debug_struct("Credentials::OAuth2")
                 .field("identity", identity)
-                .field("access_token", &"<redacted>")
+                .field("token_source", &"<token-source>")
                 .finish(),
         }
     }
@@ -174,4 +216,39 @@ impl AuthPolicy {
 pub(crate) struct AuthOutcome {
     /// Mechanism used for the successful authentication exchange.
     pub(crate) mechanism: AuthMechanism,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_net::AccessToken;
+
+    #[tokio::test]
+    async fn oauth2_credentials_reread_rotated_token() {
+        let source = StaticTokenSource::new("old-token", None);
+        let credentials = Credentials::oauth2_source("user@example.com", Arc::new(source.clone()));
+
+        // First read: the token the auth path would present on the
+        // initial connect.
+        assert_eq!(
+            credentials.kind().current_token().await.as_deref(),
+            Some("old-token")
+        );
+
+        // Rotate the token on the shared source, as ratatoskr would after
+        // refreshing and persisting a new access token.
+        source.set(AccessToken::new("new-token", None));
+
+        // Second read re-enters the exact per-connect read point a
+        // reconnect would use, and observes the rotated token - proving
+        // the stale-token-on-reconnect path is closed.
+        assert_eq!(
+            credentials.kind().current_token().await.as_deref(),
+            Some("new-token")
+        );
+
+        // Password credentials have no token source.
+        let password = Credentials::password("user", "pw");
+        assert!(password.kind().current_token().await.is_none());
+    }
 }

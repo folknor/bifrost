@@ -276,7 +276,7 @@ impl CalDavClient {
         let request = self
             .http
             .request(Method::GET, url)
-            .headers(self.auth_headers());
+            .headers(self.auth_headers(operation).await?);
         let response = request
             .send()
             .await
@@ -309,7 +309,7 @@ impl CalDavClient {
             .http
             .request(Method::PUT, url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body);
         match condition {
             PutCondition::IfNoneMatch => {
@@ -345,7 +345,7 @@ impl CalDavClient {
         let request = self
             .http
             .request(Method::DELETE, url)
-            .headers(self.auth_headers());
+            .headers(self.auth_headers(operation).await?);
         self.send_status_request(request, operation).await
     }
 
@@ -363,7 +363,7 @@ impl CalDavClient {
             .http
             .request(Method::POST, outbox_url)
             .header(CONTENT_TYPE, "text/calendar; charset=utf-8")
-            .headers(self.auth_headers());
+            .headers(self.auth_headers(AccountOperation::EventRsvp).await?);
         if let Ok(value) = HeaderValue::from_str(&schedule_address(originator)) {
             request = request.header("Originator", value);
         }
@@ -405,7 +405,7 @@ impl CalDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", depth)
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -423,7 +423,7 @@ impl CalDavClient {
             .request(method, url)
             .header(CONTENT_TYPE, "application/xml; charset=utf-8")
             .header("Depth", "1")
-            .headers(self.auth_headers())
+            .headers(self.auth_headers(operation).await?)
             .body(body.to_string());
         self.send_body_request(request, operation).await
     }
@@ -470,7 +470,10 @@ impl CalDavClient {
         }
     }
 
-    fn auth_headers(&self) -> HeaderMap {
+    /// Build the per-request auth headers. The bearer token is read from
+    /// the shared source on every call, so a token rotated mid-sync is
+    /// honored on the next DAV request without reopening the account.
+    async fn auth_headers(&self, operation: AccountOperation) -> Result<HeaderMap, AccountError> {
         let mut headers = HeaderMap::new();
         match &self.credentials {
             CalDavCredentials::Basic { username, password } => {
@@ -480,13 +483,19 @@ impl CalDavClient {
                     headers.insert(AUTHORIZATION, value);
                 }
             }
-            CalDavCredentials::Bearer { access_token } => {
-                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {access_token}")) {
+            CalDavCredentials::Bearer { token_source } => {
+                let token = token_source.current().await.map_err(|error| {
+                    transport_error(
+                        operation,
+                        format!("failed to read OAuth access token: {error}"),
+                    )
+                })?;
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", token.as_str())) {
                     headers.insert(AUTHORIZATION, value);
                 }
             }
         }
-        headers
+        Ok(headers)
     }
 }
 
@@ -830,9 +839,7 @@ mod tests {
         let client = CalDavClient {
             http: reqwest::Client::new(),
             base_url: "not a url".to_string(),
-            credentials: CalDavCredentials::Bearer {
-                access_token: "token".to_string(),
-            },
+            credentials: CalDavCredentials::bearer("token"),
         };
 
         assert_eq!(

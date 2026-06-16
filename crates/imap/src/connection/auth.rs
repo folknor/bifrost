@@ -40,7 +40,7 @@ impl ImapConnection {
         match credentials.kind() {
             CredentialsKind::OAuth2 {
                 identity,
-                access_token,
+                token_source,
             } => {
                 if !profile.supports_sasl_auth(AuthMechanism::XOAuth2) {
                     return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
@@ -54,6 +54,13 @@ impl ImapConnection {
                         )],
                     )));
                 }
+                // Read the current token from the shared source at connect
+                // time. On a reconnect this re-enters here and re-reads, so
+                // a token rotated since the last connect is presented fresh.
+                let access_token = token_source.current().await.map_err(|e| Error::Auth {
+                    text: format!("failed to read OAuth access token: {e}"),
+                    code: None,
+                })?;
                 self.authenticate_xoauth2(identity, access_token.as_str(), timeout)
                     .await?;
                 Ok(AuthOutcome {

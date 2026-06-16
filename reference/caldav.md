@@ -4,8 +4,14 @@ Current Stage 4 standalone CalDAV account implementation.
 
 ## Public surface
 
-- `CalDavCredentials` - Basic or bearer credentials.
-- `CalDavConfig` - base URL plus credentials.
+- `CalDavCredentials` - Basic or bearer credentials. `bearer(token)`
+  wraps a raw string; `bearer_source(Arc<dyn TokenSource>)` takes a
+  shared rotation source. The bearer token is read via `current().await`
+  per DAV request (in `auth_headers`), so a token rotated mid-sync is
+  honored on the next request without reopen. `Clone` only, hand-written
+  `Debug` redacting the source; no `PartialEq`/`Eq`.
+- `CalDavConfig` - base URL plus credentials (`Debug`/`Clone`, no
+  `PartialEq`/`Eq`).
 - `CalDavAccountFactory` - implements `AccountFactory`.
 
 `CalDavAccountFactory::open(account_id)` discovers the CalDAV calendar

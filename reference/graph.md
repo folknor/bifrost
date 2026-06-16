@@ -3,9 +3,9 @@
 Current architecture of the Graph Account-layer code under
 `crates/graph/src/account/`. The public surface is
 `bifrost_graph::account::{GraphClient, GraphAccountFactory}`:
-`GraphClient` carries credentials / endpoints into the factory,
-and consumers use the returned `Arc<dyn Account>`. Raw Microsoft
-Graph REST helpers and wire types are crate-private.
+`GraphClient` carries credentials / endpoints into the factory, and
+consumers use the returned `Arc<dyn Account>`. Raw Graph REST helpers
+and wire types are crate-private.
 
 The same `Account` impl owns Graph's Stage 1 PIM action surface:
 message moves, flag/category writes, send/draft lifecycle, search,
@@ -118,59 +118,56 @@ the server page chain ends.
 The `account` module path remains public because the cross-crate
 conformance test and existing consumers construct the factory
 through it; helper modules and `GraphAccount` stay crate-private.
-`GraphClient` is public only as factory input. Its public methods
-configure credentials, API bases, a pre-attached `AccountNet`,
-token rotation, or shared-mailbox scoping; request helpers stay
-`pub(crate)`.
+`GraphClient` is public only as factory input; request helpers stay
+`pub(crate)`. `new` / `with_api_base*` take a raw token string;
+`with_source` and `with_account_net` take a shared `Arc<dyn
+TokenSource>`. The held source is what `attach_account` hands to
+bifrost-net, read live per request. Other methods configure API bases or
+shared-mailbox scoping.
 
-`GraphAccountFactory` carries a `GraphClient`, a `PushMode`, and
-an optional `PushEndpoint` (the public HTTPS webhook URL).
-`with_push_endpoint(url)` selects `PushMode::GraphSubscriptions`
-and stores the webhook URL; `with_ews_streaming()` selects
-`PushMode::EwsStreaming` and clears the endpoint. The default
-factory shape is webhook-mode without an endpoint, in which case
-`push_subscribe` returns `Error::MissingCoreCapability`.
+`GraphAccountFactory` carries a `GraphClient`, a `PushMode`, and an
+optional `PushEndpoint` (the public HTTPS webhook URL).
+`with_push_endpoint(url)` selects `PushMode::GraphSubscriptions` and
+stores the URL; `with_ews_streaming()` selects `PushMode::EwsStreaming`
+and clears the endpoint. The default is webhook-mode without an
+endpoint, where `push_subscribe` returns `Error::MissingCoreCapability`.
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to
 `bifrost-net` under the engine `AccountId`, validates the token with a
 `users/me` profile fetch (`get_profile`), constructs a `GraphAccount`,
 and runs `list_mail_folders_recursive` to seed the `FolderTree`. Cursors
-are not pre-seeded; they mint lazily from `establish_initial_cursor`
-plus the first `inventory_stream` page. Returns `Arc<dyn Account>`.
+mint lazily from `establish_initial_cursor` plus the first
+`inventory_stream` page. Returns `Arc<dyn Account>`.
 
 `GraphAccount` owns:
 
-- The shared `GraphClient` (clones are cheap; the inner state is
-  `Arc`-shared).
+- The shared `GraphClient` (clones cheap; inner state `Arc`-shared).
 - The built `AccountCapabilities` (cached at `new`).
-- The push mode plus optional webhook endpoint.
-- A `broadcast::Sender<WatchEvent>` whose receivers feed
-  `push_stream`.
-- An `Arc<RwLock<CursorIndex>>` (the discovered cursor scope
-  list) and an `Arc<RwLock<FolderTree>>` (parent map for the
-  folder hierarchy).
-- A `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` for
-  webhook subscriptions plus an `Arc<Mutex<Option<JoinHandle>>>`
-  for the renewal health worker.
+- The push mode plus optional endpoint.
+- A `broadcast::Sender<WatchEvent>` whose receivers feed `push_stream`.
+- An `Arc<RwLock<CursorIndex>>` (discovered cursor scope list) and an
+  `Arc<RwLock<FolderTree>>` (parent map for the folder hierarchy).
+- A `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` for webhook
+  subscriptions plus an `Arc<Mutex<Option<JoinHandle>>>` for the renewal
+  health worker.
 - A `HashMap<SubscriptionHandle, EwsSubscriptionState>` plus a
   matching `JoinHandle` slot for the EWS streaming worker.
 - A `CancellationToken` driving worker shutdown.
-- An `etag_index: Arc<RwLock<HashMap<String, String>>>` of
-  per-object change keys harvested from inventory, changes, and
-  get responses; this powers `If-Match` on mutations.
-- `set_priority` and `set_bandwidth_cap` delegate to the
-  underlying `AccountNet`; the transport owns the canonical knobs.
+- An `etag_index: Arc<RwLock<HashMap<String, String>>>` of per-object
+  change keys harvested from inventory, changes, and get responses; this
+  powers `If-Match` on mutations.
+- `set_priority` / `set_bandwidth_cap` delegate to the underlying
+  `AccountNet`; the transport owns the knobs.
 
 Reopen is engine-delegated: on drop or after `close()`, the engine calls
 `GraphAccountFactory::open` again for a fresh `GraphAccount` with empty
 caches and a fresh shutdown token. The factory holds the client, so the
-new account inherits whatever access token it currently exposes.
+new account reads the token source's current value.
 
-`close()` cancels the shutdown token and aborts the EWS worker
-join handle. The graph subscription worker observes
-`shutdown.cancelled()` on its select arm and exits cleanly. The
-push stream wraps the broadcast receiver in a `stream::unfold`
-that selects against the same shutdown token.
+`close()` cancels the shutdown token and aborts the EWS worker join
+handle. The subscription worker observes `shutdown.cancelled()` on its
+select arm and exits cleanly. The push stream wraps the broadcast
+receiver in a `stream::unfold` selecting against the same token.
 
 ## Capabilities
 

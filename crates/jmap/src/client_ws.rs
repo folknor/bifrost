@@ -139,7 +139,7 @@ impl Client {
             .parse()
             .map_err(|e: http::uri::InvalidUri| crate::Error::InvalidUrl(e.to_string()))?;
 
-        let authorization = self.authorization();
+        let authorization = self.authorization().await?;
         let auth_value =
             HeaderValue::from_str(&authorization).map_err(crate::Error::from_invalid_header)?;
 

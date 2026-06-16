@@ -63,10 +63,20 @@ Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming c
 ## Auth
 
 `Credentials` is a public opaque wrapper with `password(username,
-password)` and `oauth2(identity, access_token)` constructors. The
-stored secret material remains in the internal `SecretString` wrapper,
-which zeroizes and redacts under `Debug`; consumers no longer handle
-or import that wrapper directly. No `From<(String, String)>`.
+password)`, `oauth2(identity, access_token)` (raw string), and
+`oauth2_source(identity, Arc<dyn TokenSource>)` (shared rotation source)
+constructors. The OAuth variant holds an `Arc<dyn TokenSource>`
+(bifrost-net's trait), read via `current().await` at connect and on
+every reconnect through the same per-connect point in
+`authenticate_best` (and the ManageSieve auth path) - so a token rotated
+on the shared source is presented fresh on reconnect, closing the
+stale-token-on-reconnect path. Password secret material remains in the
+internal `SecretString` wrapper, which zeroizes and redacts under
+`Debug`. `Credentials` is `Clone` only - the `PartialEq`/`Eq` it once
+derived is dropped (a live token source is not `Eq`; nothing compares
+credentials). Unlike SMTP's `Credentials`, IMAP's was never
+serde-derived, so that drop is the whole derive fallout. No
+`From<(String, String)>`.
 
 Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER,
 CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256, and the channel-bound

@@ -29,7 +29,7 @@ struct ClientInner {
     api_base: String,
     api_beta_base: String,
     rate_limit_host: String,
-    token_source: StaticTokenSource,
+    token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
     semaphore: Arc<Semaphore>,
 }
@@ -54,10 +54,32 @@ impl GraphClient {
         api_beta_base: impl Into<String>,
         access_token: impl Into<String>,
     ) -> Self {
+        // Bases are trimmed once in `with_bases_and_source`.
+        let token_source: Arc<dyn TokenSource> =
+            Arc::new(StaticTokenSource::new(access_token, None));
+        Self::with_bases_and_source(api_base, api_beta_base, token_source)
+    }
+
+    // pub: source-accepting constructor. ratatoskr hands in a shared
+    // `Arc<dyn TokenSource>` (typically an `OAuthRefresher` over its own
+    // refresh-token store) so a token it refreshes and persists is read
+    // live at every wire authentication without reopening the client.
+    pub fn with_source(
+        api_base: impl Into<String>,
+        api_beta_base: impl Into<String>,
+        source: Arc<dyn TokenSource>,
+    ) -> Self {
+        Self::with_bases_and_source(api_base, api_beta_base, source)
+    }
+
+    fn with_bases_and_source(
+        api_base: impl Into<String>,
+        api_beta_base: impl Into<String>,
+        token_source: Arc<dyn TokenSource>,
+    ) -> Self {
         let api_base = trim_base(api_base.into());
         let api_beta_base = trim_base(api_beta_base.into());
         let rate_limit_host = host_from_api_base(&api_base);
-        let token_source = StaticTokenSource::new(access_token, None);
         Self {
             inner: Arc::new(ClientInner {
                 net: Some(Net::shared_default()),
@@ -77,7 +99,7 @@ impl GraphClient {
         net: AccountNet,
         api_base: impl Into<String>,
         api_beta_base: impl Into<String>,
-        token_source: StaticTokenSource,
+        token_source: Arc<dyn TokenSource>,
     ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
@@ -95,7 +117,7 @@ impl GraphClient {
 
     pub(crate) fn attach_account(&self, account_id: AccountId) {
         if let Some(net) = self.inner.net.as_ref() {
-            let token_source: Arc<dyn TokenSource> = Arc::new(self.inner.token_source.clone());
+            let token_source = Arc::clone(&self.inner.token_source);
             let account_net = net.attach_account(
                 account_id,
                 AccountSpec {
@@ -155,7 +177,13 @@ impl GraphClient {
 
     #[cfg(test)]
     pub(crate) async fn access_token(&self) -> String {
-        self.inner.token_source.token().as_str().to_string()
+        self.inner
+            .token_source
+            .current()
+            .await
+            .expect("static token source is infallible")
+            .as_str()
+            .to_string()
     }
 
     pub(crate) fn api_path_prefix(&self) -> String {
@@ -174,7 +202,7 @@ impl GraphClient {
                 api_base: self.inner.api_base.clone(),
                 api_beta_base: self.inner.api_beta_base.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
-                token_source: self.inner.token_source.clone(),
+                token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into()),
                 semaphore: Arc::clone(&self.inner.semaphore),
             }),
@@ -476,6 +504,18 @@ mod tests {
     fn derives_beta_base_from_v1_base() {
         let client = GraphClient::with_api_base("https://example.test/v1.0/", "token");
         assert_eq!(client.api_beta_base(), "https://example.test/beta");
+    }
+
+    #[tokio::test]
+    async fn rotated_token_source_is_read() {
+        use bifrost_net::AccessToken;
+
+        let source = StaticTokenSource::new("old-token", None);
+        let client =
+            GraphClient::with_source(GRAPH_API_BASE, GRAPH_API_BETA, Arc::new(source.clone()));
+        assert_eq!(client.access_token().await, "old-token");
+        source.set(AccessToken::new("new-token", None));
+        assert_eq!(client.access_token().await, "new-token");
     }
 
     #[test]

@@ -463,7 +463,7 @@ async fn authenticate(
         }
         CredentialsKind::OAuth2 {
             identity,
-            access_token,
+            token_source,
         } => {
             if !supports_mechanism(&offered, "XOAUTH2") {
                 return Err(Error::AuthPolicy(AuthPolicyFailure::new(
@@ -471,6 +471,13 @@ async fn authenticate(
                     Vec::new(),
                 )));
             }
+            // Read the current token from the shared source at auth time,
+            // mirroring the IMAP connect path, so a rotated token is
+            // presented on every ManageSieve (re)authentication.
+            let access_token = token_source.current().await.map_err(|e| Error::Auth {
+                text: format!("failed to read OAuth access token: {e}"),
+                code: None,
+            })?;
             (
                 AuthMechanism::XOAuth2,
                 format!(

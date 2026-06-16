@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use bifrost_net::{AccessToken, AccountId as NetAccountId, StaticTokenSource};
+use bifrost_net::{AccountId as NetAccountId, StaticTokenSource, TokenSource};
 use reqwest::header;
 
 use crate::{
@@ -25,17 +25,16 @@ use crate::{
 
 const DEFAULT_TIMEOUT_MS: u64 = 10 * 1000;
 
-#[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum Credentials {
     Basic(String),
-    Bearer(StaticTokenSource),
+    Bearer(Arc<dyn TokenSource>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum Authorization {
     Basic(String),
-    Bearer(StaticTokenSource),
+    Bearer(Arc<dyn TokenSource>),
 }
 
 impl Authorization {
@@ -46,35 +45,38 @@ impl Authorization {
         }
     }
 
-    pub(crate) fn header_value(&self) -> String {
+    #[cfg(test)]
+    pub(crate) fn from_credentials_for_test(credentials: Credentials) -> Self {
+        Self::from_credentials(credentials)
+    }
+
+    /// Build the `Authorization` header value. For the bearer case this
+    /// reads `source.current()` so a token rotated on the shared source
+    /// is presented live; only the WebSocket handshake (which builds its
+    /// own header) and the Basic path take this route - the HTTP request
+    /// pipeline injects the bearer through `AccountNet` instead.
+    pub(crate) async fn header_value(&self) -> Result<String, bifrost_net::Error> {
         match self {
-            Self::Basic(value) => format!("Basic {value}"),
-            Self::Bearer(source) => format!("Bearer {}", source.token().as_str()),
+            Self::Basic(value) => Ok(format!("Basic {value}")),
+            Self::Bearer(source) => {
+                let token = source.current().await?;
+                Ok(format!("Bearer {}", token.as_str()))
+            }
         }
     }
 
-    pub(crate) fn account_token_source(&self) -> StaticTokenSource {
+    pub(crate) fn account_token_source(&self) -> Arc<dyn TokenSource> {
         match self {
             // AccountNet requires a token source even when JMAP is
             // using Basic auth. This source is intentionally inert;
             // the request builder disables bearer injection for Basic.
-            Self::Basic(_) => StaticTokenSource::new("", None),
-            Self::Bearer(source) => source.clone(),
+            Self::Basic(_) => Arc::new(StaticTokenSource::new("", None)),
+            Self::Bearer(source) => Arc::clone(source),
         }
     }
 
     pub(crate) fn uses_bearer_pipeline(&self) -> bool {
         matches!(self, Self::Bearer(_))
-    }
-
-    pub(crate) fn set_bearer_token(&self, token: AccessToken) -> bool {
-        match self {
-            Self::Basic(_) => false,
-            Self::Bearer(source) => {
-                source.set(token);
-                true
-            }
-        }
     }
 }
 
@@ -384,9 +386,15 @@ impl<T: HttpTransport> Client<T> {
     }
 
     /// Returns the `Authorization` header value used by this client.
+    /// Async because the bearer case reads the current token from the
+    /// shared source so a rotated token is presented on reconnect.
     #[cfg(feature = "websockets")]
-    pub(crate) fn authorization(&self) -> String {
-        self.inner.authorization.header_value()
+    pub(crate) async fn authorization(&self) -> crate::Result<String> {
+        self.inner
+            .authorization
+            .header_value()
+            .await
+            .map_err(|e| crate::Error::from(crate::core::transport::TransportError::from_net(e)))
     }
 }
 
@@ -397,10 +405,10 @@ impl Credentials {
     }
 
     pub(crate) fn bearer(token: impl Into<String>) -> Self {
-        Credentials::Bearer(StaticTokenSource::new(token, None))
+        Credentials::Bearer(Arc::new(StaticTokenSource::new(token, None)))
     }
 
-    pub(crate) fn bearer_source(source: StaticTokenSource) -> Self {
+    pub(crate) fn bearer_source(source: Arc<dyn TokenSource>) -> Self {
         Credentials::Bearer(source)
     }
 }

@@ -231,11 +231,14 @@ impl Display for Rset {
 }
 
 /// AUTH command
-#[derive(PartialEq, Eq, Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+//
+// No `PartialEq`/`Eq`/`serde` derives: `Credentials` carries a live
+// `Arc<dyn TokenSource>` for OAuth, which is neither comparable nor
+// serializable. The wire bytes flow through `Display` over the
+// precomputed `response`, so these derives were never load-bearing.
+#[derive(Clone)]
 pub(crate) struct Auth {
     mechanism: Mechanism,
-    credentials: Credentials,
     challenge: Option<String>,
     response: Option<String>,
 }
@@ -259,20 +262,24 @@ impl Display for Auth {
 }
 
 impl Auth {
-    /// Creates an AUTH command (from a challenge if provided)
+    /// Creates an AUTH command (from a challenge if provided).
+    ///
+    /// `oauth_token` is the access token resolved by the connection's
+    /// auth driver from the credential's `TokenSource`; `None` for
+    /// password / SCRAM mechanisms.
     pub(crate) fn new(
         mechanism: Mechanism,
         credentials: Credentials,
         challenge: Option<String>,
+        oauth_token: Option<&str>,
     ) -> Result<Auth, Error> {
         let response = if mechanism.supports_initial_response() || challenge.is_some() {
-            Some(mechanism.response(&credentials, challenge.as_deref())?)
+            Some(mechanism.response_with_token(&credentials, challenge.as_deref(), oauth_token)?)
         } else {
             None
         };
         Ok(Auth {
             mechanism,
-            credentials,
             challenge,
             response,
         })
@@ -284,6 +291,7 @@ impl Auth {
         mechanism: Mechanism,
         credentials: Credentials,
         response: &Response,
+        oauth_token: Option<&str>,
     ) -> Result<Auth, Error> {
         if !response.has_code(334) {
             return Err(error::parse("Expecting a challenge"));
@@ -300,11 +308,14 @@ impl Auth {
         #[cfg(feature = "tracing")]
         tracing::debug!("auth decoded challenge: {}", decoded_challenge);
 
-        let response = Some(mechanism.response(&credentials, Some(decoded_challenge.as_ref()))?);
+        let response = Some(mechanism.response_with_token(
+            &credentials,
+            Some(decoded_challenge.as_ref()),
+            oauth_token,
+        )?);
 
         Ok(Auth {
             mechanism,
-            credentials,
             challenge: Some(decoded_challenge),
             response,
         })
@@ -384,14 +395,14 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Plain, credentials.clone(), None).unwrap()
+                Auth::new(Mechanism::Plain, credentials.clone(), None, None).unwrap()
             ),
             "AUTH PLAIN AHVzZXIAcGFzc3dvcmQ=\r\n"
         );
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Login, credentials, None).unwrap()
+                Auth::new(Mechanism::Login, credentials, None, None).unwrap()
             ),
             "AUTH LOGIN\r\n"
         );
@@ -399,14 +410,20 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::Xoauth2, credentials.clone(), None).unwrap()
+                Auth::new(Mechanism::Xoauth2, credentials.clone(), None, Some("token")).unwrap()
             ),
             "AUTH XOAUTH2 dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
         assert_eq!(
             format!(
                 "{}",
-                Auth::new(Mechanism::OAuthBearer, credentials.clone(), None).unwrap()
+                Auth::new(
+                    Mechanism::OAuthBearer,
+                    credentials.clone(),
+                    None,
+                    Some("token")
+                )
+                .unwrap()
             ),
             "AUTH OAUTHBEARER bixhPXVzZXIsAWF1dGg9QmVhcmVyIHRva2VuAQE=\r\n"
         );
@@ -421,8 +438,13 @@ mod test {
         assert_eq!(
             format!(
                 "{}",
-                Auth::new_from_response(Mechanism::OAuthBearer, credentials, &continuation)
-                    .unwrap()
+                Auth::new_from_response(
+                    Mechanism::OAuthBearer,
+                    credentials,
+                    &continuation,
+                    Some("token")
+                )
+                .unwrap()
             ),
             "AQ==\r\n"
         );
@@ -434,7 +456,7 @@ mod test {
         // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which
         // errors for SCRAM) and must emit a bare `AUTH SCRAM-SHA-256`.
         let credentials = Credentials::password("user".to_owned(), "password".to_owned());
-        let auth = Auth::new(Mechanism::ScramSha256, credentials, None).unwrap();
+        let auth = Auth::new(Mechanism::ScramSha256, credentials, None, None).unwrap();
         assert_eq!(format!("{auth}"), "AUTH SCRAM-SHA-256\r\n");
     }
 }

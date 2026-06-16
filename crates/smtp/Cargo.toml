@@ -24,6 +24,7 @@ idna = "1"
 
 bifrost-types = { path = "../types", optional = true }
 bifrost-sasl = { path = "../sasl" }
+bifrost-net = { path = "../net" }
 getrandom = { workspace = true }
 
 tracing = { workspace = true, features = ["std"], optional = true }

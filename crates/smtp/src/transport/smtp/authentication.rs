@@ -1,7 +1,10 @@
 //! Provides limited SASL authentication mechanisms
 
 use std::fmt::{self, Debug, Display, Formatter};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
+use bifrost_net::{StaticTokenSource, TokenSource};
 use bifrost_sasl::{ScramChannelBinding, ScramHash};
 
 use crate::transport::smtp::error::{self, Error, SmtpCommandPhase};
@@ -36,8 +39,14 @@ pub(crate) const OAUTH2_MECHANISMS: &[Mechanism] = &[Mechanism::OAuthBearer, Mec
 pub(crate) const DEFAULT_MECHANISMS: &[Mechanism] = PASSWORD_MECHANISMS;
 
 /// Contains user credentials
-#[derive(PartialEq, Eq, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+//
+// `Credentials` no longer derives `PartialEq`/`Eq` or the `serde`
+// round-trip it used to: the OAuth variant now carries a live
+// `Arc<dyn TokenSource>` instead of a frozen token string, and a token
+// source is neither comparable nor serializable. Rotation material is
+// the consumer's to persist; serializing a credential would freeze a
+// token that is meant to rotate. Password credentials keep `Clone`.
+#[derive(Clone)]
 // pub: users configure password or OAuth bearer SASL credentials.
 pub enum Credentials {
     /// Username and password credentials.
@@ -51,8 +60,10 @@ pub enum Credentials {
     OAuth2 {
         /// Authorization identity, usually the email address being accessed.
         identity: String,
-        /// OAuth 2.0 access token.
-        access_token: Zeroizing<String>,
+        /// Live source of the OAuth 2.0 access token. Read at each wire
+        /// authentication so a token rotated on the shared source is
+        /// presented without reconstructing the credential.
+        token_source: Arc<dyn TokenSource>,
     },
 }
 
@@ -94,15 +105,32 @@ impl Credentials {
         }
     }
 
-    /// Create OAuth 2.0 bearer-token credentials.
+    /// Create OAuth 2.0 bearer-token credentials from a raw token string.
+    /// Convenience wrapper: the token is held in a `StaticTokenSource` so
+    /// existing call sites keep their string ergonomics.
     pub fn oauth2<I, T>(identity: I, access_token: T) -> Credentials
     where
         I: Into<String>,
         T: IntoSecretString,
     {
+        let token = access_token.into_secret_string();
+        Credentials::oauth2_source(
+            identity,
+            Arc::new(StaticTokenSource::new(token.to_string(), None)),
+        )
+    }
+
+    /// Create OAuth 2.0 bearer-token credentials from a shared token
+    /// source. ratatoskr supplies one `Arc<dyn TokenSource>` it also
+    /// drives rotation on, so a refreshed token is read live at every
+    /// SMTP authentication without reconstructing the credential.
+    pub fn oauth2_source<I>(identity: I, token_source: Arc<dyn TokenSource>) -> Credentials
+    where
+        I: Into<String>,
+    {
         Credentials::OAuth2 {
             identity: identity.into(),
-            access_token: access_token.into_secret_string(),
+            token_source,
         }
     }
 
@@ -122,17 +150,86 @@ impl Credentials {
         }
     }
 
-    fn oauth2_parts(&self) -> Result<(&str, &str), Error> {
+    /// Pair the credential's OAuth identity with a token already resolved
+    /// by the connection driver. Rejects password credentials (wrong
+    /// mechanism) and a missing token (driver bug: an OAuth mechanism was
+    /// driven without resolving the token first).
+    fn oauth_identity_and_token<'a>(
+        &'a self,
+        oauth_token: Option<&'a str>,
+    ) -> Result<(&'a str, &'a str), Error> {
         match self {
-            Credentials::OAuth2 {
-                identity,
-                access_token,
-            } => Ok((identity, access_token.as_str())),
+            Credentials::OAuth2 { identity, .. } => {
+                let token = oauth_token.ok_or_else(|| {
+                    error::invalid_input("OAuth mechanism driven without a resolved access token")
+                })?;
+                Ok((identity, token))
+            }
             Credentials::Password { .. } => Err(error::invalid_input(
                 "password credentials cannot be used with OAuth2 authentication mechanisms",
             )),
         }
     }
+
+    /// Resolve the OAuth identity and a freshly read access token from
+    /// the shared source. Used by the async transport, which awaits a
+    /// possible refresh.
+    pub(crate) async fn oauth2_token(&self) -> Result<(String, Zeroizing<String>), Error> {
+        match self {
+            Credentials::OAuth2 {
+                identity,
+                token_source,
+            } => {
+                let token = token_source.current().await.map_err(oauth_token_error)?;
+                Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
+            }
+            Credentials::Password { .. } => Err(error::invalid_input(
+                "password credentials cannot be used with OAuth2 authentication mechanisms",
+            )),
+        }
+    }
+
+    /// Resolve the OAuth identity and current access token without an
+    /// executor, by polling `current()` once. The blocking transport has
+    /// no async context to await a refresh in; a `StaticTokenSource` (and
+    /// an `OAuthRefresher` whose token is already fresh) resolves on the
+    /// first poll. A source that would need a network refresh yields
+    /// `Pending` and is rejected - live refresh requires the async
+    /// transport.
+    pub(crate) fn oauth2_token_blocking(&self) -> Result<(String, Zeroizing<String>), Error> {
+        match self {
+            Credentials::OAuth2 {
+                identity,
+                token_source,
+            } => {
+                let mut future = token_source.current();
+                let waker = Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Ready(Ok(token)) => {
+                        Ok((identity.clone(), Zeroizing::new(token.as_str().to_owned())))
+                    }
+                    Poll::Ready(Err(e)) => Err(oauth_token_error(e)),
+                    Poll::Pending => Err(error::invalid_input(
+                        "OAuth token source requires a network refresh; use the async SMTP transport",
+                    )
+                    .with_phase(SmtpCommandPhase::Auth)),
+                }
+            }
+            Credentials::Password { .. } => Err(error::invalid_input(
+                "password credentials cannot be used with OAuth2 authentication mechanisms",
+            )),
+        }
+    }
+}
+
+/// Map a token-source failure into the SMTP error model as an auth-phase
+/// input fault carrying the source error's message. The `TokenSource`
+/// failure projection (`AuthLost` vs `RefreshFailed`) is the error
+/// model's concern downstream and is not refined here.
+fn oauth_token_error(error: bifrost_net::Error) -> Error {
+    error::invalid_input(format!("failed to read OAuth access token: {error}"))
+        .with_phase(SmtpCommandPhase::Auth)
 }
 
 impl Debug for Credentials {
@@ -218,12 +315,18 @@ impl Mechanism {
         }
     }
 
-    /// Returns the string to send to the server, using the provided username, password and
-    /// challenge in some cases
-    pub fn response(
+    /// Returns the string to send to the server, using the provided
+    /// username, password and challenge in some cases.
+    ///
+    /// `oauth_token` is the access token already resolved from the
+    /// credential's `TokenSource` by the connection's auth driver (which
+    /// has the async/blocking context to read it). It is `None` for
+    /// password mechanisms and ignored by them.
+    pub(crate) fn response_with_token(
         self,
         credentials: &Credentials,
         challenge: Option<&str>,
+        oauth_token: Option<&str>,
     ) -> Result<String, Error> {
         match self {
             Mechanism::ScramSha1
@@ -268,7 +371,8 @@ impl Mechanism {
                     "This mechanism does not expect a challenge",
                 )),
                 None => {
-                    let (identity, access_token) = credentials.oauth2_parts()?;
+                    let (identity, access_token) =
+                        credentials.oauth_identity_and_token(oauth_token)?;
                     // Shared bifrost-sasl builder returns the raw payload as a
                     // zeroizing Secret; the AUTH command base64-frames it. The
                     // Secret drops and zeroizes after this owned copy.
@@ -282,7 +386,8 @@ impl Mechanism {
                 // not payload construction, so it stays in SMTP.
                 Some(_) => Ok("\x01".to_owned()),
                 None => {
-                    let (identity, access_token) = credentials.oauth2_parts()?;
+                    let (identity, access_token) =
+                        credentials.oauth_identity_and_token(oauth_token)?;
                     Ok(bifrost_sasl::oauthbearer_payload(identity, access_token)
                         .as_str()
                         .to_owned())
@@ -608,10 +713,14 @@ mod test {
     #[test]
     fn scram_response_encoder_is_an_error() {
         let credentials = Credentials::password("u".to_owned(), "p".to_owned());
-        assert!(Mechanism::ScramSha256.response(&credentials, None).is_err());
+        assert!(
+            Mechanism::ScramSha256
+                .response_with_token(&credentials, None, None)
+                .is_err()
+        );
         assert!(
             Mechanism::ScramSha256Plus
-                .response(&credentials, Some("anything"))
+                .response_with_token(&credentials, Some("anything"), None)
                 .is_err()
         );
     }
@@ -887,10 +996,16 @@ mod test {
         let credentials = Credentials::password("username".to_owned(), "password".to_owned());
 
         assert_eq!(
-            mechanism.response(&credentials, None).unwrap(),
+            mechanism
+                .response_with_token(&credentials, None, None)
+                .unwrap(),
             "\u{0}username\u{0}password"
         );
-        assert!(mechanism.response(&credentials, Some("test")).is_err());
+        assert!(
+            mechanism
+                .response_with_token(&credentials, Some("test"), None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -900,14 +1015,22 @@ mod test {
         let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
 
         assert_eq!(
-            mechanism.response(&credentials, Some("Username")).unwrap(),
+            mechanism
+                .response_with_token(&credentials, Some("Username"), None)
+                .unwrap(),
             "alice"
         );
         assert_eq!(
-            mechanism.response(&credentials, Some("Password")).unwrap(),
+            mechanism
+                .response_with_token(&credentials, Some("Password"), None)
+                .unwrap(),
             "wonderland"
         );
-        assert!(mechanism.response(&credentials, None).is_err());
+        assert!(
+            mechanism
+                .response_with_token(&credentials, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -917,14 +1040,22 @@ mod test {
         let credentials = Credentials::password("alice".to_owned(), "wonderland".to_owned());
 
         assert_eq!(
-            mechanism.response(&credentials, Some("username")).unwrap(),
+            mechanism
+                .response_with_token(&credentials, Some("username"), None)
+                .unwrap(),
             "alice"
         );
         assert_eq!(
-            mechanism.response(&credentials, Some("password")).unwrap(),
+            mechanism
+                .response_with_token(&credentials, Some("password"), None)
+                .unwrap(),
             "wonderland"
         );
-        assert!(mechanism.response(&credentials, None).is_err());
+        assert!(
+            mechanism
+                .response_with_token(&credentials, None, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -936,11 +1067,18 @@ mod test {
             "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
         );
 
+        let token = "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==";
         assert_eq!(
-            mechanism.response(&credentials, None).unwrap(),
+            mechanism
+                .response_with_token(&credentials, None, Some(token))
+                .unwrap(),
             "user=username\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
-        assert!(mechanism.response(&credentials, Some("test")).is_err());
+        assert!(
+            mechanism
+                .response_with_token(&credentials, Some("test"), Some(token))
+                .is_err()
+        );
     }
 
     #[test]
@@ -952,7 +1090,10 @@ mod test {
             "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==".to_owned(),
         );
 
-        let response = mechanism.response(&credentials, None).unwrap();
+        let token = "vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==";
+        let response = mechanism
+            .response_with_token(&credentials, None, Some(token))
+            .unwrap();
         assert_eq!(
             response,
             "n,a=user@example.com,\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
@@ -960,12 +1101,18 @@ mod test {
         assert!(!response.contains("\x01host="));
         assert!(!response.contains("\x01port="));
         assert_eq!(
-            mechanism.response(&credentials, Some("{}")).unwrap(),
+            mechanism
+                .response_with_token(&credentials, Some("{}"), Some(token))
+                .unwrap(),
             "\x01"
         );
         assert_eq!(
             mechanism
-                .response(&credentials, Some(r#"{"status":"invalid_token"}"#))
+                .response_with_token(
+                    &credentials,
+                    Some(r#"{"status":"invalid_token"}"#),
+                    Some(token)
+                )
                 .unwrap(),
             "\x01"
         );
@@ -977,7 +1124,9 @@ mod test {
         let credentials = Credentials::oauth2("a,b=c".to_owned(), "token".to_owned());
 
         assert_eq!(
-            mechanism.response(&credentials, None).unwrap(),
+            mechanism
+                .response_with_token(&credentials, None, Some("token"))
+                .unwrap(),
             "n,a=a=2Cb=3Dc,\x01auth=Bearer token\x01\x01"
         );
     }
@@ -986,16 +1135,18 @@ mod test {
     fn test_rejects_wrong_credential_kind() {
         assert!(
             Mechanism::Plain
-                .response(
+                .response_with_token(
                     &Credentials::oauth2("alice".to_owned(), "token".to_owned()),
-                    None
+                    None,
+                    Some("token"),
                 )
                 .is_err()
         );
         assert!(
             Mechanism::Xoauth2
-                .response(
+                .response_with_token(
                     &Credentials::password("alice".to_owned(), "wonderland".to_owned()),
+                    None,
                     None,
                 )
                 .is_err()
@@ -1009,9 +1160,43 @@ mod test {
             Zeroizing::new("access-token".to_owned()),
         );
 
+        // The token threads through the source convenience constructor and
+        // is read back by the blocking resolver.
+        let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
         assert_eq!(
-            Mechanism::Xoauth2.response(&credentials, None).unwrap(),
+            Mechanism::Xoauth2
+                .response_with_token(&credentials, None, Some(token.as_str()))
+                .unwrap(),
             "user=alice\x01auth=Bearer access-token\x01\x01"
         );
+    }
+
+    #[tokio::test]
+    async fn oauth2_payload_reads_current_token() {
+        use bifrost_net::{AccessToken, StaticTokenSource};
+        use std::sync::Arc;
+
+        let source = StaticTokenSource::new("old-token", None);
+        let credentials = Credentials::oauth2_source("user@example.com", Arc::new(source.clone()));
+
+        // The SASL payload is built from the token the source currently
+        // holds, both through the async read and the blocking read.
+        let (_identity, token) = credentials.oauth2_token().await.unwrap();
+        let payload = Mechanism::OAuthBearer
+            .response_with_token(&credentials, None, Some(token.as_str()))
+            .unwrap();
+        assert!(payload.contains("auth=Bearer old-token"), "got: {payload}");
+
+        // Rotate the token on the shared source; the next read presents the
+        // new token with no reconstruction of the credential.
+        source.set(AccessToken::new("new-token", None));
+        let (_identity, token) = credentials.oauth2_token().await.unwrap();
+        let payload = Mechanism::Xoauth2
+            .response_with_token(&credentials, None, Some(token.as_str()))
+            .unwrap();
+        assert!(payload.contains("auth=Bearer new-token"), "got: {payload}");
+
+        let (_identity, token) = credentials.oauth2_token_blocking().unwrap();
+        assert_eq!(token.as_str(), "new-token");
     }
 }
