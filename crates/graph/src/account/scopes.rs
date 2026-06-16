@@ -2,11 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountError, AccountOperation, Batch, Checkpoint, CursorScope, FolderId, MembershipScope,
-    ObjectType, PageBoundary, ScopeLifecycle, SyncEvent,
+    AccessErrorKind, AccountError, AccountErrorKind, AccountOperation, Batch, Checkpoint,
+    CursorScope, FolderId, MembershipScope, ObjectType, PageBoundary, ScopeLifecycle, SyncEvent,
+    Warning, WarningKind,
 };
 
 use super::GraphAccount;
+use super::foreign::{encode_foreign, owner_tag, parse_folder};
 use super::graph_error::{GraphErrorContext, into_account_error};
 
 #[derive(Debug, Default, Clone)]
@@ -45,12 +47,13 @@ pub(crate) async fn discover_cursor_scope_events(
     account: GraphAccount,
 ) -> Vec<SyncEvent<CursorScope>> {
     match discover_cursor_scopes_inner(&account).await {
-        Ok(scopes) => {
+        Ok((scopes, warnings)) => {
             account.cursor_index.write().await.replace(scopes.clone());
-            vec![
-                batch(scopes, Some(PageBoundary::Final)),
-                SyncEvent::Done(None),
-            ]
+            let mut events: Vec<SyncEvent<CursorScope>> =
+                warnings.into_iter().map(SyncEvent::Warning).collect();
+            events.push(batch(scopes, Some(PageBoundary::Final)));
+            events.push(SyncEvent::Done(None));
+            events
         }
         Err(error) => vec![SyncEvent::Terminated(error), SyncEvent::Done(None)],
     }
@@ -89,7 +92,9 @@ pub(crate) fn batch<T>(items: Vec<T>, page_boundary: Option<PageBoundary>) -> Sy
 
 async fn discover_cursor_scopes_inner(
     account: &GraphAccount,
-) -> Result<Vec<CursorScope>, AccountError> {
+) -> Result<(Vec<CursorScope>, Vec<Warning>), AccountError> {
+    // Primary mailbox: a list failure here is account-fatal (the whole
+    // account cannot be discovered), so propagate it.
     let mail_folders = account
         .client
         .list_mail_folders_recursive()
@@ -114,7 +119,43 @@ async fn discover_cursor_scopes_inner(
         });
     }
 
-    Ok(scopes)
+    // Foreign (shared/delegate) mailboxes: each is independent. A
+    // per-mailbox permission denial means that shared mailbox is no
+    // longer accessible - skip it with a scoped Warning rather than
+    // failing the whole discovery (the primary and other shared
+    // mailboxes still sync).
+    let mut warnings = Vec::new();
+    for (mailbox, client) in account.shared_clients.iter() {
+        match client.list_mail_folders_recursive().await {
+            Ok(folders) => {
+                for folder in folders {
+                    scopes.push(CursorScope::FolderType {
+                        folder: encode_foreign(mailbox, &folder.id),
+                        ty: ObjectType::Email,
+                    });
+                }
+            }
+            Err(error) => {
+                let account_error = into_account_error(
+                    error,
+                    GraphErrorContext::graph(AccountOperation::DiscoverMemberships),
+                );
+                if matches!(
+                    account_error.kind(),
+                    AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+                ) {
+                    warnings.push(Warning::support_only(
+                        WarningKind::OperatorAttentionNeeded,
+                        format!("shared mailbox {mailbox} skipped: access denied during discovery"),
+                    ));
+                } else {
+                    return Err(account_error);
+                }
+            }
+        }
+    }
+
+    Ok((scopes, warnings))
 }
 
 async fn discover_memberships_inner(
@@ -123,7 +164,7 @@ async fn discover_memberships_inner(
     let scopes = {
         let cached = account.cursor_index.read().await.scopes();
         if cached.is_empty() {
-            discover_cursor_scopes_inner(account).await?
+            discover_cursor_scopes_inner(account).await?.0
         } else {
             cached
         }
@@ -134,6 +175,13 @@ async fn discover_memberships_inner(
         if let CursorScope::FolderType { folder, .. } = scope
             && seen.insert(folder.clone())
         {
+            // A foreign folder also contributes its owner tag (the
+            // shared-mailbox identity), which the engine's covering
+            // rule cannot form because the folder-id and mailbox-id
+            // strings differ.
+            if let Some(foreign) = parse_folder(&folder).foreign() {
+                memberships.push(owner_tag(&foreign.mailbox));
+            }
             memberships.push(MembershipScope::Folder(folder));
         }
     }
@@ -142,9 +190,61 @@ async fn discover_memberships_inner(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::FolderId;
+    use bifrost_types::{FolderId, MailboxId};
 
+    use super::super::PushMode;
     use super::*;
+    use crate::client::GraphClient;
+
+    #[tokio::test]
+    async fn discover_emits_foreign_owner_membership() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        // Seed the cursor index directly so the membership pass does not
+        // hit the network: one primary folder, one foreign folder.
+        let primary = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let foreign = CursorScope::FolderType {
+            folder: encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        account
+            .cursor_index
+            .write()
+            .await
+            .replace(vec![primary.clone(), foreign.clone()]);
+
+        let memberships = discover_memberships_inner(&account)
+            .await
+            .expect("membership discovery succeeds");
+
+        // The foreign folder contributes its owner tag (the shared
+        // mailbox identity) in addition to its folder membership.
+        assert!(memberships.contains(&MembershipScope::Mailbox(MailboxId(
+            "shared@contoso.com".to_string()
+        ))));
+        assert!(
+            memberships.contains(&MembershipScope::Folder(encode_foreign(
+                "shared@contoso.com",
+                "AAMk"
+            )))
+        );
+        // The primary folder contributes only its folder membership - no
+        // owner tag.
+        assert!(memberships.contains(&MembershipScope::Folder(FolderId("inbox".to_string()))));
+        assert_eq!(
+            memberships
+                .iter()
+                .filter(|m| matches!(m, MembershipScope::Mailbox(_)))
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn scope_batch_has_final_boundary() {

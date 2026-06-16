@@ -13,7 +13,7 @@ use super::GraphAccount;
 use super::cursor::{
     GraphCursorPayload, GraphPageMarker, encode_cursor, kind_for_scope, scope_for_kind,
 };
-use super::graph_error::{GraphErrorContext, cursor_error_to_account_error, into_account_error};
+use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
 
 const EVENT_SELECT: &str = "\
 id,subject,bodyPreview,start,end,isAllDay,location,organizer,\
@@ -36,6 +36,12 @@ pub(crate) fn inventory_stream(
                 return;
             }
         };
+        // A foreign (shared) scope tags every inventory item with its
+        // owning mailbox so the consumer maps the item to its shared
+        // owner and the foreign mailbox's native folder ids cannot be
+        // conflated with the primary's in the membership index (the
+        // A5c-established owner-tag pattern). `None` for a primary scope.
+        let owner = account.owner_of_scope(&scope);
         let kind = match kind_for_scope(&scope) {
             Ok(kind) => kind,
             Err(error) => {
@@ -53,7 +59,16 @@ pub(crate) fn inventory_stream(
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncInventory)
                         .with_scope(ErrorScope::Cursor(scope.clone()));
-                    yield SyncEvent::Terminated(into_account_error(error, ctx));
+                    // A permission denial on a foreign (shared) scope
+                    // quarantines just this scope; a primary-scope
+                    // denial stays terminal account-wide.
+                    let owner = account.owner_of_scope(&scope);
+                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                        error,
+                        &scope,
+                        owner.as_ref(),
+                        ctx,
+                    ));
                     yield SyncEvent::Done(None);
                     return;
                 }
@@ -64,9 +79,14 @@ pub(crate) fn inventory_stream(
                 if is_removed(&value) {
                     continue;
                 }
-                if let Some(entry) = inventory_entry_from_value(&scope, &value) {
+                if let Some(mut entry) = inventory_entry_from_value(&scope, &value) {
                     if let ServerVersion::ETag(etag) = &entry.fingerprint.server_version {
                         etags.push((entry.id.0.clone(), etag.clone()));
+                    }
+                    if let Some(owner) = &owner {
+                        entry
+                            .memberships
+                            .push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
                     }
                     entries.push(entry);
                 }
@@ -205,10 +225,15 @@ pub(crate) fn initial_delta_url(
     account: &GraphAccount,
     scope: &CursorScope,
 ) -> Result<String, super::cursor::CursorError> {
-    let prefix = account.client.api_path_prefix();
+    // Route the prefix through the scope's owning client (primary or a
+    // shared mailbox) and use the *native* folder id in the path - the
+    // foreign-mailbox prefix lives in the URL's `/users/{id}` segment,
+    // not in the `/mailFolders/{id}` segment.
+    let prefix = account.client_for_scope(scope).api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => {
-            let encoded = bifrost_net::url::encode_component(&folder.0);
+            let native = super::foreign::parse_folder(folder).native_id().to_string();
+            let encoded = bifrost_net::url::encode_component(&native);
             match ty {
                 ObjectType::Email => Ok(format!(
                     "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"
@@ -349,6 +374,64 @@ mod tests {
         };
         let url = initial_delta_url(&account, &scope).expect("email scope is supported");
         assert!(url.starts_with("/me/mailFolders/inbox/messages/delta?"));
+    }
+
+    #[test]
+    fn client_for_scope_routes_foreign_prefix() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let foreign_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        let primary_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        // The foreign scope routes through the shared client, whose
+        // prefix targets `/users/{mailbox}`.
+        assert_eq!(
+            account.client_for_scope(&foreign_scope).api_path_prefix(),
+            "/users/shared%40contoso.com"
+        );
+        // The primary scope - and any unconfigured foreign mailbox -
+        // stays on `/me`.
+        assert_eq!(
+            account.client_for_scope(&primary_scope).api_path_prefix(),
+            "/me"
+        );
+        let unconfigured = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("other@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        assert_eq!(
+            account.client_for_scope(&unconfigured).api_path_prefix(),
+            "/me"
+        );
+    }
+
+    #[test]
+    fn initial_delta_url_uses_shared_mailbox_prefix() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        let url = initial_delta_url(&account, &scope).expect("foreign email scope is supported");
+        // The mailbox rides in the `/users/{id}` segment; the native
+        // folder id (the foreign prefix stripped) rides in
+        // `/mailFolders/{id}`.
+        assert!(
+            url.starts_with("/users/shared%40contoso.com/mailFolders/AAMk/messages/delta?"),
+            "unexpected url: {url}"
+        );
     }
 
     #[test]

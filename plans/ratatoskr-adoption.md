@@ -163,16 +163,33 @@ at spec time.
 - Depends on: A2 (send surface settled).
 - TODO: none.
 
-### A5 - Shared mailboxes plus public folders - OPEN (A5c LANDED, A5a/A5b remain)
+### A5 - Shared mailboxes plus public folders - OPEN (A5c + A5a LANDED, A5b remains)
 
 - Intent: first-class bifrost scopes - Graph (EWS / Autodiscover) and IMAP
   (NAMESPACE / ACL) - surfaced through `discover_cursor_scopes` /
   `discover_memberships` and fully sync-integrated, not CRUD-only.
-- A5 split into three sub-bricks; **A5c is the first and is LANDED**, A5a and
-  A5b remain OPEN (so A5 overall is OPEN):
+- A5 split into three sub-bricks; **A5c and A5a are LANDED**, A5b remains OPEN
+  (so A5 overall is OPEN):
   - **A5c (IMAP NAMESPACE/ACL shared folders) - LANDED.** See below.
-  - **A5a (Graph delegate mailboxes + JMAP shared accounts) - OPEN.** Foreign
-    `accountId` / `for_shared_mailbox`, different routing (`api_path_prefix`).
+  - **A5a (Graph delegate mailboxes + JMAP shared accounts) - LANDED.** Graph
+    config-supplied foreign mailboxes (`with_shared_mailbox`, per-mailbox
+    `for_shared_mailbox` clients selected by `client_for_scope`); JMAP
+    session-auto-discovered non-personal accounts (`foreign_mail`,
+    `mail_for_scope`). Both surface as cursor-resident scopes (Graph
+    `FolderType` namespaced via a per-crate `foreign.rs` codec, JMAP
+    `Folder { account_id, mailbox_id }` with an additive `SCOPE_TAG_FOLDER`
+    envelope variant), emit `MembershipScope::Mailbox(owner)` tags, and
+    quarantine a foreign-scope permission denial through `graph_scope_revoked`
+    / `jmap_scope_revoked` -> `ScopeRevoked` -> `DisableScope` while a primary
+    denial stays terminal. Implementation lives in git history (the A5a landing
+    commit) and the reference docs; the spec was retired at landing. Deliberate
+    A5a-scoped-out follow-ups: **foreign-account mutations** (the JMAP
+    per-accountId state store is shaped for `ifInState` but the mutation path is
+    unwired) and **live foreign-mailbox lifecycle** (discovery is seeded once at
+    open; Graph is config-seeded at construction, JMAP's `scope_lifecycle`
+    worker polls only the primary, so a foreign mailbox added after open appears
+    at the next reopen). Graph delegate auto-discovery (EWS `GetDelegate` /
+    Autodiscover) is A5b; shared-mailbox send-as is C-3.
   - **A5b (Graph EWS public folders + Autodiscover) - OPEN.** The size-L
     unknown: no-delta-token poll strategy, FindFolder/FindItem.
 - Settled model (decided during A5c; A5a/A5b inherit it): a shared mailbox is
@@ -305,8 +322,8 @@ at spec time.
   - **GAL / A-2** - the org directory-search primitive is split out into its own
     sibling brick (A9 below). It is a new primitive with two substantial,
     asymmetric provider backends, not a flag; it does not ride A8.
-  - **C-3** - Graph shared-mailbox send / send-as identity. Waits on A5 (which
-    has not landed); the port-map ties C-3 to A5.
+  - **C-3** - Graph shared-mailbox send / send-as identity. Gated on A5a's
+    foreign-mailbox routing (now landed); the send-as leg itself is still open.
   - **A-6** - Gmail `CATEGORY_*` bundling priority. POLICY: the ML categories are
     surfaced uniformly already; the bundling heuristic stays a ratatoskr consumer
     decision. No bifrost surface change.
@@ -342,8 +359,8 @@ A1 is the literal first task - it gates everything. Then:
 
 - A2 needs A1; A4 needs A2.
 - A3 and A6 land after A1; otherwise independent.
-- A5 is survey-first and the biggest unknown; start its survey early so its
-  size is known before the schedule firms up.
+- A5 is survey-first and the biggest unknown; A5c (IMAP) and A5a (Graph delegate
+  + JMAP shared) have landed, leaving only A5b (EWS public folders, size L).
 - A7 is independent.
 - A8's known warts are independent; its first independent slice has landed
   (importance, MDN, `remove_from_container` polish, draft-update confirm,

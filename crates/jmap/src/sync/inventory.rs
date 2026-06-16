@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountStream, Batch, BlobId, CursorScope, Fingerprint, InventoryEntry, InventoryPartition,
-    MembershipScope, ObjectId, ObjectType, PageBoundary, ServerVersion, SyncEvent, ThreadId,
+    MailboxId as TypesMailboxId, MembershipScope, ObjectId, ObjectType, PageBoundary,
+    ServerVersion, SyncEvent, ThreadId,
 };
 
 use crate::core::query;
@@ -18,10 +19,26 @@ pub(crate) fn stream(
     mail: MailAccount,
     limits: CoreLimits,
     scope: CursorScope,
+    owner: Option<TypesMailboxId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match scope {
         CursorScope::Type(ObjectType::Email) => email_inventory(mail, limits),
         CursorScope::Type(ObjectType::Mailbox) => mailbox_inventory(mail),
+        // A foreign (shared/delegate) account mailbox: page its emails
+        // via `Email/query` filtered on the native mailbox id, hydrating
+        // inventory entries against the foreign account.
+        CursorScope::Folder(ref folder) => match super::foreign::parse_foreign(folder) {
+            Some(parsed) => {
+                foreign_email_inventory(mail, limits, scope.clone(), parsed.mailbox_id, owner)
+            }
+            None => Box::pin(async_stream::stream! {
+                yield super::error::terminated_unsupported(
+                    bifrost_types::AccountOperation::SyncInventory,
+                    Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                    "JMAP folder scope is not a foreign-mailbox scope",
+                );
+            }),
+        },
         CursorScope::Type(ObjectType::Thread) => Box::pin(async_stream::stream! {
                 yield super::error::terminated_unsupported(
                     bifrost_types::AccountOperation::SyncInventory,
@@ -51,9 +68,10 @@ pub(crate) fn stream_partition(
     limits: CoreLimits,
     scope: CursorScope,
     partition: InventoryPartition,
+    owner: Option<TypesMailboxId>,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
     match partition {
-        InventoryPartition::Full => stream(mail, limits, scope),
+        InventoryPartition::Full => stream(mail, limits, scope, owner),
         InventoryPartition::Page { from, to }
             if matches!(scope, CursorScope::Type(ObjectType::Email)) =>
         {
@@ -67,6 +85,132 @@ pub(crate) fn stream_partition(
             );
         }),
     }
+}
+
+fn foreign_email_inventory(
+    mail: MailAccount,
+    limits: CoreLimits,
+    scope: CursorScope,
+    mailbox_id: String,
+    owner: Option<TypesMailboxId>,
+) -> AccountStream<SyncEvent<InventoryEntry>> {
+    Box::pin(async_stream::stream! {
+        let limit = limits.max_objects_in_get.max(1);
+        let mut position: i32 = 0;
+
+        loop {
+            let started = Instant::now();
+            let query_response = mail
+                .call(
+                    EmailQuery::new()
+                        .filter(crate::email::query::Filter::in_mailbox(mailbox_id.clone()))
+                        .sort([query::Comparator::new(crate::email::query::Comparator::ReceivedAt).descending()])
+                        .position(position)
+                        .limit(limit),
+                )
+                .await;
+
+            let query_response = match query_response {
+                Ok(response) => response,
+                Err(err) => {
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        owner.as_ref(),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
+                        ),
+                    ));
+                    break;
+                }
+            };
+
+            let ids = query_response.ids().to_vec();
+            if ids.is_empty() {
+                yield SyncEvent::Done(None);
+                break;
+            }
+
+            let get_response = mail
+                .call(EmailGet::new().ids(ids.clone()).properties(inventory_properties()))
+                .await;
+
+            let get_response = match get_response {
+                Ok(response) => response,
+                Err(err) => {
+                    yield super::error::terminated(super::error::shared_scope_error(
+                        err,
+                        &scope,
+                        owner.as_ref(),
+                        super::error::JmapErrorContext::cursor(
+                            bifrost_types::AccountOperation::SyncInventory,
+                            scope.clone(),
+                        ),
+                    ));
+                    break;
+                }
+            };
+
+            let state = get_response.state().to_string();
+            let mut items = Vec::new();
+            for email in get_response.into_list() {
+                let mut entry = email_to_inventory(email, &state);
+                // Each foreign (shared/delegate) inventory item carries
+                // its owning account's `Mailbox(accountId)` membership in
+                // addition to its native mailbox memberships, so the
+                // consumer maps the item to its shared-account owner and
+                // the foreign account's native mailbox ids cannot be
+                // conflated with the primary's in the membership index
+                // (the A5c-established owner-tag pattern).
+                if let Some(owner) = &owner {
+                    entry
+                        .memberships
+                        .push(MembershipScope::Mailbox(owner.clone()));
+                }
+                items.push(entry);
+            }
+
+            let batch_len = items.len();
+            if batch_len != 0 {
+                yield SyncEvent::Batch(Batch {
+                    items,
+                    page_boundary: PageBoundary::Page,
+                    server_latency: started.elapsed(),
+                    bytes_in: 0,
+                    checkpoint: None,
+                });
+            }
+
+            if batch_len < limit {
+                yield SyncEvent::Done(None);
+                break;
+            }
+
+            let advance = match i32::try_from(batch_len) {
+                Ok(value) => value,
+                Err(_) => {
+                    yield super::error::terminated_contract_violation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                        "JMAP foreign inventory page was too large to advance an i32 position",
+                    );
+                    break;
+                }
+            };
+            position = match position.checked_add(advance) {
+                Some(next) => next,
+                None => {
+                    yield super::error::terminated_contract_violation(
+                        bifrost_types::AccountOperation::SyncInventory,
+                        Some(bifrost_types::ErrorScope::Cursor(scope.clone())),
+                        "JMAP foreign inventory position overflowed",
+                    );
+                    break;
+                }
+            };
+        }
+    })
 }
 
 fn email_inventory(

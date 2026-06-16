@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -7,31 +6,40 @@ use bifrost_types::{
     SyncEvent,
 };
 use futures::StreamExt;
-use tokio::sync::Mutex;
 
 use crate::email::{EmailGet, EmailId, EmailPatch, EmailSet};
 use crate::mailbox::MailboxId;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
+use super::state_cache::{self, StateMap};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
 pub(crate) fn set_flags(
     mail: MailAccount,
     limits: CoreLimits,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(mail, limits, email_state, targets, MutationKind::Flags(op))
+    mutation_stream(
+        mail,
+        limits,
+        email_states,
+        account_id,
+        targets,
+        MutationKind::Flags(op),
+    )
 }
 
 pub(crate) fn move_to(
     mail: MailAccount,
     limits: CoreLimits,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
@@ -48,17 +56,25 @@ pub(crate) fn move_to(
             });
         }
     };
-    mutation_stream(mail, limits, email_state, targets, kind)
+    mutation_stream(mail, limits, email_states, account_id, targets, kind)
 }
 
 pub(crate) fn destroy(
     mail: MailAccount,
     limits: CoreLimits,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     targets: AccountStream<ObjectId>,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(mail, limits, email_state, targets, MutationKind::Destroy)
+    mutation_stream(
+        mail,
+        limits,
+        email_states,
+        account_id,
+        targets,
+        MutationKind::Destroy,
+    )
 }
 
 enum MutationKind {
@@ -78,7 +94,8 @@ fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
 fn mutation_stream(
     mail: MailAccount,
     limits: CoreLimits,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
@@ -88,7 +105,7 @@ fn mutation_stream(
         while let Some(target) = targets.next().await {
             batch.push(target);
             if batch.len() >= batch_size {
-                match apply_batch(&mail, &email_state, &kind, &mut batch).await {
+                match apply_batch(&mail, &email_states, &account_id, &kind, &mut batch).await {
                     Ok(Some(out)) => yield SyncEvent::Batch(out),
                     Ok(None) => {}
                     Err(err) => {
@@ -103,7 +120,7 @@ fn mutation_stream(
         }
 
         if !batch.is_empty() {
-            match apply_batch(&mail, &email_state, &kind, &mut batch).await {
+            match apply_batch(&mail, &email_states, &account_id, &kind, &mut batch).await {
                 Ok(Some(out)) => yield SyncEvent::Batch(out),
                 Ok(None) => {}
                 Err(err) => {
@@ -122,12 +139,13 @@ fn mutation_stream(
 
 async fn apply_batch(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
     let started = Instant::now();
-    let mut state = current_or_probe_state(mail, email_state).await?;
+    let mut state = current_or_probe_state(mail, email_states, account_id).await?;
     let ids = std::mem::take(batch);
     if ids.is_empty() {
         return Ok(None);
@@ -140,7 +158,7 @@ async fn apply_batch(
                 return Err(err);
             }
             let fresh = probe_email_state(mail).await?;
-            set_email_state(email_state, fresh.clone()).await;
+            state_cache::set(email_states, account_id, fresh.clone()).await;
             state = fresh;
             send_set(mail, &state, &ids, kind).await?
         }
@@ -148,7 +166,7 @@ async fn apply_batch(
 
     let new_state = response.new_state().to_string();
     if !new_state.is_empty() {
-        advance_email_state(email_state, Some(&state), new_state).await;
+        state_cache::advance(email_states, account_id, Some(&state), new_state).await;
     }
 
     let operation = operation_for_kind(kind);
@@ -254,27 +272,19 @@ fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) {
 
 async fn current_or_probe_state(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
 ) -> crate::Result<String> {
-    let cached = {
-        let guard = email_state.lock().await;
-        guard.clone()
-    };
-
-    match cached {
-        Some(state) => Ok(state),
-        None => {
-            let state = probe_email_state(mail).await?;
-            let mut guard = email_state.lock().await;
-            match guard.clone() {
-                Some(existing) => Ok(existing),
-                None => {
-                    *guard = Some(state.clone());
-                    Ok(state)
-                }
-            }
-        }
+    if let Some(state) = state_cache::get(email_states, account_id).await {
+        return Ok(state);
     }
+    let state = probe_email_state(mail).await?;
+    // Re-check under the lock: another task may have probed concurrently.
+    if let Some(existing) = state_cache::get(email_states, account_id).await {
+        return Ok(existing);
+    }
+    state_cache::set(email_states, account_id, state.clone()).await;
+    Ok(state)
 }
 
 pub(crate) async fn probe_email_state(mail: &MailAccount) -> crate::Result<String> {
@@ -282,21 +292,4 @@ pub(crate) async fn probe_email_state(mail: &MailAccount) -> crate::Result<Strin
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?
         .into_state())
-}
-
-async fn set_email_state(email_state: &Arc<Mutex<Option<String>>>, state: String) {
-    let mut guard = email_state.lock().await;
-    *guard = Some(state);
-}
-
-async fn advance_email_state(
-    email_state: &Arc<Mutex<Option<String>>>,
-    expected: Option<&str>,
-    state: String,
-) {
-    let mut guard = email_state.lock().await;
-    match (guard.as_deref(), expected) {
-        (Some(current), Some(expected)) if current != expected => {}
-        _ => *guard = Some(state),
-    }
 }

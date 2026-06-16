@@ -524,6 +524,62 @@ fn set_error_type_to_jmap_method(error_type: SetErrorType) -> Option<JmapMethod>
     }
 }
 
+/// Build a `SyncState(ScopeRevoked)` error scoped to one foreign
+/// (shared/delegate) account mailbox's `Folder` scope. With the scope
+/// attached, the central `derive` resolves it to
+/// `Engine(DisableScope(scope))` - the engine quarantines just that
+/// cursor scope without escalating account-wide. The owning account
+/// rides as support-only diagnostic text for telemetry.
+#[must_use]
+pub(crate) fn jmap_scope_revoked(
+    scope: CursorScope,
+    owner: &bifrost_types::MailboxId,
+    operation: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+        Cause::State(StateCause::ScopeRevoked),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .scope(ErrorScope::Cursor(scope))
+    .text(DiagnosticText::support_only(format!(
+        "shared account access revoked (owner {})",
+        owner.0,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Map a per-scope failure for a foreign (shared/delegate) account
+/// mailbox. When the scope belongs to a shared account (`owner.is_some()`)
+/// and the failure classifies as permission-denied (the class that would
+/// otherwise derive terminal `NoPermission` - JMAP `forbidden`),
+/// quarantine just this foreign scope via `ScopeRevoked` instead of
+/// escalating account-wide. A primary scope (`owner == None`), or any
+/// non-permission failure, flows through the unchanged `into_account_error`
+/// path - a primary-account permission loss is a genuine account-level
+/// signal.
+#[must_use]
+pub(crate) fn shared_scope_error(
+    err: crate::Error,
+    scope: &CursorScope,
+    owner: Option<&bifrost_types::MailboxId>,
+    ctx: JmapErrorContext,
+) -> AccountError {
+    if let Some(owner) = owner {
+        let account_error = into_account_error(err, ctx.clone());
+        if matches!(
+            account_error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ) {
+            return jmap_scope_revoked(scope.clone(), owner, ctx.operation);
+        }
+        return account_error;
+    }
+    into_account_error(err, ctx)
+}
+
 // ---- internal helpers --------------------------------------------------
 
 fn build(kind: AccountErrorKind, primary: Cause, ctx: &JmapErrorContext) -> AccountErrorBuilder {
@@ -1131,6 +1187,47 @@ mod tests {
         let err = into_account_error(
             method_error("forbidden"),
             JmapErrorContext::new(AccountOperation::UpdateFlags),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        );
+        assert!(err.recovery().is_terminal());
+        assert!(matches!(err.recovery(), RecoveryClass::NoPermission { .. }));
+    }
+
+    #[test]
+    fn shared_account_permission_loss_derives_disable_scope() {
+        use bifrost_types::{EngineDirective, MailboxId};
+        let scope = CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-3"));
+        let owner = MailboxId("acct-9".to_string());
+        let err = shared_scope_error(
+            method_error("forbidden"),
+            &scope,
+            Some(&owner),
+            JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        );
+        assert_eq!(
+            *err.recovery(),
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
+        );
+        assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    #[test]
+    fn primary_account_permission_loss_stays_terminal() {
+        // A primary scope passes no owner: the same `forbidden` stays
+        // terminal `NoPermission`, not quarantine.
+        let scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+        let err = shared_scope_error(
+            method_error("forbidden"),
+            &scope,
+            None,
+            JmapErrorContext::cursor(AccountOperation::SyncChanges, scope.clone()),
         );
         assert_eq!(
             err.kind(),

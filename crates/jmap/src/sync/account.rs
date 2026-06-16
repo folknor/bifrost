@@ -23,9 +23,10 @@ use crate::client::Client;
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
+use super::state_cache::StateMap;
 use super::{
-    blob, calendar_ops, changes, contacts, discover, filters, hydrate, inventory, mutation, pim,
-    push, state,
+    blob, calendar_ops, changes, contacts, discover, filters, foreign, hydrate, inventory,
+    mutation, pim, push, state,
 };
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
@@ -33,6 +34,11 @@ type MailAccount = crate::account::Account<ReqwestTransport>;
 pub(crate) struct JmapAccount {
     pub(crate) client: Client,
     pub(crate) mail: MailAccount,
+    /// Foreign (shared/delegate) mail accounts, keyed by JMAP
+    /// `accountId`. Enumerated at `open` from the session's non-personal
+    /// accounts that advertise the mail capability. A foreign `Folder`
+    /// scope routes here via `mail_for_scope`.
+    pub(crate) foreign_mail: Arc<HashMap<String, MailAccount>>,
     pub(crate) submission: Option<MailAccount>,
     /// `urn:ietf:params:jmap:submission` `maxDelayedSend` (seconds);
     /// `0` when the server advertises no scheduled-send window. Read by
@@ -52,9 +58,13 @@ pub(crate) struct JmapAccount {
     pub(crate) shutdown: CancellationToken,
     pub(crate) closed: AtomicBool,
     pub(crate) subscription_seq: AtomicU64,
-    pub(crate) email_state: Arc<Mutex<Option<String>>>,
-    pub(crate) mailbox_state: Arc<Mutex<Option<String>>>,
-    pub(crate) thread_state: Arc<Mutex<Option<String>>>,
+    /// Per-`accountId` `Email/changes` state cache (the mutation
+    /// `ifInState` cache and changes side-cache). Keyed by accountId so
+    /// the primary and each foreign account hold distinct state - a
+    /// single `Option<String>` would clobber one with the other.
+    pub(crate) email_states: StateMap,
+    pub(crate) mailbox_states: StateMap,
+    pub(crate) thread_states: StateMap,
     pub(crate) mailbox_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -63,6 +73,7 @@ impl JmapAccount {
     pub(crate) fn new(
         client: Client,
         mail: MailAccount,
+        foreign_mail: HashMap<String, MailAccount>,
         submission: Option<MailAccount>,
         max_delayed_send: usize,
         vacation: Option<MailAccount>,
@@ -76,14 +87,15 @@ impl JmapAccount {
         seed_states: HashMap<CursorScope, bifrost_types::OpaqueChangeState>,
         ws: push::WsState,
         shutdown: CancellationToken,
-        email_state: Option<String>,
-        mailbox_state: Option<String>,
-        thread_state: Option<String>,
+        email_states: HashMap<String, Option<String>>,
+        mailbox_states: HashMap<String, Option<String>>,
+        thread_states: HashMap<String, Option<String>>,
         mailbox_names: HashMap<String, String>,
     ) -> Self {
         Self {
             client,
             mail,
+            foreign_mail: Arc::new(foreign_mail),
             submission,
             max_delayed_send,
             vacation,
@@ -100,11 +112,40 @@ impl JmapAccount {
             shutdown,
             closed: AtomicBool::new(false),
             subscription_seq: AtomicU64::new(1),
-            email_state: Arc::new(Mutex::new(email_state)),
-            mailbox_state: Arc::new(Mutex::new(mailbox_state)),
-            thread_state: Arc::new(Mutex::new(thread_state)),
+            email_states: Arc::new(Mutex::new(email_states)),
+            mailbox_states: Arc::new(Mutex::new(mailbox_states)),
+            thread_states: Arc::new(Mutex::new(thread_states)),
             mailbox_names: Arc::new(Mutex::new(mailbox_names)),
         }
+    }
+
+    /// Resolve the `MailAccount` handle that routes a cursor scope. A
+    /// foreign `Folder` scope (whose `FolderId` carries a JMAP
+    /// `accountId`) routes to that account's handle; every primary
+    /// `Type(_)` / `Query(_)` scope routes to `self.mail`.
+    pub(crate) fn mail_for_scope(&self, scope: &CursorScope) -> &MailAccount {
+        match resolve_foreign_account_id(scope, |id| self.foreign_mail.contains_key(id)) {
+            Some(account_id) => self
+                .foreign_mail
+                .get(&account_id)
+                .expect("resolve_foreign_account_id only returns a known foreign id"),
+            None => &self.mail,
+        }
+    }
+
+    /// The accountId that keys the state cache for a scope: the parsed
+    /// foreign accountId for a `Folder` scope, else the primary account's
+    /// id. Both forms key the same per-accountId maps.
+    pub(crate) fn account_id_for_scope(&self, scope: &CursorScope) -> String {
+        self.mail_for_scope(scope).id_str().to_string()
+    }
+
+    /// The owning shared-account identity for a foreign `Folder` scope,
+    /// or `None` for a primary scope. Drives the revocation-isolation
+    /// decision (quarantine the foreign scope vs escalate account-wide).
+    pub(crate) fn owner_of_scope(&self, scope: &CursorScope) -> Option<bifrost_types::MailboxId> {
+        resolve_foreign_account_id(scope, |id| self.foreign_mail.contains_key(id))
+            .map(bifrost_types::MailboxId)
     }
 
     pub(crate) fn cursor_scopes(&self) -> Vec<CursorScope> {
@@ -113,10 +154,33 @@ impl JmapAccount {
             CursorScope::Type(bifrost_types::ObjectType::Mailbox),
         ];
 
-        ordered
+        let mut scopes: Vec<CursorScope> = ordered
             .into_iter()
             .filter(|scope| self.seed_states.contains_key(scope))
-            .collect()
+            .collect();
+
+        // Foreign (shared/delegate) account mailboxes surface as seeded
+        // `Folder` scopes (the foreign accountId rides in the FolderId).
+        // Preserve a deterministic order so discovery is stable.
+        let mut foreign: Vec<CursorScope> = self
+            .seed_states
+            .keys()
+            .filter(|scope| matches!(scope, CursorScope::Folder(_)))
+            .cloned()
+            .collect();
+        foreign.sort_by(|a, b| match (a, b) {
+            (CursorScope::Folder(x), CursorScope::Folder(y)) => x.0.cmp(&y.0),
+            _ => std::cmp::Ordering::Equal,
+        });
+        scopes.extend(foreign);
+        scopes
+    }
+
+    /// The owner-tag memberships every foreign account contributes:
+    /// `Mailbox(accountId)` per foreign account. Emitted alongside the
+    /// primary account's per-mailbox memberships during discovery.
+    pub(crate) fn foreign_owner_memberships(&self) -> Vec<MembershipScope> {
+        foreign_owner_memberships_from_scopes(self.seed_states.keys())
     }
 
     pub(crate) fn next_subscription_handle(&self) -> SubscriptionHandle {
@@ -160,14 +224,15 @@ impl Account for JmapAccount {
     }
 
     fn discover_memberships(&self) -> AccountStream<SyncEvent<MembershipScope>> {
-        discover::memberships(self.mail.clone())
+        discover::memberships(self.mail.clone(), self.foreign_owner_memberships())
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
         discover::scope_lifecycle(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.mailbox_state),
+            Arc::clone(&self.mailbox_states),
+            self.mail.id_str().to_string(),
             Arc::clone(&self.mailbox_names),
             self.shutdown.clone(),
         )
@@ -203,7 +268,9 @@ impl Account for JmapAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
-        inventory::stream(self.mail.clone(), self.core_limits, scope)
+        let mail = self.mail_for_scope(&scope).clone();
+        let owner = self.owner_of_scope(&scope);
+        inventory::stream(mail, self.core_limits, scope, owner)
     }
 
     fn inventory_partitioning(&self, scope: &CursorScope) -> InventoryPartitioning {
@@ -223,7 +290,9 @@ impl Account for JmapAccount {
         scope: CursorScope,
         partition: InventoryPartition,
     ) -> AccountStream<SyncEvent<InventoryEntry>> {
-        inventory::stream_partition(self.mail.clone(), self.core_limits, scope, partition)
+        let mail = self.mail_for_scope(&scope).clone();
+        let owner = self.owner_of_scope(&scope);
+        inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
     }
 
     fn get_stream(
@@ -238,13 +307,18 @@ impl Account for JmapAccount {
         &self,
         cursor: ChangeCursor,
     ) -> AccountStream<SyncEvent<bifrost_types::Change>> {
+        let mail = self.mail_for_scope(&cursor.scope).clone();
+        let account_id = self.account_id_for_scope(&cursor.scope);
+        let owner = self.owner_of_scope(&cursor.scope);
         changes::stream(
-            self.mail.clone(),
+            mail,
+            account_id,
             self.core_limits,
             cursor,
-            Arc::clone(&self.email_state),
-            Arc::clone(&self.mailbox_state),
-            Arc::clone(&self.thread_state),
+            owner,
+            Arc::clone(&self.email_states),
+            Arc::clone(&self.mailbox_states),
+            Arc::clone(&self.thread_states),
         )
     }
 
@@ -308,7 +382,8 @@ impl Account for JmapAccount {
         mutation::set_flags(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             targets,
             op,
             key,
@@ -324,7 +399,8 @@ impl Account for JmapAccount {
         mutation::move_to(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             targets,
             destination,
             key,
@@ -339,7 +415,8 @@ impl Account for JmapAccount {
         mutation::destroy(
             self.mail.clone(),
             self.core_limits,
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             targets,
             key,
         )
@@ -352,7 +429,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::add_to_container(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             target,
             container,
         )
@@ -365,7 +443,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::remove_from_container(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             target,
             container,
         )
@@ -379,7 +458,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_keyword(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             target,
             keyword,
             value,
@@ -435,7 +515,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_is_read(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             target,
             is_read,
         )
@@ -448,7 +529,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_importance(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             target,
             level,
         )
@@ -465,7 +547,8 @@ impl Account for JmapAccount {
         }
         pim::send_message(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             self.max_delayed_send,
             request,
         )
@@ -493,7 +576,12 @@ impl Account for JmapAccount {
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
-        pim::draft_create(self.mail.clone(), Arc::clone(&self.email_state), patch)
+        pim::draft_create(
+            self.mail.clone(),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
+            patch,
+        )
     }
 
     fn draft_update(
@@ -503,14 +591,20 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::draft_update(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             draft,
             patch,
         )
     }
 
     fn draft_discard(&self, draft: DraftHandle) -> AccountFuture<Result<(), AccountError>> {
-        pim::draft_discard(self.mail.clone(), Arc::clone(&self.email_state), draft)
+        pim::draft_discard(
+            self.mail.clone(),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
+            draft,
+        )
     }
 
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
@@ -522,7 +616,12 @@ impl Account for JmapAccount {
             );
             return Box::pin(async move { Err(err) });
         }
-        pim::draft_send(self.mail.clone(), Arc::clone(&self.email_state), draft)
+        pim::draft_send(
+            self.mail.clone(),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
+            draft,
+        )
     }
 
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
@@ -579,7 +678,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
         pim::container_create(
             self.mail.clone(),
-            Arc::clone(&self.mailbox_state),
+            Arc::clone(&self.mailbox_states),
+            self.mail.id_str().to_string(),
             kind,
             name,
             parent,
@@ -593,7 +693,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::container_rename(
             self.mail.clone(),
-            Arc::clone(&self.mailbox_state),
+            Arc::clone(&self.mailbox_states),
+            self.mail.id_str().to_string(),
             container,
             name,
         )
@@ -606,7 +707,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::container_move(
             self.mail.clone(),
-            Arc::clone(&self.mailbox_state),
+            Arc::clone(&self.mailbox_states),
+            self.mail.id_str().to_string(),
             container,
             new_parent,
         )
@@ -615,7 +717,8 @@ impl Account for JmapAccount {
     fn container_delete(&self, container: ContainerId) -> AccountFuture<Result<(), AccountError>> {
         pim::container_delete(
             self.mail.clone(),
-            Arc::clone(&self.mailbox_state),
+            Arc::clone(&self.mailbox_states),
+            self.mail.id_str().to_string(),
             container,
         )
     }
@@ -790,7 +893,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::move_thread(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             thread,
             target,
             source,
@@ -842,7 +946,8 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::delete_thread(
             self.mail.clone(),
-            Arc::clone(&self.email_state),
+            Arc::clone(&self.email_states),
+            self.mail.id_str().to_string(),
             thread,
             current,
         )
@@ -866,5 +971,110 @@ impl Account for JmapAccount {
                 )),
             }
         })
+    }
+}
+
+/// One `Mailbox(accountId)` owner tag per distinct foreign account among
+/// the given scopes. Pure, so discovery's owner-tag emission is
+/// unit-testable without a live account.
+fn foreign_owner_memberships_from_scopes<'a, I>(scopes: I) -> Vec<MembershipScope>
+where
+    I: IntoIterator<Item = &'a CursorScope>,
+{
+    let mut owners: Vec<String> = scopes
+        .into_iter()
+        .filter_map(|scope| match scope {
+            CursorScope::Folder(folder) => {
+                foreign::parse_foreign(folder).map(|parsed| parsed.account_id)
+            }
+            _ => None,
+        })
+        .collect();
+    owners.sort();
+    owners.dedup();
+    owners
+        .into_iter()
+        .map(|id| foreign::owner_tag(&id))
+        .collect()
+}
+
+/// The foreign JMAP `accountId` a scope routes to, or `None` for a
+/// primary scope. Only a `CursorScope::Folder` whose `FolderId` parses
+/// as a foreign mailbox AND whose account is registered (per
+/// `is_registered`) routes foreign; every other scope is primary. Pure,
+/// so the routing decision is unit-testable without a live `Client`.
+fn resolve_foreign_account_id<F>(scope: &CursorScope, is_registered: F) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
+    if let CursorScope::Folder(folder) = scope
+        && let Some(parsed) = foreign::parse_foreign(folder)
+        && is_registered(&parsed.account_id)
+    {
+        Some(parsed.account_id)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use bifrost_types::{CursorScope, MailboxId, MembershipScope, ObjectType, QueryId};
+
+    use super::super::foreign;
+    use super::{foreign_owner_memberships_from_scopes, resolve_foreign_account_id};
+
+    #[test]
+    fn discover_emits_foreign_account_owner_membership() {
+        // Two foreign mailboxes in one account plus one in another: the
+        // owner tag is per-account (deduped), not per-mailbox.
+        let scopes = [
+            CursorScope::Type(ObjectType::Email),
+            CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-1")),
+            CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-2")),
+            CursorScope::Folder(foreign::encode_foreign("acct-7", "mbx-3")),
+        ];
+        let owners = foreign_owner_memberships_from_scopes(scopes.iter());
+        assert!(owners.contains(&MembershipScope::Mailbox(MailboxId("acct-9".to_string()))));
+        assert!(owners.contains(&MembershipScope::Mailbox(MailboxId("acct-7".to_string()))));
+        // One owner tag per account, not per mailbox.
+        assert_eq!(owners.len(), 2);
+    }
+
+    #[test]
+    fn mail_for_scope_routes_foreign_account() {
+        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
+        let is_registered = |id: &str| registered.contains(id);
+
+        // A foreign Folder scope for a registered account routes foreign.
+        let foreign_scope = CursorScope::Folder(foreign::encode_foreign("acct-9", "mbx-3"));
+        assert_eq!(
+            resolve_foreign_account_id(&foreign_scope, is_registered),
+            Some("acct-9".to_string())
+        );
+
+        // A foreign Folder scope for an UNregistered account falls back
+        // to primary (None) - the engine never minted a foreign cursor
+        // for an account we did not open.
+        let unknown_scope = CursorScope::Folder(foreign::encode_foreign("acct-other", "mbx-3"));
+        assert_eq!(
+            resolve_foreign_account_id(&unknown_scope, is_registered),
+            None
+        );
+
+        // Primary scopes never route foreign.
+        assert_eq!(
+            resolve_foreign_account_id(&CursorScope::Type(ObjectType::Email), is_registered),
+            None
+        );
+        assert_eq!(
+            resolve_foreign_account_id(
+                &CursorScope::Query(QueryId("q1".to_string())),
+                is_registered
+            ),
+            None
+        );
     }
 }

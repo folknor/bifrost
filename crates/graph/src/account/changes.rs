@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::GraphAccount;
 use super::cursor::{CursorError, decode_cursor, encode_cursor};
-use super::graph_error::{GraphErrorContext, cursor_error_to_account_error, into_account_error};
+use super::graph_error::{GraphErrorContext, cursor_error_to_account_error};
 use super::inventory::{
     batch, fetch_delta_page, graph_etag, is_removed, membership_from_value, page_marker,
     removed_id, scope_matches_payload,
@@ -47,7 +47,15 @@ pub(crate) fn changes_stream(
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
                         .with_scope(ErrorScope::Cursor(scope.clone()));
-                    yield SyncEvent::Terminated(into_account_error(error, ctx));
+                    // Foreign-scope permission denial quarantines just
+                    // this scope; primary-scope denial stays terminal.
+                    let owner = account.owner_of_scope(&scope);
+                    yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
+                        error,
+                        &scope,
+                        owner.as_ref(),
+                        ctx,
+                    ));
                     yield SyncEvent::Done(None);
                     return;
                 }

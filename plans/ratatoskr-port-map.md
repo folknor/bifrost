@@ -282,13 +282,13 @@ above.
 
 ---
 
-## A5 - Shared mailboxes + public folders (largest brick) - OPEN (A5c LANDED)
+## A5 - Shared mailboxes + public folders (largest brick) - OPEN (A5c + A5a LANDED)
 
 Substantial ratatoskr code (~110 KB / 6 files) but most is CRUD + ad-hoc
 poll-loop-into-SQLite - the shape the plan warns against. The hard, novel work is
 reshaping that onto `CursorScope`/`changes_stream`, which has no ratatoskr
-analog. Splits **three** ways, not two. **A5c is the first leg and is LANDED;
-A5a and A5b remain OPEN, so A5 overall is OPEN.**
+analog. Splits **three** ways, not two. **A5c and A5a are LANDED; A5b remains
+OPEN, so A5 overall is OPEN.**
 
 **Gating fork - RESOLVED by A5c (option (a)-lite, no new variant).** ratatoskr
 models a shared mailbox as a *cloned client* (`for_shared_mailbox`), not a scope.
@@ -332,14 +332,28 @@ account-layer glue, not codec porting. What actually landed:
 | revocation recovery | `SyncState(ScopeRevoked)` -> `EngineDirective::DisableScope` quarantine | DONE |
 | `build_uid_set` | bifrost typed `UidSet` | ALREADY-IN-BIFROST |
 
-### A5a - Shared mailboxes, Graph delegate + JMAP shared accounts (size S-M)
+### A5a - Shared mailboxes, Graph delegate + JMAP shared accounts (size S-M) - LANDED
 
-Graph plumbing (`for_shared_mailbox`/`api_path_prefix`/`is_shared_mailbox`/
-`mailbox_id`) is **ALREADY-IN-BIFROST** (`graph/client.rs:161-195`). Real work:
-a scope shape carrying the foreign mailbox identity, discovery emitting those
-scopes, inventory/changes honoring `api_path_prefix()`, JMAP threading a foreign
-`accountId`. Beyond CRUD: per-scope recovery isolation (a 403 on one shared
-mailbox must not kill the account).
+Landed as planned: the foreign-mailbox identity rides inside the scope's
+`FolderId` (per-crate `foreign.rs` codec, `\u{1f}` separator), discovery emits
+those scopes, inventory/changes route through the right `api_path_prefix()`
+(Graph) / foreign `accountId` handle (JMAP), and a foreign-scope 403 quarantines
+that scope only (`graph_scope_revoked` / `jmap_scope_revoked` -> `ScopeRevoked`
+-> `DisableScope`) while a primary 403 stays terminal. Graph foreign mailboxes
+are **config-supplied** (`with_shared_mailbox`; no Graph REST "list my delegated
+mailboxes" call - EWS `GetDelegate` / Autodiscover is A5b); JMAP
+**auto-discovers** non-personal mail accounts from the session. JMAP carried one
+internal refactor: the three scalar `*_state` caches became per-accountId maps
+(`state_cache.rs`) and `JmapScopeRepr` gained an additive `Folder` envelope
+variant (`SCOPE_TAG_FOLDER`, no version bump). Durable record: git history (the
+A5a landing commit) + `reference/graph.md` / `reference/jmap.md`; the spec was
+retired at landing.
+
+**Named A5a-scoped-out follow-ups** (read/sync only): foreign-account
+*mutations* (the JMAP per-accountId state store is shaped for `ifInState` but the
+mutation path is unwired - mirrors Graph's C-3 send-as exclusion) and live
+foreign *mailbox lifecycle* (discovery seeded once at open; a foreign mailbox
+added afterwards surfaces at the next reopen).
 
 ### A5b - Graph EWS public folders + Autodiscover (size L, the real unknown)
 
@@ -562,8 +576,9 @@ C-1 IMAP-send-via-SMTP = **A2**. C-2 scheduled send (three unwired provider entr
 points off the uniform trait; JMAP `maxDelayedSend` gate is the textbook
 "immutable limit -> flag") = **A4**, including the cancel/reschedule gap above.
 C-3 Graph shared-mailbox send (`send_as_shared_mailbox`, `send_on_behalf_of`,
-inline-only attachments on `/users/{id}`) ties to **A5** + a send-as identity
-parameter on the send surface.
+inline-only attachments on `/users/{id}`) builds on **A5a** (landed
+foreign-mailbox routing) + a send-as identity parameter on the send surface;
+the send-as leg itself is still open.
 
 ### Group D - transport quirks, mostly ALREADY absorbed
 
@@ -584,14 +599,14 @@ Graph-importance intent expansion (B-1, densest) - RESOLVED (A8): uniform
 send (C-1 / A2) - landed. 5. Contacts/calendar/auto-response dispatch (A-3/4/5) -
 RESOLVED on the bifrost side once the primitives + A7 landed; consumer rewrite is
 Track B. (Cloud attachments, the former top priority A-1 / A6, has landed.) Still
-open under A8: C-3 (needs A5), A-6 (policy), graph-S1/graph-N3, and the
-Track-B-driven tail.
+open under A8: C-3 (builds on A5a, now landed; send-as leg still open), A-6
+(policy), graph-S1/graph-N3, and the Track-B-driven tail.
 
 **Independence:** standalone now - A-2 (now A9), graph-S1, graph-N3, A-6
 (policy). RESOLVED (A8) - B-1 (importance), B-2 (`graph-N1`), B-3 (draft-update
 new-id confirm), B-4 (MDN). Needs A1 - A6, A3, A2. Chained - A4 needs A2; C-3
-needs A5; A-4/A-5 CalDAV/CardDAV legs needed A7 (now landed, so A-3/4/5 are
-RESOLVED on the bifrost side).
+builds on A5a (landed); A-4/A-5 CalDAV/CardDAV legs needed A7 (now landed, so
+A-3/4/5 are RESOLVED on the bifrost side).
 
 ---
 
@@ -602,9 +617,9 @@ how a foreign/shared mailbox is modeled before any A5 porting.
 
 **Unwired-but-required surface (the roadmap).** Present in the clone, zero callers,
 all things ratatoskr will wire against bifrost's ideal surface: cloud-attachment
-upload (A6), scheduled send + cancel + reschedule (A4), send-as / on-behalf (A5/C-3),
-raw-message fetch (A3), GAL (A8 A-2). Upside: no back-compat constraint - design the
-ideal uniform surface.
+upload (A6), scheduled send + cancel + reschedule (A4), send-as / on-behalf (C-3,
+gated on A5a now landed), raw-message fetch (A3), GAL (A8 A-2). Upside: no
+back-compat constraint - design the ideal uniform surface.
 
 **Bugs worth fixing inside the relevant brick (not separate work):**
 - IMAP/SMTP stale-token-at-construction (A1).
@@ -627,8 +642,8 @@ enum parallels `MailProviderKind` (divergence risk); contact dispatch keys on a
 2. **A2** then **A4** (A4 includes cancel/reschedule).
 3. **A3** and **A6** after A1, independent of each other.
 4. **A5** - scope-vs-Account decision RESOLVED (cursor-resident `Folder`, no new
-   variant). **A5c (IMAP NAMESPACE) LANDED** as the cheapest, highest-ratio leg;
-   **A5a (Graph delegate + JMAP shared)** and **A5b (EWS, size-L unknown)** remain.
+   variant). **A5c (IMAP NAMESPACE)** and **A5a (Graph delegate + JMAP shared)**
+   LANDED; only **A5b (EWS, size-L unknown)** remains.
 5. **A7** - independent; fold the DAV robustness guards in.
 6. **A8** - standalone warts anytime; B-driven tail closes near the end. Consider
    pulling **GAL (A-2)** out as its own small brick.

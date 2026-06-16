@@ -9,17 +9,24 @@ use bifrost_types::{
 
 use tokio_util::sync::CancellationToken;
 
+use crate::account::Account as JmapMailAccount;
 use crate::client::{Client, Credentials};
 use crate::core::capability;
+use crate::core::capability::Capability;
+use crate::core::id::AccountId as JmapAccountId;
 use crate::principal::PrincipalGet;
 use crate::thread::ThreadId;
+use crate::transport_reqwest::ReqwestTransport;
 
 use super::account::JmapAccount;
 use super::capabilities;
 use super::discover;
+use super::foreign;
 use super::mutation;
 use super::push::{ReconnectPolicy, WsState};
 use super::state;
+
+type MailAccount = JmapMailAccount<ReqwestTransport>;
 
 // pub: re-exported through crate::sync for engine AccountFactory registration.
 #[derive(Debug, Clone)]
@@ -213,6 +220,55 @@ impl AccountFactory for JmapAccountFactory {
                 .expect("static thread cursor scope is supported"),
             );
 
+            // Per-accountId state caches. The primary account's id keys
+            // the same maps every foreign account does - no primary-vs-
+            // foreign branch in the cache itself.
+            let primary_id = mail.id_str().to_string();
+            let mut email_states: HashMap<String, Option<String>> = HashMap::new();
+            let mut mailbox_states: HashMap<String, Option<String>> = HashMap::new();
+            let mut thread_states: HashMap<String, Option<String>> = HashMap::new();
+            email_states.insert(primary_id.clone(), Some(email_state.clone()));
+            mailbox_states.insert(primary_id.clone(), Some(mailbox_state.clone()));
+            thread_states.insert(primary_id.clone(), Some(thread_state.clone()));
+
+            // Foreign (shared/delegate) accounts: the session lists every
+            // non-personal mail account. For each, probe its three states
+            // and seed one `Folder` cursor scope per mailbox. A
+            // permission-denied probe skips that foreign account (the
+            // primary and other foreign accounts still open).
+            let foreign_ids = foreign_mail_account_ids(&client, &primary_id);
+            let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
+            for foreign_id in foreign_ids {
+                let foreign_account =
+                    MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
+                match seed_foreign_account(&foreign_account).await {
+                    Ok(seed) => {
+                        email_states.insert(foreign_id.clone(), Some(seed.email_state));
+                        mailbox_states.insert(foreign_id.clone(), Some(seed.mailbox_state));
+                        thread_states.insert(foreign_id.clone(), Some(seed.thread_state));
+                        for mailbox_id in seed.mailbox_ids {
+                            let scope = CursorScope::Folder(foreign::encode_foreign(
+                                &foreign_id,
+                                &mailbox_id,
+                            ));
+                            // Foreign email changes track the account's
+                            // Email state; seed each mailbox's Folder
+                            // cursor from it.
+                            if let Ok(encoded) =
+                                state::encode_for_scope(&scope, seed.email_state_for_seed.clone())
+                            {
+                                seed_states.insert(scope, encoded);
+                            }
+                        }
+                        foreign_mail.insert(foreign_id, foreign_account);
+                    }
+                    Err(_skip) => {
+                        // Permission-denied or transient: skip this
+                        // foreign account, do not abort open.
+                    }
+                }
+            }
+
             let shutdown = CancellationToken::new();
             let ws = WsState::spawn(
                 client.clone(),
@@ -224,6 +280,7 @@ impl AccountFactory for JmapAccountFactory {
             let account = JmapAccount::new(
                 client,
                 mail,
+                foreign_mail,
                 submission,
                 max_delayed_send,
                 vacation,
@@ -237,9 +294,9 @@ impl AccountFactory for JmapAccountFactory {
                 seed_states,
                 ws,
                 shutdown,
-                Some(email_state),
-                Some(mailbox_state),
-                Some(thread_state),
+                email_states,
+                mailbox_states,
+                thread_states,
                 mailbox_names,
             );
 
@@ -309,6 +366,60 @@ fn push_email_alias(emails: &mut Vec<String>, email: &str) {
     if !emails.iter().any(|existing| existing == &normalized) {
         emails.push(normalized);
     }
+}
+
+/// The session's non-personal mail accounts (foreign / shared /
+/// delegate), excluding the primary mail account. JMAP servers list
+/// shared/delegated accounts with `isPersonal: false` and their own
+/// `accountCapabilities`; A5a auto-discovers them from the session (no
+/// config needed, unlike Graph).
+fn foreign_mail_account_ids(client: &Client, primary_id: &str) -> Vec<String> {
+    let session = client.session();
+    let mut ids: Vec<String> = session
+        .accounts()
+        .filter(|id| id.as_str() != primary_id)
+        .filter(|id| {
+            session.account(id).is_some_and(|account| {
+                !account.is_personal()
+                    && account
+                        .capabilities()
+                        .any(|uri| uri.as_str() == <capability::Mail as Capability>::URI)
+            })
+        })
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+struct ForeignSeed {
+    email_state: String,
+    mailbox_state: String,
+    thread_state: String,
+    /// The foreign account's mailbox ids, one `Folder` cursor scope per.
+    mailbox_ids: Vec<String>,
+    /// The Email state seeded into each foreign `Folder` cursor (the
+    /// foreign account's `Email/changes` state).
+    email_state_for_seed: String,
+}
+
+/// Probe one foreign account's `Email` / `Mailbox` / `Thread` states and
+/// enumerate its mailboxes. Mirrors the three primary probes. A failure
+/// (permission-denied or transient) returns `Err` so the caller skips
+/// this account without aborting `open`.
+async fn seed_foreign_account(mail: &MailAccount) -> crate::Result<ForeignSeed> {
+    let email_state = mutation::probe_email_state(mail).await?;
+    let (mailbox_state, mailbox_names) = discover::fetch_mailbox_names(mail).await?;
+    let thread_state = probe_thread_state(mail).await?;
+    let mailbox_ids: Vec<String> = mailbox_names.into_keys().collect();
+    Ok(ForeignSeed {
+        email_state_for_seed: email_state.clone(),
+        email_state,
+        mailbox_state,
+        thread_state,
+        mailbox_ids,
+    })
 }
 
 async fn connect(

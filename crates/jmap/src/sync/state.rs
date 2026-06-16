@@ -11,6 +11,10 @@ const SCOPE_TAG_EMAIL: u8 = 1;
 const SCOPE_TAG_MAILBOX: u8 = 2;
 const SCOPE_TAG_THREAD: u8 = 3;
 const SCOPE_TAG_QUERY: u8 = 4;
+// Additive: foreign (shared/delegate) account mailbox scope. Existing
+// primary cursors carry tags 1-4 and still decode, so no envelope-version
+// bump is required.
+const SCOPE_TAG_FOLDER: u8 = 5;
 
 // types: protocol-owned cursor payload inside bifrost-types::OpaqueChangeState.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +31,14 @@ pub(crate) enum JmapScopeRepr {
     Mailbox,
     Thread,
     Query(String),
+    /// A foreign (shared/delegate) account mailbox. The owning JMAP
+    /// `accountId` and the native mailbox id are recovered from the
+    /// `CursorScope::Folder(FolderId(encode_foreign(account_id,
+    /// mailbox_id)))` codec so a cold resume routes to the same account.
+    Folder {
+        account_id: String,
+        mailbox_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +57,12 @@ impl JmapScopeRepr {
             CursorScope::Type(ObjectType::Mailbox) => Ok(Self::Mailbox),
             CursorScope::Type(ObjectType::Thread) => Ok(Self::Thread),
             CursorScope::Query(query) => Ok(Self::Query(query.0.clone())),
+            CursorScope::Folder(folder) => super::foreign::parse_foreign(folder)
+                .map(|parsed| Self::Folder {
+                    account_id: parsed.account_id,
+                    mailbox_id: parsed.mailbox_id,
+                })
+                .ok_or(JmapCursorError::UnsupportedScope),
             _ => Err(JmapCursorError::UnsupportedScope),
         }
     }
@@ -55,6 +73,10 @@ impl JmapScopeRepr {
             Self::Mailbox => CursorScope::Type(ObjectType::Mailbox),
             Self::Thread => CursorScope::Type(ObjectType::Thread),
             Self::Query(query) => CursorScope::Query(QueryId(query.clone())),
+            Self::Folder {
+                account_id,
+                mailbox_id,
+            } => CursorScope::Folder(super::foreign::encode_foreign(account_id, mailbox_id)),
         }
     }
 }
@@ -112,6 +134,14 @@ fn encode_scope(scope: &JmapScopeRepr, out: &mut Vec<u8>) {
             out.push(SCOPE_TAG_QUERY);
             encode_string(query, out);
         }
+        JmapScopeRepr::Folder {
+            account_id,
+            mailbox_id,
+        } => {
+            out.push(SCOPE_TAG_FOLDER);
+            encode_string(account_id, out);
+            encode_string(mailbox_id, out);
+        }
     }
 }
 
@@ -152,6 +182,14 @@ fn decode_scope(input: &mut &[u8]) -> Result<JmapScopeRepr, JmapCursorError> {
         SCOPE_TAG_MAILBOX => Ok(JmapScopeRepr::Mailbox),
         SCOPE_TAG_THREAD => Ok(JmapScopeRepr::Thread),
         SCOPE_TAG_QUERY => Ok(JmapScopeRepr::Query(decode_string(input)?)),
+        SCOPE_TAG_FOLDER => {
+            let account_id = decode_string(input)?;
+            let mailbox_id = decode_string(input)?;
+            Ok(JmapScopeRepr::Folder {
+                account_id,
+                mailbox_id,
+            })
+        }
         _ => Err(JmapCursorError::SchemaIncompatible),
     }
 }
@@ -266,6 +304,38 @@ mod tests {
         let state = JmapCursorState::V1 {
             scope: JmapScopeRepr::Query("q-789".to_string()),
             state_string: "s-789".to_string(),
+        };
+        assert_eq!(decode(&encode(&state)).unwrap(), state);
+    }
+
+    #[test]
+    fn foreign_folder_scope_round_trips_through_cursor() {
+        // A foreign `Folder` scope survives encode_for_scope ->
+        // decode_cursor and reconstructs the same account + mailbox.
+        let scope = CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-3"));
+        let cursor = cursor_for_scope(scope.clone(), "fstate").expect("foreign scope encodes");
+        let (repr, state_string) = decode_cursor(&cursor).expect("foreign cursor decodes");
+        assert_eq!(state_string, "fstate");
+        assert_eq!(
+            repr,
+            JmapScopeRepr::Folder {
+                account_id: "acct-9".to_string(),
+                mailbox_id: "mbx-3".to_string(),
+            }
+        );
+        // The decoded repr reconstructs the original scope (the
+        // decode_cursor scope-equality guard holds).
+        assert_eq!(repr.to_cursor_scope(), scope);
+    }
+
+    #[test]
+    fn folder_scope_byte_round_trips() {
+        let state = JmapCursorState::V1 {
+            scope: JmapScopeRepr::Folder {
+                account_id: "acct-9".to_string(),
+                mailbox_id: "mbx-3".to_string(),
+            },
+            state_string: "s".to_string(),
         };
         assert_eq!(decode(&encode(&state)).unwrap(), state);
     }

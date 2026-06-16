@@ -1,13 +1,11 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope, MembershipScope,
-    ObjectChange, ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind,
-    SyncEvent,
+    AccountStream, Batch, Change, ChangeCursor, Checkpoint, CursorScope,
+    MailboxId as TypesMailboxId, MembershipScope, ObjectChange, ObjectChangeKind, ObjectId,
+    PageBoundary, ScopeChange, ScopeChangeKind, SyncEvent,
 };
-use tokio::sync::Mutex;
 
 use crate::core::changes::ChangesObject;
 use crate::core::query_changes::QueryChangesResponse;
@@ -18,16 +16,20 @@ use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
 use super::state::{self, JmapScopeRepr};
+use super::state_cache::{self, StateMap};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stream(
     mail: MailAccount,
+    account_id: String,
     limits: CoreLimits,
     cursor: ChangeCursor,
-    email_state: Arc<Mutex<Option<String>>>,
-    mailbox_state: Arc<Mutex<Option<String>>>,
-    thread_state: Arc<Mutex<Option<String>>>,
+    owner: Option<TypesMailboxId>,
+    email_states: StateMap,
+    mailbox_states: StateMap,
+    thread_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     let decoded = state::decode_cursor(&cursor);
     let (scope, state_string) = match decoded {
@@ -63,35 +65,57 @@ pub(crate) fn stream(
     match scope {
         JmapScopeRepr::Email => email_changes(
             mail,
+            account_id,
             limits,
             cursor.scope.clone(),
             state_string,
-            email_state,
+            None,
+            email_states,
         ),
         JmapScopeRepr::Mailbox => mailbox_changes(
             mail,
+            account_id,
             limits,
             cursor.scope.clone(),
             state_string,
-            mailbox_state,
+            mailbox_states,
         ),
         JmapScopeRepr::Thread => thread_changes(
             mail,
+            account_id,
             limits,
             cursor.scope.clone(),
             state_string,
-            thread_state,
+            thread_states,
         ),
         JmapScopeRepr::Query(query_id) => query_changes(mail, limits, query_id, state_string),
+        // A foreign (shared/delegate) account mailbox: its emails sync
+        // against that foreign account's `Email/changes` state. The
+        // membership is the foreign mailbox; the owner tag drives
+        // revocation isolation. `Email/changes` is account-wide, so the
+        // per-mailbox membership rides on the change items' scope
+        // changes rather than filtering the changes call.
+        JmapScopeRepr::Folder { .. } => email_changes(
+            mail,
+            account_id,
+            limits,
+            cursor.scope.clone(),
+            state_string,
+            owner,
+            email_states,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn email_changes(
     mail: MailAccount,
+    account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
     mut since_state: String,
-    shared_state: Arc<Mutex<Option<String>>>,
+    owner: Option<TypesMailboxId>,
+    email_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
         let max_changes = nonzero(limits.max_objects_in_get);
@@ -104,13 +128,17 @@ fn email_changes(
             let response = match response {
                 Ok(response) => response,
                 Err(err) => {
-                    yield super::error::terminated_from_jmap(
+                    // Foreign-scope permission denial quarantines just
+                    // this scope; primary-scope denial stays terminal.
+                    yield super::error::terminated(super::error::shared_scope_error(
                         err,
+                        &scope,
+                        owner.as_ref(),
                         super::error::JmapErrorContext::cursor(
                             bifrost_types::AccountOperation::SyncChanges,
                             scope.clone(),
                         ),
-                    );
+                    ));
                     break;
                 }
             };
@@ -125,7 +153,7 @@ fn email_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            advance_state(&shared_state, &since_state, new_state.clone()).await;
+            state_cache::advance(&email_states, &account_id, Some(&since_state), new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -146,10 +174,11 @@ fn email_changes(
 
 fn mailbox_changes(
     mail: MailAccount,
+    account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
     mut since_state: String,
-    shared_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
         let max_changes = nonzero(limits.max_objects_in_get);
@@ -186,7 +215,7 @@ fn mailbox_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            advance_state(&shared_state, &since_state, new_state.clone()).await;
+            state_cache::advance(&mailbox_states, &account_id, Some(&since_state), new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -207,10 +236,11 @@ fn mailbox_changes(
 
 fn thread_changes(
     mail: MailAccount,
+    account_id: String,
     limits: CoreLimits,
     scope: CursorScope,
     mut since_state: String,
-    shared_state: Arc<Mutex<Option<String>>>,
+    thread_states: StateMap,
 ) -> AccountStream<SyncEvent<Change>> {
     Box::pin(async_stream::stream! {
         let max_changes = nonzero(limits.max_objects_in_get);
@@ -244,7 +274,7 @@ fn thread_changes(
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
-            advance_state(&shared_state, &since_state, new_state.clone()).await;
+            state_cache::advance(&thread_states, &account_id, Some(&since_state), new_state.clone()).await;
 
             yield SyncEvent::Batch(Batch {
                 items: changes,
@@ -341,12 +371,4 @@ fn checkpoint_for(scope: CursorScope, state_string: String) -> ChangeCursor {
 
 fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
-}
-
-async fn advance_state(state: &Arc<Mutex<Option<String>>>, expected: &str, value: String) {
-    let mut guard = state.lock().await;
-    match guard.as_deref() {
-        Some(current) if current != expected => {}
-        _ => *guard = Some(value),
-    }
 }

@@ -14,6 +14,7 @@ use crate::mailbox::{Mailbox, MailboxChanges, MailboxGet, MailboxId, Property};
 use crate::transport_reqwest::ReqwestTransport;
 
 use super::capabilities::CoreLimits;
+use super::state_cache::{self, StateMap};
 
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
@@ -32,7 +33,10 @@ pub(crate) fn cursor_scopes(scopes: Vec<CursorScope>) -> AccountStream<SyncEvent
     })
 }
 
-pub(crate) fn memberships(mail: MailAccount) -> AccountStream<SyncEvent<MembershipScope>> {
+pub(crate) fn memberships(
+    mail: MailAccount,
+    foreign_owners: Vec<MembershipScope>,
+) -> AccountStream<SyncEvent<MembershipScope>> {
     Box::pin(async_stream::stream! {
         let started = Instant::now();
         let response = mail
@@ -41,7 +45,7 @@ pub(crate) fn memberships(mail: MailAccount) -> AccountStream<SyncEvent<Membersh
 
         match response {
             Ok(response) => {
-                let items = response
+                let mut items = response
                     .into_list()
                     .into_iter()
                     .filter_map(|mut mailbox| {
@@ -55,6 +59,11 @@ pub(crate) fn memberships(mail: MailAccount) -> AccountStream<SyncEvent<Membersh
                         }
                     })
                     .collect::<Vec<_>>();
+
+                // Each foreign (shared/delegate) account contributes its
+                // owner tag (`Mailbox(accountId)`) so the consumer maps
+                // its foreign scopes to the shared-account identity.
+                items.extend(foreign_owners);
 
                 if !items.is_empty() {
                     yield SyncEvent::Batch(Batch {
@@ -99,7 +108,8 @@ pub(crate) async fn fetch_mailbox_names(
 pub(crate) fn scope_lifecycle(
     mail: MailAccount,
     limits: CoreLimits,
-    mailbox_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
+    account_id: String,
     mailbox_names: Arc<Mutex<HashMap<String, String>>>,
     shutdown: CancellationToken,
 ) -> AccountStream<ScopeLifecycleEvent> {
@@ -109,10 +119,7 @@ pub(crate) fn scope_lifecycle(
                 break;
             }
 
-            let since_state = {
-                let guard = mailbox_state.lock().await;
-                guard.clone()
-            };
+            let since_state = state_cache::get(&mailbox_states, &account_id).await;
 
             let Some(since_state) = since_state else {
                 tokio::time::sleep(Duration::from_secs(300)).await;
@@ -133,7 +140,8 @@ pub(crate) fn scope_lifecycle(
                     let created = response.created().to_vec();
                     let updated = response.updated().to_vec();
                     let destroyed = response.destroyed().to_vec();
-                    set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
+                    state_cache::set(&mailbox_states, &account_id, response.new_state().to_string())
+                        .await;
 
                     if (!created.is_empty() || !updated.is_empty())
                         && let Ok(fetched) =
@@ -233,11 +241,6 @@ async fn fetch_mailboxes<'a>(
         )
         .await?
         .into_list())
-}
-
-async fn set_mailbox_state(state: &Arc<Mutex<Option<String>>>, value: String) {
-    let mut guard = state.lock().await;
-    *guard = Some(value);
 }
 
 async fn update_mailbox_name(

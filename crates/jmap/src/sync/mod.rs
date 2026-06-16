@@ -15,12 +15,14 @@ mod discover;
 mod error;
 mod factory;
 mod filters;
+mod foreign;
 mod hydrate;
 mod inventory;
 mod mutation;
 mod pim;
 mod push;
 mod state;
+mod state_cache;
 
 // pub: engine registration surface consumed by bifrost-sync users.
 pub use factory::{JmapAccountFactory, JmapAccountFactoryBuilder, JmapCredentials};

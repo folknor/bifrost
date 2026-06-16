@@ -13,10 +13,10 @@ use bifrost_net::error::cap_status_body;
 use bifrost_net::{NetErrorContext, parse_retry_after};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
-    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, DiagnosticText, ErrorScope,
-    GraphSignal, MailboxUnavailableKind, Protocol, ProtocolErrorKind, Provider, RequestCause,
-    ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind,
-    ThrottleScope, TransmissionState, WireCause,
+    AccountOperation, AttemptCause, AuthCause, AuthErrorKind, Cause, CursorScope, DiagnosticText,
+    ErrorScope, GraphSignal, MailboxId, MailboxUnavailableKind, Protocol, ProtocolErrorKind,
+    Provider, RequestCause, ResourceKind, RetryHint, ServerCause, ServerErrorKind, StateCause,
+    SyncStateErrorKind, ThrottleScope, TransmissionState, WireCause,
 };
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, RETRY_AFTER};
@@ -695,6 +695,63 @@ fn throttle_scope_for(_ctx: &GraphErrorContext) -> Option<ThrottleScope> {
     // All Microsoft tenants share the per-tenant throttle policy
     // (Graph REST and EWS both meter at the tenant level).
     Some(ThrottleScope::Tenant)
+}
+
+/// Build a `SyncState(ScopeRevoked)` error scoped to one foreign
+/// (shared/delegate) mailbox's folder scope. With the scope attached,
+/// the central `derive` resolves it to
+/// `Engine(DisableScope(scope))` - the engine quarantines just that
+/// cursor scope without escalating to account-wide auth loss. The owning
+/// mailbox rides as support-only diagnostic text for telemetry.
+#[must_use]
+pub(crate) fn graph_scope_revoked(
+    scope: CursorScope,
+    owner: &MailboxId,
+    operation: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+        Cause::State(StateCause::ScopeRevoked),
+    )
+    .protocol(Protocol::Graph)
+    .provider(Provider::Microsoft)
+    .operation(operation)
+    .scope(ErrorScope::Cursor(scope))
+    .text(DiagnosticText::support_only(format!(
+        "shared mailbox access revoked (owner {})",
+        owner.0,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Map a per-scope failure for a foreign (shared/delegate) mailbox.
+/// When the scope belongs to a shared mailbox (`owner.is_some()`) and
+/// the failure classifies as permission-denied (the class that would
+/// otherwise derive terminal `NoPermission` - `AccessDenied`/`Forbidden`/
+/// 403), quarantine just this foreign scope via `ScopeRevoked` instead
+/// of escalating account-wide. A primary-mailbox scope (`owner == None`),
+/// or any non-permission failure, flows through the unchanged
+/// `into_account_error` path - a primary-mailbox permission loss is a
+/// genuine account-level signal.
+#[must_use]
+pub(crate) fn graph_shared_scope_error(
+    error: GraphError,
+    scope: &CursorScope,
+    owner: Option<&MailboxId>,
+    ctx: GraphErrorContext,
+) -> AccountError {
+    if let Some(owner) = owner {
+        let account_error = into_account_error(error, ctx.clone());
+        if matches!(
+            account_error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ) {
+            return graph_scope_revoked(scope.clone(), owner, ctx.operation);
+        }
+        return account_error;
+    }
+    into_account_error(error, ctx)
 }
 
 /// Build an `AccountError` for an operation this account does not support.
@@ -1471,5 +1528,71 @@ mod tests {
         ));
         assert_eq!(err.operation(), Some(AccountOperation::RemoveFromContainer));
         assert!(matches!(err.recovery(), RecoveryClass::Unsupported(_)));
+    }
+
+    fn forbidden_response() -> GraphError {
+        GraphError::Response(GraphResponseError::from_response(
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            body(r#"{"error":{"code":"Forbidden","message":"nope"}}"#),
+        ))
+    }
+
+    fn foreign_email_scope() -> CursorScope {
+        CursorScope::FolderType {
+            folder: crate::account::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: bifrost_types::ObjectType::Email,
+        }
+    }
+
+    fn primary_email_scope() -> CursorScope {
+        CursorScope::FolderType {
+            folder: bifrost_types::FolderId("inbox".to_string()),
+            ty: bifrost_types::ObjectType::Email,
+        }
+    }
+
+    #[test]
+    fn shared_mailbox_permission_loss_derives_disable_scope() {
+        let scope = foreign_email_scope();
+        let owner = MailboxId("shared@contoso.com".to_string());
+        let err = graph_shared_scope_error(
+            forbidden_response(),
+            &scope,
+            Some(&owner),
+            GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        assert_eq!(
+            *err.recovery(),
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
+        );
+        assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    #[test]
+    fn primary_mailbox_permission_loss_stays_terminal() {
+        let scope = primary_email_scope();
+        // A primary folder is untagged (`owner == None`): the same 403
+        // must still derive terminal `NoPermission`, not quarantine.
+        let err = graph_shared_scope_error(
+            forbidden_response(),
+            &scope,
+            None,
+            GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ));
+        assert!(err.recovery().is_terminal());
+        assert!(matches!(err.recovery(), RecoveryClass::NoPermission { .. }));
     }
 }

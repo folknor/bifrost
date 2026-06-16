@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
@@ -37,8 +36,8 @@ fn schema_incompatible_search_cursor() -> AccountError {
 }
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::sync::Mutex;
 
+use super::state_cache::{self, StateMap};
 use crate::core::SetCreate;
 use crate::core::query;
 use crate::email::{
@@ -65,14 +64,16 @@ const ATTACHMENT_HANDLE_PREFIX: &str = "jmap:";
 
 pub(crate) fn add_to_container(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     target: MutationTarget,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         patch_mailbox_membership(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             target,
             container,
             true,
@@ -84,14 +85,16 @@ pub(crate) fn add_to_container(
 
 pub(crate) fn remove_from_container(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     target: MutationTarget,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         patch_mailbox_membership(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             target,
             container,
             false,
@@ -103,7 +106,8 @@ pub(crate) fn remove_from_container(
 
 pub(crate) fn set_keyword(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     target: MutationTarget,
     keyword: String,
     value: bool,
@@ -114,7 +118,8 @@ pub(crate) fn set_keyword(
         let ids_for_set = ids.clone();
         let mut response = send_email_set_with_retry(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             AccountOperation::SetKeyword,
             move |state| {
                 let mut set = EmailSet::new().if_in_state(state.to_string());
@@ -136,11 +141,19 @@ pub(crate) fn set_keyword(
 
 pub(crate) fn set_is_read(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     target: MutationTarget,
     is_read: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
-    set_keyword(mail, email_state, target, SEEN_KEYWORD.to_string(), is_read)
+    set_keyword(
+        mail,
+        email_states,
+        account_id,
+        target,
+        SEEN_KEYWORD.to_string(),
+        is_read,
+    )
 }
 
 /// Exclusive importance overwrite via the `$important` keyword. JMAP's
@@ -148,13 +161,15 @@ pub(crate) fn set_is_read(
 /// it. One `Email/set` keyword update, no expand-into-two.
 pub(crate) fn set_importance(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     target: MutationTarget,
     level: Importance,
 ) -> AccountFuture<Result<(), AccountError>> {
     set_keyword(
         mail,
-        email_state,
+        email_states,
+        account_id,
         target,
         IMPORTANT_KEYWORD.to_string(),
         importance_sets_important_keyword(level),
@@ -169,7 +184,8 @@ fn importance_sets_important_keyword(level: Importance) -> bool {
 
 pub(crate) fn send_message(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     max_delayed_send: usize,
     request: bifrost_types::SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
@@ -280,7 +296,13 @@ pub(crate) fn send_message(
             .map_err(to_acct_err(AccountOperation::Send))?;
 
         if !email_response.new_state().is_empty() {
-            advance_email_state(&email_state, None, email_response.new_state().to_string()).await;
+            state_cache::advance(
+                &email_states,
+                &account_id,
+                None,
+                email_response.new_state().to_string(),
+            )
+            .await;
         }
 
         // Handle contract (A4): a scheduled send returns the
@@ -319,7 +341,8 @@ pub(crate) fn attachment_upload(
 
 pub(crate) fn draft_create(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     patch: bifrost_types::DraftPatch,
 ) -> AccountFuture<Result<bifrost_types::DraftHandle, AccountError>> {
     Box::pin(async move {
@@ -339,7 +362,13 @@ pub(crate) fn draft_create(
             .await
             .map_err(to_acct_err(AccountOperation::DraftCreate))?;
         if !response.new_state().is_empty() {
-            advance_email_state(&email_state, None, response.new_state().to_string()).await;
+            state_cache::advance(
+                &email_states,
+                &account_id,
+                None,
+                response.new_state().to_string(),
+            )
+            .await;
         }
         let mut email = response
             .created(&create_id)
@@ -350,7 +379,8 @@ pub(crate) fn draft_create(
 
 pub(crate) fn draft_update(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     draft: bifrost_types::DraftHandle,
     patch: bifrost_types::DraftPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -367,7 +397,8 @@ pub(crate) fn draft_update(
         let email_id_for_set = email_id.clone();
         let mut response = send_email_set_with_retry(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             AccountOperation::DraftUpdate,
             move |state| {
                 let mut set = EmailSet::new().if_in_state(state.to_string());
@@ -385,13 +416,15 @@ pub(crate) fn draft_update(
 
 pub(crate) fn draft_discard(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     draft: bifrost_types::DraftHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         destroy_emails(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             [EmailId::new(draft.0)],
             AccountOperation::DraftDiscard,
         )
@@ -401,7 +434,8 @@ pub(crate) fn draft_discard(
 
 pub(crate) fn draft_send(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     draft: bifrost_types::DraftHandle,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
@@ -426,7 +460,7 @@ pub(crate) fn draft_send(
         let fresh = super::mutation::probe_email_state(&mail)
             .await
             .map_err(to_acct_err(AccountOperation::DraftSend))?;
-        set_email_state(&email_state, fresh).await;
+        state_cache::set(&email_states, &account_id, fresh).await;
         Ok(ObjectId(draft_id.into_string()))
     })
 }
@@ -493,7 +527,8 @@ pub(crate) fn containers_list(
 
 pub(crate) fn container_create(
     mail: MailAccount,
-    mailbox_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
+    account_id: String,
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
@@ -516,7 +551,12 @@ pub(crate) fn container_create(
             .await
             .map_err(to_acct_err(AccountOperation::ContainerCreate))?;
         if !response.new_state().is_empty() {
-            set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
+            state_cache::set(
+                &mailbox_states,
+                &account_id,
+                response.new_state().to_string(),
+            )
+            .await;
         }
         let mut mailbox = response
             .created(&create_id)
@@ -527,7 +567,8 @@ pub(crate) fn container_create(
 
 pub(crate) fn container_rename(
     mail: MailAccount,
-    mailbox_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
+    account_id: String,
     container: ContainerId,
     name: String,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -543,7 +584,12 @@ pub(crate) fn container_rename(
             .unwrap_update_errors()
             .map_err(to_acct_err(AccountOperation::ContainerRename))?;
         if !response.new_state().is_empty() {
-            set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
+            state_cache::set(
+                &mailbox_states,
+                &account_id,
+                response.new_state().to_string(),
+            )
+            .await;
         }
         Ok(())
     })
@@ -551,7 +597,8 @@ pub(crate) fn container_rename(
 
 pub(crate) fn container_move(
     mail: MailAccount,
-    mailbox_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
+    account_id: String,
     container: ContainerId,
     new_parent: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -568,7 +615,12 @@ pub(crate) fn container_move(
             .unwrap_update_errors()
             .map_err(to_acct_err(AccountOperation::ContainerMove))?;
         if !response.new_state().is_empty() {
-            set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
+            state_cache::set(
+                &mailbox_states,
+                &account_id,
+                response.new_state().to_string(),
+            )
+            .await;
         }
         Ok(())
     })
@@ -576,7 +628,8 @@ pub(crate) fn container_move(
 
 pub(crate) fn container_delete(
     mail: MailAccount,
-    mailbox_state: Arc<Mutex<Option<String>>>,
+    mailbox_states: StateMap,
+    account_id: String,
     container: ContainerId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
@@ -593,7 +646,12 @@ pub(crate) fn container_delete(
             .destroyed(&mailbox)
             .map_err(to_acct_err(AccountOperation::ContainerDelete))?;
         if !response.new_state().is_empty() {
-            set_mailbox_state(&mailbox_state, response.new_state().to_string()).await;
+            state_cache::set(
+                &mailbox_states,
+                &account_id,
+                response.new_state().to_string(),
+            )
+            .await;
         }
         Ok(())
     })
@@ -910,7 +968,8 @@ pub(crate) fn message_hydrate(
 
 pub(crate) fn move_thread(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     thread: ThreadId,
     target: ContainerId,
     source: Option<ContainerId>,
@@ -918,7 +977,8 @@ pub(crate) fn move_thread(
     Box::pin(async move {
         patch_mailbox_membership(
             &mail,
-            &email_state,
+            &email_states,
+            &account_id,
             MutationTarget::Thread(thread.clone()),
             target,
             true,
@@ -928,7 +988,8 @@ pub(crate) fn move_thread(
         if let Some(source) = source {
             patch_mailbox_membership(
                 &mail,
-                &email_state,
+                &email_states,
+                &account_id,
                 MutationTarget::Thread(thread),
                 source,
                 false,
@@ -942,7 +1003,8 @@ pub(crate) fn move_thread(
 
 pub(crate) fn delete_thread(
     mail: MailAccount,
-    email_state: Arc<Mutex<Option<String>>>,
+    email_states: StateMap,
+    account_id: String,
     thread: ThreadId,
     current: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -965,11 +1027,19 @@ pub(crate) fn delete_thread(
                 AccountOperation::BulkDestroy,
             )
             .await?;
-            destroy_emails(&mail, &email_state, ids, AccountOperation::BulkDestroy).await
+            destroy_emails(
+                &mail,
+                &email_states,
+                &account_id,
+                ids,
+                AccountOperation::BulkDestroy,
+            )
+            .await
         } else {
             patch_mailbox_membership(
                 &mail,
-                &email_state,
+                &email_states,
+                &account_id,
                 MutationTarget::Thread(thread.clone()),
                 ContainerId(trash.into_string()),
                 true,
@@ -979,7 +1049,8 @@ pub(crate) fn delete_thread(
             if let Some(source) = current {
                 patch_mailbox_membership(
                     &mail,
-                    &email_state,
+                    &email_states,
+                    &account_id,
                     MutationTarget::Thread(thread),
                     source,
                     false,
@@ -994,7 +1065,8 @@ pub(crate) fn delete_thread(
 
 async fn patch_mailbox_membership(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
     target: MutationTarget,
     container: ContainerId,
     value: bool,
@@ -1003,14 +1075,15 @@ async fn patch_mailbox_membership(
     let ids = resolve_target(mail, target, op).await?;
     let mailbox = MailboxId::new(container.0);
     let ids_for_set = ids.clone();
-    let mut response = send_email_set_with_retry(mail, email_state, op, move |state| {
-        let mut set = EmailSet::new().if_in_state(state.to_string());
-        for id in &ids_for_set {
-            set.update(id.clone()).mailbox_id(&mailbox, value);
-        }
-        set
-    })
-    .await?;
+    let mut response =
+        send_email_set_with_retry(mail, email_states, account_id, op, move |state| {
+            let mut set = EmailSet::new().if_in_state(state.to_string());
+            for id in &ids_for_set {
+                set.update(id.clone()).mailbox_id(&mailbox, value);
+            }
+            set
+        })
+        .await?;
     for id in &ids {
         response.updated(id).map_err(to_acct_err(op))?;
     }
@@ -1054,7 +1127,8 @@ async fn resolve_target(
 
 async fn destroy_emails(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
     ids: impl IntoIterator<Item = EmailId> + Clone + Send + 'static,
     op: AccountOperation,
 ) -> Result<(), AccountError> {
@@ -1063,12 +1137,13 @@ async fn destroy_emails(
         return Ok(());
     }
     let ids_for_set = ids_vec.clone();
-    let mut response = send_email_set_with_retry(mail, email_state, op, move |state| {
-        EmailSet::new()
-            .if_in_state(state.to_string())
-            .destroy(ids_for_set.clone())
-    })
-    .await?;
+    let mut response =
+        send_email_set_with_retry(mail, email_states, account_id, op, move |state| {
+            EmailSet::new()
+                .if_in_state(state.to_string())
+                .destroy(ids_for_set.clone())
+        })
+        .await?;
     for id in &ids_vec {
         response.destroyed(id).map_err(to_acct_err(op))?;
     }
@@ -1077,14 +1152,15 @@ async fn destroy_emails(
 
 async fn send_email_set_with_retry<F>(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
     op: AccountOperation,
     mut make_set: F,
 ) -> Result<crate::core::set::SetResponse<Email>, AccountError>
 where
     F: FnMut(&str) -> EmailSet,
 {
-    let mut state = current_or_probe_email_state(mail, email_state, op).await?;
+    let mut state = current_or_probe_email_state(mail, email_states, account_id, op).await?;
     let err_fn = to_acct_err(op);
     let response = match mail.call(make_set(&state)).await {
         Ok(response) => response,
@@ -1095,64 +1171,40 @@ where
             let fresh = super::mutation::probe_email_state(mail)
                 .await
                 .map_err(to_acct_err(op))?;
-            set_email_state(email_state, fresh.clone()).await;
+            state_cache::set(email_states, account_id, fresh.clone()).await;
             state = fresh;
             mail.call(make_set(&state)).await.map_err(to_acct_err(op))?
         }
     };
     if !response.new_state().is_empty() {
-        advance_email_state(email_state, Some(&state), response.new_state().to_string()).await;
+        state_cache::advance(
+            email_states,
+            account_id,
+            Some(&state),
+            response.new_state().to_string(),
+        )
+        .await;
     }
     Ok(response)
 }
 
 async fn current_or_probe_email_state(
     mail: &MailAccount,
-    email_state: &Arc<Mutex<Option<String>>>,
+    email_states: &StateMap,
+    account_id: &str,
     op: AccountOperation,
 ) -> Result<String, AccountError> {
-    let cached = {
-        let guard = email_state.lock().await;
-        guard.clone()
-    };
-    match cached {
-        Some(state) => Ok(state),
-        None => {
-            let state = super::mutation::probe_email_state(mail)
-                .await
-                .map_err(to_acct_err(op))?;
-            let mut guard = email_state.lock().await;
-            match guard.clone() {
-                Some(existing) => Ok(existing),
-                None => {
-                    *guard = Some(state.clone());
-                    Ok(state)
-                }
-            }
-        }
+    if let Some(state) = state_cache::get(email_states, account_id).await {
+        return Ok(state);
     }
-}
-
-async fn set_email_state(email_state: &Arc<Mutex<Option<String>>>, state: String) {
-    let mut guard = email_state.lock().await;
-    *guard = Some(state);
-}
-
-async fn advance_email_state(
-    email_state: &Arc<Mutex<Option<String>>>,
-    expected: Option<&str>,
-    state: String,
-) {
-    let mut guard = email_state.lock().await;
-    match (guard.as_deref(), expected) {
-        (Some(current), Some(expected)) if current != expected => {}
-        _ => *guard = Some(state),
+    let state = super::mutation::probe_email_state(mail)
+        .await
+        .map_err(to_acct_err(op))?;
+    if let Some(existing) = state_cache::get(email_states, account_id).await {
+        return Ok(existing);
     }
-}
-
-async fn set_mailbox_state(mailbox_state: &Arc<Mutex<Option<String>>>, state: String) {
-    let mut guard = mailbox_state.lock().await;
-    *guard = Some(state);
+    state_cache::set(email_states, account_id, state.clone()).await;
+    Ok(state)
 }
 
 async fn role_mailbox(

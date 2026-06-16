@@ -8,6 +8,7 @@ mod cursor;
 mod error;
 mod ews_stream;
 mod filters;
+mod foreign;
 mod get;
 mod graph_error;
 mod inventory;
@@ -57,6 +58,14 @@ pub(crate) enum PushMode {
 #[derive(Clone)]
 pub(crate) struct GraphAccount {
     pub(crate) client: GraphClient,
+    /// Foreign (shared/delegate) mailbox clients, keyed by the
+    /// `/users/{id}` routing key. Built once at `open` from the
+    /// factory's configured shared mailboxes via
+    /// `GraphClient::for_shared_mailbox`. Selecting the right client by
+    /// scope (`client_for_scope`) keeps every existing call site - which
+    /// reads `api_path_prefix()` off the client - mailbox-correct by
+    /// construction.
+    pub(crate) shared_clients: Arc<HashMap<String, GraphClient>>,
     pub(crate) capabilities: AccountCapabilities,
     pub(crate) push_endpoint: Option<PushEndpoint>,
     pub(crate) push_mode: PushMode,
@@ -77,10 +86,16 @@ impl GraphAccount {
         client: GraphClient,
         push_mode: PushMode,
         push_endpoint: Option<PushEndpoint>,
+        shared_mailboxes: &[String],
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
+        let shared_clients = shared_mailboxes
+            .iter()
+            .map(|mailbox| (mailbox.clone(), client.for_shared_mailbox(mailbox.clone())))
+            .collect();
         Self {
             client,
+            shared_clients: Arc::new(shared_clients),
             capabilities: capabilities::build_capabilities(push_mode),
             push_endpoint,
             push_mode,
@@ -98,7 +113,46 @@ impl GraphAccount {
 
     #[cfg(test)]
     pub(crate) fn new_for_tests(client: GraphClient, push_mode: PushMode) -> Self {
-        Self::new(client, push_mode, None)
+        Self::new(client, push_mode, None, &[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests_with_shared(
+        client: GraphClient,
+        push_mode: PushMode,
+        shared_mailboxes: &[String],
+    ) -> Self {
+        Self::new(client, push_mode, None, shared_mailboxes)
+    }
+
+    /// Select the `GraphClient` whose `/users/{mailbox}` prefix routes
+    /// this scope. A `FolderType` scope whose `FolderId` parses as a
+    /// foreign-mailbox folder and whose mailbox has a configured shared
+    /// client routes there; everything else (primary folders, unknown
+    /// mailboxes) routes through the primary client.
+    pub(crate) fn client_for_scope(&self, scope: &CursorScope) -> &GraphClient {
+        if let CursorScope::FolderType { folder, .. } = scope
+            && let Some(foreign) = foreign::parse_folder(folder).foreign()
+            && let Some(client) = self.shared_clients.get(&foreign.mailbox)
+        {
+            client
+        } else {
+            &self.client
+        }
+    }
+
+    /// The owning shared-mailbox identity for a foreign scope, or `None`
+    /// for a primary-mailbox scope. Used to decide whether a per-scope
+    /// permission denial quarantines just this scope (foreign) or
+    /// escalates account-wide (primary).
+    pub(crate) fn owner_of_scope(&self, scope: &CursorScope) -> Option<bifrost_types::MailboxId> {
+        if let CursorScope::FolderType { folder, .. } = scope {
+            foreign::parse_folder(folder)
+                .foreign()
+                .map(|foreign| bifrost_types::MailboxId(foreign.mailbox.clone()))
+        } else {
+            None
+        }
     }
 }
 
@@ -107,6 +161,7 @@ pub struct GraphAccountFactory {
     client: GraphClient,
     push_mode: PushMode,
     push_endpoint: Option<PushEndpoint>,
+    shared_mailboxes: Vec<String>,
 }
 
 impl GraphAccountFactory {
@@ -116,7 +171,19 @@ impl GraphAccountFactory {
             client,
             push_mode: PushMode::GraphSubscriptions,
             push_endpoint: None,
+            shared_mailboxes: Vec::new(),
         }
+    }
+
+    /// Register a delegate/shared mailbox by its routing key (the SMTP
+    /// address or user id Graph accepts at `/users/{id}`). The mailbox's
+    /// folders are discovered, established, and synced alongside the
+    /// primary mailbox. Auto-discovery of delegated mailboxes is A5b
+    /// (Autodiscover/EWS); until then the consumer names them here.
+    // pub: shared-mailbox consumers register foreign mailboxes before building the factory.
+    pub fn with_shared_mailbox(mut self, mailbox: impl Into<String>) -> Self {
+        self.shared_mailboxes.push(mailbox.into());
+        self
     }
 
     // pub: webhook-mode consumers provide the public Graph subscription callback URL here.
@@ -144,6 +211,7 @@ impl AccountFactory for GraphAccountFactory {
         let client = self.client.clone();
         let push_mode = self.push_mode;
         let push_endpoint = self.push_endpoint.clone();
+        let shared_mailboxes = self.shared_mailboxes.clone();
         Box::pin(async move {
             client.attach_account(account_id);
             client.get_profile().await.map_err(|e| {
@@ -154,7 +222,8 @@ impl AccountFactory for GraphAccountFactory {
                     ),
                 )
             })?;
-            let account = GraphAccount::new(client.clone(), push_mode, push_endpoint);
+            let account =
+                GraphAccount::new(client.clone(), push_mode, push_endpoint, &shared_mailboxes);
             let folders = client.list_mail_folders_recursive().await.map_err(|e| {
                 super::account::graph_error::into_account_error(
                     e,
