@@ -1,0 +1,360 @@
+# bifrost error model reference
+
+The shared `AccountError` contract every protocol crate produces and
+every consumer (`bifrost-sync`, downstream apps) reads. Lives in
+`crates/types/src/error/` and is re-exported from
+`bifrost_types::error`. Per-provider wire-to-`AccountError` mapping is
+documented in each `reference/<crate>.md`; this doc is the shared
+target they map onto. The code is authoritative for anything derivable
+(the kind/cause/recovery enums and the `derive` table); this file
+captures the load-bearing shape and the invariants the table enforces.
+
+## AccountError
+
+`AccountError` (`account_error.rs`) is an opaque
+`Arc<AccountErrorInner>` newtype: `Clone` is one Arc bump, so it rides
+through batch lanes, broadcast channels, and `Fatal` wrappers without
+deep copies. `#[non_exhaustive]`, no public fields, no public
+constructor - the only way in is `AccountErrorBuilder`. The inner
+struct carries `kind`, derived `recovery` / `remediation` /
+`message_key`, optional `scope` / `operation` / `provider` /
+`protocol`, the `DiagnosticInfo`, and the `CauseChain`.
+
+Accessors (all `&self`, cheap): `kind`, `recovery`,
+`suggested_remediation`, `scope`, `operation`, `provider`, `protocol`,
+`message_key`, `chain`, plus the diagnostic projections below.
+`Display` prints `"{message_key} ({kind:?})"` - never free-form
+provider text. `StdError::source()` bridges to
+`chain.outermost()` so `?`-chaining and `anyhow`-style walkers reach
+the cause graph; each `Cause` variant is itself `StdError`.
+
+`into_builder(self)` is the **decoration** path, not reclassification.
+It unwraps the Arc (clone-on-share), splits the chain into primary +
+extras, and returns a builder pre-loaded with the original `kind`,
+primary `Cause`, top-level fields, and diagnostics. The builder exposes
+no kind-changing method; `push_cause` only appends secondary evidence.
+Derived fields recompute on `try_build`. Builder-only overrides
+(`idempotency_override`, `throttle_scope`) are **not** preserved across
+the round-trip and must be reapplied; a `ServerCause` retry hint
+survives structurally because it lives in the chain. Reclassifying to a
+different primary kind/cause requires a fresh `AccountErrorBuilder::new`.
+
+## AccountErrorBuilder funnel
+
+`builder.rs`. `AccountErrorBuilder::new(kind, primary_cause)` is the
+sole entry; setters are `#[must_use]` consuming-`self` (`operation`,
+`scope`, `provider`, `protocol`, `push_cause`, `request_id`,
+`trace_id`, `status`, `native_code`, `text`, `idempotency_override`,
+`throttle_scope`).
+
+The terminator is **`try_build` -> `Result<AccountError,
+AccountErrorBuildError>`**, not an infallible `build`. The `Err` arm is
+a producer-bug surface, not recoverable runtime state: protocol-crate
+translation boundaries call
+`.expect("valid account error classification")`. `AccountErrorBuildError`
+(`#[non_exhaustive]`) enumerates the four enforced invariants:
+
+- `EmptyChain` - every error carries at least one primary `Cause`.
+  (In practice unreachable from `new`, which requires a primary.)
+- `KindCauseMismatch { kind, primary_cause }` - the declared `kind`
+  and the outermost `Cause` disagree (`recovery::kind_matches_cause`).
+  **Also** the carrier for a `throttle_scope` attached to anything but
+  `Server(RateLimited | QuotaExhausted)`.
+- `TransportAcknowledged` - `Transport(_)` kind paired with any
+  `Attempt(Acknowledged)` cause. Transport failure means no complete
+  server response arrived; an acknowledged attempt belongs on a
+  `Server`/`Protocol` kind.
+- `CursorInvalidWithoutScope` - `SyncState(CursorInvalid)` without an
+  `ErrorScope::Cursor`. The engine cannot route a scope-less cursor
+  restart; the convergence rewrite removed the silent
+  `RestartAccount` fallback, so producers must thread the scope.
+
+On success `try_build` derives `recovery` (`recovery::derive`),
+`remediation` (`recovery::suggest`), and `message_key`
+(`message_key::derive`) from the validated parts, then freezes the
+Arc. Derivation is pure: same parts in, same classification out.
+
+## AccountErrorKind and message keys
+
+`kind.rs`. `AccountErrorKind` (`#[non_exhaustive]`) is the stable
+top-level taxonomy with per-family subkind enums:
+
+- `Transport(TransportErrorKind)` - `Network` / `Timeout` / `Tls`.
+- `Authentication(AuthErrorKind)` - `Expired` / `RefreshTransient` /
+  `Revoked` / `ReauthorizationRequired`.
+- `Authorization(AccessErrorKind)` - admin consent, conditional
+  access, policy, scope, permission, account-disabled, mailbox
+  unavailable (`MailboxUnavailableKind::{Transient,Permanent}`),
+  not-licensed.
+- `Server(ServerErrorKind)` - `Unavailable` / `RateLimited` /
+  `QuotaExhausted` / `Error { status: Option<u16> }`.
+- `SyncState(SyncStateErrorKind)` - cursor invalid, strategy failure,
+  scope-capability lost, schema incompatible, capability changed,
+  operator-override needed.
+- `ConcurrencyConflict` (flat).
+- `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
+- `NotFound(ResourceKind)` - message, mailbox, thread, calendar,
+  contact, draft, identity, vacation, push-subscription, account.
+- `Unsupported(AccountOperation)`.
+- `Protocol(ProtocolErrorKind)` - parse-failed, missing-field,
+  contract-violation, partial-response, unknown.
+
+`message_key::derive(&kind) -> &'static str` is the stable telemetry
+namespace: dotted, family-prefixed, hyphenated leaf
+(`transport.network`, `auth.refresh-transient`,
+`authz.admin-consent-required`, `server.rate-limited`,
+`syncstate.cursor-invalid`, `concurrency.conflict`,
+`request.batch-input-invalid`, `notfound.message`,
+`protocol.partial-response`, ...). The keys are exhaustively pinned by
+`documented_message_keys_are_derived`. Two collapse subkind detail:
+`Server(Error { status })` is always `server.error` (status rides in
+`DiagnosticInfo`, not the key), and `Unsupported(_)` is the bare
+`unsupported`. The dotted convention is the contract; read
+`message_key.rs` for the live list rather than copying it here.
+
+## RecoveryClass
+
+`recovery.rs`. `RecoveryClass` (`#[non_exhaustive]`) is the consumer's
+dispatch surface. Four mutually-exclusive, exhaustive helpers partition
+it (proven by `recovery_helpers_are_mutually_exclusive_and_exhaustive`):
+
+- `is_retryable()` -> `Retry(RetryAdvice)`.
+- `requires_reconciliation()` -> `Reconcile(ReconcileAdvice)`.
+- `requires_engine_action()` -> `Engine(EngineDirective)`.
+- `is_terminal()` - the negation: everything else (`AuthLost`,
+  `NeedsAdminConsent`, `NeedsPolicyChange`, `NoPermission`,
+  `Unsupported`, `ClientBug`, `ProviderContractViolation`,
+  `ProviderRefused`, `UnknownPermanent`).
+
+`EngineDirective`: `RestartScope(CursorScope)`, `RestartAccount`,
+`DowngradeStrategy(StrategyDowngrade)`,
+`DowngradeCapabilityForScope(CursorScope)`, `SchemaIncompatible`,
+`OperatorOverrideRequired { reason }`. There is no longer a
+`CapabilityChanged` directive - capability shifts route to
+`RestartAccount` so the engine re-runs discovery (the
+`StateCause::CapabilityChanged` delta is forensic-only).
+
+`RetryAdvice { disposition, retry_hint, reason, throttle_scope }`.
+Retry timing is a single **`RetryHint` enum**, not split fields:
+`After(Duration)` (delta-seconds / `min_delay` semantics) or
+`At(SystemTime)` (HTTP-date `Retry-After`). `not_before(now)` and
+`min_delay(now)` resolve it either way (the split `not_before` +
+`min_delay` fields the spec once carried produced the side-channel bug
+the convergence rewrite eliminated). `disposition` is
+`RetryDisposition::{SameRequest, AfterStateRefresh, AfterAuthRefresh}`;
+`reason` is `RetryReason::{Transport, ServerUnavailable, RateLimited,
+QuotaExhausted, ConcurrencyConflict, RefreshTransient}`.
+
+`ReconcileAdvice { reason, guidance }`:
+`ReconcileReason::{TransportDropAfterSend, PartialCompletionSignal}`
+plus `guidance.actions: Vec<ReconcileAction>` where `ReconcileAction`
+is `CheckTarget` / `DedupeByClientId`.
+
+`ThrottleScope::{CurrentOperation, Mailbox, Account, Tenant, Provider}`
+is the producer hint; the engine lifts the sharable scopes into a
+`ThrottleKey::{Mailbox, Account, Tenant, Provider}` bucket.
+`CurrentOperation` is a per-call inline delay and never enters a key.
+
+`Fatal(AccountError)` is the terminal-only newtype. `TryFrom` accepts
+iff `recovery().is_terminal()`, returning the error back on the `Err`
+arm otherwise; engine operator-notification / permanent-failure sinks
+consume `Fatal` so the type system enforces "the engine has nothing
+left to try." This is the collapse point: every terminal `RecoveryClass`
+variant funnels into one carrier.
+
+`RemediationAction` (operator-facing suggestion, derived by `suggest`):
+`RefreshToken`, `Reauthorize`, `RequestAdminConsent { needed }`,
+`UpdateTenantPolicy`, `CheckMailboxLicense`,
+`RetryLater { retry_hint }`, `FixClientRequest`,
+`ContactProviderSupport`.
+
+### Central derivation
+
+`recovery::derive(kind, scope, operation, chain, throttle_scope,
+idempotency_override)` is the single mapping. Two inputs come from
+outside the kind: `tx_state` = the first `Attempt` cause's
+`TransmissionState` (default `Unsent`), and `idempotent` =
+`idempotency_override` else `operation.is_idempotent()` (a `None`
+operation is treated idempotent). The rules at altitude (read
+`derive_*` for exact rows):
+
+- **Transport** -> always transient. `transient_retry_or_reconcile`:
+  `Unsent`/`Acknowledged`, or `InFlight`+idempotent -> `Retry(SameRequest,
+  Transport)`; `InFlight`+non-idempotent ->
+  `Reconcile(TransportDropAfterSend, [CheckTarget])`. `Acknowledged` is
+  a producer bug here: `debug_assert!` in debug, defensive demotion to
+  `InFlight` in release (and `try_build` rejects it upstream anyway).
+- **Authentication** -> `RefreshTransient` is `Retry(AfterAuthRefresh,
+  RefreshTransient)` (carries the chain's server retry hint); `Expired` /
+  `Revoked` / `ReauthorizationRequired` collapse to `AuthLost`.
+- **Authorization** -> `AdminConsentRequired` ->
+  `NeedsAdminConsent { needed }`; conditional-access / policy / scope /
+  not-licensed -> `NeedsPolicyChange`; `PermissionDenied` ->
+  `NoPermission { resource }`; `AccountDisabled` and
+  `MailboxUnavailable(Permanent)` -> `ProviderRefused`;
+  `MailboxUnavailable(Transient)` -> `Retry(SameRequest)`.
+- **Server** -> `Unavailable`/`RateLimited`/`QuotaExhausted` route
+  through `transient_retry_or_reconcile` (rate/quota propagate
+  `throttle_scope` and the retry hint). `Error { status }`: 5xx (or no
+  numeric status while `InFlight`) is transient; everything else (4xx,
+  IMAP `NO`/`BAD` not in-flight) -> `ProviderRefused`.
+- **SyncState** -> all `Engine(_)`: `CursorInvalid` -> `RestartScope`
+  (scope guaranteed by build-time check); `StrategyFailure` ->
+  `DowngradeStrategy`; `ScopeCapabilityLost` ->
+  `DowngradeCapabilityForScope` (or `RestartAccount` if no scope);
+  `SchemaIncompatible` -> `SchemaIncompatible`; `CapabilityChanged` ->
+  `RestartAccount`; `OperatorOverrideNeeded` ->
+  `OperatorOverrideRequired { reason }`.
+- **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
+  ConcurrencyConflict)`.
+- **Request** (both subkinds) -> `ClientBug`.
+- **NotFound** -> `ProviderRefused` (unconditional; the per-operation
+  "this NotFound is benign, absorb it" policy is **not** in this module
+  - it lives at the call site in each protocol crate's operation, which
+  swallows the absent-resource case before building an error).
+- **Unsupported** -> `Unsupported(op)`.
+- **Protocol** -> parse / missing-field / contract-violation ->
+  `ProviderContractViolation`; `PartialResponse` -> `Retry(SameRequest)`
+  if idempotent else `Reconcile(PartialCompletionSignal, [CheckTarget,
+  DedupeByClientId])`; `Unknown` -> `UnknownPermanent`.
+
+## Cause chain
+
+`cause.rs`. `CauseChain` is a non-empty ordered `Vec<Cause>`:
+`outermost()` (the primary, index 0) and `root()` (last). `Cause`
+(`#[non_exhaustive]`) variants:
+
+- `Transport(TransportCause { kind, message })`,
+- `Attempt(AttemptCause { transmission_state })`,
+- `Auth(AuthCause)`, `Access(AccessCause)`, `Server(ServerCause)`,
+  `State(StateCause)`, `Request(RequestCause)`,
+- `Wire(WireCause)`.
+
+`AttemptCause` / `TransmissionState::{Unsent, InFlight, Acknowledged}`
+is the **transmission-evidence** carrier: it is what `derive` reads to
+choose retry-vs-reconcile, and what `try_build` cross-checks against
+`Transport`. Producers thread it as a secondary cause via `push_cause`.
+
+`ServerCause` carries the optional `RetryHint` for the
+unavailable/rate/quota arms (the only structural channel for retry
+timing). `StateCause` carries engine-directive payloads
+(`StrategyDowngrade`, `CapabilityChanged { delta }`,
+`OperatorOverrideNeeded { reason }`).
+
+`WireCause` is **diagnostic-only** - it never feeds `derive` (the
+recovery mapping keys off `kind`, not the raw wire code). It preserves
+the provider's native vocabulary for support exports:
+`Graph(GraphSignal)`, `Jmap(JmapMethod)`, `Imap(ImapResponseCode)`,
+`Smtp(EnhancedStatusCode)`, `Gmail(GmailSignal)`, and
+`MalformedResponse { protocol, detail }`. Each provider enum exposes
+`code()` (the on-wire string) for telemetry. `Cause::summary()`
+projects any cause into a flat `CauseSummary { kind, detail,
+transmission_state, status, native_code }` for the internal export
+tier.
+
+## Batch and stream outcomes
+
+`batch.rs`. `BatchOutcome<T>` (`#[non_exhaustive]`, immutable) is the
+**three-lane** result of a `Vec<BatchItem<_>>` operation:
+`succeeded: [BatchSuccess<T>]`, `failed: [BatchFailure]`,
+`uncertain: [BatchUncertain]`, plus an `order` index so `iter()`
+replays submission order. The lanes are closed by design - a fourth
+lane is a deliberate breaking change, never a wildcard-absorbed
+extension. `BatchFailure` and `BatchUncertain` each carry an
+`AccountError`; the uncertain lane is the batch analogue of an
+`InFlight` non-idempotent drop and always queues for read-back.
+
+`BatchItemId(String)` correlates each lane entry back to its submitted
+`BatchItem`. `BatchOutcomeBuilder` accumulates via `push_succeeded` /
+`push_failed` / `push_uncertain`, then `finalize(&expected)` enforces
+the **accounting invariant**: every submitted id appears in exactly one
+lane, with no missing / duplicate / unknown ids, else
+`BatchInvariantError { missing, duplicates, unknown }`. This is a
+producer-bug surface caught by per-crate tests.
+
+Boundary contract for batch-shaped `Account` methods: **`Err(_)` means
+nothing was transmitted** (whole-request failure); **`Ok(BatchOutcome)`
+means every item is accounted for exactly once** across the three
+lanes. `validate_batch_input` is the pre-flight guard - empty input or
+empty/duplicate `BatchItemId`s surface as
+`Request(BatchInputInvalid)` before any byte crosses the side-effect
+boundary.
+
+`stream.rs`. `ItemOutcome<T>` is the streaming counterpart -
+`Succeeded(BatchSuccess<T>)` / `Failed(BatchFailure)` /
+`Uncertain(BatchUncertain)` - the same closed three-lane model, emitted
+per item instead of collected. Deliberately not `#[non_exhaustive]`: a
+wildcard arm would let stale consumer policy silently apply to a new
+lane. `MutationSuccess::{Applied, Skipped}` is the flag-mutation
+success payload.
+
+## Diagnostics and consent tiers
+
+`diagnostic.rs`. `DiagnosticInfo` holds `request_id`, `trace_id`,
+`status`, `native_code`, and `text: Vec<DiagnosticText>`.
+`DiagnosticText { value, visibility }` tags each string
+`DetailVisibility::{UserSafe, SupportOnly}` (constructors
+`user_safe` / `support_only`). This tagging drives a graduated
+consent-tier export off `AccountError`:
+
+- `telemetry_fields()` / `support_minimal()` -> `TelemetryView`:
+  discriminants + ids + structured recovery fields + transmission
+  state. **No free-form text** (`telemetry_has_no_free_form_text`); safe
+  to ship to metrics unconditionally.
+- `user_safe_text()` -> iterator over only the `UserSafe` strings.
+- `support_consented()` -> `SupportExportConsented`: telemetry +
+  user-safe text + support-only text + `scope`. Requires user consent.
+- `support_internal()` -> `SupportExportInternal`: the consented export
+  plus the full `chain` as `CauseSummary`s. Internal tier only.
+
+All export structs are `Serialize`; `TelemetryView` projects the
+recovery fields (disposition/reason/throttle for retry, reason/actions
+for reconcile, none for terminal) via the `recovery_fields` /
+`recovery_discriminant` matches in `account_error.rs`.
+
+## Scope, operation, provider, protocol
+
+`scope.rs`. `ErrorScope` (`#[non_exhaustive]`, custom `Serialize`)
+locates the failure: `Account`, `Cursor(CursorScope)`, and id-bearing
+`Mailbox` / `Message` / `Thread` / `Calendar` / `Contact` plus the
+collection variants. `AccountOperation` is the large
+`#[non_exhaustive]` operation enum; `is_idempotent()` is the
+**authoritative idempotency source** `derive` consults (the explicit
+non-idempotent set is the mutating ops - sends, creates, updates,
+deletes, moves, container/draft/contact/event writes). `Provider` and
+`Protocol` are the small stable provenance enums.
+
+## Warning is outside the error model
+
+`warning.rs`. `Warning { kind: WarningKind, message, next_action,
+protocol_detail, retry_count }` is **deliberately not** part of the
+error model: it is advisory, never aborts a stream, carries no
+`RecoveryClass`, and never converts to `AccountError`.
+`WarningKind::{StrategyDowngraded, OperatorAttentionNeeded, Throttled,
+ClockSkew, BlobNotByteStream, ReadbackSkipped, Other}`. The sync engine
+emits warnings alongside (not instead of) errors; see `reference/sync.md`.
+
+## File map
+
+```
+crates/types/src/error/
+  mod.rs           // module + public re-exports
+  account_error.rs // AccountError, accessors, into_builder,
+                   // StdError bridge, TelemetryView projection
+  builder.rs       // AccountErrorBuilder + try_build invariants
+                   // (AccountErrorBuildError)
+  kind.rs          // AccountErrorKind + subkind enums
+  message_key.rs   // derive() stable dotted namespace
+  recovery.rs      // RecoveryClass, derive/suggest, RetryHint,
+                   // EngineDirective, Fatal, ThrottleKey/Scope
+  cause.rs         // Cause/CauseChain, Attempt/TransmissionState,
+                   // WireCause provider vocabularies, CauseSummary
+  batch.rs         // BatchOutcome three-lane + builder/finalize,
+                   // BatchItemId, validate_batch_input
+  stream.rs        // ItemOutcome, MutationSuccess
+  diagnostic.rs    // DiagnosticInfo/Text, DetailVisibility,
+                   // TelemetryView, support-export tiers
+  scope.rs         // ErrorScope, AccountOperation (is_idempotent),
+                   // Provider, Protocol
+  warning.rs       // Warning + WarningKind (outside the error model)
+```
