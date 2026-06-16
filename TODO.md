@@ -82,6 +82,20 @@ re-auditors don't re-raise them.)
   accounts. (Carried from the deleted `plans/unification.md` decision
   point 8, which was never stamped resolved.)
 
+## bifrost-sasl
+
+- **sasl-F1.** Typed public auth-outcome surface. The SASL/channel-binding
+  work landed the computation, mechanism selection, and downgrade protection,
+  but deferred a typed public record of *which mechanism + channel binding
+  were used* on success (useful for audit logs / enterprise debugging) and a
+  typed failure reason (mechanism rejected, channel binding required but
+  unavailable, credential rejected, server protocol violation). Today the
+  protocol crates map into their existing error types and expose no such
+  outcome record. Was step 5 ("Public API shape") of the deleted SASL plan;
+  build it when a consumer (ratatoskr) needs the audit surface. Lives in
+  `bifrost-imap` / `bifrost-smtp` (the public auth surfaces), not the private
+  `bifrost-sasl` crate.
+
 ## bifrost-gmail
 
 - **gmail-N1.** `inventory.rs:196`: clone `id` before move into

@@ -118,3 +118,40 @@ collapsing the formerly duplicated IMAP and SMTP builders. The crate still
 exposes no selection function - selection policy lives in each protocol crate.
 EdDSA leaf-cert channel binding is deliberately a hard error until an
 evidence-driven vector pins the binding hash a real server uses.
+
+## Mechanism preference
+
+When password credentials are configured, each protocol crate picks the
+strongest mechanism the server advertises, in this canonical order:
+
+1. SCRAM-SHA-256-PLUS
+2. SCRAM-SHA-1-PLUS
+3. SCRAM-SHA-256
+4. SCRAM-SHA-1
+5. PLAIN (only over TLS)
+
+A channel-bound SHA-1 exchange outranks an unbound SHA-256 one, so
+SCRAM-SHA-1-PLUS sits above SCRAM-SHA-256. LOGIN and any other
+cleartext-credential mechanism are never auto-selected when something
+stronger is on offer; they are opt-in only (IMAP `AuthPolicy::allow_login`,
+SMTP an explicit `authentication(...)` list - LOGIN is not in SMTP's default
+`PASSWORD_MECHANISMS`). OAuth (XOAUTH2 / OAUTHBEARER) is an orthogonal path:
+when OAuth credentials are configured the SCRAM ladder does not apply. RFC 5802
+Section 6 downgrade protection drops the unbound `SCRAM-SHA-N` rung whenever
+`SCRAM-SHA-N-PLUS` is advertised, and a PLUS rung whose binding cannot be
+produced (plaintext, or an EdDSA cert) is skipped rather than downgraded - so a
+binding-incapable connection against a PLUS-advertising server falls through to
+PLAIN-over-TLS. The selection function lives per-protocol (IMAP
+`password_mechanism_ladder`, SMTP `password_mechanism_order`); see
+`reference/imap.md` / `reference/smtp.md`.
+
+## Non-goals
+
+- `tls-unique` channel binding. TLS 1.3 removed the extractor and bifrost only
+  supports modern TLS, so `tls-server-end-point` is the only binding offered.
+- SCRAM-SHA-512 family. Not implemented; revisit if a real deployment requires
+  it.
+- GSSAPI / Kerberos. Different stack, no demand.
+- A typed public auth-outcome surface (which mechanism + binding were used, or a
+  typed failure reason) is not built; the protocol crates map into their
+  existing error types. Tracked in `TODO.md`.
