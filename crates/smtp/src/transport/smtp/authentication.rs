@@ -269,39 +269,27 @@ impl Mechanism {
                 )),
                 None => {
                     let (identity, access_token) = credentials.oauth2_parts()?;
-                    Ok(format!(
-                        "user={identity}\x01auth=Bearer {access_token}\x01\x01"
-                    ))
+                    // Shared bifrost-sasl builder returns the raw payload as a
+                    // zeroizing Secret; the AUTH command base64-frames it. The
+                    // Secret drops and zeroizes after this owned copy.
+                    Ok(bifrost_sasl::xoauth2_payload(identity, access_token)
+                        .as_str()
+                        .to_owned())
                 }
             },
             Mechanism::OAuthBearer => match challenge {
+                // RFC 7628 error-continuation response: protocol command flow,
+                // not payload construction, so it stays in SMTP.
                 Some(_) => Ok("\x01".to_owned()),
                 None => {
                     let (identity, access_token) = credentials.oauth2_parts()?;
-                    let identity = gs2_escape(identity);
-                    // RFC 7628 examples include host and port, but bearer
-                    // token authentication does not require them. Keeping the
-                    // mechanism encoder transport-agnostic avoids coupling
-                    // credentials to SMTP connection state.
-                    Ok(format!(
-                        "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"
-                    ))
+                    Ok(bifrost_sasl::oauthbearer_payload(identity, access_token)
+                        .as_str()
+                        .to_owned())
                 }
             },
         }
     }
-}
-
-fn gs2_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            ',' => escaped.push_str("=2C"),
-            '=' => escaped.push_str("=3D"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
 }
 
 fn contains_ignore_ascii_case<'a>(

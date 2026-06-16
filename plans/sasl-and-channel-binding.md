@@ -170,7 +170,8 @@ channel-binding/SCRAM-PLUS computation. IMAP's mechanism selection now
 prefers PLUS with downgrade protection (see git history). SMTP now has
 the same SCRAM family (non-PLUS and PLUS) with mechanism selection and
 downgrade protection wired through `bifrost-sasl` (see git history).
-The remaining steps:
+OAuth payload construction (XOAUTH2 / OAUTHBEARER) now lives in
+`bifrost-sasl::{xoauth2_payload, oauthbearer_payload}`; the duplicated
+IMAP and SMTP builders have been collapsed onto it (see git history).
 
-1. Move OAuth payload construction into the shared crate; collapse
-   the duplicated XOAUTH2 / OAUTHBEARER builders in IMAP and SMTP.
+All steps in this plan have landed.

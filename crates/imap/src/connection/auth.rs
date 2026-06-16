@@ -317,12 +317,11 @@ impl ImapConnection {
                 return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
             }
 
-            // Build XOAUTH2 payload:
-            // "user=<user>\x01auth=Bearer <token>\x01\x01"
-            let payload =
-                zeroize::Zeroizing::new(format!("user={user}\x01auth=Bearer {token}\x01\x01"));
+            // Build XOAUTH2 payload via the shared bifrost-sasl builder, then
+            // base64-frame it for AUTHENTICATE. The raw token-bearing Secret is
+            // a temporary that zeroizes on drop; only the base64 form persists.
             let encoded: SecretString = base64::engine::general_purpose::STANDARD
-                .encode(payload.as_bytes())
+                .encode(bifrost_sasl::xoauth2_payload(user, token).as_bytes())
                 .into();
 
             let has_sasl_ir =
@@ -1090,5 +1089,17 @@ mod ladder_tests {
         assert!(p256 < p1, "SHA-256-PLUS must precede SHA-1-PLUS");
         assert!(p1 < n256, "SHA-1-PLUS must precede non-PLUS SCRAM");
         assert!(n256 < plain, "non-PLUS SCRAM must precede PLAIN");
+    }
+
+    #[test]
+    fn xoauth2_base64_payload_is_byte_stable() {
+        use base64::Engine;
+
+        // The base64 of the shared builder output for user/token must equal the
+        // exact literal SMTP pins for the same inputs (commands.rs), proving the
+        // moved bytes are unchanged on the wire.
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(bifrost_sasl::xoauth2_payload("user", "token").as_bytes());
+        assert_eq!(encoded, "dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=");
     }
 }

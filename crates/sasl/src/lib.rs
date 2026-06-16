@@ -15,12 +15,14 @@
 mod channel_binding;
 mod cram;
 mod error;
+mod oauth;
 mod scram;
 mod secret;
 
 pub use channel_binding::tls_server_end_point;
 pub use cram::cram_md5_response;
 pub use error::SaslError;
+pub use oauth::{oauthbearer_payload, xoauth2_payload};
 pub use scram::{
     ChannelBinding, ScramChannelBinding, ScramHash, decode_continuation, escape_username,
     scram_client_final, verify_server_final,

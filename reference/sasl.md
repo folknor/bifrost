@@ -63,6 +63,15 @@ inside the protocol consumers, never the other way around.
   SASL continuation to UTF-8.
 - `cram_md5_response(user, pass, challenge) -> Result<Secret, SaslError>` -
   RFC 2195 CRAM-MD5 response.
+- `xoauth2_payload(user, access_token) -> Secret` /
+  `oauthbearer_payload(identity, access_token) -> Secret` (`oauth.rs`) - OAuth
+  SASL client payloads as a zeroizing `Secret` of the *raw* (un-base64'd)
+  bytes; the protocol crate frames them (IMAP base64-encodes for AUTHENTICATE,
+  SMTP's AUTH command base64-encodes downstream). XOAUTH2 has no GS2 framing so
+  nothing is escaped; OAUTHBEARER's `a=` identity is GS2-escaped via
+  `escape_username` (same RFC-derived escape table as SCRAM saslname) and the
+  optional RFC 7628 `host=` / `port=` attributes are deliberately omitted to
+  stay transport-agnostic.
 
 The per-hash proof helpers, `scram_field`, and the HMAC/XOR primitives stay
 private to the crate.
@@ -103,9 +112,9 @@ IMAP and SMTP both drive the PLUS path: their consumers send the
 advertised, and enforce RFC 5802 Section 6 downgrade protection (see
 `reference/imap.md` / `reference/smtp.md` and git history). SMTP consumes
 `ScramHash` / `ScramChannelBinding` / `scram_client_final` /
-`verify_server_final` via `ScramExchange`. Still future, in later steps of
-`plans/sasl-and-channel-binding.md`: OAuth (XOAUTH2 / OAUTHBEARER)
-payload construction currently duplicated in the protocol crates. The crate
-still exposes no selection function - selection policy lives in each protocol
-crate. EdDSA leaf-cert channel binding is deliberately a hard error until an
+`verify_server_final` via `ScramExchange`. OAuth (XOAUTH2 / OAUTHBEARER)
+payload construction now lives here (`xoauth2_payload` / `oauthbearer_payload`),
+collapsing the formerly duplicated IMAP and SMTP builders. The crate still
+exposes no selection function - selection policy lives in each protocol crate.
+EdDSA leaf-cert channel binding is deliberately a hard error until an
 evidence-driven vector pins the binding hash a real server uses.
