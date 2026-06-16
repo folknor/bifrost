@@ -487,6 +487,7 @@ impl AuthMechanismRejection {
 pub(crate) enum AuthMechanismRejectionReason {
     DisabledByPolicy,
     CleartextWithoutTls,
+    ChannelBindingUnavailable,
 }
 
 impl std::fmt::Display for AuthMechanismRejectionReason {
@@ -494,6 +495,7 @@ impl std::fmt::Display for AuthMechanismRejectionReason {
         match self {
             Self::DisabledByPolicy => f.write_str("disabled by policy"),
             Self::CleartextWithoutTls => f.write_str("requires TLS by policy"),
+            Self::ChannelBindingUnavailable => f.write_str("channel binding unavailable"),
         }
     }
 }

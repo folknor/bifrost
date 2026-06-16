@@ -77,15 +77,19 @@ impl fmt::Debug for Credentials {
 
 /// SASL or legacy authentication mechanism selected by the client.
 ///
-/// SCRAM channel-binding mechanisms such as `SCRAM-SHA-256-PLUS` are
-/// intentionally not represented here yet. They need TLS channel-binding
-/// material from the transport, and this crate's transport abstraction does
-/// not expose that material. `authenticate_best` will therefore not silently
-/// treat a `*-PLUS` advertisement as the non-PLUS SCRAM mechanism.
+/// The `*-PLUS` variants are the SCRAM channel-binding mechanisms. They are
+/// channel-bound via RFC 5929 `tls-server-end-point` and are selected only
+/// when the peer certificate yields a binding value; `authenticate_best`
+/// prefers them over their non-PLUS counterparts and enforces RFC 5802
+/// Section 6 downgrade protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AuthMechanism {
     /// SASL XOAUTH2 bearer-token authentication.
     XOAuth2,
+    /// SASL SCRAM-SHA-256-PLUS (channel-bound).
+    ScramSha256Plus,
+    /// SASL SCRAM-SHA-1-PLUS (channel-bound).
+    ScramSha1Plus,
     /// SASL SCRAM-SHA-256.
     ScramSha256,
     /// SASL SCRAM-SHA-1.
@@ -103,6 +107,8 @@ impl AuthMechanism {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::XOAuth2 => "XOAUTH2",
+            Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
+            Self::ScramSha1Plus => "SCRAM-SHA-1-PLUS",
             Self::ScramSha256 => "SCRAM-SHA-256",
             Self::ScramSha1 => "SCRAM-SHA-1",
             Self::Plain => "PLAIN",

@@ -24,16 +24,21 @@ servers; SMTP must not stay weaker just because sending is the
   signature computation now live in `bifrost-sasl` as well:
   `tls_server_end_point`, `ChannelBinding`, `ScramChannelBinding`, and the
   `c=`/GS2-threaded `scram_client_final`. The SASL crate is capable of
-  PLUS; IMAP still invokes only the non-PLUS path. See `reference/sasl.md`
-  for the landed surface.
+  PLUS. See `reference/sasl.md` for the landed surface.
+- IMAP mechanism selection now prefers the `-PLUS` variants when the
+  server advertises them, pulls the peer cert DER through to the SCRAM
+  consumer's GS2 header, and enforces RFC 5802 Section 6 downgrade
+  protection (the matching non-PLUS rung is refused when a PLUS variant
+  is advertised). See `reference/imap.md` and git history. SMTP still
+  carries no SCRAM family.
 - SMTP advertises only PLAIN, LOGIN, XOAUTH2, OAUTHBEARER in
   `crates/smtp/src/transport/smtp/authentication.rs:132`. No SCRAM
   family at all.
 - Both crates now surface the peer certificate DER upward through
   their stream wrappers (`peer_certificate_der` accessors on the IMAP
   `ImapConnection` handle and the SMTP sync/async connection structs).
-  This is the transport prerequisite for SCRAM-PLUS; the binding value
-  itself is not computed yet.
+  This is the transport prerequisite for SCRAM-PLUS. IMAP now consumes
+  it (DER -> `tls_server_end_point` -> GS2 header); SMTP does not yet.
 
 ## Plan
 
@@ -44,9 +49,12 @@ through both protocol crates). Both `bifrost-imap` and `bifrost-smtp`
 depend on it. The crate is private - it does not appear in the
 public APIs of either protocol crate.
 
-The shared layer owns:
+The shared layer owns the SASL primitives; mechanism selection and
+downgrade protection landed in each protocol crate over its own
+advertised-mechanism profile rather than in the shared crate (IMAP's
+`password_mechanism_ladder` is the landed reference). The shared layer
+owns:
 
-- Mechanism selection (priority list, downgrade-protection logic).
 - SCRAM computation (state machine, `scram_client_final`,
   per-hash proof functions, server-final verification, PLUS variants).
 - OAuth payload construction (XOAUTH2 / OAUTHBEARER framing, which is
@@ -98,16 +106,18 @@ the SASL crate is sufficient.
 
 Once channel binding exists below the protocols:
 
-- IMAP grows SCRAM-SHA-256-PLUS (and optionally SCRAM-SHA-1-PLUS)
-  alongside the existing non-PLUS variants.
+- IMAP grew SCRAM-SHA-256-PLUS and SCRAM-SHA-1-PLUS alongside the
+  existing non-PLUS variants (landed; see git history).
 - SMTP grows the full SCRAM family at once - non-PLUS and PLUS
   together, since it currently has none.
 
 Downgrade protection (RFC 5802 §6): when the server's advertised
 mechanism list includes a PLUS variant, the client must not fall
 back to the matching non-PLUS variant, even if the server also lists
-it. This logic lives in the shared SASL crate so both protocols get
-it for free.
+it. The SASL crate supplies the binding primitives; the selection
+ladder and downgrade decision live in each protocol crate over its own
+advertised-mechanism profile (IMAP's `password_mechanism_ladder` is the
+landed reference). SMTP should mirror the same rule.
 
 ### 4. Mechanism preference
 
@@ -125,8 +135,10 @@ OAuth and password auth are orthogonal paths in the account config.
   fallbacks. They are never picked automatically when something
   stronger is on offer; the account config has to opt in explicitly.
 
-The mechanism-selection function lives in the shared SASL crate so
-both protocols apply the same policy.
+Each protocol crate owns its mechanism-selection function over its own
+advertised-mechanism profile, applying the same policy. IMAP's ladder
+places SCRAM-SHA-1-PLUS above SCRAM-SHA-256 (a channel-bound SHA-1
+exchange outranks unbound SHA-256); SMTP should match.
 
 ### 5. Public API shape
 
@@ -154,12 +166,12 @@ The `peer_certificate_der` transport accessor, the private
 rewired), and the `tls-server-end-point` channel binding plus
 SCRAM-PLUS computation in that crate have all landed; see git history
 for the stream-wrapper plumbing, the SASL extraction, and the
-channel-binding/SCRAM-PLUS computation. The remaining steps:
+channel-binding/SCRAM-PLUS computation. IMAP's mechanism selection now
+prefers PLUS with downgrade protection (see git history). The remaining
+steps:
 
-1. Wire IMAP's mechanism selection to prefer PLUS when the server
-   advertises it; add downgrade-protection check.
-2. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
+1. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
    crate; wire the same mechanism selection and downgrade
    protection.
-3. Move OAuth payload construction into the shared crate; collapse
+2. Move OAuth payload construction into the shared crate; collapse
    the duplicated XOAUTH2 / OAUTHBEARER builders in IMAP and SMTP.

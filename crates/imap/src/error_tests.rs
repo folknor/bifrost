@@ -23,6 +23,28 @@ fn auth_policy_failure() -> AuthPolicyFailure {
     )
 }
 
+#[test]
+fn channel_binding_unavailable_display() {
+    assert_eq!(
+        AuthMechanismRejectionReason::ChannelBindingUnavailable.to_string(),
+        "channel binding unavailable"
+    );
+
+    // The reason renders with its mechanism inside an AuthPolicyFailure.
+    let failure = AuthPolicyFailure::new(
+        vec!["AUTH=SCRAM-SHA-256-PLUS".to_owned()],
+        vec![AuthMechanismRejection::new(
+            crate::types::AuthMechanism::ScramSha256Plus,
+            AuthMechanismRejectionReason::ChannelBindingUnavailable,
+        )],
+    );
+    let rendered = failure.to_string();
+    assert!(
+        rendered.contains("SCRAM-SHA-256-PLUS (channel binding unavailable)"),
+        "got: {rendered}"
+    );
+}
+
 // --- Display formatting smoke tests ---
 
 #[test]

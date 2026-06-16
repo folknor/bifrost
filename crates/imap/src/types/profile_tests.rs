@@ -59,6 +59,10 @@ fn scram_plus_does_not_satisfy_non_plus_scram() {
     );
 
     assert!(!profile.supports_sasl_auth(AuthMechanism::ScramSha256));
+    // The PLUS advertisement is matched by its own variant.
+    assert!(profile.supports_sasl_auth(AuthMechanism::ScramSha256Plus));
+    assert_eq!(AuthMechanism::ScramSha256Plus.name(), "SCRAM-SHA-256-PLUS");
+    assert_eq!(AuthMechanism::ScramSha1Plus.name(), "SCRAM-SHA-1-PLUS");
 }
 
 #[test]

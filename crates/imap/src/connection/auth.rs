@@ -9,10 +9,19 @@ impl ImapConnection {
 
     /// Authenticate using a policy-selected mechanism.
     ///
-    /// Password credentials prefer SCRAM-SHA-256, SCRAM-SHA-1, then PLAIN on
-    /// encrypted connections, then CRAM-MD5 only when explicitly allowed by
-    /// policy and TLS is active. LOGIN is never used unless explicitly
-    /// allowed in [`AuthPolicy`].
+    /// Password credentials prefer the channel-bound SCRAM variants
+    /// (SCRAM-SHA-256-PLUS, SCRAM-SHA-1-PLUS) over their unbound counterparts
+    /// (SCRAM-SHA-256, SCRAM-SHA-1), then PLAIN on encrypted connections, then
+    /// CRAM-MD5 only when explicitly allowed by policy and TLS is active.
+    /// LOGIN is never used unless explicitly allowed in [`AuthPolicy`].
+    ///
+    /// RFC 5802 Section 6 downgrade protection: when the server advertises a
+    /// `SCRAM-SHA-N-PLUS` variant, the matching non-PLUS `SCRAM-SHA-N` rung is
+    /// skipped with a `ChannelBindingUnavailable` rejection rather than
+    /// attempted, so a man-in-the-middle cannot strip the channel binding by
+    /// forcing the unbound fallback. If the PLUS binding cannot be resolved
+    /// (plaintext, or an EdDSA leaf certificate), both SCRAM rungs for that
+    /// hash are unavailable and auth falls through to PLAIN-over-TLS.
     ///
     /// OAuth credentials currently use XOAUTH2 and require TLS unless the
     /// policy explicitly permits cleartext credential mechanisms.
@@ -53,23 +62,41 @@ impl ImapConnection {
             }
             CredentialsKind::Password { username, password } => {
                 let mut rejected = Vec::new();
-                for mechanism in [
-                    AuthMechanism::ScramSha256,
-                    AuthMechanism::ScramSha1,
-                    AuthMechanism::Plain,
-                    AuthMechanism::CramMd5,
-                    AuthMechanism::Login,
-                ] {
-                    let supported = if mechanism == AuthMechanism::Login {
-                        profile.supports_login_command()
-                    } else {
-                        profile.supports_sasl_auth(mechanism)
+                for candidate in password_mechanism_ladder(&profile, policy, self.is_encrypted()) {
+                    let mechanism = match candidate {
+                        PasswordCandidate::Reject(rejection) => {
+                            rejected.push(rejection);
+                            continue;
+                        }
+                        PasswordCandidate::Attempt(mechanism) => mechanism,
                     };
-                    if !supported {
-                        continue;
-                    }
-                    let mut rejection = None;
                     match mechanism {
+                        AuthMechanism::ScramSha256Plus | AuthMechanism::ScramSha1Plus => {
+                            let hash = if mechanism == AuthMechanism::ScramSha256Plus {
+                                bifrost_sasl::ScramHash::Sha256
+                            } else {
+                                bifrost_sasl::ScramHash::Sha1
+                            };
+                            // One DER fetch + hash per PLUS candidate; a
+                            // failure here is a typed rejection, not a fall
+                            // through to unbound SCRAM (RFC 5802 Section 6).
+                            let Some(resolved) = self.resolve_scram_binding().await else {
+                                rejected.push(AuthMechanismRejection::new(
+                                    mechanism,
+                                    AuthMechanismRejectionReason::ChannelBindingUnavailable,
+                                ));
+                                continue;
+                            };
+                            self.authenticate_scram_with_binding(
+                                username,
+                                password.as_str(),
+                                hash,
+                                bifrost_sasl::ChannelBinding::TlsServerEndPoint,
+                                Some(resolved),
+                                timeout,
+                            )
+                            .await?;
+                        }
                         AuthMechanism::ScramSha256 => {
                             self.authenticate_scram_sha256(username, password.as_str(), timeout)
                                 .await?;
@@ -79,41 +106,14 @@ impl ImapConnection {
                                 .await?;
                         }
                         AuthMechanism::Plain => {
-                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
-                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
-                            }
-                            if let Some(reason) = rejection {
-                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
-                                continue;
-                            }
                             self.authenticate_plain(username, password.as_str(), timeout)
                                 .await?;
                         }
                         AuthMechanism::CramMd5 => {
-                            if !policy.allow_cram_md5 {
-                                rejection = Some(AuthMechanismRejectionReason::DisabledByPolicy);
-                            }
-                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
-                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
-                            }
-                            if let Some(reason) = rejection {
-                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
-                                continue;
-                            }
                             self.authenticate_cram_md5(username, password.as_str(), timeout)
                                 .await?;
                         }
                         AuthMechanism::Login => {
-                            if !policy.allow_login {
-                                rejection = Some(AuthMechanismRejectionReason::DisabledByPolicy);
-                            }
-                            if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
-                                rejection = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
-                            }
-                            if let Some(reason) = rejection {
-                                rejected.push(AuthMechanismRejection::new(mechanism, reason));
-                                continue;
-                            }
                             self.login(username, password.as_str(), timeout).await?;
                         }
                         AuthMechanism::XOAuth2 => unreachable!("password path skips XOAUTH2"),
@@ -387,8 +387,15 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.authenticate_scram(user, pass, bifrost_sasl::ScramHash::Sha1, timeout)
-            .await
+        self.authenticate_scram_with_binding(
+            user,
+            pass,
+            bifrost_sasl::ScramHash::Sha1,
+            bifrost_sasl::ChannelBinding::None,
+            None,
+            timeout,
+        )
+        .await
     }
 
     /// Authenticate with SASL SCRAM-SHA-256 (RFC 7677).
@@ -398,21 +405,70 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.authenticate_scram(user, pass, bifrost_sasl::ScramHash::Sha256, timeout)
-            .await
+        self.authenticate_scram_with_binding(
+            user,
+            pass,
+            bifrost_sasl::ScramHash::Sha256,
+            bifrost_sasl::ChannelBinding::None,
+            None,
+            timeout,
+        )
+        .await
     }
 
-    async fn authenticate_scram(
+    /// Run a SCRAM exchange under a chosen channel-binding dimension.
+    ///
+    /// `binding` selects the wire mechanism token and GS2 header. For
+    /// `ChannelBinding::TlsServerEndPoint`, the data-carrying
+    /// `ScramChannelBinding` is resolved here unless `resolved` already
+    /// carries it (so `authenticate_best` can fetch the peer cert DER once and
+    /// thread it in). A direct caller that omits `resolved` and whose binding
+    /// cannot be resolved gets a typed `Error::AuthPolicy` carrying a single
+    /// `ChannelBindingUnavailable` rejection rather than a silent fall-through.
+    async fn authenticate_scram_with_binding(
         &self,
         user: &str,
         pass: &str,
-        mechanism: bifrost_sasl::ScramHash,
+        hash: bifrost_sasl::ScramHash,
+        binding: bifrost_sasl::ChannelBinding,
+        resolved: Option<bifrost_sasl::ScramChannelBinding>,
         timeout: Duration,
     ) -> Result<(), Error> {
-        use super::dispatch::AuthenticateScramConsumer;
+        use bifrost_sasl::{ChannelBinding, ScramChannelBinding};
 
-        // Non-PLUS path: channel binding is a later step.
-        self.require_auth_mechanism(mechanism.mechanism_name(bifrost_sasl::ChannelBinding::None))?;
+        use super::dispatch::AuthenticateScramConsumer;
+        use crate::error::{
+            AuthMechanismRejection, AuthMechanismRejectionReason, AuthPolicyFailure,
+        };
+        use crate::types::AuthMechanism;
+
+        self.require_auth_mechanism(hash.mechanism_name(binding))?;
+
+        let scram_binding = match binding {
+            ChannelBinding::TlsServerEndPoint => match resolved {
+                Some(resolved) => resolved,
+                None => self.resolve_scram_binding().await.ok_or_else(|| {
+                    // `ScramHash` is `#[non_exhaustive]`; SHA-1 maps to its
+                    // PLUS variant, SHA-256 (and any future hash) to the
+                    // SHA-256 PLUS variant for the audit/display rejection.
+                    let mechanism = match hash {
+                        bifrost_sasl::ScramHash::Sha1 => AuthMechanism::ScramSha1Plus,
+                        _ => AuthMechanism::ScramSha256Plus,
+                    };
+                    Error::AuthPolicy(AuthPolicyFailure::new(
+                        offered_authentication(&self.server_profile(), false),
+                        vec![AuthMechanismRejection::new(
+                            mechanism,
+                            AuthMechanismRejectionReason::ChannelBindingUnavailable,
+                        )],
+                    ))
+                })?,
+            },
+            // `ChannelBinding` is `#[non_exhaustive]`; `None` and any future
+            // unbound dimension carry no GS2 binding data.
+            _ => ScramChannelBinding::None,
+        };
+
         let has_sasl_ir = {
             let snap = self.state_rx.borrow();
             snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap)
@@ -420,17 +476,17 @@ impl ImapConnection {
 
         let nonce = generate_scram_nonce()?;
         let consumer = AuthenticateScramConsumer::new(
-            mechanism,
+            hash,
             user.to_owned(),
             pass.to_owned().into(),
             nonce,
             has_sasl_ir,
+            scram_binding,
         );
         let initial_response = has_sasl_ir.then(|| consumer.initial_response());
         let cmd = Command::Authenticate {
-            mechanism: mechanism
-                .mechanism_name(bifrost_sasl::ChannelBinding::None)
-                .to_owned(),
+            // Single source of truth for the emitted token: the SASL crate.
+            mechanism: hash.mechanism_name(binding).to_owned(),
             initial_response,
         };
 
@@ -441,6 +497,19 @@ impl ImapConnection {
                 .map_err(|_| Error::timeout_inflight())??;
 
         self.complete_auth(caps_provided, deadline).await
+    }
+
+    /// Resolve the `tls-server-end-point` channel binding for the live
+    /// connection: fetch the peer certificate DER once and hash it.
+    ///
+    /// Returns `None` when the DER is absent (plaintext, dead driver, or
+    /// native-tls produced no DER) or when `tls_server_end_point` errors
+    /// (unsupported signature algorithm, EdDSA leaf, truncated cert). The
+    /// caller turns `None` into a `ChannelBindingUnavailable` rejection.
+    async fn resolve_scram_binding(&self) -> Option<bifrost_sasl::ScramChannelBinding> {
+        let der = self.peer_certificate_der().await?;
+        let bytes = bifrost_sasl::tls_server_end_point(&der).ok()?;
+        Some(bifrost_sasl::ScramChannelBinding::TlsServerEndPoint(bytes))
     }
 
     /// Finalize authentication: refresh capabilities if the server did
@@ -766,6 +835,105 @@ impl ImapConnection {
     }
 }
 
+/// One rung of the password-credential mechanism ladder: either a mechanism
+/// to attempt against the live driver, or a typed local rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PasswordCandidate {
+    /// Mechanism is advertised and policy-allowed; attempt it.
+    Attempt(crate::types::AuthMechanism),
+    /// Mechanism is gated by local policy, TLS, or downgrade protection.
+    Reject(crate::error::AuthMechanismRejection),
+}
+
+/// Pure, network-free selection of the password-credential mechanism ladder.
+///
+/// Walks the fixed preference order
+/// `[ScramSha256Plus, ScramSha1Plus, ScramSha256, ScramSha1, Plain, CramMd5,
+/// Login]`, emitting an `Attempt` for advertised + policy-allowed rungs and a
+/// `Reject` for policy/TLS-gated ones. Per RFC 5802 Section 6, a non-PLUS
+/// `SCRAM-SHA-N` rung whose matching `SCRAM-SHA-N-PLUS` is advertised is
+/// emitted as `Reject(ChannelBindingUnavailable)` - the downgrade skip. PLUS
+/// rungs are emitted as `Attempt`; whether the binding actually resolves needs
+/// a live cert and is decided by `authenticate_best`, not here.
+fn password_mechanism_ladder(
+    profile: &crate::types::ServerProfile,
+    policy: &crate::types::AuthPolicy,
+    is_encrypted: bool,
+) -> Vec<PasswordCandidate> {
+    use crate::error::{AuthMechanismRejection, AuthMechanismRejectionReason};
+    use crate::types::AuthMechanism;
+
+    let server_offers_sha256_plus = profile.supports_sasl_auth(AuthMechanism::ScramSha256Plus);
+    let server_offers_sha1_plus = profile.supports_sasl_auth(AuthMechanism::ScramSha1Plus);
+
+    let order = [
+        AuthMechanism::ScramSha256Plus,
+        AuthMechanism::ScramSha1Plus,
+        AuthMechanism::ScramSha256,
+        AuthMechanism::ScramSha1,
+        AuthMechanism::Plain,
+        AuthMechanism::CramMd5,
+        AuthMechanism::Login,
+    ];
+
+    let mut ladder = Vec::new();
+    for mechanism in order {
+        let advertised = if mechanism == AuthMechanism::Login {
+            profile.supports_login_command()
+        } else {
+            profile.supports_sasl_auth(mechanism)
+        };
+        if !advertised {
+            continue;
+        }
+
+        // RFC 5802 Section 6: refuse the unbound SCRAM-SHA-N rung when the
+        // matching PLUS variant was advertised. This is purely a function of
+        // the advertised set, so it lives in the pure helper.
+        let downgrade_forbidden = (mechanism == AuthMechanism::ScramSha256
+            && server_offers_sha256_plus)
+            || (mechanism == AuthMechanism::ScramSha1 && server_offers_sha1_plus);
+        if downgrade_forbidden {
+            ladder.push(PasswordCandidate::Reject(AuthMechanismRejection::new(
+                mechanism,
+                AuthMechanismRejectionReason::ChannelBindingUnavailable,
+            )));
+            continue;
+        }
+
+        let mut reason = None;
+        match mechanism {
+            AuthMechanism::CramMd5 if !policy.allow_cram_md5 => {
+                reason = Some(AuthMechanismRejectionReason::DisabledByPolicy);
+            }
+            AuthMechanism::Login if !policy.allow_login => {
+                reason = Some(AuthMechanismRejectionReason::DisabledByPolicy);
+            }
+            _ => {}
+        }
+        // Cleartext gate applies to credential-bearing legacy mechanisms only;
+        // SCRAM never sends reusable credentials. When a mechanism is both
+        // disabled by policy and on a plaintext connection, the TLS reason is
+        // reported (last-write-wins), preserving the pre-refactor behavior so
+        // the rejection display does not silently change.
+        let cleartext_gated = matches!(
+            mechanism,
+            AuthMechanism::Plain | AuthMechanism::CramMd5 | AuthMechanism::Login
+        );
+        if cleartext_gated && !is_encrypted && !policy.allow_cleartext_without_tls {
+            reason = Some(AuthMechanismRejectionReason::CleartextWithoutTls);
+        }
+
+        match reason {
+            Some(reason) => ladder.push(PasswordCandidate::Reject(AuthMechanismRejection::new(
+                mechanism, reason,
+            ))),
+            None => ladder.push(PasswordCandidate::Attempt(mechanism)),
+        }
+    }
+    ladder
+}
+
 fn offered_authentication(
     profile: &crate::types::ServerProfile,
     include_login: bool,
@@ -807,4 +975,120 @@ fn generate_scram_nonce() -> Result<String, Error> {
     getrandom::fill(&mut bytes)
         .map_err(|e| Error::Protocol(format!("failed to generate SCRAM nonce: {e}")))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::{PasswordCandidate, password_mechanism_ladder};
+    use crate::error::{AuthMechanismRejection, AuthMechanismRejectionReason};
+    use crate::types::{AuthMechanism, AuthPolicy, Capability, ServerProfile};
+
+    fn profile(mechanisms: &[&str]) -> ServerProfile {
+        let caps = mechanisms
+            .iter()
+            .map(|m| Capability::Auth((*m).to_owned()))
+            .collect();
+        ServerProfile::new(caps, vec![])
+    }
+
+    fn pos(ladder: &[PasswordCandidate], mechanism: AuthMechanism) -> Option<usize> {
+        ladder.iter().position(|c| match c {
+            PasswordCandidate::Attempt(m) => *m == mechanism,
+            PasswordCandidate::Reject(r) => r.mechanism == mechanism,
+        })
+    }
+
+    #[test]
+    fn password_mechanism_ladder_downgrade_skip_when_plus_advertised() {
+        // Server advertises SHA-256-PLUS, SHA-256, and SHA-1 (no SHA-1-PLUS).
+        let profile = profile(&["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256", "SCRAM-SHA-1"]);
+        let ladder = password_mechanism_ladder(&profile, &AuthPolicy::default(), true);
+
+        let plus = pos(&ladder, AuthMechanism::ScramSha256Plus).unwrap();
+        assert_eq!(
+            ladder[plus],
+            PasswordCandidate::Attempt(AuthMechanism::ScramSha256Plus)
+        );
+
+        // The matching non-PLUS rung is the downgrade skip.
+        let non_plus = pos(&ladder, AuthMechanism::ScramSha256).unwrap();
+        assert_eq!(
+            ladder[non_plus],
+            PasswordCandidate::Reject(AuthMechanismRejection::new(
+                AuthMechanism::ScramSha256,
+                AuthMechanismRejectionReason::ChannelBindingUnavailable,
+            ))
+        );
+
+        // SHA-1 has no PLUS offer, so it stays attemptable.
+        let sha1 = pos(&ladder, AuthMechanism::ScramSha1).unwrap();
+        assert_eq!(
+            ladder[sha1],
+            PasswordCandidate::Attempt(AuthMechanism::ScramSha1)
+        );
+    }
+
+    #[test]
+    fn password_mechanism_ladder_no_spurious_skip_without_plus() {
+        let profile = profile(&["SCRAM-SHA-256"]);
+        let ladder = password_mechanism_ladder(&profile, &AuthPolicy::default(), true);
+        let idx = pos(&ladder, AuthMechanism::ScramSha256).unwrap();
+        assert_eq!(
+            ladder[idx],
+            PasswordCandidate::Attempt(AuthMechanism::ScramSha256)
+        );
+    }
+
+    #[test]
+    fn password_mechanism_ladder_tls_reason_wins_over_policy_for_legacy() {
+        // LOGIN advertised, disabled by policy (default), on a plaintext
+        // connection: the original loop reported CleartextWithoutTls because
+        // the TLS gate ran last (last-write-wins). The refactored helper must
+        // preserve that, so the rejection display does not silently flip to
+        // DisabledByPolicy.
+        let profile = profile(&["PLAIN"]);
+        let ladder = password_mechanism_ladder(&profile, &AuthPolicy::default(), false);
+
+        // PLAIN is not policy-disabled but is cleartext-gated on plaintext.
+        let plain = pos(&ladder, AuthMechanism::Plain).unwrap();
+        assert_eq!(
+            ladder[plain],
+            PasswordCandidate::Reject(AuthMechanismRejection::new(
+                AuthMechanism::Plain,
+                AuthMechanismRejectionReason::CleartextWithoutTls,
+            ))
+        );
+
+        // LOGIN is both disabled-by-policy and cleartext-gated; TLS wins.
+        let login = pos(&ladder, AuthMechanism::Login).unwrap();
+        assert_eq!(
+            ladder[login],
+            PasswordCandidate::Reject(AuthMechanismRejection::new(
+                AuthMechanism::Login,
+                AuthMechanismRejectionReason::CleartextWithoutTls,
+            ))
+        );
+    }
+
+    #[test]
+    fn password_mechanism_ladder_orders_plus_before_non_plus_before_plain() {
+        let profile = profile(&[
+            "SCRAM-SHA-256-PLUS",
+            "SCRAM-SHA-1-PLUS",
+            "SCRAM-SHA-256",
+            "SCRAM-SHA-1",
+            "PLAIN",
+        ]);
+        let ladder = password_mechanism_ladder(&profile, &AuthPolicy::default(), true);
+
+        let p256 = pos(&ladder, AuthMechanism::ScramSha256Plus).unwrap();
+        let p1 = pos(&ladder, AuthMechanism::ScramSha1Plus).unwrap();
+        let n256 = pos(&ladder, AuthMechanism::ScramSha256).unwrap();
+        let plain = pos(&ladder, AuthMechanism::Plain).unwrap();
+
+        assert!(p256 < p1, "SHA-256-PLUS must precede SHA-1-PLUS");
+        assert!(p1 < n256, "SHA-1-PLUS must precede non-PLUS SCRAM");
+        assert!(n256 < plain, "non-PLUS SCRAM must precede PLAIN");
+    }
 }

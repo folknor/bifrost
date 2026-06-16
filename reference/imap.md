@@ -69,7 +69,11 @@ which zeroizes and redacts under `Debug`; consumers no longer handle
 or import that wrapper directly. No `From<(String, String)>`.
 
 Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER,
-CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256.
+CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256, and the channel-bound
+SCRAM-SHA-1-PLUS / SCRAM-SHA-256-PLUS. Each variant's `name()` is the
+wire token; the PLUS variants match the `-PLUS` advertisement and the
+SASL crate (`ScramHash::mechanism_name`) is the single authority for the
+token actually emitted on the socket.
 
 SCRAM and CRAM-MD5 computation (the `scram_client_final` /
 `verify_server_final` transitions, the per-hash proofs, and the CRAM-MD5
@@ -81,6 +85,8 @@ the IMAP error model at the call boundary.
 `AuthPolicy` TLS-gates cleartext mechanisms by default. PLAIN and LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated, because a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline. LOGIN-the-IMAP-command is opt-in (`with_login`).
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest match. SASL-IR is used when advertised or implied by IMAP4rev2. Malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
+
+The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed preference order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection lives in the helper: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. `authenticate_best` walks the ladder; for a PLUS `Attempt` it resolves the `tls-server-end-point` binding once via `resolve_scram_binding()` (peer-cert DER fetch + `bifrost_sasl::tls_server_end_point`) and threads it into `authenticate_scram_with_binding`. A binding that cannot resolve (plaintext, EdDSA leaf cert, unsupported sig-alg) becomes a `ChannelBindingUnavailable` rejection; combined with the downgrade skip, an EdDSA-cert server advertising a `-PLUS` variant disables SCRAM entirely and falls through to PLAIN-over-TLS (RFC-compliant, credential stays encrypted). A direct `authenticate_scram_with_binding(.., TlsServerEndPoint, None, ..)` call surfaces the same failure as a typed `Error::AuthPolicy`.
 
 ## Typed IDs and sets
 

@@ -332,6 +332,10 @@ pub(crate) struct AuthenticateScramConsumer {
     pass: SecretString,
     client_nonce: String,
     client_first_bare: String,
+    /// GS2 channel binding for this exchange. `None` reproduces the old
+    /// `n,,` / `c=biws` behavior byte-for-byte; `TlsServerEndPoint` drives
+    /// the `-PLUS` GS2 header and `c=` value.
+    binding: ScramChannelBinding,
     state: ScramState,
     expected_server_signature: Option<Vec<u8>>,
     caps_seen: bool,
@@ -345,6 +349,7 @@ impl AuthenticateScramConsumer {
         pass: SecretString,
         nonce: String,
         sasl_ir_used: bool,
+        binding: ScramChannelBinding,
     ) -> Self {
         let client_first_bare = format!("n={},r={nonce}", escape_username(&user));
         Self {
@@ -352,6 +357,7 @@ impl AuthenticateScramConsumer {
             pass,
             client_nonce: nonce,
             client_first_bare,
+            binding,
             state: if sasl_ir_used {
                 ScramState::AwaitServerFirst
             } else {
@@ -366,8 +372,10 @@ impl AuthenticateScramConsumer {
     pub(crate) fn initial_response(&self) -> SecretString {
         use base64::Engine;
 
+        // RFC 5802: the GS2 header MUST come from the binding, never a
+        // literal, so the header and the `c=` value can never desync.
         base64::engine::general_purpose::STANDARD
-            .encode(format!("n,,{}", self.client_first_bare).as_bytes())
+            .encode(format!("{}{}", self.binding.gs2_header(), self.client_first_bare).as_bytes())
             .into()
     }
 }
@@ -423,15 +431,13 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
             }
             ScramState::AwaitServerFirst => {
                 let server_first = decode_continuation(&cont.data)?;
-                // Non-PLUS path: GS2 header `n,,`, no channel binding. PLUS
-                // consumers are a later step.
                 let (client_final, server_signature) = scram_client_final(
                     self.mechanism,
                     &self.pass,
                     &self.client_nonce,
                     &self.client_first_bare,
                     &server_first,
-                    &ScramChannelBinding::None,
+                    &self.binding,
                 )?;
                 self.expected_server_signature = Some(server_signature);
                 self.state = ScramState::AwaitServerFinal;
@@ -453,5 +459,62 @@ impl ContinuationConsumer for AuthenticateScramConsumer {
                 "unexpected continuation after SCRAM server-final message".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use base64::Engine;
+
+    use super::*;
+
+    fn decode_initial(consumer: &AuthenticateScramConsumer) -> String {
+        let ir = consumer.initial_response();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(ir.as_bytes())
+            .unwrap();
+        String::from_utf8(raw).unwrap()
+    }
+
+    #[test]
+    fn scram_consumer_gs2_header_plus_prefix() {
+        // Username with `=` and `,` exercises saslname escaping inside the
+        // PLUS GS2 header.
+        let consumer = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "us=,er".to_owned(),
+            "pw".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::TlsServerEndPoint(vec![1, 2, 3, 4]),
+        );
+        let decoded = decode_initial(&consumer);
+        assert!(
+            decoded.starts_with("p=tls-server-end-point,,n="),
+            "PLUS client-first must carry the tls-server-end-point GS2 header, got: {decoded}"
+        );
+        // saslname escaping: `=` -> `=3D`, `,` -> `=2C`.
+        assert!(
+            decoded.contains("n=us=3D=2Cer,r=nonce123"),
+            "escaped username + nonce must follow the header, got: {decoded}"
+        );
+    }
+
+    #[test]
+    fn scram_consumer_gs2_header_none_prefix() {
+        let consumer = AuthenticateScramConsumer::new(
+            ScramHash::Sha256,
+            "user".to_owned(),
+            "pw".to_owned().into(),
+            "nonce123".to_owned(),
+            true,
+            ScramChannelBinding::None,
+        );
+        let decoded = decode_initial(&consumer);
+        assert!(
+            decoded.starts_with("n,,n=user,r=nonce123"),
+            "non-PLUS client-first must keep the literal n,, header, got: {decoded}"
+        );
     }
 }
