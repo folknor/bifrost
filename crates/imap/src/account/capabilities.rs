@@ -14,6 +14,7 @@ pub(crate) fn build_capabilities(
     has_sieve: bool,
     has_carddav: bool,
     has_caldav: bool,
+    submission_configured: bool,
 ) -> AccountCapabilities {
     let has_drafts = folders.iter().any(|folder| {
         folder
@@ -60,12 +61,12 @@ pub(crate) fn build_capabilities(
             set_category: false,
             set_extended_property: false,
             set_is_read: true,
-            send_message: false,
+            send_message: submission_configured,
             attachment_upload: false,
             draft_create: has_drafts && profile.supports(Capability::UidPlus),
             draft_update: false,
             draft_discard: true,
-            draft_send: false,
+            draft_send: submission_configured,
             search: has_thread_references,
             search_messages: true,
             containers_list: true,
@@ -128,7 +129,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[], false, false, false);
+        let caps = build_capabilities(&profile, &[], false, false, false, false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -150,14 +151,14 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, false, false);
+        let caps = build_capabilities(&profile, &[], false, false, false, false);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
     }
 
     #[test]
     fn capability_builder_advertises_sieve_when_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], true, false, false);
+        let caps = build_capabilities(&profile, &[], true, false, false, false);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);
@@ -169,7 +170,7 @@ mod tests {
     #[test]
     fn capability_builder_advertises_contacts_when_carddav_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, true, false);
+        let caps = build_capabilities(&profile, &[], false, true, false, false);
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);
         assert!(caps.pim_methods.contact_get);
@@ -178,5 +179,20 @@ mod tests {
         assert!(caps.pim_methods.contact_delete);
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
+    }
+
+    #[test]
+    fn capabilities_send_flag_tracks_submission() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+
+        let without = build_capabilities(&profile, &[], false, false, false, false);
+        assert!(!without.pim_methods.send_message);
+        assert!(!without.pim_methods.draft_send);
+
+        let with = build_capabilities(&profile, &[], false, false, false, true);
+        assert!(with.pim_methods.send_message);
+        assert!(with.pim_methods.draft_send);
+        // Submission does not turn on uploaded-attachment support (A6).
+        assert!(!with.pim_methods.attachment_upload);
     }
 }

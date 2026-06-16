@@ -103,7 +103,7 @@ A2).
 
 ---
 
-## A2 - IMAP send
+## A2 - IMAP send - LANDED
 
 The composition that "leaks up" is real and lands almost directly.
 
@@ -120,25 +120,52 @@ The composition that "leaks up" is real and lands almost directly.
 `ImapAccountConfig`; construct the transport inside the account (SMTP XOAUTH2
 reuses the *same* rotated token as IMAP). Gate `pim_methods.send_message` /
 `draft_send` true iff an SMTP config is present (mirrors how caldav/carddav/sieve
-gate their flags). Build RFC822 from the structured `SendRequest` via
-`bifrost_smtp::Message::builder`, send, optional APPEND-to-Sent honoring
-`save_to_sent`, return the Sent-folder `ObjectId`. Error mapping is already
-end-to-end (bifrost-smtp's `account_error.rs` yields `AccountError`).
+gate their flags). Build RFC822 from the structured `SendRequest`, send, optional
+APPEND-to-Sent honoring `save_to_sent`, return the Sent-folder `ObjectId`. Error
+mapping is already end-to-end (bifrost-smtp's `account_error.rs` yields
+`AccountError`).
 
 **Depends on:** A1. bifrost-smtp is otherwise feature-complete for this.
 
-**Cautions:**
-- Do **not** port ratatoskr's synthetic `imap-sent-{ts}-{hex}` message id; return
-  the real APPENDUID via UIDPLUS (bifrost already tracks it). Porting the fake id
-  would be a regression.
-- A failed Sent-APPEND after a successful SMTP send is the `Reconcile`/`Uncertain`
-  shape, not a silent log-and-drop. Decide deliberately.
-- `draft_update` is Unsupported in bifrost IMAP but ratatoskr does delete+recreate
-  - a small free adjacent win while this code is open.
-- Read-receipt header injection (`inject_read_receipt_header_base64url`) is
-  product policy on raw bytes; bifrost's structured `SendRequest` has no MDN-request
-  field. Confirm whether `SendRequest` grows one or ratatoskr injects it, so the
-  capability is not silently lost.
+**As landed.** `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` builds
+an owned `bifrost-smtp` transport inside the IMAP account; `send_message` /
+`draft_send` are real and the capability flags report `true` only when submission
+is configured, else `Unsupported` and `false`. Submission auth reuses the IMAP
+`Credentials` (the A1 `Arc<dyn TokenSource>` threads straight across) unless
+`SubmissionCredentials` overrides it. RFC822 assembly did **not** route through
+`bifrost_smtp::Message::builder` (which consumes its own `Mailbox`/`Address`
+types, forcing a header-level `bifrost_types::Address -> Mailbox` conversion onto
+the critical path). Instead Google's `MailDocument` serializer was lifted into a
+shared `bifrost-types::mime` assembler (`send_request_to_rfc5322` /
+`render_rfc5322`) that operates on `bifrost_types::Address` natively; Google, IMAP
+send, and IMAP `draft_create`/`draft_patch` now share that one composition path,
+and the narrow bare-addr-spec conversion to SMTP's `Envelope` is confined to the
+submission boundary.
+
+**Cautions (resolved at landing):**
+- Synthetic message id avoided: `send_message` returns the real APPENDUID-derived
+  `ObjectId` from the Sent APPEND (UIDPLUS) when available, falling back to an
+  explicitly-built controlled-domain `Message-ID` only when no Sent APPEND
+  succeeded - never ratatoskr's `imap-sent-{ts}-{hex}` synthetic id.
+- A failed Sent-APPEND after a committed SMTP send is non-fatal (the send is
+  authoritative, never resend) but **not** silent: it logs an uncertain-Sent
+  reconcile warning rather than a bare log-and-drop.
+- `draft_update` was left out of scope deliberately (ratatoskr's delete+recreate
+  is not on the send surface A2/A4/B5 need); it stays `Unsupported` in bifrost
+  IMAP. If later implemented it is a clean delete+recreate on the Drafts APPEND
+  primitive.
+- Read-receipt / MDN injection was left above the seam: A2 did not grow
+  `SendRequest` with an MDN field (a cross-provider `types` change out of A2's
+  blast radius), so ratatoskr injects `Disposition-Notification-To` above this
+  seam, or a follow-up adds the field for all providers at once. The capability is
+  preserved, not silently dropped.
+- `draft_send` adds a net-new raw `BODY[]` full-message fetch (hydration returns a
+  parsed projection, not verbatim octets) plus deliberate Bcc-into-envelope /
+  strip-from-body handling so blind recipients are delivered without leaking the
+  `Bcc:` header.
+- `attachment_upload` stays `Unsupported` (A6 territory); uploaded-attachment
+  handles in a `SendRequest` are rejected. `smtp-M1` (raw-socket bandwidth
+  metering parity) was not folded in - it stays in `TODO.md`.
 
 ---
 

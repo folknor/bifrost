@@ -99,19 +99,27 @@ at spec time.
 - TODO resolved: the "Token rotation asymmetry across factories" cross-cutting
   item is closed by this brick.
 
-### A2 - IMAP send
+### A2 - IMAP send - LANDED
 
 - Intent: one uniform send surface; no IMAP-plus-SMTP composition leaks up.
-- Current: `send_message` / `draft_send` are already on `Account`, and the
-  `send_message` docstring states "IMAP via the configured bifrost-smtp
-  transport." `PimMethodSupport.send_message` exists. Verify at spec time
-  whether IMAP's impl actually composes an SMTP backend or returns
-  `Unsupported`.
-- Spec delivers: IMAP `send_message` / `draft_send` backed by a bifrost-smtp
-  transport constructed inside the IMAP account, authenticating via the same
-  `TokenSource` from A1; capability flag true.
+- Delivered: `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` builds an
+  owned `bifrost-smtp` transport inside the IMAP account. With submission
+  configured, `send_message` and `draft_send` are real and the capability flags
+  report `true`; without it they return `Unsupported` and the flags stay `false`.
+  Submission auth reuses the IMAP `Credentials` (the A1 `Arc<dyn TokenSource>`
+  threads straight across) unless `SubmissionCredentials` overrides it. MIME
+  assembly moved to a shared `bifrost-types::mime` serializer
+  (`send_request_to_rfc5322` / `render_rfc5322`) lifted from Google's
+  `MailDocument`; Google, IMAP send, and IMAP `draft_create`/`draft_patch` now
+  share one composition path. `send_message` returns the real APPENDUID-derived
+  `ObjectId` from the Sent APPEND when available, else a controlled-domain
+  generated `Message-ID`. A failed Sent-APPEND after a committed send is
+  non-fatal (never resend) but logs an uncertain-Sent reconcile warning.
+  `draft_send` adds a net-new raw `BODY[]` fetch plus Bcc-into-envelope /
+  strip-from-body handling. `attachment_upload` stays `Unsupported` (A6).
 - Depends on: A1 (shared token source).
-- TODO: `smtp-M1` adjacent (raw-socket bandwidth metering parity).
+- TODO: `smtp-M1` adjacent (raw-socket bandwidth metering parity) - not folded
+  in; the submission transport uses the SMTP crate's own pooling.
 
 ### A3 - Raw RFC822 hydration
 

@@ -196,9 +196,70 @@ Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is op
 - Containers: LIST-backed folder enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE. DELETE first checks `STATUS MESSAGES` and refuses non-empty mailboxes.
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised.
 - Hydration: one-shot message FETCH and synthetic thread hydration.
-- Draft create/discard: APPEND to the Drafts folder with `\Draft` when Drafts and UIDPLUS are present; discard deletes the draft object id.
+- Draft create/discard: APPEND to the Drafts folder with `\Draft` when Drafts and UIDPLUS are present; discard deletes the draft object id. Draft bodies are built by the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles still rejected as `AttachmentUpload`), so the `Bcc:` header is preserved in the saved draft.
+- Send / draft-send: real when `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` is set (see "Submission" below); `Unsupported` otherwise.
 
-Unsupported PIM methods return `Error::Unsupported` and have false capability flags: SMTP send, attachment upload, draft update/send, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
+Unsupported PIM methods return `Error::Unsupported` and have false capability flags: attachment upload, draft update, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. SMTP send and draft-send are unsupported only when no submission config is present. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
+
+### Submission (SMTP send)
+
+`ImapAccountConfig::with_submission(SmtpSubmissionConfig)` makes the account
+own a `bifrost-smtp` transport (`crates/imap/src/account/submission.rs`,
+`SubmissionTransport`). The factory builds it at open and stores it on
+`ImapAccountInner.submission`; `build_capabilities(.., submission_configured)`
+flips `send_message` / `draft_send` true together with the impls (one atomic
+flag/behavior flip - the flag never lies). `attachment_upload` stays false (A6).
+
+- `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 /
+  StartTls 587 / Plaintext 587, mapped to SMTP `relay` / `starttls_relay` /
+  `builder_dangerous`), optional port/timeout/pool, the default From address,
+  a `save_to_sent_default`, and optional `SubmissionCredentials`. It is `Clone`
+  but not `Eq`/serde (a live token source is neither).
+- Credential reuse: when `credentials` is `None`, the SMTP credentials are
+  derived from the IMAP `Credentials` via `credentials.kind()` -
+  password->password, or OAuth identity + the *same* `Arc<dyn TokenSource>`
+  (A1) cloned across the boundary. An override supplies explicit submission
+  auth.
+- The send path stays in `bifrost_types::Address` space. The only
+  `Address -> bifrost_smtp::Address` conversion is the bare addr-spec
+  reverse-path / recipient conversion at `SubmissionTransport::send_rfc5322`,
+  which drives `AsyncSmtpTransport::send_raw_batch_with_options` and returns
+  SMTP's already-translated `AccountError` (no IMAP `Smtp` error variant; a
+  submission *build* failure maps to `InvalidInput`). `draft_send` re-stamps
+  the returned error's operation to `DraftSend`.
+- MIME assembly is the shared `bifrost-types::mime` serializer
+  (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts), lifted
+  from Google's `MailDocument` so Google and IMAP share one path. It emits
+  text/html/`multipart/alternative` bodies, a `multipart/mixed` wrapper for
+  inline attachments, RFC 2047 display names, and a controlled-domain
+  `Message-ID` (sender domain, never `hostname::get()`).
+- `ObjectId` rule: `send_message` / `draft_send` return the real
+  APPENDUID-derived id from the Sent APPEND when UIDPLUS yields one, else the
+  generated/parsed `Message-ID` (`imapmsgid1:<id>`). The send result is
+  authoritative for `Ok`; the id depends only on whether a real APPENDUID was
+  obtained.
+- Sent-APPEND contract: after a committed SMTP send, a failed (or
+  no-UIDPLUS, or no-Sent-folder) APPEND is non-fatal - SMTP is never
+  re-driven - but not silent: it logs an uncertain-Sent reconcile warning and
+  falls back to the generated `Message-ID`.
+- `draft_send` is "fetch + send + discard": a net-new one-shot raw `BODY[]`
+  full-message fetch (bounded by `DRAFT_FETCH_BUDGET`, 64 MiB, through the
+  `FetchLimit` guard - never `usize::MAX`) recovers the verbatim draft
+  octets (hydration only returns a parsed projection), the headers build the
+  envelope, and the `Bcc:` header is folded into RCPT recipients but
+  stripped from the transmitted body. A failed post-send discard is logged,
+  not fatal.
+- Sent-copy Bcc retention: the body transmitted over SMTP strips `Bcc:`
+  (blind recipients are never disclosed on the wire), but the copy APPENDed
+  to the Sent folder retains it - the sender's Sent copy is their own record
+  of who was blind copied. `send_message` uses the assembler's `sent_copy`
+  variant (a Bcc-bearing render, present only when the request has a Bcc);
+  `draft_send` APPENDs the original saved-draft octets, which already carry
+  the `Bcc:` header.
+
+`bifrost-imap` now depends on `bifrost-smtp` (feature `tokio`;
+`account-error` rides in as a default feature). SMTP has no path back to
+IMAP, so this is acyclic.
 
 When `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)` is
 set, IMAP advertises `filter_rule_shape: Scripts` and all five

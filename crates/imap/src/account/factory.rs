@@ -11,6 +11,7 @@ use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfi
 
 use super::error::ImapErrorContext;
 use super::sieve::ManageSieveConfig;
+use super::submission::{SmtpSubmissionConfig, SubmissionTransport};
 use super::{
     ImapAccount, ImapAccountParts, Pool, account_error_with, capabilities,
     folder_registry::FolderRegistry,
@@ -48,6 +49,7 @@ pub struct ImapAccountConfig {
     pub sieve: Option<ManageSieveConfig>,
     pub carddav: Option<CardDavConfig>,
     pub caldav: Option<CalDavConfig>,
+    pub submission: Option<SmtpSubmissionConfig>,
 }
 
 impl ImapAccountConfig {
@@ -67,6 +69,7 @@ impl ImapAccountConfig {
             sieve: None,
             carddav: None,
             caldav: None,
+            submission: None,
         }
     }
 
@@ -92,6 +95,11 @@ impl ImapAccountConfig {
 
     pub fn with_caldav(mut self, config: CalDavConfig) -> Self {
         self.caldav = Some(config);
+        self
+    }
+
+    pub fn with_submission(mut self, config: SmtpSubmissionConfig) -> Self {
+        self.submission = Some(config);
         self
     }
 }
@@ -141,12 +149,14 @@ impl AccountFactory for ImapAccountFactory {
                 .map_err(discover_err)?;
             let contacts = open_carddav(&cfg, account_id.clone()).await?;
             let calendars = open_caldav(&cfg, account_id.clone()).await?;
+            let submission = open_submission(&cfg)?;
             let caps = capabilities::build_capabilities(
                 &profile,
                 &folders,
                 cfg.sieve.is_some(),
                 contacts.is_some(),
                 calendars.is_some(),
+                submission.is_some(),
             );
             let registry = Arc::new(FolderRegistry::from_list(folders));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
@@ -167,6 +177,7 @@ impl AccountFactory for ImapAccountFactory {
                 bandwidth_cap,
                 contacts,
                 calendars,
+                submission,
             });
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
@@ -184,6 +195,16 @@ async fn open_carddav(
         .open(account_id)
         .await
         .map(Some)
+}
+
+fn open_submission(
+    cfg: &ImapAccountConfig,
+) -> Result<Option<Arc<SubmissionTransport>>, AccountError> {
+    let Some(config) = &cfg.submission else {
+        return Ok(None);
+    };
+    let transport = SubmissionTransport::build(config, &cfg.credentials).map_err(discover_err)?;
+    Ok(Some(Arc::new(transport)))
 }
 
 async fn open_caldav(

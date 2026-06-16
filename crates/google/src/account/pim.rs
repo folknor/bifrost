@@ -1,11 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
     Container, ContainerId, ContainerKind, DraftHandle, DraftPatch, FolderRole,
@@ -704,6 +700,10 @@ fn page_token(request: &SearchRequest) -> Result<Option<String>, AccountError> {
         .transpose()
 }
 
+fn sanitize_header(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").trim().to_string()
+}
+
 fn query_term(value: &str) -> String {
     let sanitized = sanitize_header(value);
     if sanitized
@@ -1128,166 +1128,30 @@ fn render_message(
         ));
     }
 
-    let mut headers = Vec::new();
     let from = doc
         .from
         .clone()
         .unwrap_or_else(|| Address::bare(default_address.to_string()));
-    push_header(&mut headers, "From", &format_address(&from));
-    push_address_header(&mut headers, "To", &doc.to);
-    push_address_header(&mut headers, "Cc", &doc.cc);
-    push_address_header(&mut headers, "Bcc", &doc.bcc);
-    push_address_header(&mut headers, "Reply-To", &doc.reply_to);
-    if let Some(subject) = &doc.subject {
-        push_header(&mut headers, "Subject", &encode_header_value(subject));
-    }
-    if let Some(in_reply_to) = &doc.in_reply_to {
-        push_header(&mut headers, "In-Reply-To", in_reply_to);
-    }
-    if !doc.references.is_empty() {
-        push_header(&mut headers, "References", &doc.references.join(" "));
-    }
-    headers.push("MIME-Version: 1.0".to_string());
-
-    let entity = render_entity(doc);
-    let raw = format!("{}\r\n{}\r\n", headers.join("\r\n"), entity);
-    Ok(URL_SAFE_NO_PAD.encode(raw.as_bytes()))
-}
-
-fn render_entity(doc: &MailDocument) -> String {
-    if doc.attachments_inline.is_empty() {
-        return render_body_entity(doc);
-    }
-
-    let boundary = boundary("mixed");
-    let mut out = String::new();
-    out.push_str(&format!(
-        "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n"
-    ));
-    push_part(&mut out, &boundary, &render_body_entity(doc));
-    for attachment in &doc.attachments_inline {
-        push_part(&mut out, &boundary, &render_attachment_entity(attachment));
-    }
-    out.push_str(&format!("--{boundary}--\r\n"));
-    out
-}
-
-fn render_body_entity(doc: &MailDocument) -> String {
-    match (&doc.body_text, &doc.body_html) {
-        (Some(text), Some(html)) => {
-            let boundary = boundary("alternative");
-            let mut out = String::new();
-            out.push_str(&format!(
-                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
-            ));
-            push_part(&mut out, &boundary, &render_text_entity("text/plain", text));
-            push_part(&mut out, &boundary, &render_text_entity("text/html", html));
-            out.push_str(&format!("--{boundary}--\r\n"));
-            out
-        }
-        (Some(text), None) => render_text_entity("text/plain", text),
-        (None, Some(html)) => render_text_entity("text/html", html),
-        (None, None) => render_text_entity("text/plain", ""),
-    }
-}
-
-fn render_text_entity(mime: &str, body: &str) -> String {
-    format!(
-        "Content-Type: {mime}; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        wrap_base64(body.as_bytes())
-    )
-}
-
-fn render_attachment_entity(attachment: &AttachmentInline) -> String {
-    let disposition = if attachment.inline {
-        "inline"
-    } else {
-        "attachment"
+    // Gmail learns the Bcc recipients from the message headers (it strips
+    // the Bcc header itself before delivery), so the Google path emits it.
+    // Gmail mints its own Message-ID, so none is requested here.
+    let composed = bifrost_types::ComposedMessage {
+        from: Some(&from),
+        to: &doc.to,
+        cc: &doc.cc,
+        bcc: &doc.bcc,
+        reply_to: &doc.reply_to,
+        subject: doc.subject.as_deref(),
+        body_text: doc.body_text.as_deref(),
+        body_html: doc.body_html.as_deref(),
+        attachments_inline: &doc.attachments_inline,
+        in_reply_to: doc.in_reply_to.as_deref(),
+        references: &doc.references,
+        message_id: None,
+        include_bcc_header: true,
     };
-    let filename = sanitize_header(&attachment.filename);
-    format!(
-        "Content-Type: {}; name=\"{}\"\r\nContent-Disposition: {disposition}; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
-        sanitize_header(&attachment.mime),
-        filename,
-        filename,
-        wrap_base64(&attachment.data)
-    )
-}
-
-fn push_part(out: &mut String, boundary: &str, part: &str) {
-    out.push_str(&format!("--{boundary}\r\n"));
-    out.push_str(part);
-}
-
-fn push_header(headers: &mut Vec<String>, name: &str, value: &str) {
-    headers.push(format!("{name}: {}", sanitize_header(value)));
-}
-
-fn push_address_header(headers: &mut Vec<String>, name: &str, addresses: &[Address]) {
-    if !addresses.is_empty() {
-        push_header(
-            headers,
-            name,
-            &addresses
-                .iter()
-                .map(format_address)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-}
-
-fn format_address(address: &Address) -> String {
-    let email = sanitize_header(&address.address);
-    match address
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        Some(name) => format!("{} <{email}>", encode_phrase(name)),
-        None => email,
-    }
-}
-
-fn encode_phrase(value: &str) -> String {
-    if value.is_ascii() {
-        format!("\"{}\"", sanitize_header(value).replace('"', "\\\""))
-    } else {
-        encode_header_value(value)
-    }
-}
-
-fn encode_header_value(value: &str) -> String {
-    let sanitized = sanitize_header(value);
-    if sanitized.is_ascii() {
-        sanitized
-    } else {
-        format!("=?UTF-8?B?{}?=", STANDARD.encode(sanitized.as_bytes()))
-    }
-}
-
-fn sanitize_header(value: &str) -> String {
-    value.replace(['\r', '\n'], " ").trim().to_string()
-}
-
-fn wrap_base64(bytes: &[u8]) -> String {
-    let encoded = STANDARD.encode(bytes);
-    encoded
-        .as_bytes()
-        .chunks(76)
-        .map(|chunk| std::str::from_utf8(chunk).unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join("\r\n")
-}
-
-fn boundary(kind: &str) -> String {
-    static NEXT_BOUNDARY: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_BOUNDARY.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("bifrost-google-{kind}-{nanos}-{sequence}")
+    let raw = bifrost_types::render_rfc5322(&composed);
+    Ok(URL_SAFE_NO_PAD.encode(&raw))
 }
 
 fn system_time_to_millis_string(time: SystemTime) -> String {

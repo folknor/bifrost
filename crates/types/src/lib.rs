@@ -27,6 +27,7 @@ pub mod events;
 pub mod filter;
 pub mod hydration;
 pub mod ids;
+pub mod mime;
 pub mod mutation;
 pub mod page;
 pub mod search;
@@ -64,6 +65,11 @@ pub use filter::{
 // Mail composition types.
 pub use compose::{
     Address, AttachmentHandle, AttachmentInline, DraftHandle, DraftPatch, IdentityId, SendRequest,
+};
+
+// Shared RFC 5322 / MIME assembler.
+pub use mime::{
+    ComposedMessage, RenderedMessage, SubmissionEnvelope, render_rfc5322, send_request_to_rfc5322,
 };
 
 // Container / label / mutation-target types.

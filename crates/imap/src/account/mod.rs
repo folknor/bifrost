@@ -42,10 +42,15 @@ mod pool;
 mod push;
 mod scopes;
 mod sieve;
+mod submission;
 
 // pub: consumers register this factory with bifrost-sync without naming ImapAccount.
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
 pub use sieve::ManageSieveConfig;
+// pub: consumers configure IMAP submission (SMTP send) through these.
+pub use submission::{SmtpSubmissionConfig, SubmissionCredentials, SubmissionTls};
+
+pub(crate) use submission::SubmissionTransport;
 
 pub(crate) use envelope::{
     DecodedObjectId, FolderCursor, decode_blob_id, decode_cursor, decode_object_id,
@@ -79,6 +84,7 @@ pub(crate) struct ImapAccountInner {
     pub(crate) push: push::PushState,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
+    pub(crate) submission: Option<Arc<SubmissionTransport>>,
 }
 
 pub(crate) struct ImapAccountParts {
@@ -91,6 +97,7 @@ pub(crate) struct ImapAccountParts {
     pub(crate) bandwidth_cap: Arc<AtomicU64>,
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
+    pub(crate) submission: Option<Arc<SubmissionTransport>>,
 }
 
 impl ImapAccount {
@@ -111,6 +118,7 @@ impl ImapAccount {
                 push: push::PushState::new(),
                 contacts: parts.contacts,
                 calendars: parts.calendars,
+                submission: parts.submission,
             }),
         }
     }
@@ -441,8 +449,8 @@ impl Account for ImapAccount {
         pim::set_is_read(self.clone(), target, is_read)
     }
 
-    fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object(bifrost_types::AccountOperation::Send)
+    fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::send_message(self.clone(), request)
     }
 
     fn attachment_upload(
@@ -469,8 +477,8 @@ impl Account for ImapAccount {
         pim::draft_discard(self.clone(), draft)
     }
 
-    fn draft_send(&self, _draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
-        pim::unsupported_object(bifrost_types::AccountOperation::DraftSend)
+    fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::draft_send(self.clone(), draft)
     }
 
     fn search(

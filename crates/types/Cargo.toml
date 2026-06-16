@@ -15,6 +15,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

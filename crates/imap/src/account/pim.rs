@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use bifrost_types::compose::{Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId};
+use bifrost_types::compose::{
+    Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest,
+};
 use bifrost_types::container::{
     Container, ContainerId, ContainerKind, FolderRole, MutationTarget, Provenance,
 };
@@ -34,6 +36,14 @@ use crate::error::Error;
 fn op_err(op: AccountOperation) -> impl Fn(Error) -> AccountError + Copy {
     move |e| account_error_with(e, super::error::ImapErrorContext::operation(op))
 }
+
+/// Memory budget for the one-shot full-message `BODY[]` fetch in
+/// `draft_send`. A saved draft is the account's own outgoing message, so
+/// this need only bound a single message body, not a folder sweep. 64 MiB
+/// comfortably covers any realistic draft (large inline attachments
+/// included) while keeping the `FetchLimit` guard engaged, so a corrupt or
+/// adversarial server cannot make us buffer an unbounded literal.
+const DRAFT_FETCH_BUDGET: usize = 64 * 1024 * 1024;
 
 pub(crate) fn add_to_container(
     account: ImapAccount,
@@ -150,6 +160,397 @@ pub(crate) fn draft_create(
         };
         Ok(DraftHandle(encode_object_id(&folder, uidvalidity, uid).0))
     })
+}
+
+pub(crate) fn send_message(
+    account: ImapAccount,
+    request: SendRequest,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        let Some(submission) = account.submission.clone() else {
+            return Err(super::error::unsupported(AccountOperation::Send));
+        };
+
+        // The shared assembler is provider-neutral and leaves the protocol
+        // unstamped; attribute it to IMAP here so a "no recipient" /
+        // "uploaded attachments" rejection carries the right protocol.
+        let rendered = bifrost_types::send_request_to_rfc5322(&request, submission.default_from())
+            .map_err(stamp_imap_protocol)?;
+        submission
+            .send_rfc5322(&rendered.envelope, &rendered.raw)
+            .await?;
+
+        // The message is committed. Optionally append to Sent; a failed
+        // APPEND is non-fatal (never resend) but is not swallowed: it
+        // surfaces the uncertain Sent state and falls back to the
+        // generated Message-ID for the returned id.
+        let save = request
+            .save_to_sent
+            .unwrap_or_else(|| submission.save_to_sent_default());
+        // The Sent copy retains the `Bcc:` header (the sender's record of
+        // who was blind copied); only the transmitted body strips it. The
+        // assembler hands back a distinct Bcc-bearing body when a Bcc is
+        // present, else the two are identical and we reuse `raw`.
+        let sent_body = rendered.sent_copy.as_deref().unwrap_or(&rendered.raw);
+        let object_id =
+            append_to_sent_or_fallback(&account, sent_body, save, &rendered.message_id).await;
+        Ok(object_id)
+    })
+}
+
+pub(crate) fn draft_send(
+    account: ImapAccount,
+    draft: DraftHandle,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        let Some(submission) = account.submission.clone() else {
+            return Err(super::error::unsupported(AccountOperation::DraftSend));
+        };
+
+        let decoded = decode_object_id(&ObjectId(draft.0.clone()))?;
+        let raw = fetch_full_message(&account, &decoded).await?;
+
+        // Parse the draft headers to build the envelope: To/Cc/Bcc drive
+        // RCPT TO, From/Sender drive MAIL FROM. The Bcc header is folded
+        // into recipients and stripped from the transmitted body so blind
+        // recipients are delivered but never disclosed.
+        let parsed = parse_draft_for_submission(&raw, submission.default_from())?;
+        submission
+            .send_rfc5322(&parsed.envelope, &parsed.body)
+            .await
+            .map_err(|err| restamp(err, AccountOperation::DraftSend))?;
+
+        // Sent; discard the draft from Drafts and optionally append to
+        // Sent. The Sent copy is the saved draft `raw`, which retains the
+        // `Bcc:` header (the sender's record of who was blind copied) -
+        // only `parsed.body` (the transmitted bytes) strips it.
+        let object_id = append_to_sent_or_fallback(
+            &account,
+            &raw,
+            submission.save_to_sent_default(),
+            &parsed.message_id,
+        )
+        .await;
+
+        // Discard the original draft. A failed discard is non-fatal: the
+        // message was sent. Surface it as a warning rather than failing.
+        if let Err(err) =
+            delete_messages(&account, vec![decoded], AccountOperation::DraftSend).await
+        {
+            tracing::warn!(
+                target: "bifrost_imap::draft_send",
+                error = %err,
+                "draft sent but discard from Drafts failed; the draft may linger"
+            );
+        }
+
+        Ok(object_id)
+    })
+}
+
+/// Append the raw message to the Sent folder when requested and a Sent
+/// role folder resolves. Returns the real APPENDUID-derived `ObjectId`
+/// when the server surfaces one under UIDPLUS, else the supplied
+/// fallback `Message-ID` (controlled domain). A failed APPEND after a
+/// committed send is non-fatal: the send already succeeded, so we never
+/// re-drive SMTP; the uncertain Sent state is logged for reconcile.
+async fn append_to_sent_or_fallback(
+    account: &ImapAccount,
+    raw: &[u8],
+    save: bool,
+    fallback_message_id: &str,
+) -> ObjectId {
+    let fallback = || ObjectId(format!("imapmsgid1:{fallback_message_id}"));
+    if !save {
+        return fallback();
+    }
+    let Some(sent) = role_folder(account, FolderRole::Sent) else {
+        tracing::warn!(
+            target: "bifrost_imap::send",
+            "save_to_sent requested but no Sent folder resolved; returning generated Message-ID"
+        );
+        return fallback();
+    };
+    let conn = match account.pool.dial_idle().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::warn!(
+                target: "bifrost_imap::send",
+                error = %err,
+                "message sent but Sent-folder APPEND could not get a connection; \
+                 local Sent view is uncertain (reconcile by checking the Sent folder)"
+            );
+            return fallback();
+        }
+    };
+    match conn
+        .append(
+            sent.as_str(),
+            &[Flag::Seen],
+            None,
+            raw,
+            account.command_timeout(),
+        )
+        .await
+    {
+        Ok(Some((uidvalidity, uid))) => encode_object_id(&sent, uidvalidity, uid),
+        Ok(None) => {
+            // Sent succeeded but the server gave no UIDPLUS code.
+            fallback()
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "bifrost_imap::send",
+                error = %err,
+                "message sent but Sent-folder APPEND failed; \
+                 local Sent view is uncertain (reconcile by checking the Sent folder)"
+            );
+            fallback()
+        }
+    }
+}
+
+/// One-shot raw `BODY[]` full-message fetch. Hydration returns a parsed
+/// projection, not verbatim octets, so `draft_send` needs this dedicated
+/// fetch to recover the exact RFC 5322 bytes of a saved draft.
+async fn fetch_full_message(
+    account: &ImapAccount,
+    decoded: &DecodedObjectId,
+) -> Result<Vec<u8>, AccountError> {
+    let err = op_err(AccountOperation::DraftSend);
+    let mut conn = account
+        .checkout_for_folder(&decoded.folder)
+        .await
+        .map_err(err)?;
+    account
+        .select_folder(&mut conn, &decoded.folder, None, true)
+        .await
+        .map_err(err)?;
+    let uids = uid_set_from_u32(&[decoded.uid])
+        .ok_or_else(|| pim_malformed("draft object id has no UID"))?;
+    let responses = conn
+        .connection()
+        .uid_fetch_full_messages(&uids, DRAFT_FETCH_BUDGET, account.command_timeout())
+        .await
+        .map_err(err)?;
+    responses
+        .into_iter()
+        .find(|fetch| fetch.uid == Some(decoded.uid))
+        .and_then(|fetch| {
+            fetch
+                .body_sections
+                .into_iter()
+                .find(|section| section.section.is_empty())
+                .and_then(|section| section.data)
+        })
+        .ok_or_else(|| pim_malformed("draft message body not returned by FETCH"))
+}
+
+#[derive(Debug)]
+struct ParsedDraft {
+    envelope: bifrost_types::SubmissionEnvelope,
+    body: Vec<u8>,
+    message_id: String,
+}
+
+/// Parse a saved draft's RFC 5322 headers into a submission envelope and
+/// strip the `Bcc:` header from the transmitted body. To/Cc/Bcc become
+/// the recipient set; From (or `default_from`) is the reverse path. The
+/// draft's own `Message-ID` is the fallback id.
+fn parse_draft_for_submission(
+    raw: &[u8],
+    default_from: &bifrost_types::Address,
+) -> Result<ParsedDraft, AccountError> {
+    let text = String::from_utf8_lossy(raw);
+    let split = text
+        .find("\r\n\r\n")
+        .map(|idx| (idx, idx + 4))
+        .or_else(|| text.find("\n\n").map(|idx| (idx, idx + 2)));
+    let (header_end, body_start) = split.unwrap_or((text.len(), text.len()));
+    let header_block = &text[..header_end];
+
+    let headers = unfold_headers(header_block);
+
+    let from = first_address(&headers, "from")
+        .or_else(|| first_address(&headers, "sender"))
+        .unwrap_or_else(|| default_from.clone());
+
+    let mut recipients = Vec::new();
+    recipients.extend(addresses_for(&headers, "to"));
+    recipients.extend(addresses_for(&headers, "cc"));
+    recipients.extend(addresses_for(&headers, "bcc"));
+    if recipients.is_empty() {
+        return Err(pim_malformed("draft has no recipients"));
+    }
+
+    let message_id = header_value(&headers, "message-id")
+        .map(|value| {
+            value
+                .trim()
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_owned()
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let domain = from
+                .address
+                .rsplit_once('@')
+                .map_or("localhost", |(_, domain)| domain);
+            format!("bifrost.draft@{domain}")
+        });
+
+    let body = strip_bcc_header(header_block, &text[body_start..]);
+
+    Ok(ParsedDraft {
+        envelope: bifrost_types::SubmissionEnvelope { from, recipients },
+        body,
+        message_id,
+    })
+}
+
+/// Reassemble the message bytes with every `Bcc:` header line removed so
+/// blind recipients are not disclosed in the transmitted message.
+fn strip_bcc_header(header_block: &str, body: &str) -> Vec<u8> {
+    let mut kept = String::with_capacity(header_block.len() + body.len() + 4);
+    let mut skipping = false;
+    for line in header_block.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(['\r', '\n']);
+        let is_continuation = line.starts_with(' ') || line.starts_with('\t');
+        if !is_continuation {
+            skipping = trimmed
+                .split_once(':')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("bcc"));
+        }
+        if !skipping {
+            kept.push_str(line);
+        }
+    }
+    if !kept.ends_with('\n') {
+        kept.push_str("\r\n");
+    }
+    kept.push_str("\r\n");
+    kept.push_str(body);
+    kept.into_bytes()
+}
+
+/// Collapse RFC 5322 folded header lines into `(lowercase-name, value)`
+/// pairs, preserving order.
+fn unfold_headers(header_block: &str) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in header_block.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+            let last = headers.last_mut().expect("non-empty");
+            last.1.push(' ');
+            last.1.push_str(line.trim());
+        } else if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+    headers
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn addresses_for(headers: &[(String, String)], name: &str) -> Vec<bifrost_types::Address> {
+    headers
+        .iter()
+        .filter(|(key, _)| key == name)
+        .flat_map(|(_, value)| parse_address_list(value))
+        .collect()
+}
+
+fn first_address(headers: &[(String, String)], name: &str) -> Option<bifrost_types::Address> {
+    header_value(headers, name).and_then(|value| parse_address_list(value).into_iter().next())
+}
+
+/// Minimal RFC 5322 address-list parser sufficient for envelope
+/// construction (recipient addr-specs and an optional display name).
+///
+/// Commas inside a quoted display name or inside the angle-bracketed
+/// addr-spec do not split addresses - otherwise a draft this crate
+/// itself emitted (the shared assembler quotes names like
+/// `"Last, First" <a@b>`) would round-trip into garbage recipients.
+fn parse_address_list(value: &str) -> Vec<bifrost_types::Address> {
+    split_address_list(value)
+        .into_iter()
+        .filter_map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                return None;
+            }
+            if let Some((name, rest)) = item.split_once('<')
+                && let Some((address, _)) = rest.split_once('>')
+            {
+                let name = name.trim().trim_matches('"').trim();
+                return Some(bifrost_types::Address {
+                    name: (!name.is_empty()).then(|| name.to_owned()),
+                    address: address.trim().to_owned(),
+                });
+            }
+            Some(bifrost_types::Address::bare(item.to_owned()))
+        })
+        .collect()
+}
+
+/// Split an address-list header value on the top-level commas only:
+/// commas inside a `"..."` quoted display name or inside a `<...>`
+/// addr-spec are not separators.
+fn split_address_list(value: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    for ch in value.chars() {
+        match ch {
+            '"' if !in_angle => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            '<' if !in_quotes => {
+                in_angle = true;
+                current.push(ch);
+            }
+            '>' if !in_quotes => {
+                in_angle = false;
+                current.push(ch);
+            }
+            ',' if !in_quotes && !in_angle => {
+                items.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    items.push(current);
+    items
+}
+
+/// Re-stamp an `AccountError` from the submission boundary with the IMAP
+/// operation that drove it, so recovery/telemetry attribute it correctly.
+fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
+    err.into_builder()
+        .operation(op)
+        .try_build()
+        .expect("valid account error classification")
+}
+
+/// Attribute a provider-neutral assembler error to IMAP. The shared
+/// `bifrost-types` MIME assembler leaves the protocol unset (it is shared
+/// across providers); the IMAP send path stamps `Protocol::Imap` so
+/// telemetry and recovery attribute the failure to this account.
+fn stamp_imap_protocol(err: AccountError) -> AccountError {
+    err.into_builder()
+        .protocol(Protocol::Imap)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 pub(crate) fn draft_discard(
@@ -1182,94 +1583,47 @@ fn addresses(addresses: &[crate::types::EnvelopeAddress]) -> Vec<Address> {
         .collect()
 }
 
+/// Serialize a `DraftPatch` into RFC 5322 octets via the shared
+/// `bifrost-types` MIME assembler - the same path the send surface uses,
+/// so IMAP has one composition path, not two. Inline attachments are now
+/// supported on drafts; uploaded-attachment handles remain rejected (A6).
+/// The `Bcc:` header is preserved in the saved draft body (unlike the
+/// send path, which strips it).
 fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
     if patch
-        .attachments_inline
+        .attachments_uploaded
         .as_ref()
         .is_some_and(|attachments| !attachments.is_empty())
-        || patch
-            .attachments_uploaded
-            .as_ref()
-            .is_some_and(|attachments| !attachments.is_empty())
     {
-        return Err(super::error::unsupported(AccountOperation::DraftCreate));
+        return Err(super::error::unsupported(
+            AccountOperation::AttachmentUpload,
+        ));
     }
-    let mut out = String::new();
-    if let Some(Some(from)) = &patch.from {
-        header(&mut out, "From", &format_address(from));
-    }
-    if let Some(to) = &patch.to {
-        header(&mut out, "To", &format_addresses(to));
-    }
-    if let Some(cc) = &patch.cc {
-        header(&mut out, "Cc", &format_addresses(cc));
-    }
-    if let Some(bcc) = &patch.bcc {
-        header(&mut out, "Bcc", &format_addresses(bcc));
-    }
-    if let Some(reply_to) = &patch.reply_to {
-        header(&mut out, "Reply-To", &format_addresses(reply_to));
-    }
-    if let Some(Some(subject)) = &patch.subject {
-        header(&mut out, "Subject", subject);
-    }
-    if let Some(Some(in_reply_to)) = &patch.in_reply_to {
-        header(&mut out, "In-Reply-To", in_reply_to);
-    }
-    if let Some(references) = &patch.references
-        && !references.is_empty()
-    {
-        header(&mut out, "References", &references.join(" "));
-    }
-    out.push_str("MIME-Version: 1.0\r\n");
-    match (&patch.body_text, &patch.body_html) {
-        (Some(Some(text)), Some(Some(html))) => {
-            let boundary = "bifrost-imap-draft-alt";
-            header(
-                &mut out,
-                "Content-Type",
-                &format!("multipart/alternative; boundary=\"{boundary}\""),
-            );
-            out.push_str("\r\n");
-            out.push_str("--");
-            out.push_str(boundary);
-            out.push_str("\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n");
-            out.push_str(text);
-            out.push_str("\r\n--");
-            out.push_str(boundary);
-            out.push_str("\r\nContent-Type: text/html; charset=utf-8\r\n\r\n");
-            out.push_str(html);
-            out.push_str("\r\n--");
-            out.push_str(boundary);
-            out.push_str("--\r\n");
-        }
-        (_, Some(Some(html))) => {
-            out.push_str("Content-Type: text/html; charset=utf-8\r\n\r\n");
-            out.push_str(html);
-        }
-        (Some(Some(text)), _) => {
-            out.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
-            out.push_str(text);
-        }
-        _ => {
-            out.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
-        }
-    }
-    Ok(out.into_bytes())
-}
 
-fn header(out: &mut String, name: &str, value: &str) {
-    if value.trim().is_empty() {
-        return;
-    }
-    out.push_str(name);
-    out.push_str(": ");
-    out.push_str(&sanitize_header(value));
-    out.push_str("\r\n");
-}
+    let from = patch.from.as_ref().and_then(Option::as_ref);
+    let empty_addresses: Vec<Address> = Vec::new();
+    let empty_strings: Vec<String> = Vec::new();
+    let empty_attachments: Vec<bifrost_types::AttachmentInline> = Vec::new();
 
-fn sanitize_header(value: &str) -> String {
-    value.replace(['\r', '\n'], " ")
+    let composed = bifrost_types::ComposedMessage {
+        from,
+        to: patch.to.as_deref().unwrap_or(&empty_addresses),
+        cc: patch.cc.as_deref().unwrap_or(&empty_addresses),
+        bcc: patch.bcc.as_deref().unwrap_or(&empty_addresses),
+        reply_to: patch.reply_to.as_deref().unwrap_or(&empty_addresses),
+        subject: patch.subject.as_ref().and_then(Option::as_deref),
+        body_text: patch.body_text.as_ref().and_then(Option::as_deref),
+        body_html: patch.body_html.as_ref().and_then(Option::as_deref),
+        attachments_inline: patch
+            .attachments_inline
+            .as_deref()
+            .unwrap_or(&empty_attachments),
+        in_reply_to: patch.in_reply_to.as_ref().and_then(Option::as_deref),
+        references: patch.references.as_deref().unwrap_or(&empty_strings),
+        message_id: None,
+        include_bcc_header: true,
+    };
+    Ok(bifrost_types::render_rfc5322(&composed))
 }
 
 /// Build a `Request(Malformed)` `AccountError` for local PIM failures
@@ -1292,23 +1646,75 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
     .expect("valid account error classification")
 }
 
-fn format_addresses(addresses: &[Address]) -> String {
-    addresses
-        .iter()
-        .map(format_address)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn format_address(address: &Address) -> String {
-    match &address.name {
-        Some(name) if !name.trim().is_empty() => {
-            format!(
-                "{} <{}>",
-                sanitize_header(name),
-                sanitize_header(&address.address)
-            )
-        }
-        _ => sanitize_header(&address.address),
+    #[test]
+    fn draft_send_strips_bcc_into_envelope() {
+        let raw = b"From: Me <me@sender.test>\r\n\
+To: Ann <ann@to.test>\r\n\
+Cc: cc@cc.test\r\n\
+Bcc: blind1@bcc.test, Blind Two <blind2@bcc.test>\r\n\
+Subject: Hi\r\n\
+Message-ID: <draft-123@sender.test>\r\n\
+\r\n\
+body text\r\n";
+        let default_from = bifrost_types::Address::bare("fallback@sender.test");
+        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+
+        // Bcc addresses are folded into the envelope recipients.
+        let recipients: Vec<&str> = parsed
+            .envelope
+            .recipients
+            .iter()
+            .map(|a| a.address.as_str())
+            .collect();
+        assert_eq!(
+            recipients,
+            [
+                "ann@to.test",
+                "cc@cc.test",
+                "blind1@bcc.test",
+                "blind2@bcc.test"
+            ]
+        );
+        assert_eq!(parsed.envelope.from.address, "me@sender.test");
+        assert_eq!(parsed.message_id, "draft-123@sender.test");
+
+        // Bcc header is stripped from the transmitted body; To/Cc remain.
+        let body = String::from_utf8(parsed.body).expect("utf8");
+        assert!(!body.to_ascii_lowercase().contains("bcc:"));
+        assert!(body.contains("To: Ann <ann@to.test>"));
+        assert!(body.contains("Cc: cc@cc.test"));
+        assert!(body.contains("body text"));
+    }
+
+    #[test]
+    fn draft_send_falls_back_to_default_from_and_requires_recipient() {
+        let default_from = bifrost_types::Address::bare("fallback@sender.test");
+
+        // No From header: reverse path falls back to default_from.
+        let raw = b"To: ann@to.test\r\n\r\nhi\r\n";
+        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        assert_eq!(parsed.envelope.from.address, "fallback@sender.test");
+
+        // No recipients at all: malformed.
+        let raw = b"From: me@sender.test\r\n\r\nhi\r\n";
+        let err = parse_draft_for_submission(raw, &default_from).expect_err("no recipients");
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+    }
+
+    #[test]
+    fn parse_address_list_respects_quoted_commas() {
+        // A display name this crate's own assembler quotes (`"Last, First"`)
+        // must not split into a phantom recipient.
+        let parsed = parse_address_list("\"Doe, Jane\" <jane@to.test>, bob@to.test");
+        let addrs: Vec<&str> = parsed.iter().map(|a| a.address.as_str()).collect();
+        assert_eq!(addrs, ["jane@to.test", "bob@to.test"]);
+        assert_eq!(parsed[0].name.as_deref(), Some("Doe, Jane"));
     }
 }

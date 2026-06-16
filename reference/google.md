@@ -38,10 +38,9 @@ Internal modules:
 - `push.rs` - Cloud Pub/Sub `watch`/`stop`, `PubSubConfig`,
   `PubSubControl`, renewer task.
 - `mutation.rs` - `bulk_set_flags`, `bulk_move`, `bulk_destroy`.
-- `pim.rs` - Phase 3.6 unified PIM primitives: message and
-  thread label mutations, MIME send and drafts, search translation,
-  container CRUD, identities, vacation responder, and typed
-  message/thread hydration.
+- `pim.rs` - Phase 3.6 PIM primitives: message/thread label
+  mutations, MIME send and drafts, search translation, container
+  CRUD, identities, vacation responder, message/thread hydration.
 - `filters.rs` - Gmail settings filter list/create/delete and
   typed-rule mapping.
 - `flags.rs` - Gmail-label-to-IMAP-flag canonicalization and the
@@ -105,26 +104,22 @@ on the same cancellation token.
 
 - `cursor_freshness: CursorFreshness::ServerIssued`. The
   `historyId` is server-issued and monotone per account; the
-  engine can trust it as a freshness signal without a local
-  clock.
+  engine trusts it as a freshness signal without a local clock.
 - `blob_range: BlobRangeSupport::No`. Gmail attachments arrive
-  base64url-encoded inside a JSON envelope. There is no HTTP
-  Range surface against attachment downloads; `open_blob_range`
-  enforces the unsupported case early.
-- `blob_digest_pre_download: false`. The attachment metadata
-  does not carry a digest separately from the body.
+  base64url-encoded inside a JSON envelope with no HTTP Range
+  surface; `open_blob_range` enforces the unsupported case early.
+- `blob_digest_pre_download: false`. Attachment metadata carries
+  no digest separate from the body.
 - `push: PushCapability::OutOfProcessPubsub`. Push lives on
-  Google Cloud Pub/Sub, not on a connection bifrost owns.
-  `push_in_process()` is false; consumers wire their own
-  Pub/Sub subscriber and feed `InvalidationSink` from there.
+  Google Cloud Pub/Sub, not a connection bifrost owns.
+  `push_in_process()` is false; consumers wire their own Pub/Sub
+  subscriber and feed `InvalidationSink` from there.
 - `mutation.concurrency: MutationConcurrency::None`. Gmail has
-  no server-side optimistic-concurrency primitive on
-  `batchModify`. The engine's read-back guard is the
-  lost-update safety net.
+  no optimistic-concurrency primitive on `batchModify`; the
+  engine's read-back guard is the lost-update safety net.
 - `mutation.replay_safety: MutationReplaySafety::None`. Gmail
-  does not document a client-mintable dedup token, so the
-  shared `IdempotencyKey` is accepted and held engine-side
-  rather than wired onto the request.
+  has no client-mintable dedup token, so the shared
+  `IdempotencyKey` is held engine-side, not wired onto the request.
 - `batching_policy: BatchingPolicy { max_items: 1000, max_wait:
   75ms, flush_on_input_close: true }`. 1000 matches Gmail's
   `batchModify` cap.
@@ -136,13 +131,13 @@ on the same cancellation token.
 - `historyid_expires_after: None`. Gmail does not document a
   fixed retention window for `historyId`. The Account layer
   detects expiry reactively via `classify_history_error`
-  (404/410 -> `RestartScope`) rather than scheduling on a
-  timer. `describe_cursor` reports `CostClass::Expensive` only
+  (404/410 -> `RestartScope`), not on a timer.
+  `describe_cursor` reports `CostClass::Expensive` only
   when the cursor envelope no longer decodes against the open
   account's email-address; that flips
   `SyncStrategy::ServerCursor` to `SyncStrategy::None` and
   `freshness` to `None`, prompting the engine to re-establish.
-- `delta_token_expires_after: None`. Gmail has no delta token.
+- `delta_token_expires_after: None`. No delta token.
 - `pim_methods`:
   - Supported: `add_to_container`, `remove_from_container`,
     `set_label_membership`, `set_is_read`, `send_message`,
@@ -188,18 +183,19 @@ Mail mutation primitives use Gmail label modification:
   Archive removes `INBOX`; removing from Archive is a no-op because
   archive is the absence of the Inbox label, not a native label.
 
-Composition primitives build RFC 5322 MIME locally and send the
-base64url raw message through Gmail:
+Composition renders MIME through the shared `bifrost-types::mime`
+serializer (`render_rfc5322`, lifted from the old `MailDocument` body
+builder, shared with IMAP send) and sends the base64url message through
+Gmail. `MailDocument` keeps Gmail orchestration (draft-patch apply,
+hydration) and emits `Bcc:` so Gmail learns blind recipients:
 
 - `send_message` calls `users.messages.send`. Inline attachments are
   encoded into the MIME tree. Pre-uploaded attachment handles are
-  unsupported because Gmail has no separate upload primitive for
-  message attachments.
-- `draft_create`, `draft_update`, `draft_discard`, and `draft_send`
-  call Gmail drafts endpoints. `draft_update` fetches the current
-  draft in `full` format, projects editable headers/body/attachments
-  into the shared draft document, applies the partial patch, then
-  replaces the draft with a new raw MIME body.
+  unsupported (Gmail has no separate message-attachment upload).
+- `draft_create`, `draft_update`, `draft_discard`, `draft_send` call
+  Gmail drafts endpoints. `draft_update` fetches the draft in `full`,
+  projects editable fields into `MailDocument`, applies the patch, then
+  replaces the draft with the re-rendered raw MIME.
 - `attachment_upload` returns `Unsupported`.
 
 Search translates the shared `SearchRequest` AST into Gmail query
