@@ -142,6 +142,13 @@ impl WireReader {
         self.stream.set_keepalive(ka)
     }
 
+    /// DER of the peer certificate. Delegates to
+    /// [`ImapStream::peer_certificate_der`]. Read-only; touches no buffer
+    /// or wire state.
+    pub(in crate::connection) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        self.stream.peer_certificate_der()
+    }
+
     /// Consume the reader and return the owned stream.
     ///
     /// Used by stream upgrades (STARTTLS, COMPRESS): drop this reader

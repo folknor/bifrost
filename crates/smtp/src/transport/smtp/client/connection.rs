@@ -1277,6 +1277,15 @@ impl SmtpConnection {
         self.stream.get_ref().is_encrypted()
     }
 
+    /// DER of the peer (server) certificate. See
+    /// [`NetworkStream::peer_certificate_der`] for the contract.
+    // Plumbing for SCRAM-PLUS channel binding; the first consumer is the
+    // SASL layer, so there is no in-crate caller yet.
+    #[allow(dead_code)]
+    pub(crate) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        self.stream.get_ref().peer_certificate_der()
+    }
+
     /// Set timeout
     pub(crate) fn set_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         self.stream.get_mut().set_read_timeout(duration)?;
@@ -1573,6 +1582,33 @@ mod test {
         assert!(
             !observed.contains("QUIT"),
             "abort must close without sending QUIT, got {observed:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn peer_certificate_der_is_none_on_plaintext() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream.write_all(b"220 localhost\r\n").unwrap();
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut ehlo = String::new();
+            reader.read_line(&mut ehlo).unwrap();
+            stream.write_all(b"250 localhost\r\n").unwrap();
+        });
+
+        let connection =
+            SmtpConnection::connect(address, None, &ClientId::default(), None, None).unwrap();
+        assert!(
+            connection.peer_certificate_der().is_none(),
+            "plaintext connection must have no peer certificate DER"
         );
         handle.join().unwrap();
     }

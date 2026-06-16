@@ -183,6 +183,27 @@ impl NetworkStream {
         }
     }
 
+    /// DER of the peer (server) certificate when the connection is TLS.
+    ///
+    /// Returns `None` on plaintext, Unix-domain, and disconnected
+    /// streams, and when native-tls cannot produce the certificate DER.
+    /// The DER is the input to RFC 5929 `tls-server-end-point` channel
+    /// binding; computing the binding is the SASL layer's job, not this
+    /// accessor's.
+    // Plumbing for SCRAM-PLUS channel binding; the first consumer is the
+    // SASL layer, so there is no in-crate caller yet.
+    #[allow(dead_code)]
+    pub(crate) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        match self.inner.as_ref() {
+            Some(InnerNetworkStream::NativeTls(s)) => s
+                .peer_certificate()
+                .ok()
+                .flatten()
+                .and_then(|c| c.to_der().ok()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn set_read_timeout(&mut self, duration: Option<Duration>) -> io::Result<()> {
         match self.inner.as_mut() {
             Some(InnerNetworkStream::Tcp(stream)) => stream.set_read_timeout(duration),

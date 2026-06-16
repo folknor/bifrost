@@ -327,6 +327,33 @@ impl ImapStream {
         })
     }
 
+    /// DER of the peer (server) certificate when the underlying transport
+    /// is TLS (directly or beneath COMPRESS=DEFLATE).
+    ///
+    /// Returns `None` for plain TCP, the poisoned upgrade sentinel, and
+    /// in-memory test streams, and when native-tls cannot produce the
+    /// certificate DER. The DER is the RFC 5929 `tls-server-end-point`
+    /// input; the SASL layer computes the binding.
+    pub(super) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        let tls = match self {
+            Self::Tls(s) => Some(s),
+            Self::Compressed(c) => match &c.inner {
+                InnerStream::Tls(s) => Some(s),
+                InnerStream::Plain(_) => None,
+            },
+            Self::Plain(_) | Self::Poisoned => None,
+            #[cfg(test)]
+            Self::Memory(_) => None,
+        };
+        tls.and_then(|s| {
+            s.get_ref()
+                .peer_certificate()
+                .ok()
+                .flatten()
+                .and_then(|c| c.to_der().ok())
+        })
+    }
+
     /// Extract the underlying `TcpStream` for STARTTLS upgrade.
     pub(super) fn into_tcp(self) -> Option<TcpStream> {
         match self {

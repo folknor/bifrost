@@ -115,6 +115,20 @@ impl dispatch::Consumer for PanickingConsumer {
 // Driver-panic  -  consumer panic surfaces as DriverPanicked (I7)
 // ---------------------------------------------------------------------------
 
+/// The peer-certificate handle routes through the full driver path
+/// (handle method -> `DriverCommand::PeerCertificate` -> driver-loop arm
+/// -> `WireReader` -> `ImapStream::Memory`) and returns `None` over the
+/// non-TLS in-memory transport. This pins the dispatch wiring: a missing
+/// driver-loop arm would hang the oneshot and the test would time out.
+#[tokio::test]
+async fn peer_certificate_der_none_over_memory_stream() {
+    let (conn, _server) = make_driver_test_pair().await;
+    assert!(
+        conn.peer_certificate_der().await.is_none(),
+        "in-memory (non-TLS) transport must have no peer certificate DER"
+    );
+}
+
 /// Invariant: a consumer that panics inside the driver task surfaces
 /// as `Error::DriverPanicked` on the caller side. The panic message
 /// is extracted from the `JoinError` and included in the error.

@@ -21,8 +21,11 @@ servers; SMTP must not stay weaker just because sending is the
 - SMTP advertises only PLAIN, LOGIN, XOAUTH2, OAUTHBEARER in
   `crates/smtp/src/transport/smtp/authentication.rs:132`. No SCRAM
   family at all.
-- IMAP and SMTP both wrap `native-tls` streams but neither surfaces
-  the peer certificate upward. That is the real blocker for SCRAM-PLUS.
+- Both crates now surface the peer certificate DER upward through
+  their stream wrappers (`peer_certificate_der` accessors on the IMAP
+  `ImapConnection` handle and the SMTP sync/async connection structs).
+  This is the transport prerequisite for SCRAM-PLUS; the binding value
+  itself is not computed yet.
 
 ## Plan
 
@@ -61,13 +64,13 @@ is underneath.
 Channel binding is the real blocker; landing it first unblocks
 SCRAM-PLUS for both crates.
 
-`NetworkStream` / `AsyncNetworkStream` in both crates grow a
-`peer_certificate()` accessor returning the server certificate DER.
-`native-tls`'s `TlsStream::peer_certificate()` already exposes the
-DER bytes; the work is just plumbing them upward through the stream
-wrappers.
+The stream wrappers in both crates expose a `peer_certificate_der`
+accessor returning the server certificate DER (landed; pull it from
+`native-tls`'s `TlsStream::peer_certificate()`, routed through the
+IMAP driver and the SMTP connection structs).
 
-The SASL crate then implements `tls-server-end-point` once.
+The SASL crate then implements `tls-server-end-point` once on top of
+that DER.
 
 **RFC 5929 §4, done properly.** The channel-binding value is the
 hash of the **DER-encoded server certificate** (not the
@@ -138,17 +141,19 @@ rejected, server protocol violation).
 
 ## Implementation order
 
-1. `peer_certificate()` accessor on `NetworkStream` and
-   `AsyncNetworkStream` in both crates.
-2. New private `bifrost-sasl` crate. Move IMAP's SCRAM state
+The `peer_certificate_der` transport accessor (formerly step 1) has
+landed in both crates; see git history for the stream-wrapper plumbing.
+The remaining steps:
+
+1. New private `bifrost-sasl` crate. Move IMAP's SCRAM state
    machine and helpers into it; rewire IMAP to consume them. IMAP
    stays green.
-3. Implement `tls-server-end-point` (with correct signature-hash
+2. Implement `tls-server-end-point` (with correct signature-hash
    selection) and SCRAM-PLUS variants in the SASL crate.
-4. Wire IMAP's mechanism selection to prefer PLUS when the server
+3. Wire IMAP's mechanism selection to prefer PLUS when the server
    advertises it; add downgrade-protection check.
-5. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
+4. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
    crate; wire the same mechanism selection and downgrade
    protection.
-6. Move OAuth payload construction into the shared crate; collapse
+5. Move OAuth payload construction into the shared crate; collapse
    the duplicated XOAUTH2 / OAUTHBEARER builders in IMAP and SMTP.

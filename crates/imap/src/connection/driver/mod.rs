@@ -91,6 +91,10 @@ pub(super) enum DriverCommand {
         /// Channel for the result.
         result_tx: oneshot::Sender<Result<(), Error>>,
     },
+    /// Read the peer certificate DER from the owned stream (no wire I/O).
+    PeerCertificate {
+        result_tx: oneshot::Sender<Option<Vec<u8>>>,
+    },
     /// IDLE session  -  the driver enters IDLE mode on the wire, reads
     /// events and publishes them via the event sink, and exits when
     /// `done_rx` fires or the server terminates IDLE (RFC 2177).
@@ -454,6 +458,11 @@ pub(super) async fn driver_task(
                     DriverCommand::SetKeepalive { keepalive, result_tx } => {
                         let result = wire_reader.set_keepalive(&keepalive);
                         let _ = result_tx.send(result);
+                        // No protocol state changed  -  skip snapshot publish.
+                        continue;
+                    }
+                    DriverCommand::PeerCertificate { result_tx } => {
+                        let _ = result_tx.send(wire_reader.peer_certificate_der());
                         // No protocol state changed  -  skip snapshot publish.
                         continue;
                     }

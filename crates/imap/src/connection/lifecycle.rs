@@ -259,6 +259,23 @@ impl ImapConnection {
         }
     }
 
+    /// DER of the peer (server) certificate, or `None` when the transport
+    /// is not TLS, native-tls cannot produce the DER, or the driver has
+    /// exited.
+    ///
+    /// A connection whose driver has died has no live TLS session and thus
+    /// no channel binding  -  the same observable outcome as a plaintext
+    /// connection  -  so the dead-driver path collapses to `None` rather
+    /// than surfacing a driver-gone error.
+    pub(crate) async fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let dcmd = super::driver::DriverCommand::PeerCertificate { result_tx };
+        if self.cmd_tx.send(dcmd).await.is_err() {
+            return None;
+        }
+        result_rx.await.unwrap_or(None)
+    }
+
     /// If the driver task has terminated, return an error describing
     /// why (panic message if panicked, or `DriverGone` if exited
     /// cleanly). Called from `submit` when `cmd_tx.send` fails so the

@@ -267,6 +267,26 @@ impl AsyncNetworkStream {
             InnerAsyncNetworkStream::None => false,
         }
     }
+
+    /// DER of the peer (server) certificate when the connection is TLS.
+    ///
+    /// See `NetworkStream::peer_certificate_der` for the contract; this is
+    /// the Tokio sibling reaching the same native-tls session through
+    /// `tokio_native_tls::TlsStream::get_ref`.
+    // Plumbing for SCRAM-PLUS channel binding; the first consumer is the
+    // SASL layer, so there is no in-crate caller yet.
+    #[allow(dead_code)]
+    pub(crate) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        match &self.inner {
+            InnerAsyncNetworkStream::TokioNativeTls(s) => s
+                .get_ref()
+                .peer_certificate()
+                .ok()
+                .flatten()
+                .and_then(|c| c.to_der().ok()),
+            _ => None,
+        }
+    }
 }
 
 impl AsyncRead for AsyncNetworkStream {
