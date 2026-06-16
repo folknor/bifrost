@@ -156,6 +156,11 @@ pub struct PimMethodSupport {
     pub set_label_membership: bool,
     pub set_category: bool,
     pub set_extended_property: bool,
+    /// Native message-importance overwrite (`set_importance`). Graph
+    /// `PATCH { importance }`, JMAP/IMAP `$important` keyword. `false`
+    /// on Gmail (no importance field) and the DAV crates -> the
+    /// primitive returns `Unsupported(SetImportance)`.
+    pub set_importance: bool,
     pub set_is_read: bool,
     // Mail composition primitives.
     pub send_message: bool,
@@ -275,6 +280,11 @@ pub struct ConvenienceShape {
     /// Same shape for the `$forwarded` flag.
     pub forwarded_via_keyword: bool,
     pub forwarded_via_extended_property: bool,
+    /// True iff `mark_mdn_sent` should flip the `$MDNSent` keyword via
+    /// `set_keyword`. `true` on JMAP and IMAP. `false` on Gmail and Graph:
+    /// their read-receipt model (Graph `isReadReceiptRequested`) is
+    /// read-only, so the convenience returns `Unsupported(UpdateFlags)`.
+    pub mdn_sent_via_keyword: bool,
 }
 
 impl Default for ConvenienceShape {
@@ -285,6 +295,7 @@ impl Default for ConvenienceShape {
             replied_via_extended_property: false,
             forwarded_via_keyword: false,
             forwarded_via_extended_property: false,
+            mdn_sent_via_keyword: false,
         }
     }
 }

@@ -10,10 +10,10 @@ use bifrost_types::{
     ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
     DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectChange,
-    ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority,
-    ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
+    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryPartition,
+    InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
+    Priority, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SubscriptionHandle,
     SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
@@ -585,6 +585,14 @@ impl Account for CardDavAccount {
         _is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         unsupported_future(AccountOperation::SetIsRead)
+    }
+
+    fn set_importance(
+        &self,
+        _target: MutationTarget,
+        _level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        unsupported_future(AccountOperation::SetImportance)
     }
 
     fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {

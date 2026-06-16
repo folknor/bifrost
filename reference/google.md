@@ -160,7 +160,8 @@ on the same cancellation token.
     `event_update`, `event_delete`, `event_rsvp`, `event_search`,
     `event_autocomplete`, and `host_attachment` (Drive hosting).
   - Unsupported: `set_keyword`, `set_category`,
-    `set_extended_property`, `attachment_upload`,
+    `set_extended_property`, `set_importance` (Gmail has no
+    message-importance field), `attachment_upload`,
     `container_move`, `scheduled_send`, and `quota_get`. The Gmail
     REST API has no scheduled-send lever (it is web-UI only), so a
     `SendRequest::scheduled.is_some()` is rejected `Unsupported(Send)`
@@ -173,7 +174,9 @@ on the same cancellation token.
   `set_starred` convenience dispatches to Gmail's `STARRED` label.
   Replied and forwarded convenience flags are false because Gmail
   derives that state from messages rather than exposing a writeable
-  flag.
+  flag. `mdn_sent_via_keyword` is false: Gmail's read-receipt model is
+  read-only, so `mark_mdn_sent` returns `Unsupported(UpdateFlags)`.
+  Hydrated `Message.importance` is always `Normal`.
 
 ## PIM primitives and conveniences
 
@@ -187,8 +190,8 @@ Mail mutation primitives use Gmail label modification:
   `MutationTarget`.
 - `set_label_membership` is the same add/remove label operation.
 - `set_is_read` flips Gmail's `UNREAD` label with inverted polarity.
-- `set_keyword`, `set_category`, and `set_extended_property` return
-  `AccountError::Unsupported`.
+- `set_keyword`, `set_category`, `set_extended_property`, and
+  `set_importance` return `AccountError::Unsupported`.
 - The Archive container is synthetic: adding to Archive removes
   `INBOX`; removing from Archive is a no-op (archive is the absence
   of the Inbox label, not a native label).

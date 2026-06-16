@@ -240,20 +240,77 @@ at spec time.
   absent from `Cargo.lock`); full CardDAV `sync-collection` parity with CalDAV
   is a named follow-up.
 
-### A8 - Provider-wart absorption sweep
+### A8 - Provider-wart absorption sweep - PARTIALLY LANDED (OPEN)
 
 - Intent: anywhere a wart would otherwise force a ratatoskr special-case,
   bifrost absorbs it behind the uniform surface or expresses a clean capability
   flag. Immutable provider limits become flags, never consumer branches.
-- Current: scattered and partly tracked - Graph `remove_from_container` should
-  report `Unsupported(RemoveFromContainer)`; `BlobRangeSupport` exists for
-  blob-range uniformity; Gmail attachment inlining sits behind
-  `attachment_upload`.
-- Spec delivers: the enumerated wart fixes, each as a capability flag or
-  internal absorption. The known ones can land independently; the full list is
-  confirmed once Track B exercises the surface.
+- A8 is a *sweep* spanning the port-map's Groups A-D, not a single landing. The
+  first slice of independent/unblocked warts has landed; the rest stays tracked
+  here and in the port-map's A8 tables. The brick is OPEN until its tail closes.
+- LANDED (first slice): the independent warts unblocked by A1-A7. Delivered as
+  one coherent landing:
+  - **graph-N1 / B-2** - Graph `remove_from_container` returns
+    `Unsupported(RemoveFromContainer)` with `remove_from_container: false`, now
+    pinned by a method-behavior test (not just the flag). Closes `graph-N1`.
+  - **B-1 (importance leg)** - a uniform three-valued `Importance` enum in
+    `bifrost-types::hydration` (re-exported from `lib.rs`), a `Message.importance`
+    read field populated at all four mail-crate construction sites, and a
+    `set_importance` mutation primitive gated by `PimMethodSupport.set_importance`
+    and `AccountOperation::SetImportance`. Graph absorbs its single-valued
+    exclusivity inside one `If-Match`-conditioned PATCH (one overwrite, never
+    expand-into-two); JMAP/IMAP map `High` <-> `$important`; Gmail returns
+    `Unsupported`. The consumer never expands one importance change into two
+    intents.
+  - **B-4 (MDN `$MDNSent`)** - a `mark_mdn_sent` convenience backed by
+    `set_keyword`, gated by the new `ConvenienceShape.mdn_sent_via_keyword` hint
+    (true on JMAP/IMAP, false on Gmail/Graph where the read-receipt bit is
+    read-only; the false case reports `Unsupported(UpdateFlags)`). Rides the same
+    `ConvenienceShape` dispatch as `mark_replied`/`mark_forwarded` - no new
+    operation variant.
+  - **B-3 (draft-update new-id)** - confirmed uniform by construction:
+    `draft_update` returns `Result<(), _>` and surfaces no post-update id, so the
+    new-id contract is identical across all four mail crates (the consumer keeps
+    its `DraftHandle`; impls remap internally).
+  - **A-3 / A-4 / A-5 dispatch** - verified (not rebuilt): the uniform
+    `vacation_*` / `contact_*` / `event_*` trait surface already absorbs
+    ratatoskr's `match source:&str` / `match CalendarProvider` / six-per-provider
+    free fns now that A7 landed the CalDAV/CardDAV legs. Resolved on the
+    bifrost side; the consumer rewrite is Track B (B4/B6/B8).
+- STILL OPEN (tracked, NOT closed by the first slice):
+  - **GAL / A-2** - the org directory-search primitive is split out into its own
+    sibling brick (A9 below). It is a new primitive with two substantial,
+    asymmetric provider backends, not a flag; it does not ride A8.
+  - **C-3** - Graph shared-mailbox send / send-as identity. Waits on A5 (which
+    has not landed); the port-map ties C-3 to A5.
+  - **A-6** - Gmail `CATEGORY_*` bundling priority. POLICY: the ML categories are
+    surfaced uniformly already; the bundling heuristic stays a ratatoskr consumer
+    decision. No bifrost surface change.
+  - **The Track-B-driven tail** - warts that only surface once ratatoskr
+    exercises the uniform surface land near the end of Track B, not here.
+  - **graph-S1 / graph-N3** - Group D transport quirks, tied to a net/sync
+    per-account-limiter decision; outside this slice's blast radius.
 - Depends on: known warts independent; B-driven warts land last.
-- TODO: `graph-N1`, `graph-S1`, and the broader per-crate N-item cleanups.
+- TODO: `graph-S1`, `graph-N3`, and the broader per-crate N-item cleanups
+  (`graph-N1` is now closed and removed from `TODO.md`).
+
+### A9 - Global Address List / directory search
+
+- Intent: the org-directory address-list primitive that A-2 (`handlers/gal.rs`
+  `match provider`) needs - split out of A8 because it is a new search primitive
+  with two substantial, asymmetric provider backends (Graph directory
+  `/users` + `peopleAdminSettings`; Google Admin Directory / People
+  `searchDirectoryPeople`) plus a CardDAV leg, not a flag + thin convenience.
+  The directory corpus is a *different corpus* from the user's personal
+  address books (`contact_search`), which is why it earns its own primitive.
+- Spec delivers: a `directory_search` primitive on `Account` returning a page of
+  directory cards, a `directory_search` flag in `PimMethodSupport`, the Graph and
+  Google directory backends, the CardDAV directory-gateway leg, and the
+  `Unsupported(DirectorySearch)` default for accounts without a directory.
+- Depends on: nothing structurally - standalone, can land before or after the A8
+  tail. A8 deliberately does not add a `directory_search` flag (a `false` flag
+  with no primitive would be dead surface).
+- TODO: none yet; sized at spec time.
 
 ## 6. Sequencing
 
@@ -264,7 +321,10 @@ A1 is the literal first task - it gates everything. Then:
 - A5 is survey-first and the biggest unknown; start its survey early so its
   size is known before the schedule firms up.
 - A7 is independent.
-- A8's known warts are independent; its B-driven tail closes near the end.
+- A8's known warts are independent; its first independent slice has landed
+  (importance, MDN, `remove_from_container` polish, draft-update confirm,
+  contacts/calendar/vacation verification), and its B-driven tail closes near the
+  end. A9 (GAL) is standalone and can land any time.
 
 Downstream stakes (Track B dependents, from the migration plan): A1 unblocks all
 of Track B; A2/A4 -> send and drafts (B5); A3 -> the sync consumer body store

@@ -438,6 +438,14 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::SetIsRead)
     }
 
+    fn set_importance(
+        &self,
+        _target: MutationTarget,
+        _level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        unsupported_future(AccountOperation::SetImportance)
+    }
+
     fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
         unsupported_future(AccountOperation::Send)
     }

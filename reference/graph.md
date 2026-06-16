@@ -217,7 +217,8 @@ receiver in a `stream::unfold` selecting against the same token.
   reactive when the next call returns 410 Gone or 400
   InvalidDeltaToken.
 - `pim_methods`: true for `add_to_container`, `set_category`,
-  `set_extended_property`, `set_is_read`, send/draft lifecycle,
+  `set_extended_property`, `set_importance`, `set_is_read`, send/draft
+  lifecycle,
   `scheduled_send` (with native cancel/reschedule), search, mail
   folder CRUD, `identities_list`, vacation get/set, typed
   thread/message hydration, contact and calendar primitives, and
@@ -234,6 +235,9 @@ receiver in a `stream::unfold` selecting against the same token.
   forwarded dispatch to `set_extended_property` with
   `PidTagLastVerbExecuted` (`Integer 0x1081`) values 102 and 104;
   keyword-backed replied/forwarded flags are false.
+  `mdn_sent_via_keyword = false`: Graph's read-receipt bit
+  (`isReadReceiptRequested`) is read-only, so `mark_mdn_sent` surfaces
+  `Unsupported(UpdateFlags)`.
 
 ## Cursor envelope
 
@@ -408,6 +412,13 @@ operations, fanning out a `MutationTarget::Thread` via
 batches `DELETE .../singleValueExtendedProperties/<prop-id>` and
 tolerates 404. `PR_LAST_VERB_EXECUTED` aliases `Integer 0x1081`. These
 writes send `If-Match` when `changeKey` exists.
+
+`set_importance` patches the single-valued `importance` field
+(`{ "importance": "low|normal|high" }`) in exactly one `If-Match`-
+conditioned PATCH per message - one overwrite, never a clear-then-set
+pair. The read side maps the same wire field back onto
+`Message.importance` (`low`/`high` literal; absent or unrecognized ->
+`Normal`).
 
 Send / draft lifecycle is draft-backed so the trait can return an id:
 `POST /messages` to create, `POST /messages/{id}/send` to send, return

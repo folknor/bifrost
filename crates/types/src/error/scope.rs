@@ -136,6 +136,7 @@ pub enum AccountOperation {
     SetLabelMembership,
     SetCategory,
     SetExtendedProperty,
+    SetImportance,
     SetIsRead,
     Send,
     AttachmentUpload,

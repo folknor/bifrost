@@ -14,10 +14,11 @@ use bifrost_types::{
     ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
     DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -475,6 +476,14 @@ impl Account for ImapAccount {
         is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_is_read(self.clone(), target, is_read)
+    }
+
+    fn set_importance(
+        &self,
+        target: MutationTarget,
+        level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_importance(self.clone(), target, level)
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {

@@ -5,8 +5,9 @@ use base64::Engine;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerId,
     ContainerKind, DraftHandle, DraftPatch, ErrorScope, FolderRole, HydrationProjection, Identity,
-    IdentityId, LabelId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
-    Provenance, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
+    IdentityId, Importance, LabelId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind,
+    ProtocolKind, Provenance, SearchFilter, SearchRequest, ThreadHydration, ThreadId,
+    VacationConfig,
 };
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -205,6 +206,55 @@ pub(crate) async fn set_is_read(
         });
     }
     patch_messages(&account, patches, AccountOperation::SetIsRead).await
+}
+
+/// Exclusive importance overwrite: one `If-Match`-conditioned PATCH of
+/// `{ importance }` per resolved message. Graph's `importance` is a
+/// single-valued field, so this is a strict single overwrite with no
+/// read-modify-write - the consumer never expands one change into two.
+pub(crate) async fn set_importance(
+    account: GraphAccount,
+    target: MutationTarget,
+    level: Importance,
+) -> Result<(), AccountError> {
+    let values = resolve_target_values(
+        &account,
+        target,
+        "id,changeKey",
+        AccountOperation::SetImportance,
+    )
+    .await?;
+    let body = graph_importance_body(level);
+    let mut patches = Vec::new();
+    for message in values {
+        let id = object_id_from_value(&message, AccountOperation::SetImportance)?;
+        let etag = graph_etag(&message).ok_or_else(|| {
+            pim_protocol_error(
+                AccountOperation::SetImportance,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!("Graph message {} did not expose an etag", id.0),
+            )
+        })?;
+        patches.push(MessagePatch {
+            id,
+            body: body.clone(),
+            etag,
+        });
+    }
+    patch_messages(&account, patches, AccountOperation::SetImportance).await
+}
+
+/// The single exclusive PATCH body for `set_importance`. Maps the
+/// uniform level onto Graph's single-valued `importance` field - one
+/// overwrite, never a clear-then-set pair.
+fn graph_importance_body(level: Importance) -> Value {
+    let wire = match level {
+        Importance::Low => "low",
+        Importance::High => "high",
+        // `Normal` and any future variant collapse to Graph's `normal`.
+        _ => "normal",
+    };
+    json!({ "importance": wire })
 }
 
 pub(crate) async fn send_message(
@@ -1403,6 +1453,7 @@ fn message_from_value(
             .map(|id| vec![ContainerId(id.to_string())])
             .unwrap_or_default(),
         flags: flags_from_message(value),
+        importance: importance_from_graph(value),
         body_text,
         body_html,
         attachments,
@@ -1412,6 +1463,17 @@ fn message_from_value(
             .map(|header| header.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
     })
+}
+
+/// Map Graph's single-valued `importance` wire field
+/// (`low|normal|high`) onto the uniform `Importance` enum. Absent or
+/// unrecognized -> `Normal`.
+fn importance_from_graph(value: &Value) -> Importance {
+    match value.get("importance").and_then(Value::as_str) {
+        Some(level) if level.eq_ignore_ascii_case("low") => Importance::Low,
+        Some(level) if level.eq_ignore_ascii_case("high") => Importance::High,
+        _ => Importance::Normal,
+    }
 }
 
 fn body_parts_from_graph_body(body: &Value) -> (Option<String>, Option<String>) {
@@ -1711,5 +1773,45 @@ mod tests {
         };
         let value = graph_attachment_from_inline(&attachment).expect("attachment builds");
         assert_eq!(value["contentBytes"], json!("aGVsbG8="));
+    }
+
+    #[test]
+    fn importance_read_maps_graph_wire_field() {
+        assert_eq!(
+            importance_from_graph(&json!({ "importance": "high" })),
+            Importance::High
+        );
+        assert_eq!(
+            importance_from_graph(&json!({ "importance": "low" })),
+            Importance::Low
+        );
+        assert_eq!(
+            importance_from_graph(&json!({ "importance": "normal" })),
+            Importance::Normal
+        );
+        // Absent or unrecognized -> Normal.
+        assert_eq!(importance_from_graph(&json!({})), Importance::Normal);
+        assert_eq!(
+            importance_from_graph(&json!({ "importance": "URGENT" })),
+            Importance::Normal
+        );
+    }
+
+    #[test]
+    fn set_importance_produces_one_exclusive_patch_body() {
+        // Exactly one wire op: a single `{ "importance": "high" }` body,
+        // no clear-then-set pair. The `If-Match` etag is attached by
+        // `patch_messages` from `MessagePatch::etag`, not the body.
+        let body = graph_importance_body(Importance::High);
+        assert_eq!(body, json!({ "importance": "high" }));
+        assert_eq!(body.as_object().expect("object").len(), 1);
+        assert_eq!(
+            graph_importance_body(Importance::Low),
+            json!({ "importance": "low" })
+        );
+        assert_eq!(
+            graph_importance_body(Importance::Normal),
+            json!({ "importance": "normal" })
+        );
     }
 }

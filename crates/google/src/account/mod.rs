@@ -26,7 +26,7 @@ use bifrost_types::{
     ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
     DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
     FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
     MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection,
     QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
     ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
@@ -398,6 +398,20 @@ impl Account for GoogleAccount {
         is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::set_is_read(Arc::clone(&self.client), target, is_read)
+    }
+
+    fn set_importance(
+        &self,
+        _target: MutationTarget,
+        _level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        // Gmail has no message-importance field.
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::SetImportance),
+                error::GmailErrorContext::mutation(AccountOperation::SetImportance),
+            ))
+        })
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {

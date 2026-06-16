@@ -35,6 +35,8 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             set_label_membership: true,
             set_category: false,
             set_extended_property: false,
+            // Gmail has no message-importance field.
+            set_importance: false,
             set_is_read: true,
             send_message: true,
             attachment_upload: false,
@@ -89,6 +91,8 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             replied_via_extended_property: false,
             forwarded_via_keyword: false,
             forwarded_via_extended_property: false,
+            // Gmail's read-receipt model is read-only.
+            mdn_sent_via_keyword: false,
         },
     }
 }
@@ -134,6 +138,10 @@ mod tests {
         assert!(caps.pim_methods.set_label_membership);
         assert!(!caps.pim_methods.set_category);
         assert!(!caps.pim_methods.set_extended_property);
+        // Gmail has no message-importance field and a read-only
+        // read-receipt model.
+        assert!(!caps.pim_methods.set_importance);
+        assert!(!caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.set_is_read);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.attachment_upload);

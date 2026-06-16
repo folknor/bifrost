@@ -115,8 +115,6 @@ re-auditors don't re-raise them.)
 
 ## bifrost-graph
 
-- **graph-N1.** `remove_from_container` should report
-  `Unsupported(RemoveFromContainer)`.
 - **graph-N2.** `wire_or_specific` and trailing `_ => {}` arms: delete
   them; let `#[non_exhaustive]` enforce coverage.
 - **graph-N3.** `parse_retry_after_header`: add HTTP-date support.

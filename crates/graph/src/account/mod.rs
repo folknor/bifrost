@@ -29,11 +29,11 @@ use bifrost_types::{
     ContactSearchRequest, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
     DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
     FilterValidation, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -396,6 +396,15 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::set_is_read(account, target, is_read).await })
+    }
+
+    fn set_importance(
+        &self,
+        target: MutationTarget,
+        level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { pim::set_importance(account, target, level).await })
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {

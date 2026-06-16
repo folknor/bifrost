@@ -184,8 +184,9 @@ Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is op
 `capabilities.rs` fills `AccountCapabilities::pim_methods` and `conveniences` at open time. IMAP advertises real support for:
 
 - Container membership: `add_to_container` via UID COPY, `remove_from_container` via `+FLAGS.SILENT \Deleted` plus UID EXPUNGE.
-- Keywords: `set_keyword` via UID STORE, with the convenience keywords `$flagged`, `$answered`, and `$seen` mapped to `\Flagged`, `\Answered`, and `\Seen`. `$forwarded` remains an IMAP keyword.
+- Keywords: `set_keyword` via UID STORE, with the convenience keywords `$flagged`, `$answered`, and `$seen` mapped to `\Flagged`, `\Answered`, and `\Seen`. `$forwarded` and `$MDNSent` remain IMAP keywords; `mdn_sent_via_keyword` is true, so `mark_mdn_sent` flips `$MDNSent`.
 - Read state: `set_is_read` via `\Seen`.
+- Importance: `set_importance` maps onto the `$important` keyword (no native IMAP importance field). Two-valued and exclusive: `High` sets `$important`, `Normal`/`Low` clear it, one STORE op. The read side maps `$important` presence onto `Message.importance` (`High` if set, else `Normal`).
 - Search messages: UID SEARCH across selectable folders, with `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only when `THREAD=REFERENCES` is available and returns synthetic IMAP thread ids containing folder, UIDVALIDITY, and member UIDs.
 - Containers: LIST-backed folder enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE. DELETE first checks `STATUS MESSAGES` and refuses non-empty mailboxes.
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised.

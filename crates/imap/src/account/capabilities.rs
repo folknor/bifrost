@@ -66,6 +66,7 @@ pub(crate) fn build_capabilities(
             set_label_membership: false,
             set_category: false,
             set_extended_property: false,
+            set_importance: true,
             set_is_read: true,
             send_message: submission_configured,
             attachment_upload: false,
@@ -128,6 +129,7 @@ pub(crate) fn build_capabilities(
             replied_via_extended_property: false,
             forwarded_via_keyword: true,
             forwarded_via_extended_property: false,
+            mdn_sent_via_keyword: true,
         },
     }
 }
@@ -159,6 +161,8 @@ mod tests {
         assert!(!caps.pim_methods.contact_search);
         assert!(!caps.pim_methods.contact_autocomplete);
         assert!(caps.pim_methods.open_raw_rfc822);
+        assert!(caps.pim_methods.set_importance);
+        assert!(caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.requires_uidvalidity_recheck);
     }
 

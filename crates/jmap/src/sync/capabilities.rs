@@ -121,6 +121,7 @@ pub(crate) fn build(
             set_label_membership: false,
             set_category: false,
             set_extended_property: false,
+            set_importance: true,
             set_is_read: true,
             send_message: support.submission,
             attachment_upload: true,
@@ -179,6 +180,7 @@ pub(crate) fn build(
             replied_via_extended_property: false,
             forwarded_via_keyword: true,
             forwarded_via_extended_property: false,
+            mdn_sent_via_keyword: true,
         },
     };
 
@@ -259,6 +261,8 @@ mod tests {
         assert_eq!(caps.conveniences.starred, StarredFlagShape::Keyword);
         assert!(caps.conveniences.replied_via_keyword);
         assert!(caps.conveniences.forwarded_via_keyword);
+        assert!(caps.conveniences.mdn_sent_via_keyword);
+        assert!(caps.pim_methods.set_importance);
         assert_eq!(limits.max_objects_in_get, 256);
         assert_eq!(limits.max_objects_in_set, 700);
     }

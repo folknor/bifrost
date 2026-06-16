@@ -8,7 +8,7 @@ use bifrost_types::compose::{
 use bifrost_types::container::{
     Container, ContainerId, ContainerKind, FolderRole, MutationTarget, Provenance,
 };
-use bifrost_types::hydration::{HydrationProjection, Message, ThreadHydration};
+use bifrost_types::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use bifrost_types::ids::{ObjectId, ThreadId};
 use bifrost_types::page::Page;
 use bifrost_types::search::{SearchFilter, SearchRequest};
@@ -113,6 +113,34 @@ pub(crate) fn set_is_read(
         )
         .await
     })
+}
+
+pub(crate) fn set_importance(
+    account: ImapAccount,
+    target: MutationTarget,
+    level: Importance,
+) -> AccountFuture<Result<(), AccountError>> {
+    // IMAP has no native importance field; map onto the `$important`
+    // keyword. Exclusive: `High` sets it, `Normal`/`Low` clear it - one
+    // STORE op, never an expand-into-two.
+    Box::pin(async move {
+        let important = importance_sets_important_keyword(level);
+        let ids = decoded_targets(&target)?;
+        set_flag(
+            &account,
+            ids,
+            imap_flag_for_keyword("$important"),
+            important,
+            AccountOperation::SetImportance,
+        )
+        .await
+    })
+}
+
+/// IMAP's two-valued importance mapping: `High` sets the `$important`
+/// keyword, `Normal`/`Low` clear it.
+fn importance_sets_important_keyword(level: Importance) -> bool {
+    matches!(level, Importance::High)
 }
 
 pub(crate) fn unsupported_unit(
@@ -1540,6 +1568,12 @@ fn fetch_to_message(
         .iter()
         .find_map(|section| section.data.as_ref())
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    let flags = super::inventory::flags_set(fetch.flags.as_deref().unwrap_or(&[]));
+    let importance = if flags.contains("$important") {
+        Importance::High
+    } else {
+        Importance::Normal
+    };
     Some(Message {
         id: encode_object_id(folder, uidvalidity, uid),
         thread_id: fetch
@@ -1569,7 +1603,8 @@ fn fetch_to_message(
         subject: envelope.as_ref().and_then(|env| env.subject.clone()),
         date: None,
         containers: vec![ContainerId(folder.as_str().to_owned())],
-        flags: super::inventory::flags_set(fetch.flags.as_deref().unwrap_or(&[])),
+        importance,
+        flags,
         body_text: match projection {
             HydrationProjection::Headers => None,
             _ => body.clone(),
@@ -1662,6 +1697,15 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn importance_high_sets_keyword_others_clear() {
+        // High -> set `$important`; Normal/Low -> clear it. One STORE op,
+        // never an expand-into-two.
+        assert!(importance_sets_important_keyword(Importance::High));
+        assert!(!importance_sets_important_keyword(Importance::Normal));
+        assert!(!importance_sets_important_keyword(Importance::Low));
+    }
 
     #[tokio::test]
     async fn host_attachment_unsupported() {

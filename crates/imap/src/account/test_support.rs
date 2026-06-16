@@ -18,7 +18,7 @@ use bifrost_types::{
     CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch,
     EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape,
     FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry, ItemOutcome,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
     MembershipScope, Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
     MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority,
     Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
@@ -49,6 +49,9 @@ pub(crate) struct StubAccount {
     pub(crate) changes_called: AtomicBool,
     pub(crate) establish_called: AtomicBool,
     pub(crate) describe_called: AtomicBool,
+    /// Records the `(keyword, value)` of the last `set_keyword` call so
+    /// flag-convenience dispatch (e.g. `mark_mdn_sent`) can be observed.
+    pub(crate) last_set_keyword: std::sync::Mutex<Option<(String, bool)>>,
 }
 
 /// Sentinel ObjectId an `inventory_stream` / `changes_stream`
@@ -65,6 +68,7 @@ impl StubAccount {
             changes_called: AtomicBool::new(false),
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
+            last_set_keyword: std::sync::Mutex::new(None),
         }
     }
 
@@ -78,6 +82,7 @@ impl StubAccount {
             changes_called: AtomicBool::new(false),
             establish_called: AtomicBool::new(false),
             describe_called: AtomicBool::new(false),
+            last_set_keyword: std::sync::Mutex::new(None),
         }
     }
 }
@@ -305,10 +310,13 @@ impl Account for StubAccount {
     fn set_keyword(
         &self,
         _target: MutationTarget,
-        _keyword: String,
-        _value: bool,
+        keyword: String,
+        value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported(AccountOperation::SetKeyword)) })
+        // Records the call and succeeds so flag-convenience dispatch
+        // (e.g. mark_mdn_sent) can be observed reaching the success path.
+        *self.last_set_keyword.lock().expect("stub mutex") = Some((keyword, value));
+        Box::pin(async { Ok(()) })
     }
 
     fn set_label_membership(
@@ -344,6 +352,14 @@ impl Account for StubAccount {
         _is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::SetIsRead)) })
+    }
+
+    fn set_importance(
+        &self,
+        _target: MutationTarget,
+        _level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(AccountOperation::SetImportance)) })
     }
 
     fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
@@ -611,4 +627,44 @@ impl Account for StubAccount {
 /// fields.
 pub(crate) fn stub_arc(account: StubAccount) -> Arc<dyn Account> {
     Arc::new(account)
+}
+
+#[cfg(test)]
+mod mdn_tests {
+    use super::*;
+
+    fn caps_with_mdn(mdn_sent_via_keyword: bool) -> AccountCapabilities {
+        let mut caps = stub_capabilities();
+        caps.conveniences.mdn_sent_via_keyword = mdn_sent_via_keyword;
+        caps
+    }
+
+    #[tokio::test]
+    async fn mark_mdn_sent_dispatches_to_set_keyword_when_enabled() {
+        // mdn_sent_via_keyword: true -> mark_mdn_sent flips `$MDNSent`
+        // through set_keyword, observed succeeding and recorded.
+        let stub = StubAccount::with_capabilities(caps_with_mdn(true));
+        stub.mark_mdn_sent(ObjectId("m1".to_string()))
+            .await
+            .expect("mark_mdn_sent dispatches to set_keyword");
+        let recorded = stub.last_set_keyword.lock().expect("stub mutex").clone();
+        assert_eq!(recorded, Some(("$MDNSent".to_string(), true)));
+    }
+
+    #[tokio::test]
+    async fn mark_mdn_sent_unsupported_when_read_only() {
+        // mdn_sent_via_keyword: false -> the read-receipt model is
+        // read-only (Gmail/Graph), so the convenience surfaces
+        // Unsupported(UpdateFlags) and never touches set_keyword.
+        let stub = StubAccount::with_capabilities(caps_with_mdn(false));
+        let err = stub
+            .mark_mdn_sent(ObjectId("m1".to_string()))
+            .await
+            .expect_err("mark_mdn_sent is unsupported when read-only");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        );
+        assert!(stub.last_set_keyword.lock().expect("stub mutex").is_none());
+    }
 }

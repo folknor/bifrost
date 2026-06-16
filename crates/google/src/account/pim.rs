@@ -5,8 +5,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
     Container, ContainerId, ContainerKind, DraftHandle, DraftPatch, FolderRole,
-    HydrationProjection, Identity, IdentityId, IdentityPatch, Message, MutationTarget, ObjectId,
-    Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter, SearchRequest, SendRequest,
+    HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, Message, MutationTarget,
+    ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter, SearchRequest, SendRequest,
     ThreadHydration, ThreadId, VacationConfig,
 };
 use bytes::Bytes;
@@ -819,6 +819,8 @@ async fn message_from_gmail(
             .map(|id| ContainerId(id.clone()))
             .collect(),
         flags,
+        // Gmail has no importance field; always Normal.
+        importance: Importance::Normal,
         body_text,
         body_html,
         attachments,

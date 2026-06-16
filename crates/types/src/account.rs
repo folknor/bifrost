@@ -51,7 +51,7 @@ use crate::events::{
 use crate::filter::{
     FilterValidation, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
 };
-use crate::hydration::{HydrationProjection, Message, ThreadHydration};
+use crate::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use crate::ids::{AccountId, ObjectId, SubscriptionHandle, ThreadId};
 use crate::mutation::{FlagOp, HydratedObject, IdempotencyKey, Projection};
 use crate::page::Page;
@@ -333,6 +333,21 @@ pub trait Account: Send + Sync {
         target: MutationTarget,
         property_id: String,
         value: Option<String>,
+    ) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Set a message's importance to exactly `level`. The primitive is
+    /// *exclusive*: the implementation makes `level` the message's sole
+    /// importance, clearing any prior value in the same wire operation.
+    /// This exclusivity is the wart absorption - Graph's `importance` is a
+    /// single-valued field, so the consumer issues one call, never an
+    /// expand-into-two. JMAP/IMAP map `High` -> set `$important`,
+    /// `Normal`/`Low` -> clear it. Accounts without an importance concept
+    /// clear `set_importance` in `capabilities().pim_methods` and return
+    /// `Unsupported(SetImportance)`.
+    fn set_importance(
+        &self,
+        target: MutationTarget,
+        level: Importance,
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Mark read state. Every protocol implements this; canonical
@@ -795,6 +810,20 @@ pub trait Account: Send + Sync {
                 PR_LAST_VERB_EXECUTED.to_string(),
                 Some(PR_LAST_VERB_FORWARDED.to_string()),
             );
+        }
+        Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
+    }
+
+    /// Persist that an MDN (read receipt) was dispatched for `message`, by
+    /// flipping the `$MDNSent` keyword. Dispatches through
+    /// `capabilities().conveniences.mdn_sent_via_keyword`; accounts whose
+    /// read-receipt model is read-only (Gmail, Graph) leave it `false` and
+    /// the convenience returns `Unsupported(UpdateFlags)`.
+    fn mark_mdn_sent(&self, message: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        const MDN_SENT_KEYWORD: &str = "$MDNSent";
+        let target = MutationTarget::Message(message);
+        if self.capabilities().conveniences.mdn_sent_via_keyword {
+            return self.set_keyword(target, MDN_SENT_KEYWORD.to_string(), true);
         }
         Box::pin(async { Err(unsupported_error(AccountOperation::UpdateFlags)) })
     }

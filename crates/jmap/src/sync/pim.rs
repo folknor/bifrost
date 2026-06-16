@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
     BlobHandle, BlobId, Container, ContainerId, ContainerKind, FolderRole, HydrationProjection,
-    LabelId, Message, MutationTarget, ObjectId, Page, Provenance, QuotaInfo, SearchFilter,
-    SearchRequest, ThreadHydration, ThreadId, VacationConfig,
+    Importance, LabelId, Message, MutationTarget, ObjectId, Page, Provenance, QuotaInfo,
+    SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 /// Convert a crate-internal error to `AccountError` with the correct
 /// `AccountOperation` for this call site. Every call site in this
@@ -58,6 +58,7 @@ use crate::vacation_response::{VacationResponseGet, VacationResponseId, Vacation
 type MailAccount = crate::account::Account<ReqwestTransport>;
 
 const SEEN_KEYWORD: &str = "$seen";
+const IMPORTANT_KEYWORD: &str = "$important";
 const DRAFT_KEYWORD: &str = "$draft";
 const SUBMISSION_CREATE_ID: &str = "submit0";
 const ATTACHMENT_HANDLE_PREFIX: &str = "jmap:";
@@ -140,6 +141,30 @@ pub(crate) fn set_is_read(
     is_read: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     set_keyword(mail, email_state, target, SEEN_KEYWORD.to_string(), is_read)
+}
+
+/// Exclusive importance overwrite via the `$important` keyword. JMAP's
+/// model is two-valued: `High` sets `$important`, `Normal`/`Low` clear
+/// it. One `Email/set` keyword update, no expand-into-two.
+pub(crate) fn set_importance(
+    mail: MailAccount,
+    email_state: Arc<Mutex<Option<String>>>,
+    target: MutationTarget,
+    level: Importance,
+) -> AccountFuture<Result<(), AccountError>> {
+    set_keyword(
+        mail,
+        email_state,
+        target,
+        IMPORTANT_KEYWORD.to_string(),
+        importance_sets_important_keyword(level),
+    )
+}
+
+/// JMAP's two-valued importance mapping: `High` sets `$important`,
+/// `Normal`/`Low` clear it.
+fn importance_sets_important_keyword(level: Importance) -> bool {
+    matches!(level, Importance::High)
 }
 
 pub(crate) fn send_message(
@@ -1942,6 +1967,11 @@ fn email_to_message(email: Email, projection: HydrationProjection) -> Message {
             .or_else(|| email.received_at())
             .and_then(unix_to_system_time),
         containers,
+        importance: if flags.contains("$important") {
+            Importance::High
+        } else {
+            Importance::Normal
+        },
         flags,
         body_text,
         body_html,
@@ -2001,5 +2031,19 @@ fn unix_to_system_time(timestamp: i64) -> Option<SystemTime> {
         Some(UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(timestamp).ok()?))
     } else {
         UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(timestamp.unsigned_abs()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn importance_high_sets_keyword_others_clear() {
+        // High -> set `$important`; Normal/Low -> clear it. One keyword op,
+        // never an expand-into-two.
+        assert!(importance_sets_important_keyword(Importance::High));
+        assert!(!importance_sets_important_keyword(Importance::Normal));
+        assert!(!importance_sets_important_keyword(Importance::Low));
     }
 }

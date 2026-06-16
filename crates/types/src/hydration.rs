@@ -14,6 +14,21 @@ use crate::compose::Address;
 use crate::container::ContainerId;
 use crate::ids::{ObjectId, ThreadId};
 
+/// Message importance, the uniform representation of the
+/// single-valued/exclusive priority bit that Graph (`importance`),
+/// JMAP (`$important`-adjacent keywords), and IMAP (no native field)
+/// each express differently. Exclusive by construction: a message has
+/// exactly one importance at a time, which is the whole point - it is
+/// why a consumer must never expand one importance change into two
+/// intents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Importance {
+    Low,
+    Normal,
+    High,
+}
+
 /// Per-message projection selector for `message_hydrate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -53,6 +68,11 @@ pub struct Message {
     pub containers: Vec<ContainerId>,
     /// Keywords / flags currently set on the message.
     pub flags: std::collections::HashSet<String>,
+    /// Message importance. The uniform, exclusive importance bit:
+    /// Graph maps its `low|normal|high` wire field; JMAP/IMAP map the
+    /// `$important` keyword (present -> `High`, absent -> `Normal`);
+    /// Gmail has no importance field and is always `Normal`.
+    pub importance: Importance,
     /// Plain-text body. `None` when not requested by the projection
     /// or when the message has no text/plain part.
     pub body_text: Option<String>,

@@ -1456,4 +1456,20 @@ mod tests {
             AccountErrorKind::Protocol(ProtocolErrorKind::ParseFailed)
         ));
     }
+
+    // `GraphAccount::remove_from_container` is a one-line tail call to
+    // `unsupported_account_error(RemoveFromContainer)`, so pinning the
+    // helper fully pins the method's behavior end-to-end: the returned
+    // `AccountError` carries the exact `Unsupported(RemoveFromContainer)`
+    // kind and operation, not a generic protocol error.
+    #[test]
+    fn remove_from_container_is_unsupported() {
+        let err = unsupported_account_error(AccountOperation::RemoveFromContainer);
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::RemoveFromContainer)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::RemoveFromContainer));
+        assert!(matches!(err.recovery(), RecoveryClass::Unsupported(_)));
+    }
 }

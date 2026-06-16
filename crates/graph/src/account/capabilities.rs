@@ -38,6 +38,7 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             set_label_membership: false,
             set_category: true,
             set_extended_property: true,
+            set_importance: true,
             set_is_read: true,
             send_message: true,
             attachment_upload: false,
@@ -94,6 +95,9 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             replied_via_extended_property: true,
             forwarded_via_keyword: false,
             forwarded_via_extended_property: true,
+            // Graph's read-receipt bit (isReadReceiptRequested) is
+            // read-only; mark_mdn_sent surfaces Unsupported(UpdateFlags).
+            mdn_sent_via_keyword: false,
         },
     }
 }
@@ -161,6 +165,9 @@ mod tests {
         assert!(!caps.pim_methods.remove_from_container);
         assert!(caps.pim_methods.set_category);
         assert!(caps.pim_methods.set_extended_property);
+        assert!(caps.pim_methods.set_importance);
+        // Graph's read-receipt bit is read-only.
+        assert!(!caps.conveniences.mdn_sent_via_keyword);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.attachment_upload);
         assert!(caps.pim_methods.open_raw_rfc822);

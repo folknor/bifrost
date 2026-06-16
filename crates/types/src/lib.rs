@@ -123,7 +123,7 @@ pub use events::{
 };
 
 // Threading + hydration types.
-pub use hydration::{HydrationProjection, Message, ThreadHydration};
+pub use hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 
 // Newtype ids.
 pub use ids::{

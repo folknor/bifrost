@@ -18,12 +18,13 @@ use bifrost_types::{
     CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
     EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
     HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
+    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId,
+    VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -298,6 +299,14 @@ impl Account for FlagsAccount {
         _is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetIsRead)) })
+    }
+
+    fn set_importance(
+        &self,
+        _target: MutationTarget,
+        _level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::SetImportance)) })
     }
 
     fn send_message(&self, _request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {

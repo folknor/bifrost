@@ -9,10 +9,10 @@ use bifrost_types::{
     ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
     CursorEstablishment, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
     EventPatch, EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
+    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
     ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
     ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
@@ -438,6 +438,19 @@ impl Account for JmapAccount {
             Arc::clone(&self.email_state),
             target,
             is_read,
+        )
+    }
+
+    fn set_importance(
+        &self,
+        target: MutationTarget,
+        level: Importance,
+    ) -> AccountFuture<Result<(), AccountError>> {
+        pim::set_importance(
+            self.mail.clone(),
+            Arc::clone(&self.email_state),
+            target,
+            level,
         )
     }
 

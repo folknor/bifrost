@@ -507,24 +507,26 @@ value. Group A below is that high-value set.
 
 | # | ratatoskr leak | absorption | status | brick |
 |---|---|---|---|---|
-| A-2 | `handlers/gal.rs` `match provider` for GAL | directory/GAL primitive + `directory_search` flag | NEEDS | A8 (candidate own brick) |
-| A-3 | `auto_responses.rs` six per-provider free fns | `vacation_get`/`set` flags exist; audience+date model-mapping into impls | PARTIAL | A8 |
-| A-4 | `actions/contacts.rs` `match source:&str` + two body builders | `contact_*` flags exist; per-provider mapping into impls | PARTIAL | A8 + A7 (CardDAV) |
-| A-5 | `calendar/actions.rs` `match CalendarProvider` | `event_*` flags exist; mapping into impls | PARTIAL | A8 + A7 (CalDAV) |
+| A-2 | `handlers/gal.rs` `match provider` for GAL | directory/GAL primitive + `directory_search` flag | NEEDS (open) | A9 (split out of A8) |
+| A-3 | `auto_responses.rs` six per-provider free fns | `vacation_get`/`set` flags exist; audience+date model-mapping into impls | RESOLVED (bifrost) - consumer rewrite is Track B B6 | A8 |
+| A-4 | `actions/contacts.rs` `match source:&str` + two body builders | `contact_*` flags exist; per-provider mapping into impls | RESOLVED (bifrost, post-A7) - consumer rewrite is Track B B4 | A8 + A7 (CardDAV) |
+| A-5 | `calendar/actions.rs` `match CalendarProvider` | `event_*` flags exist; mapping into impls | RESOLVED (bifrost, post-A7) - consumer rewrite is Track B B8 | A8 + A7 (CalDAV) |
 | A-6 | `bundling.rs` Gmail CATEGORY_* top priority | surface ML categories uniformly; heuristic stays consumer | POLICY | A8 |
 
-GAL (A-2) is arguably under-served by "just a flag" - ratatoskr has real Graph and
-Google directory impls that need a home; it may deserve its own small brick rather
-than riding A8.
+GAL (A-2) is under-served by "just a flag" - ratatoskr has real Graph and Google
+directory impls that need a home, so it was split out of A8 into its own brick
+(A9 in `ratatoskr-adoption.md`): a `directory_search` primitive with two
+asymmetric backends over a different corpus from personal `contact_search`, plus
+a CardDAV leg and a `directory_search` flag. It is standalone and still open.
 
 ### Group B - model-mapping warts already behind `ProviderOps`
 
 | # | ratatoskr wart | absorption | status |
 |---|---|---|---|
-| B-1 | `LabelKind` provider-typed taxonomy; Graph importance is single-valued/exclusive so `actions/label.rs` **expands one add into two intents** | importance-exclusivity belongs inside the bifrost-graph `set_category`/importance primitive; consumer never expands. Needs a uniform importance representation | PARTIAL (densest wart) |
-| B-2 | Graph `remove_from_container` move-only | `Unsupported(RemoveFromContainer)` + flag false (`graph-N1`) | ALREADY (error polish only) |
-| B-3 | Graph draft update = delete+recreate, "returns possibly-new id" | confirm bifrost `draft_update` new-id contract is uniform across all four | PARTIAL |
-| B-4 | MDN `$MDNSent` - JMAP/IMAP only (Graph `isReadReceiptRequested` read-only) | `mark_mdn_sent` via `set_keyword` + flag; Gmail/Graph false | NEEDS |
+| B-1 | `LabelKind` provider-typed taxonomy; Graph importance is single-valued/exclusive so `actions/label.rs` **expands one add into two intents** | uniform `Importance` enum + `set_importance` primitive (exclusive overwrite inside each impl); consumer never expands. `Message.importance` read field populated by all four mail crates | RESOLVED (A8) |
+| B-2 | Graph `remove_from_container` move-only | `Unsupported(RemoveFromContainer)` + flag false (`graph-N1`); method behavior pinned by test | RESOLVED (A8) |
+| B-3 | Graph draft update = delete+recreate, "returns possibly-new id" | `draft_update` returns `Result<(), _>` - no post-update id is surfaced, so the new-id contract is uniform by construction across all four (the consumer keeps its `DraftHandle`; impls remap internally) | RESOLVED (A8) |
+| B-4 | MDN `$MDNSent` - JMAP/IMAP only (Graph `isReadReceiptRequested` read-only) | `mark_mdn_sent` via `set_keyword` gated by `ConvenienceShape.mdn_sent_via_keyword`; JMAP/IMAP true, Gmail/Graph false (reports `Unsupported(UpdateFlags)`) | RESOLVED (A8) |
 | B-5 | replied/forwarded send-intent (`PR_LAST_VERB`) | `ConvenienceShape.replied_via_*`/`forwarded_via_*` | ALREADY |
 
 ### Group C - send-path warts
@@ -549,14 +551,20 @@ QRESYNC-CONDSTORE-Basic / IDLE / client-side threads -> ALREADY (shared mailboxe
 
 ### A8 priority (most forces a consumer `match provider`)
 
-1. GAL (A-2). 2. `LabelKind` + Graph-importance intent expansion (B-1, densest).
-3. Scheduled send (C-2 / A4). 4. IMAP send (C-1 / A2). 5. Contacts/calendar/
-auto-response dispatch (A-3/4/5, mostly resolved once the bifrost primitives + A7
-land). (Cloud attachments, the former top priority A-1 / A6, has landed.)
+1. GAL (A-2) - split out to its own brick A9, still open. 2. `LabelKind` +
+Graph-importance intent expansion (B-1, densest) - RESOLVED (A8): uniform
+`Importance` + `set_importance`. 3. Scheduled send (C-2 / A4) - landed. 4. IMAP
+send (C-1 / A2) - landed. 5. Contacts/calendar/auto-response dispatch (A-3/4/5) -
+RESOLVED on the bifrost side once the primitives + A7 landed; consumer rewrite is
+Track B. (Cloud attachments, the former top priority A-1 / A6, has landed.) Still
+open under A8: C-3 (needs A5), A-6 (policy), graph-S1/graph-N3, and the
+Track-B-driven tail.
 
-**Independence:** standalone now - A-2 (GAL flag), B-2 (`graph-N1`), B-4 (MDN
-flag), B-1 (importance, modulo a representation decision), A-6 (policy). Needs A1 -
-A6, A3, A2. Chained - A4 needs A2; C-3 needs A5; A-4/A-5 CalDAV/CardDAV legs need A7.
+**Independence:** standalone now - A-2 (now A9), graph-S1, graph-N3, A-6
+(policy). RESOLVED (A8) - B-1 (importance), B-2 (`graph-N1`), B-3 (draft-update
+new-id confirm), B-4 (MDN). Needs A1 - A6, A3, A2. Chained - A4 needs A2; C-3
+needs A5; A-4/A-5 CalDAV/CardDAV legs needed A7 (now landed, so A-3/4/5 are
+RESOLVED on the bifrost side).
 
 ---
 
