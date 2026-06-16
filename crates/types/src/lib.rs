@@ -18,6 +18,7 @@ pub mod account;
 pub mod blob;
 pub mod calendar;
 pub mod capabilities;
+pub mod cloud;
 pub mod compose;
 pub mod contact;
 pub mod container;
@@ -53,6 +54,9 @@ pub use calendar::{
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
     EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, RsvpStatus,
 };
+
+// Cloud-storage attachment hosting.
+pub use cloud::{CloudUploadMeta, HostedAttachment, ShareScope};
 
 // Server-side filter rules and scripts.
 pub use filter::{

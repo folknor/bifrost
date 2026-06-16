@@ -317,6 +317,15 @@ response through `classify_redirect`:
   for GET / HEAD.
 - 303 See Other: rewrite to GET and drop the body unconditionally.
 - 307 / 308: preserve method and body.
+- Any followed-redirect status whose `Location` header is **absent**:
+  `PassThrough`. A redirect no one can follow is handed back as a
+  terminal status (status + headers) the same way a 304 is. This is
+  load-bearing for Google Drive resumable uploads: a `308 Resume
+  Incomplete` carries a `Range` header and no `Location`, and the
+  cloud chunk loop reads that status + `Range` itself. A
+  present-but-malformed `Location` (invalid encoding / unresolvable)
+  stays a hard `MalformedRedirect`; only the missing header passes
+  through.
 
 `RedirectPolicy::trusted_hosts` is an allowlist for cross-host hops:
 empty means every host is acceptable; populated means only matching
@@ -405,7 +414,11 @@ variants:
 - `RedirectRejected { message }` - 3xx target host fell outside
   the configured `RedirectPolicy::trusted_hosts` allowlist.
 - `MalformedRedirect { kind, message }` - acknowledged 3xx response
-  with missing, non-UTF-8, or unresolvable `Location`.
+  with a present-but-broken `Location` (non-UTF-8 or unresolvable). A
+  *missing* `Location` is no longer an error: it passes through (see
+  the redirect loop above). The `MissingLocation` kind remains in the
+  enum for the error-mapping contract but is no longer produced by
+  `classify_redirect`.
 - `RedirectLoop { hops }` - redirect chain exceeded
   `RedirectPolicy::max_hops`.
 - `NetSetup { message, source }` - `Net::new` construction

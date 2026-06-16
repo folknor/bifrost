@@ -9,15 +9,15 @@ use std::time::Duration;
 
 use bifrost_types::{
     Account, AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentHandle,
-    BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, ContactCard,
-    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
+    ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container,
+    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -467,6 +467,14 @@ impl Account for ImapAccount {
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
         pim::unsupported_attachment(bifrost_types::AccountOperation::AttachmentUpload)
+    }
+
+    fn host_attachment(
+        &self,
+        _bytes: bytes::Bytes,
+        _meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        pim::unsupported_hosted(AccountOperation::HostAttachment)
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {

@@ -195,10 +195,16 @@ pub(crate) fn classify_redirect(
         return Ok(RedirectAction::PassThrough);
     }
     let Some(location) = headers.get(LOCATION) else {
-        return Err(Error::MalformedRedirect {
-            kind: MalformedRedirectKind::MissingLocation,
-            message: format!("HTTP {status} redirect missing Location header"),
-        });
+        // A followed-redirect status with no `Location` header is not a
+        // redirect anyone can follow. Rather than treat it as a malformed
+        // redirect, hand it back to the caller as a terminal status the same
+        // way a 304 is handed back. This is load-bearing for resumable
+        // uploads: Google Drive's chunk PUT signals "resume incomplete" with a
+        // 308 carrying a `Range` header and NO `Location`, and the cloud chunk
+        // loop reads that status + `Range` itself. A present-but-malformed
+        // `Location` (below) stays a hard error; only the absent one passes
+        // through.
+        return Ok(RedirectAction::PassThrough);
     };
     let location_str = location_to_str(location)?;
     let next_url = resolve_location(prior_url, &location_str)?;
@@ -376,9 +382,44 @@ mod tests {
     }
 
     #[test]
-    fn missing_location_is_a_malformed_redirect_error() {
+    fn redirect_without_location_passes_through() {
+        // A followed-redirect status with no `Location` header is not a
+        // redirect anyone can follow; it must pass through to the caller (the
+        // resumable-upload chunk loop reads the status + `Range` itself). This
+        // pins the load-bearing fix for Google Drive's 308 Resume Incomplete.
         let policy = RedirectPolicy::default();
         let h = HeaderMap::new();
+        for status in [
+            StatusCode::PERMANENT_REDIRECT,
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::FOUND,
+        ] {
+            let action = classify_redirect(
+                &policy,
+                &Method::PUT,
+                &url("https://a.example/"),
+                status,
+                &h,
+            )
+            .expect("missing Location is pass-through, not an error");
+            assert!(
+                matches!(action, RedirectAction::PassThrough),
+                "{status} without Location must pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn present_but_malformed_location_is_a_malformed_redirect_error() {
+        // A present-but-unresolvable `Location` is still a real protocol fault
+        // and must stay a hard `MalformedRedirect`. Only the *missing* header
+        // (above) becomes pass-through.
+        let policy = RedirectPolicy::default();
+        let mut h = HeaderMap::new();
+        h.insert(
+            LOCATION,
+            HeaderValue::from_str("http://[bad").expect("valid header bytes"),
+        );
         let err = classify_redirect(
             &policy,
             &Method::GET,
@@ -386,11 +427,11 @@ mod tests {
             StatusCode::FOUND,
             &h,
         )
-        .expect_err("302 without Location is an error");
+        .expect_err("302 with an unresolvable Location is an error");
         assert!(matches!(
             err,
             Error::MalformedRedirect {
-                kind: MalformedRedirectKind::MissingLocation,
+                kind: MalformedRedirectKind::UnresolvableLocation,
                 ..
             }
         ));

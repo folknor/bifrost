@@ -12,18 +12,18 @@ use bifrost_sync::run_readback_guard;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountErrorBuilder, AccountErrorKind,
     AccountFuture, AccountStream, AttachmentHandle, Batch, BatchingPolicy, BlobHandle,
-    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, ContactCard, ContactCreate,
-    ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
-    ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterRuleShape, FilterValidation, FlagOp, HydratedObject, HydratedObjectKind,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
-    ItemOutcome, MembershipScope, Message, MutationCapabilities, MutationConcurrency,
-    MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary,
-    PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass,
-    RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    BlobRangeSupport, ByteRange, Cause, Change, ChangeCursor, CloudUploadMeta, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
+    ContainerKind, ConvenienceShape, CursorDescriptor, CursorEstablishment, CursorFreshness,
+    CursorScope, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
+    EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp, HostedAttachment,
+    HydratedObject, HydratedObjectKind, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
+    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
+    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
+    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use bifrost_types::{Calendar, CalendarEvent};
@@ -314,6 +314,14 @@ impl Account for FlagsAccount {
                 bifrost_types::AccountOperation::AttachmentUpload,
             ))
         })
+    }
+
+    fn host_attachment(
+        &self,
+        _bytes: Bytes,
+        _meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::HostAttachment)) })
     }
 
     fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {

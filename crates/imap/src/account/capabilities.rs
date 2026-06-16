@@ -63,6 +63,7 @@ pub(crate) fn build_capabilities(
             set_is_read: true,
             send_message: submission_configured,
             attachment_upload: false,
+            host_attachment: false,
             draft_create: has_drafts && profile.supports(Capability::UidPlus),
             draft_update: false,
             draft_discard: true,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use bifrost_types::cloud::HostedAttachment;
 use bifrost_types::compose::{
     Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest,
 };
@@ -129,6 +130,12 @@ pub(crate) fn unsupported_object(
 pub(crate) fn unsupported_attachment(
     operation: bifrost_types::AccountOperation,
 ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
+    Box::pin(async move { Err(super::error::unsupported(operation)) })
+}
+
+pub(crate) fn unsupported_hosted(
+    operation: bifrost_types::AccountOperation,
+) -> AccountFuture<Result<HostedAttachment, AccountError>> {
     Box::pin(async move { Err(super::error::unsupported(operation)) })
 }
 
@@ -1655,6 +1662,19 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn host_attachment_unsupported() {
+        // IMAP has no cloud-drive hosting; the leg returns
+        // `Unsupported(HostAttachment)`.
+        let err = unsupported_hosted(AccountOperation::HostAttachment)
+            .await
+            .expect_err("imap host_attachment is unsupported");
+        assert_eq!(
+            err.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
+        );
+    }
 
     #[test]
     fn scheduled_send_restamp_preserves_unsupported_kind() {

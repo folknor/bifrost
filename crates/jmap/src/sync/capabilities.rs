@@ -124,6 +124,7 @@ pub(crate) fn build(
             set_is_read: true,
             send_message: support.submission,
             attachment_upload: true,
+            host_attachment: false,
             draft_create: true,
             draft_update: true,
             draft_discard: true,

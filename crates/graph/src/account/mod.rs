@@ -2,6 +2,7 @@ mod blob;
 mod calendar;
 mod capabilities;
 mod changes;
+mod cloud;
 mod contacts;
 mod cursor;
 mod error;
@@ -24,14 +25,15 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountStream,
     AddressBook, AddressBookId, BlobHandle, ByteRange, Calendar, CalendarEvent, Change,
-    ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HydratedObject, HydrationProjection, IdempotencyKey, InventoryEntry, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority,
-    Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
+    ContactSearchRequest, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterValidation, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -411,6 +413,14 @@ impl Account for GraphAccount {
                 bifrost_types::AccountOperation::AttachmentUpload,
             ))
         })
+    }
+
+    fn host_attachment(
+        &self,
+        bytes: Bytes,
+        meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        cloud::host_attachment(self.clone(), bytes, meta)
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {

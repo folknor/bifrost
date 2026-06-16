@@ -2,6 +2,7 @@ mod blobs;
 mod calendar;
 mod capabilities;
 mod changes;
+mod cloud;
 mod contacts;
 mod cursor;
 mod error;
@@ -20,16 +21,16 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFactory, AccountFuture, AccountId,
     AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle,
-    ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, ContactCard, ContactCreate,
-    ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId, ContainerKind,
-    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectId, OpaqueChangeState, Page, Priority, Projection, QuotaInfo, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta, ContactCard,
+    ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
+    IdentityId, IdentityPatch, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection,
+    QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -413,6 +414,19 @@ impl Account for GoogleAccount {
         mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
         pim::attachment_upload(bytes, mime)
+    }
+
+    fn host_attachment(
+        &self,
+        bytes: Bytes,
+        meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        cloud::host_attachment(
+            Arc::clone(&self.client),
+            self.profile.email_address.clone(),
+            bytes,
+            meta,
+        )
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {

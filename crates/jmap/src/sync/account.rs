@@ -5,15 +5,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountOperation, AccountStream,
     AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent,
-    ChangeCursor, ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest,
-    Container, ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment,
-    CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch, EventRange,
-    EventSearchRequest, FilterValidation, HydratedObject, HydrationProjection, IdempotencyKey,
-    Identity, IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
-    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
+    ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
+    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
+    EventPatch, EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, InventoryEntry,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -463,6 +464,19 @@ impl Account for JmapAccount {
         mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
         pim::attachment_upload(self.mail.clone(), bytes, mime)
+    }
+
+    fn host_attachment(
+        &self,
+        _bytes: bytes::Bytes,
+        _meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::HostAttachment,
+            None,
+            "JMAP has no cloud-drive attachment hosting",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {

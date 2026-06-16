@@ -41,6 +41,7 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             set_is_read: true,
             send_message: true,
             attachment_upload: false,
+            host_attachment: true,
             draft_create: true,
             draft_update: true,
             draft_discard: true,
@@ -107,6 +108,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn host_attachment_capability_true() {
+        // OneDrive hosting is the bifrost replacement for ratatoskr's
+        // consumer-side `supports_cloud_upload(Graph) == true`.
+        for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
+            assert!(build_capabilities(mode).pim_methods.host_attachment);
+        }
+    }
 
     #[test]
     fn graph_subscription_capabilities_are_out_of_process() {

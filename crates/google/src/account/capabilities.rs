@@ -38,6 +38,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             set_is_read: true,
             send_message: true,
             attachment_upload: false,
+            host_attachment: true,
             draft_create: true,
             draft_update: true,
             draft_discard: true,
@@ -115,6 +116,13 @@ mod tests {
         assert_eq!(caps.mutation.replay_safety, MutationReplaySafety::None);
         assert_eq!(caps.batching_policy.max_items, 1000);
         assert!(caps.historyid_expires_after.is_none());
+    }
+
+    #[test]
+    fn host_attachment_capability_true() {
+        // Google Drive hosting is the bifrost replacement for ratatoskr's
+        // consumer-side `supports_cloud_upload(Gmail) == true`.
+        assert!(gmail_capabilities().pim_methods.host_attachment);
     }
 
     #[test]

@@ -884,6 +884,7 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         | AccountOperation::SetExtendedProperty
         | AccountOperation::SetIsRead
         | AccountOperation::AttachmentUpload
+        | AccountOperation::HostAttachment
         | AccountOperation::Close
         | AccountOperation::Expunge => "gmail.modify",
         // AccountOperation is #[non_exhaustive] from bifrost-types; new

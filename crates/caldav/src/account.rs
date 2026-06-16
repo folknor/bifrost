@@ -444,6 +444,14 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::AttachmentUpload)
     }
 
+    fn host_attachment(
+        &self,
+        _bytes: Bytes,
+        _meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        unsupported_future(AccountOperation::HostAttachment)
+    }
+
     fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
         unsupported_future(AccountOperation::DraftCreate)
     }
@@ -1311,6 +1319,21 @@ mod tests {
             html_link: None,
             raw_ical: None,
         }
+    }
+
+    #[tokio::test]
+    async fn caldav_host_attachment_unsupported() {
+        // CalDAV has no cloud-drive hosting; the flag is false (Default) and
+        // the leg returns `Unsupported(HostAttachment)`.
+        assert!(!caldav_capabilities().pim_methods.host_attachment);
+
+        let err = unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
+            .await
+            .expect_err("caldav host_attachment is unsupported");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
+        );
     }
 
     #[tokio::test]

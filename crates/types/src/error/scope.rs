@@ -139,6 +139,7 @@ pub enum AccountOperation {
     SetIsRead,
     Send,
     AttachmentUpload,
+    HostAttachment,
     DraftCreate,
     DraftUpdate,
     DraftDiscard,
@@ -194,6 +195,7 @@ impl AccountOperation {
                 | Self::AddToContainer
                 | Self::RemoveFromContainer
                 | Self::AttachmentUpload
+                | Self::HostAttachment
                 | Self::DraftCreate
                 | Self::DraftUpdate
                 | Self::DraftSend
@@ -241,4 +243,16 @@ pub enum Protocol {
     Graph,
     Ews,
     CalDav,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountOperation;
+
+    #[test]
+    fn host_attachment_is_not_idempotent() {
+        // An interrupted host may have created a partial/duplicate Drive item;
+        // a blind retry is unsafe, so the operation must be non-idempotent.
+        assert!(!AccountOperation::HostAttachment.is_idempotent());
+    }
 }

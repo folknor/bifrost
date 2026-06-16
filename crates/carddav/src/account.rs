@@ -5,17 +5,17 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountId, AccountOperation,
     AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar,
-    CalendarEvent, Change, ChangeCursor, Checkpoint, ContactCard, ContactCreate, ContactId,
-    ContactPatch, ContactProvenance, ContactSearchRequest, Container, ContainerId, ContainerKind,
-    CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
-    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
-    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectChange, ObjectChangeKind, ObjectId, ObjectType,
-    OpaqueChangeState, Page, PageBoundary, Priority, ProtocolKind, QuotaInfo, RsvpStatus,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, ServerVersion, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, VacationConfig, WatchEvent,
+    CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCreate,
+    ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container, ContainerId,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
+    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
+    IdentityId, IdentityPatch, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectChange,
+    ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority,
+    ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -559,6 +559,14 @@ impl Account for CardDavAccount {
         _mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>> {
         unsupported_future(AccountOperation::AttachmentUpload)
+    }
+
+    fn host_attachment(
+        &self,
+        _bytes: Bytes,
+        _meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>> {
+        unsupported_future(AccountOperation::HostAttachment)
     }
 
     fn draft_create(&self, _patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>> {
@@ -1298,6 +1306,21 @@ fn contains(value: &str, needle: &str) -> bool {
 mod tests {
     use super::*;
     use bifrost_types::AccountErrorKind;
+
+    #[tokio::test]
+    async fn carddav_host_attachment_unsupported() {
+        // CardDAV has no cloud-drive hosting; the flag is false (Default) and
+        // the leg returns `Unsupported(HostAttachment)`.
+        assert!(!carddav_capabilities().pim_methods.host_attachment);
+
+        let err = unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
+            .await
+            .expect_err("carddav host_attachment is unsupported");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
+        );
+    }
 
     #[tokio::test]
     async fn carddav_open_raw_rfc822_unsupported() {

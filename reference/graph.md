@@ -63,6 +63,17 @@ for optimistic concurrency.
   attachments (`/messages/{id}/attachments/{aid}/$value`),
   including the reference-attachment short-circuit, plus
   `open_raw_rfc822` (whole message via `/messages/{id}/$value`).
+- `cloud.rs` - `host_attachment`: OneDrive resumable upload + a
+  `createLink` sharing link, in one call. The session POST
+  (`/me/drive/root:/Attachments/{encoded}:/createUploadSession`,
+  conflict `rename`) and link POST route through `GraphClient::post`;
+  the pre-authenticated chunk PUT uses the raw `account_net()` builder
+  with `.without_bearer_auth()` and resumes on `202 Accepted`
+  (`offset = end`, since 202 acknowledges the bytes just sent).
+  `ShareScope` maps `Anyone -> anonymous`, `Organization ->
+  organization`. The folder is the de-branded `"Attachments"`
+  (`ATTACHMENTS_FOLDER`), a seam for a future consumer-configurable
+  name. No OneDrive 308 path - 202 never enters the redirect layer.
 - `error.rs` - blob-not-byte-stream warning helper.
   Classification helpers live in `graph_error.rs`.
 
@@ -88,50 +99,43 @@ update/delete fetch the current item and send `If-Match` when the
 response carried a change key or ETag. Calendar and contact updates send
 sparse PATCH bodies, so absent fields are left untouched and scalar
 clears are encoded as JSON nulls (contact updates build a dedicated
-patch body for this: a cleared display name / notes / organization emits
+patch body: a cleared display name / notes / organization emits
 `null`, and a present repeated field replaces its Graph property,
-emitting `null` / `[]` for buckets the new collection leaves empty).
-Graph event organizer is server-derived on create; create payloads with
-a shared organizer are rejected as unsupported. Graph event status is
-also server-derived (`isCancelled` is set by cancellation actions, not a
-writable field), so create / update payloads carrying any status other
-than `Confirmed` are rejected before payload construction rather than
-silently writing a confirmed event.
-Graph contact home/work/other physical addresses map through the shared
-`ContactAddress` model. Event search uses Graph Search API for
-unscoped, non-empty default-mailbox searches, and falls back to local
-filtering over Graph list pages for specific calendars, shared mailboxes,
-empty searches, and cursor resumes. Composite `EventId`s normally embed
-the hosting calendar (`{calendar}::{event}`), but the Search API spans
-the whole mailbox without reporting each hit's calendar, so search hits
-are minted with the `$mailbox` sentinel calendar segment; `event_url`
-routes that segment through `/me/events/{id}` (Graph event ids are
-mailbox-unique) so `event_get`/`update`/`delete` resolve without a
-calendar, instead of 404-ing against a guessed default calendar. Contact search uses Graph's
-documented exact email-address `$filter` for email-shaped queries, and
-otherwise remains local filtering over Graph list pages because the
-contacts endpoint only documents exact address filtering. Local search
-paths scan pages until the requested number of matches is collected or
-the server page chain ends.
+emitting `null` / `[]` for emptied buckets).
+Graph event organizer is server-derived on create; payloads with a
+shared organizer are rejected unsupported. Event status is also
+server-derived (`isCancelled` is set by cancellation actions, not
+writable), so create/update payloads carrying any status other than
+`Confirmed` are rejected before payload construction.
+Graph contact addresses map through the shared `ContactAddress` model.
+Event search uses the Graph Search API for unscoped, non-empty
+default-mailbox searches, and falls back to local filtering for
+specific calendars, shared mailboxes, empty searches, and cursor
+resumes. Composite `EventId`s embed the hosting calendar
+(`{calendar}::{event}`), but Search spans the whole mailbox without
+reporting each hit's calendar, so hits use the `$mailbox` sentinel
+segment; `event_url` routes that through `/me/events/{id}` (event ids
+are mailbox-unique) so `event_get`/`update`/`delete` resolve without a
+calendar. Contact search uses Graph's exact email-address `$filter`
+for email-shaped queries, else local filtering over list pages. Local
+search scans pages until enough matches collect or the chain ends.
 
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
-The `account` module path remains public because the cross-crate
-conformance test and existing consumers construct the factory
-through it; helper modules and `GraphAccount` stay crate-private.
-`GraphClient` is public only as factory input; request helpers stay
-`pub(crate)`. `new` / `with_api_base*` take a raw token string;
-`with_source` and `with_account_net` take a shared `Arc<dyn
-TokenSource>`. The held source is what `attach_account` hands to
-bifrost-net, read live per request. Other methods configure API bases or
-shared-mailbox scoping.
+The `account` module path is public (the conformance test and
+consumers construct the factory through it); helper modules and
+`GraphAccount` stay crate-private. `GraphClient` is public only as
+factory input; request helpers stay `pub(crate)`. `new` /
+`with_api_base*` take a raw token; `with_source` / `with_account_net`
+take a shared `Arc<dyn TokenSource>` that `attach_account` hands to
+bifrost-net, read live per request.
 
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, and an
-optional `PushEndpoint` (the public HTTPS webhook URL).
-`with_push_endpoint(url)` selects `PushMode::GraphSubscriptions` and
-stores the URL; `with_ews_streaming()` selects `PushMode::EwsStreaming`
-and clears the endpoint. The default is webhook-mode without an
-endpoint, where `push_subscribe` returns `Error::MissingCoreCapability`.
+optional `PushEndpoint` (the HTTPS webhook URL).
+`with_push_endpoint(url)` selects `PushMode::GraphSubscriptions`;
+`with_ews_streaming()` selects `PushMode::EwsStreaming` and clears the
+endpoint. Default is webhook-mode without an endpoint, where
+`push_subscribe` returns `Error::MissingCoreCapability`.
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to
 `bifrost-net` under the engine `AccountId`, validates the token with a
@@ -202,25 +206,22 @@ receiver in a `stream::unfold` selecting against the same token.
   read-back guard is the lost-update safety net.
 - `batching_policy: { max_items: 20, max_wait: 100ms, flush_on_input_close: true }`.
   The 20-item ceiling matches Graph's documented `/$batch` limit.
-- `rate_limit_class: RateLimitClass::Tiered`. Graph documents a
-  per-mailbox concurrency tier and per-application throttling
-  budget.
+- `rate_limit_class: RateLimitClass::Tiered`. Per-mailbox
+  concurrency tier plus per-application throttling budget.
 - `quota_signal: QuotaSignal::RetryAfter`. Throttled responses
-  carry an explicit `Retry-After` header that the central
-  recovery mapping translates into `RecoveryClass::Retry`'s
-  `not_before` deadline.
-- `requires_uidvalidity_recheck: false`. Graph has no UIDVALIDITY
-  concept.
-- `historyid_expires_after: None`. Graph has no historyId.
-- `delta_token_expires_after: None`. Microsoft documents no fixed
-  delta-token lifetime; expiry is handled reactively when the
-  next call returns 410 Gone or a 400 InvalidDeltaToken.
+  carry a `Retry-After` header the central recovery mapping turns
+  into `RecoveryClass::Retry`'s `not_before` deadline.
+- `requires_uidvalidity_recheck: false`. No UIDVALIDITY.
+- `historyid_expires_after: None`. No historyId.
+- `delta_token_expires_after: None`. No fixed lifetime; expiry is
+  reactive when the next call returns 410 Gone or 400
+  InvalidDeltaToken.
 - `pim_methods`: true for `add_to_container`, `set_category`,
   `set_extended_property`, `set_is_read`, send/draft lifecycle,
   `scheduled_send` (with native cancel/reschedule), search, mail
   folder CRUD, `identities_list`, vacation get/set, typed
-  thread/message hydration, contact primitives, and calendar
-  primitives. False for
+  thread/message hydration, contact and calendar primitives, and
+  `host_attachment` (OneDrive hosting). False for
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, and
   `quota_get`.
@@ -228,28 +229,27 @@ receiver in a `stream::unfold` selecting against the same token.
   true. Graph Inbox `messageRules` are wired for
   list/create/update/delete, and `filter_validate` performs local
   shape validation before writes.
-- `conveniences`: `starred = Category`, implemented by treating the
-  reserved `$flagged` category input as Graph `flag.flagStatus`.
-  Replied and forwarded conveniences dispatch to
-  `set_extended_property` with `PidTagLastVerbExecuted`
-  (`Integer 0x1081`) values 102 and 104. Keyword-backed replied /
-  forwarded flags are false.
+- `conveniences`: `starred = Category`, treating the reserved
+  `$flagged` category input as Graph `flag.flagStatus`. Replied /
+  forwarded dispatch to `set_extended_property` with
+  `PidTagLastVerbExecuted` (`Integer 0x1081`) values 102 and 104;
+  keyword-backed replied/forwarded flags are false.
 
 ## Cursor envelope
 
-`OpaqueChangeState` for Graph is tagged with
-`ProtocolKind::Graph` and `envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION`
-(currently `1`). `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
+`OpaqueChangeState` for Graph is tagged `ProtocolKind::Graph` with
+`envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `1`).
+`CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
 `ChangeCursor.envelope_version`.
 
 `GraphCursorPayload` carries a delta kind, final `@odata.deltaLink`,
-issue timestamp, and optional page marker for mid-walk checkpoints. The
-payload lands in `OpaqueChangeState::bytes`; page markers also land in
+issue timestamp, and optional mid-walk page marker. It lands in
+`OpaqueChangeState::bytes`; page markers also land in
 `ChangeCursor::advanced_through`.
 
-`decode_cursor` rejects wrong protocol, newer / older-incompatible
-envelopes, and malformed JSON. `changes_stream` cross-checks that
-payload kind projects back to `cursor.scope`; mismatches terminate with
+`decode_cursor` rejects wrong protocol, incompatible envelopes, and
+malformed JSON. `changes_stream` cross-checks that payload kind
+projects back to `cursor.scope`; mismatches terminate with
 `SyncState(SchemaIncompatible)`. `establish_initial_cursor` accepts only
 delta-eligible `FolderType` scopes (email, event/calendar event,
 contact) and mints the first cursor through inventory. A valid
@@ -336,20 +336,19 @@ capability surface.
 ### Webhook mode (`PushMode::GraphSubscriptions`)
 
 `push_subscribe(scopes)` groups scopes by Graph subscription
-resource (`mailFolders/{folder}/messages`, `events`, or
-`contactFolders/{folder}/contacts`) and rejects the whole request if
-any scope is not subscribable. Successful subscribes create one
-server subscription per resource, store `(server_id, expires_at)` in
-a `GraphSubscriptionGroup`, and emit `WatchEvent::Reconnected`.
+resource (`mailFolders/{folder}/messages`, `events`,
+`contactFolders/{folder}/contacts`) and rejects the request if any
+scope is not subscribable. It creates one server subscription per
+resource, stores `(server_id, expires_at)` in a
+`GraphSubscriptionGroup`, and emits `WatchEvent::Reconnected`.
+`push_unsubscribe(handle)` deletes each subscription and aborts the
+renewal worker when no groups remain. The worker wakes every 10 min,
+renews inside the 30 min threshold, emits `Disconnected` on the first
+retryable failure, `Reconnected` after recovery, and
+`Terminated(AccountError)` for terminal auth/policy/permission
+failures.
 
-`push_unsubscribe(handle)` deletes each server subscription and aborts
-the renewal worker when no groups remain. The renewal worker wakes every
-10 minutes, renews subscriptions inside the 30 minute threshold, emits
-`Disconnected` on the first retryable failure, `Reconnected` after
-recovery, and `Terminated(AccountError)` for terminal auth / policy /
-permission failures.
-
-The webhook receiver is not in this crate. Consumers mount an HTTPS
+The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url`, validate `clientState`, and
 feed invalidations into the engine `InvalidationSink`. The account
 `push_stream` carries connection health only; webhook invalidations do
@@ -358,12 +357,12 @@ not flow through it.
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
 `push_subscribe` installs an `EwsSubscriptionState` (scopes plus the
-latest subscription id / watermark) and starts the EWS worker, which
+latest subscription id / watermark) and starts the EWS worker: it
 subscribes to the union of active folders, long-polls
-`GetStreamingEvents`, records watermarks, maps notifications back to
-cursor scopes, and emits `WatchEvent::Invalidated`. Failures use
+`GetStreamingEvents`, records watermarks, maps notifications to cursor
+scopes, and emits `WatchEvent::Invalidated`. Failures use
 `ews_error_to_account_error`: terminal classes terminate; transient
-classes emit `Disconnected`, sleep, reconnect, then `Reconnected`.
+ones emit `Disconnected`, sleep, reconnect, then `Reconnected`.
 
 `push_stream` is a `broadcast::Receiver<WatchEvent>` adapter that
 selects against shutdown. The EWS branch re-spawns its worker on
@@ -377,18 +376,14 @@ demand so lazy consumers still receive events.
 `submit_batch`. Submission proceeds:
 
 1. Snapshot the etag cache and refresh missing etags for `SetFlags` /
-   `Move` via `GET /messages/{id}?$select=id` per missing id (failures
-   become per-id `Failed` with `Transport(_)`). `Destroy` needs no etag.
+   `Move` via `GET /messages/{id}?$select=id` (failures -> per-id
+   `Failed` with `Transport(_)`). `Destroy` needs no etag.
 2. Build one `BatchRequestItem` per id: `PATCH` (`SetFlags`),
-   `POST /messages/{id}/move` (`Move`), `DELETE` (`Destroy`). `If-Match:
-   <changeKey>` is attached when available (mandatory for `SetFlags` /
-   `Move`, opportunistic for `Destroy`).
-3. Send `/$batch`; status drives `mutation_item_outcome`: 2xx ->
-   `Succeeded(Applied)`, 404-on-destroy -> `Succeeded(Skipped)`,
-   412 / 429 / other -> `Failed` carrying a structured `AccountError`
-   (same `response_to_account_error` path, so `AttemptCause(Acknowledged)`,
-   `WireCause::Graph`, and `Retry-After` -> `RetryHint::After` survive
-   for the central recovery mapping).
+   `POST /messages/{id}/move` (`Move`), `DELETE` (`Destroy`).
+   `If-Match: <changeKey>` is attached when available (mandatory for
+   `SetFlags` / `Move`, opportunistic for `Destroy`).
+3. Send `/$batch`; status drives `mutation_item_outcome` (see Error
+   translation).
 
 `bulk_set_flags` translates `FlagOp` to a PATCH body: `isRead` for
 `\\seen` / `read`, `flag.flagStatus` for `\\flagged` / `flagged` /
@@ -406,48 +401,46 @@ Mail mutation primitives live in `pim.rs` and use per-message Graph
 operations, fanning out a `MutationTarget::Thread` via
 `/messages?$filter=conversationId eq ...`. `add_to_container` is
 `POST /messages/{id}/move`; Graph has no symmetric remove, so
-`remove_from_container` is unsupported. `set_is_read` patches `isRead`.
-`set_category` patches `categories[]`, except reserved `$flagged` /
-`flagged` / `starred` inputs patch `flag.flagStatus`.
-`set_extended_property` patches `singleValueExtendedProperties` when
-`Some`; the clear path (`None`) batches
-`DELETE /messages/{id}/singleValueExtendedProperties/<prop-id>` and
-tolerates 404. The alias `PR_LAST_VERB_EXECUTED` maps to
-`Integer 0x1081`. These writes send `If-Match` when `changeKey` exists.
+`remove_from_container` is unsupported. `set_is_read` patches `isRead`;
+`set_category` patches `categories[]` (reserved `$flagged` / `flagged`
+/ `starred` patch `flag.flagStatus`). `set_extended_property` patches
+`singleValueExtendedProperties` when `Some`; the clear path (`None`)
+batches `DELETE .../singleValueExtendedProperties/<prop-id>` and
+tolerates 404. `PR_LAST_VERB_EXECUTED` aliases `Integer 0x1081`. These
+writes send `If-Match` when `changeKey` exists.
 
 Send / draft lifecycle is draft-backed so the trait can return an id:
 `POST /messages` to create, `POST /messages/{id}/send` to send, return
 the draft id. Inline attachments encode into Graph `fileAttachment`
 JSON. Standalone `attachment_upload` is unsupported (Graph upload
-sessions are message/draft scoped). `draft_update` patches mutable
-message fields; attachment replacement is unsupported.
+sessions are message/draft scoped); large over-limit attachments use
+`host_attachment` (`cloud.rs`) -> OneDrive. `draft_update` patches
+mutable message fields; attachment replacement is unsupported.
 
-Scheduled send is `PidTagDeferredSendTime` (`SystemTime 0x3FEF`): when
-`SendRequest::scheduled` is `Some(t)` the boundary validates `t`
-(future; Graph has no documented upper bound so it relies on server
-rejection) and PATCHes that `singleValueExtendedProperty` (ISO-8601
-UTC) onto the draft after create and before send. The returned draft
-id is the cancel/reschedule handle. `cancel_scheduled_send` DELETEs the
-deferred draft; `reschedule_send` PATCHes `PidTagDeferredSendTime` to
-the new instant in place, returning the same id. `scheduled_send` is
-unconditionally true for Graph mailbox accounts.
+Scheduled send is `PidTagDeferredSendTime` (`SystemTime 0x3FEF`): for
+`SendRequest::scheduled = Some(t)` the boundary validates `t` (future;
+no documented upper bound, so it relies on server rejection) and
+PATCHes that `singleValueExtendedProperty` (ISO-8601 UTC) onto the
+draft between create and send. The draft id is the cancel/reschedule
+handle: `cancel_scheduled_send` DELETEs it, `reschedule_send` PATCHes
+the new instant in place (same id). `scheduled_send` is always true
+for Graph mailbox accounts.
 
 Search uses `/messages` with `$filter` / `$search` / `$top` and
 `@odata.nextLink` as the opaque page cursor. Message search returns
 native ids; thread search dedups `conversationId` per result page.
 
 Container CRUD maps to mail folders only. `containers_list` returns
-native Graph folder ids (`Provenance { Graph, Folder, native }`),
-refreshes the folder tree, and maps well-known folders (`inbox`,
-`sentItems`, `drafts`, `deletedItems`, `junkEmail`, `archive`); user
-folders stay role-less. Create / rename / move / delete call the
-`mailFolders` endpoints; root moves target `msgfolderroot`.
+native folder ids (`Provenance { Graph, Folder, native }`), refreshes
+the folder tree, and maps well-known folders (`inbox`, `sentItems`,
+`drafts`, `deletedItems`, `junkEmail`, `archive`); user folders stay
+role-less. Create/rename/move/delete call `mailFolders`; root moves
+target `msgfolderroot`.
 
-Settings support is narrow. `identities_list` returns the primary `me`
-profile as the one default identity; `identity_update` is unsupported
-(no writable send-as/signature surface). Vacation get/set maps to
-`mailboxSettings.automaticRepliesSetting`. `quota_get` is unsupported
-(no stable mailbox quota resource).
+Settings are narrow: `identities_list` returns the primary `me`
+profile as the one default identity; `identity_update` is unsupported.
+Vacation get/set maps to `mailboxSettings.automaticRepliesSetting`.
+`quota_get` is unsupported.
 
 Typed hydration is separate from `get_stream`. `message_hydrate`
 fetches one message at the requested projection and maps recipients,
@@ -479,32 +472,29 @@ handle carries no digest (`digest_available_pre_download: false`).
 ## Error translation
 
 `graph_error::into_account_error(error, ctx)` converts the
-crate-internal `GraphError` enum into an `AccountError` via
+crate-internal `GraphError` into an `AccountError` via
 `AccountErrorBuilder::try_build`. `GraphErrorContext { protocol,
 operation, scope }` threads the calling operation so
-`bifrost-types::recovery::derive` computes `RecoveryClass`; the Graph
-crate has no private recovery table. `GraphErrorContext::ews(op)` is
-the matching constructor for EWS failures; the EWS-side helper
-`graph_error::ews_error_to_account_error` routes `EwsError::Transport`
-through `bifrost_net::into_account_error`, maps `EwsError::HttpStatus`
-through the same `response_to_account_error` path REST uses,
-classifies `EwsError::SoapFault { code, detail }` onto the
-`SoapFaultCode` taxonomy (Server -> Unavailable, Client/MustUnderstand/
-VersionMismatch -> 400, Unknown -> ContractViolation), and routes
-`EwsError::MalformedXml` to `Protocol(ParseFailed)`. Every produced
-error stamps `Protocol::Ews`.
+`bifrost-types::recovery::derive` computes `RecoveryClass`; the crate
+has no private recovery table. `GraphErrorContext::ews(op)` is the EWS
+constructor; `ews_error_to_account_error` routes
+`EwsError::Transport` through `bifrost_net::into_account_error`, maps
+`EwsError::HttpStatus` through the same `response_to_account_error`
+path REST uses, classifies `EwsError::SoapFault` onto `SoapFaultCode`
+(Server -> Unavailable, Client/MustUnderstand/VersionMismatch -> 400,
+Unknown -> ContractViolation), and routes `EwsError::MalformedXml` to
+`Protocol(ParseFailed)`. EWS errors stamp `Protocol::Ews`.
 
 Known Graph vocabulary lands on typed `WireCause::Graph
-(GraphSignal::*)` variants - `InvalidAuthenticationToken`,
+(GraphSignal::*)` variants (`InvalidAuthenticationToken`,
 `AccessDenied`, `Forbidden`, `AccessRestricted`,
 `ConditionalAccessBlocked`, `AdminConsentRequired`,
 `MailboxNotEnabledForRestApi`, `MailboxStoreUnavailable`,
 `ResyncRequired`, `TooManyRequests`, `GenericFileError`,
 `PreconditionFailed`, `NotFound`, `InvalidDeltaToken`,
-`SyncStateNotFound`, `Gone`. `GraphSignal::Unknown { code }` is
-reserved for forward-compat fallback; matching unknown
-vocabulary via string comparison is forbidden by the
-convergence plan's gate-5 invariant.
+`SyncStateNotFound`, `Gone`). `GraphSignal::Unknown { code }` is the
+forward-compat fallback; matching unknown vocabulary by string
+comparison is forbidden (convergence gate-5 invariant).
 
 Mapping highlights:
 
@@ -528,19 +518,16 @@ Mapping highlights:
 - `PreconditionFailed` / 412 -> `ConcurrencyConflict` ->
   `Retry::AfterStateRefresh`.
 
-`mutation_item_outcome` projects per-id `$batch` responses
-onto `ItemOutcome`: 2xx -> `Succeeded(Applied)`, 404-on-destroy ->
-`Succeeded(Skipped)` (idempotent delete), 412 -> `Failed(BatchFailure)`
-classified as `ConcurrencyConflict` (the engine reconciles via its
-read-back guard; per-item Skipped would mask a lost update against
-a deleted message), 429 and other failures -> `Failed(BatchFailure
-{ error })` carrying a structured `AccountError` with
-`Protocol::Graph`, `AttemptCause(Acknowledged)`, and the wire signal
-preserved on the cause chain. The same projector is used by
-`mutate.rs` for `bulk_*` flows, by `pim::submit_write_batch` for the
-PIM single-error contract (where per-item failures unwrap into the
-function's single `Result<(), AccountError>` return), and by
-`get.rs` for `get_stream` per-item hydration outcomes.
+`mutation_item_outcome` projects per-id `$batch` responses onto
+`ItemOutcome`: 2xx -> `Succeeded(Applied)`, 404-on-destroy ->
+`Succeeded(Skipped)` (idempotent delete), 412 ->
+`Failed(BatchFailure)` as `ConcurrencyConflict` (the engine
+reconciles via its read-back guard), 429/other -> `Failed(BatchFailure
+{ error })` carrying an `AccountError` with `Protocol::Graph`,
+`AttemptCause(Acknowledged)`, and the wire signal on the cause chain.
+The same projector serves `mutate.rs` `bulk_*`, `pim::submit_write_batch`
+(unwrapping per-item failures into one `Result`), and `get.rs`
+`get_stream` hydration outcomes.
 
 Cursor-decode failures (`CursorProtocolMismatch`,
 `CursorEnvelopeUnknown`, `SchemaIncompatible`, malformed payload)
@@ -569,21 +556,18 @@ referenceAttachment in a mixed batch.
 - Delta-token expiry is reactive: 410 Gone / 400 InvalidDeltaToken
   collapses onto `Engine(RestartScope(scope))`.
 - `MutationReplaySafety::None`. `IdempotencyKey` is accepted but not
-  transmitted; the engine read-back guard is the only lost-update
-  protection beyond the `If-Match` etag gate.
-- `remove_from_container`, keyword writes, Gmail-style label
-  membership, standalone `attachment_upload`, `identity_update`,
-  and `quota_get` are unsupported (false in `pim_methods`).
-- `send_message` / `draft_send` return the draft id because the send
-  actions answer `202 Accepted` with no body; the Sent Items id is
-  rediscovered via sync or search.
-- `draft_update` does not replace attachments; Graph upload sessions
-  need a larger primitive than Stage 1 exposes.
-- `send_message` / `draft_create` / `draft_update` accept inline
-  base64 `fileAttachment` via `graph_attachment_from_inline` but
-  reject pre-uploaded `AttachmentHandle`s with `Unsupported`.
-- Graph inbox rules are conjunction-shaped. `FilterCondition::And`
-  maps to Graph conditions, `Not(...)` maps to Graph exceptions,
-  and `Or`, date ranges, provider expressions, remove-label,
-  mark-unread, star/unstar, keyword, and reject actions are rejected
-  by local validation.
+  transmitted; the read-back guard is the only lost-update protection
+  beyond the `If-Match` etag gate.
+- `remove_from_container`, keyword writes, label membership, standalone
+  `attachment_upload`, `identity_update`, and `quota_get` are
+  unsupported (false in `pim_methods`).
+- `send_message` / `draft_send` return the draft id (send actions
+  answer `202 Accepted` with no body; the Sent Items id is
+  rediscovered via sync or search).
+- `draft_update` does not replace attachments. Inline base64
+  `fileAttachment` is accepted via `graph_attachment_from_inline`;
+  pre-uploaded `AttachmentHandle`s are rejected `Unsupported`.
+- Graph inbox rules are conjunction-shaped: `FilterCondition::And` ->
+  conditions, `Not(...)` -> exceptions; `Or`, date ranges, provider
+  expressions, remove-label, mark-unread, star/unstar, keyword, and
+  reject actions are rejected by local validation.

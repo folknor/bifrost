@@ -356,7 +356,7 @@ it is contact-group membership, shares no machinery, belongs in the contacts wor
 
 ---
 
-## A6 - Cloud-storage attachments
+## A6 - Cloud-storage attachments - LANDED
 
 Recalibrated for presence=needed: ratatoskr's `gmail/gdrive.rs` and
 `graph/onedrive.rs` are complete upload+share-link modules that are present but
@@ -376,11 +376,14 @@ not dead code; the lack of callers is just ratatoskr's incompleteness.
 is the worst failure mode):
 `fn host_attachment(&self, bytes, meta: CloudUploadMeta) -> Result<HostedAttachment, AccountError>`
 with `CloudUploadMeta { file_name, mime, size, scope: ShareScope }` and
-`HostedAttachment { share_url, provider_file_id, web_view_link }`. Behind it stays
+`HostedAttachment { share_url, provider_file_id }`. Behind it stays
 all provider divergence (256 vs 320 KiB chunk alignment, `Location` header vs JSON
-body, 308 vs 202 resume, one vs two round-trips for the link). Add a net-new
-non-idempotent `AccountOperation::HostAttachment` so the error model classifies an
-interrupted upload correctly (`AccountOperation` has no cloud variant today).
+body, 308 vs 202 resume, one vs two round-trips for the link). The net-new
+non-idempotent `AccountOperation::HostAttachment` lets the error model classify an
+interrupted upload correctly. (No `web_view_link` field landed: for Drive the
+`share_url` *is* the `webViewLink` and for OneDrive it is the sole `createLink`
+`webUrl`, so a second URL field would be redundant-or-absent; the
+`#[non_exhaustive]` struct can gain it later if a provider yields a distinct URL.)
 
 **Seam.** bifrost owns the mechanism (can-host flag, upload/link wire protocol,
 error classification). ratatoskr owns the policy (the 25 MB threshold, warn-vs-host
@@ -389,17 +392,25 @@ UX, inserting `share_url` into the body, the `UploadStatus` persistence).
 **Depends on:** A1 (must route through the shared `TokenSource` + bifrost-net, not
 ratatoskr's bare `reqwest` + hand-built Bearer). Otherwise independent of A2/A4.
 
-**Cautions:**
-- New shared types land in `crates/types` first (trait method, `ShareScope`,
-  `HostedAttachment`, `CloudUploadMeta`, `host_attachment` flag, the
-  `AccountOperation` variant) - both impls depend on them.
-- De-brand the hardcoded `"Ratatoskr Attachments"` OneDrive folder name.
-- **Latent upload-corruption bug** in `gdrive.rs:upload_file_chunked`: on a 308
-  with an unparseable Range header it falls back to `offset = end`, silently
-  skipping a gap if the server accepted fewer bytes. Fix during the adapt; do not
-  copy the optimism (OneDrive sibling avoids it).
-- COPY-AND-ADAPT must be exercised by new bifrost unit tests (the chunk-range /
-  serde tests copy cleanly).
+**Cautions (resolved at landing):**
+- New shared types landed in `crates/types` first (the `cloud` module: trait
+  method, `ShareScope`, `HostedAttachment`, `CloudUploadMeta`, `host_attachment`
+  flag, the `AccountOperation` variant) - both impls depend on them.
+- The hardcoded `"Ratatoskr Attachments"` OneDrive folder name was de-branded to
+  a neutral `"Attachments"`, with the seam documented for a future
+  consumer-configurable folder.
+- **Latent upload-corruption bug** in `gdrive.rs:upload_file_chunked` (on a 308
+  with an unparseable Range header it fell back to `offset = end`, silently
+  skipping a gap): the bifrost Drive chunk loop fails instead, never advancing on
+  an unparseable resume cursor. (OneDrive's 202 sibling never had the bug.)
+- **Load-bearing net obstacle:** default redirect-following converted Drive's
+  `308 Resume Incomplete` (no `Location` header, only `Range`) into
+  `MalformedRedirect`, failing every multi-chunk upload. Resolved by a bifrost-net
+  change: `classify_redirect` returns `PassThrough` when a followed-redirect
+  status carries no `Location`; a present-but-malformed `Location` stays a hard
+  error. OneDrive's 202 resume was unaffected.
+- The COPY-AND-ADAPT chunk-range / serde / scope-mapping behavior is pinned by
+  new bifrost unit tests in each `cloud.rs`.
 
 ---
 
@@ -485,7 +496,6 @@ value. Group A below is that high-value set.
 
 | # | ratatoskr leak | absorption | status | brick |
 |---|---|---|---|---|
-| A-1 | `cloud_attachments.rs:supports_cloud_upload` = `matches!(Graph\|Gmail)` | `host_attachment` primitive + `host_attachment` flag | NEEDS | A6 |
 | A-2 | `handlers/gal.rs` `match provider` for GAL | directory/GAL primitive + `directory_search` flag | NEEDS | A8 (candidate own brick) |
 | A-3 | `auto_responses.rs` six per-provider free fns | `vacation_get`/`set` flags exist; audience+date model-mapping into impls | PARTIAL | A8 |
 | A-4 | `actions/contacts.rs` `match source:&str` + two body builders | `contact_*` flags exist; per-provider mapping into impls | PARTIAL | A8 + A7 (CardDAV) |
@@ -528,10 +538,10 @@ QRESYNC-CONDSTORE-Basic / IDLE / client-side threads -> ALREADY (shared mailboxe
 
 ### A8 priority (most forces a consumer `match provider`)
 
-1. Cloud attachments (A-1 / A6). 2. GAL (A-2). 3. `LabelKind` + Graph-importance
-intent expansion (B-1, densest). 4. Scheduled send (C-2 / A4). 5. IMAP send (C-1 /
-A2). 6. Contacts/calendar/auto-response dispatch (A-3/4/5, mostly resolved once the
-bifrost primitives + A7 land).
+1. GAL (A-2). 2. `LabelKind` + Graph-importance intent expansion (B-1, densest).
+3. Scheduled send (C-2 / A4). 4. IMAP send (C-1 / A2). 5. Contacts/calendar/
+auto-response dispatch (A-3/4/5, mostly resolved once the bifrost primitives + A7
+land). (Cloud attachments, the former top priority A-1 / A6, has landed.)
 
 **Independence:** standalone now - A-2 (GAL flag), B-2 (`graph-N1`), B-4 (MDN
 flag), B-1 (importance, modulo a representation decision), A-6 (policy). Needs A1 -
@@ -556,7 +566,8 @@ ideal uniform surface.
   `Metadata`); JMAP raw fatal left to A1 (A3 added the dedicated raw read).
 - DAV empty-207 destroy-everything + failed-uri loss (A7).
 - CalDAV TZID-as-UTC offset bug, s34-S1 (A7).
-- gdrive 308-resume gap-skip corruption (A6).
+- gdrive 308-resume gap-skip corruption (A6, fixed - the Drive chunk loop fails
+  on an unparseable resume cursor instead of advancing past a gap).
 - Graph `add_label` category read-modify-write lost-update window (A8/B-1).
 
 **Duplicate/loose typing bifrost already fixes:** ratatoskr's `CalendarProvider`

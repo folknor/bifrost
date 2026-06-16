@@ -1037,6 +1037,21 @@ mod tests {
     }
 
     #[test]
+    fn host_attachment_unsupported() {
+        // JMAP has no cloud-drive hosting; the leg builds an
+        // `Unsupported(HostAttachment)` error via the shared helper.
+        let err = unsupported_error(
+            AccountOperation::HostAttachment,
+            None,
+            "JMAP has no cloud-drive attachment hosting",
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
+        );
+    }
+
+    #[test]
     fn state_mismatch_maps_to_concurrency_conflict() {
         let err = into_account_error(
             method_error("stateMismatch"),

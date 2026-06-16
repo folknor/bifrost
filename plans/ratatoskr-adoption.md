@@ -176,15 +176,42 @@ at spec time.
 - Depends on: nothing structurally; survey first.
 - TODO: `s34-S4` adjacent (IMAP capability flags key on `sub.is_some()`).
 
-### A6 - Cloud-storage attachments
+### A6 - Cloud-storage attachments - LANDED
 
 - Intent: large-attachment hosting plus share-link generation (Google Drive,
   Microsoft OneDrive), uniform and capability-flagged.
-- Current: absent.
-- Spec delivers: a bifrost surface for cloud upload plus share-link generation,
-  behind a capability flag; providers without it advertise false.
-- Depends on: A1.
-- TODO: none.
+- Delivered: a new `Account` primitive `host_attachment(&self, bytes: Bytes,
+  meta: CloudUploadMeta) -> AccountFuture<Result<HostedAttachment,
+  AccountError>>` that uploads an over-limit attachment to the account's cloud
+  drive and returns a shareable link in one call - upload + link are atomic from
+  the caller's view, so a successful upload with a failed link step still returns
+  `Err`. Shared types live in the new `bifrost-types::cloud` module
+  (`CloudUploadMeta { file_name, mime, size, scope }`, `HostedAttachment {
+  share_url, provider_file_id }`, `ShareScope::{Anyone, Organization}`). Gated by
+  the new `PimMethodSupport.host_attachment` flag (`true` on Gmail and Graph,
+  `Default` `false` elsewhere) and classified by the new non-idempotent
+  `AccountOperation::HostAttachment` (an interrupted upload may have created a
+  partial Drive item, so no blind retry). Google hosts via a Drive resumable
+  session (`uploadType=resumable`), 256-KiB-aligned chunked PUTs, then a
+  two-round-trip link (POST permission `{anyone|domain}`, GET `webViewLink`).
+  Graph hosts via a OneDrive `createUploadSession` under a de-branded
+  `Attachments` folder (was ratatoskr's `Ratatoskr Attachments`),
+  320-KiB-aligned chunks resuming on 202, then a one-round-trip `createLink`. The
+  four non-hosting protocols (JMAP, IMAP, CalDAV, CardDAV) return
+  `Unsupported(HostAttachment)`. Two folded-in fixes ported from the ratatoskr
+  sources: (1) a bifrost-net change - `classify_redirect` now returns
+  `PassThrough` instead of `MalformedRedirect` when a followed-redirect status
+  carries no `Location` header, so Drive's `308 Resume Incomplete` (no
+  `Location`, only `Range`) reaches the chunk loop instead of failing every
+  multi-chunk upload; a present-but-malformed `Location` stays a hard error. (2)
+  The Drive chunk loop fails on an unparseable/absent 308 `Range` header instead
+  of falling back to `offset = end`, closing a latent gap-skip upload-corruption
+  bug in the ratatoskr source.
+- Depends on: A1 (landed after; the AccountNet token source supplies the Bearer,
+  with `.without_bearer_auth()` for the pre-authed chunk PUT).
+- TODO: none. Closes A8 wart A-1 (the consumer-side
+  `supports_cloud_upload(provider) = matches!(Graph | Gmail)` is replaced by the
+  `host_attachment` capability flag).
 
 ### A7 - DAV as first-class synced accounts
 

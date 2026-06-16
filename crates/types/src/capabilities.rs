@@ -160,6 +160,14 @@ pub struct PimMethodSupport {
     // Mail composition primitives.
     pub send_message: bool,
     pub attachment_upload: bool,
+    /// Native large-attachment hosting + share-link generation (Google
+    /// Drive, Microsoft OneDrive). Gates `host_attachment`. `true` only on
+    /// the Gmail and Graph accounts; `false` -> `host_attachment` returns
+    /// `Unsupported(HostAttachment)` (JMAP, IMAP, CalDAV, CardDAV). This
+    /// flag is the bifrost replacement for ratatoskr's consumer-side
+    /// `supports_cloud_upload(provider) = matches!(Graph | Gmail)` (closes
+    /// the A8 provider-identity leak A-1).
+    pub host_attachment: bool,
     pub draft_create: bool,
     pub draft_update: bool,
     pub draft_discard: bool,

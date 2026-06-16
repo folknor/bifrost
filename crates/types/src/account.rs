@@ -29,6 +29,7 @@ use crate::calendar::{
     RsvpStatus,
 };
 use crate::capabilities::{AccountCapabilities, StarredFlagShape};
+use crate::cloud::{CloudUploadMeta, HostedAttachment};
 use crate::compose::{AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest};
 use crate::contact::{
     AddressBook, AddressBookId, ContactCard, ContactCreate, ContactId, ContactPatch,
@@ -361,6 +362,23 @@ pub trait Account: Send + Sync {
         bytes: AccountStream<Result<Bytes, AccountError>>,
         mime: String,
     ) -> AccountFuture<Result<AttachmentHandle, AccountError>>;
+
+    /// Host an over-limit attachment in the account's cloud drive and return a
+    /// shareable link, in one call. Upload + link are atomic from the caller's
+    /// view: this returns `Ok(HostedAttachment)` only when the file is on the
+    /// drive AND a link exists; any failure (including a failed link step after
+    /// a successful upload) returns `Err`. `bytes` is the whole payload;
+    /// `meta.size` MUST equal `bytes.len()`.
+    ///
+    /// Gated by `capabilities().pim_methods.host_attachment`. A `false` flag
+    /// (JMAP, IMAP, CalDAV, CardDAV) means this returns
+    /// `Unsupported(HostAttachment)`. Google -> Google Drive resumable upload +
+    /// sharing permission; Graph -> OneDrive resumable upload + `createLink`.
+    fn host_attachment(
+        &self,
+        bytes: Bytes,
+        meta: CloudUploadMeta,
+    ) -> AccountFuture<Result<HostedAttachment, AccountError>>;
 
     /// Create a new draft.
     fn draft_create(&self, patch: DraftPatch) -> AccountFuture<Result<DraftHandle, AccountError>>;
