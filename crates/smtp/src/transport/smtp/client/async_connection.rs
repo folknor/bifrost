@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::path::Path;
 use std::{fmt::Display, future::Future, time::Duration};
 
+use bifrost_sasl::ScramChannelBinding;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use super::async_net::AsyncDeadline;
@@ -17,7 +19,10 @@ use crate::{
     address::Address,
     transport::smtp::{
         Protocol,
-        authentication::{Credentials, Mechanism},
+        authentication::{
+            Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
+            first_attemptable, oauth_mechanism, password_mechanism_order, scram_hash,
+        },
         batch::{SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
         error,
@@ -1394,9 +1399,9 @@ impl AsyncSmtpConnection {
 
     /// DER of the peer (server) certificate. See
     /// [`AsyncNetworkStream::peer_certificate_der`] for the contract.
-    // Plumbing for SCRAM-PLUS channel binding; the first consumer is the
-    // SASL layer, so there is no in-crate caller yet.
-    #[allow(dead_code)]
+    ///
+    /// Consumed by `auth`'s `resolve_scram_binding` for SCRAM-PLUS channel
+    /// binding.
     pub(crate) fn peer_certificate_der(&self) -> Option<Vec<u8>> {
         self.stream.get_ref().peer_certificate_der()
     }
@@ -1427,23 +1432,131 @@ impl AsyncSmtpConnection {
             .await
     }
 
-    /// Sends an AUTH command with the given mechanism, and handles the challenge if needed
+    /// Sends an AUTH command, selecting the strongest compatible mechanism.
+    ///
+    /// Awaited twin of `SmtpConnection::auth`: same SCRAM-aware order, same
+    /// RFC 5802 Section 6 downgrade protection, same binding-skip fall-through.
     pub(crate) async fn auth(
         &mut self,
         mechanisms: &[Mechanism],
         credentials: &Credentials,
     ) -> Result<Response, Error> {
-        let mechanism = self
-            .server_info
-            .get_auth_mechanism(mechanisms)
-            .ok_or_else(|| {
-                // Tag the phase on the error so the account-error mapper can
-                // route this to Authorization(PolicyBlocked) instead of
-                // Request(Malformed) -> ClientBug.
-                error::invalid_input("No compatible authentication mechanism was found")
-                    .with_phase(SmtpCommandPhase::Auth)
-            })?;
+        // OAuth credentials never use SCRAM: select the first advertised
+        // mechanism from the caller's order and run the legacy encoder path.
+        if let Some(mechanism) = oauth_mechanism(mechanisms, &self.server_info, credentials) {
+            return self.auth_legacy(mechanism, credentials).await;
+        }
 
+        let order = password_mechanism_order(mechanisms, &self.server_info);
+
+        // The DER accessor is sync, so the PLUS binding resolution adds no
+        // round trips: selection stays network-free.
+        let mut bindings: HashMap<Mechanism, ScramChannelBinding> = HashMap::new();
+        for &mech in &order {
+            if matches!(mech, Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus)
+                && let Some(b) = self.resolve_scram_binding()
+            {
+                bindings.insert(mech, b);
+            }
+        }
+
+        let chosen = first_attemptable(&order, |m| bindings.contains_key(&m))?;
+        match chosen {
+            Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus => {
+                let binding = bindings
+                    .remove(&chosen)
+                    .expect("PLUS binding resolved above");
+                self.auth_scram(chosen, binding, credentials).await
+            }
+            Mechanism::ScramSha1 | Mechanism::ScramSha256 => {
+                self.auth_scram(chosen, ScramChannelBinding::None, credentials)
+                    .await
+            }
+            _ => self.auth_legacy(chosen, credentials).await,
+        }
+    }
+
+    /// Resolve the `tls-server-end-point` channel binding for the live
+    /// connection. The DER accessor is sync (cached on the TLS stream), so this
+    /// is non-awaiting and the binding-skip decision stays network-free.
+    fn resolve_scram_binding(&self) -> Option<ScramChannelBinding> {
+        let der = self.peer_certificate_der()?;
+        let bytes = bifrost_sasl::tls_server_end_point(&der).ok()?;
+        Some(ScramChannelBinding::TlsServerEndPoint(bytes))
+    }
+
+    /// Run a SCRAM exchange (bound or unbound) as a no-IR `334` challenge walk.
+    async fn auth_scram(
+        &mut self,
+        mechanism: Mechanism,
+        binding: ScramChannelBinding,
+        credentials: &Credentials,
+    ) -> Result<Response, Error> {
+        let hash = scram_hash(mechanism).expect("auth_scram only called for SCRAM mechanisms");
+        let (username, password) = credentials.password_parts()?;
+        let mut exchange = ScramExchange::new(hash, binding, username, password.into())?;
+
+        let auth = Auth::new(mechanism, credentials.clone(), None)?;
+        let response = try_smtp!(self.command(auth).await, self, SmtpCommandPhase::Auth);
+        if !response.has_code(334) {
+            self.abort().await;
+            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+        }
+        let response = try_smtp!(
+            self.write_auth_continuation(&exchange.client_first()).await,
+            self,
+            SmtpCommandPhase::Auth
+        );
+
+        // A malformed continuation is a protocol-class parse error (not an
+        // auth failure), so it is not Auth-phase tagged, but it must still
+        // abort the connection like every other error path in this exchange.
+        let server_first = try_smtp!(decode_auth_challenge(&response), self);
+        let response = match try_smtp!(exchange.step(&server_first), self, SmtpCommandPhase::Auth) {
+            ScramStep::Reply(client_final) => try_smtp!(
+                self.write_auth_continuation(&client_final).await,
+                self,
+                SmtpCommandPhase::Auth
+            ),
+            ScramStep::Complete => {
+                self.abort().await;
+                return Err(error::parse("SCRAM completed before server-final"));
+            }
+        };
+
+        let server_final = try_smtp!(decode_auth_challenge(&response), self);
+        match try_smtp!(exchange.step(&server_final), self, SmtpCommandPhase::Auth) {
+            ScramStep::Complete => {}
+            ScramStep::Reply(_) => {
+                self.abort().await;
+                return Err(error::parse("unexpected SCRAM reply after server-final"));
+            }
+        }
+        let response = try_smtp!(
+            self.write_auth_continuation("").await,
+            self,
+            SmtpCommandPhase::Auth
+        );
+
+        let hello_name = self.hello_name.clone();
+        try_smtp!(self.hello(&hello_name).await, self);
+        Ok(response)
+    }
+
+    /// Write a base64 SASL continuation line (already encoded) and read the
+    /// reply. An empty `line` emits a bare `\r\n`.
+    async fn write_auth_continuation(&mut self, line: &str) -> Result<Response, Error> {
+        self.write(format!("{line}\r\n").as_bytes()).await?;
+        self.read_response().await
+    }
+
+    /// The legacy stateless `Auth::new` / `Auth::new_from_response` 334 loop,
+    /// for PLAIN / LOGIN / XOAUTH2 / OAUTHBEARER.
+    async fn auth_legacy(
+        &mut self,
+        mechanism: Mechanism,
+        credentials: &Credentials,
+    ) -> Result<Response, Error> {
         // Limit challenges to avoid blocking
         let mut challenges: u8 = 10;
         let auth = Auth::new(mechanism, credentials.clone(), None)?;

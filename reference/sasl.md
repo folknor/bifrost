@@ -2,7 +2,7 @@
 
 Private shared SASL/SCRAM computation layer for the bifrost protocol crates.
 Not in the public API of any protocol crate. Depended on by `bifrost-imap`
-today; `bifrost-smtp` joins in a later step. No `bifrost-types`, no
+and `bifrost-smtp`. No `bifrost-types`, no
 `bifrost-net`, no tokio: the crate is sync and computation-only.
 
 ## Scope
@@ -98,12 +98,13 @@ correct:
 
 ## Forward note
 
-IMAP now drives the PLUS path: its consumers send the
+IMAP and SMTP both drive the PLUS path: their consumers send the
 `p=tls-server-end-point,,` GS2 header, pull the peer cert DER, select PLUS when
 advertised, and enforce RFC 5802 Section 6 downgrade protection (see
-`reference/imap.md` and git history). Still future, in later steps of
-`plans/sasl-and-channel-binding.md`: the `bifrost-smtp -> bifrost-sasl`
-dependency edge and SMTP's SCRAM family; and OAuth (XOAUTH2 / OAUTHBEARER)
+`reference/imap.md` / `reference/smtp.md` and git history). SMTP consumes
+`ScramHash` / `ScramChannelBinding` / `scram_client_final` /
+`verify_server_final` via `ScramExchange`. Still future, in later steps of
+`plans/sasl-and-channel-binding.md`: OAuth (XOAUTH2 / OAUTHBEARER)
 payload construction currently duplicated in the protocol crates. The crate
 still exposes no selection function - selection policy lives in each protocol
 crate. EdDSA leaf-cert channel binding is deliberately a hard error until an

@@ -427,4 +427,14 @@ mod test {
             "AQ==\r\n"
         );
     }
+
+    #[test]
+    fn scram_initial_command_is_bare_auth() {
+        // SCRAM has no initial response and is driven by the SCRAM exchange,
+        // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which
+        // errors for SCRAM) and must emit a bare `AUTH SCRAM-SHA-256`.
+        let credentials = Credentials::password("user".to_owned(), "password".to_owned());
+        let auth = Auth::new(Mechanism::ScramSha256, credentials, None).unwrap();
+        assert_eq!(format!("{auth}"), "AUTH SCRAM-SHA-256\r\n");
+    }
 }

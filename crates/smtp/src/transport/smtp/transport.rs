@@ -855,7 +855,9 @@ mod tests {
         LmtpTransport, SmtpTransport, Transport,
         address::Envelope,
         transport::smtp::{
-            authentication::{Credentials, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS},
+            authentication::{
+                Credentials, DEFAULT_MECHANISMS, Mechanism, OAUTH2_MECHANISMS, PASSWORD_MECHANISMS,
+            },
             test_support::{assert_lmtp_delivery_commands, spawn_lmtp_delivery_server},
         },
     };
@@ -1017,6 +1019,19 @@ mod tests {
             ))
         );
         assert_eq!(builder.info.authentication, PASSWORD_MECHANISMS);
+        // Pin the grown default-construction surface explicitly: SCRAM is now
+        // offered out of the box (strongest first), LOGIN is opt-in only.
+        assert_eq!(
+            builder.info.authentication,
+            vec![
+                Mechanism::ScramSha256Plus,
+                Mechanism::ScramSha1Plus,
+                Mechanism::ScramSha256,
+                Mechanism::ScramSha1,
+                Mechanism::Plain,
+            ]
+        );
+        assert_eq!(DEFAULT_MECHANISMS, PASSWORD_MECHANISMS);
     }
 
     #[test]

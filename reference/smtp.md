@@ -73,11 +73,19 @@ If the server advertises `SIZE=<bytes>`, message size is checked client-side bef
 
 `Credentials` is enum: `Password { user, password }` and `OAuth2 { identity, access_token }`. Both store `Zeroizing<String>`.
 
-Mechanisms: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER. Server-advertised mechanisms are honored in this order: OAUTHBEARER before XOAUTH2 (for OAuth2 credentials); explicit `authentication(...)` overrides defaults.
+Mechanisms (`Mechanism`, `#[non_exhaustive]`): PLAIN, LOGIN, XOAUTH2, OAUTHBEARER, SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-1-PLUS, SCRAM-SHA-256-PLUS. SCRAM is consumed from `bifrost-sasl` (the `-PLUS` suffix and token spelling have a single authority there); SMTP owns only the wire sequencing.
+
+Password selection (`password_mechanism_order` + `first_attemptable` in `authentication.rs`): the advertised set is intersected with the allowed set in the fixed order `SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > LOGIN`. RFC 5802 Section 6 downgrade protection: the unbound `SCRAM-SHA-N` rung is dropped when `SCRAM-SHA-N-PLUS` is advertised. A PLUS rung whose channel binding cannot resolve (plaintext, EdDSA leaf cert) is skipped and the walk falls through to the next safe rung; only binding-unavailability falls through, a wire-level rejection propagates. SCRAM runs as a no-IR `334` challenge exchange driven by `ScramExchange`; `Mechanism::response` is never called for SCRAM. PLUS channel binding (`tls-server-end-point`) comes from the cached peer-cert DER, no extra round trip.
+
+OAuth credentials never use SCRAM: they pick the first advertised OAUTHBEARER/XOAUTH2 rung in caller order (`oauth_mechanism`) and run the legacy stateless encoder. OAUTHBEARER before XOAUTH2 by default.
+
+**Default behavior change (migration note).** `PASSWORD_MECHANISMS` now defaults to SCRAM (strongest first) then PLAIN, and LOGIN is no longer in it (opt-in legacy, mirroring IMAP's `allow_login = false`). A server advertising only `AUTH LOGIN` therefore yields an empty attempt order under the default and fails with "no compatible authentication mechanism" instead of silently downgrading to LOGIN. Callers that need LOGIN must pass it explicitly via `authentication(vec![Mechanism::Login, ..])`.
 
 Plaintext AUTH is refused by default for both passwords and OAuth bearer tokens. Trusted local relays opt in with `dangerous_allow_insecure_auth(true)`.
 
 AUTH continuation formatting treats challenge responses as continuation lines even for mechanisms supporting initial response. Required for OAUTHBEARER failed-auth dummy-cancel exchange (`AQ==` on the wire).
+
+`SaslError` maps at the `From<SaslError> for Error` boundary: `Protocol` (malformed SASL, signature mismatch) to `ErrorKind::Parse`; `AuthFailed` (SCRAM `e=` server error) to `ErrorKind::InvalidInput` + `SmtpCommandPhase::Auth` so `account_error.rs` routes it to `Authorization(PolicyBlocked)`.
 
 Builder helpers: `.password(user, password)` for password auth and
 `.oauth2(identity, access_token)` for OAuth2 bearer-token auth.

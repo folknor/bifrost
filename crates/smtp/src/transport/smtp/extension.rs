@@ -291,6 +291,20 @@ impl ServerInfo {
                             "OAUTHBEARER" => {
                                 features.insert(Extension::Authentication(Mechanism::OAuthBearer));
                             }
+                            "SCRAM-SHA-1" => {
+                                features.insert(Extension::Authentication(Mechanism::ScramSha1));
+                            }
+                            "SCRAM-SHA-256" => {
+                                features.insert(Extension::Authentication(Mechanism::ScramSha256));
+                            }
+                            "SCRAM-SHA-1-PLUS" => {
+                                features
+                                    .insert(Extension::Authentication(Mechanism::ScramSha1Plus));
+                            }
+                            "SCRAM-SHA-256-PLUS" => {
+                                features
+                                    .insert(Extension::Authentication(Mechanism::ScramSha256Plus));
+                            }
                             _ => (),
                         }
                     }
@@ -400,14 +414,19 @@ impl ServerInfo {
             .contains(&Extension::Authentication(mechanism))
     }
 
-    /// Gets a compatible mechanism from a list
-    pub(crate) fn get_auth_mechanism(&self, mechanisms: &[Mechanism]) -> Option<Mechanism> {
-        for mechanism in mechanisms {
-            if self.supports_auth_mechanism(*mechanism) {
-                return Some(*mechanism);
-            }
+    /// Build a `ServerInfo` advertising exactly the given AUTH mechanisms.
+    ///
+    /// Test-only seam so the pure mechanism-selection helpers can be exercised
+    /// without parsing an EHLO banner.
+    #[cfg(test)]
+    pub(crate) fn with_auth_mechanisms(mechanisms: &[Mechanism]) -> ServerInfo {
+        ServerInfo {
+            name: "test".to_owned(),
+            features: mechanisms
+                .iter()
+                .map(|m| Extension::Authentication(*m))
+                .collect(),
         }
-        None
     }
 }
 
@@ -1345,6 +1364,29 @@ mod test {
         assert!(server_info2.supports_auth_mechanism(Mechanism::Plain));
         assert!(server_info2.supports_auth_mechanism(Mechanism::OAuthBearer));
         assert!(!server_info2.supports_feature(Extension::StartTls));
+    }
+
+    #[test]
+    fn ehlo_parses_scram_mechanisms() {
+        let response = Response::new(
+            Code::new(
+                Severity::PositiveCompletion,
+                Category::Unspecified4,
+                Detail::One,
+            ),
+            vec![
+                "me".to_owned(),
+                "AUTH SCRAM-SHA-256 SCRAM-SHA-256-PLUS SCRAM-SHA-1 PLAIN".to_owned(),
+            ],
+        );
+
+        let info = ServerInfo::from_response(&response).unwrap();
+        assert!(info.supports_auth_mechanism(Mechanism::ScramSha256));
+        assert!(info.supports_auth_mechanism(Mechanism::ScramSha256Plus));
+        assert!(info.supports_auth_mechanism(Mechanism::ScramSha1));
+        assert!(info.supports_auth_mechanism(Mechanism::Plain));
+        // SHA-1-PLUS was not advertised.
+        assert!(!info.supports_auth_mechanism(Mechanism::ScramSha1Plus));
     }
 
     #[test]

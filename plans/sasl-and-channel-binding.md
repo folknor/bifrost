@@ -29,16 +29,16 @@ servers; SMTP must not stay weaker just because sending is the
   server advertises them, pulls the peer cert DER through to the SCRAM
   consumer's GS2 header, and enforces RFC 5802 Section 6 downgrade
   protection (the matching non-PLUS rung is refused when a PLUS variant
-  is advertised). See `reference/imap.md` and git history. SMTP still
-  carries no SCRAM family.
-- SMTP advertises only PLAIN, LOGIN, XOAUTH2, OAUTHBEARER in
-  `crates/smtp/src/transport/smtp/authentication.rs:132`. No SCRAM
-  family at all.
-- Both crates now surface the peer certificate DER upward through
-  their stream wrappers (`peer_certificate_der` accessors on the IMAP
-  `ImapConnection` handle and the SMTP sync/async connection structs).
-  This is the transport prerequisite for SCRAM-PLUS. IMAP now consumes
-  it (DER -> `tls_server_end_point` -> GS2 header); SMTP does not yet.
+  is advertised). See `reference/imap.md` and git history.
+- SMTP now carries the full SCRAM family (non-PLUS and PLUS) with the
+  same mechanism selection and downgrade protection, consuming
+  `bifrost-sasl` via its `ScramExchange` driver. See `reference/smtp.md`
+  and git history.
+- Both crates surface the peer certificate DER upward through their
+  stream wrappers (`peer_certificate_der` accessors on the IMAP
+  `ImapConnection` handle and the SMTP sync/async connection structs)
+  and both consume it (DER -> `tls_server_end_point` -> GS2 header) to
+  drive SCRAM-PLUS.
 
 ## Plan
 
@@ -108,16 +108,16 @@ Once channel binding exists below the protocols:
 
 - IMAP grew SCRAM-SHA-256-PLUS and SCRAM-SHA-1-PLUS alongside the
   existing non-PLUS variants (landed; see git history).
-- SMTP grows the full SCRAM family at once - non-PLUS and PLUS
-  together, since it currently has none.
+- SMTP grew the full SCRAM family at once - non-PLUS and PLUS together
+  (landed; see git history).
 
 Downgrade protection (RFC 5802 §6): when the server's advertised
 mechanism list includes a PLUS variant, the client must not fall
 back to the matching non-PLUS variant, even if the server also lists
 it. The SASL crate supplies the binding primitives; the selection
 ladder and downgrade decision live in each protocol crate over its own
-advertised-mechanism profile (IMAP's `password_mechanism_ladder` is the
-landed reference). SMTP should mirror the same rule.
+advertised-mechanism profile (IMAP's `password_mechanism_ladder` and
+SMTP's `password_mechanism_order` are the landed references).
 
 ### 4. Mechanism preference
 
@@ -136,9 +136,9 @@ OAuth and password auth are orthogonal paths in the account config.
   stronger is on offer; the account config has to opt in explicitly.
 
 Each protocol crate owns its mechanism-selection function over its own
-advertised-mechanism profile, applying the same policy. IMAP's ladder
-places SCRAM-SHA-1-PLUS above SCRAM-SHA-256 (a channel-bound SHA-1
-exchange outranks unbound SHA-256); SMTP should match.
+advertised-mechanism profile, applying the same policy. Both ladders
+place SCRAM-SHA-1-PLUS above SCRAM-SHA-256 (a channel-bound SHA-1
+exchange outranks unbound SHA-256).
 
 ### 5. Public API shape
 
@@ -167,11 +167,10 @@ rewired), and the `tls-server-end-point` channel binding plus
 SCRAM-PLUS computation in that crate have all landed; see git history
 for the stream-wrapper plumbing, the SASL extraction, and the
 channel-binding/SCRAM-PLUS computation. IMAP's mechanism selection now
-prefers PLUS with downgrade protection (see git history). The remaining
-steps:
+prefers PLUS with downgrade protection (see git history). SMTP now has
+the same SCRAM family (non-PLUS and PLUS) with mechanism selection and
+downgrade protection wired through `bifrost-sasl` (see git history).
+The remaining steps:
 
-1. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
-   crate; wire the same mechanism selection and downgrade
-   protection.
-2. Move OAuth payload construction into the shared crate; collapse
+1. Move OAuth payload construction into the shared crate; collapse
    the duplicated XOAUTH2 / OAUTHBEARER builders in IMAP and SMTP.
