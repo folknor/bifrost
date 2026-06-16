@@ -315,7 +315,7 @@ async fn hydrate_one(
     }
 }
 
-fn raw_bytes(message: &GmailMessage) -> crate::Result<Bytes> {
+pub(crate) fn raw_bytes(message: &GmailMessage) -> crate::Result<Bytes> {
     let raw = message.raw.as_deref().ok_or_else(|| {
         crate::Error::missing_field("raw", "gmail raw projection did not include raw bytes")
     })?;

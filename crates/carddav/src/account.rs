@@ -459,6 +459,10 @@ impl Account for CardDavAccount {
         unsupported_stream(AccountOperation::OpenBlobRange)
     }
 
+    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
+        unsupported_stream(AccountOperation::OpenRawRfc822)
+    }
+
     fn bulk_set_flags(
         &self,
         _targets: AccountStream<ObjectId>,
@@ -1293,6 +1297,24 @@ fn contains(value: &str, needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::AccountErrorKind;
+
+    #[tokio::test]
+    async fn carddav_open_raw_rfc822_unsupported() {
+        // CardDAV advertises no raw RFC822 read; the flag is false and the
+        // stream's first item terminates `Unsupported(OpenRawRfc822)`.
+        assert!(!carddav_capabilities().pim_methods.open_raw_rfc822);
+
+        let mut stream = unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
+        let first = stream.next().await.expect("first event");
+        match first {
+            SyncEvent::Terminated(err) => assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::OpenRawRfc822)
+            ),
+            other => panic!("expected Terminated, got {other:?}"),
+        }
+    }
 
     #[test]
     fn offset_cursor_decodes_ascii_offsets() {

@@ -46,7 +46,8 @@ Internal modules:
 - `flags.rs` - Gmail-label-to-IMAP-flag canonicalization and the
   reverse `LabelPatch` translation used by mutations.
 - `blobs.rs` - `open_blob` / `open_blob_range` over Gmail
-  attachments.
+  attachments, plus `open_raw_rfc822` (whole message via `format=raw`,
+  decoded by `inventory::raw_bytes`).
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 

@@ -121,17 +121,30 @@ at spec time.
 - TODO: `smtp-M1` adjacent (raw-socket bandwidth metering parity) - not folded
   in; the submission transport uses the SMTP crate's own pooling.
 
-### A3 - Raw RFC822 hydration
+### A3 - Raw RFC822 hydration - LANDED
 
 - Intent: real assembled MIME bytes, uniform across all providers, for the body
   store, attachment dedup, and forwarding.
-- Current: absent. `hydration.rs` is explicitly the parsed shape "rather than
-  raw MIME bytes"; `open_blob` streams blob bytes but there is no whole-message
-  RFC822 projection. Raw-MIME assembly is deferred on the HTTP providers.
-- Spec delivers: a new read primitive yielding assembled RFC822 bytes for a
-  message, implemented on all four protocols (JMAP/Google/Graph assemble from
-  parts; IMAP fetches `BODY[]`), with a capability flag where a provider cannot.
-- Depends on: A1 (lands after).
+- Delivered: a new `Account` primitive `open_raw_rfc822(&self, message: ObjectId)
+  -> AccountStream<SyncEvent<Bytes>>` yielding the verbatim server-assembled
+  RFC822 octets (`Bytes`, never lossy-UTF8), gated by the new
+  `PimMethodSupport.open_raw_rfc822` flag and the new
+  `AccountOperation::OpenRawRfc822` (an idempotent read, outside the
+  `is_idempotent` exclusion set). Native on all four mail protocols via each
+  provider's existing server-assembled whole-message endpoint - no client-side
+  MIME assembler: IMAP `BODY.PEEK[]` (new helper in `account/blob.rs`), Gmail
+  `messages.get?format=raw` decoded by `inventory::raw_bytes`, JMAP `Email/get`
+  for `blobId` then `client.download`, Graph `GET /messages/{id}/$value` via
+  `download_stream`. The two DAV crates return
+  `Unsupported(OpenRawRfc822)` with the flag `false` (inherited from
+  `PimMethodSupport::default()`), gating the consumer's raw-source UI button.
+  Folded-in Graph contract fix: `get.rs:hydrated_from_value` no longer ships
+  serialized JSON inside `HydratedObjectKind::RawMime`; the body-bearing
+  projections (`Headers`/`Preview`/`TextOnly`/`Full`/`FullWithBlobs`) now degrade
+  to `Metadata` (falling back to `FlagsOnly`), an accepted stopgap until A1 owns
+  Graph's body-projection path. The JMAP `hydrate.rs` raw-projection fatal is
+  deliberately left in place (A1 owns it); A3 only opened the dedicated raw read.
+- Depends on: A1 (landed after).
 - TODO: none.
 
 ### A4 - Scheduled send [LANDED]

@@ -192,6 +192,10 @@ impl Account for FlagsAccount {
         Box::pin(stream::empty())
     }
 
+    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
+        Box::pin(stream::empty())
+    }
+
     fn bulk_set_flags(
         &self,
         _targets: AccountStream<ObjectId>,

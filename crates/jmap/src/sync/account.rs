@@ -289,6 +289,15 @@ impl Account for JmapAccount {
         blob::open_range(handle, range)
     }
 
+    fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<bytes::Bytes>> {
+        blob::open_raw_rfc822(
+            self.client.clone(),
+            self.mail.id().clone(),
+            self.mail.clone(),
+            message,
+        )
+    }
+
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,

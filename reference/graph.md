@@ -61,7 +61,8 @@ for optimistic concurrency.
   list/create/update/delete plus local validation.
 - `blob.rs` - `open_blob` / `open_blob_range` over Graph
   attachments (`/messages/{id}/attachments/{aid}/$value`),
-  including the reference-attachment short-circuit.
+  including the reference-attachment short-circuit, plus
+  `open_raw_rfc822` (whole message via `/messages/{id}/$value`).
 - `error.rs` - blob-not-byte-stream warning helper.
   Classification helpers live in `graph_error.rs`.
 
@@ -311,11 +312,17 @@ poisoning the rest of the batch; a transport drop on the whole `/$batch`
 request emits `SyncEvent::Terminated` at the stream level. The per-item
 projector `hydrated_from_value` produces:
 `FlagsOnly` -> a `HashSet<String>` of canonical flags
-(`\seen`, `\flagged`, `category:<name>`); `Metadata` -> re-runs
-`inventory_entry_from_value`; raw-MIME projections (`Headers`,
-`Preview`, `TextOnly`, `Full`, `FullWithBlobs`) -> serialized JSON
-inside `HydratedObjectKind::RawMime`. Attachment metadata is
-surfaced as `BlobHandle`s on the hydrated object.
+(`\seen`, `\flagged`, `category:<name>`); `Metadata` and the
+body-bearing projections (`Headers`, `Preview`, `TextOnly`, `Full`,
+`FullWithBlobs`) -> `metadata_or_flags`, i.e. `Metadata` via
+`inventory_entry_from_value` (falling back to `FlagsOnly`). Graph's
+JSON message resource is not assembled RFC822, so hydration cannot
+honestly produce `RawMime`; the body-bearing projections therefore
+degrade to `Metadata` (a recorded stopgap until A1 owns Graph's body
+projection path - until then, consumers do not rely on Graph hydration
+body projections; assembled bytes come from `open_raw_rfc822`).
+Attachment metadata is surfaced as `BlobHandle`s on the hydrated
+object.
 
 `scope_lifecycle_stream` is empty: Graph exposes no folder-lifecycle
 notification surface and the engine's adaptive polling is not yet wired

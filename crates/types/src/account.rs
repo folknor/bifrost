@@ -223,6 +223,15 @@ pub trait Account: Send + Sync {
         range: ByteRange,
     ) -> AccountStream<SyncEvent<Bytes>>;
 
+    /// Open a message's assembled RFC822 octets for streaming download.
+    /// Yields the verbatim server-assembled MIME bytes (never
+    /// re-encoded, never lossy-decoded). `Bytes`, never `String`: 8-bit
+    /// and binary MIME parts must survive intact for the body store,
+    /// attachment dedup hashes, and the raw-source viewer. Gated by
+    /// `capabilities().pim_methods.open_raw_rfc822`; an account whose
+    /// flag is false terminates with `Unsupported(OpenRawRfc822)`.
+    fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<Bytes>>;
+
     /// Bulk flag mutation. `targets` is a streaming input so
     /// engine-driven mutation pipelines backpressure cleanly.
     /// `op` carries both the operation kind AND the flag set per

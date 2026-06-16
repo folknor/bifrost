@@ -123,7 +123,7 @@ documents carry all context by design. One step's artifact must exist and be
 complete before the next step launches. If a step fails, rerun that step -
 do not improvise a recovery that bypasses it.
 
-Each file-touching prompt below ends with `Do not commit.` That guard is
+Each file-touching prompt below carries `Do not commit.` That guard is
 load-bearing, not boilerplate: the orchestrator owns the commit - step 7,
 exclusively - so an agent that commits its own work lands it before
 review-and-fix (step 5) has run and outside the orchestrator's git control. The
@@ -135,12 +135,21 @@ anyway it has skipped steps 5 through 7: soft-reset the tree back to uncommitted
 with a mixed `git reset HEAD~1` before the loop resumes, then continue from
 step 5.
 
+Every prompt to a Claude Agent (any type) also ends with `Do not launch any
+sub-agents.` This guard is load-bearing too: the loop runs exactly one Agent at
+a time, and the anti-nesting flush (see the harness-bug section) depends on it.
+An Agent that spawns its own sub-agents puts a second Agent in flight, which
+reintroduces the lingering-window nesting the flush exists to prevent. Codex
+prompts omit this guard (codex is a separate process, not a Claude Agent);
+step 2's prompt is the one Claude-Agent prompt also handed to codex, which
+harmlessly ignores it.
+
 ### 1. Spec
 
 Launch one Agent(opus), background:
 
 > Read X and reference/technical-implementation-spec.md and write a new
-> implementation spec document. Do not commit.
+> implementation spec document. Do not commit. Do not launch any sub-agents.
 
 where X is a reference to where the TODO item lives, not the item's text -
 e.g. "item N in TODO.md", in whatever form the TODO document named at
@@ -156,7 +165,8 @@ Launch simultaneously, both background:
 
 Both get the same prompt:
 
-> Please critically review Y and report back your findings.
+> Please critically review Y and report back your findings. Do not launch any
+> sub-agents.
 
 where Y is the spec document from step 1. The Opus reviewer shares the
 author's priors and catches Claude-shaped gaps; the xhigh codex reviewer
@@ -171,7 +181,8 @@ launches one Agent(opus), background:
 
 > Read Y, and the two review reports at R1 and R2. Validate each finding,
 > consolidate the two reports, and fold every valid finding regardless of
-> severity into Y. Note the findings you rejected and why. Do not commit.
+> severity into Y. Note the findings you rejected and why. Do not commit. Do
+> not launch any sub-agents.
 
 The orchestrator does not do this itself: validating findings means reading
 code, and code readings must not accumulate in the orchestrator's context -
@@ -203,7 +214,7 @@ Launch one Agent(opus), background:
 > find - bugs, gaps, smells, and nits alike, not just the serious ones. Where
 > the implementation deviates from the spec deliberately and the deviation is
 > sound, keep it and note it. Report every finding with its severity and the
-> fix you applied. Do not commit.
+> fix you applied. Do not commit. Do not launch any sub-agents.
 
 Design notes on this prompt:
 
@@ -240,7 +251,7 @@ Launch one Agent(opus), background:
 > that still describes the pre-landing state. Do not touch the spec document
 > itself, and never cite it from any document - it is deleted at landing, so
 > point durable references at git history instead. Report each
-> document you changed and why. Do not commit.
+> document you changed and why. Do not commit. Do not launch any sub-agents.
 
 The reviewers and the implementer fix documents only when they happen to
 notice them; this step is the guarantee. A landed item whose TODO entry
@@ -266,6 +277,12 @@ These are rules, not guidance:
 
 - Launch every Agent call and every codex call in the background. No
   exceptions.
+- Flush before every Agent launch that follows an Agent's rest. The moment any
+  Agent comes to rest, fire scripts/prevent-harness-bug.sh as a background
+  task, wait for its exit, and only then launch the next Agent. This is the
+  load-bearing fix for the sub-agent nesting bug (see the section below); it
+  has no exemptions and applies between items as well as between steps. Codex
+  launches need no flush (separate OS process, cannot nest).
 - Never set a timeout on anything. Never kill a run for being slow.
 - Never block waiting on a launched task. Launch, then schedule the wakeup.
 - While anything is in flight, keep the heartbeat firing: call ScheduleWakeup
@@ -311,100 +328,47 @@ These are rules, not guidance:
 
 ## Claude harness bug: sub-agent nesting at a step hand-off
 
-A bug in recent Claude harness versions fires when the NEXT step launches
-before the prior step's agent has fully torn down: the new agent is
-mis-parented INSIDE the lingering prior agent, runs to completion there, and
-the prior agent then hands back a confusing SECOND return carrying the inner
-step's work. It was first seen at the step 5 to step 6 hand-off (where it
-fires on nearly every item), but it is NOT unique to that boundary - it has
-also fired reliably at the step 1 to step 2 hand-off (spec authoring to
-critique). Both cases are documented below; the recoveries differ. It may be
-fixed in a future harness version; until then, handle it exactly as written
-here. Do NOT try to prevent it or change the procedure to dodge it - its
-cause is unknown, and the only safe move is to recognize its signal and
-recover. The orchestration steps run exactly as specified above.
+Recent Claude harness versions leave a completed background Agent (the Agent
+tool) lingering ~20-30 seconds before it fully tears down. If the orchestrator
+launches the next Agent during that window, the new Agent is mis-parented
+INSIDE the lingering one: it runs to completion there, the lingering Agent's
+lifetime swallows the inner Agent's entire runtime, and the inner work bubbles
+back as a confusing SECOND return on the WRONG (outer) Agent's id - while the
+inner Agent's own clean return never arrives. Left unhandled it compounds:
+every later launch nests deeper inside the same outer Agent, which can never
+tear down because it reacquires a live child before its window closes, so one
+Agent becomes the immortal container for the entire item.
 
-### What you observe (the step 5 to step 6 case)
+Codex runs are separate OS processes and are immune - they neither linger nor
+nest. That is why the bug fired LESS with codex in the loop: an interleaved
+codex step is itself a gap that lets the prior Agent tear down. An all-Opus
+loop has an Agent at every hand-off, so without the flush it fires every time.
 
-1. You launch step 5 (review-and-fix). It returns; you read its report and
-   are satisfied.
-2. You launch step 6 (update documents).
-3. The step 5 agent appears to return a SECOND time, with a confusing message
-   - typically one that describes "a separate documentation agent", or the
-   doc / TODO edits step 6 was supposed to make, or that says its own task is
-   already complete and it does not know why it was re-invoked.
+The fix is PREVENTION, not recovery: never launch into the lingering window.
+The moment any Agent comes to rest, fire scripts/prevent-harness-bug.sh as a
+background task, wait for it to exit, and only then launch the next Agent. The
+script is a 60-second wall-clock sleep - well clear of the measured 20-30s
+window - and its exit reliably re-invokes the orchestrator. Teardown is
+wall-clock, so idling through the flush is enough; no activity is required of
+the orchestrator during it.
 
-### What actually happened
+The rule has NO exemptions. It applies between steps within an item AND between
+items: the last step of item N to step 1 of item N+1 is a hand-off like any
+other, and "the start of the next item" is not a fresh start. A flush before a
+codex launch is unnecessary (codex cannot nest) but harmless; the load-bearing
+requirement is a flush before every Agent launch that follows an Agent's rest.
 
-When you launched step 6, the step 6 agent was mis-parented INSIDE the step 5
-agent (which had not fully torn down) as a sub-sub-agent, for reasons outside
-your control. Step 6 still RAN and COMPLETED normally - it just ran as a
-sub-agent of step 5 rather than as a top-level agent of yours. Step 5's agent
-then received "your sub-agent completed" plus step 6's report, had no frame
-for it, and handed back to you a second time with that confusing message.
-That confusing second return IS step 6's completion arriving by a strange
-path. You will NOT get a clean, separately-labelled step 6 return.
+This was characterised empirically: 0s, 10s and 20s flushes all still nested;
+30s cleared it on repeated runs; 60s is the production value, chosen with
+margin. The window does not scale with agent size, so 60s holds for the
+heaviest Claude Agent in the loop (step 5's review-and-fix) as well as the
+lightest. (Step 4, implement, is codex and immune - it never enters this.)
 
-### The remedy (do exactly this)
-
-- A confusing second return from ANY step-5-family agent (the main step 5
-  review agent, or any follow-up fix agent you launched during step 5),
-  arriving AFTER you launched step 6, IS step 6's completion. Treat it as
-  such. It is not a cosmic oddity, not a duplicate to discard, and not step 5
-  asking for more work.
-- Do NOT keep waiting for a separate step 6 return - none is coming.
-  Continuing to wait is the actual failure mode this bug causes: the loop
-  deadlocks forever on a completion signal that already arrived and was
-  dismissed. Stop the wait the moment the confusing return appears.
-- Do NOT relaunch step 5, and do NOT relaunch step 6. Step 6 already ran;
-  relaunching either one thrashes (and re-triggers the nesting).
-- You do not need step 6's report and will likely never see it cleanly. That
-  is fine: the step 6 doc-update agent is reliable and has never produced a
-  wrong result - its report is disposable. The work that must be scrutinized
-  happened in steps 4 and 5, which you already have in hand.
-- Verify step 6's edits landed on disk before proceeding: run `git status`,
-  then read the changed docs. There are no worktrees, so the nested
-  sub-sub-agent wrote into the same tree as everything else - its edits are
-  really there. Once verified, proceed to step 7 (land).
-
-### The step 1 to step 2 manifestation (spec to critique)
-
-The same bug fires at the spec-to-critique hand-off, and the recovery is
-DIFFERENT because the inner work is not disposable. What you observe: step 1
-(write the spec) returns cleanly and you launch step 2 (the two critiques);
-then the step-1 author returns a SECOND time, describing that it reviewed the
-spec and FOLDED the critique's findings into it. What happened: the step-2
-Opus reviewer was mis-parented inside the not-yet-torn-down step-1 author,
-which both ran the critique AND edited the spec in place - an uncontrolled
-partial step 3 that folded only the Opus findings. The codex reviewer, being
-a separate OS process, is immune and returns its report cleanly.
-
-Why the step 5 to step 6 remedy does not transfer: there the inner agent's
-work is a disposable doc update. Here it MUTATED the contract document (the
-spec) without the orchestrator's controlled consolidation, and folded only
-one of the two reviews. So:
-
-- Treat the author's confusing second return as the step 2 Opus reviewer
-  completing. Do NOT relaunch the reviewer.
-- Reconstruct the Opus review report (R1) from the author's second-return
-  account, and save the codex review report (R2) - which arrived clean - to
-  its own file beside the spec, exactly as a normal step 2 would.
-- Run the controlled step 3 consolidation over the now-R1-pre-folded spec
-  plus R1 and R2, with the verbatim step-3 prompt. Because step 3 re-validates
-  every finding against the code, it folds R2 (never folded), re-scrutinizes
-  R1's already-folded edits, and notes rejections - landing the spec in a
-  state protocol-equivalent to a clean run. There is no pristine pre-fold
-  spec to revert to (it was edited in place and never committed), so
-  re-validation, not reversion, is the recovery.
-- Do NOT regenerate the spec from scratch: that discards genuinely good,
-  code-verified critique work and re-rolls the same nesting bug.
-
-### If the bug does not fire
-
-If step 6 returns normally (the bug may have been fixed), handle it the
-ordinary way: read its report, verify the doc edits, proceed to step 7. The
-remedy above applies ONLY to the confusing-second-return case; do not invent
-it when step 6 returns cleanly.
+If the confusing-second-return signature ever appears DESPITE the flush, treat
+it as a flush that was missed, not as a result to accept: quiesce to a clean
+state (no Agent left idling), then resume with the flush in place. Never fold a
+nested second return into the work, and never reconstruct a contract document
+(a spec) from one - that launders corruption into the loop.
 
 ## Telemetry
 

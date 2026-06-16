@@ -195,6 +195,85 @@ fn open_blob_inner_stream(
     })
 }
 
+/// Open a message's assembled RFC822 octets via `GET /messages/{id}/$value`.
+///
+/// Graph returns the verbatim assembled MIME for the message. Streams
+/// chunks as `SyncEvent::Batch`, terminating through the shared
+/// `into_account_error` boundary tagged `OpenRawRfc822`.
+pub(crate) fn open_raw_rfc822(
+    account: GraphAccount,
+    message: ObjectId,
+) -> AccountStream<SyncEvent<Bytes>> {
+    Box::pin(async_stream::stream! {
+        let op = AccountOperation::OpenRawRfc822;
+        let mut stream = match fetch_raw_stream(&account, &message).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                let ctx = GraphErrorContext::graph(op)
+                    .with_scope(ErrorScope::Message { id: message.0.clone() });
+                yield SyncEvent::Terminated(into_account_error(*error, ctx));
+                yield SyncEvent::Done(None);
+                return;
+            }
+        };
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => yield SyncEvent::Batch(Batch {
+                    items: vec![bytes],
+                    page_boundary: PageBoundary::Page,
+                    server_latency: std::time::Duration::default(),
+                    bytes_in: 0,
+                    checkpoint: None::<Checkpoint>,
+                }),
+                Err(error) => {
+                    let account_error = AccountErrorBuilder::new(
+                        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+                        Cause::Wire(WireCause::MalformedResponse {
+                            protocol: Protocol::Graph,
+                            detail: Some(DiagnosticText::support_only(format!(
+                                "Graph raw message stream error: {error}"
+                            ))),
+                        }),
+                    )
+                    .operation(op)
+                    .provider(Provider::Microsoft)
+                    .protocol(Protocol::Graph)
+                    .scope(ErrorScope::Message { id: message.0.clone() })
+                    .try_build()
+                    .expect("valid account error classification");
+                    yield SyncEvent::Terminated(account_error);
+                    break;
+                }
+            }
+        }
+        yield SyncEvent::Done(None);
+    })
+}
+
+async fn fetch_raw_stream(
+    account: &GraphAccount,
+    message: &ObjectId,
+) -> Result<bifrost_net::ByteStream, Box<crate::error::GraphError>> {
+    let prefix = account.client.api_path_prefix();
+    let enc_message_id = bifrost_net::url::encode_component(&message.0);
+    let url = format!(
+        "{}{prefix}/messages/{enc_message_id}/$value",
+        account.client.api_base()
+    );
+    let account_net = account.client.account_net().ok_or_else(|| {
+        Box::new(crate::error::GraphError::Net(bifrost_net::Error::Network {
+            message: "Graph client is not attached to an account".to_string(),
+            transmission_state: bifrost_types::TransmissionState::Unsent,
+            source: None,
+        }))
+    })?;
+    account_net
+        .download_stream(&url, None)
+        .await
+        .map_err(|error| Box::new(crate::error::GraphError::Net(error)))
+}
+
 async fn fetch_blob_stream(
     account: &GraphAccount,
     locator: &GraphBlobLocator,

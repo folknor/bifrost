@@ -342,6 +342,10 @@ impl Account for CalDavAccount {
         unsupported_stream(AccountOperation::OpenBlobRange)
     }
 
+    fn open_raw_rfc822(&self, _message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
+        unsupported_stream(AccountOperation::OpenRawRfc822)
+    }
+
     fn bulk_set_flags(
         &self,
         _targets: AccountStream<ObjectId>,
@@ -1306,6 +1310,23 @@ mod tests {
             recurrence: EventRecurrence::default(),
             html_link: None,
             raw_ical: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn caldav_open_raw_rfc822_unsupported() {
+        // CalDAV advertises no raw RFC822 read; the flag is false and the
+        // stream's first item terminates `Unsupported(OpenRawRfc822)`.
+        assert!(!caldav_capabilities().pim_methods.open_raw_rfc822);
+
+        let mut stream = unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
+        let first = stream.next().await.expect("first event");
+        match first {
+            SyncEvent::Terminated(err) => assert_eq!(
+                err.kind(),
+                &AccountErrorKind::Unsupported(AccountOperation::OpenRawRfc822)
+            ),
+            other => panic!("expected Terminated, got {other:?}"),
         }
     }
 

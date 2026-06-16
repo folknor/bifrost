@@ -277,6 +277,10 @@ impl Account for GoogleAccount {
         blobs::open_blob_range(Arc::clone(&self.client), handle, range)
     }
 
+    fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
+        blobs::open_raw_rfc822(Arc::clone(&self.client), message)
+    }
+
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,

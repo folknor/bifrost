@@ -288,6 +288,10 @@ impl Account for GraphAccount {
         blob::open_blob_range_stream(self.clone(), handle, range)
     }
 
+    fn open_raw_rfc822(&self, message: ObjectId) -> AccountStream<SyncEvent<Bytes>> {
+        blob::open_raw_rfc822(self.clone(), message)
+    }
+
     fn bulk_set_flags(
         &self,
         targets: AccountStream<ObjectId>,

@@ -422,7 +422,7 @@ crates/imap/src/
 |   |-- seq_ops.rs   - sequence-number command surface
 |   `-- uid_ops.rs   - UID command surface
 |-- account/         - bifrost_types::Account implementation
-|   |-- blob.rs            - open_blob, open_blob_range
+|   |-- blob.rs            - open_blob, open_blob_range, open_raw_rfc822 (BODY.PEEK[])
 |   |-- capabilities.rs    - AccountCapabilities builder
 |   |-- changes.rs         - QRESYNC / CONDSTORE / Basic diff dispatch
 |   |-- close.rs           - graceful shutdown

@@ -177,6 +177,15 @@ impl GmailErrorContext {
         ctx
     }
 
+    pub(crate) fn open_raw_rfc822(id: impl Into<String>) -> Self {
+        let id = id.into();
+        let mut ctx = Self::base(AccountOperation::OpenRawRfc822);
+        ctx.resource = Some(GmailResource::Message);
+        ctx.scope = Some(ErrorScope::Message { id: id.clone() });
+        ctx.diagnostic_id = Some(id);
+        ctx
+    }
+
     pub(crate) fn send() -> Self {
         let mut ctx = Self::base(AccountOperation::Send);
         ctx.idempotency_override = Some(false);
@@ -848,6 +857,7 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         | AccountOperation::HydrateMessage
         | AccountOperation::OpenBlob
         | AccountOperation::OpenBlobRange
+        | AccountOperation::OpenRawRfc822
         | AccountOperation::Search
         | AccountOperation::SearchMessages
         | AccountOperation::Discover

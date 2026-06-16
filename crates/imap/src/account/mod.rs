@@ -360,6 +360,14 @@ impl Account for ImapAccount {
         blob::open_blob_range(self.clone(), handle, range)
     }
 
+    // Account: streams the whole message via BODY.PEEK[]; verbatim RFC822 octets.
+    fn open_raw_rfc822(
+        &self,
+        message: bifrost_types::ObjectId,
+    ) -> AccountStream<SyncEvent<bytes::Bytes>> {
+        blob::open_raw_rfc822(self.clone(), message)
+    }
+
     // Account: maps shared FlagOp batches to UID STORE; direct users call uid_store().
     fn bulk_set_flags(
         &self,

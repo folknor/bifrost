@@ -194,29 +194,20 @@ fn reconstruct_headers(h: &std::collections::HashMap<String, String>) -> HeaderM
 fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> HydratedObject {
     let kind = match projection {
         Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(flags_from_value(value)),
-        Projection::Metadata => {
-            let scope = CursorScope::FolderType {
-                folder: FolderId(
-                    value
-                        .get("parentFolderId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                ),
-                ty: ObjectType::Email,
-            };
-            inventory_entry_from_value(&scope, value)
-                .map(HydratedObjectKind::Metadata)
-                .unwrap_or_else(|| HydratedObjectKind::FlagsOnly(flags_from_value(value)))
-        }
-        Projection::Headers
+        // Graph's JSON message resource is not assembled RFC822, so the
+        // body-bearing projections cannot honestly produce `RawMime`
+        // here (the prior code minted a JSON blob, violating the
+        // RawMime = RFC822-bytes contract). A3 has no per-item `$value`
+        // fetch in the hydration path (that N+1 is A1's call), so these
+        // projections degrade to `Metadata` (falling back to `FlagsOnly`
+        // when the inventory entry cannot be built). The assembled bytes
+        // come exclusively through the dedicated `open_raw_rfc822` read.
+        Projection::Metadata
+        | Projection::Headers
         | Projection::Preview(_)
         | Projection::TextOnly
         | Projection::Full
-        | Projection::FullWithBlobs => {
-            let bytes = serde_json::to_vec(value).unwrap_or_default();
-            HydratedObjectKind::RawMime(Bytes::from(bytes))
-        }
+        | Projection::FullWithBlobs => metadata_or_flags(value),
         _ => HydratedObjectKind::FlagsOnly(flags_from_value(value)),
     };
     let blobs = value
@@ -231,6 +222,26 @@ fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> H
         .unwrap_or_default();
 
     HydratedObject { id, kind, blobs }
+}
+
+/// Build a `Metadata` kind from the Graph message JSON, falling back to
+/// `FlagsOnly` when an inventory entry cannot be constructed. Shared by
+/// the `Metadata` projection and the body-bearing projections that A3
+/// degrades to metadata (the real body path is `open_raw_rfc822`).
+fn metadata_or_flags(value: &Value) -> HydratedObjectKind {
+    let scope = CursorScope::FolderType {
+        folder: FolderId(
+            value
+                .get("parentFolderId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        ty: ObjectType::Email,
+    };
+    inventory_entry_from_value(&scope, value)
+        .map(HydratedObjectKind::Metadata)
+        .unwrap_or_else(|| HydratedObjectKind::FlagsOnly(flags_from_value(value)))
 }
 
 fn flags_from_value(value: &Value) -> HashSet<String> {
@@ -275,5 +286,43 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
     match destination {
         MembershipScope::Folder(folder) => Some(folder),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A3: Graph hydration body projections no longer mint a JSON
+    /// `RawMime` (the prior contract violation). They degrade to
+    /// `Metadata` (or `FlagsOnly` on the fallback path), never
+    /// `RawMime`. Asserting the exact degraded variant records the
+    /// stopgap as a deliberate contract, not an accident. The assembled
+    /// bytes come exclusively through `open_raw_rfc822`.
+    #[test]
+    fn hydration_body_projection_degrades_to_metadata() {
+        let value = json!({
+            "id": "AAMkmessage",
+            "parentFolderId": "inbox",
+            "isRead": true,
+            "changeKey": "CK1"
+        });
+
+        for projection in [Projection::Headers, Projection::Full] {
+            let hydrated =
+                hydrated_from_value(ObjectId("AAMkmessage".to_string()), &value, projection);
+            match hydrated.kind {
+                HydratedObjectKind::Metadata(_) => {}
+                other => panic!("expected Metadata for {projection:?}, got {other:?}"),
+            }
+        }
+
+        // Fallback path: a value with no `id` cannot build an inventory
+        // entry, so it degrades to `FlagsOnly` - still never `RawMime`.
+        let no_id = json!({ "parentFolderId": "inbox", "isRead": false });
+        let hydrated =
+            hydrated_from_value(ObjectId("missing".to_string()), &no_id, Projection::Headers);
+        assert!(matches!(hydrated.kind, HydratedObjectKind::FlagsOnly(_)));
     }
 }

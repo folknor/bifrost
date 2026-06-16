@@ -188,6 +188,14 @@ pub struct PimMethodSupport {
     // Hydration primitives.
     pub thread_hydrate: bool,
     pub message_hydrate: bool,
+    /// Native server-assembled whole-message RFC822 read
+    /// (`open_raw_rfc822`). IMAP `BODY.PEEK[]`, Gmail `format=raw`,
+    /// JMAP whole-message `blobId` + `download`, Graph
+    /// `GET /messages/{id}/$value`. Gates the consumer's "show raw
+    /// source" / body store / attachment-dedup paths. `false` -> the
+    /// method terminates `Unsupported(OpenRawRfc822)` (the two DAV
+    /// crates).
+    pub open_raw_rfc822: bool,
     // Server-side filter primitives.
     pub filters_list: bool,
     pub filter_create: bool,

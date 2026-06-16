@@ -62,6 +62,7 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             quota_get: false,
             thread_hydrate: true,
             message_hydrate: true,
+            open_raw_rfc822: true,
             filters_list: true,
             filter_create: true,
             filter_update: true,
@@ -152,6 +153,7 @@ mod tests {
         assert!(caps.pim_methods.set_extended_property);
         assert!(caps.pim_methods.send_message);
         assert!(!caps.pim_methods.attachment_upload);
+        assert!(caps.pim_methods.open_raw_rfc822);
         assert!(caps.pim_methods.vacation_get);
         assert!(!caps.pim_methods.quota_get);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Rules);

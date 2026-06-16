@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use bifrost_types::{
     AccountError, AccountOperation, AccountStream, Batch, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, ByteRange, PageBoundary, SyncEvent,
+    BlobHandle, BlobId, ByteRange, ObjectId, PageBoundary, SyncEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -75,6 +75,44 @@ pub(crate) fn open_blob_range(
     // if a handle somehow advertises range support we slice locally.
     let _ = client;
     Box::pin(stream::empty())
+}
+
+/// Open a message's assembled RFC822 octets via Gmail `format=raw`.
+///
+/// Gmail returns the whole message base64url-encoded inside a JSON
+/// envelope; `raw_bytes` decodes it to verbatim MIME octets. Emits one
+/// `Final` batch then `Done`.
+pub(crate) fn open_raw_rfc822(
+    client: Arc<GmailClient>,
+    message: ObjectId,
+) -> AccountStream<SyncEvent<Bytes>> {
+    Box::pin(
+        stream::once(async move {
+            let started = Instant::now();
+            match download_raw(&client, &message.0).await {
+                Ok(bytes) => {
+                    let bytes_in = bytes.len() as u64;
+                    SyncEvent::Batch(Batch {
+                        items: vec![bytes],
+                        page_boundary: PageBoundary::Final,
+                        server_latency: started.elapsed(),
+                        bytes_in,
+                        checkpoint: None,
+                    })
+                }
+                Err(error) => terminate_blob(error::into_account_error(
+                    error,
+                    error::GmailErrorContext::open_raw_rfc822(message.0.clone()),
+                )),
+            }
+        })
+        .flat_map(finish_blob_event),
+    )
+}
+
+async fn download_raw(client: &GmailClient, message_id: &str) -> crate::Result<Bytes> {
+    let message = client.get_message(message_id, "raw").await?;
+    super::inventory::raw_bytes(&message)
 }
 
 fn finish_blob_event(event: SyncEvent<Bytes>) -> impl futures::Stream<Item = SyncEvent<Bytes>> {

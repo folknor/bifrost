@@ -123,6 +123,7 @@ pub enum AccountOperation {
     HydrateMessage,
     OpenBlob,
     OpenBlobRange,
+    OpenRawRfc822,
     PushSubscribe,
     PushUnsubscribe,
     PushStream,

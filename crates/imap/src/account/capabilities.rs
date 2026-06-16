@@ -86,6 +86,7 @@ pub(crate) fn build_capabilities(
             quota_get: profile.supports(Capability::Quota),
             thread_hydrate: has_thread_references,
             message_hydrate: true,
+            open_raw_rfc822: true,
             filters_list: has_sieve,
             filter_create: has_sieve,
             filter_update: has_sieve,
@@ -150,6 +151,7 @@ mod tests {
         assert!(!caps.pim_methods.contact_delete);
         assert!(!caps.pim_methods.contact_search);
         assert!(!caps.pim_methods.contact_autocomplete);
+        assert!(caps.pim_methods.open_raw_rfc822);
         assert!(caps.requires_uidvalidity_recheck);
     }
 

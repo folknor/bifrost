@@ -169,7 +169,7 @@ submission boundary.
 
 ---
 
-## A3 - Raw RFC822 hydration
+## A3 - Raw RFC822 hydration - LANDED
 
 Recalibrated for presence=needed: ratatoskr's `common/ops.rs:fetch_raw_message`
 is an IMAP-only impl behind an otherwise-`Unsupported` trait default, currently
@@ -199,15 +199,26 @@ hashes. Streaming serves the body-store/dedup consumers; a viewer can buffer.
 Capability flag `pim_methods.open_raw_rfc822`: true for all four mail providers,
 false only for CalDAV/CardDAV-only composed accounts (which gates the UI button).
 
-**Depends on:** A1 (reuses the projection/`HydratedObjectKind::RawMime` plumbing).
+**Depends on:** A1 (landed after).
 
-**Bugs to fix along the way:**
-- **Graph contract violation:** bifrost Graph currently puts *serialized JSON*
-  into `HydratedObjectKind::RawMime`, whose contract is raw RFC822 bytes. Switch
-  Graph's raw arm to `GET /messages/{id}/$value`.
-- **JMAP self-block:** bifrost JMAP *fatals* raw projections though the
-  `Email.blobId` blob and the download transport both already exist. It is the
-  cheapest provider to wire.
+**As landed.** The uniform `open_raw_rfc822` primitive ships on all four mail
+protocols (IMAP `BODY.PEEK[]`, Gmail `format=raw`, JMAP `Email/get blobId` +
+`client.download`, Graph `$value`); the two DAV crates return
+`Unsupported(OpenRawRfc822)` with the `open_raw_rfc822` flag `false`. `Bytes`
+throughout - no `from_utf8_lossy`. The de-risk held: no client-side MIME
+assembler was built.
+
+**Bugs fixed at landing:**
+- **Graph contract violation (fixed):** bifrost Graph no longer puts serialized
+  JSON into `HydratedObjectKind::RawMime`. `hydrated_from_value`'s body-bearing
+  projections (`Headers`/`Preview`/`TextOnly`/`Full`/`FullWithBlobs`) now degrade
+  to `Metadata` (falling back to `FlagsOnly`); the assembled bytes come solely
+  through `open_raw_rfc822` (`GET /messages/{id}/$value`). The degradation is a
+  recorded stopgap until A1 owns Graph's body-projection path.
+- **JMAP self-block (left in place by design):** the `hydrate.rs` raw-projection
+  fatal was NOT removed - it belongs to A1. A3 instead opened the dedicated raw
+  read (`Email/get blobId` + `client.download`), the cheapest provider to wire,
+  leaving the hydration fatal untouched.
 
 ---
 
@@ -541,7 +552,8 @@ ideal uniform surface.
 
 **Bugs worth fixing inside the relevant brick (not separate work):**
 - IMAP/SMTP stale-token-at-construction (A1).
-- Graph `RawMime` carrying JSON; JMAP fataling raw projections (A3).
+- Graph `RawMime` carrying JSON (A3, fixed - body projections degrade to
+  `Metadata`); JMAP raw fatal left to A1 (A3 added the dedicated raw read).
 - DAV empty-207 destroy-everything + failed-uri loss (A7).
 - CalDAV TZID-as-UTC offset bug, s34-S1 (A7).
 - gdrive 308-resume gap-skip corruption (A6).

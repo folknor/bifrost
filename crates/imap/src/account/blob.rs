@@ -1,14 +1,15 @@
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, BlobHandle, ByteRange, Cause, Checkpoint,
-    DiagnosticText, PageBoundary, Protocol, RequestCause, RequestErrorKind, SyncEvent,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, BlobHandle, ByteRange,
+    Cause, Checkpoint, DiagnosticText, ObjectId, PageBoundary, Protocol, RequestCause,
+    RequestErrorKind, SyncEvent,
 };
 use bytes::Bytes;
 
-use crate::types::FetchAttr;
+use crate::types::{FetchAttr, MailboxName};
 
 use super::{
-    ImapAccount, batch, boxed_receiver_stream, decode_blob_id, fatal_event, terminated_event,
-    uid_set_from_u32,
+    ImapAccount, batch, boxed_receiver_stream, decode_blob_id, decode_object_id, fatal_event,
+    terminated_event, uid_set_from_u32,
 };
 
 pub(crate) fn open_blob(
@@ -124,39 +125,118 @@ async fn run_blob(
         }
     }
 
-    let mut conn = account.checkout_for_folder(&decoded.folder).await?;
-    let cursor = account
-        .folders
-        .get(&decoded.folder)
-        .and_then(|entry| entry.cursor());
+    let attr = blob_attr(decoded.section.as_deref(), range, handle.size);
+    run_fetch(
+        &account,
+        &decoded.folder,
+        decoded.uidvalidity,
+        decoded.uid,
+        attr,
+        AccountOperation::OpenBlob,
+        tx,
+    )
+    .await
+}
+
+/// Open a message's assembled RFC822 octets (`BODY.PEEK[]`).
+///
+/// Mirrors `open_blob` but decodes an `ObjectId` (folder / uidvalidity /
+/// uid, no section) and fetches the whole message with no section or
+/// partial, tagging transport errors `OpenRawRfc822`.
+pub(crate) fn open_raw_rfc822(
+    account: ImapAccount,
+    message: ObjectId,
+) -> bifrost_types::AccountStream<SyncEvent<Bytes>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
+    let scope_id = message.0.clone();
+    tokio::spawn(async move {
+        match run_raw(account, message, &tx).await {
+            Ok(()) => {
+                let _ = tx.send(SyncEvent::Done(None::<Checkpoint>)).await;
+            }
+            Err(BlobError::ChannelDropped) => {}
+            Err(BlobError::Account(err)) => {
+                let _ = tx.send(terminated_event(err)).await;
+            }
+            Err(BlobError::Imap(err)) => {
+                let _ = tx
+                    .send(fatal_event(
+                        err,
+                        super::error::ImapErrorContext::operation(AccountOperation::OpenRawRfc822)
+                            .with_message_id(scope_id),
+                    ))
+                    .await;
+            }
+        }
+    });
+    boxed_receiver_stream(rx)
+}
+
+async fn run_raw(
+    account: ImapAccount,
+    message: ObjectId,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
+) -> Result<(), BlobError> {
+    let decoded = decode_object_id(&message)?;
+    let attr = FetchAttr::BodySection {
+        peek: true,
+        section: None,
+        partial: None,
+    };
+    run_fetch(
+        &account,
+        &decoded.folder,
+        decoded.uidvalidity,
+        decoded.uid,
+        attr,
+        AccountOperation::OpenRawRfc822,
+        tx,
+    )
+    .await
+}
+
+/// Shared selection / UIDVALIDITY recheck / `uid_fetch` core for the
+/// blob and raw-message reads. `op` tags the UIDVALIDITY-mismatch error
+/// so the caller's operation is preserved.
+#[allow(clippy::too_many_arguments)]
+async fn run_fetch(
+    account: &ImapAccount,
+    folder: &MailboxName,
+    expected_uidvalidity: u32,
+    uid: u32,
+    attr: FetchAttr,
+    op: AccountOperation,
+    tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
+) -> Result<(), BlobError> {
+    let mut conn = account.checkout_for_folder(folder).await?;
+    let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
     let selected = account
-        .select_folder(&mut conn, &decoded.folder, cursor.as_ref(), true)
+        .select_folder(&mut conn, folder, cursor.as_ref(), true)
         .await?;
     let uidvalidity = selected
         .mailbox
         .uid_validity
         .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
-    if uidvalidity != decoded.uidvalidity {
+    if uidvalidity != expected_uidvalidity {
         return Err(BlobError::Account(
             AccountErrorBuilder::new(
                 AccountErrorKind::Request(RequestErrorKind::Malformed),
                 Cause::Request(RequestCause::Malformed {
-                    detail: DiagnosticText::support_only("UIDVALIDITY changed before blob fetch"),
+                    detail: DiagnosticText::support_only("UIDVALIDITY changed before fetch"),
                 }),
             )
             .protocol(Protocol::Imap)
-            .operation(bifrost_types::AccountOperation::OpenBlob)
+            .operation(op)
             .scope(bifrost_types::ErrorScope::Mailbox {
-                id: decoded.folder.as_str().to_owned(),
+                id: folder.as_str().to_owned(),
             })
             .try_build()
             .expect("valid account error classification"),
         ));
     }
-    let Some(uid_set) = uid_set_from_u32(&[decoded.uid]) else {
+    let Some(uid_set) = uid_set_from_u32(&[uid]) else {
         return Ok(());
     };
-    let attr = blob_attr(decoded.section.as_deref(), range, handle.size);
     let fetches = conn
         .connection()
         .uid_fetch(

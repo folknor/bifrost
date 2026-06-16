@@ -57,6 +57,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             quota_get: false,
             thread_hydrate: true,
             message_hydrate: true,
+            open_raw_rfc822: true,
             filters_list: true,
             filter_create: true,
             filter_update: false,
@@ -146,6 +147,7 @@ mod tests {
         assert!(!caps.pim_methods.quota_get);
         assert!(caps.pim_methods.thread_hydrate);
         assert!(caps.pim_methods.message_hydrate);
+        assert!(caps.pim_methods.open_raw_rfc822);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Rules);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);

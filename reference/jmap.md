@@ -176,7 +176,7 @@ crates/jmap/src/sync/
   pim.rs           - unified PIM primitives: mail mutations, send,
                      drafts, search, containers, settings, hydration
   filters.rs       - SieveScript-backed server-side filter scripts
-  blob.rs          - open_blob / open_blob_range
+  blob.rs          - open_blob / open_blob_range / open_raw_rfc822 (Email/get blobId + download)
   error.rs         - to_recovery / to_account_error mapping
 ```
 
@@ -246,7 +246,7 @@ Supported scopes for `inventory_stream` and `changes_stream`:
 
 Every successful change-stream batch carries a `Checkpoint::Change(ChangeCursor)` whose state string is the post-call `newState`. The change loop continues until `hasMoreChanges` is false, then emits `SyncEvent::Done(Some(Checkpoint::Change(...)))`. Shared `Mutex<Option<String>>` state caches are advanced compare-and-swap style so a stale writer does not clobber a newer state.
 
-`get_stream` (hydration) supports `Projection::FlagsOnly` and `Projection::Metadata` for Email. Raw-MIME projections emit a fatal-unsupported event - MIME assembly is outside this wave. Batches are sized at `max_objects_in_get`. Per-item lane: every hydrated email is emitted as `ItemOutcome::Succeeded(BatchSuccess { item, output: HydratedObject })` so the return type matches the unified `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>` trait signature. Locally-invalid input ids or transport-drop ambiguity flow through `ItemOutcome::Failed` / `Uncertain` on the same channel rather than terminating the entire stream.
+`get_stream` (hydration) supports `Projection::FlagsOnly` and `Projection::Metadata` for Email. Raw-MIME projections emit a fatal-unsupported event - MIME assembly is outside this wave. (The dedicated whole-message raw read is `open_raw_rfc822` in `blob.rs`: one `Email/get` for `blobId` then `client.download`; it is independent of this hydration fatal.) Batches are sized at `max_objects_in_get`. Per-item lane: every hydrated email is emitted as `ItemOutcome::Succeeded(BatchSuccess { item, output: HydratedObject })` so the return type matches the unified `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>` trait signature. Locally-invalid input ids or transport-drop ambiguity flow through `ItemOutcome::Failed` / `Uncertain` on the same channel rather than terminating the entire stream.
 
 ### Push and reconnect
 

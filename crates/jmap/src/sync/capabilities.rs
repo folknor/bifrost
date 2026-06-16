@@ -143,6 +143,7 @@ pub(crate) fn build(
             quota_get: support.quota,
             thread_hydrate: true,
             message_hydrate: true,
+            open_raw_rfc822: true,
             filters_list: support.sieve,
             filter_create: support.sieve,
             filter_update: support.sieve,
@@ -249,6 +250,7 @@ mod tests {
         assert_eq!(caps.batching_policy.max_items, 500);
         assert!(caps.pim_methods.add_to_container);
         assert!(caps.pim_methods.send_message);
+        assert!(caps.pim_methods.open_raw_rfc822);
         assert!(!caps.pim_methods.set_label_membership);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
