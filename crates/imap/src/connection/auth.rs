@@ -387,7 +387,7 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.authenticate_scram(user, pass, super::dispatch::ScramMechanism::Sha1, timeout)
+        self.authenticate_scram(user, pass, bifrost_sasl::ScramHash::Sha1, timeout)
             .await
     }
 
@@ -398,7 +398,7 @@ impl ImapConnection {
         pass: &str,
         timeout: Duration,
     ) -> Result<(), Error> {
-        self.authenticate_scram(user, pass, super::dispatch::ScramMechanism::Sha256, timeout)
+        self.authenticate_scram(user, pass, bifrost_sasl::ScramHash::Sha256, timeout)
             .await
     }
 
@@ -406,12 +406,12 @@ impl ImapConnection {
         &self,
         user: &str,
         pass: &str,
-        mechanism: super::dispatch::ScramMechanism,
+        mechanism: bifrost_sasl::ScramHash,
         timeout: Duration,
     ) -> Result<(), Error> {
         use super::dispatch::AuthenticateScramConsumer;
 
-        self.require_auth_mechanism(mechanism.name())?;
+        self.require_auth_mechanism(mechanism.mechanism_name())?;
         let has_sasl_ir = {
             let snap = self.state_rx.borrow();
             snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap)
@@ -427,7 +427,7 @@ impl ImapConnection {
         );
         let initial_response = has_sasl_ir.then(|| consumer.initial_response());
         let cmd = Command::Authenticate {
-            mechanism: mechanism.name().to_owned(),
+            mechanism: mechanism.mechanism_name().to_owned(),
             initial_response,
         };
 

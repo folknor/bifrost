@@ -43,49 +43,6 @@ fn default_ctx() -> ConsumerContext<'static> {
     }
 }
 
-#[test]
-fn cram_md5_response_matches_rfc_2195_vector() {
-    let response = cram_md5_response(
-        "tim",
-        "tanstaaftanstaaf",
-        "PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2UucmVzdG9uLm1jaS5uZXQ+",
-    )
-    .unwrap();
-    assert_eq!(
-        response.as_str(),
-        "dGltIGI5MTNhNjAyYzdlZGE3YTQ5NWI0ZTZlNzMzNGQzODkw"
-    );
-}
-
-#[test]
-fn scram_sha1_client_final_matches_rfc_5802_vector() {
-    use base64::Engine;
-
-    let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
-    let client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
-    let server_first = "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
-    let (client_final, server_signature) = scram_client_final(
-        ScramMechanism::Sha1,
-        "pencil",
-        client_nonce,
-        client_first_bare,
-        server_first,
-    )
-    .unwrap();
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(client_final.as_str())
-        .unwrap();
-    let decoded = String::from_utf8(decoded).unwrap();
-    assert_eq!(
-        decoded,
-        "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,p=v0X8v3Bz2T0CJGbJQyF0X+HI4Ts="
-    );
-    assert_eq!(
-        base64::engine::general_purpose::STANDARD.encode(server_signature),
-        "rmF9pqV8S7suAoZWja4dJRkFsKQ="
-    );
-}
-
 #[tokio::test]
 async fn streaming_fetch_consumer_does_not_drop_slow_receiver_backlog() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

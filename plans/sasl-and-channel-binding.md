@@ -13,11 +13,12 @@ servers; SMTP must not stay weaker just because sending is the
 
 ## Current state
 
-- IMAP hand-rolls SCRAM-SHA-1 and SCRAM-SHA-256 in
-  `crates/imap/src/connection/dispatch/auth.rs:322`. State machine,
-  `scram_client_final`, `scram_proof_sha1` / `scram_proof_sha256`,
-  and server-final verification are all already there. No
-  channel-binding variant yet.
+- SCRAM-SHA-1 / SCRAM-SHA-256 and CRAM-MD5 computation now lives in
+  the private `bifrost-sasl` crate (`crates/sasl/`): `scram_client_final`,
+  `verify_server_final`, the per-hash proofs, and `cram_md5_response`.
+  IMAP's dispatch consumers in
+  `crates/imap/src/connection/dispatch/auth.rs` drive the `+`
+  continuation flow and invoke it. No channel-binding variant yet.
 - SMTP advertises only PLAIN, LOGIN, XOAUTH2, OAUTHBEARER in
   `crates/smtp/src/transport/smtp/authentication.rs:132`. No SCRAM
   family at all.
@@ -141,19 +142,17 @@ rejected, server protocol violation).
 
 ## Implementation order
 
-The `peer_certificate_der` transport accessor (formerly step 1) has
-landed in both crates; see git history for the stream-wrapper plumbing.
-The remaining steps:
+The `peer_certificate_der` transport accessor and the private
+`bifrost-sasl` crate (IMAP's SCRAM/CRAM computation extracted and
+rewired) have both landed; see git history for the stream-wrapper
+plumbing and the SASL extraction. The remaining steps:
 
-1. New private `bifrost-sasl` crate. Move IMAP's SCRAM state
-   machine and helpers into it; rewire IMAP to consume them. IMAP
-   stays green.
-2. Implement `tls-server-end-point` (with correct signature-hash
+1. Implement `tls-server-end-point` (with correct signature-hash
    selection) and SCRAM-PLUS variants in the SASL crate.
-3. Wire IMAP's mechanism selection to prefer PLUS when the server
+2. Wire IMAP's mechanism selection to prefer PLUS when the server
    advertises it; add downgrade-protection check.
-4. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
+3. Add the SCRAM family (non-PLUS and PLUS) to SMTP via the shared
    crate; wire the same mechanism selection and downgrade
    protection.
-5. Move OAuth payload construction into the shared crate; collapse
+4. Move OAuth payload construction into the shared crate; collapse
    the duplicated XOAUTH2 / OAUTHBEARER builders in IMAP and SMTP.

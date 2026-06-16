@@ -71,6 +71,13 @@ or import that wrapper directly. No `From<(String, String)>`.
 Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER,
 CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256.
 
+SCRAM and CRAM-MD5 computation (the `scram_client_final` /
+`verify_server_final` transitions, the per-hash proofs, and the CRAM-MD5
+response) lives in the private `bifrost-sasl` crate; the dispatch consumers
+(`AuthenticateScramConsumer`, `AuthenticateCramMd5Consumer`) drive the `+`
+continuation flow and invoke it, mapping `bifrost_sasl::SaslError` back into
+the IMAP error model at the call boundary.
+
 `AuthPolicy` TLS-gates cleartext mechanisms by default. PLAIN and LOGIN refuse over plaintext unless `allow_cleartext_without_tls` is set. CRAM-MD5 is opt-in (`with_cram_md5`) AND TLS-gated, because a MITM can pick the challenge and brute-force `HMAC-MD5(password, challenge)` offline. LOGIN-the-IMAP-command is opt-in (`with_login`).
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest match. SASL-IR is used when advertised or implied by IMAP4rev2. Malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.

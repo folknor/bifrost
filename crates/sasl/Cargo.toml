@@ -1,0 +1,25 @@
+[package]
+name = "bifrost-sasl"
+description = "Private shared SASL/SCRAM layer for the bifrost IMAP and SMTP clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+zeroize = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+hmac = "0.13.0"
+md-5 = "0.11.0"
+pbkdf2 = "0.13.0"
+sha1 = "0.11.0"

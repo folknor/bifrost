@@ -36,6 +36,7 @@ Crates present:
 - `crates/carddav/` → `bifrost-carddav` - CardDAV account crate for contacts.
 - `crates/caldav/` → `bifrost-caldav` - CalDAV account crate for calendars.
 - `crates/smtp/` → `bifrost-smtp` - SMTP and LMTP client. Lettre-derived. Native-tls only.
+- `crates/sasl/` → `bifrost-sasl` - private shared SASL/SCRAM computation layer (SCRAM, CRAM-MD5). Consumed by `bifrost-imap`; not public.
 
 All crates are pre-1.0, API stabilization phase.
 
@@ -120,4 +121,5 @@ Per-crate architecture and conventions. Single source of truth for current code 
 - `reference/caldav.md` - bifrost-caldav standalone calendar Account implementation.
 - `reference/smtp.md` - bifrost-smtp transport types, PIPELINING, DSN, message builder, LMTP.
 - `reference/net.md` - bifrost-net shared HTTP transport: retry, rate-limiting, observability.
+- `reference/sasl.md` - bifrost-sasl private SASL/SCRAM computation crate: `Secret`, `SaslError`, `ScramHash`, the pure SCRAM/CRAM functions, and the error-mapping contract with the protocol crates.
 - `reference/sync.md` - bifrost-sync engine: scheduler, multiplexer, partitioned backfill, push reconciler, mutation pipeline, checkpoint envelope versioning, scope lifecycle.

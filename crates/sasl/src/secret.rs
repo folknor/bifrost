@@ -12,52 +12,44 @@ use zeroize::Zeroizing;
 /// any other credential material and avoid formatting or logging them.
 #[repr(transparent)]
 #[derive(Clone, Default, Eq)]
-pub(crate) struct SecretString(Zeroizing<String>);
+pub struct Secret(Zeroizing<String>);
 
-impl SecretString {
+impl Secret {
     /// Borrow the unredacted secret as a string slice.
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
     /// Borrow the unredacted secret as bytes.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 
     /// Consume the wrapper and return the zeroizing string.
-    pub(crate) fn into_zeroizing(self) -> Zeroizing<String> {
+    pub fn into_zeroizing(self) -> Zeroizing<String> {
         self.0
     }
 }
 
-impl From<String> for SecretString {
+impl From<String> for Secret {
     fn from(value: String) -> Self {
         Self(Zeroizing::new(value))
     }
 }
 
-impl From<&str> for SecretString {
+impl From<&str> for Secret {
     fn from(value: &str) -> Self {
         Self(Zeroizing::new(value.to_owned()))
     }
 }
 
-impl From<Zeroizing<String>> for SecretString {
+impl From<Zeroizing<String>> for Secret {
     fn from(value: Zeroizing<String>) -> Self {
         Self(value)
     }
 }
 
-impl From<bifrost_sasl::Secret> for SecretString {
-    fn from(value: bifrost_sasl::Secret) -> Self {
-        // Move the inner zeroizing allocation; no plaintext copy is left
-        // un-zeroized.
-        Self::from(value.into_zeroizing())
-    }
-}
-
-impl Deref for SecretString {
+impl Deref for Secret {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -65,13 +57,13 @@ impl Deref for SecretString {
     }
 }
 
-impl AsRef<str> for SecretString {
+impl AsRef<str> for Secret {
     fn as_ref(&self) -> &str {
         self.as_str()
     }
 }
 
-impl PartialEq for SecretString {
+impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
         let a = self.as_bytes();
         let b = other.as_bytes();
@@ -86,7 +78,7 @@ impl PartialEq for SecretString {
     }
 }
 
-impl fmt::Debug for SecretString {
+impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted>")
     }

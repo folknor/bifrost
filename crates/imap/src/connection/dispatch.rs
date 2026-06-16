@@ -29,7 +29,7 @@ mod thread_sort;
 
 pub(crate) use auth::{
     AuthenticateCramMd5Consumer, AuthenticatePlainConsumer, AuthenticateScramConsumer,
-    AuthenticateXoauth2Consumer, LoginConsumer, ScramMechanism,
+    AuthenticateXoauth2Consumer, LoginConsumer,
 };
 #[cfg(test)]
 pub(crate) use fetch::StreamingFetchConsumer;
@@ -54,8 +54,6 @@ pub(crate) use thread_sort::{SortConsumer, ThreadConsumer};
 
 #[cfg(test)]
 use crate::types::FetchResponse;
-#[cfg(test)]
-use auth::{cram_md5_response, scram_client_final};
 
 /// Typed consumer trait for a single command's response stream.
 ///
