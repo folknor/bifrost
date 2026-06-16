@@ -446,9 +446,19 @@ Adding a future `RecoveryClass` variant fails to compile in
 case, but the closed `RecoveryPlan` enum enforces the dispatch
 surface). `Engine(EngineDirective::*)` directives drive
 `restart-scope` / `restart-account` / `downgrade-strategy` /
-`downgrade-capability` / `schema-clear` / `operator-override`
-flows; `Terminal(Fatal)` carries the typed terminal account error
-into operator-notification queues and persistent-failure dashboards.
+`downgrade-capability` / `schema-clear` / `operator-override` /
+`disable-scope` flows. `DisableScope` quarantines a single cursor scope
+(an admin revoked one shared/other-user IMAP folder mid-sync): the engine
+deletes the scope's in-memory and durable cursor, drops it from the
+membership index, and broadcasts a scoped
+`Warning::OperatorAttentionNeeded`; the poll loop self-drains on the next
+iteration, siblings keep syncing, and the account is neither paused nor
+treated as auth-lost. `Terminal(Fatal)` is the type-system collapse point
+that enforces "the engine has nothing left to try"; both the terminal arms
+(multiplexer and engine) emit a structured `TelemetryView` `warn!` rather
+than writing to any built-in queue or dashboard. Any operator-notification
+queue is the consumer's to build off the broadcast
+`SyncEvent::Terminated`.
 
 Reopens use exponential backoff with ±20% jitter (1s initial, 5min
 cap) and a three-attempt budget. After three failures the engine

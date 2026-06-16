@@ -245,6 +245,57 @@ pub(crate) fn strategy_failure(folder: &MailboxName, downgrade: StrategyDowngrad
     .expect("valid account error classification")
 }
 
+/// Build a `SyncState(ScopeRevoked)` error scoped to one shared folder.
+/// Derives to `Engine(DisableScope(Folder(id)))` - the engine quarantines
+/// just that scope without escalating to account-wide auth loss. The
+/// owning mailbox rides as support-only diagnostic text for telemetry.
+pub(crate) fn scope_revoked(
+    folder: &MailboxName,
+    owner: &bifrost_types::MailboxId,
+    operation: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+        Cause::State(StateCause::ScopeRevoked),
+    )
+    .protocol(Protocol::Imap)
+    .operation(operation)
+    .scope(ErrorScope::Cursor(super::folder_scope(folder)))
+    .text(DiagnosticText::support_only(format!(
+        "shared folder access revoked for {} (owner {})",
+        folder.as_str(),
+        owner.0,
+    )))
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Map a per-folder failure for a shared/other-user folder. When the
+/// failure is a permission/access denial (the class that would otherwise
+/// derive terminal `NoPermission`) and the folder is shared
+/// (`shared_owner.is_some()`), produce a scoped `ScopeRevoked` that
+/// quarantines just this folder instead of escalating account-wide. A
+/// personal folder (`shared_owner == None`), or any non-permission
+/// failure, flows through the normal `into_account_error` mapping - a
+/// personal-folder permission loss is a genuine account-level signal.
+pub(crate) fn shared_folder_error(
+    error: Error,
+    folder: &MailboxName,
+    shared_owner: Option<&bifrost_types::MailboxId>,
+    ctx: ImapErrorContext,
+) -> AccountError {
+    if let Some(owner) = shared_owner {
+        let translation = classify(&error, &ctx);
+        if matches!(
+            translation.kind,
+            AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
+        ) {
+            return scope_revoked(folder, owner, ctx.operation);
+        }
+    }
+    into_account_error(error, ctx)
+}
+
 // ---------------------------------------------------------------------
 // Internal classification machinery.
 // ---------------------------------------------------------------------

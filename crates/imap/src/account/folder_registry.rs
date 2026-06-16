@@ -99,6 +99,11 @@ pub(crate) struct FolderEntry {
     pub(crate) selectable: bool,
     pub(crate) delimiter: Option<char>,
     pub(crate) attributes: Vec<MailboxAttribute>,
+    /// `Some(owner)` for a shared/other-user folder discovered under a
+    /// non-personal namespace; `None` for the account's own personal
+    /// folders. Drives `MembershipScope::Mailbox` tagging and
+    /// `ErrorScope::Mailbox` scoping on revocation.
+    pub(crate) shared_owner: Option<bifrost_types::MailboxId>,
     cursor: RwLock<Option<FolderCursor>>,
     modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
@@ -112,6 +117,13 @@ struct ModSeqCache {
 
 impl FolderEntry {
     pub(crate) fn from_mailbox(info: MailboxInfo) -> Self {
+        Self::from_mailbox_with_owner(info, None)
+    }
+
+    pub(crate) fn from_mailbox_with_owner(
+        info: MailboxInfo,
+        shared_owner: Option<bifrost_types::MailboxId>,
+    ) -> Self {
         let selectable = !info.attributes.iter().any(|attr| {
             matches!(
                 attr,
@@ -123,6 +135,7 @@ impl FolderEntry {
             selectable,
             delimiter: info.delimiter,
             attributes: info.attributes,
+            shared_owner,
             cursor: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
@@ -220,6 +233,31 @@ impl FolderRegistry {
         let registry = Self::default();
         registry.replace_all(folders);
         registry
+    }
+
+    /// Build the registry from the personal-root LIST plus the
+    /// shared/other-user folders discovered under non-personal namespaces.
+    /// Personal entries carry `shared_owner: None`; each shared entry
+    /// carries `Some(owner)` so membership tagging and scoped revocation
+    /// can route on the owning mailbox.
+    pub(crate) fn from_lists(
+        personal: Vec<MailboxInfo>,
+        shared: Vec<(MailboxInfo, bifrost_types::MailboxId)>,
+    ) -> Self {
+        let registry = Self::default();
+        registry.replace_all(personal);
+        registry.ingest_shared(shared);
+        registry
+    }
+
+    /// Install shared/other-user folders, each tagged with its owning
+    /// mailbox. Additive: existing personal entries are left in place.
+    pub(crate) fn ingest_shared(&self, shared: Vec<(MailboxInfo, bifrost_types::MailboxId)>) {
+        let mut map = self.by_name.write().expect("folder registry lock poisoned");
+        for (info, owner) in shared {
+            let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, Some(owner)));
+            map.insert(entry.name.as_str().to_owned(), entry);
+        }
     }
 
     pub(crate) fn replace_all(&self, folders: Vec<MailboxInfo>) {

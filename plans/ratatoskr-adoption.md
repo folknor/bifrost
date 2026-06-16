@@ -163,18 +163,42 @@ at spec time.
 - Depends on: A2 (send surface settled).
 - TODO: none.
 
-### A5 - Shared mailboxes plus public folders
+### A5 - Shared mailboxes plus public folders - OPEN (A5c LANDED, A5a/A5b remain)
 
 - Intent: first-class bifrost scopes - Graph (EWS / Autodiscover) and IMAP
   (NAMESPACE / ACL) - surfaced through `discover_cursor_scopes` /
   `discover_memberships` and fully sync-integrated, not CRUD-only.
-- Current: near-greenfield - no `SharedMailbox` / `PublicFolder` scope or
-  capability. `CursorScope` / `MembershipScope` exist to extend. This is the
-  largest Track A unknown.
-- Spec delivers: TBD - size after a dedicated current-state survey. Likely
-  splits (Graph EWS path; IMAP NAMESPACE/ACL path), each sync-integrated.
-- Depends on: nothing structurally; survey first.
+- A5 split into three sub-bricks; **A5c is the first and is LANDED**, A5a and
+  A5b remain OPEN (so A5 overall is OPEN):
+  - **A5c (IMAP NAMESPACE/ACL shared folders) - LANDED.** See below.
+  - **A5a (Graph delegate mailboxes + JMAP shared accounts) - OPEN.** Foreign
+    `accountId` / `for_shared_mailbox`, different routing (`api_path_prefix`).
+  - **A5b (Graph EWS public folders + Autodiscover) - OPEN.** The size-L
+    unknown: no-delta-token poll strategy, FindFolder/FindItem.
+- Settled model (decided during A5c; A5a/A5b inherit it): a shared mailbox is
+  **cursor-resident**, surfaced as an ordinary `CursorScope::Folder` - NO new
+  `CursorScope` variant (a new variant would be silently mis-serviced by the
+  scope routers). The **owner tag is the existing `MailboxId`**, emitted as a
+  `MembershipScope::Mailbox(owner)` on each shared item's
+  `InventoryEntry.memberships` / `ScopeChange` (no new consumer surface). The
+  ratatoskr consumer maps that tag to `shared_mailbox_id` and treats an unknown
+  tag as a hard error. Revocation **quarantines, not escalates**: a per-scope
+  permission denial routes through `EngineDirective::DisableScope` (deletes that
+  scope's cursor, broadcasts a scoped warning) while siblings keep syncing - it
+  is NOT account-wide auth loss.
+- A5c delivered (see `reference/imap.md` "Shared / other-user folders (A5c)",
+  `reference/sync.md` `DisableScope`, `reference/error-model.md` `ScopeRevoked`):
+  NAMESPACE-driven shared/other-user folder discovery with per-principal owner
+  derivation, advisory ACL/MYRIGHTS read-gating at discovery, owner-tagged
+  membership emission, and the `SyncState(ScopeRevoked)` ->
+  `EngineDirective::DisableScope` quarantine recovery path. Implementation lives
+  in git history (the A5c landing commit), not in a plan doc - the spec was
+  retired at landing.
+- Depends on: nothing structurally; A5c landed first as the cheapest, highest-
+  ratio leg. A5a/A5b survey-first.
 - TODO: `s34-S4` adjacent (IMAP capability flags key on `sub.is_some()`).
+  `sync-N1` partially addressed by A5c's explicit `DisableScope` routing (see
+  TODO.md).
 
 ### A6 - Cloud-storage attachments - LANDED
 

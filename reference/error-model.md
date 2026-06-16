@@ -90,7 +90,7 @@ top-level taxonomy with per-family subkind enums:
   `QuotaExhausted` / `Error { status: Option<u16> }`.
 - `SyncState(SyncStateErrorKind)` - cursor invalid, strategy failure,
   scope-capability lost, schema incompatible, capability changed,
-  operator-override needed.
+  operator-override needed, scope revoked.
 - `ConcurrencyConflict` (flat).
 - `Request(RequestErrorKind)` - `Malformed` / `BatchInputInvalid`.
 - `NotFound(ResourceKind)` - message, mailbox, thread, calendar,
@@ -129,7 +129,9 @@ it (proven by `recovery_helpers_are_mutually_exclusive_and_exhaustive`):
 `EngineDirective`: `RestartScope(CursorScope)`, `RestartAccount`,
 `DowngradeStrategy(StrategyDowngrade)`,
 `DowngradeCapabilityForScope(CursorScope)`, `SchemaIncompatible`,
-`OperatorOverrideRequired { reason }`. There is no longer a
+`OperatorOverrideRequired { reason }`, `DisableScope(CursorScope)`
+(quarantine one cursor scope without escalating account-wide: a revoked
+shared/other-user IMAP folder). There is no longer a
 `CapabilityChanged` directive - capability shifts route to
 `RestartAccount` so the engine re-runs discovery (the
 `StateCause::CapabilityChanged` delta is forensic-only).
@@ -157,10 +159,13 @@ is the producer hint; the engine lifts the sharable scopes into a
 
 `Fatal(AccountError)` is the terminal-only newtype. `TryFrom` accepts
 iff `recovery().is_terminal()`, returning the error back on the `Err`
-arm otherwise; engine operator-notification / permanent-failure sinks
-consume `Fatal` so the type system enforces "the engine has nothing
-left to try." This is the collapse point: every terminal `RecoveryClass`
-variant funnels into one carrier.
+arm otherwise. `Fatal` is the type-system collapse point that enforces
+"the engine has nothing left to try": every terminal `RecoveryClass`
+variant funnels into one carrier. The engine does not ship a built-in
+operator-notification queue or permanent-failure dashboard - both
+terminal arms emit a structured `TelemetryView` `warn!`; any operator
+queue is the consumer's to build off the broadcast
+`SyncEvent::Terminated`.
 
 `RemediationAction` (operator-facing suggestion, derived by `suggest`):
 `RefreshToken`, `Reauthorize`, `RequestAdminConsent { needed }`,
@@ -204,7 +209,8 @@ operation is treated idempotent). The rules at altitude (read
   `DowngradeCapabilityForScope` (or `RestartAccount` if no scope);
   `SchemaIncompatible` -> `SchemaIncompatible`; `CapabilityChanged` ->
   `RestartAccount`; `OperatorOverrideNeeded` ->
-  `OperatorOverrideRequired { reason }`.
+  `OperatorOverrideRequired { reason }`; `ScopeRevoked` ->
+  `DisableScope` (or `RestartAccount` if no scope).
 - **ConcurrencyConflict** -> `Retry(AfterStateRefresh,
   ConcurrencyConflict)`.
 - **Request** (both subkinds) -> `ClientBug`.

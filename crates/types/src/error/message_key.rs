@@ -61,6 +61,7 @@ pub(crate) fn derive(kind: &AccountErrorKind) -> &'static str {
         AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded) => {
             "syncstate.operator-override-needed"
         }
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked) => "syncstate.scope-revoked",
         AccountErrorKind::ConcurrencyConflict => "concurrency.conflict",
         AccountErrorKind::Request(RequestErrorKind::Malformed) => "request.malformed",
         AccountErrorKind::Request(RequestErrorKind::BatchInputInvalid) => {
@@ -200,6 +201,10 @@ mod tests {
             (
                 AccountErrorKind::SyncState(SyncStateErrorKind::OperatorOverrideNeeded),
                 "syncstate.operator-override-needed",
+            ),
+            (
+                AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+                "syncstate.scope-revoked",
             ),
             (
                 AccountErrorKind::ConcurrencyConflict,

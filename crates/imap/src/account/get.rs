@@ -104,7 +104,11 @@ async fn run_folder_get(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
 ) -> Result<(), GetError> {
     let mut conn = account.checkout_for_folder(folder).await?;
-    let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
+    let folder_entry = account.folders.get(folder);
+    let cursor = folder_entry.as_ref().and_then(|entry| entry.cursor());
+    let shared_owner = folder_entry
+        .as_ref()
+        .and_then(|entry| entry.shared_owner.clone());
     let selected = account
         .select_folder(&mut conn, folder, cursor.as_ref(), true)
         .await?;
@@ -136,7 +140,13 @@ async fn run_folder_get(
                 .folders
                 .record_modseq(folder, uidvalidity, uid, modseq)?;
         }
-        if let Some(object) = fetch_to_hydrated(folder, uidvalidity, fetch, projection) {
+        if let Some(object) = fetch_to_hydrated(
+            folder,
+            uidvalidity,
+            fetch,
+            projection,
+            shared_owner.as_ref(),
+        ) {
             let item = BatchItemId(object.id.0.clone());
             out.push(ItemOutcome::Succeeded(BatchSuccess::new(item, object)));
             if out.len() >= BATCH_ITEMS {
@@ -211,6 +221,7 @@ fn fetch_to_hydrated(
     uidvalidity: u32,
     fetch: FetchResponse,
     projection: Projection,
+    shared_owner: Option<&bifrost_types::MailboxId>,
 ) -> Option<HydratedObject> {
     let uid = fetch.uid?;
     let id = super::encode_object_id(folder, uidvalidity, uid);
@@ -218,9 +229,12 @@ fn fetch_to_hydrated(
         Projection::FlagsOnly => {
             HydratedObjectKind::FlagsOnly(flags_set(fetch.flags.as_deref().unwrap_or(&[])))
         }
-        Projection::Metadata => {
-            HydratedObjectKind::Metadata(fetch_to_inventory(folder, uidvalidity, fetch))
-        }
+        Projection::Metadata => HydratedObjectKind::Metadata(fetch_to_inventory(
+            folder,
+            uidvalidity,
+            fetch,
+            shared_owner,
+        )),
         _ => {
             let bytes = fetch
                 .body_sections

@@ -64,6 +64,11 @@ pub(crate) fn inventory_stream(
                     ))
                     .await;
             }
+            Err(InventoryError::Account(err)) => {
+                let _ = tx
+                    .send(super::terminated_event::<InventoryEntry, _>(err))
+                    .await;
+            }
         }
     });
     boxed_receiver_stream(rx)
@@ -78,6 +83,10 @@ struct ChannelDropped;
 
 enum InventoryError {
     Imap(crate::Error),
+    /// A pre-classified `AccountError` (the shared-folder revocation path
+    /// builds `ScopeRevoked` rather than letting the raw permission denial
+    /// derive terminal `NoPermission`).
+    Account(bifrost_types::AccountError),
     ChannelDropped,
 }
 
@@ -113,10 +122,30 @@ async fn run_inventory(
     }
     let folder = folder_from_scope(&scope, bifrost_types::AccountOperation::SyncInventory)
         .map_err(|e| crate::Error::Protocol(e.to_string()))?;
+    let shared_owner = account
+        .folders
+        .get(&folder)
+        .and_then(|entry| entry.shared_owner.clone());
     let mut conn = account.checkout_for_folder(&folder).await?;
-    let selected = account
-        .select_folder(&mut conn, &folder, None, true)
-        .await?;
+    let selected = match account.select_folder(&mut conn, &folder, None, true).await {
+        Ok(selected) => selected,
+        // A permission denial on a shared folder quarantines just that
+        // scope (`ScopeRevoked` -> `DisableScope`) instead of escalating
+        // account-wide. A personal folder, or any non-permission failure,
+        // flows through the normal mapping.
+        Err(err) if shared_owner.is_some() => {
+            return Err(InventoryError::Account(super::error::shared_folder_error(
+                err,
+                &folder,
+                shared_owner.as_ref(),
+                super::error::ImapErrorContext::operation(
+                    bifrost_types::AccountOperation::SyncInventory,
+                )
+                .with_folder_scope(&folder),
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let uidvalidity = selected
         .mailbox
         .uid_validity
@@ -150,7 +179,7 @@ async fn run_inventory(
                                     .record_modseq(&folder, uidvalidity, uid, modseq)?;
                             }
                             known.push(uid);
-                            batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch));
+                            batch_items.push(fetch_to_inventory(&folder, uidvalidity, fetch, shared_owner.as_ref()));
                             if batch_items.len() >= BATCH_ITEMS {
                                 let out = std::mem::take(&mut batch_items);
                                 tx.send(batch(out, PageBoundary::Page, None)).await.map_err(|_| ChannelDropped)?;
@@ -208,12 +237,20 @@ pub(crate) fn fetch_to_inventory(
     folder: &MailboxName,
     uidvalidity: u32,
     fetch: FetchResponse,
+    shared_owner: Option<&bifrost_types::MailboxId>,
 ) -> InventoryEntry {
     let flags_hash = flags_hash(fetch.flags.as_deref().unwrap_or(&[]));
     let envelope = fetch.envelope;
+    // A shared/other-user folder's inventory item carries both its
+    // `Folder` membership and its owning `Mailbox(owner)` membership so
+    // the consumer can map the item to a shared mailbox identity (A5c).
+    let mut memberships = vec![membership_scope(folder)];
+    if let Some(owner) = shared_owner {
+        memberships.push(bifrost_types::MembershipScope::Mailbox(owner.clone()));
+    }
     InventoryEntry {
         id: encode_object_id(folder, uidvalidity, fetch.uid.unwrap_or_default()),
-        memberships: vec![membership_scope(folder)],
+        memberships,
         size: fetch.rfc822_size,
         blob_id: None,
         fingerprint: Fingerprint {

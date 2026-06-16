@@ -282,33 +282,54 @@ above.
 
 ---
 
-## A5 - Shared mailboxes + public folders (largest brick)
+## A5 - Shared mailboxes + public folders (largest brick) - OPEN (A5c LANDED)
 
 Substantial ratatoskr code (~110 KB / 6 files) but most is CRUD + ad-hoc
 poll-loop-into-SQLite - the shape the plan warns against. The hard, novel work is
 reshaping that onto `CursorScope`/`changes_stream`, which has no ratatoskr
-analog. Splits **three** ways, not two.
+analog. Splits **three** ways, not two. **A5c is the first leg and is LANDED;
+A5a and A5b remain OPEN, so A5 overall is OPEN.**
 
-**Gating fork (resolve before any porting).** ratatoskr models a shared mailbox
-as a *cloned client* (`for_shared_mailbox`), not a scope. bifrost must choose:
-(a) new `CursorScope` variants carrying foreign-mailbox / public-folder routing,
-threaded through the cursor envelope + `ErrorScope` + `scope_covers_membership`;
-or (b) a separate `Account` instance per shared mailbox with the engine attaching
-N accounts. Deep blast radius either way; this gates all three sub-bricks.
+**Gating fork - RESOLVED by A5c (option (a)-lite, no new variant).** ratatoskr
+models a shared mailbox as a *cloned client* (`for_shared_mailbox`), not a scope.
+The fork was (a) new `CursorScope` variants vs (b) a separate `Account` instance
+per shared mailbox. **Settled model (decided during A5c; A5a/A5b inherit it):**
+neither extreme. A shared mailbox is **cursor-resident** and surfaces as an
+**ordinary `CursorScope::Folder`** - NO new `CursorScope` variant (a new variant
+would be silently mis-serviced by `route_typed_scope` / IMAP's `route_scope`,
+the s34-G1 class). The protocol routing detail rides the opaque cursor payload,
+never inspected by the engine. The **owner tag is the existing `MailboxId`**,
+emitted as a `MembershipScope::Mailbox(owner)` on each shared item's memberships
+(no new consumer surface); the consumer maps it to `shared_mailbox_id` and
+treats an unknown tag as a hard error. Per-scope recovery isolation is
+**`EngineDirective::DisableScope` quarantine** (delete that scope's cursor +
+broadcast a scoped warning; siblings keep syncing; NOT account-wide auth loss).
+A5a (Graph/JMAP) carries the foreign-mailbox routing in the same cursor-resident
+shape; A5b (EWS public folders) likewise.
 
-### A5c - IMAP NAMESPACE/ACL shared folders (size M, best first landing)
+### A5c - IMAP NAMESPACE/ACL shared folders (size M) - LANDED
 
 Highest value-to-effort: shared IMAP folders are ordinary folders behind a
 NAMESPACE prefix, so once scoped they reuse the entire CONDSTORE/QRESYNC
-`changes_stream` with **no new sync code**.
+`changes_stream` with **no new sync code**. Landed; the spec was retired at
+landing, so the durable record is git history (the A5c landing commit) and the
+reference docs: `reference/imap.md` "Shared / other-user folders (A5c)",
+`reference/sync.md` `DisableScope`, `reference/error-model.md` `ScopeRevoked`.
+
+**Codec table correction (was stale).** The port-map originally listed
+`parse_rights` / `discover_namespaces` / `discover_myrights` as COPY/ADAPT codec
+work. The IMAP codec was **already done** before A5c began (`Command::Namespace`
+/ `MyRights` / `GetAcl` with full encode/decode and typed responses); A5c was
+account-layer glue, not codec porting. What actually landed:
 
 | ratatoskr | bifrost dest | class |
 |---|---|---|
-| `imap/public_folders.rs:parse_rights` (RFC 4314) + tests | imap codec/account | COPY-DIRECT |
-| `discover_namespaces` (raw NAMESPACE byte-scan) | bifrost nom-8 codec NAMESPACE production | COPY-AND-ADAPT |
-| `discover_myrights` (MYRIGHTS) | typed command/response | COPY-AND-ADAPT |
-| `list_shared_folders` | extend `account/scopes.rs` discovery | RESHAPE |
-| `sync_imap_public_folder` (SEARCH SINCE loop) | existing `changes_stream` Basic strategy | RESHAPE (mostly free) |
+| RFC 4314 rights parse | `imap/src/types/acl.rs` `MailboxRights` (new, `pub(crate)`) | DONE |
+| NAMESPACE + MYRIGHTS issue/gate | `discover_shared_folders` in `account/factory.rs` (codec already existed) | DONE |
+| owner derivation | `mailbox_owner_for` / `mailbox_owner_from_other_user_path` (per-principal for `#user/`) | DONE |
+| `list_shared_folders` | `account/scopes.rs` `memberships_for_entry` + `FolderRegistry::from_lists` owner tag | DONE |
+| shared-folder sync | existing `changes_stream` (ordinary `CursorScope::Folder`, no new sync code) | DONE |
+| revocation recovery | `SyncState(ScopeRevoked)` -> `EngineDirective::DisableScope` quarantine | DONE |
 | `build_uid_set` | bifrost typed `UidSet` | ALREADY-IN-BIFROST |
 
 ### A5a - Shared mailboxes, Graph delegate + JMAP shared accounts (size S-M)
@@ -342,12 +363,18 @@ not a side table. bifrost's EWS today is only the streaming-fallback skeleton
 path (`ews_error_to_account_error`, `SoapFaultCode`) already exists, which
 de-risks the adapt.
 
-**Top risks:** (1) the scope-vs-Account fork; (2) the no-delta-token strategy;
-(3) routing context must be cursor-resident; (4) no shared rights/permission type
-exists (ratatoskr has three divergent ones - `ImapFolderRights`,
-`EwsEffectiveRights`, `can_*` columns; bifrost needs one, and a decision: advisory
-hint vs enforced pre-flight reject); (5) EWS operation surface maturity; (6) no
-push for shared/public scopes (poll-only acceptable v1).
+**Top risks:** (1) the scope-vs-Account fork - **RESOLVED** (cursor-resident
+`CursorScope::Folder`, no new variant; see the gating-fork note above);
+(2) the no-delta-token strategy (A5b, still open); (3) routing context must be
+cursor-resident - **settled as the model** (the opaque cursor payload carries
+protocol routing; the engine never inspects it); (4) shared rights/permission
+type - **resolved for A5c as advisory**: one `MailboxRights` type
+(`imap/src/types/acl.rs`) gates discovery (skip unreadable folders) but does NOT
+pre-flight-reject mutations; `NO [ACL]` stays authoritative per-operation. A5a/A5b
+may revisit enforced reject; (5) EWS operation surface maturity (A5b); (6) no
+push for shared/public scopes - for A5c a shared folder is an ordinary `Folder`
+scope, so IDLE on the most-active scope already covers it; poll-only acceptable
+for A5b public folders.
 
 **Re-home:** `group_sync.rs` (Graph distribution-list membership) is **not** A5 -
 it is contact-group membership, shares no machinery, belongs in the contacts work.
@@ -599,8 +626,9 @@ enum parallels `MailProviderKind` (divergence risk); contact dispatch keys on a
 1. **A1** - first domino, JMAP -> Graph/Google -> IMAP -> SMTP.
 2. **A2** then **A4** (A4 includes cancel/reschedule).
 3. **A3** and **A6** after A1, independent of each other.
-4. **A5** - start the scope-vs-Account decision early; **A5c (IMAP NAMESPACE)**
-   first as the cheapest, highest-ratio landing; **A5b (EWS)** is the size-L unknown.
+4. **A5** - scope-vs-Account decision RESOLVED (cursor-resident `Folder`, no new
+   variant). **A5c (IMAP NAMESPACE) LANDED** as the cheapest, highest-ratio leg;
+   **A5a (Graph delegate + JMAP shared)** and **A5b (EWS, size-L unknown)** remain.
 5. **A7** - independent; fold the DAV robustness guards in.
 6. **A8** - standalone warts anytime; B-driven tail closes near the end. Consider
    pulling **GAL (A-2)** out as its own small brick.

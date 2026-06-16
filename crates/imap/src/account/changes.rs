@@ -159,6 +159,27 @@ impl From<AccountError> for ChangeError {
     }
 }
 
+/// Map a SELECT error for a shared/other-user folder to a scoped
+/// `ScopeRevoked` (quarantine just this folder) when it is a permission
+/// denial; otherwise return the raw error for the normal mapping. A
+/// personal folder (`shared_owner == None`) always returns the raw error.
+fn select_error(account: &ImapAccount, folder: &MailboxName, err: crate::Error) -> ChangeError {
+    let shared_owner = account
+        .folders
+        .get(folder)
+        .and_then(|entry| entry.shared_owner.clone());
+    if shared_owner.is_some() {
+        return ChangeError::Account(super::error::shared_folder_error(
+            err,
+            folder,
+            shared_owner.as_ref(),
+            super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::SyncChanges)
+                .with_folder_scope(folder),
+        ));
+    }
+    ChangeError::Imap(err)
+}
+
 async fn run_changes(
     account: ImapAccount,
     change_cursor: ChangeCursor,
@@ -254,7 +275,7 @@ async fn run_qresync(
             )
             .await;
         }
-        Err(err) => return Err(err.into()),
+        Err(err) => return Err(select_error(&account, &folder, err)),
     };
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, expected_uidvalidity, uidvalidity)?;
@@ -472,7 +493,8 @@ async fn run_condstore_with_baseline(
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
-        .await?;
+        .await
+        .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
     if !known_uids_complete {
@@ -547,7 +569,8 @@ async fn run_basic(
     let mut conn = account.checkout_for_folder(&folder).await?;
     let selected = account
         .select_folder(&mut conn, &folder, Some(&cursor), true)
-        .await?;
+        .await
+        .map_err(|err| select_error(&account, &folder, err))?;
     let uidvalidity = selected_uidvalidity(&selected.mailbox)?;
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
     let live = search_all(&account, conn.connection()).await?;

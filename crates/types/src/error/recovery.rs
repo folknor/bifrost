@@ -63,7 +63,16 @@ pub enum EngineDirective {
     DowngradeStrategy(StrategyDowngrade),
     DowngradeCapabilityForScope(CursorScope),
     SchemaIncompatible,
-    OperatorOverrideRequired { reason: String },
+    OperatorOverrideRequired {
+        reason: String,
+    },
+    /// Permanently disable a single cursor scope without escalating to
+    /// the account: an admin revoked access to one shared/other-user
+    /// folder mid-sync. The engine deletes the scope's in-memory and
+    /// durable cursor, drops it from the membership index, and broadcasts
+    /// a scoped `Warning::OperatorAttentionNeeded`. Siblings keep syncing;
+    /// the account is NOT paused and auth is NOT treated as lost.
+    DisableScope(CursorScope),
 }
 
 /// Provider-supplied hint for when a retry may be attempted. The hint
@@ -385,7 +394,8 @@ pub(crate) fn suggest(
             SyncStateErrorKind::StrategyFailure
             | SyncStateErrorKind::ScopeCapabilityLost
             | SyncStateErrorKind::CapabilityChanged
-            | SyncStateErrorKind::OperatorOverrideNeeded,
+            | SyncStateErrorKind::OperatorOverrideNeeded
+            | SyncStateErrorKind::ScopeRevoked,
         )
         | AccountErrorKind::ConcurrencyConflict
         | AccountErrorKind::Unsupported(_)
@@ -519,6 +529,7 @@ fn sync_kind_matches_cause(kind: SyncStateErrorKind, cause: &StateCause) -> bool
                 SyncStateErrorKind::OperatorOverrideNeeded,
                 StateCause::OperatorOverrideNeeded { .. }
             )
+            | (SyncStateErrorKind::ScopeRevoked, StateCause::ScopeRevoked)
     )
 }
 
@@ -643,6 +654,16 @@ fn derive_sync_state(
             Some(scope) => {
                 RecoveryClass::Engine(EngineDirective::DowngradeCapabilityForScope(scope))
             }
+            None => RecoveryClass::Engine(EngineDirective::RestartAccount),
+        },
+        // A revoked single shared folder quarantines that scope without
+        // escalating account-wide. `ScopeRevoked` requires a cursor scope
+        // to be meaningful; rather than add a `try_build` invariant, the
+        // scope-less case falls back to a full reopen (matching the
+        // `ScopeCapabilityLost` shape above). The IMAP producer always
+        // threads the scope, so the fallback is unreachable in practice.
+        SyncStateErrorKind::ScopeRevoked => match cursor_scope(scope) {
+            Some(scope) => RecoveryClass::Engine(EngineDirective::DisableScope(scope)),
             None => RecoveryClass::Engine(EngineDirective::RestartAccount),
         },
         SyncStateErrorKind::SchemaIncompatible => {
@@ -1364,6 +1385,52 @@ mod tests {
             Cause::State(StateCause::CursorInvalid),
             ErrorScope::Cursor(CursorScope::Account),
         );
+    }
+
+    #[test]
+    fn scope_revoked_derives_disable_scope() {
+        let scope = ErrorScope::Cursor(CursorScope::Folder(crate::FolderId("Shared/alice".into())));
+        let recovery = derive(
+            &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+            Some(&scope),
+            Some(AccountOperation::SyncChanges),
+            &chain(Cause::State(StateCause::ScopeRevoked)),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            recovery,
+            RecoveryClass::Engine(EngineDirective::DisableScope(CursorScope::Folder(
+                crate::FolderId("Shared/alice".into())
+            )))
+        );
+    }
+
+    #[test]
+    fn scope_revoked_without_scope_falls_back_to_restart_account() {
+        let recovery = derive(
+            &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+            None,
+            Some(AccountOperation::SyncChanges),
+            &chain(Cause::State(StateCause::ScopeRevoked)),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            recovery,
+            RecoveryClass::Engine(EngineDirective::RestartAccount)
+        );
+    }
+
+    #[test]
+    fn disable_scope_is_engine_action_not_terminal() {
+        let recovery = RecoveryClass::Engine(EngineDirective::DisableScope(CursorScope::Folder(
+            crate::FolderId("Shared/alice".into()),
+        )));
+        assert!(recovery.requires_engine_action());
+        assert!(!recovery.is_terminal());
     }
 
     fn build(kind: AccountErrorKind, primary_cause: Cause) -> AccountError {

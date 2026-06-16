@@ -7,6 +7,7 @@
 //! All types are fully owned  -  no lifetime parameters. Parsers produce these from `&[u8]`
 //! and callers can store them freely.
 
+mod acl;
 mod address;
 mod auth;
 pub(crate) mod body;
@@ -28,6 +29,7 @@ mod sync;
 mod uid_range;
 pub(crate) mod validated;
 
+pub(crate) use acl::MailboxRights;
 pub(crate) use address::Address;
 pub(crate) use auth::{AuthMechanism, AuthOutcome, CredentialsKind};
 pub use auth::{AuthPolicy, Credentials};

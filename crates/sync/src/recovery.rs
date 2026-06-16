@@ -105,11 +105,17 @@ pub(crate) fn retry_delay(advice: &RetryAdvice, now: SystemTime, fallback: Durat
 pub(crate) fn directive_target_scope(directive: &EngineDirective) -> Option<CursorScope> {
     match directive {
         EngineDirective::RestartScope(scope)
-        | EngineDirective::DowngradeCapabilityForScope(scope) => Some(scope.clone()),
+        | EngineDirective::DowngradeCapabilityForScope(scope)
+        | EngineDirective::DisableScope(scope) => Some(scope.clone()),
         EngineDirective::DowngradeStrategy(_)
         | EngineDirective::RestartAccount
         | EngineDirective::SchemaIncompatible
         | EngineDirective::OperatorOverrideRequired { .. } => None,
+        // `EngineDirective` is `#[non_exhaustive]` from `bifrost-types`, so
+        // this wildcard is REQUIRED for compilation across the crate
+        // boundary even though every current variant is named above. A new
+        // scope-bearing variant still defaults account-wide here until a
+        // human adds its arm (the sync-N1 residual).
         _ => None,
     }
 }
@@ -365,6 +371,10 @@ mod tests {
         );
         assert_eq!(
             directive_target_scope(&EngineDirective::DowngradeCapabilityForScope(scope.clone())),
+            Some(scope.clone())
+        );
+        assert_eq!(
+            directive_target_scope(&EngineDirective::DisableScope(scope.clone())),
             Some(scope)
         );
         assert_eq!(

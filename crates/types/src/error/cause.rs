@@ -343,6 +343,9 @@ pub enum StateCause {
         reason: String,
     },
     ConcurrencyConflict,
+    /// Access to one cursor scope was revoked mid-sync. Pairs with
+    /// `SyncStateErrorKind::ScopeRevoked`.
+    ScopeRevoked,
 }
 
 impl StateCause {
@@ -354,7 +357,8 @@ impl StateCause {
             | Self::ScopeCapabilityLost
             | Self::SchemaIncompatible
             | Self::CapabilityChanged { .. }
-            | Self::ConcurrencyConflict => None,
+            | Self::ConcurrencyConflict
+            | Self::ScopeRevoked => None,
         }
     }
 }

@@ -70,6 +70,10 @@ pub enum SyncStateErrorKind {
     SchemaIncompatible,
     CapabilityChanged,
     OperatorOverrideNeeded,
+    /// Access to one cursor scope was revoked mid-sync (an admin pulled
+    /// rights on a single shared/other-user IMAP folder). Quarantine just
+    /// that scope; do NOT escalate to account-wide auth loss.
+    ScopeRevoked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

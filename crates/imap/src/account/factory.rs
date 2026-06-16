@@ -7,7 +7,9 @@ use bifrost_caldav::{CalDavAccountFactory, CalDavConfig};
 use bifrost_carddav::{CardDavAccountFactory, CardDavConfig};
 
 use crate::connection::ImapConfig;
-use crate::types::{AuthPolicy, Capability, Credentials, MailboxInfo, ServerProfile};
+use crate::types::{
+    AuthPolicy, Capability, Credentials, MailboxInfo, MailboxRights, ServerProfile,
+};
 
 use super::error::ImapErrorContext;
 use super::sieve::ManageSieveConfig;
@@ -147,6 +149,14 @@ impl AccountFactory for ImapAccountFactory {
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
                 .map_err(discover_err)?;
+            // Surface shared/other-user folders via NAMESPACE + ACL gating
+            // (A5c). A NAMESPACE-less or personal-only server yields an
+            // empty list; a single revoked prefix is skipped, not fatal.
+            let shared = discover_shared_folders(&conn, &cfg, &profile)
+                .await
+                .into_iter()
+                .map(|sf| (sf.info, sf.owner))
+                .collect::<Vec<_>>();
             // Fail-soft: a DAV open failure degrades to IMAP-only for
             // this cycle instead of failing the whole IMAP account.
             let mut dav_degraded = Vec::new();
@@ -165,7 +175,7 @@ impl AccountFactory for ImapAccountFactory {
                 calendars.as_ref().map(|c| c.capabilities()),
                 submission.is_some(),
             );
-            let registry = Arc::new(FolderRegistry::from_list(folders));
+            let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
             let pool = Arc::new(Pool::new(
                 Arc::clone(&cfg),
@@ -378,6 +388,165 @@ fn server_id_disables_qresync(server_id: &[(String, Option<String>)]) -> bool {
     })
 }
 
+/// One shared/other-user folder discovered under a non-personal
+/// namespace, carrying its owning mailbox identity for membership tagging
+/// and scoped recovery.
+pub(crate) struct SharedFolder {
+    pub(crate) info: MailboxInfo,
+    /// The owning mailbox. For an other-user namespace (root `#user/`),
+    /// this is the per-principal segment that follows the root in each
+    /// folder's own path - `#user/alice/INBOX` -> `MailboxId("alice")` -
+    /// so distinct users get distinct owners. For a shared namespace
+    /// (root `#shared.`), all folders share one owner, the root minus its
+    /// trailing delimiter -> `MailboxId("#shared")`.
+    pub(crate) owner: bifrost_types::MailboxId,
+}
+
+/// Owner identity for the *shared* namespace: the namespace root minus its
+/// trailing delimiter. All folders under a shared root collapse to this one
+/// owner (there is no per-principal segment in a shared namespace). Pure and
+/// tested.
+pub(crate) fn mailbox_owner_for(prefix: &str, delimiter: Option<char>) -> bifrost_types::MailboxId {
+    let trimmed = match delimiter {
+        Some(d) => prefix.strip_suffix(d).unwrap_or(prefix),
+        None => prefix,
+    };
+    let owner = match delimiter {
+        Some(d) => trimmed.rsplit(d).next().unwrap_or(trimmed),
+        None => trimmed,
+    };
+    bifrost_types::MailboxId(owner.to_owned())
+}
+
+/// Owner identity for the *other-user* namespace: the per-principal segment
+/// that follows the namespace root in a folder's own path. RFC 2342 returns
+/// a single `other` descriptor for the whole root (`#user/`), not one per
+/// user, so the owning principal can only be read off each folder path -
+/// `#user/alice/INBOX` under root `#user/` (delimiter `/`) -> `alice`;
+/// `#user/bob` -> `bob`. Distinct users therefore get distinct owners.
+/// Falls back to the root-derived owner when the folder path does not sit
+/// under the prefix or has no segment after it (defensive; a well-formed
+/// LIST under the prefix always does). Pure and tested.
+pub(crate) fn mailbox_owner_from_other_user_path(
+    folder_path: &str,
+    prefix: &str,
+    delimiter: Option<char>,
+) -> bifrost_types::MailboxId {
+    let relative = folder_path.strip_prefix(prefix).unwrap_or(folder_path);
+    let segment = match delimiter {
+        Some(d) => relative.split(d).find(|s| !s.is_empty()),
+        None => (!relative.is_empty()).then_some(relative),
+    };
+    match segment {
+        Some(owner) => bifrost_types::MailboxId(owner.to_owned()),
+        None => mailbox_owner_for(prefix, delimiter),
+    }
+}
+
+/// Issue NAMESPACE (when advertised / rev2) and LIST each non-empty
+/// `other` and `shared` namespace prefix. Returns the discovered shared
+/// folders tagged with their owning mailbox. NAMESPACE absent or empty
+/// other/shared lists -> empty Vec (a plain personal-only server). A LIST
+/// under one prefix failing is non-fatal: log + skip that prefix, keep the
+/// others (a revoked prefix must not fail the whole open). When the server
+/// advertises ACL, each candidate folder is gated by MYRIGHTS: folders the
+/// user cannot read are dropped before registration (do not surface a
+/// scope you cannot SELECT). When ACL is not advertised, LIST visibility is
+/// taken to imply at least lookup, and a later SELECT surfaces any `NO`.
+pub(crate) async fn discover_shared_folders(
+    conn: &crate::ImapConnection,
+    cfg: &ImapAccountConfig,
+    profile: &ServerProfile,
+) -> Vec<SharedFolder> {
+    if !profile.supports(Capability::Namespace) && !profile.imap4rev2 {
+        return Vec::new();
+    }
+    let namespaces = match conn.namespace(cfg.imap.command_timeout).await {
+        Ok(ns) => ns,
+        Err(err) => {
+            tracing::debug!(error = %err, "NAMESPACE failed; treating as personal-only");
+            return Vec::new();
+        }
+    };
+    let acl = profile.supports(Capability::Acl);
+    let mut out = Vec::new();
+    // Other-user and shared namespaces are both non-personal, but their
+    // owner derivation differs: an other-user root (`#user/`) carries one
+    // descriptor for ALL users, so the owning principal is read per-folder
+    // (the segment after the root). A shared root (`#shared.`) has no
+    // per-principal segment, so every folder under it shares one owner.
+    let descriptors = namespaces
+        .other
+        .iter()
+        .map(|d| (d, true))
+        .chain(namespaces.shared.iter().map(|d| (d, false)));
+    for (descriptor, is_other_user) in descriptors {
+        if descriptor.prefix.is_empty() {
+            continue;
+        }
+        let shared_owner = mailbox_owner_for(&descriptor.prefix, descriptor.delimiter);
+        // LIST everything under this prefix. `LIST "<prefix>" "*"` enumerates
+        // the namespace's folders.
+        let listed = match conn
+            .list(&descriptor.prefix, "*", cfg.imap.command_timeout)
+            .await
+        {
+            Ok(folders) => folders,
+            Err(err) => {
+                tracing::debug!(
+                    prefix = %descriptor.prefix,
+                    error = %err,
+                    "LIST under shared namespace prefix failed; skipping prefix"
+                );
+                continue;
+            }
+        };
+        for info in listed {
+            let owner = if is_other_user {
+                mailbox_owner_from_other_user_path(
+                    info.name.as_str(),
+                    &descriptor.prefix,
+                    descriptor.delimiter,
+                )
+            } else {
+                shared_owner.clone()
+            };
+            let selectable = !info.attributes.iter().any(|attr| {
+                matches!(
+                    attr,
+                    crate::types::MailboxAttribute::NoSelect
+                        | crate::types::MailboxAttribute::NonExistent
+                )
+            });
+            if acl && selectable {
+                // Pre-flight ACL gate: skip folders we cannot read. The
+                // rights gate is advisory; a per-folder MYRIGHTS failure is
+                // non-fatal (log + keep the folder; SELECT stays
+                // authoritative).
+                match conn
+                    .my_rights(info.name.as_str(), cfg.imap.command_timeout)
+                    .await
+                {
+                    Ok(rights) => {
+                        if !MailboxRights::parse(&rights).can_read() {
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            mailbox = %info.name.as_str(),
+                            error = %err,
+                            "MYRIGHTS failed for shared folder; registering and deferring to SELECT"
+                        );
+                    }
+                }
+            }
+            out.push(SharedFolder { info, owner });
+        }
+    }
+    out
+}
+
 pub(crate) async fn list_folders(
     conn: &crate::ImapConnection,
     cfg: &ImapAccountConfig,
@@ -399,6 +568,62 @@ pub(crate) async fn list_folders(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_owner_for_strips_delimiter() {
+        // Shared-root helper: trailing-delimiter-stripped final segment.
+        // Single-segment shared prefix: no interior delimiter, whole
+        // (trailing-stripped) prefix is the owner.
+        assert_eq!(
+            mailbox_owner_for("#shared.", Some('.')),
+            bifrost_types::MailboxId("#shared".to_owned())
+        );
+        // No delimiter: prefix is the owner verbatim.
+        assert_eq!(
+            mailbox_owner_for("Shared", None),
+            bifrost_types::MailboxId("Shared".to_owned())
+        );
+        // Multi-segment shared root collapses to its final segment.
+        assert_eq!(
+            mailbox_owner_for("#shared/dept/", Some('/')),
+            bifrost_types::MailboxId("dept".to_owned())
+        );
+    }
+
+    #[test]
+    fn mailbox_owner_from_other_user_path_reads_principal_per_folder() {
+        // RFC 2342 returns one `other` descriptor (`#user/`) for every
+        // user. The owning principal must be read off each folder path so
+        // distinct users get distinct owners - not collapsed to the root.
+        assert_eq!(
+            mailbox_owner_from_other_user_path("#user/alice/INBOX", "#user/", Some('/')),
+            bifrost_types::MailboxId("alice".to_owned())
+        );
+        assert_eq!(
+            mailbox_owner_from_other_user_path("#user/bob/Sent", "#user/", Some('/')),
+            bifrost_types::MailboxId("bob".to_owned())
+        );
+        // The user-root folder itself (no segment after the principal).
+        assert_eq!(
+            mailbox_owner_from_other_user_path("#user/alice", "#user/", Some('/')),
+            bifrost_types::MailboxId("alice".to_owned())
+        );
+        // Non-default delimiter.
+        assert_eq!(
+            mailbox_owner_from_other_user_path(
+                "Other Users.carol.INBOX",
+                "Other Users.",
+                Some('.')
+            ),
+            bifrost_types::MailboxId("carol".to_owned())
+        );
+        // Defensive fallback: a path not under the prefix degrades to the
+        // root-derived owner rather than panicking.
+        assert_eq!(
+            mailbox_owner_from_other_user_path("#user/", "#user/", Some('/')),
+            bifrost_types::MailboxId("#user".to_owned())
+        );
+    }
 
     #[test]
     fn qresync_runtime_gate_defaults_off() {

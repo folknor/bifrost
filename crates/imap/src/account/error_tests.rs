@@ -14,7 +14,7 @@ use bifrost_types::{
     ThrottleScope, TransmissionState, TransportErrorKind, WireCause,
 };
 
-use super::{ImapErrorContext, into_account_error, strategy_failure};
+use super::{ImapErrorContext, into_account_error, shared_folder_error, strategy_failure};
 use crate::Error;
 use crate::types::{MailboxName, ResponseCode};
 
@@ -149,6 +149,58 @@ fn no_with_noperm_maps_to_permission_denied_with_scope_resource() {
         _ => None,
     });
     assert_eq!(resource, Some(Some(ResourceKind::Message)));
+}
+
+#[test]
+fn shared_folder_permission_loss_derives_disable_scope() {
+    let err = Error::no_with_code("no perm".into(), Some(ResponseCode::NoPerm));
+    let folder = mailbox("Shared/alice/INBOX");
+    let owner = bifrost_types::MailboxId("alice".to_owned());
+    let account = shared_folder_error(
+        err,
+        &folder,
+        Some(&owner),
+        ImapErrorContext::operation(AccountOperation::SyncChanges).with_folder_scope(&folder),
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+    ));
+    assert_eq!(
+        *account.recovery(),
+        RecoveryClass::Engine(EngineDirective::DisableScope(folder_cursor(
+            "Shared/alice/INBOX"
+        )))
+    );
+    assert_eq!(
+        account.scope(),
+        Some(&ErrorScope::Cursor(folder_cursor("Shared/alice/INBOX")))
+    );
+}
+
+#[test]
+fn personal_folder_permission_loss_stays_terminal() {
+    let err = Error::no_with_code("no perm".into(), Some(ResponseCode::NoPerm));
+    let folder = mailbox("INBOX");
+    // A personal folder is untagged (`shared_owner == None`): the same
+    // response must still derive terminal `NoPermission`, not quarantine.
+    let account = shared_folder_error(
+        err,
+        &folder,
+        None,
+        ImapErrorContext::operation(AccountOperation::SyncChanges).with_folder_scope(&folder),
+    );
+
+    assert!(matches!(
+        account.kind(),
+        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+    ));
+    assert!(account.recovery().is_terminal());
+    assert!(matches!(
+        account.recovery(),
+        RecoveryClass::NoPermission { .. }
+    ));
 }
 
 #[test]

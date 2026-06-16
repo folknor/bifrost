@@ -162,10 +162,21 @@ re-auditors don't re-raise them.)
   `RecoveryContext` with `Option<MailboxId>`, tenant, and `Provider`;
   thread them through `apply_throttle`. Doing F5 alone has no
   observable effect because the read side (F4) isn't wired.
-- **sync-N1.** `directive_target_scope` and other `_ => None`
-  after-exhaustive arms: drop the catch-alls so
-  `EngineDirective`'s `#[non_exhaustive]` enforces coverage at compile
-  time.
+- **sync-N1.** (partially addressed) `directive_target_scope` and other
+  `_ => None` after-exhaustive arms route a new scope-bearing
+  `EngineDirective` variant account-wide instead of failing to compile.
+  A5c reduced the footgun for the known variants: `directive_target_scope`
+  now names `DisableScope` (and the other scope-bearing variants)
+  explicitly before the wildcard, so every *current* variant routes
+  per-scope. The residual stands: the `_ => None` wildcard could NOT be
+  dropped - `EngineDirective` is `#[non_exhaustive]` in `bifrost-types`
+  and the match is in `bifrost-sync`, so a cross-crate match requires a
+  catch-all even when every variant is named (the existing comment at the
+  arm states this). Full compile-time enforcement remains impossible
+  without dropping `#[non_exhaustive]` from the `pub`, re-exported enum -
+  a broader API-stability change out of A5c scope. Until then a future
+  scope-bearing variant still defaults account-wide here and needs a human
+  to add its arm.
 - **sync-N2.** `MutationBucket::BlockedByEngine` vs `FailedTerminal`:
   split into distinct counter fields.
 - **sync-N3.** `wait_for_real_subscriber` 25ms hot-poll: switch to

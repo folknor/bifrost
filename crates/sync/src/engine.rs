@@ -1868,6 +1868,9 @@ async fn handle_engine_directive(
             );
             engine_pause(ctx, PauseReason::OperatorOverrideRequired);
         }
+        EngineDirective::DisableScope(directive_scope) => {
+            disable_scope(ctx, directive_scope).await;
+        }
         // EngineDirective is #[non_exhaustive] from bifrost-types; new
         // variants land here unhandled and require explicit dispatch
         // before they ship. The fallback warns rather than silently
@@ -1932,6 +1935,38 @@ async fn restart_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
         );
     }
     re_establish_scope_with_backoff(ctx, scope).await;
+}
+
+/// Quarantine a single scope: delete its in-memory and durable cursor and
+/// drop it from the membership index (`CursorRegistry::delete` does both),
+/// then broadcast a scoped operator warning. The per-scope poll loop
+/// self-terminates on its next iteration when `cursors.snapshot(scope)`
+/// returns `None` (the self-drain check in the multiplexer). Unlike
+/// `restart_scope`, there is NO re-establishment, NO pause, and NO
+/// account-wide escalation: a revoked shared folder must stay gone until
+/// the next full account reopen re-runs discovery (where MYRIGHTS filters
+/// it out if still revoked, or it re-appears if access was restored).
+/// Siblings are untouched.
+async fn disable_scope(ctx: &RecoveryContext<'_>, scope: CursorScope) {
+    ctx.cursors.delete(&scope);
+    if let Err(err) = ctx.store.delete_change_cursor(ctx.account_id, &scope).await {
+        tracing::warn!(
+            target: "bifrost.sync.changes",
+            account = ?ctx.account_id,
+            scope = ?scope,
+            error = %err,
+            "DisableScope: delete_change_cursor failed"
+        );
+    }
+    broadcast_warning(
+        ctx.changes_tx,
+        Some(scope.clone()),
+        bifrost_types::Warning::user_safe(
+            bifrost_types::WarningKind::OperatorAttentionNeeded,
+            format!("shared folder access revoked; scope disabled: {scope:?}"),
+        )
+        .with_protocol_detail(DiagnosticText::support_only(format!("{scope:?}"))),
+    );
 }
 
 async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: CursorScope) {
@@ -2345,5 +2380,61 @@ mod tests {
         };
         let membership = MembershipScope::Mailbox(bifrost_types::MailboxId("archive".into()));
         assert!(!scope_covers_membership(&scope, &membership));
+    }
+
+    /// `disable_scope` quarantines a single shared-folder scope by
+    /// deleting its cursor and dropping its membership index edges. The
+    /// poll loop self-drains on the next iteration once
+    /// `cursors.snapshot(scope)` returns `None`. This pins the registry
+    /// mechanism the quarantine relies on: a shared `Folder` scope tagged
+    /// with its owning `Mailbox` membership is fully removed by
+    /// `CursorRegistry::delete` (cursor + membership), and an untargeted
+    /// sibling scope is untouched.
+    #[test]
+    fn disable_scope_deletes_cursor_and_drops_membership() {
+        use crate::cursor::CursorRegistry;
+        use bifrost_types::{ChangeCursor, MailboxId, OpaqueChangeState, ProtocolKind};
+
+        let cursors = CursorRegistry::new();
+        let shared = CursorScope::Folder(FolderId("Shared/alice/INBOX".into()));
+        let sibling = CursorScope::Folder(FolderId("INBOX".into()));
+
+        let mk = |scope: &CursorScope| ChangeCursor {
+            scope: scope.clone(),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Imap,
+                envelope_version: 1,
+                bytes: Vec::new(),
+            },
+            advanced_through: None,
+            envelope_version: 1,
+        };
+        cursors.put(mk(&shared));
+        cursors.put(mk(&sibling));
+        cursors.link_membership(
+            MembershipScope::Mailbox(MailboxId("alice".into())),
+            shared.clone(),
+        );
+        cursors.link_membership(
+            MembershipScope::Folder(FolderId("INBOX".into())),
+            sibling.clone(),
+        );
+
+        // The mechanism inside `disable_scope`: a single registry delete
+        // drops both the cursor and the membership edges for the scope.
+        cursors.delete(&shared);
+
+        assert!(cursors.snapshot(&shared).is_none());
+        assert!(
+            cursors
+                .scopes_for_membership(&MembershipScope::Mailbox(MailboxId("alice".into())))
+                .is_empty()
+        );
+        // Sibling scope untouched.
+        assert!(cursors.snapshot(&sibling).is_some());
+        assert_eq!(
+            cursors.scopes_for_membership(&MembershipScope::Folder(FolderId("INBOX".into()))),
+            vec![sibling]
+        );
     }
 }

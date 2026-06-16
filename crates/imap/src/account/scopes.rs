@@ -35,7 +35,7 @@ pub(crate) fn discover_memberships(
         .folders
         .entries()
         .into_iter()
-        .map(|entry| membership_scope(&entry.name))
+        .flat_map(|entry| memberships_for_entry(&entry))
         .collect();
     let subs: Vec<Arc<dyn Account>> = [account.contacts.clone(), account.calendars.clone()]
         .into_iter()
@@ -64,6 +64,22 @@ where
     bifrost_types::account_compose::merge_scope_streams(items, warnings, subs, discover)
 }
 
+/// Memberships a single folder entry contributes to discovery. Every
+/// folder keeps its `Folder` membership for folder-keyed routing. A
+/// shared/other-user folder (`shared_owner.is_some()`) also emits its
+/// owning `Mailbox(owner)` membership so the consumer maps the scope to a
+/// shared mailbox identity (A5c). The owner tag does not form via the
+/// engine's `scope_covers_membership` covering rule (the FolderId and
+/// MailboxId strings differ for a shared folder), so it must be emitted
+/// explicitly here.
+fn memberships_for_entry(entry: &super::folder_registry::FolderEntry) -> Vec<MembershipScope> {
+    let mut out = vec![membership_scope(&entry.name)];
+    if let Some(owner) = &entry.shared_owner {
+        out.push(MembershipScope::Mailbox(owner.clone()));
+    }
+    out
+}
+
 pub(crate) fn scope_lifecycle_stream(
     account: ImapAccount,
 ) -> bifrost_types::AccountStream<bifrost_types::ScopeLifecycleEvent> {
@@ -78,11 +94,97 @@ pub(crate) fn scope_lifecycle_stream(
 
 #[cfg(test)]
 mod tests {
-    use bifrost_types::{CursorScope, FolderId, ObjectType, SyncEvent};
+    use bifrost_types::{CursorScope, FolderId, MailboxId, ObjectType, SyncEvent};
     use futures::StreamExt;
 
+    use super::super::folder_registry::FolderRegistry;
+    use super::super::folder_scope;
     use super::super::test_support::{StubAccount, stub_arc};
-    use super::fan_in_discovery;
+    use super::{fan_in_discovery, memberships_for_entry};
+    use crate::types::{MailboxInfo, MailboxName};
+    use bifrost_types::MembershipScope;
+
+    fn mailbox_info(name: &str) -> MailboxInfo {
+        MailboxInfo {
+            name: MailboxName::new(name).expect("valid mailbox name"),
+            delimiter: Some('/'),
+            ..Default::default()
+        }
+    }
+
+    // A registry with one personal + one shared folder yields, for the
+    // shared one, both `Folder(..)` and `Mailbox(owner)` memberships; the
+    // personal one yields only `Folder`.
+    #[test]
+    fn discover_memberships_tags_shared_folder_with_mailbox() {
+        let registry = FolderRegistry::from_lists(
+            vec![mailbox_info("INBOX")],
+            vec![(
+                mailbox_info("Shared/alice/INBOX"),
+                MailboxId("alice".to_string()),
+            )],
+        );
+
+        let mut personal = None;
+        let mut shared = None;
+        for entry in registry.entries() {
+            if entry.name.as_str() == "INBOX" {
+                personal = Some(memberships_for_entry(&entry));
+            } else {
+                shared = Some(memberships_for_entry(&entry));
+            }
+        }
+
+        let personal = personal.expect("personal entry present");
+        assert_eq!(
+            personal,
+            vec![MembershipScope::Folder(FolderId("INBOX".to_string()))]
+        );
+
+        let shared = shared.expect("shared entry present");
+        assert!(shared.contains(&MembershipScope::Folder(FolderId(
+            "Shared/alice/INBOX".to_string()
+        ))));
+        assert!(shared.contains(&MembershipScope::Mailbox(MailboxId("alice".to_string()))));
+        assert_eq!(shared.len(), 2);
+    }
+
+    // A shared selectable folder surfaces as an ordinary
+    // `CursorScope::Folder` in the merged discovery batch, exactly like a
+    // personal folder (decision 3: no `route_typed_scope` change).
+    #[tokio::test]
+    async fn discover_cursor_scopes_includes_shared_folder_scope() {
+        let registry = FolderRegistry::from_lists(
+            vec![mailbox_info("INBOX")],
+            vec![(
+                mailbox_info("Shared/alice/INBOX"),
+                MailboxId("alice".to_string()),
+            )],
+        );
+        let folder_scopes: Vec<CursorScope> = registry
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.selectable)
+            .map(|entry| folder_scope(&entry.name))
+            .collect();
+
+        let mut stream = fan_in_discovery(folder_scopes, Vec::new(), Vec::new(), |sub| {
+            sub.discover_cursor_scopes()
+        });
+
+        let mut items = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                SyncEvent::Batch(batch) => items.extend(batch.items),
+                SyncEvent::Done(_) => break,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(items.contains(&CursorScope::Folder(FolderId("INBOX".to_string()))));
+        assert!(items.contains(&CursorScope::Folder(FolderId(
+            "Shared/alice/INBOX".to_string()
+        ))));
+    }
 
     // Brick 2: discovery fan-in. A populated folder set merged with a
     // stub contacts sub-account (whose discovery yields one
