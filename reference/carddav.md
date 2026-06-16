@@ -66,7 +66,12 @@ Supported contact primitives:
   fields, including ADR postal addresses, then keep local filtering and
   offset-cursor paging as a
   defensive guard. Empty search hydrates the addressbook to preserve
-  match-all behavior.
+  match-all behavior. This is the *personal* corpus only;
+  `directory_search` (org directory / GAL) returns
+  `Unsupported(DirectorySearch)` with the capability flag `false`. An RFC
+  6352 directory-gateway leg is a named follow-up (see `TODO.md`): the
+  port evidence has no CardDAV directory impl, and gateway discovery is a
+  substantial provider-specific unknown.
 
 CardDAV maps ADR postal addresses through the shared `ContactAddress`
 model and inline vCard 3 `PHOTO;ENCODING=b` data through shared

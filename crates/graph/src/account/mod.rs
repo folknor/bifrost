@@ -30,13 +30,13 @@ use bifrost_types::{
     AddressBook, AddressBookId, BlobHandle, ByteRange, Calendar, CalendarEvent, Change,
     ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterValidation, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey,
-    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
-    MutationTarget, ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId,
-    VacationConfig, WatchEvent,
+    DirectoryCard, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
+    EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject, HydrationProjection,
+    IdempotencyKey, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -828,6 +828,18 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { contacts::search(account, request).await })
+    }
+
+    fn directory_search(
+        &self,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        let account = self.clone();
+        Box::pin(
+            async move { contacts::directory_search(account, query, limit, page_cursor).await },
+        )
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

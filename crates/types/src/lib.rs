@@ -24,6 +24,7 @@ pub mod compose;
 pub mod contact;
 pub mod container;
 pub mod cursor;
+pub mod directory;
 pub mod error;
 pub mod events;
 pub mod filter;
@@ -89,6 +90,9 @@ pub use contact::{
     ContactId, ContactOrganization, ContactPatch, ContactPhone, ContactPhoto, ContactProvenance,
     ContactSearchRequest,
 };
+
+// Organization-directory (GAL) result type.
+pub use directory::DirectoryCard;
 
 // Cursor + scope types.
 pub use cursor::{

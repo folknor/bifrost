@@ -172,6 +172,7 @@ pub enum AccountOperation {
     ContactDelete,
     ContactSearch,
     ContactAutocomplete,
+    DirectorySearch,
     CalendarsList,
     EventsInRange,
     EventGet,
@@ -255,5 +256,12 @@ mod tests {
         // An interrupted host may have created a partial/duplicate Drive item;
         // a blind retry is unsafe, so the operation must be non-idempotent.
         assert!(!AccountOperation::HostAttachment.is_idempotent());
+    }
+
+    #[test]
+    fn directory_search_is_idempotent() {
+        // A directory search is a read; a transport drop mid-search is safely
+        // retryable, so it stays idempotent by omission from the exclusion set.
+        assert!(AccountOperation::DirectorySearch.is_idempotent());
     }
 }

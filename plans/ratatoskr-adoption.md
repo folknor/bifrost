@@ -354,19 +354,31 @@ at spec time.
 
 - Intent: the org-directory address-list primitive that A-2 (`handlers/gal.rs`
   `match provider`) needs - split out of A8 because it is a new search primitive
-  with two substantial, asymmetric provider backends (Graph directory
-  `/users` + `peopleAdminSettings`; Google Admin Directory / People
-  `searchDirectoryPeople`) plus a CardDAV leg, not a flag + thin convenience.
-  The directory corpus is a *different corpus* from the user's personal
-  address books (`contact_search`), which is why it earns its own primitive.
+  with two substantial, asymmetric provider backends (Graph directory `/users`;
+  Google People `listDirectoryPeople` / `searchDirectoryPeople`), not a flag +
+  thin convenience. The directory corpus is a *different corpus* from the user's
+  personal address books (`contact_search`), which is why it earns its own
+  primitive.
 - Spec delivers: a `directory_search` primitive on `Account` returning a page of
   directory cards, a `directory_search` flag in `PimMethodSupport`, the Graph and
-  Google directory backends, the CardDAV directory-gateway leg, and the
-  `Unsupported(DirectorySearch)` default for accounts without a directory.
+  Google directory backends, and the `Unsupported(DirectorySearch)` default for
+  accounts without a directory.
 - Depends on: nothing structurally - standalone, can land before or after the A8
   tail. A8 deliberately does not add a `directory_search` flag (a `false` flag
   with no primitive would be dead surface).
-- TODO: none yet; sized at spec time.
+- LANDED. `directory_search(query, limit, page_cursor) -> Page<DirectoryCard>`
+  on `Account`; new `DirectoryCard` (`crates/types/src/directory.rs`),
+  `PimMethodSupport.directory_search`, `AccountOperation::DirectorySearch`
+  (idempotent). Graph backend: `/users` with `startswith` `$filter`. Google
+  backend: `listDirectoryPeople` (empty query) / `searchDirectoryPeople`
+  (non-empty, with warmup), 403 directory-absence swallowed to an empty page for
+  `PermissionDenied`/`InsufficientScope`, `PolicyBlocked` propagated. JMAP, IMAP,
+  CalDAV, CardDAV are `Unsupported(DirectorySearch)`. The Google backend uses the
+  People directory endpoints (`listDirectoryPeople` for the empty-query
+  enumeration, `searchDirectoryPeople` for a non-empty lookup); the Graph backend
+  uses `/users` with a `startswith` `$filter`. One refinement of the brick text
+  above: the CardDAV directory-gateway leg is scoped out as a named follow-up
+  (`TODO.md` a9-1), not delivered here.
 
 ## 6. Sequencing
 

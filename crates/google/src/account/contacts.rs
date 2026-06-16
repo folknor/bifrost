@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountFuture, AccountOperation, AddressBook, AddressBookId, ContactCard,
-    ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone,
-    ContactProvenance, ContactSearchRequest, Page, ProtocolKind,
+    AccessErrorKind, AccountError, AccountErrorKind, AccountFuture, AccountOperation, AddressBook,
+    AddressBookId, ContactCard, ContactCreate, ContactEmail, ContactId, ContactOrganization,
+    ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, Page,
+    ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -268,6 +269,152 @@ pub(crate) fn search(
     })
 }
 
+/// Organization directory (Global Address List) search.
+///
+/// An empty `query` enumerates the domain directory via
+/// `people:listDirectoryPeople` (the ratatoskr path, no warmup); a
+/// non-empty `query` runs `people:searchDirectoryPeople`, which - like
+/// the `searchContacts` family - requires a cache-priming warmup call
+/// before the real query. Personal Gmail accounts (and accounts without
+/// the directory scope) have no directory and answer 403; that surfaces
+/// as `PermissionDenied` or `InsufficientScope`, both of which are
+/// swallowed to an empty page. A `PolicyBlocked` 403 is a genuine admin
+/// refusal and propagates.
+pub(crate) fn directory_search(
+    client: Arc<GmailClient>,
+    query: String,
+    limit: Option<u32>,
+    page_cursor: Option<Vec<u8>>,
+) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+    Box::pin(async move {
+        if !query.is_empty() {
+            // search* family cache-priming warmup; its own 403 is itself
+            // the "no directory" signal.
+            match client
+                .get::<DirectoryPeopleResponse>(&directory_search_warmup_url())
+                .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    let err = collection_error(error, AccountOperation::DirectorySearch);
+                    return directory_absence_to_empty(err);
+                }
+            }
+        }
+        let url = directory_search_url(&query, limit, page_cursor.as_deref())?;
+        let response: DirectoryPeopleResponse = match client.get(&url).await {
+            Ok(response) => response,
+            Err(error) => {
+                let err = collection_error(error, AccountOperation::DirectorySearch);
+                return directory_absence_to_empty(err);
+            }
+        };
+        let items = response
+            .people
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(person_to_directory_card)
+            .collect();
+        Ok(Page {
+            items,
+            next_cursor: response.next_page_token.map(String::into_bytes),
+            estimated_total: None,
+        })
+    })
+}
+
+/// Swallow the two directory-absence classifications (`PermissionDenied`
+/// and `InsufficientScope`) into an empty page; propagate everything
+/// else (notably `PolicyBlocked`, a real admin refusal). Classify first,
+/// then branch on the typed kind, per the error-model contract.
+fn directory_absence_to_empty(err: AccountError) -> Result<Page<DirectoryCard>, AccountError> {
+    match err.kind() {
+        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        | AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope) => {
+            Ok(Page::single(vec![]))
+        }
+        _ => Err(err),
+    }
+}
+
+const DIRECTORY_READ_MASK: &str = "names,emailAddresses,phoneNumbers,organizations";
+const DIRECTORY_SOURCES: &str = "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE";
+
+fn directory_search_warmup_url() -> String {
+    format!(
+        "{PEOPLE_API_BASE}/people:searchDirectoryPeople?query=&readMask={}&sources={DIRECTORY_SOURCES}",
+        bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+    )
+}
+
+fn directory_search_url(
+    query: &str,
+    limit: Option<u32>,
+    page_cursor: Option<&[u8]>,
+) -> Result<String, AccountError> {
+    let page_size = limit.unwrap_or(1000).min(1000);
+    let mut url = if query.is_empty() {
+        format!(
+            "{PEOPLE_API_BASE}/people:listDirectoryPeople?readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
+            bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+        )
+    } else {
+        format!(
+            "{PEOPLE_API_BASE}/people:searchDirectoryPeople?query={}&readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
+            bifrost_net::url::encode_component(query),
+            bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+        )
+    };
+    if let Some(cursor) = page_cursor {
+        let token = std::str::from_utf8(cursor)
+            .map_err(|error| local_error(AccountOperation::DirectorySearch, error.to_string()))?;
+        url.push_str("&pageToken=");
+        url.push_str(&bifrost_net::url::encode_component(token));
+    }
+    Ok(url)
+}
+
+/// Project one directory `Person` into a `DirectoryCard`. Returns `None`
+/// when the row has no email (matching ratatoskr's mail-less drop). The
+/// first email is the key; the rest land in `additional_emails`. The org
+/// tuple comes from `organizations[0]`.
+fn person_to_directory_card(person: Person) -> Option<DirectoryCard> {
+    let display_name = person
+        .names
+        .as_ref()
+        .and_then(|names| names.first())
+        .and_then(|name| name.display_name.clone());
+    let mut emails = person
+        .email_addresses
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|email| email.value)
+        .filter(|value| !value.is_empty());
+    let email = emails.next()?;
+    let additional_emails = emails.collect();
+    let phones = person
+        .phone_numbers
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|phone| phone.value)
+        .collect();
+    let org = person.organizations.unwrap_or_default().into_iter().next();
+    let (company, title, department) = match org {
+        Some(org) => (org.name, org.title, org.department),
+        None => (None, None, None),
+    };
+    Some(DirectoryCard {
+        email,
+        display_name,
+        additional_emails,
+        phones,
+        company,
+        title,
+        department,
+        provider: ProtocolKind::Gmail,
+    })
+}
+
 fn reject_photo_url_patch(patch: &ContactPatch) -> Result<(), AccountError> {
     if patch.photo_url.is_some() {
         return Err(error::into_account_error(
@@ -498,6 +645,7 @@ fn person_from_create(contact: &ContactCreate) -> Person {
         organizations: non_empty(contact.organizations.iter().map(|org| Organization {
             name: Some(org.name.clone()),
             title: org.title.clone(),
+            department: None,
         })),
         addresses: non_empty(contact.addresses.iter().map(address_to_people)),
         photos: None,
@@ -558,6 +706,7 @@ fn apply_patch_to_person(person: &mut Person, patch: &ContactPatch) {
         person.organizations = non_empty(organizations.iter().map(|org| Organization {
             name: Some(org.name.clone()),
             title: org.title.clone(),
+            department: None,
         }));
     }
     if let Some(addresses) = &patch.addresses {
@@ -758,6 +907,13 @@ struct SearchResult {
     person: Person,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryPeopleResponse {
+    people: Option<Vec<Person>>,
+    next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Name {
@@ -834,6 +990,8 @@ struct Organization {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    department: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,6 +1060,7 @@ mod tests {
             organizations: Some(vec![Organization {
                 name: Some("Analytical Engines".to_string()),
                 title: Some("Programmer".to_string()),
+                department: None,
             }]),
             addresses: Some(vec![PeopleAddress {
                 formatted_value: Some("1 Example St, London".to_string()),
@@ -1239,5 +1398,129 @@ mod tests {
         let error = require_person_etag(&Person::default()).expect_err("missing etag should fail");
 
         assert_eq!(error.operation(), Some(AccountOperation::ContactUpdate));
+    }
+
+    fn directory_403(reason: &str) -> AccountError {
+        let body = format!(
+            r#"{{"error":{{"code":403,"message":"x","errors":[{{"domain":"global","reason":"{reason}"}}]}}}}"#
+        );
+        let error = crate::error::Error::response_from_parts(
+            crate::error::GmailService::GmailApi,
+            403,
+            crate::error::GmailResponseHeaders::default(),
+            bytes::Bytes::copy_from_slice(body.as_bytes()),
+        );
+        collection_error(error, AccountOperation::DirectorySearch)
+    }
+
+    #[test]
+    fn directory_search_empty_query_lists_directory_people() {
+        let url = directory_search_url("", Some(2000), None).expect("url");
+
+        assert!(url.contains("people:listDirectoryPeople"));
+        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
+        // limit caps at 1000.
+        assert!(url.contains("pageSize=1000"));
+        assert!(!url.contains("searchDirectoryPeople"));
+    }
+
+    #[test]
+    fn directory_search_nonempty_query_searches_directory_people() {
+        let url = directory_search_url("Ada Lovelace", None, Some(b"tok".as_slice())).expect("url");
+
+        assert!(url.contains("people:searchDirectoryPeople"));
+        assert!(url.contains("query=Ada%20Lovelace"));
+        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
+        assert!(url.contains("pageToken=tok"));
+    }
+
+    #[test]
+    fn directory_search_warmup_url_uses_empty_query() {
+        let url = directory_search_warmup_url();
+
+        assert!(url.contains("people:searchDirectoryPeople?query=&"));
+        assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
+        assert!(!url.contains("pageSize="));
+    }
+
+    #[test]
+    fn directory_card_from_person_drops_emailless_and_maps_org() {
+        // No email -> dropped.
+        let emailless = Person {
+            names: Some(vec![Name {
+                display_name: Some("No Email".to_string()),
+                given_name: None,
+                family_name: None,
+                extra: Map::new(),
+            }]),
+            ..Person::default()
+        };
+        assert!(person_to_directory_card(emailless).is_none());
+
+        let person = Person {
+            names: Some(vec![Name {
+                display_name: Some("Ada Lovelace".to_string()),
+                given_name: None,
+                family_name: None,
+                extra: Map::new(),
+            }]),
+            email_addresses: Some(vec![
+                EmailAddress {
+                    value: Some("ada@example.com".to_string()),
+                    kind: None,
+                    formatted_type: None,
+                    metadata: None,
+                },
+                EmailAddress {
+                    value: Some("ada.alt@example.com".to_string()),
+                    kind: None,
+                    formatted_type: None,
+                    metadata: None,
+                },
+            ]),
+            phone_numbers: Some(vec![PhoneNumber {
+                value: Some("+15551234".to_string()),
+                kind: None,
+                formatted_type: None,
+                metadata: None,
+            }]),
+            organizations: Some(vec![Organization {
+                name: Some("Analytical Engines".to_string()),
+                title: Some("Programmer".to_string()),
+                department: Some("Research".to_string()),
+            }]),
+            ..Person::default()
+        };
+        let card = person_to_directory_card(person).expect("maps to card");
+        assert_eq!(card.email, "ada@example.com");
+        assert_eq!(
+            card.additional_emails,
+            vec!["ada.alt@example.com".to_string()]
+        );
+        assert_eq!(card.phones, vec!["+15551234".to_string()]);
+        assert_eq!(card.company.as_deref(), Some("Analytical Engines"));
+        assert_eq!(card.title.as_deref(), Some("Programmer"));
+        assert_eq!(card.department.as_deref(), Some("Research"));
+        assert_eq!(card.provider, ProtocolKind::Gmail);
+    }
+
+    #[test]
+    fn directory_absence_403_returns_empty_page() {
+        // insufficientPermissions (missing scope) -> empty page.
+        let empty = directory_absence_to_empty(directory_403("insufficientPermissions"))
+            .expect("swallowed");
+        assert!(empty.items.is_empty());
+
+        // bare forbidden / PERMISSION_DENIED -> empty page.
+        let empty = directory_absence_to_empty(directory_403("forbidden")).expect("swallowed");
+        assert!(empty.items.is_empty());
+
+        // domainPolicy is a real admin refusal -> propagates.
+        let err = directory_absence_to_empty(directory_403("domainPolicy"))
+            .expect_err("policy block propagates");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
+        );
     }
 }

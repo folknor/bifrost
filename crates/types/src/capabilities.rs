@@ -224,6 +224,15 @@ pub struct PimMethodSupport {
     pub contact_delete: bool,
     pub contact_search: bool,
     pub contact_autocomplete: bool,
+    /// Native organization-directory / Global Address List search
+    /// (`directory_search`). Microsoft Graph `/users`, Google People
+    /// `listDirectoryPeople` / `searchDirectoryPeople`. The directory corpus is
+    /// org-wide and read-only, distinct from the per-account address books
+    /// `contact_search` serves. `true` only on Graph and Gmail; `false` ->
+    /// `directory_search` returns `Unsupported(DirectorySearch)` (JMAP, IMAP,
+    /// CalDAV, CardDAV). Replaces ratatoskr's consumer-side `match provider`
+    /// in `handlers/gal.rs` (closes the A8 provider-identity leak A-2).
+    pub directory_search: bool,
     // Calendar primitives and conveniences.
     pub calendars_list: bool,
     pub events_in_range: bool,

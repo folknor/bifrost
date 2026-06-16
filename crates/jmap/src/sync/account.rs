@@ -7,14 +7,14 @@ use bifrost_types::{
     AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent,
     ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId,
-    EventPatch, EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
-    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    CursorEstablishment, CursorScope, DirectoryCard, DraftHandle, DraftPatch, ErrorScope,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
+    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -817,6 +817,20 @@ impl Account for JmapAccount {
         request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         contacts::search(self.contacts.clone(), request)
+    }
+
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::DirectorySearch,
+            None,
+            "JMAP has no organization-directory concept",
+        );
+        Box::pin(async move { Err(err) })
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

@@ -74,6 +74,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             contact_delete: true,
             contact_search: true,
             contact_autocomplete: true,
+            directory_search: true,
             calendars_list: true,
             events_in_range: true,
             event_get: true,
@@ -178,6 +179,7 @@ mod tests {
         assert!(caps.pim_methods.contact_delete);
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
+        assert!(caps.pim_methods.directory_search);
     }
 
     #[test]

@@ -23,14 +23,14 @@ use bifrost_types::{
     AccountOperation, AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle,
     ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta, ContactCard,
     ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection,
-    QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
-    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
+    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
+    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -631,6 +631,15 @@ impl Account for GoogleAccount {
         request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         contacts::search(Arc::clone(&self.client), request)
+    }
+
+    fn directory_search(
+        &self,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        contacts::directory_search(Arc::clone(&self.client), query, limit, page_cursor)
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

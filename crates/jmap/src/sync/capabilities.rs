@@ -159,6 +159,7 @@ pub(crate) fn build(
             contact_delete: support.contacts,
             contact_search: support.contacts,
             contact_autocomplete: support.contacts,
+            directory_search: false,
             calendars_list: support.calendar,
             events_in_range: support.calendar,
             event_get: support.calendar,

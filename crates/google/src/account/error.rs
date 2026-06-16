@@ -866,6 +866,8 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         | AccountOperation::DiscoverMemberships
         | AccountOperation::ScopeLifecycle
         | AccountOperation::QuotaGet => "gmail.readonly",
+        // Organization-directory lookup uses the People directory scope.
+        AccountOperation::DirectorySearch => "directory.readonly",
         // Push watch CRUD requires the metadata scope at minimum;
         // Pub/Sub still uses the user mailbox surface.
         AccountOperation::PushSubscribe

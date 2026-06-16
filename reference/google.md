@@ -52,9 +52,9 @@ Internal modules:
   builder (sets `X-Upload-Content-*`, which typed `post` cannot); the
   pre-authed chunk PUT skips auth (`.without_bearer_auth()`) and
   resumes on 308 via `Range: bytes=0-N` - an absent/unparseable 308
-  `Range` is a hard failure, never a silent `offset = end` gap-skip.
-  Then a `permissions` POST (`type: anyone` / `type: domain` + account
-  domain) and a `webViewLink` GET. The 308 reaches the loop only via
+  `Range` is a hard failure, never a silent gap-skip. Then a
+  `permissions` POST (`type: anyone` / `type: domain` + account domain)
+  and a `webViewLink` GET. The 308 reaches the loop only via
   bifrost-net's missing-`Location` passthrough.
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
@@ -88,8 +88,7 @@ account-scoped clone attached to `bifrost-net` under the engine
 - `scope_cache: Arc<RwLock<ScopeSnapshot>>` for the label list.
 - `shutdown: CancellationToken` for the renewer and the
   lifecycle stream.
-- `set_priority` / `set_bandwidth_cap` delegate to the underlying
-  `AccountNet`; the transport owns the knobs.
+- `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
 Clients (`from_access_token` or `from_token_source`) retain their parent
 `Net`, so `open(account_id)` mints a fresh `AccountNet` under the engine
@@ -102,48 +101,42 @@ again with the same `AccountId`. The factory holds the credentials and
 client, so the new `GoogleAccount` carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
 
-`close()` is idempotent. It marks `closed`, cancels `shutdown`,
-and aborts the Pub/Sub renewer task. The renewer task selects on
-`shutdown.cancelled()` and exits cleanly. `push_stream` exits
-on the same cancellation token.
+`close()` is idempotent: it marks `closed`, cancels `shutdown`, and aborts the
+Pub/Sub renewer. The renewer and `push_stream` both select on
+`shutdown.cancelled()` and exit cleanly.
 
 ## Capabilities
 
 `gmail_capabilities()` in `capabilities.rs`:
 
-- `cursor_freshness: CursorFreshness::ServerIssued`. The
-  `historyId` is server-issued and monotone per account; trusted
-  as a freshness signal without a local clock.
-- `blob_range: BlobRangeSupport::No`. Gmail attachments arrive
-  base64url inside a JSON envelope with no HTTP Range surface;
-  `open_blob_range` enforces the unsupported case early.
+- `cursor_freshness: CursorFreshness::ServerIssued`. The `historyId` is
+  server-issued and monotone per account; trusted without a local clock.
+- `blob_range: BlobRangeSupport::No`. Gmail attachments arrive base64url inside
+  a JSON envelope with no HTTP Range surface; `open_blob_range` enforces it.
 - `blob_digest_pre_download: false`. Attachment metadata carries
   no digest separate from the body.
-- `push: PushCapability::OutOfProcessPubsub`. Push lives on
-  Cloud Pub/Sub, not a connection bifrost owns.
-  `push_in_process()` is false; consumers wire their own subscriber
-  and feed `InvalidationSink`.
+- `push: PushCapability::OutOfProcessPubsub`. Push lives on Cloud Pub/Sub, not a
+  connection bifrost owns; `push_in_process()` is false and consumers wire their
+  own subscriber feeding `InvalidationSink`.
 - `mutation.concurrency: MutationConcurrency::None`. No
   optimistic-concurrency primitive on `batchModify`; the engine's
   read-back guard is the lost-update safety net.
-- `mutation.replay_safety: MutationReplaySafety::None`. No
-  client-mintable dedup token, so the shared `IdempotencyKey` is
-  held engine-side, not wired onto the request.
+- `mutation.replay_safety: MutationReplaySafety::None`. No client-mintable
+  dedup token; the shared `IdempotencyKey` is held engine-side.
 - `batching_policy: BatchingPolicy { max_items: 1000, max_wait:
   75ms, flush_on_input_close: true }`. 1000 = Gmail's `batchModify`
   cap.
 - `rate_limit_class: RateLimitClass::Tiered`. Per-user quota units,
   not a uniform rps cap.
-- `quota_signal: QuotaSignal::QuotaUnits`.
+- `quota_signal: QuotaUnits`.
 - `requires_uidvalidity_recheck: false`. Gmail has no
   UIDVALIDITY model.
-- `historyid_expires_after: None`. No documented `historyId`
-  retention window; expiry is detected reactively via
-  `classify_history_error` (404/410 -> `RestartScope`), not on a
-  timer. `describe_cursor` reports `CostClass::Expensive` only when
-  the cursor envelope no longer decodes against the open account's
-  email-address; that flips `SyncStrategy::ServerCursor` ->
-  `None` and `freshness` -> `None`, prompting re-establish.
+- `historyid_expires_after: None`. No documented `historyId` retention window;
+  expiry is detected reactively via `classify_history_error` (404/410 ->
+  `RestartScope`), not on a timer. `describe_cursor` reports
+  `CostClass::Expensive` only when the cursor envelope no longer decodes against
+  the open account's email-address; that flips `SyncStrategy::ServerCursor` and
+  `freshness` to `None`, prompting re-establish.
 - `delta_token_expires_after: None`.
 - `pim_methods`:
   - Supported: `add_to_container`, `remove_from_container`,
@@ -155,18 +148,18 @@ on the same cancellation token.
     `vacation_set`, `thread_hydrate`, `message_hydrate`,
     `address_books_list`, `contacts_list`, `contact_get`,
     `contact_create`, `contact_update`, `contact_delete`,
-    `contact_search`, `contact_autocomplete`, `calendars_list`,
+    `contact_search`, `contact_autocomplete`, `directory_search`,
+    `calendars_list`,
     `events_in_range`, `event_get`, `event_create`,
     `event_update`, `event_delete`, `event_rsvp`, `event_search`,
     `event_autocomplete`, and `host_attachment` (Drive hosting).
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `set_importance` (Gmail has no
-    message-importance field), `attachment_upload`,
-    `container_move`, `scheduled_send`, and `quota_get`. The Gmail
-    REST API has no scheduled-send lever (it is web-UI only), so a
-    `SendRequest::scheduled.is_some()` is rejected `Unsupported(Send)`
-    before any wire call, and `cancel_scheduled_send` /
-    `reschedule_send` are `Unsupported`.
+    message-importance field), `attachment_upload`, `container_move`,
+    `scheduled_send`, and `quota_get`. The Gmail REST API has no
+    scheduled-send lever (web-UI only), so a scheduled `SendRequest` is
+    rejected `Unsupported(Send)` before any wire call, and
+    `cancel_scheduled_send` / `reschedule_send` are `Unsupported`.
 - `filter_rule_shape: Rules`. Gmail filters are wired for
   list/create/delete plus local validation; `filter_update` is
   unsupported (no update/replace endpoint).
@@ -191,7 +184,7 @@ Mail mutation primitives use Gmail label modification:
 - `set_label_membership` is the same add/remove label operation.
 - `set_is_read` flips Gmail's `UNREAD` label with inverted polarity.
 - `set_keyword`, `set_category`, `set_extended_property`, and
-  `set_importance` return `AccountError::Unsupported`.
+  `set_importance` are `Unsupported` (see the capability list above).
 - The Archive container is synthetic: adding to Archive removes
   `INBOX`; removing from Archive is a no-op (archive is the absence
   of the Inbox label, not a native label).
@@ -262,24 +255,34 @@ provenance dispatch for Gmail label ids.
 
 People contacts use `people/me/connections`, `people:get`,
 `people:createContact`, `people:updateContact`, and `people:deleteContact`.
-Update fetches the raw `Person`, requires the server ETag, and replaces
-only fields named by the shared `ContactPatch`. Display-name updates rewrite the first modeled name's
-given/family split while preserving unmodeled People name fields and
-additional name entries from the raw payload. Custom email and phone
-labels use People `type=custom` plus `formattedType`; postal addresses
-map through the shared `ContactAddress` model. Contact search sends the
-People empty-query warmup request before the requested `searchContacts`
-query so the cache is populated after mutations.
-The account exposes the synthetic `google:contacts` address book plus
-People `contactGroups.list` groups. List/search accept no id,
-`google:contacts`, or `contactGroups/*` ids; group-scoped queries filter
-returned contacts by `contactGroupMembership`, and group-scoped creates
-include the matching People membership. Contact photos are read-only through the shared
-`photo_url`; URL update attempts return unsupported because People
-`updateContactPhoto` requires image bytes, not a URL. Raw
-`ContactPatch.photo` updates call `updateContactPhoto` (its field mask
-travels in the body, not the URL), and clearing that field calls
-`deleteContactPhoto`.
+Update fetches the raw `Person`, requires the server ETag, and replaces only
+fields named by the shared `ContactPatch`. Display-name updates rewrite the
+first modeled name's given/family split while preserving unmodeled People name
+fields and additional name entries. Custom email and phone labels use People
+`type=custom` plus `formattedType`; postal addresses map through the shared
+`ContactAddress` model. Contact search sends the People empty-query warmup
+before `searchContacts` so the cache is populated after mutations. The account
+exposes the synthetic `google:contacts` address book plus People
+`contactGroups.list` groups. List/search accept no id, `google:contacts`, or
+`contactGroups/*` ids; group-scoped queries filter returned contacts by
+`contactGroupMembership`, and group-scoped creates include the matching People
+membership. Contact photos are read-only through the shared `photo_url`; URL
+update attempts return unsupported because People `updateContactPhoto` requires
+image bytes, not a URL. Raw `ContactPatch.photo` updates call
+`updateContactPhoto` (its field mask travels in the body, not the URL), and
+clearing that field calls `deleteContactPhoto`.
+
+`directory_search` (organization directory / GAL, distinct from the personal
+`contact_search` corpus) returns `Page<DirectoryCard>`. An empty query
+enumerates via `people:listDirectoryPeople` (no warmup); a non-empty query runs
+`people:searchDirectoryPeople`, preceded by an empty-query warmup like the
+`searchContacts` family. Both use `sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE`
+and a `names,emailAddresses,phoneNumbers,organizations` readMask; email-less
+rows are dropped, the first email is the key and the rest fill
+`additional_emails`. Accounts with no directory (personal Gmail, or missing the
+`directory.readonly` scope) answer 403; the impl swallows the directory-absence
+classifications (`PermissionDenied`, `InsufficientScope`) to an empty page,
+while `PolicyBlocked` (a real admin refusal) propagates.
 
 Google Calendar RSVP fetches the raw event, updates only the matching
 account attendee's `responseStatus`, and sends the attendee array back
@@ -323,13 +326,11 @@ wrong protocol, wrong envelope version, and wrong schema
 version, mapping each to `AccountError::SchemaIncompatible`.
 JSON deserialization errors map to `AccountError::Other`.
 
-`decode_gmail_state_for_profile` layers an
-identity check on top: the decoded `profile_email` must equal
-the open account's `email_address`. A mismatch returns
-`AccountError::Other` describing both sides; this is the
-account-identity check that prevents a checkpoint from one
-Google account being replayed into another (for example after
-the consumer rotates accounts under the same persistence key).
+`decode_gmail_state_for_profile` layers an identity check on top: the decoded
+`profile_email` must equal the open account's `email_address`. A mismatch
+returns `AccountError::Other` describing both sides, preventing a checkpoint
+from one Google account being replayed into another (for example after the
+consumer rotates accounts under the same persistence key).
 
 `cursor_from_state` projects to
 `ChangeCursor { scope: CursorScope::Account, server_state,
@@ -491,11 +492,9 @@ Flag canonicalization in `flags.rs`:
 - A canonical flag set is hashed (FNV-1a) into the
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 
-Gmail does not accept a client-mintable idempotency header on
-these endpoints. The mutation impls take the shared
-`IdempotencyKey` argument and hold it engine-side rather than
-wiring it onto the request, keeping the no-wire-token posture
-explicit at the call sites.
+Gmail accepts no client-mintable idempotency header on these endpoints, so the
+mutation impls take the shared `IdempotencyKey` and hold it engine-side rather
+than wiring it onto the request.
 
 ## Blobs
 
@@ -507,9 +506,9 @@ by `Done`.
 
 `open_blob_range` short-circuits with a Fatal carrying
 `AccountError::RangeNotSupported` when the handle's `supports_range`
-is false - the builder always sets it false for Gmail blobs, so this
-is the authoritative "no". The range-supporting branch (slicing the
-decoded buffer) exists for trait symmetry but is unreachable.
+is false - the builder always sets it false for Gmail blobs. The
+range-supporting branch (slicing the decoded buffer) exists for trait
+symmetry but is unreachable.
 
 `blob_handles_for_message` walks the MIME tree, surfacing any part
 whose `body.attachment_id` is set. Inline bodies (no attachment id)
@@ -536,10 +535,9 @@ Mapping highlights:
   `Authentication(ReauthorizationRequired)` -> `AuthLost`.
 - Authorization failures (HTTP 403 outside the quota path) ->
   `Authorization(PermissionDenied)` -> `NoPermission`. The
-  `InsufficientScope::needed` carrier is selected per
-  `AccountOperation` via `gmail_scope_for` (`gmail.send`,
-  `gmail.compose`, `gmail.labels`, `gmail.modify`, `gmail.readonly`,
-  `gmail.metadata`, `gmail.settings.basic`).
+  `InsufficientScope::needed` carrier is selected per `AccountOperation` via
+  `gmail_scope_for` (`gmail.send`/`compose`/`labels`/`modify`/`readonly`/
+  `metadata`/`settings.basic`, and `directory.readonly` for `DirectorySearch`).
 - Transport network failures (DNS, TLS, timeout) ->
   `Transport(_)` with an `AttemptCause` whose
   `transmission_state` carries the wire-level evidence; the
@@ -573,41 +571,24 @@ Mapping highlights:
   variants produce `SyncState(SchemaIncompatible)` ->
   `Engine(SchemaIncompatible)` so the engine clears the cursor.
 
-`mutation_error(ids, error, ctx)` is the per-id fan-out for
-batched mutations: it translates the single crate-level error
-once via `into_account_error` and produces one
-`ItemOutcome::Failed(BatchFailure { error: account_error.clone(),
-.. })` per submitted id - `AccountError` is `Arc<Inner>`-backed,
-so the per-id clones share storage.
+`mutation_error(ids, error, ctx)` is the per-id fan-out for batched mutations:
+it translates the crate-level error once via `into_account_error` and produces
+one `ItemOutcome::Failed(BatchFailure { error: account_error.clone(), .. })` per
+id - `AccountError` is `Arc<Inner>`-backed, so the clones share storage.
 
 ## Known limitations
 
-- Only `CursorScope::Account`; no thread, label, or query scope.
-  Inventory, push, and cursor establishment return `Unsupported` or
-  `SyncEvent::Terminated(AccountError)` for non-Account scopes.
-- No blob range; `BlobRangeSupport::No`, enforced by `open_blob_range`.
-- Push requires a consumer-supplied Pub/Sub topic.
-  `with_pubsub_config` is the only entry point; without it
-  `push_subscribe` is `Unsupported`.
-- `historyId` expiry is reactive: no advertised TTL;
-  `classify_history_error` upgrades 404/410 on the history endpoint
-  to a scope restart.
-- Mutation concurrency is `None` and replay safety is `None`. Gmail has
-  no `If-Match` on `batchModify` and no dedup header; calendar mutations
-  also write blind. The read-back-after-retry path is the safety net.
-- The Pub/Sub message body is parsed out of process. The Account
-  layer owns the watch lifecycle and `WatchEvent::Reconnected` /
-  `Disconnected`; it does not decode incoming Pub/Sub envelopes.
-- No independent message attachment-upload primitive; callers send
-  inline bytes in `SendRequest` / `DraftPatch`. (Large over-limit
-  attachments go through `host_attachment` -> Drive instead.)
-- Gmail labels are flat; `container_move` is unsupported.
-- Gmail profile data does not expose storage quota bytes;
-  `quota_get` is unsupported.
-- Replied and forwarded state are not writeable Gmail flags through
-  this API. The corresponding convenience dispatch flags are false.
+- Only `CursorScope::Account`; non-Account scopes return `Unsupported`.
+- No blob range (`BlobRangeSupport::No`); push requires a consumer-supplied
+  Pub/Sub topic (`with_pubsub_config`), else `push_subscribe` is `Unsupported`.
+- `historyId` expiry is reactive (no advertised TTL); mutation concurrency and
+  replay safety are `None` (no `If-Match`, no dedup header on `batchModify`,
+  calendar writes blind) - the read-back-after-retry path is the safety net.
+- No independent message attachment-upload primitive (callers send inline bytes;
+  over-limit attachments go through `host_attachment` -> Drive); flat labels, so
+  `container_move` is unsupported; no storage-quota bytes, so `quota_get` is
+  unsupported; replied/forwarded are not writeable Gmail flags.
 - Server-side Gmail filters map to typed rules. Direct criteria
-  (`from`/`to`/`subject`/attachment/size) plus native query strings
-  surface as `FilterCondition::ProviderExpression`. Writes reject
-  names, disabled rules, stop-processing, and unstorable actions.
-  `filter_update` is unsupported.
+  (`from`/`to`/`subject`/attachment/size) plus native query strings surface as
+  `FilterCondition::ProviderExpression`. Writes reject names, disabled rules,
+  stop-processing, and unstorable actions. `filter_update` is unsupported.

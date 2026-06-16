@@ -554,7 +554,7 @@ value. Group A below is that high-value set.
 
 | # | ratatoskr leak | absorption | status | brick |
 |---|---|---|---|---|
-| A-2 | `handlers/gal.rs` `match provider` for GAL | directory/GAL primitive + `directory_search` flag | NEEDS (open) | A9 (split out of A8) |
+| A-2 | `handlers/gal.rs` `match provider` for GAL | directory/GAL primitive + `directory_search` flag | RESOLVED - landed as brick A9 | A9 (split out of A8) |
 | A-3 | `auto_responses.rs` six per-provider free fns | `vacation_get`/`set` flags exist; audience+date model-mapping into impls | RESOLVED (bifrost) - consumer rewrite is Track B B6 | A8 |
 | A-4 | `actions/contacts.rs` `match source:&str` + two body builders | `contact_*` flags exist; per-provider mapping into impls | RESOLVED (bifrost, post-A7) - consumer rewrite is Track B B4 | A8 + A7 (CardDAV) |
 | A-5 | `calendar/actions.rs` `match CalendarProvider` | `event_*` flags exist; mapping into impls | RESOLVED (bifrost, post-A7) - consumer rewrite is Track B B8 | A8 + A7 (CalDAV) |
@@ -564,7 +564,9 @@ GAL (A-2) is under-served by "just a flag" - ratatoskr has real Graph and Google
 directory impls that need a home, so it was split out of A8 into its own brick
 (A9 in `ratatoskr-adoption.md`): a `directory_search` primitive with two
 asymmetric backends over a different corpus from personal `contact_search`, plus
-a CardDAV leg and a `directory_search` flag. It is standalone and still open.
+a `directory_search` flag. RESOLVED - landed as brick A9: Graph `/users` and
+Google People backends, `Unsupported(DirectorySearch)` on the other four (the
+CardDAV directory-gateway leg is a named follow-up, not part of A9).
 
 ### Group B - model-mapping warts already behind `ProviderOps`
 
@@ -599,7 +601,7 @@ QRESYNC-CONDSTORE-Basic / IDLE / client-side threads -> ALREADY (shared mailboxe
 
 ### A8 priority (most forces a consumer `match provider`)
 
-1. GAL (A-2) - split out to its own brick A9, still open. 2. `LabelKind` +
+1. GAL (A-2) - split out to its own brick A9, RESOLVED (landed). 2. `LabelKind` +
 Graph-importance intent expansion (B-1, densest) - RESOLVED (A8): uniform
 `Importance` + `set_importance`. 3. Scheduled send (C-2 / A4) - landed. 4. IMAP
 send (C-1 / A2) - landed. 5. Contacts/calendar/auto-response dispatch (A-3/4/5) -
@@ -608,9 +610,9 @@ Track B. (Cloud attachments, the former top priority A-1 / A6, has landed.) Stil
 open under A8: C-3 (builds on A5a, now landed; send-as leg still open), A-6
 (policy), graph-S1/graph-N3, and the Track-B-driven tail.
 
-**Independence:** standalone now - A-2 (now A9), graph-S1, graph-N3, A-6
-(policy). RESOLVED (A8) - B-1 (importance), B-2 (`graph-N1`), B-3 (draft-update
-new-id confirm), B-4 (MDN). Needs A1 - A6, A3, A2. Chained - A4 needs A2; C-3
+**Independence:** standalone now - graph-S1, graph-N3, A-6 (policy). RESOLVED -
+A-2 (brick A9, landed). RESOLVED (A8) - B-1 (importance), B-2 (`graph-N1`),
+B-3 (draft-update new-id confirm), B-4 (MDN). Needs A1 - A6, A3, A2. Chained - A4 needs A2; C-3
 builds on A5a (landed); A-4/A-5 CalDAV/CardDAV legs needed A7 (now landed, so
 A-3/4/5 are RESOLVED on the bifrost side).
 
@@ -651,5 +653,5 @@ enum parallels `MailProviderKind` (divergence risk); contact dispatch keys on a
    variant). **A5c (IMAP NAMESPACE)** and **A5a (Graph delegate + JMAP shared)**
    LANDED; only **A5b (EWS, size-L unknown)** remains.
 5. **A7** - independent; fold the DAV robustness guards in.
-6. **A8** - standalone warts anytime; B-driven tail closes near the end. Consider
-   pulling **GAL (A-2)** out as its own small brick.
+6. **A8** - standalone warts anytime; B-driven tail closes near the end.
+   **GAL (A-2)** was pulled out as its own brick **A9** - RESOLVED, landed.

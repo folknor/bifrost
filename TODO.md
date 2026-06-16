@@ -325,6 +325,19 @@ Nits:
   cleaned out of the other three mappers; left because the explicit
   arms read as intentional documentation.
 
+## A9 (directory search) follow-ups
+
+- **a9-1 (carddav)** RFC 6352 directory-gateway leg. `directory_search`
+  is `Unsupported(DirectorySearch)` on CardDAV; a server may advertise an
+  optional read-only directory-gateway address book, but gateway discovery
+  is a substantial provider-specific unknown with no ratatoskr precedent.
+  Scoped out of A9 to keep the blast radius bounded.
+- **a9-2 (graph)** `/users` `otherMails` / `proxyAddresses` into
+  `DirectoryCard.additional_emails` (A9 ships the single `mail`).
+- **a9-3 (graph)** `$search` (with `ConsistencyLevel: eventual`) as a
+  richer substring directory match than the current `startswith` prefix
+  `$filter`, if needed.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

@@ -641,6 +641,15 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::ContactSearch)
     }
 
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        unsupported_future(AccountOperation::DirectorySearch)
+    }
+
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();

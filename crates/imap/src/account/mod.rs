@@ -11,12 +11,12 @@ use bifrost_types::{
     Account, AccountError, AccountFuture, AccountOperation, AccountStream, AttachmentHandle,
     BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
     ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container,
-    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterValidation, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey,
+    Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope,
+    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
+    RsvpStatus, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
     WatchEvent,
 };
@@ -702,6 +702,15 @@ impl Account for ImapAccount {
             return contacts.contact_search(request);
         }
         unsupported_future(AccountOperation::ContactSearch)
+    }
+
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        unsupported_future(AccountOperation::DirectorySearch)
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

@@ -7,15 +7,16 @@ use bifrost_types::{
     AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar,
     CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCreate,
     ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DraftHandle,
-    DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    FlagOp, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity,
-    IdentityId, IdentityPatch, Importance, InventoryEntry, InventoryPartition,
-    InventoryPartitioning, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
-    ObjectChange, ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary,
-    Priority, ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
-    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
+    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry,
+    InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectChange, ObjectChangeKind, ObjectId, ObjectType,
+    OpaqueChangeState, Page, PageBoundary, Priority, ProtocolKind, QuotaInfo, RsvpStatus,
+    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
+    ServerFilterPatch, ServerVersion, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
+    ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -941,6 +942,15 @@ impl Account for CardDavAccount {
         })
     }
 
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        unsupported_future(AccountOperation::DirectorySearch)
+    }
+
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
         unsupported_future(AccountOperation::CalendarsList)
     }
@@ -1389,6 +1399,21 @@ mod tests {
         assert_eq!(
             err.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
+        );
+    }
+
+    #[tokio::test]
+    async fn carddav_directory_search_unsupported() {
+        // CardDAV exposes no organization directory; the flag is false (Default)
+        // and the leg returns `Unsupported(DirectorySearch)`.
+        assert!(!carddav_capabilities().pim_methods.directory_search);
+
+        let err = unsupported_future::<Page<DirectoryCard>>(AccountOperation::DirectorySearch)
+            .await
+            .expect_err("carddav directory_search is unsupported");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::DirectorySearch)
         );
     }
 

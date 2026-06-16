@@ -15,16 +15,16 @@ use bifrost_types::{
     Batch, BatchingPolicy, BlobHandle, BlobRangeSupport, ByteRange, Calendar, CalendarEvent, Cause,
     Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, Container, ContainerId, ContainerKind, ConvenienceShape, CostClass,
-    CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DraftHandle, DraftPatch,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape,
-    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
-    MembershipScope, Message, MutationCapabilities, MutationConcurrency, MutationReplaySafety,
-    MutationSuccess, MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority,
-    Projection, PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard,
+    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
+    FilterRuleShape, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
+    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
+    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
+    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
+    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::stream;
@@ -555,6 +555,15 @@ impl Account for StubAccount {
         _request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::ContactSearch)) })
+    }
+
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
+        Box::pin(async { Err(unsupported(AccountOperation::DirectorySearch)) })
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

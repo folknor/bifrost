@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountError, AccountOperation, AddressBook, AddressBookId, ContactAddress, ContactCard,
     ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone,
-    ContactProvenance, ContactSearchRequest, ErrorScope, Page, ProtocolKind,
+    ContactProvenance, ContactSearchRequest, DirectoryCard, ErrorScope, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -213,6 +213,100 @@ pub(crate) async fn search(
         items,
         next_cursor,
         estimated_total: None,
+    })
+}
+
+const DIRECTORY_SELECT: &str = "displayName,mail,businessPhones,companyName,jobTitle,department";
+
+/// Organization-directory (Global Address List) search over `/users`.
+///
+/// An empty `query` enumerates the directory; a non-empty `query` pushes
+/// a provider-side `startswith(displayName,..) or startswith(mail,..)`
+/// `$filter`. A 403 from a tenant that has not granted directory read
+/// (`User.ReadBasic.All` / `User.Read.All`) maps through `into_error` to
+/// a real `NoPermission` `AccountError` - unlike Google, an unauthorized
+/// directory is an error here, not an empty result.
+pub(crate) async fn directory_search(
+    account: GraphAccount,
+    query: String,
+    limit: Option<u32>,
+    page_cursor: Option<Vec<u8>>,
+) -> Result<Page<DirectoryCard>, AccountError> {
+    let limit_cap = limit
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(250)
+        .max(1);
+    let next_url = page_cursor
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|error| {
+            graph_error::unsupported_account_error(AccountOperation::DirectorySearch)
+                .into_builder()
+                .scope(ErrorScope::ContactCollection)
+                .text(bifrost_types::DiagnosticText::support_only(
+                    error.to_string(),
+                ))
+                .try_build()
+                .expect("valid account error classification")
+        })?;
+    let mut url = next_url.unwrap_or_else(|| {
+        let prefix = account.client.api_path_prefix();
+        let top = limit.unwrap_or(250).min(999);
+        directory_search_path(&prefix, &query, top)
+    });
+    let mut items = Vec::new();
+    let next_cursor;
+    loop {
+        let page: ODataCollection<GraphDirectoryUser> =
+            get_page(&account, &url, AccountOperation::DirectorySearch).await?;
+        items.extend(page.value.into_iter().filter_map(directory_user_to_card));
+        if items.len() >= limit_cap {
+            items.truncate(limit_cap);
+            next_cursor = page.next_link.map(String::into_bytes);
+            break;
+        }
+        let Some(next) = page.next_link else {
+            next_cursor = None;
+            break;
+        };
+        url = next;
+    }
+    Ok(Page {
+        items,
+        next_cursor,
+        estimated_total: None,
+    })
+}
+
+fn directory_search_path(prefix: &str, query: &str, top: u32) -> String {
+    let base = format!("{prefix}/users?$select={DIRECTORY_SELECT}&$top={top}");
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return base;
+    }
+    let escaped = trimmed.replace('\'', "''");
+    let filter = format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')");
+    format!(
+        "{base}&$filter={}",
+        bifrost_net::url::encode_component(&filter)
+    )
+}
+
+/// Project one `/users` directory row into a `DirectoryCard`. Returns
+/// `None` when `mail` is absent or empty (matching ratatoskr's mail-less
+/// drop). `additional_emails` is empty in A9 - `otherMails` /
+/// `proxyAddresses` is a named follow-up.
+fn directory_user_to_card(user: GraphDirectoryUser) -> Option<DirectoryCard> {
+    let email = user.mail.filter(|mail| !mail.is_empty())?;
+    Some(DirectoryCard {
+        email,
+        display_name: user.display_name,
+        additional_emails: Vec::new(),
+        phones: user.business_phones.unwrap_or_default(),
+        company: user.company_name,
+        title: user.job_title,
+        department: user.department,
+        provider: ProtocolKind::Graph,
     })
 }
 
@@ -633,6 +727,17 @@ struct GraphContactFolder {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct GraphDirectoryUser {
+    display_name: Option<String>,
+    mail: Option<String>,
+    business_phones: Option<Vec<String>>,
+    company_name: Option<String>,
+    job_title: Option<String>,
+    department: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphContact {
     id: String,
     #[serde(rename = "@odata.etag")]
@@ -938,5 +1043,62 @@ mod tests {
             contact_search_path("/me", None, "ada lovelace@example.test", 25),
             format!("/me/contacts?$select={CONTACT_SELECT}&$top=25")
         );
+    }
+
+    #[test]
+    fn directory_search_url_escapes_query_into_startswith_filter() {
+        let path = directory_search_path("/me", "O'Hara", 50);
+        assert!(path.starts_with(&format!("/me/users?$select={DIRECTORY_SELECT}&$top=50")));
+        // The single quote is doubled, and the whole filter is URL-encoded.
+        let filter = "startswith(displayName,'O''Hara') or startswith(mail,'O''Hara')";
+        assert!(path.contains(&format!(
+            "&$filter={}",
+            bifrost_net::url::encode_component(filter)
+        )));
+    }
+
+    #[test]
+    fn directory_search_empty_query_omits_filter() {
+        assert_eq!(
+            directory_search_path("/me", "", 999),
+            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+        );
+        // Whitespace-only is treated as empty.
+        assert_eq!(
+            directory_search_path("/me", "   ", 999),
+            format!("/me/users?$select={DIRECTORY_SELECT}&$top=999")
+        );
+    }
+
+    #[test]
+    fn directory_user_to_card_drops_mailless_and_maps_fields() {
+        // No mail -> dropped.
+        let mailless = GraphDirectoryUser {
+            display_name: Some("No Mail".to_string()),
+            mail: None,
+            business_phones: None,
+            company_name: None,
+            job_title: None,
+            department: None,
+        };
+        assert!(directory_user_to_card(mailless).is_none());
+
+        let user = GraphDirectoryUser {
+            display_name: Some("Ada Lovelace".to_string()),
+            mail: Some("ada@example.test".to_string()),
+            business_phones: Some(vec!["+15551234".to_string()]),
+            company_name: Some("Analytical Engines".to_string()),
+            job_title: Some("Programmer".to_string()),
+            department: Some("Research".to_string()),
+        };
+        let card = directory_user_to_card(user).expect("maps to card");
+        assert_eq!(card.email, "ada@example.test");
+        assert_eq!(card.display_name.as_deref(), Some("Ada Lovelace"));
+        assert!(card.additional_emails.is_empty());
+        assert_eq!(card.phones, vec!["+15551234".to_string()]);
+        assert_eq!(card.company.as_deref(), Some("Analytical Engines"));
+        assert_eq!(card.title.as_deref(), Some("Programmer"));
+        assert_eq!(card.department.as_deref(), Some("Research"));
+        assert_eq!(card.provider, ProtocolKind::Graph);
     }
 }

@@ -40,6 +40,7 @@ use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycleEvent,
 };
+use crate::directory::DirectoryCard;
 use crate::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ItemOutcome,
     MutationSuccess, RequestCause,
@@ -594,6 +595,23 @@ pub trait Account: Send + Sync {
         &self,
         request: ContactSearchRequest,
     ) -> AccountFuture<Result<Page<ContactCard>, AccountError>>;
+
+    /// Search the organization directory (Global Address List). The directory
+    /// is the org-wide, read-only address corpus - distinct from the per-account
+    /// address books `contact_search` serves. An empty `query` enumerates the
+    /// directory (page through `Page::next_cursor` to exhaust it); a non-empty
+    /// `query` is a provider-side lookup. `limit` caps the page; `page_cursor`
+    /// resumes from a prior `Page::next_cursor`.
+    ///
+    /// Gated by `capabilities().pim_methods.directory_search`. Accounts without
+    /// a directory (JMAP, IMAP, CalDAV, CardDAV) leave the flag `false` and
+    /// return `Unsupported(DirectorySearch)`.
+    fn directory_search(
+        &self,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>>;
 
     // ------------------------------------------------------------
     // Calendar primitives (S4-W1)

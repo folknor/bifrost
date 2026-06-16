@@ -528,6 +528,19 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::ContactSearch)) })
     }
 
+    fn directory_search(
+        &self,
+        _query: String,
+        _limit: Option<u32>,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryCard>, AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::DirectorySearch,
+            ))
+        })
+    }
+
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::CalendarsList)) })
     }
