@@ -8,10 +8,8 @@ The public consumer surface is intentionally small after S1-W3:
 construct the factory and use it through
 `Arc<dyn bifrost_types::AccountFactory>`; raw IMAP, ManageSieve,
 parser, command, protocol-error, and sync helper surfaces are
-crate-internal implementation detail.
-`ImapAccountConfig::with_carddav(CardDavConfig)` composes the
-standalone `bifrost-carddav` account for contact primitives when an
-IMAP mail account has paired DAV settings.
+crate-internal implementation detail. CardDAV/CalDAV composition
+(`with_carddav`/`with_caldav`) is covered under "Account layer".
 
 ## Driver-owned I/O
 
@@ -66,17 +64,13 @@ Buffered `uid_fetch()` uses the driver buffer path directly, not the streaming c
 password)`, `oauth2(identity, access_token)` (raw string), and
 `oauth2_source(identity, Arc<dyn TokenSource>)` (shared rotation source)
 constructors. The OAuth variant holds an `Arc<dyn TokenSource>`
-(bifrost-net's trait), read via `current().await` at connect and on
-every reconnect through the same per-connect point in
-`authenticate_best` (and the ManageSieve auth path) - so a token rotated
-on the shared source is presented fresh on reconnect, closing the
-stale-token-on-reconnect path. Password secret material remains in the
+(bifrost-net's trait), read via `current().await` at every connect and
+reconnect (in `authenticate_best` and the ManageSieve auth path), so a
+token rotated on the shared source is presented fresh on reconnect.
+Password secret material remains in the
 internal `SecretString` wrapper, which zeroizes and redacts under
-`Debug`. `Credentials` is `Clone` only - the `PartialEq`/`Eq` it once
-derived is dropped (a live token source is not `Eq`; nothing compares
-credentials). Unlike SMTP's `Credentials`, IMAP's was never
-serde-derived, so that drop is the whole derive fallout. No
-`From<(String, String)>`.
+`Debug`. `Credentials` is `Clone` only (no `PartialEq`/`Eq` - a live
+token source is not `Eq`), and has no `From<(String, String)>`.
 
 Internal `AuthMechanism`: PLAIN, LOGIN, XOAUTH2, OAUTHBEARER,
 CRAM-MD5, SCRAM-SHA-1, SCRAM-SHA-256, and the channel-bound
@@ -96,7 +90,7 @@ the IMAP error model at the call boundary.
 
 `authenticate_best(credentials, policy)` intersects server-advertised, policy-allowed, and credentials-supported mechanisms, then runs the strongest match. SASL-IR is used when advertised or implied by IMAP4rev2. Malformed mechanism names are rejected before any wire write. `AuthOutcome` carries the selected mechanism.
 
-The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed preference order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection lives in the helper: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. `authenticate_best` walks the ladder; for a PLUS `Attempt` it resolves the `tls-server-end-point` binding once via `resolve_scram_binding()` (peer-cert DER fetch + `bifrost_sasl::tls_server_end_point`) and threads it into `authenticate_scram_with_binding`. A binding that cannot resolve (plaintext, EdDSA leaf cert, unsupported sig-alg) becomes a `ChannelBindingUnavailable` rejection; combined with the downgrade skip, an EdDSA-cert server advertising a `-PLUS` variant disables SCRAM entirely and falls through to PLAIN-over-TLS (RFC-compliant, credential stays encrypted). A direct `authenticate_scram_with_binding(.., TlsServerEndPoint, None, ..)` call surfaces the same failure as a typed `Error::AuthPolicy`.
+The password ladder is a pure helper `password_mechanism_ladder(profile, policy, is_encrypted)` returning `PasswordCandidate::{Attempt, Reject}` in the fixed order SCRAM-SHA-256-PLUS > SCRAM-SHA-1-PLUS > SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN > CRAM-MD5 > LOGIN. RFC 5802 Section 6 downgrade protection lives in the helper: when the server advertises `SCRAM-SHA-N-PLUS`, the matching unbound `SCRAM-SHA-N` rung becomes `Reject(ChannelBindingUnavailable)` so a MITM cannot strip the binding. `authenticate_best` walks the ladder; for a PLUS `Attempt` it resolves the `tls-server-end-point` binding once via `resolve_scram_binding()` (peer-cert DER + `bifrost_sasl::tls_server_end_point`). A binding that cannot resolve (plaintext, EdDSA leaf cert, unsupported sig-alg) becomes a `ChannelBindingUnavailable` rejection; combined with the downgrade skip, an EdDSA-cert server advertising `-PLUS` disables SCRAM entirely and falls through to PLAIN-over-TLS (credential stays encrypted).
 
 ## Typed IDs and sets
 
@@ -145,11 +139,11 @@ crate root also re-exports the factory and config types directly.
 
 Submodules:
 
-- `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter` / `MeterSink` wiring, optional CardDAV contact account open, `ID` probe, QRESYNC negotiation, initial folder LIST.
+- `factory.rs` - `ImapAccountConfig`, `AccountFactory::open(account_id)`, optional `BandwidthMeter`/`MeterSink` wiring, fail-soft CardDAV/CalDAV sub-account open (`DavAttach`), `ID` probe, QRESYNC negotiation, folder LIST.
 - `pool.rs` - per-folder connection checkout. Push lane reserves one slot; data lanes share the rest. Every dialed connection receives the account-scoped `MeterSinkHandle` and shared bandwidth-cap atomic when configured.
 - `folder_registry.rs` - mailbox map plus per-folder cursor cache and per-folder MODSEQ cache (`record_modseq`, `modseq`, `clear_modseqs`). Cache is keyed by `(folder, uidvalidity, uid)`, stores LIST delimiter / attributes for PIM containers, and clears on UIDVALIDITY change, delete, or rename.
 - `envelope.rs` - `FolderCursor` (QResync / Condstore / Basic) plus `encode_cursor`/`decode_cursor` over `OpaqueChangeState`.
-- `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group.
+- `capabilities.rs`, `inventory.rs`, `changes.rs`, `get.rs`, `blob.rs`, `mutate.rs`, `push.rs`, `close.rs`, `scopes.rs` - one file per `Account` method group. `mod.rs` holds `route_scope`/`ScopeHandler` (the sub-account dispatch router) and `scopes.rs` the discovery fan-in.
 - `pim.rs` - Stage 1 mail action surface: container membership, keyword/read mutations, search, folder CRUD, quota, draft create/discard, message/thread hydration, and IMAP-specific thread move/delete conveniences.
 - `sieve.rs` - optional ManageSieve client plus Stage 2 literal
   script filter list/create/update/delete/validate.
@@ -205,72 +199,60 @@ Unsupported PIM methods return `Error::Unsupported` and have false capability fl
 
 `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` makes the account
 own a `bifrost-smtp` transport (`crates/imap/src/account/submission.rs`,
-`SubmissionTransport`). The factory builds it at open and stores it on
-`ImapAccountInner.submission`; `build_capabilities(.., submission_configured)`
+`SubmissionTransport`), built at open and stored on
+`ImapAccountInner.submission`. `build_capabilities(.., submission_configured)`
 flips `send_message` / `draft_send` true together with the impls (one atomic
-flag/behavior flip - the flag never lies). `attachment_upload` stays false (A6).
+flag/behavior flip). `attachment_upload` stays false (A6).
 
 - `SmtpSubmissionConfig` carries host, `SubmissionTls` (Implicit 465 /
   StartTls 587 / Plaintext 587, mapped to SMTP `relay` / `starttls_relay` /
   `builder_dangerous`), optional port/timeout/pool, the default From address,
-  a `save_to_sent_default`, and optional `SubmissionCredentials`. It is `Clone`
-  but not `Eq`/serde (a live token source is neither).
-- Credential reuse: when `credentials` is `None`, the SMTP credentials are
-  derived from the IMAP `Credentials` via `credentials.kind()` -
-  password->password, or OAuth identity + the *same* `Arc<dyn TokenSource>`
-  (A1) cloned across the boundary. An override supplies explicit submission
-  auth.
-- The send path stays in `bifrost_types::Address` space. The only
+  `save_to_sent_default`, and optional `SubmissionCredentials`. `Clone`, not
+  `Eq`/serde.
+- Credential reuse: when `credentials` is `None`, SMTP credentials derive from
+  the IMAP `Credentials` via `credentials.kind()` (password->password, or OAuth
+  identity + the *same* `Arc<dyn TokenSource>` cloned across the boundary). An
+  override supplies explicit submission auth.
+- The send path stays in `bifrost_types::Address` space; the only
   `Address -> bifrost_smtp::Address` conversion is the bare addr-spec
   reverse-path / recipient conversion at `SubmissionTransport::send_rfc5322`,
   which drives `AsyncSmtpTransport::send_raw_batch_with_options` and returns
-  SMTP's already-translated `AccountError` (no IMAP `Smtp` error variant; a
-  submission *build* failure maps to `InvalidInput`). `draft_send` re-stamps
-  the returned error's operation to `DraftSend`.
+  SMTP's already-translated `AccountError` (a submission *build* failure maps to
+  `InvalidInput`). `draft_send` re-stamps the error's operation to `DraftSend`.
 - Scheduled send is one-shot SMTP FUTURERELEASE: `SendRequest::scheduled`
   threads a `hold: Option<SystemTime>` into `send_rfc5322`, which builds
   `SendOptions::hold_until(rfc3339(t))` (absolute-time, so the boundary never
-  races `now()`; the relay computes the delay). No IMAP-side pre-validation -
-  the relay's EHLO at send time is authoritative. A relay that did not
-  advertise FUTURERELEASE yields a bifrost-smtp `FeatureUnsupported` already
-  mapped to `Unsupported(Send)`; the IMAP boundary only re-stamps
-  operation/protocol (it cannot change the kind), so the consumer sees a stable
-  `Unsupported(Send)`. A HOLD over the relay's advertised max arrives as
-  `Request(Malformed)`. RFC 4865 has no recall verb, so `cancel_scheduled_send`
-  and `reschedule_send` are `Unsupported`.
+  races `now()`). No IMAP-side pre-validation - the relay's EHLO at send time
+  is authoritative. A relay without FUTURERELEASE yields a stable
+  `Unsupported(Send)` (the boundary re-stamps operation/protocol only, not the
+  kind); a HOLD over the relay's advertised max arrives as `Request(Malformed)`.
+  RFC 4865 has no recall verb, so `cancel_scheduled_send` and `reschedule_send`
+  are `Unsupported`.
 - MIME assembly is the shared `bifrost-types::mime` serializer
-  (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts), lifted
-  from Google's `MailDocument` so Google and IMAP share one path. It emits
-  text/html/`multipart/alternative` bodies, a `multipart/mixed` wrapper for
-  inline attachments, RFC 2047 display names, and a controlled-domain
-  `Message-ID` (sender domain, never `hostname::get()`).
+  (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts), shared with
+  Google's `MailDocument`. It emits text/html/`multipart/alternative` bodies, a
+  `multipart/mixed` wrapper for inline attachments, RFC 2047 display names, and a
+  controlled-domain `Message-ID` (sender domain, never `hostname::get()`).
 - `ObjectId` rule: `send_message` / `draft_send` return the real
   APPENDUID-derived id from the Sent APPEND when UIDPLUS yields one, else the
   generated/parsed `Message-ID` (`imapmsgid1:<id>`). The send result is
-  authoritative for `Ok`; the id depends only on whether a real APPENDUID was
-  obtained.
-- Sent-APPEND contract: after a committed SMTP send, a failed (or
-  no-UIDPLUS, or no-Sent-folder) APPEND is non-fatal - SMTP is never
-  re-driven - but not silent: it logs an uncertain-Sent reconcile warning and
-  falls back to the generated `Message-ID`.
-- `draft_send` is "fetch + send + discard": a net-new one-shot raw `BODY[]`
-  full-message fetch (bounded by `DRAFT_FETCH_BUDGET`, 64 MiB, through the
-  `FetchLimit` guard - never `usize::MAX`) recovers the verbatim draft
-  octets (hydration only returns a parsed projection), the headers build the
-  envelope, and the `Bcc:` header is folded into RCPT recipients but
-  stripped from the transmitted body. A failed post-send discard is logged,
-  not fatal.
-- Sent-copy Bcc retention: the body transmitted over SMTP strips `Bcc:`
-  (blind recipients are never disclosed on the wire), but the copy APPENDed
-  to the Sent folder retains it - the sender's Sent copy is their own record
-  of who was blind copied. `send_message` uses the assembler's `sent_copy`
-  variant (a Bcc-bearing render, present only when the request has a Bcc);
-  `draft_send` APPENDs the original saved-draft octets, which already carry
-  the `Bcc:` header.
+  authoritative for `Ok`.
+- Sent-APPEND contract: after a committed SMTP send, a failed (or no-UIDPLUS,
+  or no-Sent-folder) APPEND is non-fatal (SMTP is never re-driven) but logs an
+  uncertain-Sent reconcile warning and falls back to the generated `Message-ID`.
+- `draft_send` is "fetch + send + discard": a one-shot raw `BODY[]` fetch
+  (bounded by `DRAFT_FETCH_BUDGET`, 64 MiB, through the `FetchLimit` guard)
+  recovers the verbatim draft octets, the headers build the envelope, and
+  `Bcc:` is folded into RCPT recipients but stripped from the transmitted body.
+  A failed post-send discard is logged, not fatal.
+- Sent-copy Bcc retention: the body over SMTP strips `Bcc:`, but the Sent-folder
+  APPEND retains it (the sender's own record of blind recipients). `send_message`
+  uses the assembler's `sent_copy` variant (Bcc-bearing, present only when the
+  request has a Bcc); `draft_send` APPENDs the saved-draft octets, which already
+  carry `Bcc:`.
 
-`bifrost-imap` now depends on `bifrost-smtp` (feature `tokio`;
-`account-error` rides in as a default feature). SMTP has no path back to
-IMAP, so this is acyclic.
+`bifrost-imap` depends on `bifrost-smtp` (feature `tokio`; `account-error` is a
+default feature). SMTP has no path back to IMAP, so this is acyclic.
 
 When `ImapAccountConfig::with_manage_sieve(ManageSieveConfig)` is
 set, IMAP advertises `filter_rule_shape: Scripts` and all five
@@ -280,21 +262,23 @@ with SASL PLAIN or XOAUTH2, and maps scripts to
 `FilterScript { language: Sieve }`. Without ManageSieve config, the
 filter flags remain false and calls return `Unsupported`.
 
-When `ImapAccountConfig::with_carddav(CardDavConfig)` is set, IMAP
-opens a sibling `bifrost-carddav` account during factory open,
-advertises all contact method flags true, and delegates
-`address_books_list`, `contacts_list`, `contact_get`,
-`contact_create`, `contact_update`, `contact_delete`, and
-`contact_search` to that account. Without CardDAV config, contact
-flags remain false and calls return `Unsupported`.
+When `ImapAccountConfig::with_carddav(CardDavConfig)` /
+`with_caldav(CalDavConfig)` is set, IMAP opens a sibling
+`bifrost-carddav` / `bifrost-caldav` account during factory open and
+delegates the contact / calendar PIM primitives to it. Without the
+config, the matching flags stay false and the primitives return
+`Unsupported`.
 
-When `ImapAccountConfig::with_caldav(CalDavConfig)` is set, IMAP
-opens a sibling `bifrost-caldav` account during factory open,
-advertises all calendar method flags true, and delegates
-`calendars_list`, `events_in_range`, `event_get`, `event_create`,
-`event_update`, `event_delete`, `event_rsvp`, and `event_search` to
-that account. Without CalDAV config, calendar flags remain false and
-calls return `Unsupported`.
+Composition is first-class for sync, not just primitives (subs are full
+`Arc<dyn Account>`s): `build_capabilities` copies the sub's real contact/
+calendar `pim_methods` subsets (not `sub.is_some()`); `route_scope` maps a
+`CursorScope` to `ScopeHandler::{Folder, Delegate}` and the four sync entry
+points forward to the sub on `Delegate`; discovery fans sub scopes in
+(sub errors fold to `Warning`). Routing + fan-in delegate to the reusable
+`bifrost_types::account_compose` helpers. `open_carddav`/`open_caldav` are
+fail-soft (`DavAttach::Degraded`, classified via `RecoveryClass`): a DAV
+open failure degrades to IMAP-only for the cycle and the next reopen
+retries, so a DAV outage never takes mail offline.
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread` and `delete_thread` override the trait defaults: they use the crate's cloneable account handle to do add-then-remove, and delete moves to the Trash role unless the current container is already Trash, in which case it expunges the thread from that mailbox.
 
@@ -302,7 +286,7 @@ Containers use native mailbox paths as primitive ids and provenance-native ids. 
 
 ### Bandwidth metering
 
-`ImapAccountConfig` can carry either a process `BandwidthMeter` or a generic `MeterSink`. The factory builds a `MeterSinkHandle` with the real engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read and written on every connection-level read/write path. The shared bandwidth-cap atomic is read per chunk; inbound and outbound I/O use byte buckets so `set_bandwidth_cap(None)` is unlimited and `Some(0)` is clamped to 1 B/s with a warning.
+`ImapAccountConfig` carries either a process `BandwidthMeter` or a generic `MeterSink`. The factory builds a `MeterSinkHandle` with the engine `AccountId` on every open and passes it to the initial connection plus pool dials. `WireReader` records bytes read/written on every connection read/write path. The shared bandwidth-cap atomic is read per chunk; `set_bandwidth_cap(None)` is unlimited and `Some(0)` clamps to 1 B/s with a warning.
 
 ### Folder lifecycle
 
@@ -317,43 +301,39 @@ protocol errors into `bifrost_types::AccountError` via
 `error::into_account_error(error, ctx)`; consumers never see the
 crate-internal IMAP error taxonomy.
 
-`ImapErrorContext` carries the calling `AccountOperation` (now a
-required field, not `Option`), optional `ErrorScope`, `Provider`,
-explicit `transmission_state`, and an `idempotency_override`. Every
-public `pim.rs` method threads its operation via a local `op_err`
-closure that stamps `ImapErrorContext::operation(<op>)` on every
-`map_err`; multi-call helpers (`copy_messages`, `delete_messages`,
-`set_flag`, `hydrate_decoded`, `refresh_folders`, `folder_from_scope`)
-take an explicit `op: AccountOperation` parameter so they emit errors
-tagged with the caller's operation rather than a generic default.
-This is what lets the central recovery mapping distinguish
-`Reconcile` from `Retry::SameRequest` for non-idempotent ops like
-`AddToContainer` and `DraftCreate`.
+`ImapErrorContext` carries the calling `AccountOperation` (a required field,
+not `Option`), optional `ErrorScope`, `Provider`, explicit `transmission_state`,
+and an `idempotency_override`. Every public `pim.rs` method threads its
+operation via a local `op_err` closure that stamps
+`ImapErrorContext::operation(<op>)` on every `map_err`; multi-call helpers
+(`copy_messages`, `delete_messages`, `set_flag`, `hydrate_decoded`,
+`refresh_folders`, `folder_from_scope`) take an explicit `op: AccountOperation`
+so they tag the caller's operation, not a generic default. This lets the central
+recovery mapping distinguish `Reconcile` from `Retry::SameRequest` for
+non-idempotent ops like `AddToContainer` and `DraftCreate`.
 
 `Error::response_code()` returns the structured `ResponseCode` from
 `[CODE ...]` brackets (first only); the central recovery mapping
 in `bifrost-types::recovery` consumes those response codes via the
 typed `ImapResponseCode` wire variants.
 
-`Error::No` and `Error::Bad` both carry `attempt:
-Option<ImapAttempt>`; constructors (`no_with_code`, `bad_with_code`)
-default this to `Some(Acknowledged)` because a tagged `NO` / `BAD` is
-by definition a server-acknowledged terminal response. Without this,
-recovery rows that key on `Acknowledged` (e.g. `Server(Error { status:
-None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent`
-arm and misclassify provider refusals as retryable transport drops.
+`Error::No` and `Error::Bad` both carry `attempt: Option<ImapAttempt>`;
+constructors (`no_with_code`, `bad_with_code`) default it to
+`Some(Acknowledged)` because a tagged `NO` / `BAD` is a server-acknowledged
+terminal response. Without this, recovery rows keyed on `Acknowledged` (e.g.
+`Server(Error { status: None }) + Acknowledged -> ProviderRefused`) collapse to
+the `Unsent` arm and misclassify provider refusals as retryable drops.
 
 ### Concurrency conflicts and UNCHANGEDSINCE
 
-IMAP diverges from the `MutationSuccess::Skipped` lane that other
-provider crates use when the engine's "already in this state" probe
-short-circuits a mutation. IMAP's MODSEQ cache is opportunistic: a
-cold-cache STORE goes out without `UNCHANGEDSINCE`, so we cannot
-observe "already in state" without a full SELECT+FETCH that would
-defeat the purpose of the guard. Concretely, `STORE UNCHANGEDSINCE
-<modseq>` rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed
-{ kind: ConcurrencyConflict }` for the conflicting UIDs - never as
-`Succeeded(Skipped)`. `concurrency_conflict_error` /
+IMAP diverges from the `MutationSuccess::Skipped` lane other provider crates
+use when the engine's "already in this state" probe short-circuits a mutation.
+IMAP's MODSEQ cache is opportunistic: a cold-cache STORE goes out without
+`UNCHANGEDSINCE`, so "already in state" cannot be observed without a full
+SELECT+FETCH that defeats the guard. So `STORE UNCHANGEDSINCE <modseq>`
+rejecting with `MODIFIED` surfaces as `ItemOutcome::Failed { kind:
+ConcurrencyConflict }` for the conflicting UIDs, never `Succeeded(Skipped)`.
+`concurrency_conflict_error` /
 `store_failed_error` / `uidvalidity_changed_error` each take the
 caller's `AccountOperation` so flag / move / destroy paths emit
 their own op (the central recovery mapping picks
@@ -362,48 +342,41 @@ telemetry and per-op retry budgets).
 
 ### Strategy downgrade derivation
 
-`EngineDirective::DowngradeStrategy` is reserved for the "all
-strategies exhausted" case. IMAP today never derives that directive
-at runtime: `changes.rs` handles every QRESYNC -> CONDSTORE ->
-Basic downgrade inline via `Warning::StrategyDowngraded` plus a
-direct retry on the lower strategy. The `strategy_failure` helper
-in `account/error.rs` is wired through the builder funnel and
-covered by tests so the directive is producible when needed, but
-the runtime path that reaches it does not exist while Basic remains
+`EngineDirective::DowngradeStrategy` is reserved for the "all strategies
+exhausted" case, which IMAP never derives at runtime: `changes.rs` handles
+every QRESYNC -> CONDSTORE -> Basic downgrade inline via
+`Warning::StrategyDowngraded` plus a direct retry on the lower strategy. The
+`strategy_failure` helper in `account/error.rs` is funnel-wired and tested so
+the directive is producible, but no runtime path reaches it while Basic remains
 the universal fallback.
 
 ### Per-folder mutation failure contract
 
 `mutate::mutation_stream` does not emit a trailing global
-`SyncEvent::Terminated` once a folder fails mid-batch. A per-folder
-fatal after per-item emissions surfaces as `ItemOutcome::Uncertain`
-for every remaining target in the failing folder (carrying the
-classified `AccountError`), and the loop continues to the next
-folder. Stream-level `Terminated` is reserved for failures that
-prevent any further folder attempt - auth lost, schema /
-capability break. `stream_terminating` is the gate.
+`SyncEvent::Terminated` once a folder fails mid-batch. A per-folder fatal after
+per-item emissions surfaces as `ItemOutcome::Uncertain` for every remaining
+target in the failing folder (carrying the classified `AccountError`), and the
+loop continues to the next folder. Stream-level `Terminated` is reserved for
+failures that prevent any further folder attempt (auth lost, schema/capability
+break); `stream_terminating` is the gate.
 
 ### Output-channel-dropped contract
 
-Every streaming task (`inventory_stream`, `changes_stream`,
-`get_stream`, `open_blob`, `mutation_stream`) treats a `tx.send`
-failure on a dropped output receiver as silent termination: the
-task returns without synthesizing any `crate::Error` and without
-emitting a fatal `SyncEvent::Terminated`. The error funnel is
-reserved for wire failures and structural invariant breaks; a
-consumer that walks away from its stream is not an error.
+Every streaming task (`inventory_stream`, `changes_stream`, `get_stream`,
+`open_blob`, `mutation_stream`) treats a `tx.send` failure on a dropped output
+receiver as silent termination: the task returns without synthesizing any
+`crate::Error` or fatal `SyncEvent::Terminated`. The error funnel is reserved
+for wire failures and structural invariant breaks; a consumer that walks away
+from its stream is not an error.
 
 ### Terminated-event helper
 
-`account/mod.rs` exposes a single `terminated_event::<T, _>(cause)`
-helper for surfacing fatal stream causes as
-`SyncEvent::Terminated`. It accepts any `Into<TerminatedCause>`:
-- a pre-built `AccountError` (UIDVALIDITY change, modseq reset,
-  pre-classified failures), or
-- an `(Error, ImapErrorContext)` pair to classify on the way out
-  (the legacy `fatal_event(err, ctx)` alias keeps reading naturally
-  at call sites).
-Callers do not need to choose which lane to dispatch through.
+`account/mod.rs` exposes a single `terminated_event::<T, _>(cause)` helper for
+surfacing fatal stream causes as `SyncEvent::Terminated`. It accepts any
+`Into<TerminatedCause>`: a pre-built `AccountError` (UIDVALIDITY change, modseq
+reset, pre-classified failures), or an `(Error, ImapErrorContext)` pair to
+classify on the way out (the legacy `fatal_event(err, ctx)` alias reads
+naturally at call sites). Callers do not choose a lane.
 
 ## Module layout
 

@@ -183,6 +183,21 @@ impl CalDavClient {
         calendar_url: &str,
         operation: AccountOperation,
     ) -> Result<Vec<CalDavEventEntry>, AccountError> {
+        Ok(self
+            .list_events_listing(calendar_url, operation)
+            .await?
+            .entries)
+    }
+
+    /// Depth-1 event PROPFIND returning both the committed entries and
+    /// the hrefs the server reported *failed* within the 207, so the
+    /// snapshot diff can preserve transiently-failed resources rather
+    /// than destroying them (brick 7).
+    pub(crate) async fn list_events_listing(
+        &self,
+        calendar_url: &str,
+        operation: AccountOperation,
+    ) -> Result<crate::parse::CalDavEventListing, AccountError> {
         let body = self
             .propfind_raw(calendar_url, "1", PROPFIND_EVENTS, operation)
             .await?;

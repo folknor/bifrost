@@ -43,6 +43,8 @@ mod push;
 mod scopes;
 mod sieve;
 mod submission;
+#[cfg(test)]
+mod test_support;
 
 // pub: consumers register this factory with bifrost-sync without naming ImapAccount.
 pub use factory::{ImapAccountConfig, ImapAccountFactory};
@@ -85,6 +87,11 @@ pub(crate) struct ImapAccountInner {
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
+    /// Warnings recorded at open when a configured DAV sub-account could
+    /// not be attached (brick 5 fail-soft). Drained once, on the first
+    /// `discover_cursor_scopes`, so the engine observes the degradation
+    /// without taking mail offline.
+    pub(crate) dav_degraded: std::sync::Mutex<Vec<bifrost_types::Warning>>,
 }
 
 pub(crate) struct ImapAccountParts {
@@ -98,6 +105,7 @@ pub(crate) struct ImapAccountParts {
     pub(crate) contacts: Option<Arc<dyn Account>>,
     pub(crate) calendars: Option<Arc<dyn Account>>,
     pub(crate) submission: Option<Arc<SubmissionTransport>>,
+    pub(crate) dav_degraded: Vec<bifrost_types::Warning>,
 }
 
 impl ImapAccount {
@@ -119,8 +127,20 @@ impl ImapAccount {
                 contacts: parts.contacts,
                 calendars: parts.calendars,
                 submission: parts.submission,
+                dav_degraded: std::sync::Mutex::new(parts.dav_degraded),
             }),
         }
+    }
+
+    /// Drain the degraded-DAV warnings recorded at open. Returns them
+    /// once; subsequent calls return empty (the engine re-runs discovery
+    /// on reopen, where a fresh open re-records the current state).
+    pub(crate) fn take_dav_degraded_warnings(&self) -> Vec<bifrost_types::Warning> {
+        let mut guard = self
+            .dav_degraded
+            .lock()
+            .expect("dav_degraded lock poisoned");
+        std::mem::take(&mut *guard)
     }
 }
 
@@ -911,6 +931,59 @@ pub(crate) fn folder_from_scope(
     }
 }
 
+/// Where a `CursorScope`'s sync work is serviced: IMAP itself for a
+/// folder scope, or a composed sub-account for a typed scope.
+pub(crate) enum ScopeHandler<'a> {
+    /// IMAP itself owns this folder scope.
+    Folder(MailboxName),
+    /// A composed sub-account owns this typed scope.
+    Delegate(&'a Arc<dyn Account>),
+}
+
+/// Resolve a `CursorScope` to the handler that services its sync work.
+///
+/// `Folder(_)` scopes route to IMAP via `folder_from_scope`. The two
+/// typed scopes IMAP can compose - `Type(Contact)` and
+/// `Type(CalendarEvent)` - route to the matching sub-account when one is
+/// attached, else `Unsupported`. Every other scope (including the
+/// `FolderType` struct variant, which no protocol composed under IMAP
+/// mints today) falls through to `Unsupported`, preserving the
+/// non-exhaustive guarantee.
+pub(crate) fn route_scope<'a>(
+    account: &'a ImapAccount,
+    scope: &CursorScope,
+    op: bifrost_types::AccountOperation,
+) -> Result<ScopeHandler<'a>, AccountError> {
+    route_typed_scope(
+        scope,
+        account.contacts.as_ref(),
+        account.calendars.as_ref(),
+        op,
+    )
+}
+
+/// Pure, account-free core of [`route_scope`]. Keyed only on the scope
+/// and the two optional sub-account handles so it tests in isolation and
+/// is reusable beyond IMAP (brick 10's `compose` extraction calls this).
+pub(crate) fn route_typed_scope<'a>(
+    scope: &CursorScope,
+    contacts: Option<&'a Arc<dyn Account>>,
+    calendars: Option<&'a Arc<dyn Account>>,
+    op: bifrost_types::AccountOperation,
+) -> Result<ScopeHandler<'a>, AccountError> {
+    use bifrost_types::account_compose::{ScopeTarget, route_typed_scope as route_generic};
+
+    // The generic helper decides self-vs-delegate keyed only on the
+    // scope; IMAP maps the `This` case onto its own folder handler
+    // (validating the mailbox name) and mints the `Unsupported` error in
+    // its own vocabulary when a typed scope has no matching sub.
+    match route_generic(scope, contacts, calendars) {
+        Some(ScopeTarget::This) => Ok(ScopeHandler::Folder(folder_from_scope(scope, op)?)),
+        Some(ScopeTarget::Delegate(sub)) => Ok(ScopeHandler::Delegate(sub)),
+        None => Err(error::unsupported(op)),
+    }
+}
+
 pub(crate) fn folder_scope(folder: &MailboxName) -> CursorScope {
     CursorScope::Folder(bifrost_types::FolderId(folder.as_str().to_owned()))
 }
@@ -921,4 +994,112 @@ pub(crate) fn membership_scope(folder: &MailboxName) -> MembershipScope {
 
 pub(crate) fn uid_set_from_u32(uids: &[u32]) -> Option<UidSet> {
     UidSet::from_uids(uids.iter().filter_map(|uid| crate::types::Uid::new(*uid)))
+}
+
+#[cfg(test)]
+mod router_tests {
+    use bifrost_types::{AccountErrorKind, AccountOperation, CursorScope, FolderId, ObjectType};
+
+    use super::test_support::{StubAccount, stub_arc};
+    use super::{ScopeHandler, route_typed_scope};
+
+    #[test]
+    fn route_scope_routes_folder_to_self() {
+        let scope = CursorScope::Folder(FolderId("INBOX".to_string()));
+        let handler = route_typed_scope(&scope, None, None, AccountOperation::SyncChanges)
+            .expect("folder scope routes");
+        match handler {
+            ScopeHandler::Folder(name) => assert_eq!(name.as_str(), "INBOX"),
+            ScopeHandler::Delegate(_) => panic!("folder scope must not delegate"),
+        }
+    }
+
+    #[test]
+    fn route_scope_delegates_contact_to_contacts_sub() {
+        let contacts = stub_arc(StubAccount::new(Vec::new()));
+        let scope = CursorScope::Type(ObjectType::Contact);
+        let handler =
+            route_typed_scope(&scope, Some(&contacts), None, AccountOperation::SyncChanges)
+                .expect("contact scope routes");
+        assert!(
+            matches!(handler, ScopeHandler::Delegate(_)),
+            "contact scope with a contacts sub must delegate",
+        );
+    }
+
+    #[test]
+    fn route_scope_delegates_calendar_event_to_calendars_sub() {
+        let calendars = stub_arc(StubAccount::new(Vec::new()));
+        let scope = CursorScope::Type(ObjectType::CalendarEvent);
+        let handler = route_typed_scope(
+            &scope,
+            None,
+            Some(&calendars),
+            AccountOperation::SyncChanges,
+        )
+        .expect("calendar-event scope routes");
+        assert!(matches!(handler, ScopeHandler::Delegate(_)));
+    }
+
+    #[test]
+    fn route_scope_unsupported_when_no_matching_sub() {
+        let scope = CursorScope::Type(ObjectType::Contact);
+        let result = route_typed_scope(&scope, None, None, AccountOperation::SyncChanges);
+        let Err(err) = result else {
+            panic!("typed scope without a sub must be unsupported");
+        };
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::SyncChanges)
+        );
+    }
+
+    // Brick 3: dispatch. `inventory_stream` / `changes_stream` route the
+    // scope and, on `Delegate`, hand the entire call to the sub-account.
+    // Exercising the routing + delegation directly avoids standing up a
+    // live `ImapAccount` (which needs a real connection) while still
+    // pinning that a typed scope reaches the sub and a typed scope with
+    // no sub errors `Unsupported`.
+    #[tokio::test]
+    async fn delegates_typed_scope_inventory_to_sub() {
+        use futures::StreamExt;
+
+        let contacts = stub_arc(StubAccount::new(Vec::new()));
+        let scope = CursorScope::Type(ObjectType::Contact);
+        let handler = route_typed_scope(
+            &scope,
+            Some(&contacts),
+            None,
+            AccountOperation::SyncInventory,
+        )
+        .expect("contact scope routes to delegate");
+        let ScopeHandler::Delegate(sub) = handler else {
+            panic!("expected delegate");
+        };
+        let mut stream = sub.inventory_stream(scope);
+        let first = stream.next().await.expect("delegated batch");
+        match first {
+            bifrost_types::SyncEvent::Batch(batch) => {
+                assert_eq!(
+                    batch.items.first().map(|entry| entry.id.0.as_str()),
+                    Some(super::test_support::STUB_SENTINEL),
+                    "delegated inventory must carry the sub-account's sentinel",
+                );
+            }
+            other => panic!("expected delegated batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delegates_typed_scope_unsupported_without_sub() {
+        let scope = CursorScope::Type(ObjectType::CalendarEvent);
+        let result = route_typed_scope(&scope, None, None, AccountOperation::SyncInventory);
+        let Err(err) = result else {
+            panic!("typed scope without a calendars sub must be unsupported");
+        };
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::SyncInventory)
+        );
+    }
 }

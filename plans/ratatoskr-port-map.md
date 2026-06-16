@@ -414,7 +414,18 @@ ratatoskr's bare `reqwest` + hand-built Bearer). Otherwise independent of A2/A4.
 
 ---
 
-## A7 - DAV as first-class synced accounts
+## A7 - DAV as first-class synced accounts - LANDED
+
+Landed as the composition + robustness bricks: scope router
+(`route_scope`/`ScopeHandler`) and discovery fan-in extracted to
+`bifrost_types::account_compose`, the four sync entry points delegate to the
+sub-account, capabilities copy the sub's real `pim_methods`, fail-soft
+`DavAttach` open, the empty-207 destroy-suppression + failed-uri-preservation
+guards in the caldav/carddav PROPFIND-snapshot diffs, and the CardDAV ctag
+short-circuit. The TZID-as-UTC fix (s34-S1) was deliberately scoped out to a
+standalone item (needs `chrono-tz`, absent from `Cargo.lock`); JMAP/Graph DAV
+composition and full CardDAV `sync-collection` parity are named follow-ups. The
+section below is the as-planned record.
 
 Almost no port: the DAV protocol clients and iCal/vCard projection **already
 moved** into bifrost, which is **ahead** of ratatoskr (bifrost added WebDAV
@@ -564,8 +575,9 @@ ideal uniform surface.
 - IMAP/SMTP stale-token-at-construction (A1).
 - Graph `RawMime` carrying JSON (A3, fixed - body projections degrade to
   `Metadata`); JMAP raw fatal left to A1 (A3 added the dedicated raw read).
-- DAV empty-207 destroy-everything + failed-uri loss (A7).
-- CalDAV TZID-as-UTC offset bug, s34-S1 (A7).
+- DAV empty-207 destroy-everything + failed-uri loss (A7, fixed).
+- CalDAV TZID-as-UTC offset bug, s34-S1 (scoped out of A7 to its own standalone
+  item; needs `chrono-tz`, absent from `Cargo.lock`).
 - gdrive 308-resume gap-skip corruption (A6, fixed - the Drive chunk loop fails
   on an unparseable resume cursor instead of advancing past a gap).
 - Graph `add_label` category read-modify-write lost-update window (A8/B-1).

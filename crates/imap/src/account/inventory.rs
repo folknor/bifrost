@@ -9,17 +9,26 @@ use bifrost_types::{
 use crate::types::{FetchAttr, FetchResponse, MailboxName, UidSet};
 
 use super::{
-    BATCH_ITEMS, CompactUidSet, ImapAccount, batch, boxed_receiver_stream, encode_cursor,
-    encode_object_id, fatal_event, folder_from_scope, folder_scope, membership_scope,
+    BATCH_ITEMS, CompactUidSet, ImapAccount, ScopeHandler, batch, boxed_receiver_stream,
+    encode_cursor, encode_object_id, fatal_event, folder_from_scope, folder_scope,
+    membership_scope, route_scope,
 };
 
 pub(crate) fn establish_initial_cursor(
-    _account: ImapAccount,
+    account: ImapAccount,
     scope: CursorScope,
 ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
     Box::pin(async move {
-        let _folder = folder_from_scope(&scope, bifrost_types::AccountOperation::EstablishCursor)?;
-        Ok(CursorEstablishment::EstablishViaInventory)
+        match route_scope(
+            &account,
+            &scope,
+            bifrost_types::AccountOperation::EstablishCursor,
+        )? {
+            ScopeHandler::Folder(_) => Ok(CursorEstablishment::EstablishViaInventory),
+            // A composed sub-account owns this typed scope: defer the
+            // whole cursor-establishment decision to it.
+            ScopeHandler::Delegate(sub) => sub.establish_initial_cursor(scope).await,
+        }
     })
 }
 
@@ -27,6 +36,19 @@ pub(crate) fn inventory_stream(
     account: ImapAccount,
     scope: CursorScope,
 ) -> AccountStream<SyncEvent<InventoryEntry>> {
+    // Route first: a typed scope owned by a sub-account delegates the
+    // whole inventory stream rather than checking out an IMAP folder.
+    match route_scope(
+        &account,
+        &scope,
+        bifrost_types::AccountOperation::SyncInventory,
+    ) {
+        Ok(ScopeHandler::Delegate(sub)) => return sub.inventory_stream(scope),
+        Ok(ScopeHandler::Folder(_)) => {}
+        Err(error) => {
+            return Box::pin(futures::stream::iter([SyncEvent::Terminated(error)]));
+        }
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     tokio::spawn(async move {
         match run_inventory(account, scope.clone(), tx.clone()).await {

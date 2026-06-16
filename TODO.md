@@ -227,14 +227,6 @@ deliberate "accepted fidelity limits" from that doc are documented in
 
 Gaps:
 
-- **s34-G1 (imap)** `account/scopes.rs`, `mod.rs`
-  (`folder_from_scope`) - composed CardDAV/CalDAV sub-accounts are
-  primitive-only: `discover_cursor_scopes` never emits their
-  contact/calendar cursor scopes and `folder_from_scope` returns
-  `Unsupported` for non-Folder scopes, so contact/calendar *sync*
-  dead-ends in the IMAP account. `reference/imap.md` is honest about
-  it. Decide: sync-integrated composition, or document primitive-only
-  delegation as the contract.
 - **s34-G2 (types)** `contact.rs` - `ContactCreate` has `photo_url`
   but no inline `photo` (unlike `ContactCard` / `ContactPatch`), so
   inline-photo contacts require create-then-update. Likely intentional
@@ -248,7 +240,13 @@ Smells:
   (documented RFC 3339 UTC) holds local time mislabelled as UTC - off
   by the zone offset for any consumer that trusts it. A consequence of
   the VTIMEZONE-stub limit, but the docs frame it only as
-  "fixed-offset stubs", not mislabelled instants.
+  "fixed-offset stubs", not mislabelled instants. Now a standalone
+  item: deliberately scoped out of the DAV-composition wave because a
+  correct fix must resolve a named IANA zone (`Europe/Oslo`) to a UTC
+  offset on a specific date, which needs `chrono-tz` (absent from
+  `Cargo.lock`; `chrono` alone cannot resolve arbitrary named zones).
+  Whoever schedules this must add `chrono-tz` and commit `Cargo.lock`
+  before a network-isolated build.
 - **s34-S2 (graph)** `calendar.rs` (`event_from_graph`) -
   `recurrence_id` is populated from `seriesMasterId` (master series
   id), but the shared model documents it as RECURRENCE-ID semantics
@@ -258,19 +256,6 @@ Smells:
 - **s34-S3 (graph)** `contacts.rs` - `ContactEmail.kind` maps
   to/from Graph `emailAddress.name`, a display name, not a type label.
   Round-trip is consistent (no loss) but semantically conflated.
-- **s34-S4 (imap)** `factory.rs`, `capabilities.rs` - capability
-  flags key on `sub.is_some()`, never consulting the sub-account's
-  `pim_methods`. Correct only because the DAV crates hardcode all
-  flags `true`; if either ever conditionally disables a method, IMAP
-  over-advertises.
-- **s34-S5 (imap)** `factory.rs` - `open_carddav(...).await?` /
-  `open_caldav(...).await?` mean a transient DAV outage fails the
-  whole IMAP account open, taking mail sync down with it. Decide
-  fail-hard vs fail-soft deliberately.
-- **s34-S6 (carddav)** `account.rs` - the ctag is encoded into the
-  cursor envelope but never compared, so `changes_stream` always does
-  the full PROPFIND + diff; the natural "collection unchanged"
-  short-circuit is absent.
 - **s34-S7 (carddav)** `parse.rs` - `ResponseParts` carries fields
   unused by each of its three parser call sites; shared staging/commit
   logic touches fields irrelevant per site. Mild maintenance tax.

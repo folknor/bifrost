@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod account_compose;
 pub mod blob;
 pub mod calendar;
 pub mod capabilities;

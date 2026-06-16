@@ -213,7 +213,7 @@ at spec time.
   `supports_cloud_upload(provider) = matches!(Graph | Gmail)` is replaced by the
   `host_attachment` capability flag).
 
-### A7 - DAV as first-class synced accounts
+### A7 - DAV as first-class synced accounts - LANDED
 
 - Intent: CalDAV / CardDAV emit cursor scopes and sync-integrate, and compose
   into any account, not just IMAP.
@@ -227,6 +227,18 @@ at spec time.
 - Depends on: nothing structurally.
 - TODO: `s34-G1` (the core gap), `s34-S4`, `s34-S5` (open fails hard on DAV
   outage), `s34-S6` (carddav ctag short-circuit).
+- Status: LANDED. `s34-G1` (scope router `route_scope`/`ScopeHandler` + the
+  four sync entry points + discovery fan-in), `s34-S4` (capabilities copy the
+  sub's real `pim_methods`), `s34-S5` (fail-soft `DavAttach` open), and
+  `s34-S6` (carddav ctag short-circuit) are all done, plus the two empty-207
+  destroy-suppression / failed-uri-preservation robustness ports in the
+  caldav+carddav PROPFIND-snapshot diffs. The composition router + discovery
+  fan-in are extracted to `bifrost_types::account_compose`
+  (`route_typed_scope` / `merge_scope_streams`) so JMAP/Graph composition is a
+  later wiring task, not a copy-paste. `s34-S1` (TZID-as-UTC) is carried
+  forward as its own standalone item (needs the `chrono-tz` tzdata dependency,
+  absent from `Cargo.lock`); full CardDAV `sync-collection` parity with CalDAV
+  is a named follow-up.
 
 ### A8 - Provider-wart absorption sweep
 

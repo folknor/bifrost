@@ -147,15 +147,22 @@ impl AccountFactory for ImapAccountFactory {
             let folders = list_folders(&conn, &cfg, &profile)
                 .await
                 .map_err(discover_err)?;
-            let contacts = open_carddav(&cfg, account_id.clone()).await?;
-            let calendars = open_caldav(&cfg, account_id.clone()).await?;
+            // Fail-soft: a DAV open failure degrades to IMAP-only for
+            // this cycle instead of failing the whole IMAP account.
+            let mut dav_degraded = Vec::new();
+            let contacts = open_carddav(&cfg, account_id.clone())
+                .await
+                .into_attached(&mut dav_degraded);
+            let calendars = open_caldav(&cfg, account_id.clone())
+                .await
+                .into_attached(&mut dav_degraded);
             let submission = open_submission(&cfg)?;
             let caps = capabilities::build_capabilities(
                 &profile,
                 &folders,
                 cfg.sieve.is_some(),
-                contacts.is_some(),
-                calendars.is_some(),
+                contacts.as_ref().map(|c| c.capabilities()),
+                calendars.as_ref().map(|c| c.capabilities()),
                 submission.is_some(),
             );
             let registry = Arc::new(FolderRegistry::from_list(folders));
@@ -178,23 +185,94 @@ impl AccountFactory for ImapAccountFactory {
                 contacts,
                 calendars,
                 submission,
+                dav_degraded,
             });
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
     }
 }
 
-async fn open_carddav(
-    cfg: &ImapAccountConfig,
-    account_id: AccountId,
-) -> Result<Option<Arc<dyn Account>>, AccountError> {
+/// Outcome of attempting to attach a composed DAV sub-account. Never an
+/// `Err`: a configured-but-failed open degrades to IMAP-only for this
+/// open cycle rather than failing the whole IMAP account (brick 5).
+enum DavAttach {
+    /// Opened and attached.
+    Attached(Arc<dyn Account>),
+    /// Not configured.
+    None,
+    /// Configured but open failed; attach IMAP-only this cycle.
+    Degraded {
+        warning: bifrost_types::Warning,
+        // Retried on the engine's next reopen by design. Carried for
+        // telemetry/clarity; the engine's reopen re-runs the open either
+        // way.
+        #[allow(dead_code)]
+        transient: bool,
+    },
+}
+
+impl DavAttach {
+    /// Resolve to the optional sub-account handle, pushing any degraded
+    /// warning into `degraded` so the first discovery surfaces it.
+    fn into_attached(self, degraded: &mut Vec<bifrost_types::Warning>) -> Option<Arc<dyn Account>> {
+        match self {
+            DavAttach::Attached(account) => Some(account),
+            DavAttach::None => None,
+            DavAttach::Degraded { warning, .. } => {
+                degraded.push(warning);
+                None
+            }
+        }
+    }
+}
+
+/// Classify a DAV `open` outcome into an attach decision. A success
+/// attaches; a failure degrades, routing through the central
+/// `RecoveryClass` (read `reference/error-model.md`) to decide whether
+/// the degradation is transient (retried on the engine's next reopen) or
+/// a terminal config-fix.
+fn classify_dav_open(result: Result<Arc<dyn Account>, AccountError>, label: &str) -> DavAttach {
+    match result {
+        Ok(account) => DavAttach::Attached(account),
+        Err(error) => {
+            // A retryable recovery class means the failure is transient
+            // (transport blip, server unavailable, throttle); anything
+            // terminal (auth lost, no permission, not found) needs an
+            // operator config fix. Either way IMAP stays online.
+            let transient = error.recovery().is_retryable();
+            let kind = if transient {
+                bifrost_types::WarningKind::Other
+            } else {
+                bifrost_types::WarningKind::OperatorAttentionNeeded
+            };
+            let warning = bifrost_types::Warning::support_only(
+                kind,
+                format!(
+                    "{label} sub-account did not open ({}); continuing IMAP-only{}",
+                    error.message_key(),
+                    if transient {
+                        ", will retry on reopen"
+                    } else {
+                        "; check DAV configuration"
+                    }
+                ),
+            )
+            .with_protocol_detail(bifrost_types::DiagnosticText::support_only(
+                label.to_string(),
+            ));
+            DavAttach::Degraded { warning, transient }
+        }
+    }
+}
+
+async fn open_carddav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAttach {
     let Some(config) = cfg.carddav.clone() else {
-        return Ok(None);
+        return DavAttach::None;
     };
-    CardDavAccountFactory::new(config)
-        .open(account_id)
-        .await
-        .map(Some)
+    classify_dav_open(
+        CardDavAccountFactory::new(config).open(account_id).await,
+        "CardDAV",
+    )
 }
 
 fn open_submission(
@@ -207,17 +285,14 @@ fn open_submission(
     Ok(Some(Arc::new(transport)))
 }
 
-async fn open_caldav(
-    cfg: &ImapAccountConfig,
-    account_id: AccountId,
-) -> Result<Option<Arc<dyn Account>>, AccountError> {
+async fn open_caldav(cfg: &ImapAccountConfig, account_id: AccountId) -> DavAttach {
     let Some(config) = cfg.caldav.clone() else {
-        return Ok(None);
+        return DavAttach::None;
     };
-    CalDavAccountFactory::new(config)
-        .open(account_id)
-        .await
-        .map(Some)
+    classify_dav_open(
+        CalDavAccountFactory::new(config).open(account_id).await,
+        "CalDAV",
+    )
 }
 
 fn meter_handle(
@@ -345,5 +420,64 @@ mod tests {
 
         let id = vec![("name".to_string(), Some("MyIcloudProxy".to_string()))];
         assert!(!server_id_disables_qresync(&id));
+    }
+
+    fn transport_error() -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Transport(bifrost_types::TransportErrorKind::Network),
+            bifrost_types::Cause::Transport(bifrost_types::TransportCause::new(
+                bifrost_types::TransportKind::Network,
+                None,
+            )),
+        )
+        .operation(AccountOperation::Discover)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    fn auth_lost_error() -> AccountError {
+        bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Authentication(
+                bifrost_types::AuthErrorKind::ReauthorizationRequired,
+            ),
+            bifrost_types::Cause::Auth(bifrost_types::AuthCause::ReauthorizationRequired),
+        )
+        .operation(AccountOperation::Discover)
+        .try_build()
+        .expect("valid account error classification")
+    }
+
+    #[test]
+    fn dav_open_classify_maps_transient_and_terminal_and_success() {
+        // Transport failure -> degraded, transient.
+        match classify_dav_open(Err(transport_error()), "CardDAV") {
+            DavAttach::Degraded { transient, .. } => assert!(transient, "transport is transient"),
+            other => panic!("expected Degraded, got {}", attach_label(&other)),
+        }
+
+        // Auth-lost -> degraded, terminal (not transient).
+        match classify_dav_open(Err(auth_lost_error()), "CardDAV") {
+            DavAttach::Degraded { transient, .. } => {
+                assert!(!transient, "auth-lost is a terminal config fix");
+            }
+            other => panic!("expected Degraded, got {}", attach_label(&other)),
+        }
+
+        // Success -> attached.
+        let stub = crate::account::test_support::stub_arc(
+            crate::account::test_support::StubAccount::new(Vec::new()),
+        );
+        match classify_dav_open(Ok(stub), "CardDAV") {
+            DavAttach::Attached(_) => {}
+            other => panic!("expected Attached, got {}", attach_label(&other)),
+        }
+    }
+
+    fn attach_label(attach: &DavAttach) -> &'static str {
+        match attach {
+            DavAttach::Attached(_) => "Attached",
+            DavAttach::None => "None",
+            DavAttach::Degraded { .. } => "Degraded",
+        }
     }
 }

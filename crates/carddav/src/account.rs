@@ -237,9 +237,9 @@ impl CardDavAccount {
                 same_collection_url(&client.resolve_url(&collection.href), addressbook)
             })
             .and_then(|collection| collection.ctag);
-        let mut entries = client
-            .list_contacts_for_operation(addressbook, operation)
-            .await?
+        let listing = client.list_contacts_listing(addressbook, operation).await?;
+        let mut entries = listing
+            .entries
             .into_iter()
             .map(|entry| ContactSnapshotEntry {
                 uri: client.resolve_url(&entry.uri),
@@ -247,10 +247,16 @@ impl CardDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
+        let failed_hrefs = listing
+            .failed_hrefs
+            .into_iter()
+            .map(|href| client.resolve_url(&href))
+            .collect();
         Ok(ContactSnapshot {
             addressbook_url: addressbook.to_string(),
             ctag,
             entries,
+            failed_hrefs,
         })
     }
 }
@@ -399,6 +405,38 @@ impl Account for CardDavAccount {
                     }
                 };
                 let started = Instant::now();
+                // ctag short-circuit (brick 8): when the prior cursor
+                // carries a ctag and a cheap depth-0 getctag PROPFIND
+                // shows the collection unchanged, skip the full depth-1
+                // PROPFIND + diff and carry the cursor forward with no
+                // changes. Mirrors CalDAV's sync-token short-circuit.
+                if let Some(prev_ctag) = previous.ctag.as_deref() {
+                    match client
+                        .collection_ctag(&previous.addressbook_url, AccountOperation::SyncChanges)
+                        .await
+                    {
+                        Ok(Some(current_ctag)) if current_ctag == prev_ctag => {
+                            let checkpoint = cursor_from_snapshot(cursor.scope, &previous);
+                            events.push(SyncEvent::Batch(bifrost_types::Batch {
+                                items: Vec::new(),
+                                page_boundary: PageBoundary::Final,
+                                server_latency: started.elapsed(),
+                                bytes_in: 0,
+                                checkpoint: Some(Checkpoint::Change(checkpoint.clone())),
+                            }));
+                            events.push(SyncEvent::Done(Some(Checkpoint::Change(checkpoint))));
+                            return events;
+                        }
+                        // ctag changed or server omits getctag: fall
+                        // through to the full snapshot + diff (which
+                        // still runs brick 6's empty-207 guard).
+                        Ok(_) => {}
+                        Err(error) => {
+                            events.push(SyncEvent::Terminated(error));
+                            return events;
+                        }
+                    }
+                }
                 let current = match Self::contact_snapshot(
                     &client,
                     &home,
@@ -1000,11 +1038,16 @@ fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
     etag.map_or(PutCondition::None, PutCondition::IfMatch)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ContactSnapshot {
     addressbook_url: String,
     ctag: Option<String>,
     entries: Vec<ContactSnapshotEntry>,
+    /// Hrefs the server reported *failed* within the 207 of the poll
+    /// that built this snapshot. Not persisted in the cursor (a
+    /// per-poll observation); the diff preserves these `previous`
+    /// entries rather than destroying them.
+    failed_hrefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,10 +1125,19 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, Acco
         addressbook_url,
         ctag,
         entries,
+        failed_hrefs: Vec::new(),
     })
 }
 
 fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot) -> Vec<Change> {
+    // Suspected transient empty multistatus: a server returning zero
+    // hrefs against a populated local snapshot would emit a Destroyed for
+    // every contact and wipe the consumer's store. Treat
+    // empty-vs-nonempty as "no observation," not "everything deleted."
+    if current.entries.is_empty() && !previous.entries.is_empty() {
+        return Vec::new();
+    }
+    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
     let mut changes = Vec::new();
     let mut left = 0;
     let mut right = 0;
@@ -1099,7 +1151,7 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
                 right += 1;
             }
             (Some(old), Some(new)) if old.uri < new.uri => {
-                changes.push(object_change(&old.uri, ObjectChangeKind::Destroyed));
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
                 left += 1;
             }
             (Some(_), Some(new)) => {
@@ -1107,7 +1159,7 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
                 right += 1;
             }
             (Some(old), None) => {
-                changes.push(object_change(&old.uri, ObjectChangeKind::Destroyed));
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
                 left += 1;
             }
             (None, Some(new)) => {
@@ -1118,6 +1170,16 @@ fn diff_contact_snapshots(previous: &ContactSnapshot, current: &ContactSnapshot)
         }
     }
     changes
+}
+
+/// Emit `Destroyed` for `uri` unless the server reported that resource
+/// *failed* within the 207. A transiently-failed resource is preserved
+/// locally rather than treated as absent (brick 7).
+fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
+    if failed.contains(uri) {
+        return;
+    }
+    changes.push(object_change(uri, ObjectChangeKind::Destroyed));
 }
 
 fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
@@ -1378,9 +1440,12 @@ mod tests {
                     etag: None,
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
         let cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
 
+        // failed_hrefs is a per-poll observation, not persisted; the
+        // decoded cursor carries an empty failed_hrefs.
         let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
@@ -1405,6 +1470,7 @@ mod tests {
                     etag: Some("gone".to_string()),
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
         let current = ContactSnapshot {
             addressbook_url: "book".to_string(),
@@ -1423,6 +1489,7 @@ mod tests {
                     etag: Some("created".to_string()),
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
 
         let changes = diff_contact_snapshots(&previous, &current);
@@ -1442,6 +1509,63 @@ mod tests {
                 ("d.vcf".to_string(), ObjectChangeKind::Destroyed),
             ]
         );
+    }
+
+    fn snapshot_with(entries: &[&str]) -> ContactSnapshot {
+        ContactSnapshot {
+            addressbook_url: "book".to_string(),
+            ctag: None,
+            entries: entries
+                .iter()
+                .map(|uri| ContactSnapshotEntry {
+                    uri: (*uri).to_string(),
+                    etag: Some("e".to_string()),
+                })
+                .collect(),
+            failed_hrefs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diff_contact_snapshots_suppresses_empty_207_mass_delete() {
+        // Brick 6: a populated previous diffed against an empty current
+        // yields zero changes (no Destroyed) - the suspected-transient
+        // empty multistatus.
+        let previous = snapshot_with(&["a.vcf", "b.vcf"]);
+        let empty = snapshot_with(&[]);
+        assert!(diff_contact_snapshots(&previous, &empty).is_empty());
+
+        // populated-vs-populated unchanged; empty-vs-empty zero.
+        let same = diff_contact_snapshots(&previous, &previous);
+        assert!(same.is_empty());
+        assert!(diff_contact_snapshots(&empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn failed_uri_preserved_in_contact_diff() {
+        // Brick 7: a previous entry whose href is in current.failed_hrefs
+        // is NOT emitted as Destroyed.
+        let previous = snapshot_with(&["a.vcf", "b.vcf"]);
+        let mut current = snapshot_with(&["a.vcf"]);
+        current.failed_hrefs = vec!["b.vcf".to_string()];
+
+        let changes = diff_contact_snapshots(&previous, &current);
+        assert!(
+            changes.is_empty(),
+            "a transiently-failed resource must not be destroyed: {changes:?}"
+        );
+
+        // Without the failed-href, b.vcf's absence IS a destroy.
+        let current_no_failed = snapshot_with(&["a.vcf"]);
+        let changes = diff_contact_snapshots(&previous, &current_no_failed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            changes[0],
+            Change::ObjectChange(ObjectChange {
+                kind: ObjectChangeKind::Destroyed,
+                ..
+            })
+        ));
     }
 
     #[test]

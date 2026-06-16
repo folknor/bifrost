@@ -11,12 +11,22 @@ use crate::types::{FetchAttr, MailboxName, SelectedMailbox, UidSet};
 
 use super::folder_registry::expand_range;
 use super::{
-    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, batch, boxed_receiver_stream,
-    decode_cursor, encode_cursor, encode_object_id, fatal_event, folder_from_scope, folder_scope,
-    membership_scope, terminated_event,
+    BATCH_ITEMS, CompactUidSet, FolderCursor, ImapAccount, ScopeHandler, batch,
+    boxed_receiver_stream, decode_cursor, encode_cursor, encode_object_id, fatal_event,
+    folder_from_scope, folder_scope, membership_scope, route_scope, terminated_event,
 };
 
 pub(crate) fn describe_cursor(account: &ImapAccount, cursor: &ChangeCursor) -> CursorDescriptor {
+    // A typed scope owned by a sub-account is described by that
+    // sub-account; only IMAP folder cursors fall through to the
+    // strategy/cost classification below.
+    if let Ok(ScopeHandler::Delegate(sub)) = route_scope(
+        account,
+        &cursor.scope,
+        bifrost_types::AccountOperation::SyncChanges,
+    ) {
+        return sub.describe_cursor(cursor);
+    }
     let decoded = decode_cursor(cursor);
     let folder =
         folder_from_scope(&cursor.scope, bifrost_types::AccountOperation::SyncChanges).ok();
@@ -58,6 +68,19 @@ pub(crate) fn changes_stream(
     account: ImapAccount,
     cursor: ChangeCursor,
 ) -> bifrost_types::AccountStream<SyncEvent<Change>> {
+    // Route first: a typed scope owned by a sub-account delegates the
+    // whole changes stream.
+    match route_scope(
+        &account,
+        &cursor.scope,
+        bifrost_types::AccountOperation::SyncChanges,
+    ) {
+        Ok(ScopeHandler::Delegate(sub)) => return sub.changes_stream(cursor),
+        Ok(ScopeHandler::Folder(_)) => {}
+        Err(error) => {
+            return Box::pin(futures::stream::iter([SyncEvent::Terminated(error)]));
+        }
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(super::STREAM_CAPACITY);
     let scope_for_ctx = cursor.scope.clone();
     tokio::spawn(async move {

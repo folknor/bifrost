@@ -29,9 +29,13 @@ calendar primitives.
 - `parse.rs` - XML response parsers for calendar discovery, event
   listing, multiget hydration, and nested href properties. Calendar
   collection metadata is staged per `propstat` and committed only for
-  successful 2xx propstat statuses. Event listing and multiget parsers
-  use element-stack parent checks so nested same-name properties do not
-  overwrite response-level hrefs or propstat status.
+  successful 2xx propstat statuses. `parse_propfind_events` returns a
+  `CalDavEventListing`: committed `entries` plus `failed_hrefs` (`.ics`
+  resources whose only propstat failed within the 207), so the snapshot
+  diff preserves a transiently-failed resource instead of destroying it.
+  Event listing and multiget parsers use element-stack parent checks so
+  nested same-name properties do not overwrite response-level hrefs or
+  propstat status.
 - `ical.rs` - small iCalendar projection between DAV resources and
   `bifrost-types` calendar events.
 - `capabilities.rs` - calendar-only `AccountCapabilities`.
@@ -88,10 +92,15 @@ Cursor support is calendar-event only. `discover_cursor_scopes` returns
 builds a hybrid cursor from the calendar URL, the collection
 `sync-token` when present, and a sorted href/etag snapshot.
 `changes_stream` uses WebDAV `sync-collection` when the cursor carries a
-sync token, applies returned href/etag/status entries to the snapshot,
-and emits created/updated/destroyed event changes. Calendars without a
-sync token fall back to polling snapshot diffs. `inventory_stream` emits
-event inventory entries with ETag fingerprints for the same cursor scope.
+sync token, applies returned href/etag/status entries to the snapshot
+(deleting only on explicit per-entry `404`/`410`), and emits
+created/updated/destroyed event changes. Calendars without a sync token
+fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
+sync-token path) is hardened against destroy-everything failure modes: an
+empty multistatus against a populated prior snapshot suppresses the
+mass-delete, and any href in `current.failed_hrefs` is preserved rather
+than destroyed. `inventory_stream` emits event inventory entries with ETag
+fingerprints for the same cursor scope.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

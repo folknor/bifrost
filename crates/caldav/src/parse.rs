@@ -17,6 +17,17 @@ pub(crate) struct CalDavEventEntry {
     pub(crate) etag: Option<String>,
 }
 
+/// Outcome of a depth-1 event PROPFIND: the resources whose propstat
+/// succeeded (`entries`) plus the hrefs the server reported *failed*
+/// within the 207. A failed href is a transiently-failed resource, not
+/// an absent one - the snapshot diff preserves the local copy rather
+/// than emitting a Destroyed (brick 7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CalDavEventListing {
+    pub(crate) entries: Vec<CalDavEventEntry>,
+    pub(crate) failed_hrefs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalDavFetchedEvent {
     pub(crate) uri: String,
@@ -136,9 +147,9 @@ pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollec
     Ok(collections)
 }
 
-pub(crate) fn parse_propfind_events(xml: &str) -> Result<Vec<CalDavEventEntry>, String> {
+pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, String> {
     let mut reader = Reader::from_str(xml);
-    let mut entries = Vec::new();
+    let mut listing = CalDavEventListing::default();
     let mut current = ResponseParts::default();
     let mut stack = Vec::new();
     let mut text = String::new();
@@ -150,6 +161,9 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<Vec<CalDavEventEntry>, 
                 if name == "response" {
                     current = ResponseParts::default();
                     current.in_response = true;
+                }
+                if current.in_response && name == "propstat" {
+                    current.begin_propstat();
                 }
                 if current.in_response && name == "collection" {
                     current.is_collection = true;
@@ -172,13 +186,22 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<Vec<CalDavEventEntry>, 
                         (Some("response"), "href") => current.href = trimmed(&text),
                         (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
                         (Some("prop"), "getcontenttype") => current.content_type = trimmed(&text),
+                        (Some("propstat"), "status") => {
+                            current.propstat_success =
+                                status_code(&text).map(|code| matches!(code, 200..=299));
+                        }
                         _ => {}
                     }
+                }
+                if name == "propstat" {
+                    current.commit_propstat();
                 }
                 if name == "response" {
                     current.in_response = false;
                     if let Some(entry) = current.as_event_entry() {
-                        entries.push(entry);
+                        listing.entries.push(entry);
+                    } else if let Some(href) = current.as_failed_event_href() {
+                        listing.failed_hrefs.push(href);
                     }
                 }
                 stack.pop();
@@ -190,7 +213,7 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<Vec<CalDavEventEntry>, 
         }
     }
 
-    Ok(entries)
+    Ok(listing)
 }
 
 pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CalDavFetchedEvent>, String> {
@@ -399,6 +422,8 @@ struct ResponseParts {
     in_response: bool,
     in_propstat: bool,
     propstat_success: Option<bool>,
+    has_success_propstat: bool,
+    saw_failed_propstat: bool,
     is_calendar: bool,
     propstat_is_calendar: bool,
     privilege_seen: bool,
@@ -458,7 +483,11 @@ impl ResponseParts {
     }
 
     fn commit_propstat(&mut self) {
+        if self.propstat_success == Some(false) {
+            self.saw_failed_propstat = true;
+        }
         if self.propstat_success.unwrap_or(true) {
+            self.has_success_propstat = true;
             self.is_calendar |= self.propstat_is_calendar;
             self.privilege_seen |= self.propstat_privilege_seen;
             self.write_seen |= self.propstat_write_seen;
@@ -501,6 +530,11 @@ impl ResponseParts {
         if self.is_collection {
             return None;
         }
+        // A resource whose only propstat failed is not a committed
+        // entry; it is surfaced via `as_failed_event_href` instead.
+        if self.saw_failed_propstat && !self.has_success_propstat {
+            return None;
+        }
         if !is_calendar_resource(href, &self.content_type) {
             return None;
         }
@@ -508,6 +542,21 @@ impl ResponseParts {
             uri: href.clone(),
             etag: self.etag.clone(),
         })
+    }
+
+    /// The href of an event resource the server reported *failed* within
+    /// the 207 (a non-2xx propstat, no success propstat). Only `.ics`
+    /// resources surface - a failed collection is not a
+    /// transiently-failed resource.
+    fn as_failed_event_href(&self) -> Option<String> {
+        if self.is_collection || self.has_success_propstat || !self.saw_failed_propstat {
+            return None;
+        }
+        let href = self.href.as_ref()?;
+        if !href.to_ascii_lowercase().ends_with(".ics") {
+            return None;
+        }
+        Some(href.clone())
     }
 
     fn as_fetched_event(&self) -> Option<CalDavFetchedEvent> {
@@ -639,14 +688,15 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_events(xml).expect("valid XML");
+        let listing = parse_propfind_events(xml).expect("valid XML");
         assert_eq!(
-            entries,
+            listing.entries,
             vec![CalDavEventEntry {
                 uri: "/cal/one.ics".to_string(),
                 etag: Some("abc".to_string()),
             }]
         );
+        assert!(listing.failed_hrefs.is_empty());
     }
 
     #[test]
@@ -665,8 +715,8 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_events(xml).expect("valid XML");
-        assert_eq!(entries[0].uri, "/cal/one.ics");
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert_eq!(listing.entries[0].uri, "/cal/one.ics");
     }
 
     #[test]
@@ -683,8 +733,32 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_events(xml).expect("valid XML");
-        assert!(entries.is_empty());
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert!(listing.entries.is_empty());
+    }
+
+    #[test]
+    fn propfind_events_surfaces_failed_propstat_as_failed_href() {
+        // Brick 7: an event resource whose only propstat is a 404 is not
+        // committed as an entry, but IS surfaced as a failed href so the
+        // snapshot diff preserves the local copy.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/cal/one.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"missing"</D:getetag>
+        <D:getcontenttype>text/calendar</D:getcontenttype>
+      </D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let listing = parse_propfind_events(xml).expect("valid XML");
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.failed_hrefs, vec!["/cal/one.ics".to_string()]);
     }
 
     #[test]

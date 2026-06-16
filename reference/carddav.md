@@ -27,9 +27,13 @@ contact primitives.
 - `client.rs` - crate-private reqwest CardDAV client: discovery,
   `PROPFIND`, `REPORT`, `PUT`, and `DELETE`.
 - `parse.rs` - XML response parsers for addressbook discovery,
-  contact listing, multiget hydration, and nested href properties.
-  Addressbook/listing/multiget properties are staged per `propstat` and
-  committed only for successful 2xx propstat statuses. Response parsers
+  contact listing, multiget hydration, depth-0 `getctag`, and nested href
+  properties. Addressbook/listing/multiget properties are staged per
+  `propstat` and committed only for successful 2xx propstat statuses.
+  `parse_propfind_contacts` returns a `CardDavContactListing`: committed
+  `entries` plus `failed_hrefs` (vcard resources whose only propstat
+  failed within the 207), so the snapshot diff can preserve a
+  transiently-failed resource instead of destroying it. Response parsers
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs.
 - `vcard.rs` - small vCard projection between DAV resources and
@@ -72,11 +76,17 @@ Cursor support is contact-only. `discover_cursor_scopes` returns
 `CursorScope::Type(ObjectType::Contact)`. `establish_initial_cursor`
 builds a hybrid cursor from the address book URL, the collection
 `getctag` when present, and a sorted href/etag snapshot. `changes_stream`
-polls the current snapshot and emits created/updated/destroyed contact
-changes by diffing hrefs and etags. This consumes `getctag` as collection
-state metadata but does not implement WebDAV `sync-collection`.
-`inventory_stream` emits contact inventory entries with ETag
-fingerprints for the same contact scope.
+first runs a **ctag short-circuit**: when the prior cursor carries a ctag
+and a cheap depth-0 `getctag` PROPFIND (`client.collection_ctag`) shows it
+unchanged, it emits an empty batch and carries the cursor forward, skipping
+the full depth-1 PROPFIND + diff. Otherwise it polls the current snapshot
+and diffs hrefs/etags. Full WebDAV `sync-collection` parity with CalDAV is
+a named follow-up. The PROPFIND-snapshot diff is hardened against
+destroy-everything failure modes: an empty multistatus against a populated
+prior snapshot suppresses the mass-delete (treated as "no observation"),
+and any href in `current.failed_hrefs` is preserved rather than destroyed.
+`inventory_stream` emits contact inventory entries with ETag fingerprints
+for the same contact scope.
 
 All mail, filter, blob, push, calendar, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CardDav`.

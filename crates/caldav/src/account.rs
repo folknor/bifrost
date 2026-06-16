@@ -130,9 +130,9 @@ impl CalDavAccount {
                 .and_then(|collection| collection.sync_token),
             None => None,
         };
-        let mut entries = client
-            .list_events_for_operation(calendar, operation)
-            .await?
+        let listing = client.list_events_listing(calendar, operation).await?;
+        let mut entries = listing
+            .entries
             .into_iter()
             .map(|entry| EventSnapshotEntry {
                 uri: client.resolve_url(&entry.uri),
@@ -140,10 +140,16 @@ impl CalDavAccount {
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.uri.cmp(&right.uri));
+        let failed_hrefs = listing
+            .failed_hrefs
+            .into_iter()
+            .map(|href| client.resolve_url(&href))
+            .collect();
         Ok(EventSnapshot {
             calendar_url: calendar.to_string(),
             sync_token,
             entries,
+            failed_hrefs,
         })
     }
 }
@@ -927,11 +933,16 @@ fn same_url(left: &str, right: &str) -> bool {
     left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct EventSnapshot {
     calendar_url: String,
     sync_token: Option<String>,
     entries: Vec<EventSnapshotEntry>,
+    /// Hrefs the server reported *failed* within the 207 of the poll
+    /// that built this snapshot. Not persisted in the cursor (a
+    /// per-poll observation); the diff preserves these `previous`
+    /// entries rather than destroying them (brick 7).
+    failed_hrefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1009,6 +1020,7 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
         calendar_url,
         sync_token,
         entries,
+        failed_hrefs: Vec::new(),
     })
 }
 
@@ -1075,6 +1087,17 @@ fn apply_sync_report(
 }
 
 fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Vec<Change> {
+    // Suspected transient empty multistatus: a server returning zero
+    // hrefs against a populated local snapshot would emit a Destroyed for
+    // every object and wipe the consumer's store. Treat
+    // empty-vs-nonempty as "no observation," not "everything deleted."
+    // A genuine empty-out reconciles on the next non-empty poll or via
+    // the sync-token path (apply_sync_report), which is not exposed to a
+    // bare empty multistatus.
+    if current.entries.is_empty() && !previous.entries.is_empty() {
+        return Vec::new();
+    }
+    let failed: HashSet<&str> = current.failed_hrefs.iter().map(String::as_str).collect();
     let mut changes = Vec::new();
     let mut left = 0;
     let mut right = 0;
@@ -1088,7 +1111,7 @@ fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Ve
                 right += 1;
             }
             (Some(old), Some(new)) if old.uri < new.uri => {
-                changes.push(object_change(&old.uri, ObjectChangeKind::Destroyed));
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
                 left += 1;
             }
             (Some(_), Some(new)) => {
@@ -1096,7 +1119,7 @@ fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Ve
                 right += 1;
             }
             (Some(old), None) => {
-                changes.push(object_change(&old.uri, ObjectChangeKind::Destroyed));
+                push_destroyed_unless_failed(&mut changes, &failed, &old.uri);
                 left += 1;
             }
             (None, Some(new)) => {
@@ -1107,6 +1130,16 @@ fn diff_event_snapshots(previous: &EventSnapshot, current: &EventSnapshot) -> Ve
         }
     }
     changes
+}
+
+/// Emit `Destroyed` for `uri` unless the server reported that resource
+/// *failed* within the 207. A transiently-failed resource is preserved
+/// locally rather than treated as absent (brick 7).
+fn push_destroyed_unless_failed(changes: &mut Vec<Change>, failed: &HashSet<&str>, uri: &str) {
+    if failed.contains(uri) {
+        return;
+    }
+    changes.push(object_change(uri, ObjectChangeKind::Destroyed));
 }
 
 fn object_change(uri: &str, kind: ObjectChangeKind) -> Change {
@@ -1427,6 +1460,7 @@ mod tests {
                     etag: None,
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
         let cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
 
@@ -1454,6 +1488,7 @@ mod tests {
                     etag: Some("gone".to_string()),
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
         let current = EventSnapshot {
             calendar_url: "cal".to_string(),
@@ -1472,6 +1507,7 @@ mod tests {
                     etag: Some("created".to_string()),
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
 
         let changes = diff_event_snapshots(&previous, &current);
@@ -1491,6 +1527,57 @@ mod tests {
                 ("d.ics".to_string(), ObjectChangeKind::Destroyed),
             ]
         );
+    }
+
+    fn event_snapshot_with(entries: &[&str]) -> EventSnapshot {
+        EventSnapshot {
+            calendar_url: "cal".to_string(),
+            sync_token: None,
+            entries: entries
+                .iter()
+                .map(|uri| EventSnapshotEntry {
+                    uri: (*uri).to_string(),
+                    etag: Some("e".to_string()),
+                })
+                .collect(),
+            failed_hrefs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn diff_event_snapshots_suppresses_empty_207_mass_delete() {
+        // Brick 6: a populated previous diffed against an empty current
+        // yields zero changes (no Destroyed).
+        let previous = event_snapshot_with(&["a.ics", "b.ics"]);
+        let empty = event_snapshot_with(&[]);
+        assert!(diff_event_snapshots(&previous, &empty).is_empty());
+        assert!(diff_event_snapshots(&previous, &previous).is_empty());
+        assert!(diff_event_snapshots(&empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn failed_uri_preserved_in_event_diff() {
+        // Brick 7: a previous entry whose href is in current.failed_hrefs
+        // is NOT emitted as Destroyed.
+        let previous = event_snapshot_with(&["a.ics", "b.ics"]);
+        let mut current = event_snapshot_with(&["a.ics"]);
+        current.failed_hrefs = vec!["b.ics".to_string()];
+        assert!(
+            diff_event_snapshots(&previous, &current).is_empty(),
+            "a transiently-failed resource must not be destroyed"
+        );
+
+        // Without the failed-href, b.ics's absence IS a destroy.
+        let current_no_failed = event_snapshot_with(&["a.ics"]);
+        let changes = diff_event_snapshots(&previous, &current_no_failed);
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(
+            changes[0],
+            Change::ObjectChange(ObjectChange {
+                kind: ObjectChangeKind::Destroyed,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1513,6 +1600,7 @@ mod tests {
                     etag: Some("same".to_string()),
                 },
             ],
+            failed_hrefs: Vec::new(),
         };
 
         let changes = apply_sync_report(

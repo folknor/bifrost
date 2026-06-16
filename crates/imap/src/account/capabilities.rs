@@ -12,10 +12,16 @@ pub(crate) fn build_capabilities(
     profile: &ServerProfile,
     folders: &[MailboxInfo],
     has_sieve: bool,
-    has_carddav: bool,
-    has_caldav: bool,
+    contacts: Option<&AccountCapabilities>,
+    calendars: Option<&AccountCapabilities>,
     submission_configured: bool,
 ) -> AccountCapabilities {
+    // Copy only the contact / calendar field subsets from the
+    // sub-accounts' real capability snapshots; an absent sub-account
+    // leaves those flags `false` (`PimMethodSupport::default()`). Every
+    // other `pim_methods` field stays IMAP-owned below.
+    let contact_pim = contacts.map(|c| &c.pim_methods);
+    let calendar_pim = calendars.map(|c| &c.pim_methods);
     let has_drafts = folders.iter().any(|folder| {
         folder
             .attributes
@@ -93,23 +99,23 @@ pub(crate) fn build_capabilities(
             filter_update: has_sieve,
             filter_delete: has_sieve,
             filter_validate: has_sieve,
-            address_books_list: has_carddav,
-            contacts_list: has_carddav,
-            contact_get: has_carddav,
-            contact_create: has_carddav,
-            contact_update: has_carddav,
-            contact_delete: has_carddav,
-            contact_search: has_carddav,
-            contact_autocomplete: has_carddav,
-            calendars_list: has_caldav,
-            events_in_range: has_caldav,
-            event_get: has_caldav,
-            event_create: has_caldav,
-            event_update: has_caldav,
-            event_delete: has_caldav,
-            event_rsvp: has_caldav,
-            event_search: has_caldav,
-            event_autocomplete: has_caldav,
+            address_books_list: contact_pim.is_some_and(|p| p.address_books_list),
+            contacts_list: contact_pim.is_some_and(|p| p.contacts_list),
+            contact_get: contact_pim.is_some_and(|p| p.contact_get),
+            contact_create: contact_pim.is_some_and(|p| p.contact_create),
+            contact_update: contact_pim.is_some_and(|p| p.contact_update),
+            contact_delete: contact_pim.is_some_and(|p| p.contact_delete),
+            contact_search: contact_pim.is_some_and(|p| p.contact_search),
+            contact_autocomplete: contact_pim.is_some_and(|p| p.contact_autocomplete),
+            calendars_list: calendar_pim.is_some_and(|p| p.calendars_list),
+            events_in_range: calendar_pim.is_some_and(|p| p.events_in_range),
+            event_get: calendar_pim.is_some_and(|p| p.event_get),
+            event_create: calendar_pim.is_some_and(|p| p.event_create),
+            event_update: calendar_pim.is_some_and(|p| p.event_update),
+            event_delete: calendar_pim.is_some_and(|p| p.event_delete),
+            event_rsvp: calendar_pim.is_some_and(|p| p.event_rsvp),
+            event_search: calendar_pim.is_some_and(|p| p.event_search),
+            event_autocomplete: calendar_pim.is_some_and(|p| p.event_autocomplete),
         },
         filter_rule_shape: if has_sieve {
             FilterRuleShape::Scripts
@@ -136,7 +142,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[], false, false, false, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -159,14 +165,14 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, false, false, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
     }
 
     #[test]
     fn capability_builder_advertises_sieve_when_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], true, false, false, false);
+        let caps = build_capabilities(&profile, &[], true, None, None, false);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);
@@ -175,10 +181,26 @@ mod tests {
         assert!(caps.pim_methods.filter_validate);
     }
 
+    /// Minimal capability snapshot for a composed sub-account, with all
+    /// contact flags on and all calendar flags off (the carddav shape).
+    fn contacts_snapshot() -> AccountCapabilities {
+        let mut caps = crate::account::test_support::stub_capabilities();
+        caps.pim_methods.address_books_list = true;
+        caps.pim_methods.contacts_list = true;
+        caps.pim_methods.contact_get = true;
+        caps.pim_methods.contact_create = true;
+        caps.pim_methods.contact_update = true;
+        caps.pim_methods.contact_delete = true;
+        caps.pim_methods.contact_search = true;
+        caps.pim_methods.contact_autocomplete = true;
+        caps
+    }
+
     #[test]
     fn capability_builder_advertises_contacts_when_carddav_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, true, false, false);
+        let sub = contacts_snapshot();
+        let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false);
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);
         assert!(caps.pim_methods.contact_get);
@@ -187,17 +209,44 @@ mod tests {
         assert!(caps.pim_methods.contact_delete);
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
+        // Calendar flags stay false with no calendars sub.
+        assert!(!caps.pim_methods.calendars_list);
+        assert!(!caps.pim_methods.event_rsvp);
+    }
+
+    #[test]
+    fn capability_builder_copies_real_sub_account_flags() {
+        // A calendars sub that does NOT support event_rsvp must yield a
+        // composed capability with event_rsvp = false, proving the
+        // snapshot is copied field-by-field rather than blanket-true.
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let mut calendars = crate::account::test_support::stub_capabilities();
+        calendars.pim_methods.calendars_list = true;
+        calendars.pim_methods.events_in_range = true;
+        calendars.pim_methods.event_get = true;
+        calendars.pim_methods.event_rsvp = false; // unsupported by this provider
+
+        let caps = build_capabilities(&profile, &[], false, None, Some(&calendars), false);
+        assert!(caps.pim_methods.calendars_list);
+        assert!(caps.pim_methods.event_get);
+        assert!(
+            !caps.pim_methods.event_rsvp,
+            "an unsupported sub-account flag must not be advertised true",
+        );
+        // IMAP-owned mail flags are untouched by the calendar merge.
+        assert!(caps.pim_methods.message_hydrate);
+        assert!(caps.pim_methods.search_messages);
     }
 
     #[test]
     fn capabilities_send_flag_tracks_submission() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
 
-        let without = build_capabilities(&profile, &[], false, false, false, false);
+        let without = build_capabilities(&profile, &[], false, None, None, false);
         assert!(!without.pim_methods.send_message);
         assert!(!without.pim_methods.draft_send);
 
-        let with = build_capabilities(&profile, &[], false, false, false, true);
+        let with = build_capabilities(&profile, &[], false, None, None, true);
         assert!(with.pim_methods.send_message);
         assert!(with.pim_methods.draft_send);
         // Submission does not turn on uploaded-attachment support (A6).
@@ -211,7 +260,7 @@ mod tests {
         // `false` even when submission is configured; support is decided
         // at send time by the smtp boundary.
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let with_submission = build_capabilities(&profile, &[], false, false, false, true);
+        let with_submission = build_capabilities(&profile, &[], false, None, None, true);
         assert!(!with_submission.pim_methods.scheduled_send);
     }
 }

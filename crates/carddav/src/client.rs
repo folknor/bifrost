@@ -11,8 +11,9 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue}
 use reqwest::{Method, StatusCode, Url};
 
 use crate::parse::{
-    AddressBookCollection, CardDavContactEntry, CardDavFetchedVCard, extract_href_property,
-    parse_addressbook_collections, parse_multiget_report, parse_propfind_contacts,
+    AddressBookCollection, CardDavContactEntry, CardDavContactListing, CardDavFetchedVCard,
+    extract_href_property, parse_addressbook_collections, parse_multiget_report,
+    parse_propfind_contacts,
 };
 use crate::{CardDavConfig, CardDavCredentials};
 
@@ -136,11 +137,41 @@ impl CardDavClient {
             .await
     }
 
+    /// Cheap depth-0 PROPFIND for the collection `getctag`. Returns
+    /// `None` when the server omits it, so the caller falls through to a
+    /// full snapshot + diff (brick 8 ctag short-circuit).
+    pub(crate) async fn collection_ctag(
+        &self,
+        addressbook_url: &str,
+        operation: AccountOperation,
+    ) -> Result<Option<String>, AccountError> {
+        let body = self
+            .propfind_raw(addressbook_url, "0", PROPFIND_CTAG, operation)
+            .await?;
+        crate::parse::parse_collection_ctag(&body)
+            .map_err(|error| parse_error(operation, format!("collection ctag: {error}")))
+    }
+
     pub(crate) async fn list_contacts_for_operation(
         &self,
         addressbook_url: &str,
         operation: AccountOperation,
     ) -> Result<Vec<CardDavContactEntry>, AccountError> {
+        Ok(self
+            .list_contacts_listing(addressbook_url, operation)
+            .await?
+            .entries)
+    }
+
+    /// Depth-1 contact PROPFIND returning both the committed entries and
+    /// the hrefs the server reported *failed* within the 207, so the
+    /// snapshot diff can preserve transiently-failed resources rather
+    /// than destroying them (brick 7).
+    pub(crate) async fn list_contacts_listing(
+        &self,
+        addressbook_url: &str,
+        operation: AccountOperation,
+    ) -> Result<CardDavContactListing, AccountError> {
         let body = self
             .propfind_raw(addressbook_url, "1", PROPFIND_CONTACTS, operation)
             .await?;
@@ -552,6 +583,13 @@ const PROPFIND_ADDRESSBOOKS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
   <D:prop>\n\
     <D:resourcetype/>\n\
     <D:displayname/>\n\
+    <CS:getctag/>\n\
+  </D:prop>\n\
+</D:propfind>";
+
+const PROPFIND_CTAG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+<D:propfind xmlns:D=\"DAV:\" xmlns:CS=\"http://calendarserver.org/ns/\">\n\
+  <D:prop>\n\
     <CS:getctag/>\n\
   </D:prop>\n\
 </D:propfind>";

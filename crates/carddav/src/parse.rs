@@ -8,6 +8,17 @@ pub(crate) struct CardDavContactEntry {
     pub(crate) etag: Option<String>,
 }
 
+/// Outcome of a depth-1 contact PROPFIND: the resources whose propstat
+/// succeeded (`entries`) plus the hrefs the server reported *failed*
+/// within the 207 (a non-2xx propstat). A failed href is a
+/// transiently-failed resource, not an absent one - the snapshot diff
+/// preserves the local copy rather than emitting a Destroyed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CardDavContactListing {
+    pub(crate) entries: Vec<CardDavContactEntry>,
+    pub(crate) failed_hrefs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardDavFetchedVCard {
     pub(crate) uri: String,
@@ -96,9 +107,9 @@ pub(crate) fn parse_addressbook_collections(
     Ok(collections)
 }
 
-pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<Vec<CardDavContactEntry>, String> {
+pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing, String> {
     let mut reader = Reader::from_str(xml);
-    let mut entries = Vec::new();
+    let mut listing = CardDavContactListing::default();
     let mut current = ResponseParts::default();
     let mut stack = Vec::new();
     let mut text = String::new();
@@ -142,7 +153,9 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<Vec<CardDavContactEnt
                 if name == "response" {
                     current.in_response = false;
                     if let Some(entry) = current.as_contact_entry() {
-                        entries.push(entry);
+                        listing.entries.push(entry);
+                    } else if let Some(href) = current.as_failed_contact_href() {
+                        listing.failed_hrefs.push(href);
                     }
                 }
                 stack.pop();
@@ -154,7 +167,7 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<Vec<CardDavContactEnt
         }
     }
 
-    Ok(entries)
+    Ok(listing)
 }
 
 pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard>, String> {
@@ -216,6 +229,39 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard
     }
 
     Ok(results)
+}
+
+/// Extract the collection `getctag` value from a depth-0 PROPFIND
+/// response. Returns `None` when the server omits `getctag` (the caller
+/// then falls through to a full snapshot + diff).
+pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String> {
+    let mut reader = Reader::from_str(xml);
+    let mut stack: Vec<String> = Vec::new();
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                stack.push(local_name(element.name().as_ref()));
+                text.clear();
+            }
+            Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::End(element)) => {
+                let name = local_name(element.name().as_ref());
+                let parent = stack.iter().rev().nth(1).map(String::as_str);
+                if parent == Some("prop") && name == "getctag" {
+                    return Ok(trimmed(&text));
+                }
+                stack.pop();
+                text.clear();
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("XML parse error: {error}")),
+        }
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn extract_href_property(
@@ -312,6 +358,7 @@ struct ResponseParts {
     in_propstat: bool,
     propstat_success: Option<bool>,
     has_success_propstat: bool,
+    saw_failed_propstat: bool,
     is_addressbook: bool,
     propstat_is_addressbook: bool,
     href: Option<String>,
@@ -348,6 +395,9 @@ impl ResponseParts {
     }
 
     fn commit_propstat(&mut self) {
+        if self.propstat_success == Some(false) {
+            self.saw_failed_propstat = true;
+        }
         if self.propstat_success.unwrap_or(true) {
             self.has_success_propstat = true;
             self.is_addressbook |= self.propstat_is_addressbook;
@@ -403,6 +453,23 @@ impl ResponseParts {
         })
     }
 
+    /// The href of a resource the server reported *failed* within the
+    /// 207 (a non-2xx propstat, no success propstat). Only vcard
+    /// resources are surfaced - a failed collection is not a
+    /// transiently-failed resource and must not leak into the
+    /// failed-href channel. Content-type is committed only on success,
+    /// so detection keys on the `.vcf` href suffix.
+    fn as_failed_contact_href(&self) -> Option<String> {
+        if self.has_success_propstat || !self.saw_failed_propstat {
+            return None;
+        }
+        let href = self.href.as_ref()?;
+        if !href.to_ascii_lowercase().ends_with(".vcf") {
+            return None;
+        }
+        Some(href.clone())
+    }
+
     fn as_fetched_vcard(&self) -> Option<CardDavFetchedVCard> {
         Some(CardDavFetchedVCard {
             uri: self.href.as_ref()?.clone(),
@@ -440,14 +507,15 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_contacts(xml).expect("valid XML");
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
         assert_eq!(
-            entries,
+            listing.entries,
             vec![CardDavContactEntry {
                 uri: "/contacts/card-1.vcf".to_string(),
                 etag: Some("abc".to_string()),
             }]
         );
+        assert!(listing.failed_hrefs.is_empty());
     }
 
     #[test]
@@ -466,8 +534,15 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_contacts(xml).expect("valid XML");
-        assert!(entries.is_empty());
+        // A 404-propstat resource is not committed as an entry, but it
+        // IS surfaced as a failed href so the snapshot diff can preserve
+        // the local copy instead of destroying it.
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert!(listing.entries.is_empty());
+        assert_eq!(
+            listing.failed_hrefs,
+            vec!["/contacts/card-1.vcf".to_string()]
+        );
     }
 
     #[test]
@@ -486,8 +561,8 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let entries = parse_propfind_contacts(xml).expect("valid XML");
-        assert_eq!(entries[0].uri, "/contacts/card-1.vcf");
+        let listing = parse_propfind_contacts(xml).expect("valid XML");
+        assert_eq!(listing.entries[0].uri, "/contacts/card-1.vcf");
     }
 
     #[test]
@@ -534,6 +609,46 @@ END:VCARD</C:address-data>
 
         let cards = parse_multiget_report(xml).expect("valid XML");
         assert!(cards.is_empty());
+    }
+
+    // The depth-0 getctag PROPFIND backing the brick-8 ctag
+    // short-circuit. The short-circuit decision (current == previous)
+    // is exercised end-to-end downstream against a real server, per the
+    // no-mock-server testing rule; here the deterministic piece is that
+    // the helper extracts the collection ctag the decision keys off.
+    #[test]
+    fn ctag_short_circuit_parses_depth0_getctag() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop>
+        <CS:getctag>ctag-7</CS:getctag>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let ctag = parse_collection_ctag(xml).expect("valid XML");
+        assert_eq!(ctag.as_deref(), Some("ctag-7"));
+    }
+
+    #[test]
+    fn parse_collection_ctag_absent_returns_none() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop><D:displayname>Personal</D:displayname></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        assert!(parse_collection_ctag(xml).expect("valid XML").is_none());
     }
 
     #[test]
