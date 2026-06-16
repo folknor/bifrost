@@ -1,3 +1,4 @@
+mod autodiscover;
 mod blob;
 mod calendar;
 mod capabilities;
@@ -14,6 +15,7 @@ mod graph_error;
 mod inventory;
 mod mutate;
 mod pim;
+mod public_folder;
 mod push;
 mod push_stream;
 mod scopes;
@@ -79,6 +81,22 @@ pub(crate) struct GraphAccount {
     pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<HashMap<String, String>>>,
+    /// Public-folder routing map, keyed by native EWS `FolderId`. A
+    /// folder present here is a public folder: it establishes via the
+    /// public-folder inventory pass and polls via the no-delta-token
+    /// strategy. Seeded empty at open; spec-3's Autodiscover discovery
+    /// fills it. The presence-in-map check (`public_folder_routing`) is
+    /// the discriminator that keeps a bare `CursorScope::Folder` for a
+    /// non-public folder on its existing (reject-on-delta) path.
+    pub(crate) routing_map:
+        Arc<RwLock<HashMap<bifrost_types::FolderId, cursor::PublicFolderRouting>>>,
+    /// Whether public-folder discovery is enabled (opt-in via
+    /// `with_public_folders`). Default off, so no existing Graph account
+    /// pays the Autodiscover round-trips.
+    pub(crate) public_folders_enabled: bool,
+    /// The account's primary SMTP, captured at open from the Graph
+    /// profile. Seeds the `GetUserSettings` Autodiscover lookups.
+    pub(crate) user_email: Option<String>,
 }
 
 impl GraphAccount {
@@ -87,6 +105,8 @@ impl GraphAccount {
         push_mode: PushMode,
         push_endpoint: Option<PushEndpoint>,
         shared_mailboxes: &[String],
+        public_folders_enabled: bool,
+        user_email: Option<String>,
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
         let shared_clients = shared_mailboxes
@@ -108,12 +128,15 @@ impl GraphAccount {
             ews_worker: Arc::new(Mutex::new(None)),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(HashMap::new())),
+            routing_map: Arc::new(RwLock::new(HashMap::new())),
+            public_folders_enabled,
+            user_email,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_tests(client: GraphClient, push_mode: PushMode) -> Self {
-        Self::new(client, push_mode, None, &[])
+        Self::new(client, push_mode, None, &[], false, None)
     }
 
     #[cfg(test)]
@@ -122,7 +145,18 @@ impl GraphAccount {
         push_mode: PushMode,
         shared_mailboxes: &[String],
     ) -> Self {
-        Self::new(client, push_mode, None, shared_mailboxes)
+        Self::new(client, push_mode, None, shared_mailboxes, false, None)
+    }
+
+    /// Seed a public-folder routing entry for tests. Mirrors what
+    /// spec-3's Autodiscover discovery does at runtime.
+    #[cfg(test)]
+    pub(crate) async fn seed_public_folder_for_tests(
+        &self,
+        folder: bifrost_types::FolderId,
+        routing: cursor::PublicFolderRouting,
+    ) {
+        self.routing_map.write().await.insert(folder, routing);
     }
 
     /// Select the `GraphClient` whose `/users/{mailbox}` prefix routes
@@ -139,6 +173,17 @@ impl GraphAccount {
         } else {
             &self.client
         }
+    }
+
+    /// Look up the public-folder routing for a native EWS folder id, or
+    /// `None` if the folder is not a public folder. Presence in the map
+    /// is the discriminator that routes a `CursorScope::Folder` onto the
+    /// public-folder sync path (vs the existing reject-on-delta path).
+    pub(crate) async fn public_folder_routing(
+        &self,
+        folder: &bifrost_types::FolderId,
+    ) -> Option<cursor::PublicFolderRouting> {
+        self.routing_map.read().await.get(folder).cloned()
     }
 
     /// The owning shared-mailbox identity for a foreign scope, or `None`
@@ -162,6 +207,7 @@ pub struct GraphAccountFactory {
     push_mode: PushMode,
     push_endpoint: Option<PushEndpoint>,
     shared_mailboxes: Vec<String>,
+    public_folders: bool,
 }
 
 impl GraphAccountFactory {
@@ -172,7 +218,20 @@ impl GraphAccountFactory {
             push_mode: PushMode::GraphSubscriptions,
             push_endpoint: None,
             shared_mailboxes: Vec::new(),
+            public_folders: false,
         }
+    }
+
+    /// Opt in to Exchange public-folder discovery and sync. Default off:
+    /// no existing Graph account pays the Autodiscover round-trips.
+    /// Discovered public folders surface as ordinary
+    /// `CursorScope::Folder` scopes synced by the no-delta-token poll
+    /// strategy. A per-folder Autodiscover/permission failure is skipped
+    /// with a scoped warning, not a discovery-wide failure.
+    // pub: public-folder consumers opt in before building the factory.
+    pub fn with_public_folders(mut self) -> Self {
+        self.public_folders = true;
+        self
     }
 
     /// Register a delegate/shared mailbox by its routing key (the SMTP
@@ -212,9 +271,10 @@ impl AccountFactory for GraphAccountFactory {
         let push_mode = self.push_mode;
         let push_endpoint = self.push_endpoint.clone();
         let shared_mailboxes = self.shared_mailboxes.clone();
+        let public_folders = self.public_folders;
         Box::pin(async move {
             client.attach_account(account_id);
-            client.get_profile().await.map_err(|e| {
+            let profile = client.get_profile().await.map_err(|e| {
                 super::account::graph_error::into_account_error(
                     e,
                     super::account::graph_error::GraphErrorContext::graph(
@@ -222,8 +282,15 @@ impl AccountFactory for GraphAccountFactory {
                     ),
                 )
             })?;
-            let account =
-                GraphAccount::new(client.clone(), push_mode, push_endpoint, &shared_mailboxes);
+            let user_email = profile.mail.or(profile.user_principal_name);
+            let account = GraphAccount::new(
+                client.clone(),
+                push_mode,
+                push_endpoint,
+                &shared_mailboxes,
+                public_folders,
+                user_email,
+            );
             let folders = client.list_mail_folders_recursive().await.map_err(|e| {
                 super::account::graph_error::into_account_error(
                     e,
@@ -260,19 +327,23 @@ impl Account for GraphAccount {
     }
 
     fn describe_cursor(&self, cursor: &ChangeCursor) -> CursorDescriptor {
-        let valid = cursor::decode_cursor(cursor).is_ok();
+        let decoded = cursor::decode_cursor(cursor).ok();
+        // A public folder is a client-maintained watermark poll, not a
+        // server-issued delta token; report `Poll` so the descriptor is
+        // honest about its strategy. Delta kinds stay `ServerCursor`.
+        let strategy = match decoded.as_ref().map(|p| &p.kind) {
+            Some(cursor::GraphCursorKind::PublicFolder(_)) => SyncStrategy::Poll,
+            Some(_) => SyncStrategy::ServerCursor,
+            None => SyncStrategy::None,
+        };
         CursorDescriptor {
-            cost_class: if valid {
+            cost_class: if decoded.is_some() {
                 CostClass::Cheap
             } else {
                 CostClass::Expensive
             },
-            strategy: if valid {
-                SyncStrategy::ServerCursor
-            } else {
-                SyncStrategy::None
-            },
-            freshness: valid.then(Instant::now),
+            strategy,
+            freshness: decoded.is_some().then(Instant::now),
         }
     }
 
@@ -296,7 +367,20 @@ impl Account for GraphAccount {
         &self,
         scope: CursorScope,
     ) -> AccountFuture<Result<CursorEstablishment, AccountError>> {
+        let account = self.clone();
         Box::pin(async move {
+            // Public-folder scope: discriminate by routing-map
+            // membership, NOT by the `CursorScope::Folder` variant alone
+            // (that variant is already live on the Graph delta path and
+            // must keep rejecting non-public folders).
+            if let CursorScope::Folder(folder) = &scope
+                && account.public_folder_routing(folder).await.is_some()
+            {
+                return Ok(CursorEstablishment::EstablishViaInventory);
+            }
+            // Fall through: a bare Folder NOT in the routing map stays
+            // Unsupported (preserving the reject-on-bare-Folder
+            // invariant), as does any other unsupported scope.
             cursor::kind_for_scope(&scope).map_err(|e| {
                 graph_error::cursor_error_to_account_error(
                     e,
@@ -311,6 +395,25 @@ impl Account for GraphAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+        // Route a public-folder `CursorScope::Folder` (present in the
+        // routing map) to the no-delta-token inventory pass; everything
+        // else (including a bare Folder for a non-public folder) stays
+        // on the existing delta inventory path, which still rejects it.
+        if let CursorScope::Folder(folder) = &scope {
+            let account = self.clone();
+            let folder = folder.clone();
+            let scope = scope.clone();
+            return Box::pin(
+                stream::once(async move {
+                    if account.public_folder_routing(&folder).await.is_some() {
+                        public_folder::public_folder_inventory_stream(account, scope)
+                    } else {
+                        inventory::inventory_stream(account, scope)
+                    }
+                })
+                .flatten(),
+            );
+        }
         inventory::inventory_stream(self.clone(), scope)
     }
 
@@ -323,6 +426,17 @@ impl Account for GraphAccount {
     }
 
     fn changes_stream(&self, cursor: ChangeCursor) -> AccountStream<SyncEvent<Change>> {
+        // A decoded `PublicFolder` payload routes to the no-delta-token
+        // poll strategy; any other (or undecodable) cursor stays on the
+        // existing delta changes path. The cursor kind is unambiguous,
+        // so no routing-map check is needed - the routing rides in the
+        // payload.
+        if matches!(
+            cursor::decode_cursor(&cursor).map(|p| p.kind),
+            Ok(cursor::GraphCursorKind::PublicFolder(_))
+        ) {
+            return public_folder::public_folder_changes_stream(self.clone(), cursor);
+        }
         changes::changes_stream(self.clone(), cursor)
     }
 
@@ -833,4 +947,108 @@ where
     F: Future<Output = Vec<SyncEvent<T>>> + Send + 'static,
 {
     Box::pin(stream::once(future).flat_map(stream::iter))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use bifrost_types::{AccountErrorKind, AccountOperation, FolderId, ObjectType};
+
+    use super::cursor::{
+        GraphCursorPayload, PublicFolderCursor, PublicFolderRouting, encode_cursor, kind_for_scope,
+    };
+    use super::*;
+
+    fn account() -> GraphAccount {
+        GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    fn public_folder_routing() -> PublicFolderRouting {
+        PublicFolderRouting {
+            anchor_mailbox: "content@contoso.com".to_string(),
+            public_folder_mailbox: Some("pf@contoso.com".to_string()),
+        }
+    }
+
+    fn public_folder_cursor(folder: &str) -> ChangeCursor {
+        let pf = PublicFolderCursor {
+            folder_id: folder.to_string(),
+            routing: public_folder_routing(),
+            watermark: Some("2026-03-01T10:00:00Z".to_string()),
+            last_full_scan_at: None,
+            live_ids: Vec::new(),
+        };
+        encode_cursor(
+            CursorScope::Folder(FolderId(folder.to_string())),
+            GraphCursorPayload::public_folder(pf),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bare_folder_in_routing_map_establishes_via_inventory() {
+        let account = account();
+        let folder = FolderId("AAMkPF=".to_string());
+        account
+            .seed_public_folder_for_tests(folder.clone(), public_folder_routing())
+            .await;
+
+        // A Folder scope present in the routing map establishes via
+        // inventory.
+        let in_map = account
+            .establish_initial_cursor(CursorScope::Folder(folder))
+            .await
+            .expect("seeded public folder establishes");
+        assert!(matches!(in_map, CursorEstablishment::EstablishViaInventory));
+
+        // A Folder scope absent from the map is rejected exactly as
+        // today (preserving initial_delta_url_rejects_bare_folder_scope).
+        let absent = account
+            .establish_initial_cursor(CursorScope::Folder(FolderId("other".to_string())))
+            .await;
+        let err = absent.expect_err("bare non-public folder rejected");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::EstablishCursor)
+        ));
+    }
+
+    #[test]
+    fn describe_cursor_reports_poll_for_public_folder() {
+        let account = account();
+        let pf = account.describe_cursor(&public_folder_cursor("AAMkPF="));
+        assert_eq!(pf.strategy, SyncStrategy::Poll);
+
+        let messages_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let messages = encode_cursor(
+            messages_scope.clone(),
+            GraphCursorPayload::new(
+                kind_for_scope(&messages_scope).unwrap(),
+                "https://graph.example/delta".to_string(),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            account.describe_cursor(&messages).strategy,
+            SyncStrategy::ServerCursor
+        );
+    }
+
+    #[tokio::test]
+    async fn public_folder_push_subscribe_unsupported() {
+        let account = account();
+        let scope = CursorScope::Folder(FolderId("AAMkPF=".to_string()));
+        let err = account
+            .push_subscribe(&[scope])
+            .await
+            .expect_err("public-folder push is unsupported");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
+    }
 }

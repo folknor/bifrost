@@ -8,7 +8,7 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::ews::{EwsClient, EwsError};
+use crate::ews::{EwsClient, EwsError, EwsHeaders};
 
 use super::GraphAccount;
 use super::graph_error::{GraphErrorContext, ews_error_to_account_error};
@@ -308,7 +308,7 @@ async fn subscribe(
 ) -> Result<EwsStreamingSubscription, EwsError> {
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
-    let xml = ews.execute(&body).await?;
+    let xml = ews.execute(&body, &EwsHeaders::default()).await?;
     let subscriptions = parse_subscribe_response(&xml)
         .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))?;
     subscriptions.into_iter().next().ok_or_else(|| {
@@ -329,7 +329,7 @@ async fn run_get_events_loop(
             return StreamLoopExit::Shutdown;
         }
         let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&body).await {
+        match ews.execute(&body, &EwsHeaders::default()).await {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {

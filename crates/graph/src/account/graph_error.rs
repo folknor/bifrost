@@ -754,6 +754,33 @@ pub(crate) fn graph_shared_scope_error(
     into_account_error(error, ctx)
 }
 
+/// EWS twin of `graph_shared_scope_error`. A public folder always has
+/// an owning content mailbox (`owner.is_some()`), so a per-operation
+/// `ErrorAccessDenied` (-> `Authorization(PermissionDenied)`) on a
+/// public-folder scope quarantines just that scope via `ScopeRevoked`
+/// instead of escalating account-wide. Any non-permission EWS failure,
+/// or a scope with no owner, flows through the unchanged
+/// `ews_error_to_account_error` path.
+#[must_use]
+pub(crate) fn ews_shared_scope_error(
+    error: EwsError,
+    scope: &CursorScope,
+    owner: Option<&MailboxId>,
+    ctx: GraphErrorContext,
+) -> AccountError {
+    if let Some(owner) = owner {
+        let account_error = ews_error_to_account_error(error, ctx.clone());
+        if matches!(
+            account_error.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+        ) {
+            return graph_scope_revoked(scope.clone(), owner, ctx.operation);
+        }
+        return account_error;
+    }
+    ews_error_to_account_error(error, ctx)
+}
+
 /// Build an `AccountError` for an operation this account does not support.
 #[must_use]
 pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountError {
@@ -1573,6 +1600,34 @@ mod tests {
             RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
         );
         assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    #[test]
+    fn public_folder_access_denied_quarantines_scope() {
+        // A public folder's content mailbox is always its owner, so an
+        // EWS ErrorAccessDenied quarantines just this scope via the A5a
+        // ScopeRevoked path rather than escalating account-wide.
+        let scope = CursorScope::Folder(bifrost_types::FolderId("AAMkPF=".to_string()));
+        let owner = MailboxId("content@contoso.com".to_string());
+        let err = ews_shared_scope_error(
+            EwsError::SoapFault {
+                code: SoapFaultCode::ErrorAccessDenied,
+                detail: DiagnosticText::support_only("ErrorAccessDenied".to_string()),
+            },
+            &scope,
+            Some(&owner),
+            GraphErrorContext::ews(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        assert_eq!(
+            *err.recovery(),
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope))
+        );
     }
 
     #[test]

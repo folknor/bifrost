@@ -282,13 +282,13 @@ above.
 
 ---
 
-## A5 - Shared mailboxes + public folders (largest brick) - OPEN (A5c + A5a LANDED)
+## A5 - Shared mailboxes + public folders (largest brick) - LANDED (A5a/A5b/A5c)
 
 Substantial ratatoskr code (~110 KB / 6 files) but most is CRUD + ad-hoc
 poll-loop-into-SQLite - the shape the plan warns against. The hard, novel work is
 reshaping that onto `CursorScope`/`changes_stream`, which has no ratatoskr
-analog. Splits **three** ways, not two. **A5c and A5a are LANDED; A5b remains
-OPEN, so A5 overall is OPEN.**
+analog. Splits **three** ways, not two. **All three (A5c, A5a, A5b) are LANDED,
+so A5 overall is LANDED.**
 
 **Gating fork - RESOLVED by A5c (option (a)-lite, no new variant).** ratatoskr
 models a shared mailbox as a *cloned client* (`for_shared_mailbox`), not a scope.
@@ -355,7 +355,7 @@ mutation path is unwired - mirrors Graph's C-3 send-as exclusion) and live
 foreign *mailbox lifecycle* (discovery seeded once at open; a foreign mailbox
 added afterwards surfaces at the next reopen).
 
-### A5b - Graph EWS public folders + Autodiscover (size L, the real unknown)
+### A5b - Graph EWS public folders + Autodiscover (size L, the real unknown) - LANDED
 
 | ratatoskr | bifrost dest | class |
 |---|---|---|
@@ -365,30 +365,36 @@ added afterwards surfaces at the next reopen).
 | `autodiscover.rs` HTTP entry points | same | COPY-AND-ADAPT |
 | `public_folder_sync.rs` poll loop + SQLite | new bifrost sync strategy + `CheckpointStore` | RESHAPE / RATATOSKR-KEEPS (DB) |
 
-The single biggest piece of net-new sync engineering in all of Track A: public
-folders have **no delta token**, so a timestamp-poll-plus-periodic-full-deletion-
-scan must become a first-class bifrost cursor strategy (`establish_initial_cursor`
--> `EstablishViaInventory`; `changes_stream` re-polls by `DateTimeReceived` and
-periodically does a full-id reconcile). The throttle state (`last_full_scan_at`)
-and the routing context (hierarchy/content mailbox, `X-PublicFolderMailbox`
-header) must live **inside the opaque cursor**, reconstructable on a cold resume -
-not a side table. bifrost's EWS today is only the streaming-fallback skeleton
-(client + envelope helpers); FindFolder/FindItem are net-new. The error-mapping
-path (`ews_error_to_account_error`, `SoapFaultCode`) already exists, which
-de-risks the adapt.
+LANDED (three sub-specs; see `reference/graph.md` and the A5b entry in
+`ratatoskr-adoption.md`). Public folders have **no delta token**, so the
+timestamp-poll-plus-throttled-full-deletion-scan is now a first-class bifrost
+cursor strategy: `establish_initial_cursor -> EstablishViaInventory` for a
+routing-map-member `CursorScope::Folder`, `changes_stream` re-polls by
+`DateTimeReceived` since the watermark and periodically full-id-reconciles. The
+throttle state (`last_full_scan_at`), the routing pair
+(`X-AnchorMailbox`/`X-PublicFolderMailbox`), and the deletion baseline (`live_ids`,
+capped at 10_000) all live **inside the opaque cursor** (`PublicFolderCursor`),
+reconstructable on a cold resume. EWS gained the read ops
+(`FindFolder`/`GetFolder`/`FindItem`/`GetItem` over `AccountNet`); `CreateItem`
+was deliberately NOT ported (C-3 write surface). The error-mapping path
+(`ews_error_to_account_error`, `SoapFaultCode`) was reused verbatim.
 
-**Top risks:** (1) the scope-vs-Account fork - **RESOLVED** (cursor-resident
-`CursorScope::Folder`, no new variant; see the gating-fork note above);
-(2) the no-delta-token strategy (A5b, still open); (3) routing context must be
-cursor-resident - **settled as the model** (the opaque cursor payload carries
-protocol routing; the engine never inspects it); (4) shared rights/permission
-type - **resolved for A5c as advisory**: one `MailboxRights` type
-(`imap/src/types/acl.rs`) gates discovery (skip unreadable folders) but does NOT
-pre-flight-reject mutations; `NO [ACL]` stays authoritative per-operation. A5a/A5b
-may revisit enforced reject; (5) EWS operation surface maturity (A5b); (6) no
-push for shared/public scopes - for A5c a shared folder is an ordinary `Folder`
-scope, so IDLE on the most-active scope already covers it; poll-only acceptable
-for A5b public folders.
+**Top risks (all retired - A5 landed):** (1) the scope-vs-Account fork -
+**RESOLVED** (cursor-resident `CursorScope::Folder`, no new variant; see the
+gating-fork note above); (2) the no-delta-token strategy - **LANDED** as the
+`PublicFolderCursor` watermark-poll + throttled deletion reconcile;
+(3) routing context must be cursor-resident - **settled as the model** (the
+opaque cursor payload carries protocol routing; the engine never inspects it);
+(4) shared rights/permission type - **resolved as advisory**: A5c's
+`MailboxRights` (`imap/src/types/acl.rs`) and A5b's `EwsEffectiveRights` each
+gate discovery (skip unreadable folders) but neither pre-flight-rejects
+mutations; the live `NO [ACL]` / `ErrorAccessDenied` stays authoritative
+per-operation, with no shared `bifrost-types` rights type; (5) EWS operation
+surface maturity - **landed** (`FindFolder`/`GetFolder`/`FindItem`/`GetItem`
+parsers; non-Message item classes are a named follow-up); (6) no push for
+shared/public scopes - for A5c a shared folder is an ordinary `Folder` scope so
+IDLE on the most-active scope covers it, and A5b public folders are poll-only by
+design.
 
 **Re-home:** `group_sync.rs` (Graph distribution-list membership) is **not** A5 -
 it is contact-group membership, shares no machinery, belongs in the contacts work.

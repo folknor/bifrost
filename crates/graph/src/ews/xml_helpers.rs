@@ -22,11 +22,54 @@ pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
 
 /// Strip namespace prefixes from element names for easier matching.
 /// e.g. "t:FolderId" -> "FolderId", "soap:Fault" -> "Fault"
-fn strip_ns(name: &str) -> &str {
+pub(crate) fn strip_ns(name: &str) -> &str {
     match name.find(':') {
         Some(i) => &name[i + 1..],
         None => name,
     }
+}
+
+/// Escape the five XML metacharacters for embedding a value inside a
+/// SOAP request body. Copied verbatim from the EWS request builders.
+pub(crate) fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Well-known distinguished folder IDs that EWS treats specially.
+/// `publicfoldersroot` is the entry point for the public-folder
+/// hierarchy; any other (opaque base64) id is an ordinary `FolderId`.
+pub(crate) fn is_distinguished_folder_id(id: &str) -> bool {
+    matches!(
+        id,
+        "publicfoldersroot"
+            | "inbox"
+            | "drafts"
+            | "sentitems"
+            | "deleteditems"
+            | "junkemail"
+            | "outbox"
+            | "calendar"
+            | "contacts"
+            | "tasks"
+            | "notes"
+            | "root"
+            | "msgfolderroot"
+    )
+}
+
+/// Read a named attribute off a start/empty tag, returning the empty
+/// string when absent.
+pub(crate) fn extract_attribute(e: &quick_xml::events::BytesStart<'_>, attr_name: &str) -> String {
+    for attr in e.attributes().flatten() {
+        if String::from_utf8_lossy(attr.key.as_ref()) == attr_name {
+            return String::from_utf8_lossy(&attr.value).to_string();
+        }
+    }
+    String::new()
 }
 
 // SOAP fault check.
@@ -122,7 +165,7 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
 // quick-xml 0.36+ emits Event::GeneralRef separately from Event::Text, so
 // every parser that accumulates body text needs to fold these back in or
 // `&lt;` and friends silently vanish.
-fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
+pub(crate) fn push_general_ref(e: &BytesRef<'_>, buf: &mut String) {
     let Ok(name) = std::str::from_utf8(e.as_ref()) else {
         return;
     };

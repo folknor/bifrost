@@ -44,6 +44,16 @@ pub(crate) async fn push_subscribe(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
 ) -> Result<SubscriptionHandle, AccountError> {
+    // Public folders are poll-only in v1: a bare `CursorScope::Folder`
+    // has no push surface (EWS streaming notifications do not cover the
+    // public-folder hierarchy mailbox). Reject before dispatch so both
+    // push modes are consistent.
+    if scopes
+        .iter()
+        .any(|scope| matches!(scope, CursorScope::Folder(_)))
+    {
+        return Err(unsupported_push_error());
+    }
     match account.push_mode {
         PushMode::GraphSubscriptions => subscribe_graph(account, scopes).await,
         PushMode::EwsStreaming => subscribe_ews(account, scopes).await,

@@ -176,8 +176,9 @@ pub enum CostClass {
 ///
 /// IMAP picks one of `QResync`/`Condstore`/`Basic`; JMAP and Gmail
 /// surface `ServerCursor` (their cursors are always server-issued);
-/// Graph delta is `ServerCursor`; `None` means a cursor type that does
-/// not advance (used in tests).
+/// Graph delta is `ServerCursor`; `Poll` is a client-maintained
+/// watermark poll with no server-issued cursor (Graph public folders);
+/// `None` means a cursor type that does not advance (used in tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SyncStrategy {
@@ -185,5 +186,6 @@ pub enum SyncStrategy {
     Condstore,
     Basic,
     ServerCursor,
+    Poll,
     None,
 }

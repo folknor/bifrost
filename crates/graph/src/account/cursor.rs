@@ -41,9 +41,89 @@ pub(crate) const CHANGE_CURSOR_ENVELOPE_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub(crate) enum GraphCursorKind {
-    Messages { folder_id: String },
-    Events { calendar_id: String },
-    Contacts { folder_id: String },
+    Messages {
+        folder_id: String,
+    },
+    Events {
+        calendar_id: String,
+    },
+    Contacts {
+        folder_id: String,
+    },
+    /// Public folder: no delta token. Routing + poll state live here.
+    /// The enclosing `GraphCursorPayload`'s `delta_link` /
+    /// `advanced_through` fields are unused for this kind (a public
+    /// folder is never a server-issued delta cursor).
+    PublicFolder(PublicFolderCursor),
+}
+
+/// The maximum live-id snapshot a public-folder cursor carries. The
+/// snapshot rides inside the opaque cursor the consumer re-persists on
+/// every checkpoint, so an unbounded vector would be a steady write-
+/// amplification tax. Above the cap the folder degrades to additions-
+/// only (no deletion reconcile) and stores an empty snapshot.
+pub(crate) const PUBLIC_FOLDER_LIVE_IDS_CAP: usize = 10_000;
+
+/// How long to wait between full-id deletion reconcile scans, in
+/// seconds (ported from ratatoskr `DELETION_SCAN_INTERVAL_SECS`).
+pub(crate) const FULL_SCAN_INTERVAL_SECS: u64 = 3600;
+
+/// Public-folder cursor: the entire sync state for a no-delta-token
+/// public folder. The watermark drives the incremental timestamp poll;
+/// `last_full_scan_at` throttles the deletion reconcile; `live_ids` is
+/// the deletion baseline the next scan diffs against. All of it rides
+/// in the opaque cursor so a cold resume reconstructs everything with
+/// no engine-side side table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicFolderCursor {
+    /// Native EWS folder id of the public folder.
+    pub(crate) folder_id: String,
+    /// Routing context, reconstructable on a cold resume.
+    pub(crate) routing: PublicFolderRouting,
+    /// High-water `DateTimeReceived` (RFC-3339 UTC). `None` before the
+    /// first poll.
+    pub(crate) watermark: Option<String>,
+    /// Unix seconds of the last full-id deletion scan. `None` if never
+    /// scanned.
+    pub(crate) last_full_scan_at: Option<u64>,
+    /// Authoritative live-id snapshot from the last full scan, the
+    /// deletion baseline the next scan diffs against. Empty when the
+    /// last scan exceeded `PUBLIC_FOLDER_LIVE_IDS_CAP` - in that
+    /// degraded state the folder syncs additions only and reconcile is
+    /// skipped.
+    #[serde(default)]
+    pub(crate) live_ids: Vec<String>,
+}
+
+/// Public-folder EWS routing context. Carried in the cursor so the
+/// hierarchy/content mailbox pair survives a cold resume. Mirrors the
+/// `X-AnchorMailbox` / `X-PublicFolderMailbox` routing pair EWS expects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicFolderRouting {
+    /// `X-AnchorMailbox` value: the content mailbox SMTP for content
+    /// ops, the hierarchy mailbox for hierarchy (FindFolder) ops.
+    pub(crate) anchor_mailbox: String,
+    /// `X-PublicFolderMailbox` value: the content mailbox (content ops)
+    /// or the hierarchy server (hierarchy ops). `None` when unset.
+    pub(crate) public_folder_mailbox: Option<String>,
+}
+
+impl PublicFolderRouting {
+    /// Materialize the EWS routing headers for a request against this
+    /// public folder. Owned->owned clone of both fields.
+    pub(crate) fn headers(&self) -> crate::ews::EwsHeaders {
+        crate::ews::EwsHeaders {
+            anchor_mailbox: Some(self.anchor_mailbox.clone()),
+            public_folder_mailbox: self.public_folder_mailbox.clone(),
+        }
+    }
+}
+
+/// Apply the live-id cap: returns the scan set when at/below `cap`, or
+/// `None` (degrade to additions-only, store no snapshot) when above it.
+/// Pure so the cap decision is unit-pinnable.
+pub(crate) fn cap_live_ids(ids: Vec<String>, cap: usize) -> Option<Vec<String>> {
+    if ids.len() > cap { None } else { Some(ids) }
 }
 
 // Graph delta cursors need their nextLink plus last id inside the shared opaque progress bytes.
@@ -74,6 +154,18 @@ impl GraphCursorPayload {
             delta_link,
             issued_at_unix_secs: now_unix_secs(),
             advanced_through,
+        }
+    }
+
+    /// Build a public-folder payload. There is no delta link, so the
+    /// delta-specific fields are left empty; the entire state lives in
+    /// the `PublicFolderCursor` carried by the `kind`.
+    pub(crate) fn public_folder(cursor: PublicFolderCursor) -> Self {
+        Self {
+            kind: GraphCursorKind::PublicFolder(cursor),
+            delta_link: String::new(),
+            issued_at_unix_secs: now_unix_secs(),
+            advanced_through: None,
         }
     }
 
@@ -116,6 +208,10 @@ pub(crate) fn scope_for_kind(kind: &GraphCursorKind) -> CursorScope {
             folder: FolderId(folder_id.clone()),
             ty: ObjectType::Contact,
         },
+        // A public folder surfaces as a bare `CursorScope::Folder`
+        // carrying the native EWS folder id; all routing rides in the
+        // cursor payload, not the scope.
+        GraphCursorKind::PublicFolder(pf) => CursorScope::Folder(FolderId(pf.folder_id.clone())),
     }
 }
 
@@ -337,5 +433,70 @@ mod tests {
             kind_for_scope(&CursorScope::Account),
             Err(CursorError::Unsupported)
         ));
+    }
+
+    fn public_folder_cursor() -> PublicFolderCursor {
+        PublicFolderCursor {
+            folder_id: "AAMkPF=".to_string(),
+            routing: PublicFolderRouting {
+                anchor_mailbox: "content@contoso.com".to_string(),
+                public_folder_mailbox: Some("pf@contoso.com".to_string()),
+            },
+            watermark: Some("2026-03-01T10:00:00Z".to_string()),
+            last_full_scan_at: Some(1_700_000_000),
+            live_ids: vec!["a".to_string(), "b".to_string()],
+        }
+    }
+
+    #[test]
+    fn public_folder_cursor_round_trips() {
+        let pf = public_folder_cursor();
+        let scope = CursorScope::Folder(FolderId(pf.folder_id.clone()));
+        let payload = GraphCursorPayload::public_folder(pf.clone());
+
+        let cursor = encode_cursor(scope.clone(), payload).expect("encode");
+        assert_eq!(cursor.scope, scope);
+        assert_eq!(cursor.server_state.protocol, ProtocolKind::Graph);
+        assert_eq!(
+            cursor.server_state.envelope_version,
+            GRAPH_CURSOR_ENVELOPE_VERSION
+        );
+
+        let decoded = decode_cursor(&cursor).expect("decode");
+        match decoded.kind {
+            GraphCursorKind::PublicFolder(got) => assert_eq!(got, pf),
+            other => panic!("expected PublicFolder kind, got {other:?}"),
+        }
+        // `scope_for_kind` round-trips the native folder id.
+        let kind = GraphCursorKind::PublicFolder(pf.clone());
+        assert_eq!(scope_for_kind(&kind), scope);
+    }
+
+    #[test]
+    fn old_message_cursor_still_decodes_after_public_folder_variant() {
+        // A `Messages` cursor encoded with the same envelope version
+        // still decodes unchanged - proof the additive `PublicFolder`
+        // variant did not break the existing kinds (no version bump).
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(scope, payload).expect("encode");
+        let decoded = decode_cursor(&cursor).expect("decode");
+        assert!(matches!(decoded.kind, GraphCursorKind::Messages { .. }));
+    }
+
+    #[test]
+    fn live_ids_capped_degrades_to_additions_only() {
+        let under: Vec<String> = (0..3).map(|i| i.to_string()).collect();
+        assert_eq!(cap_live_ids(under.clone(), 3), Some(under));
+
+        let over: Vec<String> = (0..5).map(|i| i.to_string()).collect();
+        assert_eq!(cap_live_ids(over, 3), None);
     }
 }

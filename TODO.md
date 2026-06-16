@@ -131,6 +131,28 @@ re-auditors don't re-raise them.)
   lands in `bifrost-net` or `bifrost-sync`, delete the local one.
   (Carried from the deleted `plans/unification.md`
   captured-but-not-decisions block.)
+- **graph-A5b-1.** Public-folder deletion reconcile is side-table-free:
+  the live-id baseline rides in the cursor (`PublicFolderCursor.live_ids`)
+  hard-capped at `PUBLIC_FOLDER_LIVE_IDS_CAP` (10_000). Above the cap a
+  folder degrades to additions-only (no `Destroyed` emission). Restore
+  reconcile for huge folders with a `CheckpointStore`-backed deletion
+  baseline once bifrost owns that side table. (A5b v1 follow-up.)
+- **graph-A5b-2.** Wire delegate auto-discovery: the Autodiscover
+  `alternativeMailboxes` parser + `discover_shared_mailboxes` entry point
+  landed (tested) in `account/autodiscover.rs` but are unconsumed
+  (`#[allow(dead_code)]`). Wire delegate *enumeration* into A5a's
+  foreign-mailbox seeding (replacing config-supplied `with_shared_mailbox`)
+  and drop the allows. (A5b-scoped-out, named in the A5b spec.)
+- **graph-A5b-3.** EWS item parsers handle only `<t:Message>`. The
+  `parse_find_items_response` / `parse_get_item_response` parsers in
+  `ews/parse.rs` enter their item-collection state on the `Message` element
+  alone, so a public folder whose `FolderClass` is `IPF.Appointment`
+  (`<t:CalendarItem>`) or `IPF.Contact` (`<t:Contact>`) is discovered as a
+  `CursorScope::Folder` scope but syncs zero items - FindFolder surfaces it,
+  FindItem returns the items, and the parser silently skips every non-Message
+  element. Add item-class support (parse `CalendarItem` / `Contact` element
+  bodies, project to the appropriate shared model) so non-mail public folders
+  actually sync. (A5b v1 follow-up; mail public folders work today.)
 
 ## bifrost-sync
 

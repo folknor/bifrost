@@ -1,4 +1,4 @@
-use super::{EWS_URL, EwsClient, EwsError, build_soap_envelope, check_soap_fault};
+use super::{EWS_URL, EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_soap_fault};
 
 impl EwsClient {
     pub(crate) fn new(net: bifrost_net::AccountNet) -> Self {
@@ -18,12 +18,20 @@ impl EwsClient {
     /// HTTP error statuses carry the status + raw body; SOAP faults
     /// carry the structured `SoapFaultCode` plus `<faultstring>`
     /// detail.
-    pub(crate) async fn execute(&self, body_xml: &str) -> Result<String, EwsError> {
+    pub(crate) async fn execute(
+        &self,
+        body_xml: &str,
+        headers: &EwsHeaders,
+    ) -> Result<String, EwsError> {
         let envelope = build_soap_envelope(body_xml);
-        let resp = self
+        let mut req = self
             .net
             .post(&self.ews_url)
-            .header("Content-Type", "text/xml; charset=utf-8")
+            .header("Content-Type", "text/xml; charset=utf-8");
+        for (name, value) in headers.pairs() {
+            req = req.header(name, &value);
+        }
+        let resp = req
             .body(bytes::Bytes::from(envelope))
             .send()
             .await

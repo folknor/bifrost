@@ -155,6 +155,19 @@ async fn discover_cursor_scopes_inner(
         }
     }
 
+    // Public folders (opt-in via `with_public_folders`): browse the
+    // Exchange public-folder hierarchy, seed each readable folder's
+    // content-mailbox routing, and surface it as a `CursorScope::Folder`
+    // synced by the no-delta-token poll strategy. Per-folder failures
+    // skip with a scoped warning - the primary/shared mailboxes already
+    // discovered above are unaffected.
+    if account.public_folders_enabled {
+        let (pf_scopes, pf_warnings) =
+            super::public_folder::discover_public_folder_scopes(account).await;
+        scopes.extend(pf_scopes);
+        warnings.extend(pf_warnings);
+    }
+
     Ok((scopes, warnings))
 }
 
@@ -172,17 +185,28 @@ async fn discover_memberships_inner(
     let mut seen = HashSet::new();
     let mut memberships = Vec::new();
     for scope in scopes {
-        if let CursorScope::FolderType { folder, .. } = scope
-            && seen.insert(folder.clone())
-        {
-            // A foreign folder also contributes its owner tag (the
-            // shared-mailbox identity), which the engine's covering
-            // rule cannot form because the folder-id and mailbox-id
-            // strings differ.
-            if let Some(foreign) = parse_folder(&folder).foreign() {
-                memberships.push(owner_tag(&foreign.mailbox));
+        match scope {
+            CursorScope::FolderType { folder, .. } if seen.insert(folder.clone()) => {
+                // A foreign folder also contributes its owner tag (the
+                // shared-mailbox identity), which the engine's covering
+                // rule cannot form because the folder-id and mailbox-id
+                // strings differ.
+                if let Some(foreign) = parse_folder(&folder).foreign() {
+                    memberships.push(owner_tag(&foreign.mailbox));
+                }
+                memberships.push(MembershipScope::Folder(folder));
             }
-            memberships.push(MembershipScope::Folder(folder));
+            // A public folder contributes its content-mailbox owner tag
+            // (the same A5a pattern) plus its folder membership.
+            CursorScope::Folder(folder) if seen.insert(folder.clone()) => {
+                if let Some(routing) = account.public_folder_routing(&folder).await {
+                    memberships.push(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                        routing.anchor_mailbox,
+                    )));
+                }
+                memberships.push(MembershipScope::Folder(folder));
+            }
+            _ => {}
         }
     }
     Ok(memberships)

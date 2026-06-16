@@ -163,13 +163,13 @@ at spec time.
 - Depends on: A2 (send surface settled).
 - TODO: none.
 
-### A5 - Shared mailboxes plus public folders - OPEN (A5c + A5a LANDED, A5b remains)
+### A5 - Shared mailboxes plus public folders - LANDED (A5a/A5b/A5c all landed)
 
 - Intent: first-class bifrost scopes - Graph (EWS / Autodiscover) and IMAP
   (NAMESPACE / ACL) - surfaced through `discover_cursor_scopes` /
   `discover_memberships` and fully sync-integrated, not CRUD-only.
-- A5 split into three sub-bricks; **A5c and A5a are LANDED**, A5b remains OPEN
-  (so A5 overall is OPEN):
+- A5 split into three sub-bricks; **all three (A5c, A5a, A5b) are LANDED**, so
+  A5 overall is LANDED:
   - **A5c (IMAP NAMESPACE/ACL shared folders) - LANDED.** See below.
   - **A5a (Graph delegate mailboxes + JMAP shared accounts) - LANDED.** Graph
     config-supplied foreign mailboxes (`with_shared_mailbox`, per-mailbox
@@ -189,9 +189,24 @@ at spec time.
     open; Graph is config-seeded at construction, JMAP's `scope_lifecycle`
     worker polls only the primary, so a foreign mailbox added after open appears
     at the next reopen). Graph delegate auto-discovery (EWS `GetDelegate` /
-    Autodiscover) is A5b; shared-mailbox send-as is C-3.
-  - **A5b (Graph EWS public folders + Autodiscover) - OPEN.** The size-L
-    unknown: no-delta-token poll strategy, FindFolder/FindItem.
+    Autodiscover) landed under A5b - the `alternativeMailboxes` parser is in the
+    tree, but wiring its enumeration into foreign seeding stays a named A5b
+    follow-up; shared-mailbox send-as is C-3.
+  - **A5b (Graph EWS public folders + Autodiscover) - LANDED.** The size-L
+    unknown, landed in three sub-specs: (1) EWS read ops
+    (`FindFolder`/`GetFolder`/`FindItem`/`GetItem` over `AccountNet` with the
+    `X-AnchorMailbox`/`X-PublicFolderMailbox` routing pair, quick-xml parsers
+    returning `EwsError`); (2) the no-delta-token cursor strategy
+    (`GraphCursorKind::PublicFolder`, watermark timestamp-poll + throttled
+    full-id deletion reconcile whose baseline rides in the cursor capped at
+    10_000 items/folder, additive `SyncStrategy::Poll`, poll-only push,
+    `ews_shared_scope_error` quarantine); (3) Autodiscover wiring
+    (`GetUserSettings` public-folder routing + content-mailbox SMTP, the tested
+    `alternativeMailboxes` delegate parser, `with_public_folders()` opt-in
+    discovery seeding the routing map). See `reference/graph.md`. Named
+    follow-ups: a `CheckpointStore`-backed deletion baseline restoring reconcile
+    past the 10_000-item cap, and wiring delegate `alternativeMailboxes`
+    enumeration into A5a's foreign-mailbox seeding (parser landed, unwired).
 - Settled model (decided during A5c; A5a/A5b inherit it): a shared mailbox is
   **cursor-resident**, surfaced as an ordinary `CursorScope::Folder` - NO new
   `CursorScope` variant (a new variant would be silently mis-serviced by the
@@ -359,8 +374,9 @@ A1 is the literal first task - it gates everything. Then:
 
 - A2 needs A1; A4 needs A2.
 - A3 and A6 land after A1; otherwise independent.
-- A5 is survey-first and the biggest unknown; A5c (IMAP) and A5a (Graph delegate
-  + JMAP shared) have landed, leaving only A5b (EWS public folders, size L).
+- A5 is survey-first and the biggest unknown; all three sub-bricks - A5c (IMAP),
+  A5a (Graph delegate + JMAP shared), and A5b (EWS public folders, size L) - have
+  landed, so A5 is closed.
 - A7 is independent.
 - A8's known warts are independent; its first independent slice has landed
   (importance, MDN, `remove_from_container` polish, draft-update confirm,

@@ -1,12 +1,43 @@
 mod client;
+mod ops;
+mod parse;
 mod xml_helpers;
 
 use bifrost_net::AccountNet;
 use bifrost_types::DiagnosticText;
 
+pub(crate) use self::parse::*;
 pub(crate) use self::xml_helpers::*;
 
 const EWS_URL: &str = "https://outlook.office365.com/EWS/Exchange.asmx";
+
+/// EWS request routing headers. Public-folder operations route by
+/// `X-AnchorMailbox` (the hierarchy or content mailbox SMTP address) and
+/// `X-PublicFolderMailbox` (the mailbox server for hierarchy ops, or the
+/// content mailbox for content ops). Both are `None` for ordinary
+/// primary-mailbox EWS calls (the streaming-notification path).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EwsHeaders {
+    pub(crate) anchor_mailbox: Option<String>,
+    pub(crate) public_folder_mailbox: Option<String>,
+}
+
+impl EwsHeaders {
+    /// Materialize the present routing headers as `(name, value)` pairs
+    /// the request builder attaches. Extracted as a pure helper so the
+    /// header decision is unit-pinnable without a live request (no
+    /// mock-server per repo rules).
+    pub(crate) fn pairs(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(anchor) = &self.anchor_mailbox {
+            out.push(("X-AnchorMailbox", anchor.clone()));
+        }
+        if let Some(pf) = &self.public_folder_mailbox {
+            out.push(("X-PublicFolderMailbox", pf.clone()));
+        }
+        out
+    }
+}
 
 /// Structured EWS transport or protocol error.
 ///
