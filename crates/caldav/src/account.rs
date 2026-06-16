@@ -460,6 +460,18 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::DraftSend)
     }
 
+    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        unsupported_future(AccountOperation::CancelScheduledSend)
+    }
+
+    fn reschedule_send(
+        &self,
+        _handle: ObjectId,
+        _scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        unsupported_future(AccountOperation::RescheduleSend)
+    }
+
     fn search(
         &self,
         _request: SearchRequest,

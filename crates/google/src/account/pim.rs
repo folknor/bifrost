@@ -129,6 +129,9 @@ pub(crate) fn send_message(
                 bifrost_types::AccountOperation::AttachmentUpload,
             ));
         }
+        if let Some(err) = scheduled_send_guard(&request) {
+            return Err(err);
+        }
         let doc = MailDocument::from_send(request, &default_address);
         let raw = render_message(&doc, &default_address, true)?;
         let message = client
@@ -1177,6 +1180,27 @@ fn non_negative_i64(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
+/// Gmail's REST API has no scheduled-send lever; a scheduled request is
+/// rejected `Unsupported(Send)` rather than silently sent now.
+fn scheduled_send_guard(request: &SendRequest) -> Option<AccountError> {
+    request
+        .scheduled
+        .is_some()
+        .then(|| unsupported(bifrost_types::AccountOperation::Send))
+}
+
+pub(crate) fn cancel_scheduled_send_unsupported() -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async {
+        Err(unsupported(
+            bifrost_types::AccountOperation::CancelScheduledSend,
+        ))
+    })
+}
+
+pub(crate) fn reschedule_send_unsupported() -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RescheduleSend)) })
+}
+
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     error::into_account_error(
         crate::error::Error::unsupported(op),
@@ -1203,6 +1227,26 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn scheduled_send_request_is_unsupported() {
+        let mut request = SendRequest::default();
+        request.scheduled = Some(std::time::SystemTime::now() + Duration::from_secs(600));
+        let err = scheduled_send_guard(&request).expect("scheduled request must be rejected");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(bifrost_types::AccountOperation::Send)
+        ));
+
+        // An immediate send passes the guard.
+        assert!(scheduled_send_guard(&SendRequest::default()).is_none());
+    }
+
+    #[test]
+    fn scheduled_send_capability_is_false() {
+        let caps = crate::account::capabilities::gmail_capabilities();
+        assert!(!caps.pim_methods.scheduled_send);
+    }
 
     #[test]
     fn container_roles_map_gmail_system_labels() {

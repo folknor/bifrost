@@ -440,6 +440,19 @@ impl Account for GoogleAccount {
         pim::draft_send(Arc::clone(&self.client), draft)
     }
 
+    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        // Gmail's REST API exposes no scheduled-send model.
+        pim::cancel_scheduled_send_unsupported()
+    }
+
+    fn reschedule_send(
+        &self,
+        _handle: ObjectId,
+        _scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::reschedule_send_unsupported()
+    }
+
     fn search(
         &self,
         request: SearchRequest,

@@ -57,6 +57,10 @@ pub(crate) struct CoreLimits {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PimSupport {
     pub(crate) submission: bool,
+    /// `urn:ietf:params:jmap:submission` `maxDelayedSend` (seconds).
+    /// `> 0` means the server accepts FUTURERELEASE hold parameters and
+    /// gates `scheduled_send`.
+    pub(crate) max_delayed_send: usize,
     pub(crate) vacation: bool,
     pub(crate) quota: bool,
     pub(crate) sieve: bool,
@@ -124,6 +128,7 @@ pub(crate) fn build(
             draft_update: true,
             draft_discard: true,
             draft_send: support.submission,
+            scheduled_send: support.submission && support.max_delayed_send > 0,
             search: true,
             search_messages: true,
             containers_list: true,
@@ -227,6 +232,7 @@ mod tests {
             &session,
             PimSupport {
                 submission: true,
+                max_delayed_send: 0,
                 vacation: true,
                 quota: true,
                 sieve: true,
@@ -290,6 +296,7 @@ mod tests {
             &session,
             PimSupport {
                 submission: false,
+                max_delayed_send: 0,
                 vacation: false,
                 quota: false,
                 sieve: false,
@@ -303,5 +310,98 @@ mod tests {
             &AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
         );
         assert!(err.recovery().is_terminal());
+    }
+
+    fn scheduled_session() -> Session {
+        session(
+            r#"{
+                "capabilities": {
+                    "urn:ietf:params:jmap:core": {
+                        "maxSizeUpload": 1000,
+                        "maxConcurrentUpload": 2,
+                        "maxSizeRequest": 100000,
+                        "maxConcurrentRequests": 4,
+                        "maxCallsInRequest": 8,
+                        "maxObjectsInGet": 256,
+                        "maxObjectsInSet": 700,
+                        "collationAlgorithms": []
+                    },
+                    "urn:ietf:params:jmap:mail": {}
+                },
+                "accounts": {},
+                "primaryAccounts": {},
+                "username": "user",
+                "apiUrl": "https://example.test/jmap/api",
+                "downloadUrl": "https://example.test/download/{accountId}/{blobId}/{name}/{type}",
+                "uploadUrl": "https://example.test/upload/{accountId}",
+                "eventSourceUrl": "https://example.test/eventsource",
+                "state": "session-state"
+            }"#,
+        )
+    }
+
+    fn pim_support(max_delayed_send: usize) -> PimSupport {
+        PimSupport {
+            submission: true,
+            max_delayed_send,
+            vacation: false,
+            quota: false,
+            sieve: false,
+            contacts: false,
+            calendar: false,
+        }
+    }
+
+    #[test]
+    fn scheduled_send_capability_tracks_max_delayed_send() {
+        let (no_window, _) = build(&scheduled_session(), pim_support(0)).unwrap();
+        assert!(
+            !no_window.pim_methods.scheduled_send,
+            "maxDelayedSend == 0 must disable scheduled_send"
+        );
+
+        let (with_window, _) = build(&scheduled_session(), pim_support(3600)).unwrap();
+        assert!(
+            with_window.pim_methods.scheduled_send,
+            "maxDelayedSend > 0 must enable scheduled_send"
+        );
+    }
+
+    #[test]
+    fn scheduled_send_envelope_serializes_holduntil_on_mailfrom() {
+        use crate::email_submission::{Address, EmailSubmissionSet, UndoStatus};
+
+        let mut set = EmailSubmissionSet::new();
+        {
+            let submit = set.create_with_id("submit0");
+            submit.undo_status(UndoStatus::Final);
+            let mail_from = Address::new("sender@example.test")
+                .with_parameter("holduntil", Some("2026-06-16T10:00:00+00:00"));
+            submit.envelope(mail_from, [Address::new("rcpt@example.test")]);
+        }
+        let json = serde_json::to_value(&set).unwrap();
+        let body = json.to_string();
+        assert!(
+            body.contains("holduntil"),
+            "envelope mailFrom must carry the holduntil parameter: {body}"
+        );
+        assert!(
+            body.contains("2026-06-16T10:00:00+00:00"),
+            "holduntil value must serialize: {body}"
+        );
+    }
+
+    #[test]
+    fn scheduled_send_cancel_patch_serializes_canceled_undo_status() {
+        use crate::email_submission::{EmailSubmissionId, EmailSubmissionSet, UndoStatus};
+
+        let mut set = EmailSubmissionSet::new();
+        set.update(EmailSubmissionId::new("submission-1"))
+            .undo_status(UndoStatus::Canceled);
+        let body = serde_json::to_value(&set).unwrap().to_string();
+        assert!(
+            body.contains("\"undoStatus\":\"canceled\""),
+            "cancel patch must serialize undoStatus canceled: {body}"
+        );
     }
 }

@@ -67,6 +67,11 @@ pub(crate) fn build_capabilities(
             draft_update: false,
             draft_discard: true,
             draft_send: submission_configured,
+            // IMAP relay FUTURERELEASE is per-connection (advertised in
+            // EHLO at send time), unknown at open. The honest snapshot
+            // is `false`; an unsupporting relay surfaces a runtime
+            // `Unsupported(Send)` from the smtp boundary.
+            scheduled_send: false,
             search: has_thread_references,
             search_messages: true,
             containers_list: true,
@@ -194,5 +199,16 @@ mod tests {
         assert!(with.pim_methods.draft_send);
         // Submission does not turn on uploaded-attachment support (A6).
         assert!(!with.pim_methods.attachment_upload);
+    }
+
+    #[test]
+    fn scheduled_send_flag_stays_false_with_submission_configured() {
+        // IMAP relay FUTURERELEASE is per-connection (EHLO at send
+        // time), unknown at open. The capability snapshot is the honest
+        // `false` even when submission is configured; support is decided
+        // at send time by the smtp boundary.
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let with_submission = build_capabilities(&profile, &[], false, false, false, true);
+        assert!(!with_submission.pim_methods.scheduled_send);
     }
 }

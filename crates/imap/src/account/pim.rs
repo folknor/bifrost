@@ -176,9 +176,15 @@ pub(crate) fn send_message(
         // "uploaded attachments" rejection carries the right protocol.
         let rendered = bifrost_types::send_request_to_rfc5322(&request, submission.default_from())
             .map_err(stamp_imap_protocol)?;
+        // Scheduled send rides on SMTP FUTURERELEASE (HOLDUNTIL). The
+        // relay's EHLO at send time is authoritative: an unsupporting
+        // relay surfaces an `Unsupported(Send)` AccountError from the
+        // smtp boundary (kind set there, not here). Re-stamp only the
+        // operation/protocol; `restamp` cannot change the kind.
         submission
-            .send_rfc5322(&rendered.envelope, &rendered.raw)
-            .await?;
+            .send_rfc5322(&rendered.envelope, &rendered.raw, request.scheduled)
+            .await
+            .map_err(|err| restamp(err, AccountOperation::Send))?;
 
         // The message is committed. Optionally append to Sent; a failed
         // APPEND is non-fatal (never resend) but is not swallowed: it
@@ -216,7 +222,7 @@ pub(crate) fn draft_send(
         // recipients are delivered but never disclosed.
         let parsed = parse_draft_for_submission(&raw, submission.default_from())?;
         submission
-            .send_rfc5322(&parsed.envelope, &parsed.body)
+            .send_rfc5322(&parsed.envelope, &parsed.body, None)
             .await
             .map_err(|err| restamp(err, AccountOperation::DraftSend))?;
 
@@ -1649,6 +1655,31 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_send_restamp_preserves_unsupported_kind() {
+        // The smtp boundary already produces `Unsupported(Send)` for an
+        // unsupporting relay (brick 4.6a). The IMAP send path re-stamps
+        // only the operation/protocol via `restamp`; it must not change
+        // the kind. Pin that the kind survives unchanged.
+        let smtp_derived = bifrost_types::AccountErrorBuilder::new(
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send),
+            bifrost_types::Cause::Request(bifrost_types::RequestCause::Unsupported {
+                operation: AccountOperation::Send,
+            }),
+        )
+        .protocol(Protocol::Smtp)
+        .operation(AccountOperation::Send)
+        .try_build()
+        .expect("valid account error classification");
+
+        let restamped = restamp(smtp_derived, AccountOperation::Send);
+        assert_eq!(
+            restamped.kind(),
+            &bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
+        );
+        assert_eq!(restamped.operation(), Some(AccountOperation::Send));
+    }
 
     #[test]
     fn draft_send_strips_bcc_into_envelope() {

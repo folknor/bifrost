@@ -225,6 +225,7 @@ impl SubmissionTransport {
         &self,
         envelope: &SubmissionEnvelope,
         raw: &[u8],
+        hold: Option<std::time::SystemTime>,
     ) -> Result<(), AccountError> {
         let from = to_smtp_address(&envelope.from);
         let recipients: Vec<BatchItem<SmtpAddress>> = envelope
@@ -236,9 +237,11 @@ impl SubmissionTransport {
             })
             .collect();
 
+        let options = build_send_options(hold);
+
         let outcome = self
             .transport
-            .send_raw_batch_with_options(Some(from), recipients, raw, &SendOptions::default())
+            .send_raw_batch_with_options(Some(from), recipients, raw, &options)
             .await?;
 
         // A single committed message either lands all recipients in the
@@ -254,6 +257,24 @@ impl SubmissionTransport {
         }
         Ok(())
     }
+}
+
+/// Build the SMTP `SendOptions` for a submission. When `hold` is
+/// `Some`, FUTURERELEASE rides as the absolute-time HOLDUNTIL parameter
+/// so the boundary does not race `now()`; the relay computes the delay
+/// and decides support (an unsupporting relay yields an
+/// `Unsupported(Send)` AccountError from the smtp layer).
+fn build_send_options(hold: Option<std::time::SystemTime>) -> SendOptions {
+    match hold {
+        Some(at) => SendOptions::default().hold_until(hold_until_rfc3339(at)),
+        None => SendOptions::default(),
+    }
+}
+
+/// Format an absolute instant as RFC 3339 for the SMTP FUTURERELEASE
+/// `HOLDUNTIL` parameter.
+fn hold_until_rfc3339(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
 }
 
 /// Convert a `bifrost_types::Address` into an SMTP envelope address.
@@ -300,6 +321,29 @@ fn resolve_credentials(
 mod tests {
     use super::*;
     use bifrost_net::StaticTokenSource;
+    use bifrost_smtp::transport::smtp::extension::{FutureReleaseParameter, MailParameter};
+
+    #[test]
+    fn scheduled_send_builds_holduntil_mail_parameter() {
+        let at = std::time::SystemTime::now() + std::time::Duration::from_secs(600);
+        let options = build_send_options(Some(at));
+        assert!(
+            options.mail_parameters().iter().any(|p| matches!(
+                p,
+                MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(_))
+            )),
+            "scheduled send must emit a FutureRelease(HoldUntil) mail parameter"
+        );
+
+        // An immediate send carries no FUTURERELEASE parameter.
+        let immediate = build_send_options(None);
+        assert!(
+            !immediate
+                .mail_parameters()
+                .iter()
+                .any(|p| matches!(p, MailParameter::FutureRelease(_)))
+        );
+    }
 
     #[test]
     fn submission_credentials_reuse_imap_oauth() {

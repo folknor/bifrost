@@ -1242,7 +1242,7 @@ impl AsyncSmtpConnection {
             }
             MailParameter::FutureRelease(value) => {
                 if !self.server_info().supports_future_release() {
-                    return Err(error::invalid_input(
+                    return Err(error::feature_unsupported(
                         "FUTURERELEASE requires server FUTURERELEASE support",
                     ));
                 }
@@ -1253,7 +1253,7 @@ impl AsyncSmtpConnection {
                             .future_release_max_interval()
                             .is_some_and(|limit| *seconds > limit) =>
                     {
-                        return Err(error::invalid_input(
+                        return Err(error::parameter_over_limit(
                             "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
                         ));
                     }

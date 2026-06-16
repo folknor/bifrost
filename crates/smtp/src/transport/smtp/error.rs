@@ -283,6 +283,16 @@ pub enum ErrorKind {
     Parse,
     /// Invalid caller input, unsupported local configuration, or local protocol state.
     InvalidInput,
+    /// A requested SMTP extension feature is not advertised by the
+    /// server (e.g. FUTURERELEASE on a relay that did not announce it).
+    /// Distinct from `InvalidInput` so the account-error mapping can
+    /// surface `Unsupported(Send)` rather than a generic malformed
+    /// request.
+    FeatureUnsupported,
+    /// A requested parameter exceeds a server-advertised limit (e.g.
+    /// HOLDFOR over the FUTURERELEASE max interval). Maps to a malformed
+    /// request - the value is out of the allowed window.
+    ParameterOverLimit,
     /// Internal client invariant failure.
     Internal,
     /// Client-side policy refusal.
@@ -318,6 +328,12 @@ impl fmt::Display for Error {
         match &self.inner.kind {
             ErrorKind::Parse => f.write_str("SMTP response parse error")?,
             ErrorKind::InvalidInput => f.write_str("invalid SMTP input")?,
+            ErrorKind::FeatureUnsupported => {
+                f.write_str("requested SMTP feature not supported by server")?;
+            }
+            ErrorKind::ParameterOverLimit => {
+                f.write_str("SMTP parameter exceeds server-advertised limit")?;
+            }
             ErrorKind::Internal => f.write_str("internal SMTP error")?,
             ErrorKind::Policy => f.write_str("SMTP policy error")?,
             ErrorKind::Network => f.write_str("SMTP network error")?,
@@ -398,6 +414,14 @@ pub(crate) fn parse<E: Into<BoxError>>(e: E) -> Error {
 
 pub(crate) fn invalid_input<E: Into<BoxError>>(e: E) -> Error {
     Error::new(ErrorKind::InvalidInput, Some(e))
+}
+
+pub(crate) fn feature_unsupported<E: Into<BoxError>>(e: E) -> Error {
+    Error::new(ErrorKind::FeatureUnsupported, Some(e))
+}
+
+pub(crate) fn parameter_over_limit<E: Into<BoxError>>(e: E) -> Error {
+    Error::new(ErrorKind::ParameterOverLimit, Some(e))
 }
 
 pub(crate) fn internal<E: Into<BoxError>>(e: E) -> Error {

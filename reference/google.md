@@ -154,7 +154,11 @@ on the same cancellation token.
     and `event_autocomplete`.
   - Unsupported: `set_keyword`, `set_category`,
     `set_extended_property`, `attachment_upload`,
-    `container_move`, and `quota_get`.
+    `container_move`, `scheduled_send`, and `quota_get`. The Gmail
+    REST API has no scheduled-send lever (it is web-UI only), so a
+    `SendRequest::scheduled.is_some()` is rejected `Unsupported(Send)`
+    before any wire call, and `cancel_scheduled_send` /
+    `reschedule_send` are `Unsupported`.
 - `filter_rule_shape: Rules`. Gmail settings filters are wired for
   list/create/delete plus local validation. `filter_update` remains
   unsupported because the Gmail API exposes no update or replace

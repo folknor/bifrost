@@ -372,6 +372,30 @@ pub trait Account: Send + Sync {
     /// implement this as draft fetch + send + discard.
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>>;
 
+    /// Cancel a previously scheduled (not yet delivered) send. `handle`
+    /// is the `ObjectId` `send_message` returned for the scheduled
+    /// submission. Returns `Unsupported(CancelScheduledSend)` where the
+    /// provider has no scheduled-send model, and `NotFound` /
+    /// `ConcurrencyConflict` where the send already left the queue.
+    ///
+    /// Gated by `capabilities().pim_methods.scheduled_send`; a
+    /// `false` flag means this returns `Unsupported`.
+    fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>>;
+
+    /// Reschedule a previously scheduled send to a new instant. Same
+    /// `handle` semantics as `cancel_scheduled_send`; `scheduled` is
+    /// the new absolute send time, validated exactly as
+    /// `SendRequest::scheduled` is. Returns the (possibly new)
+    /// `ObjectId` of the rescheduled submission.
+    ///
+    /// Gated by `capabilities().pim_methods.scheduled_send`; a
+    /// `false` flag means this returns `Unsupported`.
+    fn reschedule_send(
+        &self,
+        handle: ObjectId,
+        scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>>;
+
     // ------------------------------------------------------------
     // Search primitives (S1-W1)
     // ------------------------------------------------------------

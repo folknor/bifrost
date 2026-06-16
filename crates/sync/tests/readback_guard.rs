@@ -332,6 +332,22 @@ impl Account for FlagsAccount {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::DraftSend)) })
     }
 
+    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::CancelScheduledSend,
+            ))
+        })
+    }
+
+    fn reschedule_send(
+        &self,
+        _handle: ObjectId,
+        _scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RescheduleSend)) })
+    }
+
     fn search(
         &self,
         _request: SearchRequest,

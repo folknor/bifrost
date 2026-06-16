@@ -134,14 +134,19 @@ at spec time.
 - Depends on: A1 (lands after).
 - TODO: none.
 
-### A4 - Scheduled send
+### A4 - Scheduled send [LANDED]
 
-- Intent: first-class scheduled send where providers support it (Gmail, Graph,
-  JMAP); a flag where they do not.
-- Current: absent - no scheduled-send surface in the trait or capabilities.
-- Spec delivers: a scheduled-send parameter on the send surface plus an
-  `AccountCapabilities` flag; IMAP and other non-supporting providers flagged
-  unsupported.
+- Intent: first-class scheduled send where providers support it (Graph,
+  JMAP, IMAP-via-relay); a flag where they do not (Gmail).
+- Delivered: `SendRequest::scheduled: Option<SystemTime>`,
+  `PimMethodSupport::scheduled_send`, `cancel_scheduled_send` /
+  `reschedule_send` trait primitives, `AccountOperation::{CancelScheduledSend,
+  RescheduleSend}`, a shared `bifrost_types::validate_scheduled` boundary
+  helper, JMAP `holduntil` envelope + submission-id handle + undo/resubmit
+  cancel/reschedule, Graph `PidTagDeferredSendTime` stamp + delete/patch
+  cancel/reschedule, Gmail `Unsupported`, IMAP one-shot FUTURERELEASE
+  (HOLDUNTIL) with cancel/reschedule `Unsupported`, and an smtp
+  FUTURERELEASE-unsupported / over-limit error discriminator.
 - Depends on: A2 (send surface settled).
 - TODO: none.
 

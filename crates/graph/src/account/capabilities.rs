@@ -45,6 +45,9 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             draft_update: true,
             draft_discard: true,
             draft_send: true,
+            // Mailbox-backed Graph accounts always support deferred
+            // send via the PidTagDeferredSendTime extended property.
+            scheduled_send: true,
             search: true,
             search_messages: true,
             containers_list: true,

@@ -33,6 +33,10 @@ pub(crate) struct JmapAccount {
     pub(crate) client: Client,
     pub(crate) mail: MailAccount,
     pub(crate) submission: Option<MailAccount>,
+    /// `urn:ietf:params:jmap:submission` `maxDelayedSend` (seconds);
+    /// `0` when the server advertises no scheduled-send window. Read by
+    /// `send_message` / `reschedule_send` for boundary validation.
+    pub(crate) max_delayed_send: usize,
     pub(crate) vacation: Option<MailAccount>,
     pub(crate) quota: Option<MailAccount>,
     pub(crate) sieve: Option<MailAccount>,
@@ -59,6 +63,7 @@ impl JmapAccount {
         client: Client,
         mail: MailAccount,
         submission: Option<MailAccount>,
+        max_delayed_send: usize,
         vacation: Option<MailAccount>,
         quota: Option<MailAccount>,
         sieve: Option<MailAccount>,
@@ -79,6 +84,7 @@ impl JmapAccount {
             client,
             mail,
             submission,
+            max_delayed_send,
             vacation,
             quota,
             sieve,
@@ -434,7 +440,12 @@ impl Account for JmapAccount {
             );
             return Box::pin(async move { Err(err) });
         }
-        pim::send_message(self.mail.clone(), Arc::clone(&self.email_state), request)
+        pim::send_message(
+            self.mail.clone(),
+            Arc::clone(&self.email_state),
+            self.max_delayed_send,
+            request,
+        )
     }
 
     fn attachment_upload(
@@ -476,6 +487,34 @@ impl Account for JmapAccount {
             return Box::pin(async move { Err(err) });
         }
         pim::draft_send(self.mail.clone(), Arc::clone(&self.email_state), draft)
+    }
+
+    fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        if self.submission.is_none() || self.max_delayed_send == 0 {
+            let err = super::error::unsupported_error(
+                AccountOperation::CancelScheduledSend,
+                None,
+                "JMAP scheduled send not available",
+            );
+            return Box::pin(async move { Err(err) });
+        }
+        pim::cancel_scheduled_send(self.mail.clone(), handle)
+    }
+
+    fn reschedule_send(
+        &self,
+        handle: ObjectId,
+        scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        if self.submission.is_none() || self.max_delayed_send == 0 {
+            let err = super::error::unsupported_error(
+                AccountOperation::RescheduleSend,
+                None,
+                "JMAP scheduled send not available",
+            );
+            return Box::pin(async move { Err(err) });
+        }
+        pim::reschedule_send(self.mail.clone(), self.max_delayed_send, handle, scheduled)
     }
 
     fn search(

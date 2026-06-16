@@ -145,10 +145,28 @@ pub(crate) fn set_is_read(
 pub(crate) fn send_message(
     mail: MailAccount,
     email_state: Arc<Mutex<Option<String>>>,
+    max_delayed_send: usize,
     request: bifrost_types::SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         let identity = request.identity.clone();
+        let scheduled = request.scheduled;
+        if let Some(at) = scheduled {
+            // A scheduled request on a relay with no delay window
+            // (`maxDelayedSend == 0`, the `scheduled_send` flag false) is
+            // unsupported, not malformed - mirror the cross-provider
+            // contract (gmail/imap surface `Unsupported(Send)` too).
+            if max_delayed_send == 0 {
+                return Err(super::error::unsupported_error(
+                    AccountOperation::Send,
+                    None,
+                    "JMAP relay advertises no scheduled-send window",
+                ));
+            }
+            // The window source is the server's maxDelayedSend seconds.
+            let window = std::time::Duration::from_secs(max_delayed_send as u64);
+            bifrost_types::validate_scheduled(at, Some(window))?;
+        }
         let envelope_from = request.from.clone();
         let envelope_recipients = request
             .to
@@ -178,12 +196,24 @@ pub(crate) fn send_message(
             if let Some(from) = envelope_from.as_ref()
                 && !envelope_recipients.is_empty()
             {
+                // RFC 8621 carries SMTP FUTURERELEASE params on the
+                // envelope mailFrom address. `holduntil` is the
+                // absolute-time form matching our `SystemTime`.
+                let mut mail_from = submission_address_from_compose(from);
+                if let Some(at) = scheduled {
+                    mail_from = mail_from.with_parameter("holduntil", Some(rfc3339(at)));
+                }
                 submit.envelope(
-                    submission_address_from_compose(from),
+                    mail_from,
                     envelope_recipients
                         .iter()
                         .map(submission_address_from_compose),
                 );
+            } else if scheduled.is_some() {
+                // A scheduled send needs an envelope mailFrom to carry
+                // the hold parameter; without an explicit `from` and
+                // recipients there is nowhere to stamp it.
+                return Err(scheduled_requires_envelope());
             }
         }
 
@@ -220,7 +250,7 @@ pub(crate) fn send_message(
         let mut email = email_response
             .created(&email_create_id)
             .map_err(to_acct_err(AccountOperation::Send))?;
-        submission_response
+        let mut submission = submission_response
             .created(SUBMISSION_CREATE_ID)
             .map_err(to_acct_err(AccountOperation::Send))?;
 
@@ -228,7 +258,15 @@ pub(crate) fn send_message(
             advance_email_state(&email_state, None, email_response.new_state().to_string()).await;
         }
 
-        Ok(ObjectId(email.take_id().into_string()))
+        // Handle contract (A4): a scheduled send returns the
+        // EmailSubmission id - the undo-addressable object for
+        // cancel/reschedule. An immediate send keeps returning the
+        // email id (the submission is final, not addressable for undo).
+        if scheduled.is_some() {
+            Ok(ObjectId(submission.take_id().into_string()))
+        } else {
+            Ok(ObjectId(email.take_id().into_string()))
+        }
     })
 }
 
@@ -1631,6 +1669,159 @@ fn address_from_jmap(address: &JmapEmailAddress) -> bifrost_types::Address {
 
 fn submission_address_from_compose(address: &bifrost_types::Address) -> SubmissionAddress {
     SubmissionAddress::new(address.address.clone())
+}
+
+/// Format an absolute instant as RFC 3339 / ISO 8601 UTC for the SMTP
+/// FUTURERELEASE `holduntil` envelope parameter.
+fn rfc3339(at: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()
+}
+
+/// A scheduled JMAP send needs an envelope mailFrom (explicit `from` +
+/// recipients) to carry the hold parameter. Maps to `Request(Malformed)`.
+fn scheduled_requires_envelope() -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        bifrost_types::Cause::Request(bifrost_types::RequestCause::Malformed {
+            detail: bifrost_types::DiagnosticText::user_safe(
+                "Scheduled send requires an explicit from address and at least one recipient.",
+            ),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(AccountOperation::Send)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+/// Cancel a scheduled JMAP submission by id: `EmailSubmission/set`
+/// update setting `undoStatus: canceled`.
+pub(crate) fn cancel_scheduled_send(
+    submission_account: MailAccount,
+    handle: ObjectId,
+) -> AccountFuture<Result<(), AccountError>> {
+    Box::pin(async move {
+        let submission_id = crate::email_submission::EmailSubmissionId::from(handle.0.as_str());
+        let mut set = EmailSubmissionSet::new();
+        set.update(submission_id.clone())
+            .undo_status(UndoStatus::Canceled);
+        let mut batch = submission_account.build();
+        let handle_ref = batch
+            .call(set)
+            .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
+        let mut response = batch
+            .send()
+            .await
+            .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
+        let mut set_response = response
+            .get(&handle_ref)
+            .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
+        set_response
+            .updated(&submission_id)
+            .map_err(to_acct_err(AccountOperation::CancelScheduledSend))?;
+        Ok(())
+    })
+}
+
+/// Reschedule a scheduled JMAP submission. JMAP has no in-place
+/// reschedule: cancel the existing submission and create a new one
+/// referencing the same `emailId` with the new `holduntil`. Returns the
+/// new submission id.
+pub(crate) fn reschedule_send(
+    submission_account: MailAccount,
+    max_delayed_send: usize,
+    handle: ObjectId,
+    scheduled: SystemTime,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        let window = std::time::Duration::from_secs(max_delayed_send as u64);
+        bifrost_types::validate_scheduled(scheduled, Some(window))?;
+
+        let submission_id = crate::email_submission::EmailSubmissionId::new(handle.0.as_str());
+
+        // Fetch the existing submission to recover its emailId and
+        // envelope (the mailFrom we must restamp with the new hold).
+        let mut existing = submission_account
+            .call(crate::email_submission::EmailSubmissionGet::new().ids([submission_id.clone()]))
+            .await
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        let existing = existing
+            .pop()
+            .ok_or_else(|| reschedule_not_found(&handle.0))?;
+        let email_id = existing
+            .email_id()
+            .cloned()
+            .ok_or_else(|| reschedule_missing_field("the scheduled submission has no emailId"))?;
+        let mail_from_email = existing
+            .mail_from()
+            .ok_or_else(|| reschedule_missing_field("the scheduled submission has no envelope"))?
+            .email()
+            .to_string();
+        let rcpt_to: Vec<String> = existing
+            .rcpt_to()
+            .unwrap_or(&[])
+            .iter()
+            .map(|a| a.email().to_string())
+            .collect();
+
+        // Cancel the old submission and create the replacement in one
+        // batch.
+        let mut set = EmailSubmissionSet::new();
+        set.update(submission_id.clone())
+            .undo_status(UndoStatus::Canceled);
+        {
+            let submit = set.create_with_id(SUBMISSION_CREATE_ID);
+            submit.undo_status(UndoStatus::Final);
+            submit.email_id(email_id);
+            let mail_from = SubmissionAddress::new(mail_from_email)
+                .with_parameter("holduntil", Some(rfc3339(scheduled)));
+            submit.envelope(mail_from, rcpt_to.into_iter().map(SubmissionAddress::new));
+        }
+
+        let mut batch = submission_account.build();
+        let handle_ref = batch
+            .call(set)
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        let mut response = batch
+            .send()
+            .await
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        let mut set_response = response
+            .get(&handle_ref)
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        let mut new_submission = set_response
+            .created(SUBMISSION_CREATE_ID)
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        Ok(ObjectId(new_submission.take_id().into_string()))
+    })
+}
+
+fn reschedule_missing_field(detail: &'static str) -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::MissingField),
+        bifrost_types::Cause::Wire(bifrost_types::WireCause::MalformedResponse {
+            protocol: bifrost_types::Protocol::Jmap,
+            detail: Some(bifrost_types::DiagnosticText::support_only(detail)),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(AccountOperation::RescheduleSend)
+    .try_build()
+    .expect("valid account error classification")
+}
+
+fn reschedule_not_found(id: &str) -> AccountError {
+    bifrost_types::AccountErrorBuilder::new(
+        bifrost_types::AccountErrorKind::NotFound(bifrost_types::ResourceKind::Message),
+        bifrost_types::Cause::Request(bifrost_types::RequestCause::NotFound {
+            what: bifrost_types::ResourceKind::Message,
+            id: Some(id.to_string()),
+        }),
+    )
+    .protocol(bifrost_types::Protocol::Jmap)
+    .operation(AccountOperation::RescheduleSend)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn message_properties(projection: HydrationProjection) -> Vec<EmailProperty> {

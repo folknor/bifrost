@@ -127,6 +127,36 @@ pub(crate) fn into_account_error(error: SmtpError, ctx: SmtpErrorContext) -> Acc
             diagnostic.as_deref(),
             None,
         ),
+        ErrorKind::FeatureUnsupported => build_basic(
+            &ctx,
+            // A relay that does not advertise the requested extension
+            // (e.g. FUTURERELEASE) is reported as an unsupported send,
+            // distinct from a malformed request so the IMAP boundary can
+            // surface a stable `Unsupported(Send)` kind.
+            AccountErrorKind::Unsupported(AccountOperation::Send),
+            Cause::Request(RequestCause::Unsupported {
+                operation: AccountOperation::Send,
+            }),
+            attempt_state,
+            diagnostic.as_deref(),
+            None,
+        ),
+        ErrorKind::ParameterOverLimit => build_basic(
+            &ctx,
+            // The value is out of the server-allowed window: a malformed
+            // request, not an unsupported feature.
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::support_only(
+                    diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "parameter over limit".into()),
+                ),
+            }),
+            attempt_state,
+            diagnostic.as_deref(),
+            None,
+        ),
         ErrorKind::Internal => build_basic(
             &ctx,
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -1084,6 +1114,34 @@ mod tests {
             account.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
         ));
+    }
+
+    #[test]
+    fn future_release_unsupported_and_over_limit_map_to_distinct_kinds() {
+        // A4 brick 4.6a: the FUTURERELEASE-unsupported and HOLDFOR-over-
+        // limit cases must be told apart downstream. The former is an
+        // unsupported send (so the IMAP boundary can surface a stable
+        // Unsupported(Send) kind); the latter is a malformed request (the
+        // time is outside the server-allowed window).
+        let unsupported = crate::transport::smtp::error::feature_unsupported(
+            "FUTURERELEASE requires server FUTURERELEASE support",
+        );
+        let unsupported = into_account_error(unsupported, ctx_smtp_send());
+        assert!(matches!(
+            unsupported.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+
+        let over_limit = crate::transport::smtp::error::parameter_over_limit(
+            "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
+        );
+        let over_limit = into_account_error(over_limit, ctx_smtp_send());
+        assert!(matches!(
+            over_limit.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+
+        assert_ne!(unsupported.kind(), over_limit.kind());
     }
 
     #[test]

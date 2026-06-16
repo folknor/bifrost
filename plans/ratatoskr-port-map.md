@@ -211,7 +211,27 @@ false only for CalDAV/CardDAV-only composed accounts (which gates the UI button)
 
 ---
 
-## A4 - Scheduled send
+## A4 - Scheduled send [LANDED]
+
+Landed decisions worth recording:
+
+- **IMAP one-shot.** IMAP scheduled send is fire-and-submit via SMTP
+  FUTURERELEASE (`HOLDUNTIL`, absolute-time so the boundary never races
+  `now()`). RFC 4865 has no recall verb, so `cancel_scheduled_send` /
+  `reschedule_send` are `Unsupported` for IMAP and `scheduled_send` is a
+  per-connection truth defaulted `false` (the relay EHLO at send time is
+  authoritative, no probe-at-open).
+- **smtp discriminator (4.6a).** bifrost-smtp gained
+  `ErrorKind::{FeatureUnsupported, ParameterOverLimit}`: FUTURERELEASE-
+  unsupported maps to `Unsupported(Send)`, HOLDFOR-over-limit to
+  `Request(Malformed)`, so the IMAP boundary can tell them apart without
+  string-matching a consent-gated diagnostic.
+- **JMAP submission-id handle contract.** A scheduled JMAP send returns the
+  EmailSubmission id (the undo-addressable object) as the cancel/reschedule
+  handle; an immediate send still returns the email id. Reschedule is
+  cancel-and-resubmit (JMAP has no in-place reschedule).
+- **Graph in-place reschedule.** Cancel = DELETE the deferred draft;
+  reschedule = PATCH `PidTagDeferredSendTime`, returning the same id.
 
 Every wire primitive already exists in **bifrost** (smtp FUTURERELEASE,
 JMAP `holduntil`, Graph `PidTagDeferredSendTime`). A4 is a `SendRequest`
@@ -236,16 +256,16 @@ map to `Request(Malformed)`; unsupported -> `Unsupported(Send)`).
 **Scope gap, now firm given presence=needed.** ratatoskr ships **cancel** and
 **reschedule** for both JMAP and Graph scheduled sends
 (`cancel_scheduled_send_jmap` via `undoStatus`, Graph delete/patch). These are
-required surface ratatoskr will wire, and A4 as written in the plan has nowhere
-to land them - which would force the exact provider special-case the plan exists
-to delete. **Recommendation: A4 adds `cancel_scheduled_send` and
-`reschedule_send` primitives gated by the same flag**, not fire-and-forget.
+required surface ratatoskr wires. A4 landed `cancel_scheduled_send` and
+`reschedule_send` primitives gated by the same flag (not fire-and-forget),
+which is why no provider special-case is needed.
 
 **IMAP capability is post-EHLO.** Unlike JMAP (`maxDelayedSend` in the session
 object) and Graph (always-on), the IMAP flag depends on the relay's EHLO
 FUTURERELEASE advertisement, unknown until connect, while `AccountCapabilities`
-is an open-time snapshot. Probe once at open, or default false and surface a
-runtime `Unsupported`. Pin in the spec.
+is an open-time snapshot. Landed resolution: default the flag false and surface
+a runtime `Unsupported` (no probe-at-open), per the IMAP one-shot decision
+above.
 
 **Depends on:** A2 (uniform send surface settled first).
 

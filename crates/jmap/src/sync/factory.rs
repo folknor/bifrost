@@ -150,8 +150,13 @@ impl AccountFactory for JmapAccountFactory {
             let calendars = client.primary_account::<capability::Calendars>().ok();
             let session = client.session();
             let self_emails = fetch_self_emails(&client, &config.credentials).await;
+            let max_delayed_send = match session.submission_capabilities() {
+                Some(caps) => caps.max_delayed_send(),
+                None => 0,
+            };
             let support = capabilities::PimSupport {
                 submission: submission.is_some(),
+                max_delayed_send,
                 vacation: vacation.is_some(),
                 quota: quota.is_some(),
                 sieve: sieve.is_some(),
@@ -220,6 +225,7 @@ impl AccountFactory for JmapAccountFactory {
                 client,
                 mail,
                 submission,
+                max_delayed_send,
                 vacation,
                 quota,
                 sieve,

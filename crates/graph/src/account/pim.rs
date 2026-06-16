@@ -214,10 +214,105 @@ pub(crate) async fn send_message(
     if !request.attachments_uploaded.is_empty() {
         return Err(unsupported_account_error(AccountOperation::Send));
     }
+    if let Some(at) = request.scheduled {
+        // Graph has no documented hard cap on deferred-send time;
+        // rely on server rejection for an unreasonable window. Only
+        // the past-instant rule is enforced client-side.
+        bifrost_types::validate_scheduled(at, None)?;
+    }
+    let scheduled = request.scheduled;
     let message = message_from_send_request(&request)?;
     let draft = create_draft_message(&account, message).await?;
+    if let Some(at) = scheduled {
+        // Stamp PidTagDeferredSendTime on the draft before send so
+        // Graph queues it for deferred delivery.
+        stamp_deferred_send_time(&account, &draft, at, AccountOperation::Send).await?;
+    }
     send_draft_message(&account, &draft).await?;
     Ok(ObjectId(draft.0))
+}
+
+/// MAPI proptag form for `PidTagDeferredSendTime` (`PT_SYSTIME 0x3FEF`),
+/// the single-valued extended property Graph reads to defer a send.
+const DEFERRED_SEND_TIME_PROPERTY_ID: &str = "SystemTime 0x3FEF";
+
+/// PATCH a draft's `PidTagDeferredSendTime` extended property to `at`,
+/// serialized as ISO-8601 UTC. Used both by the scheduled send path and
+/// by `reschedule_send` (Graph reschedule is an in-place PATCH).
+async fn stamp_deferred_send_time(
+    account: &GraphAccount,
+    draft: &DraftHandle,
+    at: std::time::SystemTime,
+    operation: AccountOperation,
+) -> Result<(), AccountError> {
+    let path = format!(
+        "{}/messages/{}",
+        account.client.api_path_prefix(),
+        bifrost_net::url::encode_component(&draft.0)
+    );
+    let body = deferred_send_time_body(at);
+    account
+        .client
+        .patch(&path, &body)
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
+}
+
+/// The `MessagePatch` body that stamps `PidTagDeferredSendTime` on a
+/// Graph draft.
+fn deferred_send_time_body(at: std::time::SystemTime) -> Value {
+    json!({
+        "singleValueExtendedProperties": [{
+            "id": DEFERRED_SEND_TIME_PROPERTY_ID,
+            "value": graph_iso8601_utc(at)
+        }]
+    })
+}
+
+/// Format an absolute instant as ISO-8601 UTC for the Graph
+/// `singleValueExtendedProperty` value (matches Graph's PT_SYSTIME wire
+/// shape, e.g. `2026-06-16T10:00:00Z`).
+fn graph_iso8601_utc(at: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(at)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+pub(crate) async fn cancel_scheduled_send(
+    account: GraphAccount,
+    handle: ObjectId,
+) -> Result<(), AccountError> {
+    // A Graph deferred message sits in the mailbox until its send time;
+    // deleting it cancels the send.
+    let path = format!(
+        "{}/messages/{}",
+        account.client.api_path_prefix(),
+        bifrost_net::url::encode_component(&handle.0)
+    );
+    account.client.delete(&path).await.map_err(|e| {
+        into_account_error(
+            e,
+            GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
+        )
+    })
+}
+
+pub(crate) async fn reschedule_send(
+    account: GraphAccount,
+    handle: ObjectId,
+    scheduled: std::time::SystemTime,
+) -> Result<ObjectId, AccountError> {
+    bifrost_types::validate_scheduled(scheduled, None)?;
+    // Graph reschedule is an in-place PATCH of the deferred-send time.
+    let draft = DraftHandle(handle.0.clone());
+    stamp_deferred_send_time(
+        &account,
+        &draft,
+        scheduled,
+        AccountOperation::RescheduleSend,
+    )
+    .await?;
+    Ok(handle)
 }
 
 pub(crate) async fn draft_create(
@@ -1560,6 +1655,34 @@ mod tests {
             role_from_well_known_name("deletedItems"),
             Some(FolderRole::Trash)
         );
+    }
+
+    #[test]
+    fn scheduled_send_deferred_body_shape() {
+        // 1970-01-01T00:00:00Z plus one day -> a stable ISO-8601 UTC value.
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+        let body = deferred_send_time_body(at);
+        let props = body
+            .get("singleValueExtendedProperties")
+            .and_then(serde_json::Value::as_array)
+            .expect("singleValueExtendedProperties array");
+        let prop = &props[0];
+        assert_eq!(
+            prop.get("id").and_then(serde_json::Value::as_str),
+            Some("SystemTime 0x3FEF")
+        );
+        assert_eq!(
+            prop.get("value").and_then(serde_json::Value::as_str),
+            Some("1970-01-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn scheduled_send_capability_is_true() {
+        let caps = crate::account::capabilities::build_capabilities(
+            crate::account::PushMode::GraphSubscriptions,
+        );
+        assert!(caps.pim_methods.scheduled_send);
     }
 
     #[test]

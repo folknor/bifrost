@@ -199,7 +199,7 @@ Capabilities still advertise `MutationConcurrency::None`. The MODSEQ cache is op
 - Draft create/discard: APPEND to the Drafts folder with `\Draft` when Drafts and UIDPLUS are present; discard deletes the draft object id. Draft bodies are built by the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles still rejected as `AttachmentUpload`), so the `Bcc:` header is preserved in the saved draft.
 - Send / draft-send: real when `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` is set (see "Submission" below); `Unsupported` otherwise.
 
-Unsupported PIM methods return `Error::Unsupported` and have false capability flags: attachment upload, draft update, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set. SMTP send and draft-send are unsupported only when no submission config is present. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
+Unsupported PIM methods return `Error::Unsupported` and have false capability flags: attachment upload, draft update, Gmail label membership, Graph categories and extended properties, identities, identity update, vacation get/set, and `scheduled_send` (cancel/reschedule too). `scheduled_send` is statically false even with submission configured because FUTURERELEASE is a per-connection EHLO truth unknown at open; a scheduled send is attempted and the relay's EHLO at send time decides (see "Submission"). SMTP send and draft-send are unsupported only when no submission config is present. IMAP identities and vacation responders are external configuration or Sieve-shaped and are not exposed in Stage 1.
 
 ### Submission (SMTP send)
 
@@ -227,6 +227,17 @@ flag/behavior flip - the flag never lies). `attachment_upload` stays false (A6).
   SMTP's already-translated `AccountError` (no IMAP `Smtp` error variant; a
   submission *build* failure maps to `InvalidInput`). `draft_send` re-stamps
   the returned error's operation to `DraftSend`.
+- Scheduled send is one-shot SMTP FUTURERELEASE: `SendRequest::scheduled`
+  threads a `hold: Option<SystemTime>` into `send_rfc5322`, which builds
+  `SendOptions::hold_until(rfc3339(t))` (absolute-time, so the boundary never
+  races `now()`; the relay computes the delay). No IMAP-side pre-validation -
+  the relay's EHLO at send time is authoritative. A relay that did not
+  advertise FUTURERELEASE yields a bifrost-smtp `FeatureUnsupported` already
+  mapped to `Unsupported(Send)`; the IMAP boundary only re-stamps
+  operation/protocol (it cannot change the kind), so the consumer sees a stable
+  `Unsupported(Send)`. A HOLD over the relay's advertised max arrives as
+  `Request(Malformed)`. RFC 4865 has no recall verb, so `cancel_scheduled_send`
+  and `reschedule_send` are `Unsupported`.
 - MIME assembly is the shared `bifrost-types::mime` serializer
   (`send_request_to_rfc5322` for send, `render_rfc5322` for drafts), lifted
   from Google's `MailDocument` so Google and IMAP share one path. It emits

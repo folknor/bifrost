@@ -142,6 +142,8 @@ pub enum AccountOperation {
     DraftUpdate,
     DraftDiscard,
     DraftSend,
+    CancelScheduledSend,
+    RescheduleSend,
     Search,
     SearchMessages,
     ContainersList,
@@ -194,6 +196,7 @@ impl AccountOperation {
                 | Self::DraftCreate
                 | Self::DraftUpdate
                 | Self::DraftSend
+                | Self::RescheduleSend
                 | Self::ContainerCreate
                 | Self::ContainerRename
                 | Self::ContainerMove

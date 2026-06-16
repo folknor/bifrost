@@ -164,6 +164,12 @@ pub struct PimMethodSupport {
     pub draft_update: bool,
     pub draft_discard: bool,
     pub draft_send: bool,
+    /// Native server-side scheduled send (JMAP `maxDelayedSend > 0`,
+    /// Graph `PidTagDeferredSendTime`, IMAP relay FUTURERELEASE). Gates
+    /// `SendRequest::scheduled`, `cancel_scheduled_send`, and
+    /// `reschedule_send`. `false` -> a scheduled request is rejected
+    /// `Unsupported(Send)` and the two primitives return `Unsupported`.
+    pub scheduled_send: bool,
     // Search primitives.
     pub search: bool,
     pub search_messages: bool,

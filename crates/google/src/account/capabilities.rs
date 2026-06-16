@@ -42,6 +42,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             draft_update: true,
             draft_discard: true,
             draft_send: true,
+            scheduled_send: false,
             search: true,
             search_messages: true,
             containers_list: true,

@@ -433,6 +433,20 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::draft_send(account, draft).await })
     }
 
+    fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { pim::cancel_scheduled_send(account, handle).await })
+    }
+
+    fn reschedule_send(
+        &self,
+        handle: ObjectId,
+        scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { pim::reschedule_send(account, handle, scheduled).await })
+    }
+
     fn search(
         &self,
         request: SearchRequest,

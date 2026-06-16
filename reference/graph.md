@@ -216,8 +216,9 @@ receiver in a `stream::unfold` selecting against the same token.
   next call returns 410 Gone or a 400 InvalidDeltaToken.
 - `pim_methods`: true for `add_to_container`, `set_category`,
   `set_extended_property`, `set_is_read`, send/draft lifecycle,
-  search, mail folder CRUD, `identities_list`, vacation get/set,
-  typed thread/message hydration, contact primitives, and calendar
+  `scheduled_send` (with native cancel/reschedule), search, mail
+  folder CRUD, `identities_list`, vacation get/set, typed
+  thread/message hydration, contact primitives, and calendar
   primitives. False for
   `remove_from_container`, `set_keyword`, `set_label_membership`,
   standalone `attachment_upload`, `identity_update`, and
@@ -413,6 +414,16 @@ the draft id. Inline attachments encode into Graph `fileAttachment`
 JSON. Standalone `attachment_upload` is unsupported (Graph upload
 sessions are message/draft scoped). `draft_update` patches mutable
 message fields; attachment replacement is unsupported.
+
+Scheduled send is `PidTagDeferredSendTime` (`SystemTime 0x3FEF`): when
+`SendRequest::scheduled` is `Some(t)` the boundary validates `t`
+(future; Graph has no documented upper bound so it relies on server
+rejection) and PATCHes that `singleValueExtendedProperty` (ISO-8601
+UTC) onto the draft after create and before send. The returned draft
+id is the cancel/reschedule handle. `cancel_scheduled_send` DELETEs the
+deferred draft; `reschedule_send` PATCHes `PidTagDeferredSendTime` to
+the new instant in place, returning the same id. `scheduled_send` is
+unconditionally true for Graph mailbox accounts.
 
 Search uses `/messages` with `$filter` / `$search` / `$top` and
 `@odata.nextLink` as the opaque page cursor. Message search returns

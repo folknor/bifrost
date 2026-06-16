@@ -128,6 +128,69 @@ pub struct SendRequest {
     /// default and ignore this when `Some(false)`; IMAP uses the
     /// configured `bifrost-smtp` transport plus an APPEND.
     pub save_to_sent: Option<bool>,
+    /// Requested server-side send time. `None` sends immediately.
+    /// `Some(t)` requests delayed delivery where the provider supports
+    /// it (`capabilities().pim_methods.scheduled_send`); on providers
+    /// that do not, a `Some(t)` request is rejected with
+    /// `Unsupported(Send)` rather than silently sent now. `t` is an
+    /// absolute wall-clock instant; the provider boundary validates it
+    /// is in the future and within the provider's max-delay window.
+    pub scheduled: Option<std::time::SystemTime>,
+}
+
+/// Validate a requested scheduled-send instant at the provider
+/// boundary. Shared so the past-instant and over-window rules are
+/// identical across every native provider.
+///
+/// - `at <= now()` (past or present instant) -> `Request(Malformed)`.
+/// - `at - now() > max_window` (when `max_window` is `Some`) ->
+///   `Request(Malformed)`. Providers with no documented hard cap pass
+///   `None` and rely on server rejection.
+///
+/// Returns `Ok(())` for a valid future instant inside the window.
+///
+/// # Errors
+///
+/// Returns `Request(Malformed)` when `at` is not strictly in the
+/// future, or when it exceeds `max_window` past now.
+pub fn validate_scheduled(
+    at: std::time::SystemTime,
+    max_window: Option<std::time::Duration>,
+) -> Result<(), crate::error::AccountError> {
+    use crate::error::{
+        AccountErrorBuilder, AccountErrorKind, Cause, DiagnosticText, RequestCause,
+        RequestErrorKind,
+    };
+
+    let now = std::time::SystemTime::now();
+    let malformed = |detail: &'static str| {
+        AccountErrorBuilder::new(
+            AccountErrorKind::Request(RequestErrorKind::Malformed),
+            Cause::Request(RequestCause::Malformed {
+                detail: DiagnosticText::user_safe(detail),
+            }),
+        )
+        .operation(crate::error::AccountOperation::Send)
+        .try_build()
+        .expect("valid account error classification")
+    };
+
+    let delta = match at.duration_since(now) {
+        // Strictly-future requirement: `Ok(0)` (exactly now) and the
+        // `Err` arm (at < now) are both rejected as past instants.
+        Ok(d) if !d.is_zero() => d,
+        _ => return Err(malformed("Scheduled send time must be in the future.")),
+    };
+
+    if let Some(window) = max_window
+        && delta > window
+    {
+        return Err(malformed(
+            "Scheduled send time exceeds the provider's maximum delay window.",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Partial-update shape used by `draft_create` and `draft_update`.
@@ -160,3 +223,57 @@ pub struct DraftPatch {
 /// signal that the id namespace is different.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdentityId(pub String);
+
+#[cfg(test)]
+mod scheduled_send_tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{SendRequest, validate_scheduled};
+    use crate::capabilities::PimMethodSupport;
+    use crate::error::{AccountErrorKind, AccountOperation, RequestErrorKind};
+
+    #[test]
+    fn scheduled_send_default_request_is_immediate() {
+        assert!(SendRequest::default().scheduled.is_none());
+    }
+
+    #[test]
+    fn scheduled_send_capability_defaults_false() {
+        assert!(!PimMethodSupport::default().scheduled_send);
+    }
+
+    #[test]
+    fn scheduled_send_idempotency_placement() {
+        assert!(AccountOperation::CancelScheduledSend.is_idempotent());
+        assert!(!AccountOperation::RescheduleSend.is_idempotent());
+    }
+
+    #[test]
+    fn scheduled_send_validate_rejects_past_instant() {
+        let past = SystemTime::now() - Duration::from_secs(60);
+        let err = validate_scheduled(past, None).expect_err("past instant must be rejected");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
+    }
+
+    #[test]
+    fn scheduled_send_validate_rejects_over_window() {
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let err = validate_scheduled(future, Some(Duration::from_secs(60)))
+            .expect_err("over-window instant must be rejected");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+    }
+
+    #[test]
+    fn scheduled_send_validate_accepts_valid_future() {
+        let future = SystemTime::now() + Duration::from_secs(120);
+        assert!(validate_scheduled(future, Some(Duration::from_secs(3600))).is_ok());
+        assert!(validate_scheduled(future, None).is_ok());
+    }
+}

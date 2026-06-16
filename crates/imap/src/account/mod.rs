@@ -481,6 +481,20 @@ impl Account for ImapAccount {
         pim::draft_send(self.clone(), draft)
     }
 
+    fn cancel_scheduled_send(&self, _handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
+        // SMTP FUTURERELEASE is fire-and-submit: RFC 4865 has no verb to
+        // recall an accepted HOLDUNTIL submission. Honest provider limit.
+        pim::unsupported_unit(bifrost_types::AccountOperation::CancelScheduledSend)
+    }
+
+    fn reschedule_send(
+        &self,
+        _handle: ObjectId,
+        _scheduled: std::time::SystemTime,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::unsupported_object(bifrost_types::AccountOperation::RescheduleSend)
+    }
+
     fn search(
         &self,
         request: SearchRequest,
