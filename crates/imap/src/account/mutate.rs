@@ -443,18 +443,80 @@ async fn apply_flag_op(
             .await
         }
         FlagOp::Patch { add, remove } => {
-            store_flags(conn, set, StoreOperation::AddSilent, add, None, timeout).await?;
+            apply_patch(conn, set, add, remove, unchanged_since, timeout).await
+        }
+        _ => Err(crate::Error::Protocol("unsupported flag operation".into())),
+    }
+}
+
+/// Apply a `FlagOp::Patch` (independent add + remove sets) as the two
+/// STORE commands IMAP requires (no combined add-and-remove STORE
+/// exists), threading the MODSEQ guard.
+///
+/// The lost-update guard belongs on the *first* command: it is the
+/// checkpoint that proves no concurrent writer touched these messages
+/// since we cached their MODSEQ. If the first STORE rejects with
+/// `UNCHANGEDSINCE` (MODIFIED), the whole patch conflicts and we return
+/// that outcome without running the second command. Once the first STORE
+/// wins the race, the server has bumped each touched message's MODSEQ, so
+/// re-using the original `unchanged_since` on the second command would
+/// spuriously self-conflict on the very UIDs we just changed; the second
+/// command therefore runs unprotected (it is our own follow-up on rows we
+/// now own, equivalent to one logical patch). A patch that only adds or
+/// only removes degenerates to a single guarded STORE.
+async fn apply_patch(
+    conn: &super::PooledConn,
+    set: &crate::types::SequenceSet,
+    add: &HashSet<String>,
+    remove: &HashSet<String>,
+    unchanged_since: Option<u64>,
+    timeout: std::time::Duration,
+) -> Result<StoreWireOutcome, crate::Error> {
+    let has_add = !add.is_empty();
+    let has_remove = !remove.is_empty();
+    match (has_add, has_remove) {
+        (false, false) => Ok(StoreWireOutcome::Applied),
+        (true, false) => {
+            store_flags(
+                conn,
+                set,
+                StoreOperation::AddSilent,
+                add,
+                unchanged_since,
+                timeout,
+            )
+            .await
+        }
+        (false, true) => {
             store_flags(
                 conn,
                 set,
                 StoreOperation::RemoveSilent,
                 remove,
-                None,
+                unchanged_since,
                 timeout,
             )
             .await
         }
-        _ => Err(crate::Error::Protocol("unsupported flag operation".into())),
+        (true, true) => {
+            // First command carries the guard.
+            let first = store_flags(
+                conn,
+                set,
+                StoreOperation::AddSilent,
+                add,
+                unchanged_since,
+                timeout,
+            )
+            .await?;
+            // A guard rejection (or any non-applied outcome) on the first
+            // command means the patch did not fully land; surface it
+            // rather than charging ahead with the second.
+            if !matches!(first, StoreWireOutcome::Applied) {
+                return Ok(first);
+            }
+            store_flags(conn, set, StoreOperation::RemoveSilent, remove, None, timeout).await
+        }
     }
 }
 
@@ -544,16 +606,23 @@ fn mutation_results(
                 }
             })
             .collect(),
-        // UNCHANGEDSINCE conflict on pending-retry batch: modified UIDs
-        // are concurrency conflicts; remaining UIDs were not committed
-        // because the whole STORE was rejected.
+        // Tagged-NO STORE carrying `[MODIFIED ...]`: the server
+        // explicitly rejected the command and named the conflicting
+        // UIDs. This is a *server-acknowledged* conflict - a complete
+        // response crossed the wire, so there is no transmission
+        // ambiguity. Per the error model the conflicting UIDs are
+        // therefore `Failed(ConcurrencyConflict)` (deriving
+        // `Retry::AfterStateRefresh`), NOT `Uncertain` (which is the
+        // analogue of an in-flight transport drop and queues for
+        // read-back). The remaining UIDs were not committed because the
+        // whole STORE was rejected.
         StoreWireOutcome::PendingRetry(modified) => ids
             .into_iter()
             .map(|id| {
                 let item =
                     BatchItemId(super::encode_object_id(&id.folder, id.uidvalidity, id.uid).0);
                 if modified.contains(&id.uid) {
-                    ItemOutcome::Uncertain(BatchUncertain::new(
+                    ItemOutcome::Failed(BatchFailure::new(
                         item,
                         concurrency_conflict_error(operation, folder),
                     ))
@@ -699,6 +768,50 @@ mod tests {
             StoreWireOutcome::from_response_code(None, false),
             StoreWireOutcome::Failed
         );
+    }
+
+    #[test]
+    fn pending_retry_conflict_is_failed_not_uncertain() {
+        // A tagged-NO STORE carrying `[MODIFIED ...]` is a
+        // server-acknowledged conflict with no transmission ambiguity:
+        // the conflicting UIDs must surface as `Failed(ConcurrencyConflict)`
+        // (driving Retry::AfterStateRefresh), never `Uncertain` (the
+        // in-flight-drop analogue that queues for read-back).
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let ids = vec![
+            DecodedObjectId {
+                folder: folder.clone(),
+                uidvalidity: 7,
+                uid: 2,
+            },
+            DecodedObjectId {
+                folder: folder.clone(),
+                uidvalidity: 7,
+                uid: 5,
+            },
+        ];
+        let outcomes = mutation_results(
+            ids,
+            &[2, 5],
+            StoreWireOutcome::PendingRetry(vec![2]),
+            AccountOperation::UpdateFlags,
+            &folder,
+        );
+        // Every item is Failed - none Uncertain, none Succeeded.
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, ItemOutcome::Failed(_))),
+            "PendingRetry conflict must surface as Failed, never Uncertain"
+        );
+        // The conflicting UID (2) carries ConcurrencyConflict.
+        let has_conflict = outcomes.iter().any(|o| {
+            matches!(o, ItemOutcome::Failed(f) if matches!(
+                f.error.kind(),
+                AccountErrorKind::ConcurrencyConflict
+            ))
+        });
+        assert!(has_conflict, "conflicting UID must surface ConcurrencyConflict");
     }
 
     #[test]

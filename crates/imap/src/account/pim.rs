@@ -91,6 +91,9 @@ pub(crate) fn set_keyword(
     value: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.set_keyword {
+            return Err(super::error::unsupported(AccountOperation::SetKeyword));
+        }
         let flag = imap_flag_for_keyword(&keyword);
         let ids = decoded_targets(&target)?;
         set_flag(&account, ids, flag, value, AccountOperation::SetKeyword).await
@@ -103,6 +106,9 @@ pub(crate) fn set_is_read(
     is_read: bool,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.set_is_read {
+            return Err(super::error::unsupported(AccountOperation::SetIsRead));
+        }
         let ids = decoded_targets(&target)?;
         set_flag(
             &account,
@@ -124,6 +130,9 @@ pub(crate) fn set_importance(
     // keyword. Exclusive: `High` sets it, `Normal`/`Low` clear it - one
     // STORE op, never an expand-into-two.
     Box::pin(async move {
+        if !account.capabilities.pim_methods.set_importance {
+            return Err(super::error::unsupported(AccountOperation::SetImportance));
+        }
         let important = importance_sets_important_keyword(level);
         let ids = decoded_targets(&target)?;
         set_flag(
@@ -419,15 +428,18 @@ fn parse_draft_for_submission(
     raw: &[u8],
     default_from: &bifrost_types::Address,
 ) -> Result<ParsedDraft, AccountError> {
-    let text = String::from_utf8_lossy(raw);
-    let split = text
-        .find("\r\n\r\n")
-        .map(|idx| (idx, idx + 4))
-        .or_else(|| text.find("\n\n").map(|idx| (idx, idx + 2)));
-    let (header_end, body_start) = split.unwrap_or((text.len(), text.len()));
-    let header_block = &text[..header_end];
+    // Operate on bytes end-to-end: the transmitted body must be the
+    // verbatim draft octets. Decoding through `from_utf8_lossy` would
+    // turn any 8-bit / binary octet into U+FFFD on the wire while the
+    // Sent-folder APPEND keeps the original bytes - a silent divergence
+    // between what was sent and what is recorded. Header parsing only
+    // needs the names and the address-list / message-id values, which
+    // are ASCII-structured; we decode those lossily for parsing but
+    // never feed the decoded form back into the transmitted bytes.
+    let (header_end, body_start) = split_header_body(raw);
+    let header_block = &raw[..header_end];
 
-    let headers = unfold_headers(header_block);
+    let headers = unfold_headers(&String::from_utf8_lossy(header_block));
 
     let from = first_address(&headers, "from")
         .or_else(|| first_address(&headers, "sender"))
@@ -457,7 +469,7 @@ fn parse_draft_for_submission(
             format!("bifrost.draft@{domain}")
         });
 
-    let body = strip_bcc_header(header_block, &text[body_start..]);
+    let body = strip_bcc_header(header_block, &raw[body_start..]);
 
     Ok(ParsedDraft {
         envelope: bifrost_types::SubmissionEnvelope { from, recipients },
@@ -466,29 +478,117 @@ fn parse_draft_for_submission(
     })
 }
 
+/// Locate the header/body split of a raw RFC 5322 message, tolerating
+/// mixed CRLF / bare-LF line endings and a header-only draft (no blank
+/// line). Returns `(header_end, body_start)` byte offsets: the header
+/// block is `raw[..header_end]` and the body is `raw[body_start..]`. The
+/// separator blank line itself sits between the two and is dropped. For
+/// a header-only draft both offsets are `raw.len()` (empty body).
+fn split_header_body(raw: &[u8]) -> (usize, usize) {
+    // Find the empty line that ends the header block. We scan for the
+    // first line terminator (`\r\n` or bare `\n`) that is immediately
+    // followed by another line terminator. `header_end` is the offset
+    // just *after* the first terminator (so the last header line keeps
+    // its own ending); `body_start` is just *after* the second
+    // terminator (so the blank separator line is dropped). Mixed CRLF /
+    // bare-LF endings are tolerated on both sides.
+    let mut i = 0;
+    while i < raw.len() {
+        // Length of a terminator starting at `j`, if any.
+        let term_len = |j: usize| -> Option<usize> {
+            match raw.get(j) {
+                Some(b'\r') if raw.get(j + 1) == Some(&b'\n') => Some(2),
+                Some(b'\n') => Some(1),
+                _ => None,
+            }
+        };
+        if let Some(first) = term_len(i) {
+            let header_end = i + first;
+            if let Some(second) = term_len(header_end) {
+                return (header_end, header_end + second);
+            }
+        }
+        i += 1;
+    }
+    (raw.len(), raw.len())
+}
+
 /// Reassemble the message bytes with every `Bcc:` header line removed so
 /// blind recipients are not disclosed in the transmitted message.
-fn strip_bcc_header(header_block: &str, body: &str) -> Vec<u8> {
-    let mut kept = String::with_capacity(header_block.len() + body.len() + 4);
+///
+/// Byte-exact: header and body octets are copied verbatim (no UTF-8
+/// round-trip), so an 8-bit / binary body survives unchanged. Only the
+/// dropped `Bcc:` lines and the synthesized header/body separator touch
+/// line endings; the separator matches the header block's own ending
+/// (CRLF unless the draft is bare-LF) so a uniform-LF draft is not
+/// emitted with a mixed CRLF separator.
+fn strip_bcc_header(header_block: &[u8], body: &[u8]) -> Vec<u8> {
+    let uses_crlf = header_block.windows(2).any(|w| w == b"\r\n") || !header_block.contains(&b'\n');
+    let sep: &[u8] = if uses_crlf { b"\r\n" } else { b"\n" };
+
+    let mut kept = Vec::with_capacity(header_block.len() + body.len() + 4);
     let mut skipping = false;
-    for line in header_block.split_inclusive('\n') {
-        let trimmed = line.trim_start_matches(['\r', '\n']);
-        let is_continuation = line.starts_with(' ') || line.starts_with('\t');
+    for line in split_inclusive_lf(header_block) {
+        let trimmed = trim_leading_crlf(line);
+        let is_continuation = line.first() == Some(&b' ') || line.first() == Some(&b'\t');
         if !is_continuation {
-            skipping = trimmed
-                .split_once(':')
-                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("bcc"));
+            skipping = header_name_is_bcc(trimmed);
         }
         if !skipping {
-            kept.push_str(line);
+            kept.extend_from_slice(line);
         }
     }
-    if !kept.ends_with('\n') {
-        kept.push_str("\r\n");
+    // Ensure the header block ends with a line terminator, then add the
+    // blank-line separator, then the verbatim body.
+    if !kept.ends_with(b"\n") {
+        kept.extend_from_slice(sep);
     }
-    kept.push_str("\r\n");
-    kept.push_str(body);
-    kept.into_bytes()
+    kept.extend_from_slice(sep);
+    kept.extend_from_slice(body);
+    kept
+}
+
+/// Split on `\n`, keeping the terminator on each line (the byte analogue
+/// of `str::split_inclusive('\n')`), and skipping a trailing empty slice.
+fn split_inclusive_lf(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= bytes.len() {
+            return None;
+        }
+        let rest = &bytes[start..];
+        match rest.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                let line = &rest[..=idx];
+                start += idx + 1;
+                Some(line)
+            }
+            None => {
+                let line = rest;
+                start = bytes.len();
+                Some(line)
+            }
+        }
+    })
+}
+
+fn trim_leading_crlf(line: &[u8]) -> &[u8] {
+    let mut s = line;
+    while let [first, rest @ ..] = s
+        && (*first == b'\r' || *first == b'\n')
+    {
+        s = rest;
+    }
+    s
+}
+
+/// True when a header line's field name (before the first `:`) is `Bcc`,
+/// case-insensitive, ignoring surrounding whitespace.
+fn header_name_is_bcc(line: &[u8]) -> bool {
+    match line.iter().position(|&b| b == b':') {
+        Some(idx) => line[..idx].trim_ascii().eq_ignore_ascii_case(b"bcc"),
+        None => false,
+    }
 }
 
 /// Collapse RFC 5322 folded header lines into `(lowercase-name, value)`
@@ -593,6 +693,21 @@ fn split_address_list(value: &str) -> Vec<String> {
 
 /// Re-stamp an `AccountError` from the submission boundary with the IMAP
 /// operation that drove it, so recovery/telemetry attribute it correctly.
+///
+/// Coupling caveat: `into_builder` does NOT preserve builder-only
+/// overrides (`idempotency_override`, `throttle_scope`) per
+/// `reference/error-model.md`. After the round-trip, `derive` recomputes
+/// idempotency from the *operation* via `AccountOperation::is_idempotent`.
+/// This is correct today only because both operations `restamp` is called
+/// with - `Send` and `DraftSend` - are non-idempotent in the central
+/// table, matching what an SMTP `idempotency_override(false)` would have
+/// said. If a future caller passes an idempotent operation here, or if
+/// SMTP ever stamps an `idempotency_override` that disagrees with the
+/// operation's default, this re-stamp would silently drop it. The fix
+/// would be to reapply the override after `into_builder` (it is readable
+/// from the original error's recovery only indirectly), which requires
+/// either an accessor in `bifrost-types` or threading the override
+/// through - out of this crate's scope.
 fn restamp(err: AccountError, op: AccountOperation) -> AccountError {
     err.into_builder()
         .operation(op)
@@ -669,6 +784,9 @@ pub(crate) fn search_messages(
     request: SearchRequest,
 ) -> AccountFuture<Result<Page<ObjectId>, AccountError>> {
     Box::pin(async move {
+        if !account.capabilities.pim_methods.search_messages {
+            return Err(super::error::unsupported(AccountOperation::SearchMessages));
+        }
         let err = op_err(AccountOperation::SearchMessages);
         let plan = search_plan(&request)?;
         let mut messages = Vec::new();
@@ -1289,12 +1407,22 @@ fn combine_or(filters: &[SearchFilter]) -> Result<CriteriaPart, AccountError> {
         });
     }
     let mut parts = Vec::new();
-    let mut folder = None;
     for filter in filters {
         let part = criteria_from_filter(filter)?;
-        folder = merge_folder(folder, part.folder)?;
+        // A folder restriction (`In`) nested inside an `Or` cannot be
+        // expressed in a single-mailbox IMAP SEARCH: SEARCH runs against
+        // the currently-selected mailbox, so hoisting the `In` folder to
+        // the whole OR group would silently restrict the *other* OR
+        // branches to that folder too, changing the query's meaning. The
+        // AND case is defensible (the folder narrows the whole
+        // conjunction); the OR case is not, so reject it explicitly
+        // rather than leak the restriction.
+        if part.folder.is_some() {
+            return Err(or_folder_restriction_error());
+        }
         parts.push(part.criteria);
     }
+    let folder = None;
     let mut iter = parts.into_iter();
     let mut criteria = iter.next().unwrap_or_else(|| "ALL".to_owned());
     for next in iter {
@@ -1337,6 +1465,26 @@ fn merge_folder(
     }
 }
 
+/// A folder restriction (`SearchFilter::In`) nested inside an `Or` has no
+/// faithful single-mailbox IMAP SEARCH encoding (see `combine_or`).
+fn or_folder_restriction_error() -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("folder"),
+            message: Some(DiagnosticText::support_only(
+                "a folder restriction (In) inside an Or cannot be expressed as a \
+                 single-mailbox IMAP SEARCH; restructure the query so folder scoping \
+                 is not OR-ed with other criteria",
+            )),
+        }),
+    )
+    .protocol(Protocol::Imap)
+    .operation(AccountOperation::SearchMessages)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 fn empty_to_all(criteria: &str) -> String {
     let trimmed = criteria.trim();
     if trimmed.is_empty() {
@@ -1369,13 +1517,22 @@ fn search_folders(account: &ImapAccount, restriction: Option<&MailboxName>) -> V
     if let Some(folder) = restriction {
         return vec![folder.clone()];
     }
-    account
+    // `entries()` iterates a `HashMap`, so its order is not stable
+    // run-to-run. The multi-folder search cursor is a plain offset into
+    // the concatenated per-folder result list, so a nondeterministic
+    // folder order would make the same `page_cursor` resolve to a
+    // different slice on the next page request (dropped / duplicated
+    // results across pages). Sort by mailbox name so the concatenation
+    // order - and therefore the offset cursor - is stable.
+    let mut folders: Vec<MailboxName> = account
         .folders
         .entries()
         .into_iter()
         .filter(|entry| entry.selectable)
         .map(|entry| entry.name.clone())
-        .collect()
+        .collect();
+    folders.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    folders
 }
 
 fn page_from_items<T: Clone>(
@@ -1835,6 +1992,107 @@ body text\r\n";
             *err.kind(),
             AccountErrorKind::Request(RequestErrorKind::Malformed)
         );
+    }
+
+    #[test]
+    fn draft_send_preserves_non_utf8_body_bytes_verbatim() {
+        // An 8-bit / binary body octet (here 0xFF, invalid UTF-8) must
+        // survive byte-exact in the transmitted body. The previous
+        // `from_utf8_lossy` path turned it into U+FFFD (0xEF 0xBF 0xBD).
+        let mut raw = b"From: me@sender.test\r\nTo: ann@to.test\r\n\r\n".to_vec();
+        raw.extend_from_slice(&[0xFF, 0x00, 0xFE, b'\r', b'\n']);
+        let default_from = bifrost_types::Address::bare("fallback@sender.test");
+        let parsed = parse_draft_for_submission(&raw, &default_from).expect("parses");
+
+        // Body retains the verbatim 8-bit octets; no U+FFFD substitution.
+        assert!(parsed.body.ends_with(&[0xFF, 0x00, 0xFE, b'\r', b'\n']));
+        assert!(!parsed.body.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]));
+    }
+
+    #[test]
+    fn draft_send_bare_lf_split_and_strip_keeps_lf_endings() {
+        // A bare-LF draft (no CRLF) must split on `\n\n` and the rebuilt
+        // body must not gain a stray CRLF separator (no mixed endings).
+        let raw = b"From: me@sender.test\nTo: ann@to.test\nBcc: blind@bcc.test\n\nbody line\n";
+        let default_from = bifrost_types::Address::bare("fallback@sender.test");
+        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+
+        let body = parsed.body;
+        // Bcc folded into recipients.
+        assert!(
+            parsed
+                .envelope
+                .recipients
+                .iter()
+                .any(|a| a.address == "blind@bcc.test")
+        );
+        // No CRLF anywhere: the bare-LF draft stays bare-LF.
+        assert!(!body.windows(2).any(|w| w == b"\r\n"));
+        // Bcc header line is gone; To survives.
+        let text = String::from_utf8(body).expect("ascii");
+        assert!(!text.to_ascii_lowercase().contains("bcc:"));
+        assert!(text.contains("To: ann@to.test"));
+        assert!(text.contains("body line"));
+    }
+
+    #[test]
+    fn draft_send_header_only_draft_has_empty_body() {
+        // A header-only draft (no blank line, no body) is degenerate but
+        // recoverable: the split yields an empty body and the envelope is
+        // still built from the headers.
+        let raw = b"From: me@sender.test\r\nTo: ann@to.test\r\n";
+        let default_from = bifrost_types::Address::bare("fallback@sender.test");
+        let parsed = parse_draft_for_submission(raw, &default_from).expect("parses");
+        assert_eq!(parsed.envelope.recipients[0].address, "ann@to.test");
+        // Header block ends with CRLF + a synthesized blank line, then no body.
+        let text = String::from_utf8(parsed.body).expect("ascii");
+        assert!(text.contains("To: ann@to.test"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn split_header_body_handles_mixed_and_header_only() {
+        // CRLF blank line: header_end after `A: 1\r\nB: 2\r\n` (12),
+        // body_start after the second `\r\n` (14).
+        assert_eq!(split_header_body(b"A: 1\r\nB: 2\r\n\r\nbody"), (12, 14));
+        // Bare-LF blank line: header_end after `A: 1\nB: 2\n` (10),
+        // body_start after the second `\n` (11).
+        assert_eq!(split_header_body(b"A: 1\nB: 2\n\nbody"), (10, 11));
+        // No blank line: header-only.
+        let raw = b"A: 1\r\n";
+        assert_eq!(split_header_body(raw), (raw.len(), raw.len()));
+    }
+
+    #[test]
+    fn or_with_nested_in_folder_is_rejected() {
+        // An `In(folder)` nested inside an `Or` cannot be expressed as a
+        // single-mailbox IMAP SEARCH; reject rather than silently leak
+        // the folder restriction to the whole OR group.
+        use bifrost_types::search::SearchFilter;
+        let filter = SearchFilter::Or(vec![
+            SearchFilter::In(ContainerId("Archive".to_owned())),
+            SearchFilter::From("a@b.test".to_owned()),
+        ]);
+        let err = match criteria_from_filter(&filter) {
+            Err(err) => err,
+            Ok(_) => panic!("OR with In must be rejected"),
+        };
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+
+        // An `In` inside an `And` is still accepted (the folder narrows
+        // the whole conjunction - defensible).
+        let filter = SearchFilter::And(vec![
+            SearchFilter::In(ContainerId("Archive".to_owned())),
+            SearchFilter::From("a@b.test".to_owned()),
+        ]);
+        let part = match criteria_from_filter(&filter) {
+            Ok(part) => part,
+            Err(_) => panic!("AND with In is accepted"),
+        };
+        assert_eq!(part.folder.as_ref().map(MailboxName::as_str), Some("Archive"));
     }
 
     #[test]

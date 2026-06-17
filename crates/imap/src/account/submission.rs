@@ -244,11 +244,48 @@ impl SubmissionTransport {
             .send_raw_batch_with_options(Some(from), recipients, raw, &options)
             .await?;
 
-        // A single committed message either lands all recipients in the
-        // succeeded lane or surfaces per-recipient failures. Treat any
-        // non-succeeded recipient as the send error so the caller never
-        // reports a partial drop as success. The first failed/uncertain
-        // recipient's already-classified `AccountError` is authoritative.
+        // One shared DATA, three-lane per-recipient outcome. The
+        // `Err(_)`-means-nothing-transmitted boundary (error-model.md)
+        // governs what we may return: the IMAP send surface is
+        // `Result<(), _>` -> `Result<ObjectId, _>`, and the engine
+        // re-drives a non-idempotent `Send`/`DraftSend` on `Err`. So we
+        // must collapse to `Err` ONLY when the message reached no
+        // recipient at all. If any recipient landed in the succeeded
+        // lane, the body crossed the side-effect boundary; re-driving
+        // would double-deliver to those recipients. A partial send
+        // (recipient A delivered, B rejected on RCPT) is therefore an
+        // overall success at the send-commit boundary - the rejected
+        // recipients are logged for reconcile, never resent.
+        if !outcome.succeeded().is_empty() {
+            if let Some(failure) = outcome.failed().first() {
+                tracing::warn!(
+                    target: "bifrost_imap::send",
+                    delivered = outcome.succeeded().len(),
+                    rejected = outcome.failed().len(),
+                    uncertain = outcome.uncertain().len(),
+                    error = %failure.error,
+                    "partial submission: message committed to some recipients while \
+                     others were rejected; not re-driving (would double-deliver)"
+                );
+            } else if let Some(uncertain) = outcome.uncertain().first() {
+                tracing::warn!(
+                    target: "bifrost_imap::send",
+                    delivered = outcome.succeeded().len(),
+                    uncertain = outcome.uncertain().len(),
+                    error = %uncertain.error,
+                    "partial submission: message committed to some recipients while \
+                     others are uncertain; not re-driving (would double-deliver)"
+                );
+            }
+            return Ok(());
+        }
+
+        // Nothing succeeded. The whole message failed to reach any
+        // recipient, so `Err` (re-drive permitted) is correct. The first
+        // failed recipient's already-classified `AccountError` is
+        // authoritative; fall back to the uncertain lane (a transport
+        // drop after body carries `Reconcile(PartialCompletionSignal)`
+        // and stays a non-blind-retry).
         if let Some(failure) = outcome.failed().first() {
             return Err(failure.error.clone());
         }
