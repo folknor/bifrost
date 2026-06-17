@@ -79,6 +79,13 @@ const OID_ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04
 // 1.2.840.10045.4.1      ecdsa-with-SHA1
 const OID_ECDSA_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
 
+// Bare digest OIDs. A conforming X.509 `signatureAlgorithm` never carries a
+// bare digest OID (it carries a signature-with-digest OID such as those
+// above), so these arms cannot fire for a well-formed cert. We accept them
+// anyway as a deliberate leniency: mapping a bare digest to its hash family
+// is unambiguous and harmless, and rejecting it would be a needless
+// channel-binding failure on a marginally non-conforming peer. The
+// `signature_oid_maps_to_hash_family` test pins them for that reason.
 // 2.16.840.1.101.3.4.2.1 sha256 (bare)
 const OID_SHA256_BARE: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
 // 2.16.840.1.101.3.4.2.2 sha384 (bare)
@@ -376,5 +383,68 @@ mod tests {
         assert!(hash_family_for_oid(OID_ED25519).is_err());
         assert!(hash_family_for_oid(OID_ED448).is_err());
         assert!(hash_family_for_oid(&[0x2a, 0x03]).is_err());
+    }
+
+    // ---- DER long-form length path (`read_tlv`) ----------------------------
+    //
+    // The fixtures above all use short-form lengths. These exercise the
+    // multi-byte long-form length accumulation, the `num_len_bytes > 4`
+    // rejection, the indefinite-form (`0x80`) rejection, and that a long-form
+    // header advances `rest` past the full element.
+
+    #[test]
+    fn read_tlv_long_form_two_byte_length() {
+        // 0x82 => two length bytes follow; 0x01 0x00 == 256 content bytes.
+        let mut buf = vec![TAG_SEQUENCE, 0x82, 0x01, 0x00];
+        buf.extend(std::iter::repeat_n(0xAA, 256));
+        buf.extend_from_slice(&[0xFF, 0xFF]); // trailing bytes -> `rest`
+        let (tag, content, rest) = read_tlv(&buf).unwrap();
+        assert_eq!(tag, TAG_SEQUENCE);
+        assert_eq!(content.len(), 256);
+        assert!(content.iter().all(|&b| b == 0xAA));
+        assert_eq!(rest, &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn read_tlv_long_form_one_byte_length() {
+        // 0x81 => one length byte follows; 0x80 == 128 (> short-form max).
+        let mut buf = vec![TAG_OID, 0x81, 0x80];
+        buf.extend(std::iter::repeat_n(0x11, 128));
+        let (tag, content, rest) = read_tlv(&buf).unwrap();
+        assert_eq!(tag, TAG_OID);
+        assert_eq!(content.len(), 128);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn read_tlv_indefinite_form_is_rejected() {
+        // 0x80 is the indefinite form, invalid in DER.
+        let buf = [TAG_SEQUENCE, 0x80, 0x00, 0x00];
+        let err = read_tlv(&buf).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_tlv_more_than_four_length_bytes_is_rejected() {
+        // 0x85 => five length bytes; rejected before any narrowing.
+        let buf = [TAG_SEQUENCE, 0x85, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let err = read_tlv(&buf).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_tlv_long_form_length_overruns_buffer() {
+        // 0x82 declares 256 content bytes but the buffer is short -> truncation.
+        let buf = [TAG_SEQUENCE, 0x82, 0x01, 0x00, 0xAA, 0xAA];
+        let err = read_tlv(&buf).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_tlv_truncated_long_form_length_field() {
+        // 0x83 promises three length bytes but only one is present.
+        let buf = [TAG_SEQUENCE, 0x83, 0x01];
+        let err = read_tlv(&buf).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
     }
 }

@@ -6,6 +6,13 @@
 use crate::error::SaslError;
 use crate::secret::Secret;
 
+/// Upper bound on the SCRAM `i=` iteration count fed to PBKDF2. RFC 7677 sets
+/// the floor at 4096; this ceiling sits far above any legitimate deployment
+/// (real-world values run 4k-600k) while keeping a single PBKDF2 run bounded so
+/// a hostile/misconfigured peer cannot pin a core. 100,000,000 SHA-256 PBKDF2
+/// rounds is already seconds of work; anything beyond is treated as an attack.
+const MAX_SCRAM_ITERATIONS: u32 = 100_000_000;
+
 /// The hash function backing a SCRAM mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -121,7 +128,11 @@ pub fn scram_client_final(
     }
     let server_nonce = scram_field(server_first, 'r')
         .ok_or_else(|| SaslError::Protocol("SCRAM server-first message missing nonce".into()))?;
-    if !server_nonce.starts_with(client_nonce) {
+    // RFC 5802: the server-nonce (`r=`) is the client nonce with server-supplied
+    // bytes appended, so it must STRICTLY extend the client nonce. An equal
+    // nonce means the server contributed zero entropy (malformed or replayed
+    // server-first); reject it.
+    if !server_nonce.starts_with(client_nonce) || server_nonce.len() <= client_nonce.len() {
         return Err(SaslError::Protocol(
             "SCRAM server nonce does not extend client nonce".into(),
         ));
@@ -141,6 +152,18 @@ pub fn scram_client_final(
         return Err(SaslError::Protocol(
             "SCRAM iteration count must be greater than zero".into(),
         ));
+    }
+    // RFC 7677 mandates a minimum of 4096 and notes the count should stay within
+    // reason; an unbounded `i=` is a CPU DoS, since the value flows straight into
+    // PBKDF2. A hostile/misconfigured peer sending `i=4000000000` would pin a
+    // core for minutes per attempt. Cap at a generous ceiling well above any
+    // legitimate deployment (current real-world values are 4k-600k). Capping
+    // here also protects the IMAP driver, which passes the value through
+    // uncapped.
+    if iterations > MAX_SCRAM_ITERATIONS {
+        return Err(SaslError::Protocol(format!(
+            "SCRAM iteration count {iterations} exceeds the maximum of {MAX_SCRAM_ITERATIONS}"
+        )));
     }
 
     // RFC 5802 Section 6: the `c=` attribute is base64(gs2-header || cbind-data).
@@ -186,7 +209,10 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
     let actual = base64::engine::general_purpose::STANDARD
         .decode(verifier)
         .map_err(|e| SaslError::Protocol(format!("invalid SCRAM server verifier: {e}")))?;
-    if actual != expected_signature {
+    // `actual` is the attacker-controllable `v=` field; compare in constant
+    // time so a MITM cannot use a timing oracle to forge the server signature
+    // and impersonate the server. Matches the proof compare in `secret.rs`.
+    if !constant_time_eq(&actual, expected_signature) {
         return Err(SaslError::Protocol(
             "SCRAM server signature verification failed".into(),
         ));
@@ -194,10 +220,29 @@ pub fn verify_server_final(server_final: &str, expected_signature: &[u8]) -> Res
     Ok(())
 }
 
+/// Constant-time byte-slice equality. Folds the length difference and every
+/// byte XOR into one accumulator, so the comparison time does not depend on
+/// where (or whether) the slices first differ. Leaks `max(len)`, which is not
+/// secret here (the signature length is fixed by the hash).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    for index in 0..max_len {
+        let lhs = a.get(index).copied().unwrap_or(0);
+        let rhs = b.get(index).copied().unwrap_or(0);
+        diff |= usize::from(lhs ^ rhs);
+    }
+    diff == 0
+}
+
 fn scram_field(message: &str, key: char) -> Option<&str> {
-    message
-        .split(',')
-        .find_map(|field| field.strip_prefix(&format!("{key}=")))
+    // Match `<key>=` without rebuilding a `format!("{key}=")` String on every
+    // call (4-5 lookups per message). Strip the single `key` char, then the `=`.
+    message.split(',').find_map(|field| {
+        field
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+    })
 }
 
 fn scram_proof_and_server_signature(
@@ -372,6 +417,76 @@ mod tests {
             ScramChannelBinding::TlsServerEndPoint(vec![0x01]).binding(),
             ChannelBinding::TlsServerEndPoint
         );
+    }
+
+    #[test]
+    fn scram_rejects_iteration_count_above_ceiling() {
+        let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
+        let client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
+        // i= one above the ceiling; must be rejected before PBKDF2 runs.
+        let i = u64::from(MAX_SCRAM_ITERATIONS) + 1;
+        let server_first = format!(
+            "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i={i}"
+        );
+        let err = scram_client_final(
+            ScramHash::Sha256,
+            "pencil",
+            client_nonce,
+            client_first_bare,
+            &server_first,
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn scram_rejects_server_nonce_equal_to_client_nonce() {
+        let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
+        let client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
+        // server-nonce == client-nonce: server contributed no entropy.
+        let server_first = "r=fyko+d2lbbFgONRv9qkxdawL,s=QSXCR+Q6sek8bf92,i=4096";
+        let err = scram_client_final(
+            ScramHash::Sha1,
+            "pencil",
+            client_nonce,
+            client_first_bare,
+            server_first,
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_server_final_accepts_matching_signature() {
+        use base64::Engine;
+        let sig = vec![0x01, 0x02, 0x03, 0x04];
+        let server_final = format!(
+            "v={}",
+            base64::engine::general_purpose::STANDARD.encode(&sig)
+        );
+        assert!(verify_server_final(&server_final, &sig).is_ok());
+    }
+
+    #[test]
+    fn verify_server_final_rejects_mismatched_signature_as_protocol() {
+        use base64::Engine;
+        let actual = vec![0x01, 0x02, 0x03, 0x04];
+        let expected = vec![0x01, 0x02, 0x03, 0x05];
+        let server_final = format!(
+            "v={}",
+            base64::engine::general_purpose::STANDARD.encode(&actual)
+        );
+        // Signature mismatch is a protocol-class failure, not AuthFailed.
+        let err = verify_server_final(&server_final, &expected).unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_server_final_surfaces_server_error_as_auth_failed() {
+        let err = verify_server_final("e=invalid-proof", &[0x00]).unwrap_err();
+        assert!(matches!(err, SaslError::AuthFailed(_)), "got {err:?}");
     }
 
     #[test]

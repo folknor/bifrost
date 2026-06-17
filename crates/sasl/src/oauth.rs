@@ -8,11 +8,32 @@
 
 use crate::Secret;
 
+/// Strip the `\x01` (SOH) frame delimiter from an interpolated OAuth field.
+///
+/// XOAUTH2 and OAUTHBEARER delimit attributes with `\x01`, so an embedded
+/// `\x01` in `user` / `identity` / token would desync the frame and let a
+/// caller inject extra attributes. Legitimate values never contain `\x01`
+/// (tokens are base64url/JWT, identities are email-shaped), so removing it is
+/// lossless for real input and closes the injection surface. The builders keep
+/// their infallible `-> Secret` signature (the consumers in IMAP/SMTP use the
+/// payload inline), so this defends rather than erroring.
+fn strip_frame_delim(field: &str) -> std::borrow::Cow<'_, str> {
+    if field.contains('\x01') {
+        std::borrow::Cow::Owned(field.replace('\x01', ""))
+    } else {
+        std::borrow::Cow::Borrowed(field)
+    }
+}
+
 /// XOAUTH2 client payload: `user=<user>\x01auth=Bearer <token>\x01\x01`.
 ///
 /// XOAUTH2 has no GS2 framing, so neither field is GS2-escaped. The
-/// `\x01`-delimited frame is byte-literal.
+/// `\x01`-delimited frame is byte-literal; any `\x01` embedded in `user` or
+/// `access_token` is stripped first (see [`strip_frame_delim`]) so it cannot
+/// desync the frame.
 pub fn xoauth2_payload(user: &str, access_token: &str) -> Secret {
+    let user = strip_frame_delim(user);
+    let access_token = strip_frame_delim(access_token);
     Secret::from(format!("user={user}\x01auth=Bearer {access_token}\x01\x01"))
 }
 
@@ -24,7 +45,10 @@ pub fn xoauth2_payload(user: &str, access_token: &str) -> Secret {
 /// attributes are deliberately omitted: bearer auth does not require them and
 /// omitting them keeps the builder transport-agnostic.
 pub fn oauthbearer_payload(identity: &str, access_token: &str) -> Secret {
-    let identity = crate::escape_username(identity);
+    // `escape_username` handles the GS2 `=`/`,` escapes but not `\x01`; strip the
+    // frame delimiter from both fields so neither can inject extra attributes.
+    let identity = crate::escape_username(&strip_frame_delim(identity));
+    let access_token = strip_frame_delim(access_token);
     Secret::from(format!(
         "n,a={identity},\x01auth=Bearer {access_token}\x01\x01"
     ))
@@ -64,6 +88,26 @@ mod tests {
         );
         assert!(!payload.as_str().contains("\x01host="));
         assert!(!payload.as_str().contains("\x01port="));
+    }
+
+    #[test]
+    fn xoauth2_payload_strips_embedded_frame_delimiter() {
+        // An embedded \x01 in either field must not survive into the frame.
+        let payload = xoauth2_payload("user\x01auth=Bearer evil", "tok\x01en");
+        assert_eq!(
+            payload.as_str(),
+            "user=userauth=Bearer evil\x01auth=Bearer token\x01\x01"
+        );
+        // Three structural \x01 (the user/auth separator plus the two trailing
+        // delimiters); none injected from the field contents.
+        assert_eq!(payload.as_str().matches('\x01').count(), 3);
+    }
+
+    #[test]
+    fn oauthbearer_payload_strips_embedded_frame_delimiter() {
+        let payload = oauthbearer_payload("id\x01entity", "tok\x01en");
+        assert_eq!(payload.as_str(), "n,a=identity,\x01auth=Bearer token\x01\x01");
+        assert_eq!(payload.as_str().matches('\x01').count(), 3);
     }
 
     #[test]
