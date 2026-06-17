@@ -20,16 +20,6 @@ use crate::{CardDavConfig, CardDavCredentials};
 const DAV_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 const MULTIGET_BATCH_SIZE: usize = 50;
 
-/// Redirect hop cap shared by both DAV crates. `bifrost-net` owns a
-/// hardened method-aware redirect loop (trusted-host allowlist, hop
-/// count, cross-host `Authorization` stripping), but the DAV clients run
-/// their own bare `reqwest::Client` and do not route through it; routing
-/// them through `bifrost-net` is a cross-crate migration tracked as a
-/// follow-up. Until then both DAV crates agree on this hop count and both
-/// enforce a base-host allowlist (see `dav_redirect_policy`) rather than
-/// silently disagreeing (10 vs 5) and following arbitrary cross-host hops.
-const DAV_MAX_REDIRECTS: usize = 5;
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PutCondition<'a> {
     IfNoneMatch,
@@ -46,11 +36,8 @@ pub(crate) struct CardDavClient {
 
 impl CardDavClient {
     pub(crate) fn new(config: &CardDavConfig) -> Result<Self, AccountError> {
-        let trusted_host = Url::parse(config.base_url.trim_end_matches('/'))
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
         let http = reqwest::Client::builder()
-            .redirect(dav_redirect_policy(trusted_host))
+            .redirect(dav_redirect_policy(&config.base_url))
             .timeout(DAV_CLIENT_TIMEOUT)
             .build()
             .map_err(|error| local_error(AccountOperation::Discover, error.to_string()))?;
@@ -409,24 +396,23 @@ impl CardDavClient {
     }
 }
 
-/// Hardened redirect policy for the DAV `reqwest::Client`: cap at
-/// `DAV_MAX_REDIRECTS` hops and refuse any cross-host redirect whose host
-/// differs from the configured base URL's host (case-insensitive). When
-/// the base URL has no parseable host the allowlist cannot be enforced, so
-/// the policy degrades to a hop cap only - matching reqwest's own
-/// cross-origin `Authorization` stripping, which still applies.
-fn dav_redirect_policy(trusted_host: Option<String>) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= DAV_MAX_REDIRECTS {
-            return attempt.error("too many redirects");
-        }
-        if let Some(host) = trusted_host.as_deref()
-            && attempt.url().host_str().map(str::to_ascii_lowercase).as_deref() != Some(host)
-        {
-            return attempt.stop();
-        }
-        attempt.follow()
-    })
+/// Hardened redirect policy for the DAV `reqwest::Client`, sourced from
+/// `bifrost-net`'s single source of truth. The hop cap and the
+/// case-insensitive host allowlist check both live in
+/// `RedirectPolicy::reqwest_policy`; here we only seed the allowlist with
+/// the configured base URL's host so cross-host redirects are stopped.
+/// When the base URL has no parseable host the allowlist stays empty and
+/// the policy degrades to a hop cap only - reqwest's own cross-origin
+/// `Authorization` stripping still applies regardless.
+fn dav_redirect_policy(base_url: &str) -> reqwest::redirect::Policy {
+    let mut policy = bifrost_net::RedirectPolicy::default();
+    if let Some(host) = Url::parse(base_url.trim_end_matches('/'))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        policy = policy.trust_host(host);
+    }
+    policy.reqwest_policy()
 }
 
 fn escape_xml(value: &str) -> String {

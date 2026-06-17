@@ -343,6 +343,25 @@ chain; `Error::RedirectLoop` surfaces past it. Each redirect hop
 resets the retry counter to 0 - hops are fresh logical requests,
 not retries.
 
+`RedirectPolicy::reqwest_policy()` is the bare-client entry point for
+callers that build their own `reqwest::Client` instead of routing
+through the pipeline (the CalDAV / CardDAV clients). It returns a
+`reqwest::redirect::Policy::custom` whose follow / stop / error
+decision is driven by the same `max_hops` (default 10) and the same
+case-insensitive `allows_host` allowlist check the pipeline's
+`classify_redirect` uses, so the redirect-hardening rule lives in
+exactly one place. A reqwest `Policy` can only decide follow / stop /
+error - it cannot rewrite methods or strip headers; cross-origin
+`Authorization` stripping is reqwest's own default and applies
+regardless, and the method-rewriting / explicit auth-strip in the
+pipeline are not part of this bare-client path. A hop outside the
+allowlist is stopped (the 3xx surfaces as a terminal status);
+exceeding `max_hops` errors. The DAV crates seed a single-host
+allowlist (their configured base host) and call this; they previously
+duplicated the hop-cap + allowlist logic locally (`dav_redirect_policy`
++ a `DAV_MAX_REDIRECTS = 5` const) - both are deleted and the DAV hop
+cap now follows bifrost-net's 10.
+
 `FollowRedirects::Disabled` skips the loop entirely; 3xx surfaces
 to the caller exactly as it did before the loop landed. The
 `NetConfig::follow_redirects(policy)` and

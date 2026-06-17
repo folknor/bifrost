@@ -121,6 +121,43 @@ impl RedirectPolicy {
         }
         self.trusted_hosts.contains(&host.to_ascii_lowercase())
     }
+
+    /// Build a `reqwest::redirect::Policy` enforcing this policy's hop
+    /// cap and trusted-host allowlist for callers that build their own
+    /// `reqwest::Client` rather than routing through `bifrost-net`'s
+    /// request pipeline (the CalDAV / CardDAV clients). This is the
+    /// single source of truth for redirect hardening: the same
+    /// `max_hops` constant and the same case-insensitive host
+    /// allowlist (`allows_host`) the pipeline's `classify_redirect`
+    /// uses internally drive the follow / stop decision here too, so
+    /// the rule lives in exactly one place.
+    ///
+    /// A `reqwest::redirect::Policy` can only decide follow / stop /
+    /// error - it cannot rewrite methods or strip headers. Cross-origin
+    /// `Authorization` stripping is reqwest's own default and applies
+    /// regardless; the method-rewriting and explicit auth-strip in the
+    /// `bifrost-net` pipeline are out of scope for this bare-client
+    /// path.
+    ///
+    /// A hop whose target host is outside the allowlist is stopped (the
+    /// 3xx surfaces to the caller as a terminal status) rather than
+    /// followed; exceeding `max_hops` errors the request.
+    #[must_use]
+    pub fn reqwest_policy(&self) -> reqwest::redirect::Policy {
+        let max_hops = usize::from(self.max_hops);
+        let policy = self.clone();
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_hops {
+                return attempt.error("too many redirects");
+            }
+            let host = attempt.url().host_str().unwrap_or("");
+            if policy.allows_host(host) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        })
+    }
 }
 
 /// Result of `classify_redirect`: what to do on a 3xx response.
@@ -297,6 +334,43 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_str(value).expect("valid header"));
         h
+    }
+
+    #[test]
+    fn reqwest_policy_same_host_mixed_case_follows() {
+        // The bare-client `reqwest_policy` follow/stop decision is driven
+        // by `allows_host` (case-insensitive) and the hop cap. reqwest
+        // does not expose an `Attempt` constructor, so pin the decision
+        // inputs directly: a mixed-case same-host hop is allowed (follow).
+        let policy = RedirectPolicy::default().trust_host("dav.example");
+        assert!(policy.allows_host("DAV.Example"));
+        // Smoke-check the builder constructs without panicking.
+        let _ = policy.reqwest_policy();
+    }
+
+    #[test]
+    fn reqwest_policy_different_host_stops() {
+        // A hop to a host outside the allowlist is not allowed (stop).
+        let policy = RedirectPolicy::default().trust_host("dav.example");
+        assert!(!policy.allows_host("evil.example"));
+    }
+
+    #[test]
+    fn reqwest_policy_empty_allowlist_follows_any_host() {
+        // An empty allowlist accepts every host; the hop cap is the only
+        // limit then.
+        let policy = RedirectPolicy::with_hops(5);
+        assert!(policy.allows_host("anything.example"));
+        assert_eq!(policy.max_hops, 5);
+    }
+
+    #[test]
+    fn reqwest_policy_hop_cap_uses_max_hops() {
+        // The reqwest policy errors once `previous().len() >= max_hops`;
+        // pin that the cap it reads is the policy's own `max_hops` (the
+        // single source the pipeline shares), default 10.
+        assert_eq!(RedirectPolicy::default().max_hops, 10);
+        let _ = RedirectPolicy::default().reqwest_policy();
     }
 
     #[test]
