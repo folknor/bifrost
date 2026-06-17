@@ -137,6 +137,32 @@ pub(crate) fn restart_scope_error(scope: CursorScope, operation: AccountOperatio
     .expect("valid account error classification")
 }
 
+/// Synthesize an `AccountError` for an engine-level re-establishment
+/// failure that has no `AccountError` of its own (`EstablishCursorFailed`,
+/// `CheckpointStore`, and the other non-`Account` `engine::Error`
+/// variants surfaced from `run_establish`). Without this, a scope that
+/// exhausts its reopen budget on purely engine-level errors would
+/// broadcast no `SyncEvent::Terminated` - only the operator warning -
+/// violating the documented "after three failures broadcast
+/// `Terminated(last_error)`" contract. Classified as
+/// `SyncState(CursorInvalid)` (the engine could not establish or persist
+/// the scope's cursor); the carried scope lets consumers route the
+/// termination to the affected scope.
+#[must_use]
+pub(crate) fn establish_failure_error(
+    scope: CursorScope,
+    operation: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        Cause::State(StateCause::CursorInvalid),
+    )
+    .scope(ErrorScope::Cursor(scope))
+    .operation(operation)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Translate a cursor envelope schema mismatch into an `AccountError`
 /// whose recovery derives to `Engine(SchemaIncompatible)`. Producers
 /// (specifically the cursor envelope decoder) hit this path when the

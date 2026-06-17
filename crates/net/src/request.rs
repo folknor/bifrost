@@ -539,8 +539,16 @@ pub(crate) async fn send_streaming_inner(
                         RedirectAction::PassThrough => {
                             // Build an empty byte stream so downstream
                             // unwrap paths (e.g. send().drain) still
-                            // work; 304/305/306 carry no body the
-                            // caller cares about.
+                            // work. 304/305/306 carry no body the caller
+                            // cares about. This arm also covers a
+                            // followed-redirect status whose `Location`
+                            // is absent (notably Google Drive's `308
+                            // Resume Incomplete`): the consumer reads only
+                            // the status + headers (`Range`), so the
+                            // passed-through body is intentionally
+                            // discarded here. If a future passthrough
+                            // shape needs its body, classify_redirect must
+                            // stop folding it into PassThrough.
                             let empty: futures::stream::Empty<Result<Bytes, Error>> =
                                 futures::stream::empty();
                             return Ok(InternalStreaming {

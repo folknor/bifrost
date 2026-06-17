@@ -109,8 +109,8 @@ feeds the per-account meter and the bandwidth-cap throttle.
   `httpdate`), capped by `policy.honor_retry_after_cap` (single
   source of truth). Without `Retry-After`: exponential backoff
   with **proportional** jitter (0..capped), capped at
-  `policy.max_backoff`. Jitter is taken from an `Instant`-based
-  process-start delta, not `SystemTime::now`, so a clock jump
+  `policy.max_backoff`. Jitter entropy comes from the workspace
+  UUID RNG (`Uuid::new_v4`), not `SystemTime::now`, so a clock jump
   cannot influence the wait.
 - 429 -> same retry path; `Retry-After` honored.
 - Network / timeout / decode errors -> retry if

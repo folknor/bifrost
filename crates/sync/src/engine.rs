@@ -1997,7 +1997,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
                         account = ?ctx.account_id,
                         scope = ?scope,
                         error = %err,
-                        "RestartScope: membership refresh failed"
+                        "scope re-establishment: membership refresh failed"
                     );
                 }
                 return;
@@ -2010,7 +2010,7 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
                     attempt,
                     kind = ?err.kind(),
                     message_key = err.message_key(),
-                    "RestartScope: re-establishment failed"
+                    "scope re-establishment failed"
                 );
                 last_account_error = Some(err);
             }
@@ -2021,8 +2021,18 @@ async fn re_establish_scope_with_backoff(ctx: &RecoveryContext<'_>, scope: Curso
                     scope = ?scope,
                     attempt,
                     error = %err,
-                    "RestartScope: re-establishment failed (engine error)"
+                    "scope re-establishment failed (engine error)"
                 );
+                // Engine-level errors (EstablishCursorFailed,
+                // CheckpointStore, ...) carry no AccountError of their
+                // own. Synthesize one so a budget exhausted entirely on
+                // engine-level failures still broadcasts
+                // SyncEvent::Terminated, per the documented contract,
+                // rather than emitting only the operator warning.
+                last_account_error = Some(crate::recovery::establish_failure_error(
+                    scope.clone(),
+                    bifrost_types::AccountOperation::EstablishCursor,
+                ));
             }
         }
     }
@@ -2111,14 +2121,13 @@ fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
 }
 
 fn jittered(base: Duration) -> Duration {
-    // Deterministic-pseudo-random ±20% jitter using nanosecond-time
-    // entropy so we don't pull in `rand`. Falls back to the base
-    // duration on clock failure.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let percent_offset = i64::from(nanos % 401) - 200; // [-200, +200] basis points
+    // ±20% jitter to break thundering-herd reopen lockstep. Entropy
+    // comes from the workspace UUID RNG (the same source bifrost-net's
+    // backoff uses) rather than `SystemTime::now()`: a wall-clock jump
+    // or low-resolution clock must not influence the jitter, and a
+    // clock running backwards would otherwise collapse the spread.
+    let entropy = i64::try_from(uuid::Uuid::new_v4().as_u128() % 401).unwrap_or(0);
+    let percent_offset = entropy - 200; // [-200, +200] basis points
     let base_ms = i64::try_from(base.as_millis()).unwrap_or(i64::MAX);
     let delta_ms = (base_ms * percent_offset) / 1_000;
     let total = u64::try_from((base_ms + delta_ms).max(0)).unwrap_or(0);
@@ -2361,6 +2370,32 @@ fn counters_from_outcomes(
 mod tests {
     use super::scope_covers_membership;
     use bifrost_types::{CursorScope, FolderId, MembershipScope, ObjectType};
+
+    #[test]
+    fn jittered_stays_within_plus_minus_20_percent() {
+        use super::jittered;
+        use std::time::Duration;
+        // Entropy comes from a fresh UUID per call; sample enough draws
+        // that the ±20% envelope is exercised without depending on the
+        // clock. The math must keep every draw inside [0.8x, 1.2x].
+        let base = Duration::from_millis(1_000);
+        let lo = Duration::from_millis(800);
+        let hi = Duration::from_millis(1_200);
+        for _ in 0..10_000 {
+            let j = jittered(base);
+            assert!(
+                j >= lo && j <= hi,
+                "jitter {j:?} outside ±20% of {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_zero_base_is_zero() {
+        use super::jittered;
+        use std::time::Duration;
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    }
 
     #[test]
     fn folder_type_scope_covers_matching_mailbox_membership() {

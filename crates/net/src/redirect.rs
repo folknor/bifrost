@@ -208,7 +208,7 @@ pub(crate) fn classify_redirect(
     };
     let location_str = location_to_str(location)?;
     let next_url = resolve_location(prior_url, &location_str)?;
-    let cross_host = next_url.host_str() != prior_url.host_str();
+    let cross_host = !same_origin(prior_url, &next_url);
 
     // RFC 7231 §6.4: 301 / 302 / 303 rewrite to GET when the prior
     // method is non-safe. 307 / 308 preserve method+body. The rewrite
@@ -250,6 +250,29 @@ fn location_to_str(value: &HeaderValue) -> Result<String, Error> {
             kind: MalformedRedirectKind::InvalidLocationEncoding,
             message: format!("Location header was not valid UTF-8: {e}"),
         })
+}
+
+/// Same-origin test for the redirect hop's `keep_auth` decision.
+///
+/// HTTP hosts are case-insensitive (RFC 3986 §3.2.2), so a mixed-case
+/// redirect back to the same host must NOT be treated as cross-host -
+/// otherwise a valid same-host hop needlessly strips `Authorization`
+/// and can be rejected by a populated trusted-host allowlist.
+///
+/// Port is part of the origin (RFC 6454): a redirect that changes only
+/// the port (`host:443` -> `host:8443`) IS cross-origin and must strip
+/// credentials. `port_or_known_default` collapses the scheme's implicit
+/// port (e.g. `https` -> 443) so `https://h/` and `https://h:443/`
+/// compare equal. Scheme itself is not compared here because the
+/// pipeline only ever issues `https`; a scheme downgrade is a separate
+/// concern not reachable through this loop.
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    let host_eq = match (a.host_str(), b.host_str()) {
+        (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
+        (None, None) => true,
+        _ => false,
+    };
+    host_eq && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// Resolve `location` against `base`. Handles absolute URLs and
@@ -379,6 +402,98 @@ mod tests {
         )
         .expect("listed host admitted");
         assert!(matches!(action, RedirectAction::Follow(_)));
+    }
+
+    #[test]
+    fn mixed_case_same_host_keeps_auth_and_is_not_cross_host() {
+        // A redirect back to the same host with different letter case is
+        // NOT cross-host: HTTP hosts are case-insensitive (RFC 3986
+        // §3.2.2). Treating it as cross-host would needlessly strip the
+        // bearer and could trip a populated allowlist.
+        let policy = RedirectPolicy::default();
+        let h = header(LOCATION, "https://A.Example/next");
+        let action = classify_redirect(
+            &policy,
+            &Method::POST,
+            &url("https://a.example/"),
+            StatusCode::TEMPORARY_REDIRECT,
+            &h,
+        )
+        .expect("same-host mixed-case 307 should classify");
+        let step = match action {
+            RedirectAction::Follow(s) => s,
+            RedirectAction::PassThrough => panic!("expected follow"),
+        };
+        assert!(
+            step.keep_auth,
+            "mixed-case same host must be treated as same-origin"
+        );
+    }
+
+    #[test]
+    fn mixed_case_same_host_admitted_by_allowlist() {
+        // With a populated allowlist, a mixed-case same-host hop must not
+        // be rejected as a foreign host.
+        let policy = RedirectPolicy::default().trust_host("a.example");
+        let h = header(LOCATION, "https://A.EXAMPLE/next");
+        let action = classify_redirect(
+            &policy,
+            &Method::POST,
+            &url("https://a.example/"),
+            StatusCode::TEMPORARY_REDIRECT,
+            &h,
+        )
+        .expect("mixed-case same host must be admitted by the allowlist");
+        assert!(matches!(action, RedirectAction::Follow(_)));
+    }
+
+    #[test]
+    fn different_port_same_host_is_cross_origin_and_strips_auth() {
+        // Port is part of the origin (RFC 6454): a redirect that only
+        // changes the port crosses an origin boundary and must strip
+        // credentials.
+        let policy = RedirectPolicy::default();
+        let h = header(LOCATION, "https://a.example:8443/next");
+        let action = classify_redirect(
+            &policy,
+            &Method::POST,
+            &url("https://a.example/"),
+            StatusCode::TEMPORARY_REDIRECT,
+            &h,
+        )
+        .expect("different-port 307 should classify");
+        let step = match action {
+            RedirectAction::Follow(s) => s,
+            RedirectAction::PassThrough => panic!("expected follow"),
+        };
+        assert!(
+            !step.keep_auth,
+            "a different-port hop is cross-origin and must strip auth"
+        );
+    }
+
+    #[test]
+    fn implicit_and_explicit_default_port_are_same_origin() {
+        // `https://h/` and `https://h:443/` are the same origin; the
+        // implicit default port must not be treated as a port change.
+        let policy = RedirectPolicy::default();
+        let h = header(LOCATION, "https://a.example:443/next");
+        let action = classify_redirect(
+            &policy,
+            &Method::POST,
+            &url("https://a.example/"),
+            StatusCode::TEMPORARY_REDIRECT,
+            &h,
+        )
+        .expect("explicit default port 307 should classify");
+        let step = match action {
+            RedirectAction::Follow(s) => s,
+            RedirectAction::PassThrough => panic!("expected follow"),
+        };
+        assert!(
+            step.keep_auth,
+            "explicit :443 equals implicit https default port"
+        );
     }
 
     #[test]
