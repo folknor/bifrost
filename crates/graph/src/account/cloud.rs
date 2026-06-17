@@ -13,6 +13,14 @@
 //! uses a neutral, consumer-agnostic `"Attachments"` folder. A future
 //! consumer-configurable folder name can replace `ATTACHMENTS_FOLDER` without
 //! touching the wire path.
+//!
+//! Mailbox routing: hosting always uploads into the *primary* user's OneDrive
+//! (`account.client`, the `/me/drive` prefix), even when the draft being
+//! composed belongs to a shared/delegate mailbox (`send_as`). This is
+//! deliberate - a shared Exchange mailbox has no OneDrive of its own, and the
+//! attachment is shared via a link rather than embedded, so the authenticated
+//! user's drive is the only sensible host. The recipient sees a link, not a
+//! drive location, so the hosting mailbox is invisible downstream.
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, CloudUploadMeta, HostedAttachment, ShareScope,
@@ -66,6 +74,35 @@ struct DriveItemResponse {
     id: String,
 }
 
+/// The 202 Accepted body OneDrive returns mid-upload. `nextExpectedRanges`
+/// is a list of `"start-end"` (or `"start-"`) byte ranges the server still
+/// wants; the first range's start is the authoritative resume offset. The
+/// server may accept fewer bytes than were sent (it is allowed to), so the
+/// client must resume from the server's reported offset rather than blindly
+/// advancing to the end of the chunk it just PUT.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadProgress {
+    #[serde(default)]
+    next_expected_ranges: Vec<String>,
+}
+
+impl UploadProgress {
+    /// The server's authoritative resume offset: the start of the first
+    /// still-expected range. `None` if the body had no parseable range.
+    fn resume_offset(&self) -> Option<usize> {
+        self.next_expected_ranges
+            .first()
+            .and_then(|range| range.split('-').next())
+            .and_then(|start| start.trim().parse::<usize>().ok())
+    }
+}
+
+/// Overall wall-clock budget for the whole chunked upload. A server that
+/// keeps returning 202 (or hangs) without ever completing must not stall
+/// the send pipeline indefinitely.
+const UPLOAD_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Response from creating a sharing link.
 #[derive(Debug, Deserialize)]
 struct CreateLinkResponse {
@@ -118,8 +155,14 @@ async fn upload_and_link(
 ) -> Result<HostedAttachment, GraphError> {
     let client = &account.client;
     let session = create_upload_session(client, &meta.file_name).await?;
-    let item_id =
-        upload_file_chunked(client, &session.upload_url, bytes, DEFAULT_CHUNK_SIZE).await?;
+    let item_id = upload_file_chunked(
+        client,
+        &session.upload_url,
+        bytes,
+        DEFAULT_CHUNK_SIZE,
+        &account.shutdown,
+    )
+    .await?;
     let share_url = create_sharing_link(client, &item_id, meta.scope).await?;
 
     Ok(HostedAttachment::new(share_url, item_id))
@@ -148,23 +191,50 @@ async fn create_upload_session(
 /// pre-authenticated session URL.
 ///
 /// 200/201 -> the final chunk was accepted; parse the drive item id. 202 ->
-/// advance `offset = end` (correct: 202 acknowledges the bytes just sent). Any
-/// other status -> classified error. OneDrive's 202 resume signal never enters
-/// bifrost-net's redirect path, so the Drive-specific 308 passthrough does not
-/// apply here.
+/// the server reports the next byte range it expects via `nextExpectedRanges`;
+/// resume from that offset (the server may accept fewer bytes than were sent,
+/// so blindly advancing `offset = end` can skip unaccepted bytes and corrupt
+/// the upload). Any other status -> classified error. OneDrive's 202 resume
+/// signal never enters bifrost-net's redirect path, so the Drive-specific 308
+/// passthrough does not apply here. The whole loop is bounded by
+/// `UPLOAD_TOTAL_TIMEOUT` and aborts if the account shutdown token fires.
 async fn upload_file_chunked(
     client: &GraphClient,
     upload_url: &str,
     data: Bytes,
     chunk_size: usize,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<String, GraphError> {
     // Defensive guard over the caller-supplied chunk size; the sole caller
-    // passes the `DEFAULT_CHUNK_SIZE` constant, so this never fires at runtime.
-    assert!(
+    // passes the `DEFAULT_CHUNK_SIZE` constant, so this is a producer-bug
+    // check, not a runtime path - a `debug_assert` keeps it out of release.
+    debug_assert!(
         chunk_size != 0 && chunk_size.is_multiple_of(CHUNK_ALIGNMENT),
         "chunk_size must be a positive multiple of {CHUNK_ALIGNMENT}, got {chunk_size}"
     );
 
+    tokio::select! {
+        () = shutdown.cancelled() => Err(shutdown_during_upload()),
+        result = tokio::time::timeout(
+            UPLOAD_TOTAL_TIMEOUT,
+            upload_chunks(client, upload_url, data, chunk_size, shutdown),
+        ) => match result {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(malformed_response(format!(
+                "OneDrive upload exceeded the {}s budget without completing",
+                UPLOAD_TOTAL_TIMEOUT.as_secs()
+            ))),
+        },
+    }
+}
+
+async fn upload_chunks(
+    client: &GraphClient,
+    upload_url: &str,
+    data: Bytes,
+    chunk_size: usize,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<String, GraphError> {
     // Empty payloads are rejected up front in `host_attachment`, so by here the
     // data is non-empty and the loop always runs at least once.
     let total = data.len();
@@ -179,6 +249,9 @@ async fn upload_file_chunked(
 
     let mut offset = 0usize;
     while offset < total {
+        if shutdown.is_cancelled() {
+            return Err(shutdown_during_upload());
+        }
         let end = (offset + chunk_size).min(total);
         let chunk = data.slice(offset..end);
         let content_range = format!("bytes {offset}-{}/{total}", end - 1);
@@ -206,16 +279,29 @@ async fn upload_file_chunked(
                     })?;
                 return Ok(item.id);
             }
-            // 202 Accepted: the bytes just sent are in; advance.
-            202 => {}
+            // 202 Accepted: read the server's authoritative resume offset
+            // from `nextExpectedRanges`. The server is allowed to accept
+            // fewer bytes than the chunk we PUT, so resuming from `end`
+            // unconditionally would skip the unaccepted tail. Fall back to
+            // `end` only when the body carried no parseable range (and
+            // guard against a non-advancing offset, which would spin).
+            202 => {
+                let progress: UploadProgress =
+                    serde_json::from_slice(response.body.as_ref()).unwrap_or_default();
+                let next = progress.resume_offset().unwrap_or(end);
+                if next <= offset {
+                    return Err(malformed_response(format!(
+                        "OneDrive 202 resume offset {next} did not advance past {offset}"
+                    )));
+                }
+                offset = next;
+            }
             _ => {
                 let err =
                     GraphResponseError::from_response(status, response.headers, response.body);
                 return Err(GraphError::Response(err));
             }
         }
-
-        offset = end;
     }
 
     // Reached only if the server 202-acknowledged the final chunk instead of
@@ -224,6 +310,17 @@ async fn upload_file_chunked(
     Err(malformed_response(
         "upload completed without receiving a drive item response".to_string(),
     ))
+}
+
+/// The account was shut down (close / reopen) while an upload was in
+/// flight. `Unsent`-state network error so the recovery mapping treats it
+/// as a retryable client-side abort.
+fn shutdown_during_upload() -> GraphError {
+    GraphError::Net(bifrost_net::Error::Network {
+        message: "OneDrive upload aborted: account shutting down".to_string(),
+        transmission_state: bifrost_types::TransmissionState::Unsent,
+        source: None,
+    })
 }
 
 /// Create a sharing link (one round-trip): POST `createLink`, return
@@ -314,6 +411,38 @@ mod tests {
         let json = r#"{"link":{"webUrl":"https://1drv.ms/x/abc"}}"#;
         let resp: CreateLinkResponse = serde_json::from_str(json).expect("deserializes");
         assert_eq!(resp.link.web_url, "https://1drv.ms/x/abc");
+    }
+
+    #[test]
+    fn resume_offset_reads_next_expected_range_start() {
+        // The server's `nextExpectedRanges` start is the authoritative
+        // resume offset, even when it is short of the chunk end the client
+        // just PUT (a partially-accepted chunk).
+        let progress = UploadProgress {
+            next_expected_ranges: vec!["1024-".to_string()],
+        };
+        assert_eq!(progress.resume_offset(), Some(1024));
+
+        let bounded = UploadProgress {
+            next_expected_ranges: vec!["524288-1048575".to_string()],
+        };
+        assert_eq!(bounded.resume_offset(), Some(524_288));
+    }
+
+    #[test]
+    fn resume_offset_none_without_ranges() {
+        assert_eq!(UploadProgress::default().resume_offset(), None);
+        let junk = UploadProgress {
+            next_expected_ranges: vec!["-".to_string()],
+        };
+        assert_eq!(junk.resume_offset(), None);
+    }
+
+    #[test]
+    fn upload_progress_deserializes_202_body() {
+        let json = r#"{"nextExpectedRanges":["327680-"]}"#;
+        let progress: UploadProgress = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(progress.resume_offset(), Some(327_680));
     }
 
     #[test]

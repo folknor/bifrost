@@ -461,6 +461,16 @@ fn classify_by_status(
     retry_hint: Option<RetryHint>,
 ) -> (AccountErrorKind, Cause, bool) {
     match code {
+        // A novel, not-yet-typed 400-coded signal on a cursor scope is
+        // almost certainly a delta-token rejection Graph added after this
+        // build (the typed `InvalidDeltaToken` / `SyncStateNotFound` codes
+        // already route here through `classify`). Treat it like the
+        // 410-coded case: route to the cursor-invalid restart rather than
+        // a terminal `Request(Malformed)`. graph.md documents delta-token
+        // expiry as reactive (410 / 400 InvalidDeltaToken -> RestartScope);
+        // forward-compat extends that to an unknown 400 in cursor context.
+        // Outside a cursor scope, a 400 stays a malformed request.
+        400 if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => cursor_invalid_or_protocol(ctx),
         400 | 422 => (
             AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
             Cause::Request(RequestCause::Malformed {
@@ -1148,6 +1158,55 @@ mod tests {
                 "code={code} did not classify as CursorInvalid"
             );
         }
+    }
+
+    #[test]
+    fn novel_400_code_on_cursor_scope_restarts_not_terminal() {
+        // A 400 carrying a code this build does not yet type
+        // (`GraphSignal::Unknown` -> `classify_by_status`) on a cursor
+        // scope is almost certainly a delta-token rejection Graph added
+        // later. It must route to the cursor-invalid restart, not a
+        // terminal `Request(Malformed)`, matching the typed
+        // InvalidDeltaToken / 410 cursor cases (forward-compat).
+        let err = classify(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"SomeFutureDeltaTokenSignal"}}"#,
+            graph_ctx(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(CursorScope::Account)),
+            &[],
+        );
+        assert!(
+            matches!(
+                err.kind(),
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+            ),
+            "expected CursorInvalid, got {:?}",
+            err.kind()
+        );
+        match err.recovery() {
+            RecoveryClass::Engine(EngineDirective::RestartScope(_)) => {}
+            other => panic!("expected Engine(RestartScope(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn novel_400_code_off_cursor_scope_stays_malformed() {
+        // The same novel 400 outside a cursor scope is a genuine bad
+        // request and stays terminal `Request(Malformed)`.
+        let err = classify(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"SomeFutureSignal"}}"#,
+            graph_ctx(AccountOperation::BulkMove),
+            &[],
+        );
+        assert!(
+            matches!(
+                err.kind(),
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+            ),
+            "expected Request(Malformed), got {:?}",
+            err.kind()
+        );
     }
 
     #[test]

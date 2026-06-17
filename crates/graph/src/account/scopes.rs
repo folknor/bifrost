@@ -102,7 +102,7 @@ async fn discover_cursor_scopes_inner(
         .map_err(|error| {
             into_account_error(
                 error,
-                GraphErrorContext::graph(AccountOperation::DiscoverMemberships),
+                GraphErrorContext::graph(AccountOperation::DiscoverCursorScopes),
             )
         })?;
     account.folder_tree.write().await.replace_mail_folders(
@@ -138,7 +138,7 @@ async fn discover_cursor_scopes_inner(
             Err(error) => {
                 let account_error = into_account_error(
                     error,
-                    GraphErrorContext::graph(AccountOperation::DiscoverMemberships),
+                    GraphErrorContext::graph(AccountOperation::DiscoverCursorScopes),
                 );
                 if matches!(
                     account_error.kind(),

@@ -61,8 +61,8 @@ pub(crate) fn inventory_stream(
                         .with_scope(ErrorScope::Cursor(scope.clone()));
                     // A permission denial on a foreign (shared) scope
                     // quarantines just this scope; a primary-scope
-                    // denial stays terminal account-wide.
-                    let owner = account.owner_of_scope(&scope);
+                    // denial stays terminal account-wide. `owner` is
+                    // hoisted above the loop (it is scope-invariant).
                     yield SyncEvent::Terminated(super::graph_error::graph_shared_scope_error(
                         error,
                         &scope,
@@ -187,12 +187,29 @@ pub(crate) fn membership_from_value(scope: &CursorScope, value: &Value) -> Membe
         CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => folder.0.clone(),
         _ => String::new(),
     };
-    let folder = value
+    let native = value
         .get("parentFolderId")
         .and_then(Value::as_str)
         .filter(|folder| !folder.is_empty())
         .unwrap_or(&fallback);
-    MembershipScope::Folder(FolderId(folder.to_string()))
+    // For a foreign (shared/delegate) scope the item's `parentFolderId`
+    // is a *native* id within the owning mailbox. Discovery emits the
+    // folder membership foreign-encoded (`encode_foreign(mailbox,
+    // native)`), so emit the same encoding here - otherwise the engine's
+    // covering rule (folder-typed cursor covers the matching folder)
+    // cannot reconcile inventory/changes against discovery, and a foreign
+    // native id colliding with a primary id (e.g. `inbox`) would conflate
+    // into the primary mailbox's membership set.
+    let folder = match scope {
+        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
+            match super::foreign::parse_folder(folder).foreign() {
+                Some(foreign) => super::foreign::encode_foreign(&foreign.mailbox, native),
+                None => FolderId(native.to_string()),
+            }
+        }
+        _ => FolderId(native.to_string()),
+    };
+    MembershipScope::Folder(folder)
 }
 
 pub(crate) fn graph_etag(value: &Value) -> Option<String> {
@@ -590,6 +607,43 @@ mod tests {
         assert_eq!(
             membership_from_value(&scope, &value),
             MembershipScope::Folder(FolderId("actual-parent".to_string()))
+        );
+    }
+
+    #[test]
+    fn membership_scope_foreign_encodes_for_foreign_scope() {
+        // A foreign (shared) scope must emit the parentFolderId
+        // foreign-encoded so it reconciles with discovery
+        // (`Folder(encode_foreign(mailbox, native))`) and a foreign
+        // native id colliding with a primary id cannot conflate into the
+        // primary mailbox's membership set.
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkRoot"),
+            ty: ObjectType::Email,
+        };
+        let value = json!({
+            "id": "m1",
+            "parentFolderId": "inbox"
+        });
+        assert_eq!(
+            membership_from_value(&scope, &value),
+            MembershipScope::Folder(super::super::foreign::encode_foreign(
+                "shared@contoso.com",
+                "inbox"
+            ))
+        );
+    }
+
+    #[test]
+    fn membership_scope_primary_stays_native() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let value = json!({ "id": "m1", "parentFolderId": "inbox" });
+        assert_eq!(
+            membership_from_value(&scope, &value),
+            MembershipScope::Folder(FolderId("inbox".to_string()))
         );
     }
 

@@ -27,34 +27,51 @@ pub(crate) fn get_stream(
     Box::pin(async_stream::stream! {
         let max_items = account.capabilities.batching_policy.max_items.max(1);
         let mut chunk = Vec::with_capacity(max_items);
+        // The input is a stream, so "is this the last chunk" is only
+        // known after the input ends. Hold a filled chunk back by one
+        // step: once the stream is exhausted, the held chunk (if any) is
+        // the final batch and carries `PageBoundary::Final`, matching the
+        // inventory/changes streams (a hydration that fired chunks tagged
+        // only `Page` never told the engine where the stream terminated).
+        let mut pending: Option<Vec<ObjectId>> = None;
         while let Some(id) = ids.next().await {
             chunk.push(id);
             if chunk.len() >= max_items {
-                match fetch_batch(&account, &chunk, projection).await {
-                    Ok(batch_events) => {
-                        for event in batch_events {
-                            yield event;
+                if let Some(ready) = pending.take() {
+                    match fetch_batch(&account, &ready, projection, false).await {
+                        Ok(batch_events) => for event in batch_events { yield event; },
+                        Err(error) => {
+                            let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
+                                .with_scope(ErrorScope::Account);
+                            yield SyncEvent::Terminated(into_account_error(error, ctx));
+                            yield SyncEvent::Done(None);
+                            return;
                         }
                     }
-                    Err(error) => {
-                        let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
-                            .with_scope(ErrorScope::Account);
-                        yield SyncEvent::Terminated(into_account_error(error, ctx));
-                        yield SyncEvent::Done(None);
-                        return;
-                    }
                 }
-                chunk.clear();
+                pending = Some(std::mem::replace(&mut chunk, Vec::with_capacity(max_items)));
             }
         }
 
-        if !chunk.is_empty() {
-            match fetch_batch(&account, &chunk, projection).await {
-                Ok(batch_events) => {
-                    for event in batch_events {
-                        yield event;
-                    }
+        // Flush the held-back full chunk (non-final iff a trailing
+        // partial chunk follows) then the trailing partial chunk.
+        let trailing_nonempty = !chunk.is_empty();
+        if let Some(ready) = pending.take() {
+            match fetch_batch(&account, &ready, projection, !trailing_nonempty).await {
+                Ok(batch_events) => for event in batch_events { yield event; },
+                Err(error) => {
+                    let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
+                        .with_scope(ErrorScope::Account);
+                    yield SyncEvent::Terminated(into_account_error(error, ctx));
+                    yield SyncEvent::Done(None);
+                    return;
                 }
+            }
+        }
+
+        if trailing_nonempty {
+            match fetch_batch(&account, &chunk, projection, true).await {
+                Ok(batch_events) => for event in batch_events { yield event; },
                 Err(error) => {
                     let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
                         .with_scope(ErrorScope::Account);
@@ -79,6 +96,7 @@ async fn fetch_batch(
     account: &GraphAccount,
     ids: &[ObjectId],
     projection: Projection,
+    is_final: bool,
 ) -> Result<Vec<SyncEvent<ItemOutcome<HydratedObject>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -171,7 +189,11 @@ async fn fetch_batch(
 
     Ok(vec![SyncEvent::Batch(Batch {
         items: outcomes,
-        page_boundary: PageBoundary::Page,
+        page_boundary: if is_final {
+            PageBoundary::Final
+        } else {
+            PageBoundary::Page
+        },
         server_latency: std::time::Duration::default(),
         bytes_in: 0,
         checkpoint: None::<Checkpoint>,

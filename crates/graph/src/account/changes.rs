@@ -135,7 +135,22 @@ pub(crate) fn changes_stream(
                 yield SyncEvent::Done(Some(checkpoint));
                 return;
             } else {
-                yield batch(changes, PageBoundary::Final, None);
+                // A Graph delta page MUST carry either an `@odata.nextLink`
+                // (more pages) or an `@odata.deltaLink` (end of the walk).
+                // Neither present is a Graph contract violation. Emitting
+                // `Final` + `Done(None)` here would drop the cursor advance,
+                // so the engine would re-issue the same final page on every
+                // poll forever. Terminate with a contract violation instead
+                // so the failure is visible rather than a silent live-lock.
+                if !changes.is_empty() {
+                    yield batch(changes, PageBoundary::Page, None);
+                }
+                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                    AccountOperation::SyncChanges,
+                    Some(ErrorScope::Cursor(scope.clone())),
+                    "Graph delta page carried neither @odata.nextLink nor @odata.deltaLink",
+                ));
                 yield SyncEvent::Done(None);
                 return;
             }
