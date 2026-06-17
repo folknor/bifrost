@@ -7,8 +7,9 @@
 //! shapes and decorates them with attempt/phase context.
 //!
 //! Recovery is never constructed here. Every conversion funnels through
-//! `AccountErrorBuilder::build`, which derives recovery centrally from the kind
-//! + cause chain + transmission state + idempotency.
+//! `AccountErrorBuilder::try_build` (via `finish`; the infallible `build` is
+//! gone), which derives recovery centrally from the kind + cause chain +
+//! transmission state + idempotency.
 
 use bifrost_types::error::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,

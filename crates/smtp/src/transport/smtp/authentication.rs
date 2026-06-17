@@ -367,9 +367,14 @@ impl Mechanism {
                 Err(error::invalid_input("Unrecognized challenge"))
             }
             Mechanism::Xoauth2 => match challenge {
-                Some(_) => Err(error::invalid_input(
-                    "This mechanism does not expect a challenge",
-                )),
+                // A failed XOAUTH2 auth returns `334 <base64-json-error>`
+                // (Google / Microsoft) rather than a tagged failure. RFC 6749
+                // SASL XOAUTH2 requires the client to acknowledge with an empty
+                // response so the server emits the final failure reply; we send
+                // the `\x01` dummy-cancel line (`AQ==` on the wire), matching
+                // OAUTHBEARER's RFC 7628 error-continuation. The connection
+                // driver then classifies the negative reply on the Auth lane.
+                Some(_) => Ok("\x01".to_owned()),
                 None => {
                     let (identity, access_token) =
                         credentials.oauth_identity_and_token(oauth_token)?;
@@ -509,20 +514,29 @@ pub(crate) fn first_attemptable(
     order: &[Mechanism],
     binding_available: impl Fn(Mechanism) -> bool,
 ) -> Result<Mechanism, Error> {
+    let mut skipped_plus_for_binding = false;
     for &mechanism in order {
         let is_plus = matches!(
             mechanism,
             Mechanism::ScramSha1Plus | Mechanism::ScramSha256Plus
         );
         if is_plus && !binding_available(mechanism) {
+            skipped_plus_for_binding = true;
             continue;
         }
         return Ok(mechanism);
     }
-    Err(
-        error::invalid_input("channel binding required but unavailable")
-            .with_phase(SmtpCommandPhase::Auth),
-    )
+    // Two distinct exhaustion shapes share this routing (InvalidInput + Auth ->
+    // PolicyBlocked) but warrant different diagnostics: every candidate was a
+    // binding-unavailable PLUS rung, versus the empty order / no-compatible-
+    // mechanism case (the default-set-vs-`AUTH LOGIN`-only outcome documented
+    // in `reference/smtp.md`).
+    let message = if skipped_plus_for_binding {
+        "channel binding required but unavailable"
+    } else {
+        "no compatible authentication mechanism"
+    };
+    Err(error::invalid_input(message).with_phase(SmtpCommandPhase::Auth))
 }
 
 /// Next client line a [`ScramExchange::step`] produces.
@@ -640,6 +654,19 @@ pub(crate) fn decode_auth_challenge(
     if !response.has_code(334) {
         return Err(error::parse("expected a SCRAM 334 continuation"));
     }
+    decode_scram_payload(response)
+}
+
+/// Decode the base64 SASL payload carried in a reply's first word, regardless
+/// of the reply code.
+///
+/// Used for the SCRAM server-final, which RFC 4954 carries on a `334`
+/// continuation but which some servers (field-observed) fold directly onto the
+/// `235` success reply (`235 v=...`). The caller is responsible for validating
+/// the reply code; this only extracts and decodes the payload.
+pub(crate) fn decode_scram_payload(
+    response: &crate::transport::smtp::response::Response,
+) -> Result<String, Error> {
     let encoded = response
         .first_word()
         .ok_or_else(|| error::parse("could not read SCRAM challenge"))?;
@@ -828,14 +855,28 @@ mod test {
             Mechanism::ScramSha256Plus
         );
 
-        // All-PLUS order with no binding -> Auth-phase invalid_input error.
+        // All-PLUS order with no binding -> Auth-phase invalid_input error,
+        // diagnosed as a channel-binding failure (every candidate was a
+        // binding-unavailable PLUS rung).
         let all_plus = [Mechanism::ScramSha256Plus, Mechanism::ScramSha1Plus];
         let err = first_attemptable(&all_plus, |_| false).unwrap_err();
         assert!(err.is_invalid_input());
         assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            err.diagnostic_text().as_deref(),
+            Some("channel binding required but unavailable")
+        );
 
-        // Empty order -> same error.
-        assert!(first_attemptable(&[], |_| true).is_err());
+        // Empty order -> same routing (Auth-phase invalid_input) but the
+        // no-compatible-mechanism diagnostic, not the channel-binding one (no
+        // PLUS rung was skipped).
+        let err = first_attemptable(&[], |_| true).unwrap_err();
+        assert!(err.is_invalid_input());
+        assert_eq!(err.phase(), Some(SmtpCommandPhase::Auth));
+        assert_eq!(
+            err.diagnostic_text().as_deref(),
+            Some("no compatible authentication mechanism")
+        );
     }
 
     #[test]
@@ -990,6 +1031,49 @@ mod test {
     }
 
     #[test]
+    fn server_final_decodes_from_either_334_or_235() {
+        use super::{decode_auth_challenge, decode_scram_payload};
+        use crate::transport::smtp::response::{Category, Code, Detail, Response, Severity};
+
+        let payload = crate::base64::encode("v=server-signature");
+
+        // RFC 4954 shape: server-final on a 334 continuation.
+        let continuation = Response::new(
+            Code {
+                severity: Severity::PositiveIntermediate,
+                category: Category::Unspecified3,
+                detail: Detail::Four,
+            },
+            vec![payload.clone()],
+        );
+        assert_eq!(
+            decode_auth_challenge(&continuation).unwrap(),
+            "v=server-signature"
+        );
+        assert_eq!(
+            decode_scram_payload(&continuation).unwrap(),
+            "v=server-signature"
+        );
+
+        // Field-observed shape: server-final folded onto the 235 success reply.
+        // The 334-only decoder rejects it (the spurious parse error this fix
+        // removes); the code-agnostic decoder accepts it.
+        let success = Response::new(
+            Code {
+                severity: Severity::PositiveCompletion,
+                category: Category::Unspecified3,
+                detail: Detail::Five,
+            },
+            vec![payload],
+        );
+        assert!(decode_auth_challenge(&success).is_err());
+        assert_eq!(
+            decode_scram_payload(&success).unwrap(),
+            "v=server-signature"
+        );
+    }
+
+    #[test]
     fn test_plain() {
         let mechanism = Mechanism::Plain;
 
@@ -1074,10 +1158,19 @@ mod test {
                 .unwrap(),
             "user=username\x01auth=Bearer vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg==\x01\x01"
         );
-        assert!(
+        // A 334 challenge after the initial response is XOAUTH2's failed-auth
+        // shape (`334 <base64-json-error>`); like OAUTHBEARER, the encoder
+        // returns the `\x01` dummy-cancel so the server emits the tagged
+        // failure reply on the next read.
+        assert_eq!(
             mechanism
-                .response_with_token(&credentials, Some("test"), Some(token))
-                .is_err()
+                .response_with_token(
+                    &credentials,
+                    Some(r#"{"status":"401"}"#),
+                    Some(token)
+                )
+                .unwrap(),
+            "\x01"
         );
     }
 

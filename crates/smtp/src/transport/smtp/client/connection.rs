@@ -22,7 +22,8 @@ use crate::{
         Protocol,
         authentication::{
             Credentials, Mechanism, ScramExchange, ScramStep, decode_auth_challenge,
-            first_attemptable, oauth_mechanism, password_mechanism_order, scram_hash,
+            decode_scram_payload, first_attemptable, oauth_mechanism, password_mechanism_order,
+            scram_hash,
         },
         batch::{SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
@@ -468,15 +469,32 @@ impl SmtpConnection {
             return self.send_smtp_batch_pipelined(from, email, mail_options, options, progress);
         }
 
-        // Non-pipelined path.
+        // Non-pipelined path. Split the wire event the same way the pipelined
+        // sibling does so identical events yield identical transmission
+        // evidence regardless of PIPELINING: a transport drop is `InFlight`,
+        // an acknowledged negative reply is `Acknowledged` (not `Unsent`).
+        // `command_accepting_status` keeps a negative reply as an `Ok`
+        // response instead of folding it into a transport-shaped `Err`.
         let mail_cmd = Mail::new(from, mail_options);
-        if let Err(e) = self.command(mail_cmd) {
-            self.abort();
-            return Err((
-                e.with_attempt(SmtpTransmissionState::Unsent)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
+        match self.command_accepting_status(mail_cmd) {
+            Ok(resp) if resp.is_positive() => {}
+            Ok(resp) => {
+                self.abort();
+                return Err((
+                    error::status(resp)
+                        .with_attempt(SmtpTransmissionState::Acknowledged)
+                        .with_phase(SmtpCommandPhase::MailFrom),
+                    progress,
+                ));
+            }
+            Err(e) => {
+                self.abort();
+                return Err((
+                    e.with_attempt(SmtpTransmissionState::InFlight)
+                        .with_phase(SmtpCommandPhase::MailFrom),
+                    progress,
+                ));
+            }
         }
 
         let recipient_addresses: Vec<Address> = progress
@@ -757,14 +775,29 @@ impl SmtpConnection {
                 )
             })?;
 
+        // MAIL FROM: an acknowledged negative reply is `Acknowledged`, a
+        // transport drop is `InFlight` - never `Unsent` for either. See the
+        // SMTP non-pipelined path for the same split.
         let mail_cmd = Mail::new(from, mail_options);
-        if let Err(e) = self.command(mail_cmd) {
-            self.abort();
-            return Err((
-                e.with_attempt(SmtpTransmissionState::Unsent)
-                    .with_phase(SmtpCommandPhase::MailFrom),
-                progress,
-            ));
+        match self.command_accepting_status(mail_cmd) {
+            Ok(resp) if resp.is_positive() => {}
+            Ok(resp) => {
+                self.abort();
+                return Err((
+                    error::status(resp)
+                        .with_attempt(SmtpTransmissionState::Acknowledged)
+                        .with_phase(SmtpCommandPhase::MailFrom),
+                    progress,
+                ));
+            }
+            Err(e) => {
+                self.abort();
+                return Err((
+                    e.with_attempt(SmtpTransmissionState::InFlight)
+                        .with_phase(SmtpCommandPhase::MailFrom),
+                    progress,
+                ));
+            }
         }
 
         let recipient_addresses: Vec<Address> = progress
@@ -851,7 +884,6 @@ impl SmtpConnection {
         progress.set_body_finished();
 
         // Read one final LMTP status per accepted recipient.
-        let mut lmtp_index = 0usize;
         for i in 0..progress.recipients.len() {
             if !matches!(
                 progress.recipients[i].rcpt,
@@ -862,7 +894,6 @@ impl SmtpConnection {
             match self.read_response_accepting_status() {
                 Ok(resp) => {
                     progress.record_lmtp_final(i, resp);
-                    lmtp_index += 1;
                 }
                 Err(e) => {
                     use crate::transport::smtp::account_error::{
@@ -881,7 +912,6 @@ impl SmtpConnection {
                 }
             }
         }
-        let _ = lmtp_index;
 
         Ok(progress)
     }
@@ -1426,24 +1456,58 @@ impl SmtpConnection {
             }
         };
 
-        // 334 carrying server-final -> verify, then send the empty line.
-        let server_final = try_smtp!(decode_auth_challenge(&response), self);
-        match try_smtp!(exchange.step(&server_final), self, SmtpCommandPhase::Auth) {
-            ScramStep::Complete => {}
-            ScramStep::Reply(_) => {
+        // Server-final reply. RFC 4954 carries it on a `334` continuation, with
+        // the tagged `235` success following an empty client line. Some servers
+        // (field-observed) fold the server-final straight onto the `235`
+        // success reply (`235 v=...`). Both shapes are accepted; anything else
+        // is an auth failure (or protocol error) and aborts. A `334` here must
+        // not be mistaken for success - only a positive reply ends the walk.
+        let success = if response.has_code(334) {
+            let server_final = try_smtp!(decode_auth_challenge(&response), self);
+            try_smtp!(
+                Self::verify_scram_server_final(&mut exchange, &server_final),
+                self,
+                SmtpCommandPhase::Auth
+            );
+            let final_reply = try_smtp!(
+                self.write_auth_continuation(""),
+                self,
+                SmtpCommandPhase::Auth
+            );
+            if !final_reply.is_positive() {
                 self.abort();
-                return Err(error::parse("unexpected SCRAM reply after server-final"));
+                return Err(error::status(final_reply).with_phase(SmtpCommandPhase::Auth));
             }
-        }
-        let response = try_smtp!(
-            self.write_auth_continuation(""),
-            self,
-            SmtpCommandPhase::Auth
-        );
+            final_reply
+        } else if response.is_positive() {
+            let server_final = try_smtp!(decode_scram_payload(&response), self);
+            try_smtp!(
+                Self::verify_scram_server_final(&mut exchange, &server_final),
+                self,
+                SmtpCommandPhase::Auth
+            );
+            response
+        } else {
+            self.abort();
+            return Err(error::status(response).with_phase(SmtpCommandPhase::Auth));
+        };
 
         let hello_name = self.hello_name.clone();
         try_smtp!(self.hello(&hello_name), self);
-        Ok(response)
+        Ok(success)
+    }
+
+    /// Verify a decoded SCRAM server-final, mapping a non-terminal step to a
+    /// parse-class error. Shared by the `334`-continuation and `235`-folded
+    /// server-final shapes.
+    fn verify_scram_server_final(
+        exchange: &mut ScramExchange,
+        server_final: &str,
+    ) -> Result<(), Error> {
+        match exchange.step(server_final)? {
+            ScramStep::Complete => Ok(()),
+            ScramStep::Reply(_) => Err(error::parse("unexpected SCRAM reply after server-final")),
+        }
     }
 
     /// Write a base64 SASL continuation line (already encoded) and read the
@@ -1483,20 +1547,29 @@ impl SmtpConnection {
 
         while challenges > 0 && response.has_code(334) {
             challenges -= 1;
-            response = try_smtp!(
-                self.command(Auth::new_from_response(
-                    mechanism,
-                    credentials.clone(),
-                    &response,
-                    oauth_token,
-                )?),
+            // Build the continuation reply. For XOAUTH2/OAUTHBEARER a 334 here
+            // is the server's base64 failure detail, and the encoder returns
+            // the dummy-cancel line so the next read surfaces the tagged
+            // negative reply on the Auth lane. Any construction error (bad
+            // base64, an encoder rejecting an unexpected challenge) must abort
+            // and carry the Auth phase, not leak through a bare `?` as an
+            // untagged parse error.
+            let continuation = try_smtp!(
+                Auth::new_from_response(mechanism, credentials.clone(), &response, oauth_token),
                 self,
                 SmtpCommandPhase::Auth
             );
+            response = try_smtp!(self.command(continuation), self, SmtpCommandPhase::Auth);
         }
 
         if challenges == 0 {
-            Err(error::parse("Unexpected number of challenges"))
+            // The server never completed (or rejected) the exchange within the
+            // round-trip budget: an auth-exchange failure, routed on the Auth
+            // lane (InvalidInput + Auth -> Authorization), not an untagged
+            // Protocol(ParseFailed).
+            self.abort();
+            Err(error::invalid_input("Unexpected number of challenges")
+                .with_phase(SmtpCommandPhase::Auth))
         } else {
             let hello_name = self.hello_name.clone();
             try_smtp!(self.hello(&hello_name), self);

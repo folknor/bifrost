@@ -451,6 +451,37 @@ mod test {
     }
 
     #[test]
+    fn xoauth2_challenge_emits_dummy_cancel() {
+        // A failed XOAUTH2 auth returns `334 <base64-json-error>`. Building the
+        // continuation reply from that challenge must emit the dummy-cancel
+        // line (`AQ==` = base64 of `\x01`), matching OAUTHBEARER, so the server
+        // emits the tagged failure reply instead of the exchange leaking
+        // through as an untagged "does not expect a challenge" error.
+        let credentials = Credentials::oauth2("user".to_owned(), "token".to_owned());
+        let continuation = Response::new(
+            crate::transport::smtp::response::Code {
+                severity: crate::transport::smtp::response::Severity::PositiveIntermediate,
+                category: crate::transport::smtp::response::Category::Unspecified3,
+                detail: crate::transport::smtp::response::Detail::Four,
+            },
+            vec![crate::base64::encode(r#"{"status":"401"}"#)],
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Auth::new_from_response(
+                    Mechanism::Xoauth2,
+                    credentials,
+                    &continuation,
+                    Some("token")
+                )
+                .unwrap()
+            ),
+            "AQ==\r\n"
+        );
+    }
+
+    #[test]
     fn scram_initial_command_is_bare_auth() {
         // SCRAM has no initial response and is driven by the SCRAM exchange,
         // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which
