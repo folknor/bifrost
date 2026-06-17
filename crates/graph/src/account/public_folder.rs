@@ -34,6 +34,14 @@ use crate::ews::{EwsClient, EwsError, EwsFolder, EwsItem};
 /// Max entries per `FindItem` page.
 const PUBLIC_FOLDER_PAGE_SIZE: u32 = 100;
 
+/// Defensive cap on the number of `FindItem` pages walked for one
+/// folder. At `PUBLIC_FOLDER_PAGE_SIZE` items/page this covers well
+/// beyond the `PUBLIC_FOLDER_LIVE_IDS_CAP` (10k) ceiling; it only bites a
+/// misbehaving server that reports `IncludesLastItemInRange=false`
+/// forever (or saturates the offset at `u32::MAX`), which would
+/// otherwise spin the page loop indefinitely.
+const PUBLIC_FOLDER_PAGE_CAP: usize = 1_000;
+
 /// Defensive cap on the number of `FindFolder` browse calls during
 /// hierarchy discovery. A public-folder hierarchy is a tree, so this
 /// only bites a pathological (cyclic or enormous) hierarchy; the dedup
@@ -44,19 +52,57 @@ const PUBLIC_FOLDER_BROWSE_STEP_CAP: usize = 1_000;
 // ── Pure helpers ────────────────────────────────────────────
 
 /// Advance a watermark to the newest `received_at` seen in a batch.
-/// RFC-3339 UTC timestamps compare correctly lexicographically, so the
-/// new watermark is the string max of the prior watermark and every
-/// item's `received_at`.
+///
+/// EWS `DateTimeReceived` is RFC-3339 UTC, but the fractional-second
+/// precision is inconsistent across items (`...00Z` vs `...00.5Z`), so a
+/// raw string comparison mis-orders them: `'Z'` (0x5A) sorts after `'.'`
+/// (0x2E), making `...00Z` look NEWER than `...00.5Z`. That would move
+/// the watermark backward (re-fetching items) or forward past an item
+/// (skipping it forever). Parse both sides to a real instant and compare
+/// chronologically; the stored watermark is the original string of the
+/// chronologically-newest value (preserving whatever precision the
+/// server emitted so the `>=` restriction round-trips). An unparseable
+/// timestamp is conservatively ignored for the comparison.
 pub(crate) fn advance_watermark(prior: Option<String>, items: &[EwsItem]) -> Option<String> {
     let mut best = prior;
+    let mut best_instant = best.as_deref().and_then(parse_received);
     for item in items {
-        if let Some(received) = item.received_at.as_ref()
-            && best.as_ref().is_none_or(|cur| received > cur)
-        {
+        let Some(received) = item.received_at.as_ref() else {
+            continue;
+        };
+        let Some(instant) = parse_received(received) else {
+            continue;
+        };
+        if best_instant.is_none_or(|cur| instant > cur) {
             best = Some(received.clone());
+            best_instant = Some(instant);
         }
     }
     best
+}
+
+/// Parse an EWS `DateTimeReceived` (RFC-3339 / ISO-8601 UTC) into a
+/// comparable instant. Returns `None` for an unparseable value so the
+/// caller can fall back conservatively rather than mis-order.
+fn parse_received(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Collect the ids of items whose `received_at` equals `watermark`.
+/// These sit on the inclusive (`>=`) restriction boundary and would be
+/// re-fetched on every subsequent poll; the cursor remembers them so the
+/// next poll can skip re-emitting the ones it already saw.
+pub(crate) fn boundary_ids_at(watermark: Option<&str>, items: &[EwsItem]) -> Vec<String> {
+    let Some(watermark) = watermark else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| item.received_at.as_deref() == Some(watermark))
+        .map(|item| item.item_id.clone())
+        .collect()
 }
 
 /// Diff a fresh full-scan id set against the prior live-id snapshot.
@@ -152,6 +198,7 @@ async fn fetch_all_items(
     let headers = routing.headers();
     let mut all = Vec::new();
     let mut offset = 0u32;
+    let mut pages = 0usize;
     loop {
         let page = ews
             .find_items(folder_id, since, offset, PUBLIC_FOLDER_PAGE_SIZE, &headers)
@@ -159,6 +206,14 @@ async fn fetch_all_items(
         let count = u32::try_from(page.items.len()).unwrap_or(u32::MAX);
         all.extend(page.items);
         if page.includes_last || count == 0 {
+            break;
+        }
+        pages += 1;
+        if pages >= PUBLIC_FOLDER_PAGE_CAP {
+            // A server that never sets IncludesLastItemInRange would spin
+            // forever; stop with what we have. The deletion reconcile
+            // treats a short scan conservatively (it only emits Destroyed
+            // for ids genuinely absent from the diff baseline).
             break;
         }
         offset = offset.saturating_add(count);
@@ -191,7 +246,16 @@ pub(crate) async fn discover_public_folder_scopes(
         ));
         return (scopes, warnings);
     };
-    let domain = user_email.rsplit('@').next().unwrap_or("").to_string();
+    // Split the domain off the right of `@`; a malformed (no-`@`) email
+    // has no usable domain (the prior `rsplit('@').next()` returned the
+    // whole string, producing a bogus `guid@whole-email` replica SMTP).
+    let Some(domain) = user_email.rsplit_once('@').map(|(_, d)| d.to_string()) else {
+        warnings.push(Warning::support_only(
+            WarningKind::OperatorAttentionNeeded,
+            "public-folder discovery skipped: account email has no domain".to_string(),
+        ));
+        return (scopes, warnings);
+    };
 
     let routing = match account.discover_public_folder_routing(&user_email).await {
         Ok(routing) => routing,
@@ -307,22 +371,26 @@ async fn resolve_content_routing(
         .await
         .map_err(|_| ())?;
     let replica = detailed.replica_list.ok_or(())?;
-    let guids = crate::ews::decode_replica_list(&base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &replica,
-    ))
-    .map_err(|_| ())?;
-    let guid = guids.into_iter().next().ok_or(())?;
-    let stripped = guid.trim_matches(['{', '}']);
-    let replica_smtp = super::autodiscover::construct_replica_smtp(stripped, domain);
-    let content_mailbox = account
-        .discover_content_mailbox(&replica_smtp)
-        .await
-        .map_err(|_| ())?;
-    Ok(PublicFolderRouting {
-        anchor_mailbox: content_mailbox.clone(),
-        public_folder_mailbox: Some(content_mailbox),
-    })
+    // The bytes are already base64-decoded by the GetFolder parser; parse
+    // them straight rather than re-encode-then-decode.
+    let guids = crate::ews::decode_replica_bytes(&replica);
+    if guids.is_empty() {
+        return Err(());
+    }
+    // A public folder can be replicated across several content mailboxes;
+    // try each replica GUID's Autodiscover lookup until one resolves
+    // rather than committing to an arbitrary first entry.
+    for guid in &guids {
+        let stripped = guid.trim_matches(['{', '}']);
+        let replica_smtp = super::autodiscover::construct_replica_smtp(stripped, domain);
+        if let Ok(content_mailbox) = account.discover_content_mailbox(&replica_smtp).await {
+            return Ok(PublicFolderRouting {
+                anchor_mailbox: content_mailbox.clone(),
+                public_folder_mailbox: Some(content_mailbox),
+            });
+        }
+    }
+    Err(())
 }
 
 // ── Streams ─────────────────────────────────────────────────
@@ -357,9 +425,15 @@ pub(crate) fn public_folder_inventory_stream(
             let ctx = GraphErrorContext::ews(AccountOperation::SyncInventory)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(ews_shared_scope_error(
-                EwsError::MalformedXml(bifrost_types::DiagnosticText::support_only(
-                    "EWS account net not attached".to_string(),
-                )),
+                // Not-yet-attached is a transient lifecycle condition
+                // (the engine reopens), not a malformed wire response;
+                // route it as a retryable Transport(Unsent) rather than a
+                // terminal Protocol(ParseFailed) that kills the scope.
+                EwsError::Transport(bifrost_net::Error::Network {
+                    message: "EWS account net not attached".to_string(),
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                    source: None,
+                }),
                 &scope,
                 None,
                 ctx,
@@ -391,14 +465,32 @@ pub(crate) fn public_folder_inventory_stream(
         // deletion baseline (capped) but sets `last_full_scan_at = None`
         // so the FIRST incremental does its inaugural reconcile against
         // this snapshot. `live_ids` empty (over cap) degrades to
-        // additions-only.
-        let live_ids = cap_live_ids(scan_set, PUBLIC_FOLDER_LIVE_IDS_CAP).unwrap_or_default();
+        // additions-only - emit the same one-warning-on-degrade the
+        // changes path emits, rather than silently entering the degraded
+        // mode (the documented one-warning-on-degrade contract).
+        let (live_ids, degraded) = match cap_live_ids(scan_set, PUBLIC_FOLDER_LIVE_IDS_CAP) {
+            Some(set) => (set, false),
+            None => (Vec::new(), true),
+        };
+        if degraded {
+            yield SyncEvent::Warning(Warning::support_only(
+                WarningKind::StrategyDowngraded,
+                format!(
+                    "public folder {} exceeds {} items; deletion reconcile \
+                     disabled, syncing additions only",
+                    folder.0, PUBLIC_FOLDER_LIVE_IDS_CAP,
+                ),
+            ));
+        }
+        let boundary_ids = boundary_ids_at(watermark.as_deref(), &items);
         let first = PublicFolderCursor {
             folder_id: folder.0.clone(),
             routing: routing.clone(),
             watermark,
             last_full_scan_at: None,
             live_ids,
+            boundary_ids,
+            degraded,
         };
         let cursor = match encode_cursor(scope.clone(), GraphCursorPayload::public_folder(first)) {
             Ok(cursor) => cursor,
@@ -450,9 +542,15 @@ pub(crate) fn public_folder_changes_stream(
             let ctx = GraphErrorContext::ews(AccountOperation::SyncChanges)
                 .with_scope(ErrorScope::Cursor(scope.clone()));
             yield SyncEvent::Terminated(ews_shared_scope_error(
-                EwsError::MalformedXml(bifrost_types::DiagnosticText::support_only(
-                    "EWS account net not attached".to_string(),
-                )),
+                // Not-yet-attached is a transient lifecycle condition
+                // (the engine reopens), not a malformed wire response;
+                // route it as a retryable Transport(Unsent) rather than a
+                // terminal Protocol(ParseFailed) that kills the scope.
+                EwsError::Transport(bifrost_net::Error::Network {
+                    message: "EWS account net not attached".to_string(),
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                    source: None,
+                }),
                 &scope,
                 None,
                 ctx,
@@ -477,7 +575,17 @@ pub(crate) fn public_folder_changes_stream(
                 return;
             }
         };
+        // The `>=` restriction re-fetches items sitting on the exact
+        // watermark second. Those already emitted on the prior poll are
+        // recorded in `pf.boundary_ids`; skip them so a quiet folder
+        // does not re-emit its newest item forever. A genuinely new item
+        // landing on the same second is absent from the set and emits.
+        let prior_boundary: std::collections::HashSet<&str> =
+            pf.boundary_ids.iter().map(String::as_str).collect();
         for item in &new_items {
+            if prior_boundary.contains(item.item_id.as_str()) {
+                continue;
+            }
             // EWS gives no created/updated split; emit Updated to match
             // Graph delta's convention.
             changes.push(Change::ObjectChange(ObjectChange {
@@ -503,6 +611,10 @@ pub(crate) fn public_folder_changes_stream(
             }));
         }
         pf.watermark = advance_watermark(pf.watermark.take(), &new_items);
+        // Recompute the boundary set against the advanced watermark: the
+        // ids of every item (old or new) sitting on the new boundary
+        // second, so the next poll skips exactly the items already seen.
+        pf.boundary_ids = boundary_ids_at(pf.watermark.as_deref(), &new_items);
 
         // 2. Throttled deletion reconcile.
         let now = now_unix_secs();
@@ -523,17 +635,27 @@ pub(crate) fn public_folder_changes_stream(
                         }
                     }
                     match cap_live_ids(scan_set, PUBLIC_FOLDER_LIVE_IDS_CAP) {
-                        Some(set) => pf.live_ids = set,
+                        Some(set) => {
+                            pf.live_ids = set;
+                            pf.degraded = false;
+                        }
                         None => {
                             pf.live_ids = Vec::new();
-                            warning = Some(Warning::support_only(
-                                WarningKind::StrategyDowngraded,
-                                format!(
-                                    "public folder {} exceeds {} items; deletion reconcile \
-                                     disabled, syncing additions only",
-                                    folder.0, PUBLIC_FOLDER_LIVE_IDS_CAP,
-                                ),
-                            ));
+                            // Warn only on the TRANSITION into degraded
+                            // mode; a folder that stays over cap would
+                            // otherwise re-emit this warning on every
+                            // hourly scan (spam).
+                            if !pf.degraded {
+                                warning = Some(Warning::support_only(
+                                    WarningKind::StrategyDowngraded,
+                                    format!(
+                                        "public folder {} exceeds {} items; deletion reconcile \
+                                         disabled, syncing additions only",
+                                        folder.0, PUBLIC_FOLDER_LIVE_IDS_CAP,
+                                    ),
+                                ));
+                            }
+                            pf.degraded = true;
                         }
                     }
                     pf.last_full_scan_at = Some(now);
@@ -609,6 +731,8 @@ mod tests {
             watermark: watermark.map(str::to_string),
             last_full_scan_at: last_scan,
             live_ids: live.iter().map(|s| (*s).to_string()).collect(),
+            boundary_ids: Vec::new(),
+            degraded: false,
         }
     }
 
@@ -630,6 +754,46 @@ mod tests {
         );
         // Empty batch leaves the prior watermark untouched.
         assert_eq!(advance_watermark(None, &[]), None);
+    }
+
+    #[test]
+    fn watermark_orders_by_instant_not_lexically() {
+        // Mixed fractional-second precision: `...00.5Z` is chronologically
+        // NEWER than `...00Z`, but lexically `'Z'`(0x5A) > `'.'`(0x2E)
+        // would pick `...00Z`. The instant comparison must pick the
+        // fractional one.
+        let items = vec![
+            item("a", Some("2026-03-01T10:00:00Z"), false),
+            item("b", Some("2026-03-01T10:00:00.5Z"), false),
+        ];
+        assert_eq!(
+            advance_watermark(None, &items).as_deref(),
+            Some("2026-03-01T10:00:00.5Z")
+        );
+        // A prior fractional watermark must not regress to a whole-second
+        // value that is chronologically older.
+        assert_eq!(
+            advance_watermark(
+                Some("2026-03-01T10:00:00.9Z".to_string()),
+                &[item("c", Some("2026-03-01T10:00:00Z"), false)],
+            )
+            .as_deref(),
+            Some("2026-03-01T10:00:00.9Z")
+        );
+    }
+
+    #[test]
+    fn boundary_ids_collects_items_at_watermark() {
+        let items = vec![
+            item("old", Some("2026-03-01T09:00:00Z"), false),
+            item("edge1", Some("2026-03-05T12:00:00Z"), false),
+            item("edge2", Some("2026-03-05T12:00:00Z"), false),
+        ];
+        let wm = advance_watermark(None, &items);
+        let boundary = boundary_ids_at(wm.as_deref(), &items);
+        assert_eq!(boundary, vec!["edge1".to_string(), "edge2".to_string()]);
+        // No watermark -> no boundary set.
+        assert!(boundary_ids_at(None, &items).is_empty());
     }
 
     #[test]

@@ -214,4 +214,72 @@ mod tests {
 
         assert!(check_soap_fault(xml).is_ok());
     }
+
+    // A 200-OK EWS body whose ResponseMessage is ResponseClass="Error"
+    // carries the application failure in `<m:ResponseCode>`, NOT a SOAP
+    // `<Fault>`. `check_response_error` must surface it so the response
+    // does not parse to an empty success.
+    #[test]
+    fn response_class_error_access_denied_is_classified() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Access is denied. Check credentials and try again.</m:MessageText>
+          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        match check_response_error(xml).expect_err("error response must classify") {
+            EwsError::SoapFault { code, detail } => {
+                assert_eq!(code, SoapFaultCode::ErrorAccessDenied);
+                assert!(detail.as_str().contains("Access is denied"));
+            }
+            other => panic!("expected SoapFault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_class_error_server_busy_is_classified() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:MessageText>The server is busy. Please try again later.</m:MessageText>
+          <m:ResponseCode>ErrorServerBusy</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        match check_response_error(xml).expect_err("throttle response must classify") {
+            EwsError::SoapFault { code, .. } => {
+                assert_eq!(code, SoapFaultCode::ErrorServerBusy);
+            }
+            other => panic!("expected SoapFault, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_class_success_passes() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        assert!(check_response_error(xml).is_ok());
+    }
 }

@@ -93,6 +93,25 @@ pub(crate) struct PublicFolderCursor {
     /// skipped.
     #[serde(default)]
     pub(crate) live_ids: Vec<String>,
+    /// Ids whose `received_at` equals the current `watermark`, captured
+    /// on the last incremental poll. The incremental `FindItem`
+    /// restriction is `>=` (so items sharing the boundary second are not
+    /// missed), which means the boundary item(s) re-appear on every
+    /// subsequent poll. Skipping ids in this set prevents a quiet folder
+    /// from re-emitting its newest item as `Updated`+`Added` forever,
+    /// while still admitting a genuinely new item that lands on the same
+    /// boundary second. Additive (`serde(default)`); a v1 cursor without
+    /// it just re-emits the boundary once, then converges.
+    #[serde(default)]
+    pub(crate) boundary_ids: Vec<String>,
+    /// Whether the folder is in the over-cap additions-only degraded
+    /// mode (deletion reconcile disabled). Distinct from "empty
+    /// `live_ids`", which is ambiguous (an empty folder also has none).
+    /// Tracking it explicitly lets the changes path warn only on the
+    /// *transition* into degraded mode instead of re-warning on every
+    /// hourly scan. Additive (`serde(default)` -> `false`).
+    #[serde(default)]
+    pub(crate) degraded: bool,
 }
 
 /// Public-folder EWS routing context. Carried in the cursor so the
@@ -445,6 +464,8 @@ mod tests {
             watermark: Some("2026-03-01T10:00:00Z".to_string()),
             last_full_scan_at: Some(1_700_000_000),
             live_ids: vec!["a".to_string(), "b".to_string()],
+            boundary_ids: vec!["b".to_string()],
+            degraded: false,
         }
     }
 

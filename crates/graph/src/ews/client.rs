@@ -1,4 +1,7 @@
-use super::{EWS_URL, EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_soap_fault};
+use super::{
+    EWS_URL, EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_response_error,
+    check_soap_fault,
+};
 
 impl EwsClient {
     pub(crate) fn new(net: bifrost_net::AccountNet) -> Self {
@@ -46,7 +49,14 @@ impl EwsClient {
         }
 
         let xml = String::from_utf8_lossy(resp.body.as_ref()).into_owned();
+        // Two distinct error shapes ride inside a 200 OK: a SOAP
+        // `<Fault>` (transport/envelope failure) and the canonical EWS
+        // application error `ResponseClass="Error"` / `<m:ResponseCode>`.
+        // Inspect both before any parser sees the body, so an
+        // `ErrorAccessDenied` / `ErrorServerBusy` is classified instead
+        // of degrading to an empty success.
         check_soap_fault(&xml)?;
+        check_response_error(&xml)?;
         Ok(xml)
     }
 }

@@ -90,7 +90,15 @@ pub(crate) fn decode_replica_list(base64_data: &str) -> Result<Vec<String>, EwsE
     let bytes = BASE64
         .decode(base64_data)
         .map_err(|e| malformed(format!("Failed to decode base64 replica list: {e}")))?;
+    Ok(decode_replica_bytes(&bytes))
+}
 
+/// Parse already-decoded `PR_REPLICA_LIST` bytes into GUID strings. The
+/// `GetFolder` parser already base64-decoded the `<t:Value>` into raw
+/// bytes, so callers holding the bytes use this directly rather than
+/// re-encoding to base64 only to have `decode_replica_list` decode it
+/// straight back.
+pub(crate) fn decode_replica_bytes(bytes: &[u8]) -> Vec<String> {
     let mut guids = Vec::new();
     let mut start = 0;
 
@@ -108,7 +116,7 @@ pub(crate) fn decode_replica_list(base64_data: &str) -> Result<Vec<String>, EwsE
         }
     }
 
-    Ok(guids)
+    guids
 }
 
 // ── Response parsers ────────────────────────────────────────
@@ -220,6 +228,11 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
     let mut in_folder = false;
     let mut in_effective_rights = false;
     let mut in_extended_property = false;
+    // PropertyTag of the current ExtendedProperty's ExtendedFieldURI.
+    // The Value is only treated as the replica list when this is the
+    // PR_REPLICA_LIST tag (0x6698), so any other ExtendedProperty whose
+    // Value happens to be base64-decodable cannot be mis-assigned.
+    let mut current_property_tag = String::new();
     let mut current_tag = String::new();
     let mut buf = String::new();
 
@@ -246,6 +259,10 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                 }
                 if in_folder && local == "ExtendedProperty" {
                     in_extended_property = true;
+                    current_property_tag.clear();
+                }
+                if in_extended_property && local == "ExtendedFieldURI" {
+                    current_property_tag = extract_attribute(e, "PropertyTag");
                 }
                 current_tag = local.to_string();
                 buf.clear();
@@ -259,6 +276,9 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                 let local = strip_ns(&name);
                 if in_folder && local == "FolderId" {
                     folder_id = extract_attribute(e, "Id");
+                }
+                if in_extended_property && local == "ExtendedFieldURI" {
+                    current_property_tag = extract_attribute(e, "PropertyTag");
                 }
             }
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
@@ -275,6 +295,7 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
                     }
                 } else if in_extended_property {
                     if current_tag == "Value"
+                        && is_replica_list_tag(&current_property_tag)
                         && !trimmed.is_empty()
                         && let Ok(bytes) = BASE64.decode(trimmed)
                     {
@@ -321,6 +342,13 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
 
 pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, EwsError> {
     let mut reader = Reader::from_str(xml);
+    // NOTE: only `<t:Message>` items are projected (non-Message classes -
+    // calendar/contact/task - are a documented follow-up), so `items.len()`
+    // can be < `total_count` (`TotalItemsInView`), which counts ALL
+    // classes. This is consistent for the public-folder cursor diff
+    // because the inventory establish pass drops the same classes, so the
+    // live-id baseline and the incremental poll both see Messages only; a
+    // mixed-class folder simply never tracks its non-Message items.
     let mut items = Vec::new();
 
     let mut total_count: u32 = 0;
@@ -604,6 +632,18 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
 }
 
 // ── Shared helpers ──────────────────────────────────────────
+
+/// Whether an `ExtendedFieldURI` PropertyTag names PR_REPLICA_LIST
+/// (`0x6698`). EWS emits the hex form; accept either case and the bare
+/// `6698`, plus the decimal equivalent for completeness.
+fn is_replica_list_tag(tag: &str) -> bool {
+    let normalized = tag
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| tag.trim().strip_prefix("0X"))
+        .unwrap_or_else(|| tag.trim());
+    normalized.eq_ignore_ascii_case("6698") || tag.trim() == "26264"
+}
 
 fn is_folder_tag(local: &str) -> bool {
     matches!(
@@ -1017,6 +1057,37 @@ mod tests {
         let guids = decode_replica_list(&b64_round).expect("decode should succeed");
         assert_eq!(guids.len(), 1);
         assert_eq!(guids[0], guid);
+    }
+
+    #[test]
+    fn get_folder_ignores_non_replica_extended_property() {
+        // A base64-decodable Value under a DIFFERENT PropertyTag must not
+        // be mis-assigned as the replica list.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetFolderResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                         xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetFolderResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Folders>
+            <t:Folder>
+              <t:FolderId Id="AAMkPF=" ChangeKey="CK1"/>
+              <t:DisplayName>No Replica</t:DisplayName>
+              <t:ExtendedProperty>
+                <t:ExtendedFieldURI PropertyTag="0x1234" PropertyType="Binary"/>
+                <t:Value>QUJDRA==</t:Value>
+              </t:ExtendedProperty>
+            </t:Folder>
+          </m:Folders>
+        </m:GetFolderResponseMessage>
+      </m:ResponseMessages>
+    </m:GetFolderResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let folder = parse_get_folder_response(xml).expect("parse should succeed");
+        assert!(folder.replica_list.is_none());
     }
 
     #[test]

@@ -162,6 +162,109 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
     Ok(())
 }
 
+/// Inspect a 200-OK EWS response body for an application-level error
+/// carried in the canonical `ResponseClass="Error"` / `<m:ResponseCode>`
+/// shape (distinct from a SOAP `<Fault>`, which `check_soap_fault`
+/// handles). EWS reports the overwhelming majority of operation failures
+/// (`ErrorAccessDenied`, `ErrorServerBusy`, `ErrorItemNotFound`, and so
+/// on) this way inside an HTTP 200, not as a SOAP fault. Without this the
+/// failed response parses to an empty success: a revoked or throttled
+/// public folder would read as "zero items" and the deletion reconcile
+/// would emit a spurious mass-`Destroyed` while the cursor advanced.
+///
+/// The first `ResponseMessage` whose `ResponseClass="Error"` wins; its
+/// `<m:ResponseCode>` token is mapped through `SoapFaultCode::parse`
+/// (the same `ErrorXxx` vocabulary) and the optional `<m:MessageText>`
+/// becomes the support-only detail. A `ResponseClass="Warning"` is not
+/// an error and is ignored. `NoError` / `Success` pass through.
+pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
+    use super::SoapFaultCode;
+    use bifrost_types::DiagnosticText;
+
+    let mut reader = Reader::from_str(xml);
+    let mut in_error_message = false;
+    let mut in_response_code = false;
+    let mut in_message_text = false;
+    let mut response_code = String::new();
+    let mut message_text = String::new();
+    let mut buf = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let local = strip_ns(&name);
+                if extract_attribute(e, "ResponseClass") == "Error" {
+                    in_error_message = true;
+                }
+                if in_error_message && local == "ResponseCode" {
+                    in_response_code = true;
+                }
+                if in_error_message && local == "MessageText" {
+                    in_message_text = true;
+                }
+                buf.clear();
+            }
+            Ok(Event::Text(ref e)) => {
+                if let Ok(raw) = std::str::from_utf8(e.as_ref())
+                    && let Ok(text) = unescape(raw)
+                {
+                    buf.push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::End(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let local = strip_ns(&name);
+                if in_response_code && local == "ResponseCode" {
+                    response_code = buf.trim().to_string();
+                    in_response_code = false;
+                }
+                if in_message_text && local == "MessageText" {
+                    message_text = buf.trim().to_string();
+                    in_message_text = false;
+                }
+                // The first errored ResponseMessage decides the
+                // classification; stop once we have its code.
+                if in_error_message && !response_code.is_empty() {
+                    break;
+                }
+                buf.clear();
+            }
+            Ok(Event::Eof) => break,
+            // A parse error here is reported as malformed XML, identical
+            // to the per-operation parsers, rather than silently treated
+            // as success.
+            Err(error) => {
+                return Err(super::EwsError::MalformedXml(DiagnosticText::support_only(
+                    format!("EWS response error scan failed: {error}"),
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    if in_error_message && !response_code.is_empty() {
+        // `NoError` on an Error-classed message is contradictory; treat
+        // any non-NoError code as the fault. `SoapFaultCode::parse` maps
+        // the EWS `ErrorXxx` vocabulary onto the shared taxonomy and
+        // collapses the unrecognized rest onto `Unknown`.
+        if response_code != "NoError" {
+            let detail = if message_text.is_empty() {
+                format!("EWS ResponseCode {response_code}")
+            } else {
+                format!("{response_code}: {message_text}")
+            };
+            return Err(super::EwsError::SoapFault {
+                code: SoapFaultCode::parse(&response_code),
+                detail: DiagnosticText::support_only(detail),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 // quick-xml 0.36+ emits Event::GeneralRef separately from Event::Text, so
 // every parser that accumulates body text needs to fold these back in or
 // `&lt;` and friends silently vanish.

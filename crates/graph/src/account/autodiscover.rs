@@ -140,19 +140,65 @@ impl GraphAccount {
         email: &str,
         settings: &[&str],
     ) -> Result<Vec<(String, String)>, AccountError> {
-        let body = build_get_user_settings_soap(email, settings);
-        let xml = self
-            .autodiscover_post(
-                AUTODISCOVER_SOAP_URL,
-                "text/xml; charset=utf-8",
-                Some((
-                    "SOAPAction",
-                    "\"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetUserSettings\"",
-                )),
-                body,
-            )
-            .await?;
-        Ok(parse_user_settings(&xml))
+        // Autodiscover redirects (`RedirectAddr` to a new email,
+        // `RedirectUrl` to a new endpoint) are common for hybrid /
+        // on-prem tenants and ride in-body, not as an HTTP 3xx. Follow a
+        // bounded chain; the cap guards against a redirect loop.
+        const MAX_REDIRECTS: usize = 5;
+        let mut url = AUTODISCOVER_SOAP_URL.to_string();
+        let mut email = email.to_string();
+
+        for _ in 0..=MAX_REDIRECTS {
+            let body = build_get_user_settings_soap(&email, settings);
+            let xml = self
+                .autodiscover_post(
+                    &url,
+                    "text/xml; charset=utf-8",
+                    Some((
+                        "SOAPAction",
+                        "\"http://schemas.microsoft.com/exchange/2010/Autodiscover/Autodiscover/GetUserSettings\"",
+                    )),
+                    body,
+                )
+                .await?;
+            let parsed = parse_user_settings_response(&xml);
+
+            // A redirect target reroutes the lookup. `RedirectAddr`
+            // (or any non-URL target) is a new mailbox to query against
+            // the same endpoint; `RedirectUrl` is a new endpoint for the
+            // same mailbox.
+            if let Some(target) = parsed.redirect_target.as_deref() {
+                if target.starts_with("http://") || target.starts_with("https://") {
+                    url = target.to_string();
+                } else {
+                    email = target.to_string();
+                }
+                continue;
+            }
+
+            // An in-body error other than `NoError` is a real failure,
+            // not an empty result. Surface it classified rather than
+            // returning an empty settings vec the caller misreads as
+            // "missing PublicFolderInformation".
+            if let Some(code) = parsed
+                .error_code
+                .as_deref()
+                .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("NoError"))
+            {
+                let detail = parsed.error_message.as_deref().unwrap_or("");
+                return Err(super::graph_error::invalid_account_error(
+                    AccountOperation::Discover,
+                    format!("Autodiscover GetUserSettings error {code}: {detail}"),
+                ));
+            }
+
+            return Ok(parsed.settings);
+        }
+
+        Err(super::graph_error::invalid_account_error(
+            AccountOperation::Discover,
+            "Autodiscover GetUserSettings exceeded redirect limit",
+        ))
     }
 
     /// Shared transport for both Autodiscover endpoints. Routes the
@@ -234,11 +280,36 @@ fn build_get_user_settings_soap(email: &str, settings: &[&str]) -> String {
 
 // ── Pure parsers (copy-direct from ratatoskr) ───────────────
 
+/// The parsed shape of a `GetUserSettings` response. EWS Autodiscover
+/// returns failures and redirects INSIDE an HTTP 200 (the in-body
+/// `<a:ErrorCode>` / `<a:RedirectTarget>`), so a status-only check reads
+/// a failed or redirecting response as an empty settings vec. This
+/// captures all three so the caller can act on them.
+#[derive(Debug, Default)]
+pub(crate) struct UserSettingsResponse {
+    pub(crate) settings: Vec<(String, String)>,
+    /// In-body `<a:ErrorCode>` (`NoError` / empty when absent).
+    pub(crate) error_code: Option<String>,
+    pub(crate) error_message: Option<String>,
+    /// In-body `<a:RedirectTarget>` (the SMTP address or URL to retry
+    /// against; common for hybrid / on-prem tenants).
+    pub(crate) redirect_target: Option<String>,
+}
+
 /// Parse `UserSetting` `<Name>`/`<Value>` pairs from a
-/// `GetUserSettings` SOAP response.
+/// `GetUserSettings` SOAP response. Thin wrapper over
+/// `parse_user_settings_response` for the settings-only tests; the
+/// production path consumes the full response (error/redirect markers).
+#[cfg(test)]
 fn parse_user_settings(xml: &str) -> Vec<(String, String)> {
+    parse_user_settings_response(xml).settings
+}
+
+/// Parse a `GetUserSettings` response into settings plus the in-body
+/// error / redirect markers.
+fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
     let mut reader = Reader::from_str(xml);
-    let mut settings = Vec::new();
+    let mut out = UserSettingsResponse::default();
 
     let mut in_user_setting = false;
     let mut current_name = String::new();
@@ -262,18 +333,38 @@ fn parse_user_settings(xml: &str) -> Vec<(String, String)> {
             Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
             Ok(Event::End(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().local_name().as_ref()).to_string();
+                let trimmed = buf.trim();
                 if in_user_setting {
-                    let trimmed = buf.trim();
                     match current_tag.as_str() {
                         "Name" => current_name = trimmed.to_string(),
+                        // A legitimately-empty setting Value is retained
+                        // (a present-but-empty setting is not the same as
+                        // an absent one).
                         "Value" => current_value = trimmed.to_string(),
+                        _ => {}
+                    }
+                } else {
+                    // Response-level (not per-UserSetting) markers.
+                    match current_tag.as_str() {
+                        "ErrorCode" if out.error_code.is_none() => {
+                            out.error_code = Some(trimmed.to_string());
+                        }
+                        "ErrorMessage" if out.error_message.is_none() && !trimmed.is_empty() => {
+                            out.error_message = Some(trimmed.to_string());
+                        }
+                        "RedirectTarget" if out.redirect_target.is_none() && !trimmed.is_empty() => {
+                            out.redirect_target = Some(trimmed.to_string());
+                        }
                         _ => {}
                     }
                 }
                 if name == "UserSetting" {
                     in_user_setting = false;
-                    if !current_name.is_empty() && !current_value.is_empty() {
-                        settings.push((current_name.clone(), current_value.clone()));
+                    // Keep the pair when a Name is present; an empty Value
+                    // is a legitimate setting, not a reason to drop it.
+                    if !current_name.is_empty() {
+                        out.settings
+                            .push((current_name.clone(), current_value.clone()));
                     }
                 }
                 buf.clear();
@@ -284,7 +375,7 @@ fn parse_user_settings(xml: &str) -> Vec<(String, String)> {
         }
     }
 
-    settings
+    out
 }
 
 /// Parse `AlternativeMailbox` elements from an Autodiscover XML response.
@@ -526,6 +617,84 @@ mod tests {
   </s:Body>
 </s:Envelope>"#;
         assert!(parse_user_settings(xml).is_empty());
+    }
+
+    #[test]
+    fn user_settings_in_body_error_is_captured() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>InvalidUser</a:ErrorCode>
+        <a:ErrorMessage>The user could not be found.</a:ErrorMessage>
+        <a:UserResponses>
+          <a:UserResponse>
+            <a:UserSettings/>
+          </a:UserResponse>
+        </a:UserResponses>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#;
+        let parsed = parse_user_settings_response(xml);
+        assert!(parsed.settings.is_empty());
+        assert_eq!(parsed.error_code.as_deref(), Some("InvalidUser"));
+        assert_eq!(
+            parsed.error_message.as_deref(),
+            Some("The user could not be found.")
+        );
+    }
+
+    #[test]
+    fn user_settings_redirect_target_is_captured() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>RedirectAddress</a:ErrorCode>
+        <a:RedirectTarget>user@redirected.contoso.com</a:RedirectTarget>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#;
+        let parsed = parse_user_settings_response(xml);
+        assert_eq!(
+            parsed.redirect_target.as_deref(),
+            Some("user@redirected.contoso.com")
+        );
+    }
+
+    #[test]
+    fn user_settings_retains_empty_value() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            xmlns:a="http://schemas.microsoft.com/exchange/2010/Autodiscover">
+  <s:Body>
+    <a:GetUserSettingsResponseMessage>
+      <a:Response>
+        <a:ErrorCode>NoError</a:ErrorCode>
+        <a:UserResponses>
+          <a:UserResponse>
+            <a:UserSettings>
+              <a:UserSetting>
+                <a:Name>PresentButEmpty</a:Name>
+                <a:Value></a:Value>
+              </a:UserSetting>
+            </a:UserSettings>
+          </a:UserResponse>
+        </a:UserResponses>
+      </a:Response>
+    </a:GetUserSettingsResponseMessage>
+  </s:Body>
+</s:Envelope>"#;
+        let parsed = parse_user_settings_response(xml);
+        assert_eq!(parsed.settings.len(), 1);
+        assert_eq!(parsed.settings[0].0, "PresentButEmpty");
+        assert_eq!(parsed.settings[0].1, "");
     }
 
     #[test]

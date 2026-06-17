@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountOperation, CursorScope, DiagnosticText, FolderId, HintPayload, InvalidationHint,
-    ObjectType, PushSource, WatchEvent,
+    AccountOperation, CursorScope, DiagnosticText, HintPayload, InvalidationHint, PushSource,
+    WatchEvent,
 };
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
@@ -323,7 +323,12 @@ async fn run_get_events_loop(
     account: &GraphAccount,
     subscription: EwsStreamingSubscription,
 ) -> StreamLoopExit {
-    let mut subscription_id = subscription.subscription_id;
+    // The subscription this loop polls is fixed for the lifetime of the
+    // loop; the worker re-subscribes (minting a fresh id) on reconnect.
+    // Re-reading the id from the shared state map each iteration was
+    // fragile - it returned the first state's id, which under the
+    // stamp-all behavior is whatever the last resubscribe wrote.
+    let subscription_id = subscription.subscription_id;
     loop {
         if account.shutdown.is_cancelled() {
             return StreamLoopExit::Shutdown;
@@ -341,33 +346,51 @@ async fn run_get_events_loop(
                             )
                             .await;
                         }
-                        let scope = match notification.parent_folder_id.as_deref() {
-                            Some(folder_id) => scope_for_folder(account, folder_id).await,
-                            None => None,
-                        }
-                        .unwrap_or_else(|| CursorScope::FolderType {
-                            folder: FolderId(
-                                notification.parent_folder_id.clone().unwrap_or_default(),
-                            ),
-                            ty: ObjectType::Email,
-                        });
+                        // A notification with a parent folder id resolves
+                        // to a known subscribed scope -> a specific hint.
+                        // One without it (a status/keep-alive-style frame,
+                        // or an unmapped folder) must NOT fabricate a
+                        // `FolderType { folder: FolderId(""), .. }` - that
+                        // is a hint for a scope that does not exist. Emit
+                        // an account-wide `Unknown` hint so the reconciler
+                        // re-checks broadly instead of chasing an empty id.
+                        let payload = match notification.parent_folder_id.as_deref() {
+                            Some(folder_id) => match scope_for_folder(account, folder_id).await {
+                                Some(scope) => HintPayload::SpecificCursorScope(scope),
+                                None => HintPayload::Unknown,
+                            },
+                            None => HintPayload::Unknown,
+                        };
                         let _ = account.push_tx.send(WatchEvent::Invalidated {
                             hint: InvalidationHint {
                                 source: PushSource::EwsStreaming,
-                                payload: HintPayload::SpecificCursorScope(scope),
+                                payload,
                             },
                         });
                     }
                 }
                 Err(error) => {
-                    // Parse failures during streaming are a Graph EWS
-                    // contract violation; surface them as a typed
-                    // terminal so the engine routes through recovery.
+                    // A parse miss mid-long-poll is not necessarily a
+                    // permanent contract violation: Microsoft interleaves
+                    // keep-alive / status frames into the streaming
+                    // response, and a single malformed chunk should
+                    // reconnect (re-subscribe), not tear push down for
+                    // good. The HTTP-error branch already reconnects;
+                    // treat a transient parse failure the same way rather
+                    // than terminating.
                     let account_error = ews_error_to_account_error(
                         EwsError::MalformedXml(DiagnosticText::support_only(error)),
                         GraphErrorContext::ews(AccountOperation::PushStream),
                     );
-                    return StreamLoopExit::Terminated(account_error);
+                    let telemetry = account_error.telemetry_fields();
+                    tracing::warn!(
+                        target: "bifrost_graph::ews",
+                        message_key = telemetry.message_key,
+                        recovery = telemetry.recovery_discriminant,
+                        "EWS GetStreamingEvents parse failed; reconnecting"
+                    );
+                    let _ = account.push_tx.send(WatchEvent::Disconnected);
+                    return StreamLoopExit::Disconnected;
                 }
             },
             Err(error) => {
@@ -389,9 +412,6 @@ async fn run_get_events_loop(
                 return StreamLoopExit::Disconnected;
             }
         }
-        subscription_id = current_subscription_id(account)
-            .await
-            .unwrap_or(subscription_id);
     }
 }
 
@@ -408,7 +428,15 @@ async fn record_subscription_id(account: &GraphAccount, subscription: &EwsStream
     let mut states = account.ews_subscriptions.write().await;
     for state in states.values_mut() {
         state.ews_subscription_id = Some(subscription.subscription_id.clone());
-        state.watermark = subscription.watermark.clone();
+        // Seed the watermark only for a state that has none yet. The
+        // worker subscribes to the union of all handles' folders and
+        // resubscribes on every reconnect; blindly overwriting here would
+        // discard per-handle watermark progress recorded by
+        // `record_watermark` since the last subscribe, replaying already
+        // delivered notifications (or, worse, regressing past them).
+        if state.watermark.is_none() {
+            state.watermark = subscription.watermark.clone();
+        }
     }
 }
 
@@ -432,13 +460,6 @@ async fn record_watermark(account: &GraphAccount, subscription_id: Option<&str>,
 async fn current_watermark(account: &GraphAccount) -> Option<String> {
     let states = account.ews_subscriptions.read().await;
     states.values().find_map(|state| state.watermark.clone())
-}
-
-async fn current_subscription_id(account: &GraphAccount) -> Option<String> {
-    let states = account.ews_subscriptions.read().await;
-    states
-        .values()
-        .find_map(|state| state.ews_subscription_id.clone())
 }
 
 async fn scope_for_folder(account: &GraphAccount, folder_id: &str) -> Option<CursorScope> {

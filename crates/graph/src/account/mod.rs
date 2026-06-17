@@ -989,6 +989,8 @@ mod tests {
             watermark: Some("2026-03-01T10:00:00Z".to_string()),
             last_full_scan_at: None,
             live_ids: Vec::new(),
+            boundary_ids: Vec::new(),
+            degraded: false,
         };
         encode_cursor(
             CursorScope::Folder(FolderId(folder.to_string())),

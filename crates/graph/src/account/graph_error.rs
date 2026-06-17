@@ -9,7 +9,6 @@
 //! `GraphSignal`. No path in this module looks at `error.message` text
 //! for control flow.
 
-use bifrost_net::error::cap_status_body;
 use bifrost_net::{NetErrorContext, parse_retry_after};
 use bifrost_types::{
     AccessCause, AccessErrorKind, AccountError, AccountErrorBuilder, AccountErrorKind,
@@ -97,9 +96,11 @@ pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext
         EwsError::HttpStatus { status, body } => {
             // Wrap the raw HTTP failure as a Graph-style response so
             // the standard status-fallback classification applies,
-            // but stamp the protocol as EWS via the context.
-            let response =
-                GraphResponseError::from_response(status, HeaderMap::new(), cap_status_body(body));
+            // but stamp the protocol as EWS via the context. The body
+            // is passed uncapped: `response_to_account_error` caps it
+            // once via `body_diagnostic`; capping here first would
+            // double-truncate (cap, then cap the capped string).
+            let response = GraphResponseError::from_response(status, HeaderMap::new(), body);
             response_to_account_error(response, &ctx)
         }
         EwsError::SoapFault { code, detail } => soap_fault_to_account_error(code, detail, &ctx),
@@ -130,14 +131,21 @@ fn soap_fault_to_account_error(
     // `<detail>` payload, but that is support-only diagnostics; we
     // do not branch UX on the string.
     let resource = resource_from_scope(ctx.scope.as_ref());
-    let (kind, cause) = match code {
+    // The third element flags a throttle path (rate-limit / quota): the
+    // engine needs a `throttle_scope` so it buckets the EWS backoff at
+    // the tenant level. Without it `ErrorServerBusy` -> `RateLimited`
+    // carries no scope and the EWS worker hot-loops on `SameRequest`,
+    // mirroring the REST 429 path which correctly stamps `Tenant`.
+    let (kind, cause, throttle) = match code {
         SoapFaultCode::Server => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            false,
         ),
         SoapFaultCode::Client | SoapFaultCode::MustUnderstand | SoapFaultCode::VersionMismatch => (
             AccountErrorKind::Server(ServerErrorKind::Error { status: Some(400) }),
             Cause::Server(ServerCause::Error { status: Some(400) }),
+            false,
         ),
         // Microsoft EWS specific faults the convergence audit
         // identified as recoverable but previously collapsed to
@@ -145,14 +153,17 @@ fn soap_fault_to_account_error(
         SoapFaultCode::ErrorAccessDenied => (
             AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
             Cause::Access(AccessCause::PermissionDenied { resource }),
+            false,
         ),
         SoapFaultCode::ErrorImpersonateUserDenied => (
             AccountErrorKind::Authorization(AccessErrorKind::ConditionalAccessBlocked),
             Cause::Access(AccessCause::ConditionalAccessBlocked),
+            false,
         ),
         SoapFaultCode::ErrorServerBusy => (
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
             Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+            true,
         ),
         SoapFaultCode::ErrorMailboxStoreUnavailable | SoapFaultCode::ErrorMailboxMoveInProgress => {
             (
@@ -162,6 +173,7 @@ fn soap_fault_to_account_error(
                 Cause::Access(AccessCause::MailboxUnavailable {
                     kind: MailboxUnavailableKind::Transient,
                 }),
+                false,
             )
         }
         SoapFaultCode::ErrorNonExistentMailbox => (
@@ -170,6 +182,7 @@ fn soap_fault_to_account_error(
                 what: ResourceKind::Mailbox,
                 id: id_from_scope(ctx.scope.as_ref()),
             }),
+            false,
         ),
         SoapFaultCode::ErrorItemNotFound => (
             AccountErrorKind::NotFound(ResourceKind::Message),
@@ -177,6 +190,7 @@ fn soap_fault_to_account_error(
                 what: ResourceKind::Message,
                 id: id_from_scope(ctx.scope.as_ref()),
             }),
+            false,
         ),
         SoapFaultCode::Unknown => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -184,10 +198,14 @@ fn soap_fault_to_account_error(
                 protocol: ctx.protocol,
                 detail: Some(detail.clone()),
             }),
+            false,
         ),
     };
-    let builder = base_builder(ctx, kind, cause).text(detail);
-    let builder = push_attempt(builder, TransmissionState::Acknowledged);
+    let mut builder = base_builder(ctx, kind, cause).text(detail);
+    builder = push_attempt(builder, TransmissionState::Acknowledged);
+    if throttle && let Some(scope) = throttle_scope_for(ctx) {
+        builder = builder.throttle_scope(scope);
+    }
     finish(builder, ctx)
 }
 
@@ -368,16 +386,7 @@ fn classify(
             Cause::State(StateCause::ConcurrencyConflict),
             false,
         ),
-        GraphSignal::Gone => {
-            // 410 Gone on a cursor scope is the canonical
-            // SyncState(CursorInvalid) -> Engine(RestartScope) signal.
-            // Outside cursor context, 410 is a permanent server error.
-            if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
-                cursor_invalid_or_protocol(ctx)
-            } else {
-                server_error_tuple(410)
-            }
-        }
+        GraphSignal::Gone => gone_410(ctx),
         GraphSignal::NotFound => match resource_from_scope(ctx.scope.as_ref()) {
             Some(resource) => (
                 AccountErrorKind::NotFound(resource),
@@ -434,6 +443,18 @@ fn cursor_invalid_or_protocol(ctx: &GraphErrorContext) -> (AccountErrorKind, Cau
     }
 }
 
+/// 410 Gone classification, single-sourced so the `GraphSignal::Gone`
+/// and the status-fallback `410` arms cannot drift. On a cursor scope it
+/// is the canonical `SyncState(CursorInvalid)` -> `Engine(RestartScope)`
+/// signal; outside cursor context it is a permanent server error.
+fn gone_410(ctx: &GraphErrorContext) -> (AccountErrorKind, Cause, bool) {
+    if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) {
+        cursor_invalid_or_protocol(ctx)
+    } else {
+        server_error_tuple(410)
+    }
+}
+
 fn classify_by_status(
     ctx: &GraphErrorContext,
     code: u16,
@@ -475,8 +496,7 @@ fn classify_by_status(
             Cause::State(StateCause::ConcurrencyConflict),
             false,
         ),
-        410 if matches!(ctx.scope, Some(ErrorScope::Cursor(_))) => cursor_invalid_or_protocol(ctx),
-        410 => server_error_tuple(code),
+        410 => gone_410(ctx),
         408 | 502 | 503 | 504 => (
             AccountErrorKind::Server(ServerErrorKind::Unavailable),
             Cause::Server(ServerCause::Unavailable { retry_hint }),
@@ -498,9 +518,11 @@ fn classify_by_status(
 
 /// `signal == None`: the body did not decode as a Graph error
 /// envelope. For 5xx the status is enough to classify as
-/// `Server(Unavailable)`. For 4xx without a typed code we treat the
-/// response as a provider-contract violation since Graph documents
-/// every error code it ships.
+/// `Server(Unavailable)`. Only a 4xx carrying a *non-empty* body that
+/// failed to parse as a Graph error envelope is treated as a
+/// provider-contract violation (Graph documents every error code it
+/// ships, so a non-empty body that does not decode is anomalous); an
+/// empty 4xx falls through to the plain status mapping.
 fn classify_no_envelope(
     ctx: &GraphErrorContext,
     code: u16,
@@ -1628,6 +1650,86 @@ mod tests {
             *err.recovery(),
             RecoveryClass::Engine(EngineDirective::DisableScope(scope))
         );
+    }
+
+    // End-to-end through the WIRE parse path: a 200-OK EWS body whose
+    // ResponseMessage is `ResponseClass="Error"` / `ErrorAccessDenied`
+    // (the canonical EWS error shape, NOT a SOAP `<Fault>`) must reach
+    // `check_response_error` -> `EwsError::SoapFault` ->
+    // `ews_shared_scope_error` -> `ScopeRevoked` -> `DisableScope`. The
+    // direct-construction test above bypasses the parse; this one proves
+    // the quarantine is reachable from the actual response body.
+    #[test]
+    fn wire_error_access_denied_quarantines_public_folder_scope() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Access is denied.</m:MessageText>
+          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let parsed = crate::ews::check_response_error(xml)
+            .expect_err("ResponseClass=Error must surface as an EwsError");
+
+        let scope = CursorScope::Folder(bifrost_types::FolderId("AAMkPF=".to_string()));
+        let owner = MailboxId("content@contoso.com".to_string());
+        let err = ews_shared_scope_error(
+            parsed,
+            &scope,
+            Some(&owner),
+            GraphErrorContext::ews(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        assert_eq!(
+            *err.recovery(),
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope))
+        );
+    }
+
+    // End-to-end through the wire parse: `ErrorServerBusy` in a 200-OK
+    // body must reach `Server(RateLimited)` with a `Tenant` throttle
+    // scope so the EWS worker backs off instead of hot-looping.
+    #[test]
+    fn wire_error_server_busy_is_rate_limited_with_tenant_throttle() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Error">
+          <m:MessageText>The server is busy.</m:MessageText>
+          <m:ResponseCode>ErrorServerBusy</m:ResponseCode>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let parsed = crate::ews::check_response_error(xml).expect_err("ServerBusy must surface");
+        let err = ews_error_to_account_error(
+            parsed,
+            GraphErrorContext::ews(AccountOperation::PushStream),
+        );
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Server(ServerErrorKind::RateLimited)
+        ));
+        match err.recovery() {
+            RecoveryClass::Retry(advice) => {
+                assert_eq!(advice.throttle_scope, Some(ThrottleScope::Tenant));
+            }
+            other => panic!("expected Retry, got {other:?}"),
+        }
     }
 
     #[test]
