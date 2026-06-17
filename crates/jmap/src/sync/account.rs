@@ -148,6 +148,19 @@ impl JmapAccount {
             .map(bifrost_types::MailboxId)
     }
 
+    /// True when `scope` is a `Folder` scope that parses as a foreign
+    /// (shared/delegate) mailbox but whose account is no longer
+    /// registered in `foreign_mail`. This happens when a foreign scope
+    /// was seeded at a prior `open` but the foreign account has since
+    /// disappeared from the session (revoked delegation, removed share).
+    /// Such a scope must NOT silently fall back to the primary account in
+    /// `mail_for_scope`: the foreign mailbox id (e.g. `inbox`) would then
+    /// resolve against the *primary* mailbox, conflating two accounts.
+    /// Callers route it to a terminal error instead.
+    pub(crate) fn is_unregistered_foreign_scope(&self, scope: &CursorScope) -> bool {
+        is_unregistered_foreign(scope, |id| self.foreign_mail.contains_key(id))
+    }
+
     pub(crate) fn cursor_scopes(&self) -> Vec<CursorScope> {
         let ordered = [
             CursorScope::Type(bifrost_types::ObjectType::Email),
@@ -268,6 +281,11 @@ impl Account for JmapAccount {
     }
 
     fn inventory_stream(&self, scope: CursorScope) -> AccountStream<SyncEvent<InventoryEntry>> {
+        if self.is_unregistered_foreign_scope(&scope) {
+            let err =
+                super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
+            return Box::pin(async_stream::stream! { yield super::error::terminated(err); });
+        }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
         inventory::stream(mail, self.core_limits, scope, owner)
@@ -290,6 +308,11 @@ impl Account for JmapAccount {
         scope: CursorScope,
         partition: InventoryPartition,
     ) -> AccountStream<SyncEvent<InventoryEntry>> {
+        if self.is_unregistered_foreign_scope(&scope) {
+            let err =
+                super::error::unregistered_foreign_scope(scope, AccountOperation::SyncInventory);
+            return Box::pin(async_stream::stream! { yield super::error::terminated(err); });
+        }
         let mail = self.mail_for_scope(&scope).clone();
         let owner = self.owner_of_scope(&scope);
         inventory::stream_partition(mail, self.core_limits, scope, partition, owner)
@@ -307,6 +330,13 @@ impl Account for JmapAccount {
         &self,
         cursor: ChangeCursor,
     ) -> AccountStream<SyncEvent<bifrost_types::Change>> {
+        if self.is_unregistered_foreign_scope(&cursor.scope) {
+            let err = super::error::unregistered_foreign_scope(
+                cursor.scope,
+                AccountOperation::SyncChanges,
+            );
+            return Box::pin(async_stream::stream! { yield super::error::terminated(err); });
+        }
         let mail = self.mail_for_scope(&cursor.scope).clone();
         let account_id = self.account_id_for_scope(&cursor.scope);
         let owner = self.owner_of_scope(&cursor.scope);
@@ -537,18 +567,24 @@ impl Account for JmapAccount {
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
-        if self.submission.is_none() {
+        let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
                 AccountOperation::Send,
                 None,
                 "JMAP submission capability not available",
             );
             return Box::pin(async move { Err(err) });
-        }
+        };
+        // Route through the resolved `Submission`-capability account
+        // handle, not `self.mail`. They are usually the same accountId,
+        // but `primary_account::<Submission>()` can resolve a distinct
+        // account; the draft `Email/set` and the `EmailSubmission/set`
+        // must both target the submission account.
+        let account_id = submission.id_str().to_string();
         pim::send_message(
-            self.mail.clone(),
+            submission,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            account_id,
             self.max_delayed_send,
             request,
         )
@@ -608,32 +644,33 @@ impl Account for JmapAccount {
     }
 
     fn draft_send(&self, draft: DraftHandle) -> AccountFuture<Result<ObjectId, AccountError>> {
-        if self.submission.is_none() {
+        let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
                 AccountOperation::DraftSend,
                 None,
                 "JMAP submission capability not available",
             );
             return Box::pin(async move { Err(err) });
-        }
-        pim::draft_send(
-            self.mail.clone(),
-            Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
-            draft,
-        )
+        };
+        // The `EmailSubmission/set` and the Sent-folder move both target
+        // the resolved submission account, not necessarily `self.mail`.
+        let account_id = submission.id_str().to_string();
+        pim::draft_send(submission, Arc::clone(&self.email_states), account_id, draft)
     }
 
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        if self.submission.is_none() || self.max_delayed_send == 0 {
+        let cancellable = self.submission.clone().filter(|_| self.max_delayed_send != 0);
+        let Some(submission) = cancellable else {
             let err = super::error::unsupported_error(
                 AccountOperation::CancelScheduledSend,
                 None,
                 "JMAP scheduled send not available",
             );
             return Box::pin(async move { Err(err) });
-        }
-        pim::cancel_scheduled_send(self.mail.clone(), handle)
+        };
+        // The submission id was minted on the `Submission` account; the
+        // `EmailSubmission/set` cancel must go to that account.
+        pim::cancel_scheduled_send(submission, handle)
     }
 
     fn reschedule_send(
@@ -641,15 +678,18 @@ impl Account for JmapAccount {
         handle: ObjectId,
         scheduled: std::time::SystemTime,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        if self.submission.is_none() || self.max_delayed_send == 0 {
+        let reschedulable = self.submission.clone().filter(|_| self.max_delayed_send != 0);
+        let Some(submission) = reschedulable else {
             let err = super::error::unsupported_error(
                 AccountOperation::RescheduleSend,
                 None,
                 "JMAP scheduled send not available",
             );
             return Box::pin(async move { Err(err) });
-        }
-        pim::reschedule_send(self.mail.clone(), self.max_delayed_send, handle, scheduled)
+        };
+        // The submission id was minted on the `Submission` account; the
+        // cancel + recreate must both target that account.
+        pim::reschedule_send(submission, self.max_delayed_send, handle, scheduled)
     }
 
     fn search(
@@ -1031,6 +1071,23 @@ where
     }
 }
 
+/// True when `scope` is a foreign-mailbox `Folder` scope whose account is
+/// NOT registered. Pure counterpart to `resolve_foreign_account_id`:
+/// where that returns `None` for both "primary scope" and "foreign but
+/// unregistered", this isolates the second case so callers can route it
+/// to a terminal error instead of misrouting it to the primary account.
+fn is_unregistered_foreign<F>(scope: &CursorScope, is_registered: F) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    match scope {
+        CursorScope::Folder(folder) => {
+            foreign::parse_foreign(folder).is_some_and(|parsed| !is_registered(&parsed.account_id))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1038,7 +1095,9 @@ mod tests {
     use bifrost_types::{CursorScope, MailboxId, MembershipScope, ObjectType, QueryId};
 
     use super::super::foreign;
-    use super::{foreign_owner_memberships_from_scopes, resolve_foreign_account_id};
+    use super::{
+        foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
+    };
 
     #[test]
     fn discover_emits_foreign_account_owner_membership() {
@@ -1069,9 +1128,10 @@ mod tests {
             Some("acct-9".to_string())
         );
 
-        // A foreign Folder scope for an UNregistered account falls back
-        // to primary (None) - the engine never minted a foreign cursor
-        // for an account we did not open.
+        // A foreign Folder scope for an UNregistered account resolves to
+        // no handle (None). It is NOT silently routed to the primary
+        // account - `is_unregistered_foreign` flags it so callers emit a
+        // terminal error (see `unregistered_foreign_scope_is_flagged_not_misrouted`).
         let unknown_scope = CursorScope::Folder(foreign::encode_foreign("acct-other", "mbx-3"));
         assert_eq!(
             resolve_foreign_account_id(&unknown_scope, is_registered),
@@ -1090,5 +1150,29 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn unregistered_foreign_scope_is_flagged_not_misrouted() {
+        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
+        let is_registered = |id: &str| registered.contains(id);
+
+        // A seeded-then-unregistered foreign scope: routing returns None
+        // (would fall back to primary), but the misroute guard flags it
+        // so the caller terminates instead of running it against the
+        // primary mailbox.
+        let gone = CursorScope::Folder(foreign::encode_foreign("acct-gone", "inbox"));
+        assert_eq!(resolve_foreign_account_id(&gone, is_registered), None);
+        assert!(is_unregistered_foreign(&gone, is_registered));
+
+        // A registered foreign scope is NOT flagged (routes foreign).
+        let live = CursorScope::Folder(foreign::encode_foreign("acct-9", "inbox"));
+        assert!(!is_unregistered_foreign(&live, is_registered));
+
+        // Primary scopes are never flagged.
+        assert!(!is_unregistered_foreign(
+            &CursorScope::Type(ObjectType::Email),
+            is_registered
+        ));
     }
 }

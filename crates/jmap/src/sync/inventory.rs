@@ -159,14 +159,10 @@ fn foreign_email_inventory(
                 // Each foreign (shared/delegate) inventory item carries
                 // its owning account's `Mailbox(accountId)` membership in
                 // addition to its native mailbox memberships, so the
-                // consumer maps the item to its shared-account owner and
-                // the foreign account's native mailbox ids cannot be
-                // conflated with the primary's in the membership index
-                // (the A5c-established owner-tag pattern).
+                // consumer maps the item to its shared-account owner (the
+                // A5c-established owner-tag pattern).
                 if let Some(owner) = &owner {
-                    entry
-                        .memberships
-                        .push(MembershipScope::Mailbox(owner.clone()));
+                    qualify_foreign_memberships(&mut entry.memberships, owner);
                 }
                 items.push(entry);
             }
@@ -211,6 +207,28 @@ fn foreign_email_inventory(
             };
         }
     })
+}
+
+/// Qualify a foreign (shared/delegate) inventory item's memberships with
+/// its owning account. The `owner` tag IS the foreign JMAP accountId.
+/// Each native `Mailbox(native)` membership is re-encoded as
+/// `Folder(encode_foreign(accountId, native))` - the same per-account
+/// namespace discovery uses for the foreign cursor scope - and the owner
+/// `Mailbox(accountId)` tag is appended. Without the re-encoding, a
+/// foreign native mailbox id (e.g. `inbox`) collides with the primary's
+/// identical id in the engine's membership index and the two accounts'
+/// messages conflate.
+fn qualify_foreign_memberships(
+    memberships: &mut Vec<MembershipScope>,
+    owner: &TypesMailboxId,
+) {
+    for membership in memberships.iter_mut() {
+        if let MembershipScope::Mailbox(native) = membership {
+            *membership =
+                MembershipScope::Folder(super::foreign::encode_foreign(&owner.0, &native.0));
+        }
+    }
+    memberships.push(MembershipScope::Mailbox(owner.clone()));
 }
 
 fn email_inventory(
@@ -631,4 +649,34 @@ pub(crate) fn fnv1a64(parts: impl IntoIterator<Item = String>) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_types::MailboxId;
+
+    #[test]
+    fn foreign_memberships_are_qualified_with_owner_account() {
+        let owner = TypesMailboxId("acct-9".to_string());
+        let mut memberships = vec![
+            MembershipScope::Mailbox(MailboxId("inbox".to_string())),
+            MembershipScope::Mailbox(MailboxId("mbx-2".to_string())),
+        ];
+        qualify_foreign_memberships(&mut memberships, &owner);
+
+        // Each native membership is re-encoded into the foreign account's
+        // namespace; a bare `Mailbox(inbox)` (which would collide with
+        // the primary's `inbox`) must not survive.
+        let inbox_qualified = super::super::foreign::encode_foreign("acct-9", "inbox");
+        assert!(memberships.contains(&MembershipScope::Folder(inbox_qualified)));
+        assert!(
+            !memberships.contains(&MembershipScope::Mailbox(MailboxId("inbox".to_string()))),
+            "native mailbox membership must be qualified, not bare"
+        );
+        // The owner tag is appended.
+        assert!(memberships.contains(&MembershipScope::Mailbox(owner.clone())));
+        // Two native memberships qualified + one owner tag.
+        assert_eq!(memberships.len(), 3);
+    }
 }

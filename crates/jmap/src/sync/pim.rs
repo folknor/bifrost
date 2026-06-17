@@ -284,6 +284,12 @@ pub(crate) fn send_message(
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
         }
 
+        // Capture the per-account email state observed before the set so
+        // the post-call advance is compare-and-swap, not an
+        // unconditional overwrite. A slow `Email/set` response carrying
+        // an older `newState` must not clobber a newer state the
+        // `Email/changes` loop has since CAS-set.
+        let prior_state = state_cache::get(&email_states, &account_id).await;
         let mut batch = mail.build();
         let email_handle = batch
             .call(email_set)
@@ -317,7 +323,7 @@ pub(crate) fn send_message(
             state_cache::advance(
                 &email_states,
                 &account_id,
-                None,
+                prior_state.as_deref(),
                 email_response.new_state().to_string(),
             )
             .await;
@@ -375,6 +381,10 @@ pub(crate) fn draft_create(
         .await?;
         let mut set = EmailSet::new();
         let create_id = set.create_item(create);
+        // CAS the post-create state against the state seen before the
+        // call (see `send_message`) so a slow response cannot clobber a
+        // newer state the changes loop already advanced to.
+        let prior_state = state_cache::get(&email_states, &account_id).await;
         let mut response = mail
             .call(set)
             .await
@@ -383,7 +393,7 @@ pub(crate) fn draft_create(
             state_cache::advance(
                 &email_states,
                 &account_id,
-                None,
+                prior_state.as_deref(),
                 response.new_state().to_string(),
             )
             .await;
@@ -1883,6 +1893,20 @@ pub(crate) fn reschedule_send(
             .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
         let mut set_response = response
             .get(&handle_ref)
+            .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
+        // Verify the cancel of the OLD submission succeeded BEFORE
+        // accepting the new one. A rejected cancel (e.g. `cannotUnsend`,
+        // the relay already released the deferred message) combined with
+        // an accepted create would leave two live submissions for the
+        // same email - a double-send. The cancel and create ride in one
+        // `EmailSubmission/set`, so a partial outcome is possible;
+        // failing the whole reschedule on a failed cancel is the
+        // double-send guard (mirrors `cancel_scheduled_send`, which
+        // checks `updated`). The new submission, if any, is left in place
+        // but the caller is told the reschedule failed and must
+        // reconcile.
+        set_response
+            .updated(&submission_id)
             .map_err(to_acct_err(AccountOperation::RescheduleSend))?;
         let mut new_submission = set_response
             .created(SUBMISSION_CREATE_ID)

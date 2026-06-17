@@ -160,7 +160,23 @@ async fn apply_batch(
             let fresh = probe_email_state(mail).await?;
             state_cache::set(email_states, account_id, fresh.clone()).await;
             state = fresh;
-            send_set(mail, &state, &ids, kind).await?
+            match send_set(mail, &state, &ids, kind).await {
+                Ok(response) => response,
+                Err(err) if super::error::is_state_mismatch(&err) => {
+                    // A second method-level `stateMismatch` after a
+                    // state refresh is a genuine concurrency conflict,
+                    // not a stream-fatal condition. Propagating it as
+                    // `Err` would both terminate the whole bulk stream
+                    // (instead of the documented per-item
+                    // `Failed(ConcurrencyConflict)`) and falsely assert
+                    // "nothing was transmitted" - the retried
+                    // `Email/set` did cross the wire. Convert the
+                    // method error into a per-item `Failed` lane so the
+                    // engine drives `Retry::AfterStateRefresh` per id.
+                    return Ok(Some(state_mismatch_failed_batch(err, kind, ids, started)));
+                }
+                Err(err) => return Err(err),
+            }
         }
     };
 
@@ -213,6 +229,56 @@ async fn apply_batch(
         bytes_in: 0,
         checkpoint: None,
     }))
+}
+
+/// Build a per-item `Failed(ConcurrencyConflict)` batch for every id in
+/// `ids` from a surviving method-level `stateMismatch`. Each id gets its
+/// own `AccountError` (scoped to that message) routed through
+/// `into_account_error`, which classifies the `stateMismatch` as
+/// `ConcurrencyConflict -> Retry::AfterStateRefresh`. This keeps the bulk
+/// stream alive: a method-level conflict is per-item recoverable, not a
+/// whole-stream terminator.
+fn state_mismatch_failed_batch(
+    err: crate::Error,
+    kind: &MutationKind,
+    ids: Vec<ObjectId>,
+    started: Instant,
+) -> Batch<ItemOutcome<MutationSuccess>> {
+    let operation = operation_for_kind(kind);
+    let mut results = Vec::with_capacity(ids.len());
+    let mut err = Some(err);
+    for id in ids {
+        // `into_account_error` consumes the error; clone the typed
+        // method error per id so every lane entry carries a full,
+        // correctly-scoped `ConcurrencyConflict` classification.
+        let item_err = match err.take() {
+            Some(e) => e,
+            None => crate::Error::Method(state_mismatch_method_error()),
+        };
+        let account_error = super::error::into_account_error(
+            item_err,
+            super::error::JmapErrorContext::new(operation)
+                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+        );
+        results.push(ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId(id.0.clone()),
+            account_error,
+        )));
+    }
+    Batch {
+        items: results,
+        page_boundary: PageBoundary::Page,
+        server_latency: started.elapsed(),
+        bytes_in: 0,
+        checkpoint: None,
+    }
+}
+
+/// A synthetic `stateMismatch` method error for the second-and-later ids
+/// in a conflicted batch (the wire error is consumed by the first id).
+fn state_mismatch_method_error() -> crate::core::error::MethodError {
+    serde_json::from_str(r#"{"type":"stateMismatch"}"#)
+        .expect("stateMismatch is a valid MethodError shape")
 }
 
 async fn send_set(
@@ -292,4 +358,44 @@ pub(crate) async fn probe_email_state(mail: &MailAccount) -> crate::Result<Strin
         .call(EmailGet::new().ids(Vec::<EmailId>::new()))
         .await?
         .into_state())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_types::{AccountErrorKind, RecoveryClass, RetryDisposition};
+
+    #[test]
+    fn surviving_state_mismatch_routes_to_per_item_failed_concurrency_conflict() {
+        // A second method-level `stateMismatch` must NOT terminate the
+        // bulk stream; every id is emitted on the per-item `Failed` lane
+        // classified `ConcurrencyConflict -> Retry::AfterStateRefresh`.
+        let err = crate::Error::Method(state_mismatch_method_error());
+        let ids = vec![ObjectId("m1".into()), ObjectId("m2".into())];
+        let batch = state_mismatch_failed_batch(
+            err,
+            &MutationKind::Destroy,
+            ids,
+            Instant::now(),
+        );
+
+        assert_eq!(batch.items.len(), 2);
+        for (idx, item) in batch.items.iter().enumerate() {
+            match item {
+                ItemOutcome::Failed(failure) => {
+                    assert_eq!(failure.error.kind(), &AccountErrorKind::ConcurrencyConflict);
+                    match failure.error.recovery() {
+                        RecoveryClass::Retry(advice) => {
+                            assert_eq!(advice.disposition, RetryDisposition::AfterStateRefresh);
+                        }
+                        other => panic!("expected Retry::AfterStateRefresh, got {other:?}"),
+                    }
+                    // Each lane entry is scoped to its own message id.
+                    let expected = if idx == 0 { "m1" } else { "m2" };
+                    assert_eq!(failure.item.0, expected);
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
 }

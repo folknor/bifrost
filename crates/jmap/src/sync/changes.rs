@@ -38,9 +38,11 @@ pub(crate) fn stream(
             return Box::pin(async_stream::stream! {
                 // Cursor decode failure: the cursor envelope produced
                 // by `state::decode_cursor` is a local cursor schema
-                // error. Phase 3 reshapes `state.rs` to return
-                // `AccountError`; for now we synthesize a
-                // SchemaIncompatible/CursorInvalid AccountError here.
+                // error. `decode_cursor` reports it as a plain
+                // `crate::Error` rather than a classified `AccountError`,
+                // so we synthesize the SchemaIncompatible AccountError at
+                // this boundary (the engine routes it to
+                // `SchemaIncompatible`).
                 let _ = err;
                 yield super::error::terminated(
                     bifrost_types::AccountErrorBuilder::new(

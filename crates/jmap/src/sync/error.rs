@@ -139,9 +139,16 @@ pub(crate) fn into_account_error(error: crate::Error, ctx: JmapErrorContext) -> 
         )
         .try_build()
         .expect("valid account error classification"),
+        // The session lists no primary account for the capability we
+        // need. Per `reference/jmap.md` this is an authentication-level
+        // signal: the credential no longer resolves to a usable primary
+        // account, so it maps to `Authentication(ReauthorizationRequired)
+        // -> AuthLost` (terminal, operator must re-authorize) rather than
+        // a `CapabilityChanged -> RestartAccount` reopen loop that would
+        // spin re-running discovery against the same empty session.
         crate::Error::NoPrimaryAccount { capability } => build(
-            AccountErrorKind::SyncState(SyncStateErrorKind::CapabilityChanged),
-            Cause::State(StateCause::CapabilityChanged { delta: None }),
+            AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired),
+            Cause::Auth(AuthCause::ReauthorizationRequired),
             &ctx,
         )
         .text(DiagnosticText::support_only(format!(
@@ -551,6 +558,33 @@ pub(crate) fn jmap_scope_revoked(
     .expect("valid account error classification")
 }
 
+/// A `Folder` scope that parses as a foreign (shared/delegate) mailbox
+/// but whose account is no longer registered (the share/delegation
+/// disappeared from the session since the cursor was seeded). The scope
+/// can no longer route to a real account handle, and falling back to the
+/// primary account would conflate the foreign mailbox id with a primary
+/// one. Classify as `SyncState(ScopeRevoked)` scoped to the cursor so the
+/// engine quarantines just this scope (`Engine(DisableScope)`) rather
+/// than misrouting it to the primary mailbox or escalating account-wide.
+#[must_use]
+pub(crate) fn unregistered_foreign_scope(
+    scope: CursorScope,
+    operation: AccountOperation,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+        Cause::State(StateCause::ScopeRevoked),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .scope(ErrorScope::Cursor(scope))
+    .text(DiagnosticText::support_only(
+        "foreign account for this mailbox scope is no longer registered in the session",
+    ))
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Map a per-scope failure for a foreign (shared/delegate) account
 /// mailbox. When the scope belongs to a shared account (`owner.is_some()`)
 /// and the failure classifies as permission-denied (the class that would
@@ -729,6 +763,22 @@ fn convert_problem(
                     Cause::Request(RequestCause::NotFound { what: resource, id }),
                 )
             } else {
+                // Scope-less HTTP 404. The three scope-less not-found
+                // shapes in this crate are deliberately distinct by wire
+                // source, not unified, because each preserves a different
+                // diagnostic signal while all three resolve terminal:
+                //   - a bare HTTP 404 (here) is a transport-level
+                //     resource refusal -> `Server(Error{404})` ->
+                //     `ProviderRefused`;
+                //   - a JMAP `notFound` SetError without a resource scope
+                //     -> `Protocol(Unknown)` -> `UnknownPermanent`
+                //     (`set_error_to_account_error`);
+                //   - a local "id absent from response" shape error ->
+                //     `Protocol(MissingField)` ->
+                //     `ProviderContractViolation` (`convert_id_not_found`).
+                // The message keys differ so support exports can tell the
+                // three apart; recovery is terminal in every case, so the
+                // engine behaves identically.
                 (
                     AccountErrorKind::Server(ServerErrorKind::Error { status: Some(404) }),
                     Cause::Server(ServerCause::Error { status: Some(404) }),
@@ -1268,6 +1318,40 @@ mod tests {
             // an acknowledged terminal response, no side effect).
             other => panic!("expected Retry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_primary_account_maps_auth_lost() {
+        // `reference/jmap.md` documents NoPrimaryAccount as
+        // `Authentication(ReauthorizationRequired) -> AuthLost`, not a
+        // `CapabilityChanged -> RestartAccount` reopen loop.
+        let err = into_account_error(
+            crate::Error::NoPrimaryAccount {
+                capability: "urn:ietf:params:jmap:mail",
+            },
+            JmapErrorContext::new(AccountOperation::SyncInventory),
+        );
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Authentication(AuthErrorKind::ReauthorizationRequired)
+        );
+        assert!(matches!(err.recovery(), RecoveryClass::AuthLost));
+    }
+
+    #[test]
+    fn unregistered_foreign_scope_disables_scope() {
+        use bifrost_types::EngineDirective;
+        let scope = CursorScope::Folder(super::super::foreign::encode_foreign("acct-gone", "mbx-1"));
+        let err = unregistered_foreign_scope(scope.clone(), AccountOperation::SyncChanges);
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        );
+        assert_eq!(
+            *err.recovery(),
+            RecoveryClass::Engine(EngineDirective::DisableScope(scope.clone()))
+        );
+        assert_eq!(err.scope(), Some(&ErrorScope::Cursor(scope)));
     }
 
     #[test]
