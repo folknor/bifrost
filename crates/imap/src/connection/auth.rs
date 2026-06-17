@@ -42,14 +42,22 @@ impl ImapConnection {
                 identity,
                 token_source,
             } => {
-                if !profile.supports_sasl_auth(AuthMechanism::XOAuth2) {
-                    return Err(Error::MissingCapability("AUTH=XOAUTH2".into()));
-                }
+                // OAUTHBEARER (RFC 7628) is the standard mechanism; XOAUTH2 is
+                // the Google-defined predecessor kept as a fallback for
+                // providers that advertise only it. Prefer the standard,
+                // mirroring SMTP's `OAUTH2_MECHANISMS` order.
+                let mechanism = if profile.supports_sasl_auth(AuthMechanism::OAuthBearer) {
+                    AuthMechanism::OAuthBearer
+                } else if profile.supports_sasl_auth(AuthMechanism::XOAuth2) {
+                    AuthMechanism::XOAuth2
+                } else {
+                    return Err(Error::MissingCapability("AUTH=OAUTHBEARER".into()));
+                };
                 if !self.is_encrypted() && !policy.allow_cleartext_without_tls {
                     return Err(Error::AuthPolicy(AuthPolicyFailure::new(
                         offered_authentication(&profile, false),
                         vec![AuthMechanismRejection::new(
-                            AuthMechanism::XOAuth2,
+                            mechanism,
                             AuthMechanismRejectionReason::CleartextWithoutTls,
                         )],
                     )));
@@ -61,11 +69,17 @@ impl ImapConnection {
                     text: format!("failed to read OAuth access token: {e}"),
                     code: None,
                 })?;
-                self.authenticate_xoauth2(identity, access_token.as_str(), timeout)
-                    .await?;
-                Ok(AuthOutcome {
-                    mechanism: AuthMechanism::XOAuth2,
-                })
+                match mechanism {
+                    AuthMechanism::OAuthBearer => {
+                        self.authenticate_oauthbearer(identity, access_token.as_str(), timeout)
+                            .await?;
+                    }
+                    _ => {
+                        self.authenticate_xoauth2(identity, access_token.as_str(), timeout)
+                            .await?;
+                    }
+                }
+                Ok(AuthOutcome { mechanism })
             }
             CredentialsKind::Password { username, password } => {
                 let mut rejected = Vec::new();
@@ -77,7 +91,7 @@ impl ImapConnection {
                         }
                         PasswordCandidate::Attempt(mechanism) => mechanism,
                     };
-                    match mechanism {
+                    let attempt = match mechanism {
                         AuthMechanism::ScramSha256Plus | AuthMechanism::ScramSha1Plus => {
                             let hash = if mechanism == AuthMechanism::ScramSha256Plus {
                                 bifrost_sasl::ScramHash::Sha256
@@ -102,28 +116,54 @@ impl ImapConnection {
                                 Some(resolved),
                                 timeout,
                             )
-                            .await?;
+                            .await
                         }
                         AuthMechanism::ScramSha256 => {
                             self.authenticate_scram_sha256(username, password.as_str(), timeout)
-                                .await?;
+                                .await
                         }
                         AuthMechanism::ScramSha1 => {
                             self.authenticate_scram_sha1(username, password.as_str(), timeout)
-                                .await?;
+                                .await
                         }
                         AuthMechanism::Plain => {
                             self.authenticate_plain(username, password.as_str(), timeout)
-                                .await?;
+                                .await
                         }
                         AuthMechanism::CramMd5 => {
                             self.authenticate_cram_md5(username, password.as_str(), timeout)
-                                .await?;
+                                .await
                         }
                         AuthMechanism::Login => {
-                            self.login(username, password.as_str(), timeout).await?;
+                            self.login(username, password.as_str(), timeout).await
                         }
-                        AuthMechanism::XOAuth2 => unreachable!("password path skips XOAUTH2"),
+                        AuthMechanism::XOAuth2 | AuthMechanism::OAuthBearer => {
+                            unreachable!("password path skips OAuth mechanisms")
+                        }
+                    };
+                    // The ladder was built from `server_profile()` snapshotted
+                    // above, but each `authenticate_*` re-reads the live
+                    // capability snapshot (`require_auth_mechanism` /
+                    // AUTH-presence checks). If the snapshot drifted between the
+                    // build and this attempt (capability skew, e.g. a refetch
+                    // after STARTTLS racing the ladder), a now-unadvertised
+                    // mechanism surfaces as `MissingCapability`. Treat that as
+                    // "this rung is no longer available" and fall through to the
+                    // next rung rather than aborting the whole ladder, so a
+                    // disappearing SCRAM rung still falls through to
+                    // PLAIN-over-TLS instead of failing the connect.
+                    match attempt {
+                        Ok(()) => {}
+                        Err(Error::MissingCapability(cap)) => {
+                            debug!(
+                                mechanism = mechanism.name(),
+                                capability = %cap,
+                                "auth mechanism unavailable on live snapshot \
+                                 (capability skew); falling through to next rung"
+                            );
+                            continue;
+                        }
+                        Err(other) => return Err(other),
                     }
                     return Ok(AuthOutcome { mechanism });
                 }
@@ -141,6 +181,13 @@ impl ImapConnection {
     /// Prefer [`authenticate_plain`](Self::authenticate_plain) when the server
     /// advertises `AUTH=PLAIN`, which is the standard SASL mechanism and works
     /// with all servers including those that don't support LOGIN (e.g. Stalwart).
+    ///
+    /// **TLS gate:** this sends reusable credentials with no TLS/policy gate.
+    /// The policy-driven gate (LOGIN is opt-in via `with_login` AND cleartext-
+    /// gated) lives in [`authenticate_best`](Self::authenticate_best). Calling
+    /// this method directly is the deliberate opt-out of that policy; a direct
+    /// caller is responsible for ensuring the connection is encrypted (the
+    /// `LOGINDISABLED` capability is still honored).
     pub async fn login(&self, user: &str, pass: &str, timeout: Duration) -> Result<(), Error> {
         use super::dispatch::LoginConsumer;
 
@@ -225,6 +272,12 @@ impl ImapConnection {
     ///
     /// Constructs the PLAIN payload (`\0user\0pass`) and sends it via
     /// AUTHENTICATE PLAIN, using SASL-IR (RFC 4959) when available.
+    ///
+    /// **TLS gate:** this sends reusable credentials with no TLS/policy gate.
+    /// The policy-driven cleartext gate lives in
+    /// [`authenticate_best`](Self::authenticate_best). Calling this method
+    /// directly is the deliberate opt-out of that policy; a direct caller is
+    /// responsible for ensuring the connection is encrypted.
     pub async fn authenticate_plain(
         &self,
         user: &str,
@@ -356,11 +409,94 @@ impl ImapConnection {
         self.complete_auth(caps_provided, deadline).await
     }
 
+    /// Authenticate with SASL OAUTHBEARER (RFC 7628).
+    ///
+    /// Uses SASL-IR (RFC 4959 Section 3) if the server advertises it. The
+    /// payload framing matches XOAUTH2 on the wire (a single base64 blob
+    /// followed by an empty-line reply to any error continuation, letting the
+    /// server finish with a tagged NO/BAD), so the dispatch consumer is shared;
+    /// only the payload bytes and the mechanism token differ. The `a=`
+    /// authorization identity is GS2-escaped inside `bifrost_sasl`.
+    ///
+    /// **TLS gate:** like the other direct mechanism methods, this enforces no
+    /// TLS/policy gate. Calling it directly is the opt-out; the policy-driven
+    /// gate lives in [`authenticate_best`](Self::authenticate_best). A direct
+    /// caller is responsible for ensuring the connection is encrypted before
+    /// presenting a bearer token.
+    pub async fn authenticate_oauthbearer(
+        &self,
+        identity: &str,
+        token: &str,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        use super::dispatch::AuthenticateXoauth2Consumer;
+        use base64::Engine;
+
+        // Validate state and build the OAUTHBEARER payload from the snapshot.
+        let (encoded, has_sasl_ir) = {
+            let snap = self.state_rx.borrow();
+            if snap.session_state != SessionState::NotAuthenticated {
+                return Err(Error::Protocol(format!(
+                    "command not valid in {:?} state (expected one of \
+                     [{:?}])",
+                    snap.session_state,
+                    SessionState::NotAuthenticated,
+                )));
+            }
+            // RFC 3501 Section 6.2.2: verify the server advertises
+            // AUTH=OAUTHBEARER before sending credentials.
+            if !snap
+                .capabilities
+                .contains(&Capability::Auth("OAUTHBEARER".into()))
+            {
+                return Err(Error::MissingCapability("AUTH=OAUTHBEARER".into()));
+            }
+
+            // Build the OAUTHBEARER payload via the shared bifrost-sasl builder,
+            // then base64-frame it for AUTHENTICATE. The raw token-bearing
+            // Secret is a temporary that zeroizes on drop; only the base64 form
+            // persists.
+            let encoded: SecretString = base64::engine::general_purpose::STANDARD
+                .encode(bifrost_sasl::oauthbearer_payload(identity, token).as_bytes())
+                .into();
+
+            let has_sasl_ir =
+                snap.capabilities.contains(&Capability::SaslIr) || is_rev2_from_snapshot(&snap);
+            drop(snap);
+            (encoded, has_sasl_ir)
+        };
+
+        let cmd = Command::Authenticate {
+            mechanism: "OAUTHBEARER".to_owned(),
+            initial_response: if has_sasl_ir {
+                Some(encoded.clone())
+            } else {
+                None
+            },
+        };
+
+        let consumer = AuthenticateXoauth2Consumer::new(encoded, has_sasl_ir);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let caps_provided =
+            tokio::time::timeout(timeout, self.submit_with_continuations(cmd, consumer))
+                .await
+                .map_err(|_| Error::timeout_inflight())??;
+
+        self.complete_auth(caps_provided, deadline).await
+    }
+
     /// Authenticate with SASL CRAM-MD5.
     ///
     /// CRAM-MD5 is a challenge-response mechanism. The password is never sent
     /// directly on the wire, but the mechanism is still legacy and should only
     /// be used when stronger SASL mechanisms are unavailable.
+    ///
+    /// **TLS gate:** this enforces no TLS/policy gate. The policy-driven gate
+    /// (CRAM-MD5 is opt-in via `with_cram_md5` AND TLS-gated, because a MITM can
+    /// choose the challenge and brute-force `HMAC-MD5(password, challenge)`
+    /// offline) lives in [`authenticate_best`](Self::authenticate_best). Calling
+    /// this method directly is the deliberate opt-out of that policy; a direct
+    /// caller is responsible for ensuring the connection is encrypted.
     pub async fn authenticate_cram_md5(
         &self,
         user: &str,
@@ -1108,5 +1244,38 @@ mod ladder_tests {
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(bifrost_sasl::xoauth2_payload("user", "token").as_bytes());
         assert_eq!(encoded, "dXNlcj11c2VyAWF1dGg9QmVhcmVyIHRva2VuAQE=");
+    }
+
+    #[test]
+    fn oauthbearer_mechanism_name_is_wire_token() {
+        // The OAUTHBEARER variant must map to the RFC 7628 wire token so the
+        // `AUTH=OAUTHBEARER` capability parse (`supports_sasl_auth`, which
+        // compares against `name()`) and the AUTHENTICATE command agree.
+        assert_eq!(AuthMechanism::OAuthBearer.name(), "OAUTHBEARER");
+    }
+
+    #[test]
+    fn oauthbearer_advertisement_is_selectable() {
+        // A server advertising only AUTH=OAUTHBEARER must be recognized as
+        // supporting it (the gap the OAUTHBEARER finding closed: previously no
+        // AuthMechanism variant matched, so it fell to MissingCapability).
+        let profile = profile(&["OAUTHBEARER"]);
+        assert!(profile.supports_sasl_auth(AuthMechanism::OAuthBearer));
+        assert!(!profile.supports_sasl_auth(AuthMechanism::XOAuth2));
+    }
+
+    #[test]
+    fn oauthbearer_base64_payload_is_byte_stable() {
+        use base64::Engine;
+
+        // The base64 of the shared bifrost-sasl builder for identity/token must
+        // be byte-identical to the RFC 7628 frame the consumer sends on the
+        // wire: `n,a=user,\x01auth=Bearer token\x01\x01`.
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(bifrost_sasl::oauthbearer_payload("user", "token").as_bytes());
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
+        assert_eq!(decoded, b"n,a=user,\x01auth=Bearer token\x01\x01");
     }
 }

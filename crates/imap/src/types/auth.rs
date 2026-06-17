@@ -126,6 +126,8 @@ impl fmt::Debug for Credentials {
 /// Section 6 downgrade protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AuthMechanism {
+    /// SASL OAUTHBEARER bearer-token authentication (RFC 7628).
+    OAuthBearer,
     /// SASL XOAUTH2 bearer-token authentication.
     XOAuth2,
     /// SASL SCRAM-SHA-256-PLUS (channel-bound).
@@ -148,6 +150,7 @@ impl AuthMechanism {
     /// Return the advertised SASL mechanism name, or `LOGIN` for the legacy command.
     pub(crate) const fn name(self) -> &'static str {
         match self {
+            Self::OAuthBearer => "OAUTHBEARER",
             Self::XOAuth2 => "XOAUTH2",
             Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
             Self::ScramSha1Plus => "SCRAM-SHA-1-PLUS",
