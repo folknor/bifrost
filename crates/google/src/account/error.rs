@@ -366,20 +366,74 @@ pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSucc
 /// `forbidden`, or an HTTP 403 with no parsed Gmail reason - i.e. the
 /// token cannot permanently delete and the driver should retry the
 /// batch as a TRASH label patch.
+///
+/// The 403 can reach us in several shapes. `post_empty_json` converts a
+/// terminal HTTP error into `Error::Response` itself, but a 403 that
+/// surfaces from bifrost-net's retry loop stays as `Error::Net`: a plain
+/// `Status { code: 403, .. }`, or - when the final attempt was a
+/// rate-limit / budget-exhaustion - wrapped in `RateLimited` /
+/// `RetryBudgetExhausted` with the 403 preserved as `final_response`.
+/// All of these are the same logical permission failure, so the detector
+/// looks through every shape rather than only `Error::Response`, staying
+/// consistent with how the classifier (which refines the wrapped final
+/// response via the Gmail body) sees a 403.
 pub(crate) fn is_batch_delete_scope_failure(error: &Error) -> bool {
-    let Error::Response(resp) = error else {
-        return false;
-    };
-    if resp.status != 403 {
-        return false;
-    }
-    let Some(env) = resp.envelope.as_ref() else {
-        return true;
+    let reason = match error {
+        // `Error::Response` carries a pre-parsed envelope; use it directly.
+        Error::Response(resp) => {
+            if resp.status != 403 {
+                return false;
+            }
+            match resp.envelope.as_ref() {
+                None => return true,
+                Some(env) => env.primary_reason(),
+            }
+        }
+        // The bifrost-net shapes preserve only the raw body bytes; parse
+        // the Gmail envelope out of them.
+        _ => {
+            let Some((status, body)) = net_failure_parts(error) else {
+                return false;
+            };
+            if status != 403 {
+                return false;
+            }
+            match parse_envelope(body) {
+                None => return true,
+                Some(env) => {
+                    return matches!(
+                        env.primary_reason(),
+                        Some("forbidden") | Some("insufficientPermissions") | None
+                    );
+                }
+            }
+        }
     };
     matches!(
-        env.primary_reason(),
+        reason,
         Some("forbidden") | Some("insufficientPermissions") | None
     )
+}
+
+/// Extract `(status, body)` from the bifrost-net `Error::Net` shapes that
+/// preserve a terminal HTTP response. Returns `None` for transport-level
+/// failures (no HTTP response) and for `Error::Response` (handled by its
+/// own pre-parsed-envelope path).
+fn net_failure_parts(error: &Error) -> Option<(u16, &[u8])> {
+    let Error::Net(net) = error else {
+        return None;
+    };
+    match net {
+        bifrost_net::Error::Status { code, body, .. } => Some((code.as_u16(), body.as_ref())),
+        bifrost_net::Error::RateLimited { final_response, .. } => {
+            Some((final_response.status.as_u16(), final_response.body.as_ref()))
+        }
+        bifrost_net::Error::RetryBudgetExhausted {
+            final_response: Some(final_response),
+            ..
+        } => Some((final_response.status.as_u16(), final_response.body.as_ref())),
+        _ => None,
+    }
 }
 
 /// Build a Gmail-specific `AccountError` for the TRASH fallback path
@@ -868,11 +922,15 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         | AccountOperation::QuotaGet => "gmail.readonly",
         // Organization-directory lookup uses the People directory scope.
         AccountOperation::DirectorySearch => "directory.readonly",
-        // Push watch CRUD requires the metadata scope at minimum;
-        // Pub/Sub still uses the user mailbox surface.
+        // `users.watch` reads the mailbox to seed the watch and emits
+        // message bodies/labels on the topic, so the metadata scope is
+        // insufficient; advertise the broader read scope.
         AccountOperation::PushSubscribe
         | AccountOperation::PushUnsubscribe
-        | AccountOperation::PushStream => "gmail.metadata",
+        | AccountOperation::PushStream => "gmail.readonly",
+        // Drive hosting (`host_attachment`) uploads to and shares from
+        // Google Drive, not Gmail; it needs a Drive scope.
+        AccountOperation::HostAttachment => "drive.file",
         // Everything else - flag mutation, label membership, move,
         // destroy, etc. - requires gmail.modify.
         AccountOperation::UpdateFlags
@@ -886,7 +944,6 @@ fn gmail_scope_for(op: AccountOperation) -> &'static str {
         | AccountOperation::SetExtendedProperty
         | AccountOperation::SetIsRead
         | AccountOperation::AttachmentUpload
-        | AccountOperation::HostAttachment
         | AccountOperation::Close
         | AccountOperation::Expunge => "gmail.modify",
         // AccountOperation is #[non_exhaustive] from bifrost-types; new
@@ -1552,6 +1609,91 @@ mod tests {
         assert!(!is_batch_delete_scope_failure(&err));
     }
 
+    fn final_response(status: u16, body: &str) -> bifrost_net::FinalResponse {
+        bifrost_net::FinalResponse {
+            status: reqwest::StatusCode::from_u16(status).expect("status"),
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn batch_delete_wrapped_net_status_403_triggers_fallback() {
+        // bifrost-net keeps a terminal HTTP failure as `Error::Net(Status)`
+        // when the retry loop didn't repackage it; the detector must look
+        // through it.
+        let err = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::FORBIDDEN,
+            body: Bytes::copy_from_slice(body_with_reason("insufficientPermissions").as_bytes()),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_wrapped_net_status_403_no_body_triggers_fallback() {
+        let err = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::FORBIDDEN,
+            body: Bytes::new(),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_rate_limited_403_final_response_triggers_fallback() {
+        // A 429 retry loop whose final attempt returned 403 lands in
+        // `RateLimited { final_response }`.
+        let err = Error::Net(bifrost_net::Error::RateLimited {
+            retry_after: None,
+            final_response: final_response(403, &body_with_reason("forbidden")),
+        });
+        assert!(is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_retry_budget_exhausted_403_triggers_fallback() {
+        let err = Error::Net(bifrost_net::Error::RetryBudgetExhausted {
+            final_response: Some(final_response(403, &body_with_reason("forbidden"))),
+            retry_after_history: Vec::new(),
+        });
+        assert!(is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_wrapped_net_status_429_does_not_trigger_fallback() {
+        // A genuine rate-limit (not a permission failure) must not be
+        // misread as a scope failure.
+        let err = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body: Bytes::copy_from_slice(body_with_reason("rateLimitExceeded").as_bytes()),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(!is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_transport_failure_does_not_trigger_fallback() {
+        let err = Error::Net(bifrost_net::Error::Network {
+            message: "dns".to_owned(),
+            transmission_state: bifrost_types::TransmissionState::Unsent,
+            source: None,
+        });
+        assert!(!is_batch_delete_scope_failure(&err));
+    }
+
+    #[test]
+    fn batch_delete_403_quota_reason_does_not_trigger_fallback() {
+        // A 403 whose reason is a quota signal is not a delete-scope
+        // failure; only forbidden/insufficientPermissions/none qualify.
+        let err = Error::Net(bifrost_net::Error::Status {
+            code: reqwest::StatusCode::FORBIDDEN,
+            body: Bytes::copy_from_slice(body_with_reason("dailyLimitExceeded").as_bytes()),
+            headers: reqwest::header::HeaderMap::new(),
+        });
+        assert!(!is_batch_delete_scope_failure(&err));
+    }
+
     #[test]
     fn blob_range_unsupported_maps_to_unsupported_open_blob_range() {
         let err = Error::Local(GmailLocalError::BlobRangeUnsupported {
@@ -1891,6 +2033,30 @@ mod tests {
         );
         assert_eq!(
             gmail_scope_for(AccountOperation::HydrateMessage),
+            "gmail.readonly"
+        );
+    }
+
+    /// `host_attachment` uploads to Google Drive, so an InsufficientScope
+    /// must advertise a Drive scope - not `gmail.modify`.
+    #[test]
+    fn gmail_scope_for_host_attachment_is_drive() {
+        assert_eq!(
+            gmail_scope_for(AccountOperation::HostAttachment),
+            "drive.file"
+        );
+    }
+
+    /// `users.watch` reads message content, so the metadata scope is
+    /// insufficient; the hint must advertise the broader read scope.
+    #[test]
+    fn gmail_scope_for_push_subscribe_is_readonly() {
+        assert_eq!(
+            gmail_scope_for(AccountOperation::PushSubscribe),
+            "gmail.readonly"
+        );
+        assert_eq!(
+            gmail_scope_for(AccountOperation::PushUnsubscribe),
             "gmail.readonly"
         );
     }

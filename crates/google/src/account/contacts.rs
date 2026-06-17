@@ -129,15 +129,20 @@ pub(crate) fn update(
     patch: ContactPatch,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
-        let etag = require_person_etag(&person)?;
+        // Pure-local guards first: fail an invalid request cheaply, before
+        // the network GET + etag round trip.
         validate_address_book(
             patch.address_book_id.as_ref(),
             AccountOperation::ContactUpdate,
         )?;
         reject_photo_url_patch(&patch)?;
+        let mut person = get_person(&client, &contact, AccountOperation::ContactUpdate).await?;
         let update_fields = update_fields_for_patch(&patch);
         if !update_fields.is_empty() {
+            // The People `updateContact` call needs the server etag; a
+            // photo-only patch (handled below via `updateContactPhoto`)
+            // does not, so only require it when a modeled field is written.
+            let etag = require_person_etag(&person)?;
             apply_patch_to_person(&mut person, &patch);
             person.resource_name = Some(contact.0.clone());
             person.etag = Some(etag);
@@ -275,11 +280,16 @@ pub(crate) fn search(
 /// `people:listDirectoryPeople` (the ratatoskr path, no warmup); a
 /// non-empty `query` runs `people:searchDirectoryPeople`, which - like
 /// the `searchContacts` family - requires a cache-priming warmup call
-/// before the real query. Personal Gmail accounts (and accounts without
-/// the directory scope) have no directory and answer 403; that surfaces
-/// as `PermissionDenied` or `InsufficientScope`, both of which are
-/// swallowed to an empty page. A `PolicyBlocked` 403 is a genuine admin
-/// refusal and propagates.
+/// before the real query. The warmup is non-fatal on a transient blip
+/// (it only primes the cache); a directory-absence 403 there short-
+/// circuits to an empty page, and a terminal non-absence failure (e.g.
+/// `PolicyBlocked`) propagates. Personal Gmail accounts (and accounts
+/// without the directory scope) have no directory and answer 403; on the
+/// first page that surfaces as `PermissionDenied` or `InsufficientScope`,
+/// both swallowed to an empty page, while a `PolicyBlocked` 403 (a genuine
+/// admin refusal) propagates. Past the first page all failures propagate:
+/// a follow-up-page 403 means the directory existed and a later page
+/// failed, so masking it would silently truncate results.
 pub(crate) fn directory_search(
     client: Arc<GmailClient>,
     query: String,
@@ -289,24 +299,42 @@ pub(crate) fn directory_search(
     Box::pin(async move {
         if !query.is_empty() {
             // search* family cache-priming warmup; its own 403 is itself
-            // the "no directory" signal.
-            match client
+            // the "no directory" signal, so a directory-absence 403 short-
+            // circuits to an empty page. A transient blip (429/500/network)
+            // is non-fatal: warmup only primes the cache, so fall through
+            // to the real query and let it produce the authoritative result
+            // rather than failing the whole search on a warmup hiccup.
+            if let Err(error) = client
                 .get::<DirectoryPeopleResponse>(&directory_search_warmup_url())
                 .await
             {
-                Ok(_) => {}
-                Err(error) => {
-                    let err = collection_error(error, AccountOperation::DirectorySearch);
-                    return directory_absence_to_empty(err);
+                let err = collection_error(error, AccountOperation::DirectorySearch);
+                if is_directory_absence(&err) {
+                    return Ok(Page::single(vec![]));
+                } else if err.recovery().is_terminal() {
+                    // A terminal non-absence failure (e.g. PolicyBlocked) is
+                    // a real refusal; surface it.
+                    return Err(err);
                 }
+                // Transient: ignore and proceed to the real query.
             }
         }
+        // The directory-absence swallow only makes sense on the first page:
+        // a 403 there means the account has no directory at all. A 403 on a
+        // follow-up page (e.g. an expired/invalid page token) means the
+        // directory existed - we already returned earlier pages - so masking
+        // it as a clean empty page would silently truncate results. Past the
+        // first page, all failures propagate.
+        let is_first_page = page_cursor.is_none();
         let url = directory_search_url(&query, limit, page_cursor.as_deref())?;
         let response: DirectoryPeopleResponse = match client.get(&url).await {
             Ok(response) => response,
             Err(error) => {
                 let err = collection_error(error, AccountOperation::DirectorySearch);
-                return directory_absence_to_empty(err);
+                if is_first_page {
+                    return directory_absence_to_empty(err);
+                }
+                return Err(err);
             }
         };
         let items = response
@@ -328,13 +356,28 @@ pub(crate) fn directory_search(
 /// else (notably `PolicyBlocked`, a real admin refusal). Classify first,
 /// then branch on the typed kind, per the error-model contract.
 fn directory_absence_to_empty(err: AccountError) -> Result<Page<DirectoryCard>, AccountError> {
-    match err.kind() {
-        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
-        | AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope) => {
-            Ok(Page::single(vec![]))
-        }
-        _ => Err(err),
+    if is_directory_absence(&err) {
+        Ok(Page::single(vec![]))
+    } else {
+        Err(err)
     }
+}
+
+/// True for the two classifications that mean "this account has no
+/// directory" (`PermissionDenied`, `InsufficientScope`). `PolicyBlocked`
+/// is a real admin refusal and is deliberately excluded so it propagates.
+///
+/// Note: Gmail's `notAuthorizedToAccessThisResource` admin refusal
+/// classifies as `PermissionDenied`, so it is treated as absence here on a
+/// first-page probe. That matches the documented swallow set; the
+/// first-page gate (see `directory_search`) keeps it from masking a
+/// mid-pagination refusal.
+fn is_directory_absence(err: &AccountError) -> bool {
+    matches!(
+        err.kind(),
+        AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+            | AccountErrorKind::Authorization(AccessErrorKind::InsufficientScope)
+    )
 }
 
 const DIRECTORY_READ_MASK: &str = "names,emailAddresses,phoneNumbers,organizations";
@@ -1522,5 +1565,52 @@ mod tests {
             err.kind(),
             &AccountErrorKind::Authorization(AccessErrorKind::PolicyBlocked)
         );
+    }
+
+    #[test]
+    fn is_directory_absence_classifies_absence_vs_refusal() {
+        // PermissionDenied / InsufficientScope == "no directory" (absence).
+        assert!(is_directory_absence(&directory_403("forbidden")));
+        assert!(is_directory_absence(&directory_403("insufficientPermissions")));
+        // notAuthorizedToAccessThisResource classifies as PermissionDenied,
+        // so on a first-page probe it reads as absence (documented swallow
+        // set); the first-page gate keeps it from masking later pages.
+        assert!(is_directory_absence(&directory_403(
+            "notAuthorizedToAccessThisResource"
+        )));
+        // domainPolicy -> PolicyBlocked is a real refusal, not absence.
+        assert!(!is_directory_absence(&directory_403("domainPolicy")));
+    }
+
+    #[test]
+    fn transient_directory_failure_is_not_absence() {
+        // A 429/5xx warmup or query blip must not be mistaken for absence;
+        // these are retryable and the directory-search logic falls through
+        // (warmup) or propagates (paginated query) rather than swallowing.
+        let body = r#"{"error":{"code":429,"message":"x","errors":[{"domain":"usageLimits","reason":"rateLimitExceeded"}]}}"#;
+        let error = crate::error::Error::response_from_parts(
+            crate::error::GmailService::GmailApi,
+            429,
+            crate::error::GmailResponseHeaders::default(),
+            bytes::Bytes::copy_from_slice(body.as_bytes()),
+        );
+        let err = collection_error(error, AccountOperation::DirectorySearch);
+        assert!(!is_directory_absence(&err));
+        assert!(err.recovery().is_retryable());
+    }
+
+    #[test]
+    fn photo_only_patch_writes_no_modeled_fields() {
+        // A photo-only patch needs `updateContactPhoto` (no etag), so
+        // `update()` must not require an etag for it: `update_fields` is
+        // empty, which is what gates the etag requirement.
+        let fields = update_fields_for_patch(&ContactPatch {
+            photo: Some(Some(bifrost_types::ContactPhoto {
+                data: vec![1, 2, 3],
+                media_type: Some("image/png".to_string()),
+            })),
+            ..ContactPatch::default()
+        });
+        assert_eq!(fields, "");
     }
 }
