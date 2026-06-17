@@ -106,14 +106,14 @@ async fn fetch_batch(
         .iter()
         .enumerate()
         .map(|(index, id)| {
-            let enc_id = bifrost_net::url::encode_component(&id.0);
+            // Decode the (possibly foreign-encoded) id: a shared-mailbox
+            // item routes to `/users/{owner}/messages/{native}`, a primary
+            // item to `/me/messages/{id}`. The owning mailbox rides in the
+            // path prefix, the native id in the `/messages/{id}` segment.
             BatchRequestItem {
                 id: index.to_string(),
                 method: "GET".to_string(),
-                url: format!(
-                    "{}/messages/{enc_id}?$select={select}",
-                    account.client.api_path_prefix()
-                ),
+                url: hydrate_url_for_id(account, id, select),
                 body: None,
                 headers: None,
             }
@@ -311,10 +311,48 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
     }
 }
 
+/// Build the per-id Graph `/$batch` GET URL for hydration, decoding the
+/// (possibly foreign-encoded) id to route to `/users/{owner}` vs `/me`.
+/// Extracted so the routing is unit-testable without a live `$batch`.
+fn hydrate_url_for_id(account: &GraphAccount, id: &ObjectId, select: &str) -> String {
+    let parsed = super::foreign::parse_message_id(id);
+    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+    format!("{prefix}/messages/{enc_id}?$select={select}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::PushMode;
+    use crate::client::GraphClient;
     use serde_json::json;
+
+    #[test]
+    fn hydrate_routes_foreign_id_to_owner_and_primary_to_me() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let foreign_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        // A foreign-scope mint encodes the owner into the message id; the
+        // request site decodes it back to `/users/{owner}/messages/{native}`.
+        let foreign_id = super::super::foreign::encode_message_id(&foreign_scope, "AAMkmsg");
+        assert_eq!(
+            hydrate_url_for_id(&account, &foreign_id, "id"),
+            "/users/shared%40contoso.com/messages/AAMkmsg?$select=id"
+        );
+        // A primary id stays bare and routes through `/me`.
+        let primary_id = ObjectId("AAMkmsg".to_string());
+        assert_eq!(
+            hydrate_url_for_id(&account, &primary_id, "id"),
+            "/me/messages/AAMkmsg?$select=id"
+        );
+    }
 
     /// A3: Graph hydration body projections no longer mint a JSON
     /// `RawMime` (the prior contract violation). They degrade to

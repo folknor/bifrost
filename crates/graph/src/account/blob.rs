@@ -255,13 +255,15 @@ async fn fetch_raw_stream(
     account: &GraphAccount,
     message: &ObjectId,
 ) -> Result<bifrost_net::ByteStream, Box<crate::error::GraphError>> {
-    let prefix = account.client.api_path_prefix();
-    let enc_message_id = bifrost_net::url::encode_component(&message.0);
-    let url = format!(
-        "{}{prefix}/messages/{enc_message_id}/$value",
-        account.client.api_base()
-    );
-    let account_net = account.client.account_net().ok_or_else(|| {
+    // Decode the (possibly foreign-encoded) id so a shared-mailbox raw
+    // fetch routes to `/users/{owner}/messages/{native}/$value`; a primary
+    // id keeps `/me`.
+    let parsed = super::foreign::parse_message_id(message);
+    let client = account.client_for_owner(parsed.owner());
+    let prefix = client.api_path_prefix();
+    let enc_message_id = bifrost_net::url::encode_component(parsed.native_id());
+    let url = format!("{}{prefix}/messages/{enc_message_id}/$value", client.api_base());
+    let account_net = client.account_net().ok_or_else(|| {
         Box::new(crate::error::GraphError::Net(bifrost_net::Error::Network {
             message: "Graph client is not attached to an account".to_string(),
             transmission_state: bifrost_types::TransmissionState::Unsent,
@@ -279,14 +281,21 @@ async fn fetch_blob_stream(
     locator: &GraphBlobLocator,
     range: Option<ByteRange>,
 ) -> Result<bifrost_net::ByteStream, BlobFetchError> {
-    let prefix = account.client.api_path_prefix();
-    let enc_message_id = bifrost_net::url::encode_component(&locator.message_id);
+    // The locator's `message_id` is whatever id minted the blob handle: a
+    // shared-mailbox attachment inherits the foreign-encoded message id, so
+    // decode and route to `/users/{owner}`; a primary attachment keeps
+    // `/me`. The attachment id is always native (it has no mailbox of its
+    // own - it rides on the message).
+    let parsed = super::foreign::parse_message_id(&ObjectId(locator.message_id.clone()));
+    let client = account.client_for_owner(parsed.owner());
+    let prefix = client.api_path_prefix();
+    let enc_message_id = bifrost_net::url::encode_component(parsed.native_id());
     let enc_attachment_id = bifrost_net::url::encode_component(&locator.attachment_id);
     let url = format!(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
-        account.client.api_base()
+        client.api_base()
     );
-    let account_net = account.client.account_net().ok_or_else(|| {
+    let account_net = client.account_net().ok_or_else(|| {
         BlobFetchError::Failed(Box::new(crate::error::GraphError::Net(
             bifrost_net::Error::Network {
                 message: "Graph client is not attached to an account".to_string(),
@@ -330,6 +339,69 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::account::{GraphAccount, PushMode};
+    use crate::client::GraphClient;
+    use bifrost_types::CursorScope;
+
+    /// A blob handle minted from a foreign-encoded message id inherits the
+    /// owning mailbox: `blob_handle_from_graph_attachment(&encoded_id, ..)`
+    /// stores the encoded id in the locator, so `open_blob` routes the
+    /// `/attachments/{aid}/$value` fetch to `/users/{owner}`.
+    #[test]
+    fn blob_handle_inherits_foreign_message_owner() {
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let encoded = super::super::foreign::encode_message_id(&scope, "AAMkmsg");
+        let handle = blob_handle_from_graph_attachment(
+            &encoded,
+            &json!({
+                "id": "att1",
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "size": 7
+            }),
+        )
+        .expect("handle expected");
+        let locator = decode_locator(&handle).expect("locator");
+        // The locator's message id is the encoded id; it decodes back to
+        // the owner + native message id.
+        let parsed = super::super::foreign::parse_message_id(&ObjectId(locator.message_id));
+        assert_eq!(parsed.owner(), Some("shared@contoso.com"));
+        assert_eq!(parsed.native_id(), "AAMkmsg");
+    }
+
+    #[test]
+    fn blob_and_raw_route_foreign_message_to_owner() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let foreign = super::super::foreign::encode_message_id(&scope, "AAMkmsg");
+        let parsed = super::super::foreign::parse_message_id(&foreign);
+        // Both fetch_raw_stream and fetch_blob_stream build their URL from
+        // exactly these two pieces: the owner's prefix + the native id.
+        assert_eq!(
+            account.client_for_owner(parsed.owner()).api_path_prefix(),
+            "/users/shared%40contoso.com"
+        );
+        assert_eq!(parsed.native_id(), "AAMkmsg");
+
+        // A primary message id stays on `/me`.
+        let primary = ObjectId("AAMkmsg".to_string());
+        let parsed_primary = super::super::foreign::parse_message_id(&primary);
+        assert_eq!(
+            account
+                .client_for_owner(parsed_primary.owner())
+                .api_path_prefix(),
+            "/me"
+        );
+    }
 
     #[test]
     fn file_attachment_handle_supports_range() {

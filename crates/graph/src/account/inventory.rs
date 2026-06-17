@@ -170,7 +170,10 @@ pub(crate) fn inventory_entry_from_value(
         .map(|thread| ThreadId(thread.to_string()));
 
     Some(InventoryEntry {
-        id: ObjectId(id),
+        // Foreign-encode the id at mint so later hydration / blob /
+        // raw-RFC822 reads route to `/users/{owner}`; a primary-scope
+        // item stays bare. Exactly one wire form per logical item.
+        id: super::foreign::encode_message_id(scope, &id),
         memberships: vec![membership],
         size: None,
         blob_id: None,
@@ -645,6 +648,27 @@ mod tests {
             membership_from_value(&scope, &value),
             MembershipScope::Folder(FolderId("inbox".to_string()))
         );
+    }
+
+    #[test]
+    fn inventory_entry_id_encodes_foreign_scope_and_leaves_primary_bare() {
+        // Foreign scope: the entry id carries the owning mailbox so later
+        // hydration / blob reads route to `/users/{owner}`.
+        let foreign_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let value = json!({ "id": "AAMkmsg", "changeKey": "ck1" });
+        let entry = inventory_entry_from_value(&foreign_scope, &value).expect("entry");
+        assert_eq!(entry.id.0, "shared@contoso.com\u{1f}AAMkmsg");
+
+        // Primary scope: the id stays bare. One encoding per logical item.
+        let primary_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let entry = inventory_entry_from_value(&primary_scope, &value).expect("entry");
+        assert_eq!(entry.id.0, "AAMkmsg");
     }
 
     #[test]

@@ -282,16 +282,24 @@ async fn unsubscribe_ews(
 }
 
 fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<String> {
-    let prefix = account.client.api_path_prefix();
+    // Route the resource through the scope's owning client (primary `/me`
+    // or a shared mailbox's `/users/{owner}`) and use the *native* folder
+    // id in the path. A foreign scope carries the owning mailbox inside the
+    // `FolderId`; percent-encoding that raw foreign id into the URL (the
+    // old behavior) produced a `/me/mailFolders/{owner%1Ffolder}/...`
+    // resource Graph cannot resolve.
+    let prefix = account.client_for_scope(scope).api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => match ty {
             ObjectType::Email => {
-                let encoded = bifrost_net::url::encode_component(&folder.0);
+                let native = super::foreign::parse_folder(folder).native_id().to_string();
+                let encoded = bifrost_net::url::encode_component(&native);
                 Some(format!("{prefix}/mailFolders/{encoded}/messages"))
             }
             ObjectType::Event | ObjectType::CalendarEvent => Some(format!("{prefix}/events")),
             ObjectType::Contact => {
-                let encoded = bifrost_net::url::encode_component(&folder.0);
+                let native = super::foreign::parse_folder(folder).native_id().to_string();
+                let encoded = bifrost_net::url::encode_component(&native);
                 Some(format!("{prefix}/contactFolders/{encoded}/contacts"))
             }
             _ => None,
@@ -359,6 +367,28 @@ mod tests {
             resource_for_scope(&account, &scope).as_deref(),
             Some("/me/events")
         );
+    }
+
+    #[test]
+    fn graph_subscription_resource_routes_foreign_scope_to_owner() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        // The owning mailbox rides in the `/users/{id}` segment and only
+        // the native folder id is in `/mailFolders/{id}` - no raw foreign
+        // id (no `%1F` separator) is percent-encoded into the URL.
+        let resource = resource_for_scope(&account, &scope).expect("foreign scope resolves");
+        assert_eq!(
+            resource,
+            "/users/shared%40contoso.com/mailFolders/AAMk/messages"
+        );
+        assert!(!resource.contains("%1F"));
     }
 
     /// `subscribe_graph` must fail loudly when any requested scope

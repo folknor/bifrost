@@ -69,8 +69,12 @@ pub(crate) fn changes_stream(
                 }
                 if is_removed(&value) {
                     if let Some(id) = removed_id(&value) {
+                        // Encode the removed id the same way the Added /
+                        // Updated ids are encoded, so a foreign item's
+                        // remove carries the same bytes its add did
+                        // (ratatoskr equality-joins on this id).
                         changes.push(Change::ScopeChange(ScopeChange {
-                            id,
+                            id: super::foreign::encode_message_id(&scope, &id.0),
                             membership: membership_from_value(&scope, &value),
                             kind: ScopeChangeKind::Removed,
                         }));
@@ -78,7 +82,11 @@ pub(crate) fn changes_stream(
                     continue;
                 }
                 if let Some(id) = value.get("id").and_then(Value::as_str) {
-                    let object_id = bifrost_types::ObjectId(id.to_string());
+                    // Foreign-encode the change id at mint: the readback
+                    // guard feeds these ids straight back into
+                    // `get_stream(FlagsOnly)`, which decodes and routes to
+                    // `/users/{owner}`. A primary-scope id stays bare.
+                    let object_id = super::foreign::encode_message_id(&scope, id);
                     if let Some(etag) = graph_etag(&value) {
                         etags.push((object_id.0.clone(), etag));
                     }

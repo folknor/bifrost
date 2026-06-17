@@ -175,6 +175,19 @@ impl GraphAccount {
         }
     }
 
+    /// Select the `GraphClient` for an owning mailbox decoded from a
+    /// foreign-encoded message/blob id. `None` (a primary-mailbox item)
+    /// routes through `/me`; a configured shared mailbox routes through
+    /// its `/users/{mailbox}` client. An unconfigured mailbox falls back
+    /// to the primary client - the subsequent request will surface the
+    /// real `/me` 404, which is more honest than a silent local error for
+    /// an id this account never minted.
+    pub(crate) fn client_for_owner(&self, owner: Option<&str>) -> &GraphClient {
+        owner
+            .and_then(|mailbox| self.shared_clients.get(mailbox))
+            .unwrap_or(&self.client)
+    }
+
     /// Look up the public-folder routing for a native EWS folder id, or
     /// `None` if the folder is not a public folder. Presence in the map
     /// is the discriminator that routes a `CursorScope::Folder` onto the
