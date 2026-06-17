@@ -1383,7 +1383,7 @@ async fn search_message_rows(
     account: &GraphAccount,
     request: SearchRequest,
 ) -> Result<Page<SearchRow>, AccountError> {
-    let url = search_url(account, &request)?;
+    let url = search_url(&account.client.api_path_prefix(), &request)?;
     let ctx = GraphErrorContext::graph(AccountOperation::Search);
     let page: ODataCollection<Value> = if url.starts_with("http") {
         account.client.get_absolute(&url).await
@@ -1407,7 +1407,7 @@ async fn search_message_rows(
     })
 }
 
-fn search_url(account: &GraphAccount, request: &SearchRequest) -> Result<String, AccountError> {
+fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountError> {
     if let Some(cursor) = &request.page_cursor {
         return String::from_utf8(cursor.clone()).map_err(|error| {
             pim_protocol_error(
@@ -1421,44 +1421,167 @@ fn search_url(account: &GraphAccount, request: &SearchRequest) -> Result<String,
         "$select=id,conversationId".to_string(),
         format!("$top={}", request.limit.unwrap_or(50).clamp(1, 250)),
     ];
-    if let Some(filter) = &request.filter {
-        let filter = odata_filter(filter)?;
-        if !filter.is_empty() {
+    // Graph `/messages` forbids combining `$search` with `$filter` in one
+    // request (it answers 400). A structured filter that needs `$search`
+    // (any From/To substring leaf, since `$filter` `contains()` on the
+    // sender/recipient navigation properties is rejected) therefore forces
+    // the *whole* request onto `$search`/KQL: the structured filter is
+    // expressed as KQL and AND-combined with any raw `provider_query`.
+    // Otherwise the OData `$filter` path stays in force, and a bare
+    // `provider_query` (no structured filter) still goes through `$search`.
+    let needs_search = request
+        .filter
+        .as_ref()
+        .is_some_and(filter_requires_search);
+    if needs_search {
+        let mut kql_parts = Vec::new();
+        if let Some(filter) = &request.filter {
+            let kql = kql_filter(filter)?;
+            if !kql.is_empty() {
+                kql_parts.push(kql);
+            }
+        }
+        if let Some(provider_query) = &request.provider_query {
+            kql_parts.push(graph_search_escape(provider_query));
+        }
+        let search = if kql_parts.len() == 1 {
+            kql_parts.remove(0)
+        } else {
+            kql_parts
+                .into_iter()
+                .map(|part| format!("({part})"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        params.push(format!(
+            "$search={}",
+            bifrost_net::url::encode_component(&format!("\"{search}\""))
+        ));
+    } else {
+        if let Some(filter) = &request.filter {
+            let filter = odata_filter(filter)?;
+            if !filter.is_empty() {
+                params.push(format!(
+                    "$filter={}",
+                    bifrost_net::url::encode_component(&filter)
+                ));
+            }
+        }
+        if let Some(provider_query) = &request.provider_query {
             params.push(format!(
-                "$filter={}",
-                bifrost_net::url::encode_component(&filter)
+                "$search={}",
+                bifrost_net::url::encode_component(&format!(
+                    "\"{}\"",
+                    graph_search_escape(provider_query)
+                ))
             ));
         }
     }
-    if let Some(provider_query) = &request.provider_query {
-        params.push(format!(
-            "$search={}",
-            bifrost_net::url::encode_component(&format!(
-                "\"{}\"",
-                graph_search_escape(provider_query)
-            ))
-        ));
+    Ok(format!("{prefix}/messages?{}", params.join("&")))
+}
+
+/// True if any leaf of the filter tree is a `From`/`To` substring match.
+/// Graph `$filter` rejects `contains()` on the sender/recipient navigation
+/// properties, so the whole request must route through `$search`/KQL when
+/// one of these is present anywhere in the boolean composition.
+fn filter_requires_search(filter: &SearchFilter) -> bool {
+    match filter {
+        SearchFilter::From(_) | SearchFilter::To(_) => true,
+        SearchFilter::And(filters) | SearchFilter::Or(filters) => {
+            filters.iter().any(filter_requires_search)
+        }
+        SearchFilter::Not(inner) => filter_requires_search(inner),
+        _ => false,
     }
-    Ok(format!(
-        "{}/messages?{}",
-        account.client.api_path_prefix(),
-        params.join("&")
-    ))
+}
+
+/// Express the whole filter tree as a KQL `$search` string.
+///
+/// Used only when `filter_requires_search` holds, because Graph cannot mix
+/// `$search` with `$filter`. KQL property restrictions cover sender,
+/// recipient, subject, body, attachment presence, category, and a send-date
+/// range; KQL terms are AND/OR/NOT-composed. The one structured leaf with no
+/// KQL equivalent on `/messages?$search` is `In` (folder scoping), which has
+/// no KQL property - rather than silently drop it (returning matches from
+/// other folders) or emit an invalid mixed request, it is a clean
+/// `Request(Malformed)` so the caller learns the combination is unsupported.
+fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> {
+    match filter {
+        SearchFilter::From(value) => Ok(format!("from:{}", kql_quoted(value))),
+        // KQL `to:` and `cc:` cover the recipient set; there is no KQL
+        // bcc property, matching Graph's search surface.
+        SearchFilter::To(value) => Ok(format!(
+            "(to:{0} OR cc:{0})",
+            kql_quoted(value)
+        )),
+        SearchFilter::Subject(value) => Ok(format!("subject:{}", kql_quoted(value))),
+        SearchFilter::Body(value) => Ok(format!("body:{}", kql_quoted(value))),
+        SearchFilter::Has(value) => {
+            if value.is_empty() {
+                Ok("hasattachment:true".to_string())
+            } else {
+                Err(unsupported_account_error(AccountOperation::Search))
+            }
+        }
+        SearchFilter::Labeled(label) => {
+            Ok(format!("category:{}", kql_quoted(&label_id_native(label))))
+        }
+        SearchFilter::DateRange { after, before } => {
+            let mut parts = Vec::new();
+            if let Some(after) = after {
+                parts.push(format!("received>={}", system_time_date(*after)));
+            }
+            if let Some(before) = before {
+                parts.push(format!("received<{}", system_time_date(*before)));
+            }
+            Ok(parts.join(" AND "))
+        }
+        SearchFilter::And(filters) => kql_join(filters, "AND"),
+        SearchFilter::Or(filters) => kql_join(filters, "OR"),
+        SearchFilter::Not(filter) => Ok(format!("NOT ({})", kql_filter(filter)?)),
+        // `In` (folder scoping) has no KQL property; failing cleanly beats
+        // shipping a request that would silently search every folder.
+        SearchFilter::In(_) => Err(invalid_account_error(
+            AccountOperation::Search,
+            "Graph search cannot combine a folder restriction with a \
+             sender/recipient substring match (no KQL folder property); \
+             use a folder-scoped search or drop the From/To term",
+        )),
+        _ => Err(unsupported_account_error(AccountOperation::Search)),
+    }
+}
+
+fn kql_join(filters: &[SearchFilter], op: &str) -> Result<String, AccountError> {
+    let mut parts = Vec::new();
+    for filter in filters {
+        let part = kql_filter(filter)?;
+        if !part.is_empty() {
+            parts.push(format!("({part})"));
+        }
+    }
+    Ok(parts.join(&format!(" {op} ")))
+}
+
+/// KQL-quoted string value: wrap in double quotes (so multi-word values are
+/// one phrase, not OR-ed tokens) and escape embedded double quotes.
+fn kql_quoted(value: &str) -> String {
+    format!("\"{}\"", graph_search_escape(value))
+}
+
+/// KQL date literal (`YYYY-MM-DD`) for the `received` range predicates.
+fn system_time_date(value: SystemTime) -> String {
+    let dt: chrono::DateTime<chrono::Utc> = value.into();
+    dt.format("%Y-%m-%d").to_string()
 }
 
 fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError> {
-    // KNOWN LIMITATION (pre-existing): Graph `/messages` `$filter` does
-    // not support `contains()` on the sender/recipient navigation
-    // properties below; the server answers 400 "Unsupported or invalid
-    // query filter clause". The only server-supported substring route for
-    // these fields is `$search` (KQL via `provider_query` in `search_url`),
-    // which is a different query model and is not a drop-in for the
-    // structured `SearchFilter::{From, To}` contract. Rather than swap in
-    // an equally-rejected `$filter` shape, the substring sender/recipient
-    // match is left to the `$search` path; these clauses stay as-is and
-    // are expected to fail server-side for substring use. Resolving this
-    // requires routing `From`/`To` through `$search`, which is a contract
-    // decision flagged separately, not a local rewrite.
+    // `From`/`To` are never reached here: any filter tree containing a
+    // sender/recipient substring leaf is detected by `filter_requires_search`
+    // in `search_url` and routed onto `$search`/KQL instead (Graph `$filter`
+    // rejects `contains()` on those navigation properties with a 400). The
+    // arms below are kept as a defensive fallback for a direct `odata_filter`
+    // call and use the rejected `contains()` shape, but the live `search_url`
+    // path no longer emits them.
     match filter {
         SearchFilter::From(value) => Ok(format!(
             "(contains(from/emailAddress/address,{0}) or contains(from/emailAddress/name,{0}))",
@@ -2044,6 +2167,108 @@ mod tests {
         let filter =
             odata_filter(&SearchFilter::Subject("Bob's plan".to_string())).expect("filter builds");
         assert_eq!(filter, "contains(subject,'Bob''s plan')");
+    }
+
+    // The query string carries the KQL phrase percent-encoded; compare
+    // against the same encoder the production path uses rather than a
+    // hand-maintained decode table.
+    fn search_param(url: &str) -> String {
+        url.split("$search=")
+            .nth(1)
+            .expect("url has a $search param")
+            .to_string()
+    }
+
+    #[test]
+    fn from_to_filters_route_through_search_kql_not_filter() {
+        // A From substring must hit `$search` (KQL), never the `$filter`
+        // `contains()` Graph rejects.
+        let req = SearchRequest::filter(SearchFilter::From("alice".to_string()));
+        let url = search_url("/me", &req).expect("url builds");
+        assert!(url.contains("$search="), "{url}");
+        assert!(!url.contains("$filter="), "{url}");
+        assert_eq!(
+            search_param(&url),
+            bifrost_net::url::encode_component("\"from:\"alice\"\"")
+        );
+
+        let to = SearchRequest::filter(SearchFilter::To("bob@x".to_string()));
+        let to_url = search_url("/me", &to).expect("url builds");
+        assert_eq!(
+            search_param(&to_url),
+            bifrost_net::url::encode_component("\"(to:\"bob@x\" OR cc:\"bob@x\")\"")
+        );
+    }
+
+    #[test]
+    fn non_sender_filter_still_uses_odata_filter() {
+        // Subject-only search has a clean `$filter` shape; it must not be
+        // forced onto `$search`.
+        let req = SearchRequest::filter(SearchFilter::Subject("invoice".to_string()));
+        let url = search_url("/me", &req).expect("url builds");
+        assert!(url.contains("$filter="), "{url}");
+        assert!(!url.contains("$search="), "{url}");
+    }
+
+    #[test]
+    fn mixed_from_and_date_range_collapses_to_one_kql_search() {
+        // From substring AND a date range: the whole thing goes to KQL,
+        // never a mixed `$search`+`$filter` request.
+        let req = SearchRequest::filter(SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::DateRange {
+                after: Some(SystemTime::UNIX_EPOCH),
+                before: None,
+            },
+        ]));
+        let url = search_url("/me", &req).expect("url builds");
+        assert!(url.contains("$search="), "{url}");
+        assert!(!url.contains("$filter="), "{url}");
+        assert_eq!(
+            search_param(&url),
+            bifrost_net::url::encode_component(
+                "\"(from:\"alice\") AND (received>=1970-01-01)\""
+            )
+        );
+    }
+
+    #[test]
+    fn from_filter_and_provider_query_combine_in_kql() {
+        // A structured From plus a raw provider query AND together into one
+        // `$search`; the request must not emit both `$filter` and `$search`.
+        let mut req = SearchRequest::filter(SearchFilter::From("alice".to_string()));
+        req.provider_query = Some("importance:high".to_string());
+        let url = search_url("/me", &req).expect("url builds");
+        assert!(url.contains("$search="), "{url}");
+        assert!(!url.contains("$filter="), "{url}");
+        assert_eq!(
+            search_param(&url),
+            bifrost_net::url::encode_component(
+                "\"(from:\"alice\") AND (importance:high)\""
+            )
+        );
+    }
+
+    #[test]
+    fn from_combined_with_folder_restriction_is_malformed() {
+        // `In` has no KQL property; combining it with a From substring is an
+        // inexpressible query and must fail cleanly rather than ship an
+        // invalid request or silently search every folder.
+        let req = SearchRequest::filter(SearchFilter::And(vec![
+            SearchFilter::From("alice".to_string()),
+            SearchFilter::In(ContainerId("inbox".to_string())),
+        ]));
+        let err = search_url("/me", &req).expect_err("inexpressible combination");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Search));
+    }
+
+    #[test]
+    fn kql_quoting_escapes_embedded_double_quotes() {
+        assert_eq!(kql_quoted(r#"a"b"#), r#""a\"b""#);
     }
 
     #[test]

@@ -84,7 +84,7 @@ outlook.timezone="UTC"`. Recurrence maps common daily/weekly/monthly/yearly
 patterns to RRULE and back; unsupported outbound parts reject serialization,
 unsupported inbound shapes are omitted, and `relativeMonthly`/`relativeYearly`
 lacking BYMONTHDAY+BYDAY reject locally. Outbound times map a conservative IANA
--> Windows table (unknown IANA ids reject pre-payload). `responseStatus` maps to
+-> Windows table (unknown ids reject pre-payload). `responseStatus` maps to
 `self_response`; RSVP uses native `accept`/`decline`/`tentativelyAccept`.
 Calendar/contact update/delete fetch-then-`If-Match` and send sparse PATCH
 (scalar clears as null; contacts emit `null`/`[]` for emptied buckets). Event
@@ -192,15 +192,14 @@ selecting against the same token.
 (landing in `OpaqueChangeState::bytes`; page markers also in
 `ChangeCursor::advanced_through`).
 
-`decode_cursor` rejects wrong protocol, incompatible envelopes, and
-malformed JSON. `changes_stream` cross-checks that payload kind projects
-back to `cursor.scope`; mismatches terminate with
-`SyncState(SchemaIncompatible)`. `establish_initial_cursor` accepts
-delta-eligible `FolderType` scopes (email, event/calendar event, contact)
-plus any `CursorScope::Folder` present in the public-folder routing map;
-both mint the first cursor through inventory. A delta `describe_cursor` is
-cheap/`ServerCursor`/fresh; a public-folder cursor is cheap/`Poll`/fresh;
-invalid cursors reseed through inventory.
+`decode_cursor` rejects wrong protocol, incompatible envelopes, and malformed
+JSON. `changes_stream` cross-checks that payload kind projects back to
+`cursor.scope`; mismatches terminate with `SyncState(SchemaIncompatible)`.
+`establish_initial_cursor` accepts delta-eligible `FolderType` scopes (email,
+event/calendar event, contact) plus any `CursorScope::Folder` in the
+public-folder routing map; both mint the first cursor through inventory. A delta
+`describe_cursor` is cheap/`ServerCursor`/fresh; a public-folder cursor is
+cheap/`Poll`/fresh; invalid cursors reseed through inventory.
 
 ### Public-folder cursor (no delta token)
 
@@ -219,10 +218,9 @@ it the snapshot empties and the folder degrades to additions-only with one
 scoped `Warning`. Dispatch: routing-map membership for `Folder` scopes
 (establish/inventory), cursor kind for changes; a bare non-public `Folder`
 keeps its reject-on-delta behavior. `push_subscribe` is
-`Unsupported(PushSubscribe)` for any `Folder` scope (poll-only v1). Lost
-rights surface as EWS `ErrorAccessDenied` and quarantine just that scope
-via `ews_shared_scope_error` -> `ScopeRevoked` -> `DisableScope`
-(owner = content mailbox).
+`Unsupported(PushSubscribe)` for any `Folder` scope (poll-only v1). Lost rights
+surface as EWS `ErrorAccessDenied` and quarantine just that scope via
+`ews_shared_scope_error` -> `ScopeRevoked` -> `DisableScope`.
 
 ## Per-scope inventory, changes, hydration
 
@@ -287,9 +285,10 @@ then each shared mailbox's folders, emitting foreign-namespaced `FolderType`
 scopes; a per-mailbox permission denial skips with a `Warning`.
 `discover_memberships_inner` emits the foreign `MembershipScope::Mailbox(owner)`
 tag with the folder membership, and `inventory_stream` stamps it onto every
-foreign-scope item (the engine covering rule cannot form it). `initial_delta_url` reads the prefix from
-`client_for_scope` and the native id from `parse_folder`, so the mailbox rides
-in `/users/{id}` and the native id in `/mailFolders/{id}`.
+foreign-scope item (the engine covering rule cannot form it).
+`initial_delta_url` reads the prefix from `client_for_scope` and the native id
+from `parse_folder`, so the mailbox rides in `/users/{id}`, the id in
+`/mailFolders/{id}`.
 
 Revocation isolation: `graph_shared_scope_error(error, scope, owner, ctx)`
 quarantines just the foreign scope when the failure is
@@ -300,10 +299,10 @@ primary scope (`owner == None`) stays terminal `NoPermission`. Wired at the
 
 Foreign-mailbox enumeration is config-supplied (`with_shared_mailbox`): Graph
 REST has no "list my delegated mailboxes" call. The Autodiscover
-`alternativeMailboxes` parser + entry point land in `autodiscover.rs` (tested)
-but unwired - delegate *enumeration* into the foreign seeding is a named
-follow-up (`TODO.md`). The EWS twin `ews_shared_scope_error` applies the same
-`ScopeRevoked` -> `DisableScope` isolation to public-folder scopes.
+`alternativeMailboxes` parser lands in `autodiscover.rs` (tested) but unwired -
+delegate enumeration into the foreign seeding is a named follow-up (`TODO.md`).
+The EWS twin `ews_shared_scope_error` applies the same `ScopeRevoked` ->
+`DisableScope` isolation to public-folder scopes.
 
 ## Public-folder discovery (Autodiscover)
 
@@ -372,13 +371,12 @@ rewrites the `categories` array, `Add`/`Remove`/`Patch` touch named fields.
 
 Mail mutation primitives live in `pim.rs`, per-message, fanning out a
 `MutationTarget::Thread` via `/messages?$filter=conversationId eq ...`.
-`add_to_container` is `POST /messages/{id}/move` (no symmetric remove, so
+`add_to_container` is `POST /messages/{id}/move` (no symmetric remove ->
 `remove_from_container` unsupported). `set_is_read` patches `isRead`;
 `set_category` patches `categories[]` (reserved `$flagged`/`starred` ->
 `flag.flagStatus`). `set_extended_property` patches
-`singleValueExtendedProperties` when `Some`, else `DELETE`s it (404-tolerant;
-`PR_LAST_VERB_EXECUTED` = `Integer 0x1081`). All send `If-Match` when
-`changeKey` exists.
+`singleValueExtendedProperties` when `Some`, else `DELETE`s it (404-tolerant).
+All send `If-Match` if `changeKey` set.
 
 `set_importance` patches the single-valued `importance` field in one
 `If-Match`-conditioned PATCH (never clear-then-set); the read side maps it back
@@ -390,9 +388,9 @@ Items id is rediscovered via sync/search), returning the draft id.
 Inline attachments encode into `fileAttachment` JSON; standalone
 `attachment_upload` is unsupported (over-limit -> `host_attachment` ->
 OneDrive); `draft_update` patches mutable fields (no attachment replace).
-Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`,
-ISO-8601 UTC) onto the draft between create and send for a future
-`scheduled`; the draft id is the cancel/reschedule handle.
+Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`, ISO-8601
+UTC) onto the draft between create and send; the draft id is the
+cancel/reschedule handle.
 
 `SendRequest::send_as` (gated by `pim_methods.send_as`, Graph only) routes
 create/deferred-stamp/send through the shared mailbox's `shared_clients`
@@ -404,19 +402,22 @@ mailbox is `Request(Malformed)`.
 
 Search uses `/messages` (`$filter`/`$search`/`$top`, `@odata.nextLink` as
 the opaque page cursor); message search returns native ids, thread search
-dedups `conversationId` per page.
+dedups `conversationId` per page. Graph forbids `$search`+`$filter` together and
+rejects `$filter` `contains()` on sender/recipient (400), so any
+`SearchFilter::{From,To}` leaf (`filter_requires_search`) routes the whole
+filter onto `$search`/KQL (`kql_filter`), AND-combining any `provider_query`;
+`In` + From/To is `Request(Malformed)` (no KQL folder property). No-sender
+searches keep the `$filter` path.
 
 `directory_search` (organization directory / GAL, distinct from the personal
-`/contacts` corpus `contact_search` scans) queries `/users` with
-`$select=displayName,mail,businessPhones,companyName,jobTitle,department` and
-`$top`, returning `Page<DirectoryCard>`. A non-empty query pushes a
-provider-side `$filter` of `startswith(displayName,'q') or startswith(mail,'q')`
-(single-quote-escaped then URL-encoded as a whole) - unlike `contact_search`,
-which scans client-side and only server-filters exact-email queries. Rows
-without `mail` are dropped; `additional_emails` is empty in A9
-(`otherMails`/`proxyAddresses` is a follow-up). `@odata.nextLink` is the page
-cursor. A tenant lacking `User.ReadBasic.All` / `User.Read.All` answers 403,
-which maps through `graph_error` to a real `NoPermission` error (an unauthorized
+`/contacts` corpus `contact_search` scans) queries `/users` with a
+`displayName,mail,businessPhones,companyName,jobTitle,department` `$select`,
+`$top`, and (non-empty query) a provider-side `$filter`
+`startswith(displayName,'q') or startswith(mail,'q')` (escaped + URL-encoded as
+a whole) - unlike `contact_search`, which scans client-side and only
+server-filters exact-email queries. Rows without `mail` are dropped;
+`additional_emails` is empty; `@odata.nextLink` pages. A tenant lacking
+`User.ReadBasic.All` / `User.Read.All` 403s -> `NoPermission` (an unauthorized
 directory is an error, not an empty result).
 
 Container CRUD maps to mail folders only. `containers_list` returns
@@ -501,9 +502,8 @@ Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
 `SchemaIncompatible`, malformed payload) build an AccountError with
 `SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`.
 
-Non-byte-stream attachments emit `Warning { kind:
-WarningKind::BlobNotByteStream, .. }` rather than a terminal error, so the
-engine continues past a referenceAttachment in a mixed batch.
+Non-byte-stream attachments emit a `BlobNotByteStream` `Warning` rather than a
+terminal error, so the engine continues past a referenceAttachment in a batch.
 
 ## Known limitations
 
