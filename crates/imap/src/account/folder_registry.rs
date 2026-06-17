@@ -251,12 +251,20 @@ impl FolderRegistry {
     }
 
     /// Install shared/other-user folders, each tagged with its owning
-    /// mailbox. Additive: existing personal entries are left in place.
+    /// mailbox. Additive: existing personal entries are left in place. A
+    /// shared/other-user namespace that overlaps the personal LIST (the
+    /// same folder name appears in both) must NOT flip the already-present
+    /// personal entry to shared-tagged - the personal mapping wins, so the
+    /// overlapping shared candidate is skipped rather than overwriting it.
     pub(crate) fn ingest_shared(&self, shared: Vec<(MailboxInfo, bifrost_types::MailboxId)>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
         for (info, owner) in shared {
+            let name = info.name.as_str().to_owned();
+            if map.contains_key(&name) {
+                continue;
+            }
             let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, Some(owner)));
-            map.insert(entry.name.as_str().to_owned(), entry);
+            map.insert(name, entry);
         }
     }
 
@@ -277,6 +285,20 @@ impl FolderRegistry {
             .iter()
             .any(|attr| matches!(attr, MailboxAttribute::NonExistent));
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
+        // Carry the shared-owner tag across a rename/recreate. A LIST/IDLE
+        // `MailboxInfo` does not re-derive the owning mailbox (NAMESPACE
+        // discovery does), so rebuilding the entry with `from_mailbox`
+        // (owner `None`) would silently demote a renamed/recreated shared
+        // folder to personal. A later SELECT denial on that folder would
+        // then escalate account-wide (`NoPermission`) instead of routing
+        // through the scoped `ScopeRevoked` quarantine. Source the owner
+        // from the entry being superseded: the old name on a rename, the
+        // same name on a recreate.
+        let inherited_owner = old_name
+            .as_ref()
+            .and_then(|old| map.get(old))
+            .or_else(|| map.get(&name))
+            .and_then(|entry| entry.shared_owner.clone());
         if let Some(old_name) = old_name {
             map.remove(&old_name);
         }
@@ -285,7 +307,7 @@ impl FolderRegistry {
             return;
         }
         if !map.contains_key(&name) || info.old_name.is_some() {
-            let entry = Arc::new(FolderEntry::from_mailbox(info));
+            let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, inherited_owner));
             map.insert(name, entry);
         }
     }
@@ -446,6 +468,45 @@ mod tests {
     }
 
     #[test]
+    fn ingest_shared_does_not_overwrite_personal_entry() {
+        let shared = MailboxName::new("Shared/INBOX").expect("valid mailbox");
+        let overlap = MailboxName::new("INBOX").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            vec![MailboxInfo {
+                name: overlap.clone(),
+                ..Default::default()
+            }],
+            vec![
+                (
+                    MailboxInfo {
+                        name: overlap.clone(),
+                        ..Default::default()
+                    },
+                    bifrost_types::MailboxId("alice".to_owned()),
+                ),
+                (
+                    MailboxInfo {
+                        name: shared.clone(),
+                        ..Default::default()
+                    },
+                    bifrost_types::MailboxId("alice".to_owned()),
+                ),
+            ],
+        );
+
+        // The personal INBOX must stay personal (no owner) despite an
+        // overlapping shared candidate of the same name.
+        let personal = registry.get(&overlap).expect("personal entry");
+        assert!(personal.shared_owner.is_none());
+        // The non-overlapping shared folder is still ingested.
+        let shared_entry = registry.get(&shared).expect("shared entry");
+        assert_eq!(
+            shared_entry.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned()))
+        );
+    }
+
+    #[test]
     fn mailbox_rename_removes_old_entry() {
         let old = MailboxName::new("Old").expect("valid mailbox");
         let new = MailboxName::new("New").expect("valid mailbox");
@@ -462,5 +523,63 @@ mod tests {
 
         assert!(registry.get(&old).is_none());
         assert!(registry.get(&new).is_some());
+    }
+
+    #[test]
+    fn rename_preserves_shared_owner_tag() {
+        let old = MailboxName::new("Shared/alice/Old").expect("valid mailbox");
+        let new = MailboxName::new("Shared/alice/New").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            Vec::new(),
+            vec![(
+                MailboxInfo {
+                    name: old.clone(),
+                    ..Default::default()
+                },
+                bifrost_types::MailboxId("alice".to_owned()),
+            )],
+        );
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: new.clone(),
+            old_name: Some(old.clone()),
+            ..Default::default()
+        });
+
+        let renamed = registry.get(&new).expect("renamed shared entry");
+        assert_eq!(
+            renamed.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned())),
+            "a renamed shared folder must keep its owner so a later SELECT denial quarantines",
+        );
+    }
+
+    #[test]
+    fn recreate_preserves_shared_owner_tag() {
+        let folder = MailboxName::new("Shared/alice/Proj").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            Vec::new(),
+            vec![(
+                MailboxInfo {
+                    name: folder.clone(),
+                    ..Default::default()
+                },
+                bifrost_types::MailboxId("alice".to_owned()),
+            )],
+        );
+
+        // Recreate at the same name (fresh UIDVALIDITY epoch): a same-name
+        // event with old_name set, or a contains-key replace path.
+        registry.apply_mailbox_event(MailboxInfo {
+            name: folder.clone(),
+            old_name: Some(folder.clone()),
+            ..Default::default()
+        });
+
+        let recreated = registry.get(&folder).expect("recreated shared entry");
+        assert_eq!(
+            recreated.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned())),
+        );
     }
 }

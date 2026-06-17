@@ -244,8 +244,17 @@ impl<'a> CursorBytes<'a> {
         for _ in 0..count {
             let start = self.take_u32()?;
             let end = self.take_u32()?;
+            // `end == 0` is the single-UID sentinel (UIDs are nz-number,
+            // so 0 can never be a real range end). Any other `end < start`
+            // is a genuinely malformed range that would otherwise build a
+            // backwards `UidRange`; reject it rather than silently decode
+            // a corrupt cursor into a nonsensical set.
             let range = if end == 0 {
                 crate::types::UidRange::single(start)
+            } else if end < start {
+                return Err(schema_incompatible(
+                    "IMAP cursor UID range has end before start",
+                ));
             } else {
                 crate::types::UidRange::range(start, end)
             };
@@ -552,6 +561,23 @@ mod tests {
         };
         let change = encode_cursor(CursorScope::Account, &cursor);
         assert_eq!(decode_cursor(&change).expect("decode"), cursor);
+    }
+
+    #[test]
+    fn cursor_uid_set_rejects_backwards_range() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(3); // Basic
+        push_u32(&mut bytes, 7); // uidvalidity
+        push_u32(&mut bytes, 20); // uidnext
+        push_u32(&mut bytes, 1); // one range
+        push_u32(&mut bytes, 10); // start
+        push_u32(&mut bytes, 5); // end < start, end != 0 -> malformed
+        let err = decode_folder_cursor(&bytes).expect_err("backwards range must be rejected");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::SchemaIncompatible)
+        ));
     }
 
     #[test]

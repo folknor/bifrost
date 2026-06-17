@@ -18,6 +18,11 @@ pub(crate) struct PushState {
     tx: broadcast::Sender<WatchEvent>,
     scopes: Mutex<HashMap<String, HashSet<CursorScope>>>,
     task_cancel: Mutex<Option<CancellationToken>>,
+    /// Wakes a parked IDLE loop when the subscribed scope set changes, so
+    /// a scope added after IDLE has already parked on one folder gets a
+    /// chance to be chosen instead of waiting for the current connection
+    /// to break. The loop re-evaluates `choose_idle_folder` on each wake.
+    resubscribe: std::sync::Arc<tokio::sync::Notify>,
     next_id: AtomicU64,
 }
 
@@ -28,6 +33,7 @@ impl PushState {
             tx,
             scopes: Mutex::new(HashMap::new()),
             task_cancel: Mutex::new(None),
+            resubscribe: std::sync::Arc::new(tokio::sync::Notify::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -63,6 +69,10 @@ pub(crate) fn push_subscribe(
                 ImapErrorContext::operation(AccountOperation::PushSubscribe),
             )
         })?;
+        // Nudge an already-running IDLE loop so a scope added after it
+        // parked on another folder is reconsidered without waiting for the
+        // current IDLE connection to break.
+        account.push.resubscribe.notify_one();
         Ok(handle)
     })
 }
@@ -142,6 +152,13 @@ fn ensure_idle_task(account: ImapAccount) -> Result<(), crate::Error> {
 }
 
 async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
+    // Track whether the consumer has seen a `Disconnected` since the last
+    // `Reconnected`. The very first successful connect must NOT emit
+    // `Reconnected` (there was no prior disconnect): the reconciler treats
+    // `Reconnected` as a full account-wide `Unknown` reconcile, which is
+    // spurious right after subscribe when discovery/inventory just ran.
+    let mut was_disconnected = false;
+    let resubscribe = std::sync::Arc::clone(&account.push.resubscribe);
     loop {
         if cancel.is_cancelled() || account.shutdown.is_cancelled() {
             break;
@@ -155,6 +172,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             Ok(conn) => conn,
             Err(_) => {
                 let _ = account.push.tx.send(WatchEvent::Disconnected);
+                was_disconnected = true;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -166,21 +184,59 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             Ok(selected) => selected,
             Err(_) => {
                 let _ = account.push.tx.send(WatchEvent::Disconnected);
+                was_disconnected = true;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
         };
         let uidvalidity = selected.uid_validity;
-        let _ = account.push.tx.send(WatchEvent::Reconnected);
+        if was_disconnected {
+            let _ = account.push.tx.send(WatchEvent::Reconnected);
+            was_disconnected = false;
+        }
         loop {
             if cancel.is_cancelled() || account.shutdown.is_cancelled() {
                 let _ = conn.logout().await;
                 return;
             }
-            match conn.idle(account.config.idle_timeout, cancel.clone()).await {
+            // Each IDLE round gets a child cancel token so a resubscribe
+            // notification (a new scope was added) can break this IDLE
+            // cleanly; the outer loop then re-runs `choose_idle_folder`,
+            // letting the newly-subscribed folder be picked up instead of
+            // waiting for this connection to break.
+            let round_cancel = cancel.child_token();
+            let notify_cancel = round_cancel.clone();
+            let resubscribe_for_round = std::sync::Arc::clone(&resubscribe);
+            let nudge = tokio::spawn(async move {
+                tokio::select! {
+                    () = resubscribe_for_round.notified() => notify_cancel.cancel(),
+                    () = notify_cancel.cancelled() => {}
+                }
+            });
+            let idle_result = conn
+                .idle(account.config.idle_timeout, round_cancel.clone())
+                .await;
+            let interrupted_by_resubscribe =
+                round_cancel.is_cancelled() && !cancel.is_cancelled();
+            nudge.abort();
+            match idle_result {
+                Ok(_) if interrupted_by_resubscribe => {
+                    // A new scope arrived: redial and re-choose the folder.
+                    break;
+                }
                 Ok(event) => {
                     if absorb_idle_event(&account, &folder, uidvalidity, &event).is_err() {
                         let _ = account.push.tx.send(invalidated(HintPayload::Unknown));
+                    }
+                    // A server BYE (or any server-initiated termination)
+                    // closes the connection: surface it as a disconnect
+                    // and tear down this IDLE so the outer loop redials,
+                    // rather than reporting an `Unknown` invalidation and
+                    // spinning `idle()` on a dead socket until it errors.
+                    if event_closes_connection(&event) {
+                        let _ = account.push.tx.send(WatchEvent::Disconnected);
+                        was_disconnected = true;
+                        break;
                     }
                     if let Some(event) = map_idle_event(event, &folder) {
                         let _ = account.push.tx.send(event);
@@ -188,6 +244,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
                 }
                 Err(_) => {
                     let _ = account.push.tx.send(WatchEvent::Disconnected);
+                    was_disconnected = true;
                     break;
                 }
             }
@@ -249,6 +306,13 @@ fn absorb_idle_event(
     Ok(())
 }
 
+/// Whether an IDLE event signals that the server is closing this
+/// connection. A `BYE` or server-initiated termination leaves the socket
+/// unusable; the push loop must redial rather than keep issuing `idle()`.
+pub(crate) fn event_closes_connection(event: &IdleEvent) -> bool {
+    matches!(event, IdleEvent::Bye { .. } | IdleEvent::ServerTerminated)
+}
+
 pub(crate) fn map_idle_event(
     event: IdleEvent,
     selected: &crate::types::MailboxName,
@@ -284,5 +348,21 @@ fn invalidated(payload: HintPayload) -> WatchEvent {
             source: PushSource::ImapNotify,
             payload,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bye_and_server_termination_close_the_connection() {
+        assert!(event_closes_connection(&IdleEvent::Bye {
+            code: None,
+            text: "logging out".to_string(),
+        }));
+        assert!(event_closes_connection(&IdleEvent::ServerTerminated));
+        assert!(!event_closes_connection(&IdleEvent::Exists(3)));
+        assert!(!event_closes_connection(&IdleEvent::Timeout));
     }
 }

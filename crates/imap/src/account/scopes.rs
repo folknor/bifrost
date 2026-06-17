@@ -80,6 +80,25 @@ fn memberships_for_entry(entry: &super::folder_registry::FolderEntry) -> Vec<Mem
     out
 }
 
+/// IMAP intentionally emits no `ScopeLifecycleEvent`s: this stream stays
+/// open (so the engine's lifecycle worker does not treat an early close as
+/// a fault) and yields nothing until shutdown.
+///
+/// This is a deliberate limitation, not a missing feature. IMAP discovers
+/// folders only at open/reopen (NAMESPACE + LIST in `factory.rs`), and the
+/// engine re-runs `discover_cursor_scopes` / `discover_memberships` on
+/// every account reopen. Folder mutations observed mid-session via push
+/// IDLE (`IdleEvent::MailboxEvent` -> `FolderRegistry::apply_mailbox_event`,
+/// in `push.rs`) update the in-memory registry and surface as
+/// `WatchEvent::Invalidated`, which drives a reconcile rather than a
+/// per-scope `RestartScope`. A folder that *appears* after attach (a newly
+/// shared/other-user mailbox) therefore stays invisible to the engine
+/// until the next full account reopen.
+///
+/// Wiring true folder-lifecycle detection (RFC 5465 NOTIFY MAILBOXES, or
+/// periodic LIST diffing) into a dedicated `Created`/`Renamed`/`Deleted`
+/// feed is a feature, not a bug fix, and is deferred. See `reference/imap.md`
+/// "Folder lifecycle" and `reference/sync.md` scope-lifecycle.
 pub(crate) fn scope_lifecycle_stream(
     account: ImapAccount,
 ) -> bifrost_types::AccountStream<bifrost_types::ScopeLifecycleEvent> {

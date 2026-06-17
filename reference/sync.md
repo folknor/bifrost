@@ -164,6 +164,15 @@ successful `Done`.
   `lifecycle_reopen` so the engine drives the fresh cursor
   establishment through the same recovery path; `Deleted`
   cancels the per-scope token and drops the cursor.
+  Not every protocol feeds this stream: IMAP deliberately emits
+  no lifecycle events (the stream stays open and yields nothing
+  until shutdown). IMAP discovers folders only at open/reopen, and
+  mid-session folder mutations surface as
+  `WatchEvent::Invalidated` via push IDLE rather than as
+  `ScopeLifecycle` events, so a folder that appears after attach is
+  invisible to the engine until the next account reopen. True
+  NOTIFY-MAILBOXES / LIST-diff lifecycle detection for IMAP is a
+  deferred feature, not a bug.
 - **Reopen requests** on a `mpsc::Sender<ReopenRequest>` channel:
   `RestartScope` deletes the in-memory and durable cursor before
   re-establishing; `RestartAccount` routes up to the engine's reopen

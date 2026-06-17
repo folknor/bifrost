@@ -205,10 +205,16 @@ async fn run_changes(
             known_uids,
             known_uids_complete,
         } => {
-            let reason = qresync_negotiation_warning.unwrap_or_else(|| {
-                "QRESYNC is disabled for this account session; continuing with CONDSTORE"
-                    .to_string()
-            });
+            // Prefer the one-shot warning (fires the account-level
+            // negotiation warning once), then the non-consuming session
+            // reason so a later folder's downgrade still names the
+            // specific cause rather than the generic fallback.
+            let reason = qresync_negotiation_warning
+                .or_else(|| account.qresync_negotiation_reason())
+                .unwrap_or_else(|| {
+                    "QRESYNC is disabled for this account session; continuing with CONDSTORE"
+                        .to_string()
+                });
             send_strategy_downgrade(&tx, SyncStrategy::QResync, SyncStrategy::Condstore, &reason)
                 .await?;
             run_condstore_with_baseline(

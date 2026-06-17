@@ -50,21 +50,35 @@ pub(crate) fn get_stream(
             }
         }
 
-        for (_key, (folder, ids)) in grouped {
+        // Iterate folders in a deterministic order so cross-folder output
+        // ordering is reproducible run-to-run (a `HashMap` iteration order
+        // is not). Within a folder the UID FETCH order is server-driven;
+        // only the folder grouping is sorted here.
+        let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> =
+            grouped.into_values().collect();
+        groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (folder, ids) in groups {
             match run_folder_get(&account, &folder, ids.clone(), projection, &tx).await {
                 Ok(()) => {}
                 Err(GetError::ChannelDropped) => return,
-                Err(GetError::Imap(err)) => {
+                Err(other) => {
                     // Per-folder failure does not collapse the stream:
                     // remaining items in this folder surface as
-                    // `Uncertain`, the next folder still runs.
-                    let account_err = super::account_error_with(
-                        err,
-                        super::error::ImapErrorContext::operation(
-                            bifrost_types::AccountOperation::Hydrate,
-                        )
-                        .with_folder_scope(&folder),
-                    );
+                    // `Uncertain`, the next folder still runs. A
+                    // shared-folder SELECT denial is pre-classified to
+                    // `ScopeRevoked` so it quarantines that scope rather
+                    // than masquerading as a generic hydration failure.
+                    let account_err = match other {
+                        GetError::Account(err) => err,
+                        GetError::Imap(err) => super::account_error_with(
+                            err,
+                            super::error::ImapErrorContext::operation(
+                                bifrost_types::AccountOperation::Hydrate,
+                            )
+                            .with_folder_scope(&folder),
+                        ),
+                        GetError::ChannelDropped => unreachable!("handled above"),
+                    };
                     let uncertain: Vec<ItemOutcome<HydratedObject>> = ids
                         .into_iter()
                         .map(|id| {
@@ -87,6 +101,10 @@ pub(crate) fn get_stream(
 /// per-item, or a dropped output channel (silent return).
 enum GetError {
     Imap(crate::Error),
+    /// A pre-classified `AccountError` (shared-folder SELECT denial built
+    /// as `ScopeRevoked` rather than letting the raw permission denial
+    /// derive account-terminal `NoPermission`).
+    Account(bifrost_types::AccountError),
     ChannelDropped,
 }
 
@@ -109,9 +127,29 @@ async fn run_folder_get(
     let shared_owner = folder_entry
         .as_ref()
         .and_then(|entry| entry.shared_owner.clone());
-    let selected = account
+    let selected = match account
         .select_folder(&mut conn, folder, cursor.as_ref(), true)
-        .await?;
+        .await
+    {
+        Ok(selected) => selected,
+        // A permission denial on a shared folder quarantines just that
+        // scope (`ScopeRevoked`) instead of surfacing as a generic
+        // hydration failure that could escalate account-wide; a personal
+        // folder, or any non-permission failure, flows through the normal
+        // mapping.
+        Err(err) if shared_owner.is_some() => {
+            return Err(GetError::Account(super::error::shared_folder_error(
+                err,
+                folder,
+                shared_owner.as_ref(),
+                super::error::ImapErrorContext::operation(
+                    bifrost_types::AccountOperation::Hydrate,
+                )
+                .with_folder_scope(folder),
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let uidvalidity = selected
         .mailbox
         .uid_validity

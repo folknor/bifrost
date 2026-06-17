@@ -209,10 +209,30 @@ async fn run_fetch(
     tx: &tokio::sync::mpsc::Sender<SyncEvent<Bytes>>,
 ) -> Result<(), BlobError> {
     let mut conn = account.checkout_for_folder(folder).await?;
-    let cursor = account.folders.get(folder).and_then(|entry| entry.cursor());
-    let selected = account
+    let folder_entry = account.folders.get(folder);
+    let cursor = folder_entry.as_ref().and_then(|entry| entry.cursor());
+    let shared_owner = folder_entry
+        .as_ref()
+        .and_then(|entry| entry.shared_owner.clone());
+    let selected = match account
         .select_folder(&mut conn, folder, cursor.as_ref(), true)
-        .await?;
+        .await
+    {
+        Ok(selected) => selected,
+        // A permission denial on a shared folder quarantines just that
+        // scope (`ScopeRevoked`) instead of escalating to account-level
+        // terminal; a personal folder, or any non-permission failure,
+        // flows through the normal mapping.
+        Err(err) if shared_owner.is_some() => {
+            return Err(BlobError::Account(super::error::shared_folder_error(
+                err,
+                folder,
+                shared_owner.as_ref(),
+                super::error::ImapErrorContext::operation(op).with_folder_scope(folder),
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
     let uidvalidity = selected
         .mailbox
         .uid_validity

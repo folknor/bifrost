@@ -407,13 +407,15 @@ pub(crate) struct SharedFolder {
 /// owner (there is no per-principal segment in a shared namespace). Pure and
 /// tested.
 pub(crate) fn mailbox_owner_for(prefix: &str, delimiter: Option<char>) -> bifrost_types::MailboxId {
-    let trimmed = match delimiter {
+    // The owner is the whole namespace root minus its trailing delimiter,
+    // NOT just the root's final segment. Collapsing to the final segment
+    // merges distinct multi-segment shared trees: `#shared/dept/` and
+    // `#other/dept/` would both yield `dept`, conflating two unrelated
+    // shared mailboxes' membership scopes. The full (trailing-stripped)
+    // prefix keeps them distinct.
+    let owner = match delimiter {
         Some(d) => prefix.strip_suffix(d).unwrap_or(prefix),
         None => prefix,
-    };
-    let owner = match delimiter {
-        Some(d) => trimmed.rsplit(d).next().unwrap_or(trimmed),
-        None => trimmed,
     };
     bifrost_types::MailboxId(owner.to_owned())
 }
@@ -432,7 +434,22 @@ pub(crate) fn mailbox_owner_from_other_user_path(
     prefix: &str,
     delimiter: Option<char>,
 ) -> bifrost_types::MailboxId {
-    let relative = folder_path.strip_prefix(prefix).unwrap_or(folder_path);
+    // The prefix only attributes a principal when the folder genuinely
+    // sits *under* it: a bare textual `strip_prefix` would mis-read
+    // `OtherTeam/INBOX` as belonging to the `Other` namespace and invent
+    // owner `Team`. Require the prefix to terminate on a delimiter
+    // boundary (the prefix already ends in the delimiter, or the path's
+    // next character after the prefix is the delimiter). When it does
+    // not, fall back to the root-derived owner rather than fabricating
+    // one from a partial-segment match.
+    let relative = match (folder_path.strip_prefix(prefix), delimiter) {
+        (Some(rest), Some(d)) if prefix.ends_with(d) || rest.starts_with(d) => rest,
+        (Some(rest), None) => rest,
+        // Prefix matched textually but not on a delimiter boundary
+        // (e.g. prefix `Other`, path `OtherTeam/INBOX`): not under the
+        // namespace.
+        _ => return mailbox_owner_for(prefix, delimiter),
+    };
     let segment = match delimiter {
         Some(d) => relative.split(d).find(|s| !s.is_empty()),
         None => (!relative.is_empty()).then_some(relative),
@@ -583,10 +600,17 @@ mod tests {
             mailbox_owner_for("Shared", None),
             bifrost_types::MailboxId("Shared".to_owned())
         );
-        // Multi-segment shared root collapses to its final segment.
+        // Multi-segment shared root keeps its whole (trailing-stripped)
+        // path as the owner so distinct trees do not collapse. A prior
+        // version used only the final segment, which merged
+        // `#shared/dept/` and `#other/dept/` into one `dept` owner.
         assert_eq!(
             mailbox_owner_for("#shared/dept/", Some('/')),
-            bifrost_types::MailboxId("dept".to_owned())
+            bifrost_types::MailboxId("#shared/dept".to_owned())
+        );
+        assert_ne!(
+            mailbox_owner_for("#shared/dept/", Some('/')),
+            mailbox_owner_for("#other/dept/", Some('/')),
         );
     }
 
@@ -622,6 +646,20 @@ mod tests {
         assert_eq!(
             mailbox_owner_from_other_user_path("#user/", "#user/", Some('/')),
             bifrost_types::MailboxId("#user".to_owned())
+        );
+        // Delimiter-boundary guard: a prefix that matches textually but
+        // not on a delimiter boundary (`Other` vs `OtherTeam/INBOX`) must
+        // NOT invent a bogus principal (`Team`) from the partial-segment
+        // match; it falls back to the root-derived owner.
+        assert_eq!(
+            mailbox_owner_from_other_user_path("OtherTeam/INBOX", "Other", Some('/')),
+            bifrost_types::MailboxId("Other".to_owned())
+        );
+        // A prefix without a trailing delimiter that DOES terminate on a
+        // boundary (next char is the delimiter) still reads the principal.
+        assert_eq!(
+            mailbox_owner_from_other_user_path("Other/dave/INBOX", "Other", Some('/')),
+            bifrost_types::MailboxId("dave".to_owned())
         );
     }
 

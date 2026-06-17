@@ -270,6 +270,16 @@ impl ImapAccount {
         }
         Some(warning.clone())
     }
+
+    /// Non-consuming read of the QRESYNC negotiation reason. Unlike
+    /// `take_qresync_negotiation_warning` (a one-shot that fires the
+    /// standalone account-level warning exactly once, to avoid per-folder
+    /// spam), this lets every later QRESYNC->CONDSTORE downgrade reuse the
+    /// specific session-level reason as its downgrade reason string rather
+    /// than falling back to a generic message once the one-shot is spent.
+    pub(crate) fn qresync_negotiation_reason(&self) -> Option<String> {
+        self.qresync_negotiation_warning.clone()
+    }
 }
 
 impl Account for ImapAccount {
