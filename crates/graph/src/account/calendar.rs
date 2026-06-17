@@ -232,14 +232,41 @@ pub(crate) async fn rsvp(
         .map_err(|error| into_error(error, AccountOperation::EventRsvp))
 }
 
+/// Sentinel prefix marking a `page_cursor` minted by the Graph Search API
+/// path (`search_with_graph_api`). The Search API pages by `from`/`size`
+/// offset rather than an `@odata.nextLink`, so its cursor cannot be fed to
+/// the local nextLink walk and vice versa. The bytes after the prefix are
+/// the decimal next `from` offset. `\u{1f}` cannot appear in a Graph
+/// `@odata.nextLink` URL, so the two cursor shapes never collide.
+const SEARCH_API_CURSOR_PREFIX: &[u8] = b"\x1fsearchapi:";
+
 pub(crate) async fn search(
     account: GraphAccount,
     request: EventSearchRequest,
 ) -> Result<Page<CalendarEvent>, AccountError> {
+    // A Search-API cursor must resume through the Search API: a local
+    // nextLink walk cannot consume a `from`-offset cursor.
+    if let Some(from) = search_api_cursor_offset(request.page_cursor.as_deref()) {
+        return search_with_graph_api(account, request, from).await;
+    }
     if graph_search_api_supported(&account, &request) {
-        return search_with_graph_api(account, request).await;
+        return search_with_graph_api(account, request, 0).await;
     }
     search_locally(account, request).await
+}
+
+/// Decode a Search-API `page_cursor` into its `from` offset, or `None` if
+/// the cursor is absent or is a local nextLink cursor.
+fn search_api_cursor_offset(cursor: Option<&[u8]>) -> Option<u32> {
+    let bytes = cursor?.strip_prefix(SEARCH_API_CURSOR_PREFIX)?;
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+/// Encode a Search-API next-page `from` offset into an opaque cursor.
+fn search_api_cursor(from: u32) -> Vec<u8> {
+    let mut cursor = SEARCH_API_CURSOR_PREFIX.to_vec();
+    cursor.extend_from_slice(from.to_string().as_bytes());
+    cursor
 }
 
 async fn search_locally(
@@ -301,15 +328,17 @@ async fn search_locally(
 async fn search_with_graph_api(
     account: GraphAccount,
     request: EventSearchRequest,
+    from: u32,
 ) -> Result<Page<CalendarEvent>, AccountError> {
+    let size = request.limit.unwrap_or(250).clamp(1, 250);
     let body = GraphSearchRequest {
         requests: vec![GraphSearchEntityRequest {
             entity_types: vec!["event"],
             query: GraphSearchQuery {
                 query_string: request.query.clone(),
             },
-            from: 0,
-            size: request.limit.unwrap_or(250).clamp(1, 250),
+            from,
+            size,
             fields: EVENT_SEARCH_FIELDS,
         }],
     };
@@ -318,7 +347,16 @@ async fn search_with_graph_api(
         .post::<GraphSearchResponse, _>("/search/query", &body)
         .await
         .map_err(|error| into_error(error, AccountOperation::EventSearch))?;
-    let items = response
+    // Graph Search pages by `from`/`size`; `moreResultsAvailable` on the
+    // hits container signals a further page. Carry the next `from` offset
+    // in a sentinel cursor so the next call resumes the Search API rather
+    // than capping at one page.
+    let more_results = response
+        .value
+        .iter()
+        .flat_map(|set| set.hits_containers.iter())
+        .any(|container| container.more_results_available.unwrap_or(false));
+    let items: Vec<CalendarEvent> = response
         .value
         .into_iter()
         .flat_map(|set| set.hits_containers)
@@ -326,9 +364,11 @@ async fn search_with_graph_api(
         .filter_map(|hit| hit.resource)
         .map(|event| event_from_graph(MAILBOX_SCOPE.to_string(), event))
         .collect();
+    let next_cursor = (more_results && !items.is_empty())
+        .then(|| search_api_cursor(from + u32::try_from(items.len()).unwrap_or(size)));
     Ok(Page {
         items,
-        next_cursor: None,
+        next_cursor,
         estimated_total: None,
     })
 }
@@ -487,6 +527,27 @@ fn graph_event_from_create(event: &EventCreate) -> GraphEventPatch {
 }
 
 fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
+    // Effective all-day flag for the time emission. With no explicit
+    // `is_all_day`, a date-only start/end value infers all-day. The same
+    // value must then drive both the `start`/`end` dateTime shape AND the
+    // top-level `isAllDay` field: if `graph_time` writes a midnight
+    // `dateTime` (the all-day shape) while `isAllDay` stays unset, Graph
+    // keeps a previously-timed event timed at midnight instead of
+    // converting it to all-day.
+    let effective_all_day = patch.is_all_day.unwrap_or_else(|| {
+        patch
+            .start
+            .as_ref()
+            .map(|time| is_all_day_value(&time.value))
+            .or_else(|| patch.end.as_ref().map(|time| is_all_day_value(&time.value)))
+            .unwrap_or(false)
+    });
+    // Only emit `isAllDay` when the patch actually touches a time field
+    // (or set it explicitly): a metadata-only patch must not flip the
+    // event's all-day state as a side effect.
+    let is_all_day_out = patch
+        .is_all_day
+        .or_else(|| (patch.start.is_some() || patch.end.is_some()).then_some(effective_all_day));
     GraphEventPatch {
         subject: patch.title.clone().map(|value| match value {
             Some(value) => Value::String(value),
@@ -508,23 +569,15 @@ fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
             }),
             None => Value::Null,
         }),
-        start: patch.start.as_ref().map(|time| {
-            graph_time(
-                time,
-                patch
-                    .is_all_day
-                    .unwrap_or_else(|| is_all_day_value(&time.value)),
-            )
-        }),
-        end: patch.end.as_ref().map(|time| {
-            graph_time(
-                time,
-                patch
-                    .is_all_day
-                    .unwrap_or_else(|| is_all_day_value(&time.value)),
-            )
-        }),
-        is_all_day: patch.is_all_day,
+        start: patch
+            .start
+            .as_ref()
+            .map(|time| graph_time(time, effective_all_day)),
+        end: patch
+            .end
+            .as_ref()
+            .map(|time| graph_time(time, effective_all_day)),
+        is_all_day: is_all_day_out,
         show_as: patch
             .availability
             .map(|availability| show_as(availability).to_string()),
@@ -689,8 +742,15 @@ fn graph_time_zone_name(timezone: Option<&str>) -> Option<&str> {
         "Australia/Perth" => "W. Australia Standard Time",
         "Australia/Melbourne" | "Australia/Sydney" => "AUS Eastern Standard Time",
         "Pacific/Auckland" => "New Zealand Standard Time",
+        // An IANA id we don't have a Windows mapping for: reject locally.
         value if value.contains('/') => return None,
-        value => value,
+        // A slash-free string is treated as an already-Windows tz id so
+        // they round-trip. Windows tz ids are multi-word (e.g. "W. Europe
+        // Standard Time"); the sole single-token id is "UTC" (handled
+        // above). Reject a slash-free single token as junk rather than
+        // forwarding an unresolvable tz to Graph.
+        value if value.contains(' ') => value,
+        _ => return None,
     })
 }
 
@@ -860,6 +920,19 @@ fn graph_recurrence_from_rrule(rrule: &str, start_date: String) -> Option<GraphR
         return None;
     }
     if parsed.value("BYSETPOS").is_some() && pattern.index.is_none() {
+        return None;
+    }
+    // A relative monthly/yearly pattern requires an `index`
+    // (first/second/.../last). Graph silently defaults a missing index to
+    // "first", so an RRULE like `FREQ=MONTHLY;BYDAY=MO` (every Monday)
+    // would become "first Monday" without the caller's knowledge. We
+    // cannot represent "every Monday" as a Graph relative pattern, so
+    // reject locally rather than ship a silently-narrowed recurrence.
+    if matches!(
+        pattern.kind.as_deref(),
+        Some("relativeMonthly" | "relativeYearly")
+    ) && pattern.index.is_none()
+    {
         return None;
     }
     Some(GraphRecurrence {
@@ -1183,7 +1256,9 @@ struct GraphSearchSet {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphSearchHitsContainer {
+    #[serde(default)]
     hits: Vec<GraphSearchHit>,
+    more_results_available: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1587,6 +1662,97 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Room 1")
         );
+    }
+
+    #[test]
+    fn date_only_start_patch_infers_all_day_flag() {
+        // A date-only start with no explicit is_all_day must emit
+        // isAllDay:true alongside the midnight dateTime, else Graph keeps
+        // the event timed at midnight.
+        let patch = graph_event_from_patch(&EventPatch {
+            start: Some(EventTime {
+                value: "2026-06-02".to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+        assert_eq!(value.get("isAllDay"), Some(&json!(true)));
+        assert_eq!(
+            value
+                .get("start")
+                .and_then(|start| start.get("dateTime"))
+                .and_then(Value::as_str),
+            Some("2026-06-02T00:00:00.0000000")
+        );
+    }
+
+    #[test]
+    fn timed_start_patch_does_not_set_all_day() {
+        let patch = graph_event_from_patch(&EventPatch {
+            start: Some(EventTime {
+                value: "2026-06-02T09:30:00".to_string(),
+                timezone: Some("UTC".to_string()),
+            }),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+        assert_eq!(value.get("isAllDay"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn metadata_only_patch_omits_all_day() {
+        // A patch touching no time field must not flip the event's
+        // all-day state.
+        let patch = graph_event_from_patch(&EventPatch {
+            title: Some(Some("Renamed".to_string())),
+            ..EventPatch::default()
+        });
+        let value = serde_json::to_value(&patch).expect("patch json");
+        assert!(value.get("isAllDay").is_none());
+    }
+
+    #[test]
+    fn relative_monthly_without_index_is_rejected() {
+        // FREQ=MONTHLY;BYDAY=MO (every Monday) has no Graph relative-
+        // pattern index; Graph would silently default to "first", so we
+        // reject locally rather than ship a narrowed recurrence.
+        assert!(
+            graph_recurrence_from_rrule("FREQ=MONTHLY;BYDAY=MO", "2026-06-02".to_string())
+                .is_none()
+        );
+        assert!(
+            graph_recurrence_from_rrule(
+                "FREQ=YEARLY;BYMONTH=6;BYDAY=MO",
+                "2026-06-02".to_string()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn slash_free_junk_timezone_is_rejected() {
+        // A multi-word slash-free value round-trips as a Windows tz id; a
+        // single-token junk value is rejected rather than forwarded.
+        assert_eq!(
+            graph_time_zone_name(Some("Eastern Standard Time")),
+            Some("Eastern Standard Time")
+        );
+        assert_eq!(graph_time_zone_name(Some("foo")), None);
+        assert_eq!(graph_time_zone_name(Some("UTC")), Some("UTC"));
+    }
+
+    #[test]
+    fn search_api_cursor_round_trips_offset() {
+        let cursor = search_api_cursor(50);
+        assert_eq!(search_api_cursor_offset(Some(&cursor)), Some(50));
+        // A local nextLink cursor (an https URL) is not a Search-API
+        // cursor.
+        assert_eq!(
+            search_api_cursor_offset(Some(b"https://graph.microsoft.com/next")),
+            None
+        );
+        assert_eq!(search_api_cursor_offset(None), None);
     }
 
     #[test]

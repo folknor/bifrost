@@ -183,7 +183,7 @@ pub(crate) async fn search(
             &account,
             request.address_book_id.as_ref(),
             &request.query,
-            request.limit.unwrap_or(250).min(250),
+            top_for_limit(request.limit, 250),
         )
     });
     let needle = request.query.to_ascii_lowercase();
@@ -251,7 +251,7 @@ pub(crate) async fn directory_search(
         })?;
     let mut url = next_url.unwrap_or_else(|| {
         let prefix = account.client.api_path_prefix();
-        let top = limit.unwrap_or(250).min(999);
+        let top = top_for_limit(limit, 999);
         directory_search_path(&prefix, &query, top)
     });
     let mut items = Vec::new();
@@ -380,6 +380,14 @@ fn contact_search_path(
 
 fn is_exact_email_query(query: &str) -> bool {
     !query.is_empty() && query.contains('@') && !query.chars().any(char::is_whitespace)
+}
+
+/// Resolve the Graph `$top` page size from a caller `limit`. Floors at 1
+/// (a `limit=Some(0)` would otherwise request `$top=0` and fetch nothing)
+/// and caps at the provider ceiling. The local truncation cap floors
+/// separately on the consuming side.
+fn top_for_limit(limit: Option<u32>, ceiling: u32) -> u32 {
+    limit.unwrap_or(250).clamp(1, ceiling)
 }
 
 fn create_url(account: &GraphAccount, address_book: Option<&AddressBookId>) -> String {
@@ -836,6 +844,15 @@ struct GraphContactPatchBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_for_limit_floors_zero_to_one() {
+        // limit=Some(0) must not produce $top=0 (which fetches nothing).
+        assert_eq!(top_for_limit(Some(0), 250), 1);
+        assert_eq!(top_for_limit(Some(10), 250), 10);
+        assert_eq!(top_for_limit(Some(9999), 250), 250);
+        assert_eq!(top_for_limit(None, 999), 250);
+    }
 
     #[test]
     fn graph_contact_maps_to_contact_card() {

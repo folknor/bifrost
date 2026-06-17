@@ -294,7 +294,60 @@ pub(crate) async fn send_message(
         stamp_deferred_send_time(client, &draft, at, AccountOperation::Send).await?;
     }
     send_draft_message(client, &draft).await?;
-    Ok(ObjectId(draft.0))
+    // For a scheduled send-as, the draft lives in the shared mailbox, not
+    // `/me`; the cancel/reschedule handle must carry the owning mailbox so
+    // those ops route to the same `/users/{id}` client the draft was
+    // created on (a bare draft id would 404 against `/me`). A non-scheduled
+    // send has nothing to cancel, so the discriminator is moot there.
+    let owning_mailbox = scheduled
+        .and(request.send_as.as_ref())
+        .map(|send_as| send_as.mailbox().0.clone());
+    Ok(ObjectId(encode_scheduled_send_handle(
+        owning_mailbox.as_deref(),
+        &draft.0,
+    )))
+}
+
+/// Reserved separator for the scheduled-send cancel/reschedule handle.
+/// A handle of the form `"<mailbox>\u{1f}<draft id>"` is a send-as
+/// scheduled draft owned by a shared mailbox; a plain id is a primary
+/// (`/me`) draft. `\u{1f}` (US) cannot appear in a Graph message id or an
+/// SMTP address / user id, so it is an unambiguous delimiter (mirrors the
+/// foreign-folder codec in `foreign.rs`).
+const SCHEDULED_SEND_HANDLE_SEP: char = '\u{1f}';
+
+/// Encode the owning-mailbox discriminator into a scheduled-send handle.
+/// `None` mailbox yields a bare draft id (primary `/me` draft).
+fn encode_scheduled_send_handle(mailbox: Option<&str>, draft_id: &str) -> String {
+    match mailbox {
+        Some(mailbox) => format!("{mailbox}{SCHEDULED_SEND_HANDLE_SEP}{draft_id}"),
+        None => draft_id.to_string(),
+    }
+}
+
+/// Split a scheduled-send handle back into `(owning mailbox, draft id)`.
+/// A handle with no separator is a primary draft (`None` mailbox).
+fn decode_scheduled_send_handle(handle: &str) -> (Option<&str>, &str) {
+    match handle.split_once(SCHEDULED_SEND_HANDLE_SEP) {
+        Some((mailbox, draft_id)) => (Some(mailbox), draft_id),
+        None => (None, handle),
+    }
+}
+
+/// Resolve the `GraphClient` a scheduled-send handle was created on: the
+/// shared-mailbox client when the handle carries an owning mailbox, else
+/// the primary client.
+fn client_for_scheduled_send_handle<'a>(
+    account: &'a GraphAccount,
+    mailbox: Option<&str>,
+) -> Result<&'a GraphClient, AccountError> {
+    match mailbox {
+        None => Ok(&account.client),
+        Some(mailbox) => account
+            .shared_clients
+            .get(mailbox)
+            .ok_or_else(|| send_as_unknown_mailbox(&MailboxId(mailbox.to_string()))),
+    }
 }
 
 /// Stamp Graph's `from` / `sender` fields from a `SendAs` directive.
@@ -404,13 +457,17 @@ pub(crate) async fn cancel_scheduled_send(
     handle: ObjectId,
 ) -> Result<(), AccountError> {
     // A Graph deferred message sits in the mailbox until its send time;
-    // deleting it cancels the send.
+    // deleting it cancels the send. The handle carries the owning mailbox
+    // for a send-as draft so the DELETE routes to the same client the
+    // draft was created on (else a shared-mailbox draft 404s against /me).
+    let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
+    let client = client_for_scheduled_send_handle(&account, mailbox)?;
     let path = format!(
         "{}/messages/{}",
-        account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&handle.0)
+        client.api_path_prefix(),
+        bifrost_net::url::encode_component(draft_id)
     );
-    account.client.delete(&path).await.map_err(|e| {
+    client.delete(&path).await.map_err(|e| {
         into_account_error(
             e,
             GraphErrorContext::graph(AccountOperation::CancelScheduledSend),
@@ -425,14 +482,12 @@ pub(crate) async fn reschedule_send(
 ) -> Result<ObjectId, AccountError> {
     bifrost_types::validate_scheduled(scheduled, None)?;
     // Graph reschedule is an in-place PATCH of the deferred-send time.
-    let draft = DraftHandle(handle.0.clone());
-    stamp_deferred_send_time(
-        &account.client,
-        &draft,
-        scheduled,
-        AccountOperation::RescheduleSend,
-    )
-    .await?;
+    // Route through the client the draft was created on (the handle's
+    // owning-mailbox discriminator) and patch the native draft id.
+    let (mailbox, draft_id) = decode_scheduled_send_handle(&handle.0);
+    let client = client_for_scheduled_send_handle(&account, mailbox)?;
+    let draft = DraftHandle(draft_id.to_string());
+    stamp_deferred_send_time(client, &draft, scheduled, AccountOperation::RescheduleSend).await?;
     Ok(handle)
 }
 
@@ -987,12 +1042,22 @@ async fn submit_write_batch_with_targets(
         return Ok(());
     }
     let ctx = GraphErrorContext::graph(operation);
+    // Track every submitted request id (`BatchRequestItem::id`, assigned
+    // `index.to_string()` 0..N-1 by the builders) so we can reconcile the
+    // returned responses against them: Graph occasionally returns fewer
+    // `$batch` responses than requests, and a missing id means that
+    // message was never patched. Silently returning `Ok(())` would
+    // violate the batch accounting contract (every id accounted for
+    // exactly once), so an unaccounted id surfaces as an error.
+    let expected_ids: HashSet<String> = requests.iter().map(|r| r.id.clone()).collect();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let response: BatchResponse = account
         .client
         .post_batch(&BatchRequest { requests })
         .await
         .map_err(|e| into_account_error(e, ctx.clone()))?;
     for item in response.responses {
+        seen_ids.insert(item.id.clone());
         // Reuse the per-item outcome projector so 4xx/5xx items
         // build structured `AccountError`s with `Protocol::Graph`,
         // `AttemptCause(Acknowledged)`, `WireCause::Graph(signal)`
@@ -1046,6 +1111,25 @@ async fn submit_write_batch_with_targets(
             bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
             bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
         }
+    }
+    // Any submitted id with no corresponding response was never applied
+    // server-side. The whole request was acknowledged (we got a 200 for
+    // the `$batch` envelope) but this item's fate is unknown, so surface
+    // it rather than reporting a clean `Ok(())`.
+    if let Some(missing) = expected_ids.difference(&seen_ids).next() {
+        let scope = missing
+            .parse::<usize>()
+            .ok()
+            .and_then(|idx| targets.get(idx))
+            .map(|id| ErrorScope::Message { id: id.0.clone() });
+        return Err(protocol_violation(
+            ProtocolErrorKind::ContractViolation,
+            operation,
+            scope,
+            format!(
+                "Graph $batch returned no response for request {missing} (item was not applied)"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1363,6 +1447,18 @@ fn search_url(account: &GraphAccount, request: &SearchRequest) -> Result<String,
 }
 
 fn odata_filter(filter: &SearchFilter) -> Result<String, AccountError> {
+    // KNOWN LIMITATION (pre-existing): Graph `/messages` `$filter` does
+    // not support `contains()` on the sender/recipient navigation
+    // properties below; the server answers 400 "Unsupported or invalid
+    // query filter clause". The only server-supported substring route for
+    // these fields is `$search` (KQL via `provider_query` in `search_url`),
+    // which is a different query model and is not a drop-in for the
+    // structured `SearchFilter::{From, To}` contract. Rather than swap in
+    // an equally-rejected `$filter` shape, the substring sender/recipient
+    // match is left to the `$search` path; these clauses stay as-is and
+    // are expected to fail server-side for substring use. Resolving this
+    // requires routing `From`/`To` through `$search`, which is a contract
+    // decision flagged separately, not a local rewrite.
     match filter {
         SearchFilter::From(value) => Ok(format!(
             "(contains(from/emailAddress/address,{0}) or contains(from/emailAddress/name,{0}))",
@@ -1915,6 +2011,23 @@ mod tests {
             bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
         ));
         assert_eq!(err.operation(), Some(AccountOperation::Send));
+    }
+
+    #[test]
+    fn scheduled_send_handle_round_trips_owning_mailbox() {
+        let handle = encode_scheduled_send_handle(Some("shared@contoso.com"), "AAMkAGI2");
+        let (mailbox, draft_id) = decode_scheduled_send_handle(&handle);
+        assert_eq!(mailbox, Some("shared@contoso.com"));
+        assert_eq!(draft_id, "AAMkAGI2");
+    }
+
+    #[test]
+    fn scheduled_send_handle_without_mailbox_is_bare_draft_id() {
+        let handle = encode_scheduled_send_handle(None, "AAMkAGI2");
+        assert_eq!(handle, "AAMkAGI2");
+        let (mailbox, draft_id) = decode_scheduled_send_handle(&handle);
+        assert_eq!(mailbox, None);
+        assert_eq!(draft_id, "AAMkAGI2");
     }
 
     #[test]

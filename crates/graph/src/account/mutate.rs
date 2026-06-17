@@ -156,12 +156,23 @@ async fn submit_batch(
 
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
+        // Reconcile returned responses against submitted request ids:
+        // Graph can return fewer `$batch` responses than requests, and a
+        // missing id would otherwise surface on no lane, violating the
+        // streaming "every id accounted for exactly once" contract. Track
+        // which request indices we saw and emit a failed outcome for any
+        // that never came back.
+        let submitted_indices: Vec<usize> = (0..requests.len()).collect();
+        let mut seen_indices: HashSet<usize> = HashSet::new();
         let response: BatchResponse = account
             .client
             .post_batch(&BatchRequest { requests })
             .await?;
         for item in response.responses {
             let index = item.id.parse::<usize>().ok();
+            if let Some(idx) = index {
+                seen_indices.insert(idx);
+            }
             let id = index
                 .and_then(|idx| request_ids.get(idx))
                 .cloned()
@@ -196,6 +207,30 @@ async fn submit_batch(
                 operation_for_kind(kind),
                 scope,
             ));
+        }
+
+        // Emit a failed outcome for any submitted request that got no
+        // response: the item was never applied, and dropping it silently
+        // would leave its id on no lane.
+        for idx in submitted_indices {
+            if seen_indices.contains(&idx) {
+                continue;
+            }
+            let Some(id) = request_ids.get(idx) else {
+                continue;
+            };
+            item_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                BatchItemId(id.0.clone()),
+                protocol_violation(
+                    ProtocolErrorKind::ContractViolation,
+                    operation_for_kind(kind),
+                    Some(ErrorScope::Message { id: id.0.clone() }),
+                    format!(
+                        "Graph $batch returned no response for {} (item was not applied)",
+                        id.0
+                    ),
+                ),
+            )));
         }
     }
 
@@ -351,7 +386,24 @@ fn patch_for_flags(op: &FlagOp) -> Value {
         FlagOp::Add(flags) => apply_flag_adds(&mut body, flags),
         FlagOp::Remove(flags) => apply_flag_removes(&mut body, flags),
         FlagOp::Set(flags) => {
-            apply_flag_adds(&mut body, flags);
+            // `Set` is full-replace across the flags Graph owns: any flag
+            // absent from the set must be cleared, not left untouched.
+            // `apply_flag_adds` alone only ever writes `isRead:true` /
+            // `flag:flagged` for present flags, so `Set({})` or
+            // `Set({category:x})` would leave a previously-read/flagged
+            // message read/flagged. Emit the authoritative value for each
+            // owned field.
+            body.insert(
+                "isRead".to_string(),
+                json!(has_flag(flags, "\\seen") || has_flag(flags, "read")),
+            );
+            let flagged = has_flag(flags, "\\flagged")
+                || has_flag(flags, "flagged")
+                || has_flag(flags, "starred");
+            body.insert(
+                "flag".to_string(),
+                json!({ "flagStatus": if flagged { "flagged" } else { "notFlagged" } }),
+            );
             body.insert(
                 "categories".to_string(),
                 json!(categories_from_flags(flags)),
@@ -422,5 +474,51 @@ mod tests {
         assign_batch_ids(&mut requests);
         assert_eq!(requests[0].id, "0");
         assert_eq!(requests[1].id, "1");
+    }
+
+    fn flag_set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn set_clears_unflagged_owned_fields() {
+        // `Set` with only a category present must still authoritatively
+        // clear isRead and the flag: a previously-read/flagged message
+        // becomes unread/unflagged. (Full-replace semantics.)
+        let body = patch_for_flags(&FlagOp::Set(flag_set(&["category:Work"])));
+        assert_eq!(body.get("isRead"), Some(&json!(false)));
+        assert_eq!(
+            body.get("flag"),
+            Some(&json!({ "flagStatus": "notFlagged" }))
+        );
+        assert_eq!(body.get("categories"), Some(&json!(["Work"])));
+    }
+
+    #[test]
+    fn set_empty_clears_all_owned_fields() {
+        let body = patch_for_flags(&FlagOp::Set(HashSet::new()));
+        assert_eq!(body.get("isRead"), Some(&json!(false)));
+        assert_eq!(
+            body.get("flag"),
+            Some(&json!({ "flagStatus": "notFlagged" }))
+        );
+        assert_eq!(body.get("categories"), Some(&json!([] as [&str; 0])));
+    }
+
+    #[test]
+    fn set_with_read_and_flagged_writes_true() {
+        let body = patch_for_flags(&FlagOp::Set(flag_set(&["\\Seen", "\\Flagged"])));
+        assert_eq!(body.get("isRead"), Some(&json!(true)));
+        assert_eq!(body.get("flag"), Some(&json!({ "flagStatus": "flagged" })));
+    }
+
+    #[test]
+    fn add_does_not_clear_absent_fields() {
+        // `Add` is incremental: only the present flag is written, others
+        // are untouched.
+        let body = patch_for_flags(&FlagOp::Add(flag_set(&["\\Seen"])));
+        assert_eq!(body.get("isRead"), Some(&json!(true)));
+        assert!(body.get("flag").is_none());
+        assert!(body.get("categories").is_none());
     }
 }

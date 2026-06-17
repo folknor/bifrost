@@ -329,9 +329,19 @@ fn apply_condition(
             let target = predicate_target(conditions, exceptions, inverted);
             target.sent_to_addresses.push(recipient(value));
         }
-        FilterCondition::Cc(value) | FilterCondition::Recipient(value) => {
+        FilterCondition::Recipient(value) => {
             let target = predicate_target(conditions, exceptions, inverted);
             target.recipient_contains.push(value.clone());
+        }
+        FilterCondition::Cc(_) => {
+            // Graph `messageRulePredicates` has no Cc-address predicate;
+            // only `recipientContains` (any To/Cc recipient). Folding Cc
+            // into `recipientContains` silently widens a Cc-specific rule
+            // to match any recipient, so reject rather than mis-translate.
+            return Err(invalid(
+                op,
+                "Graph message rules cannot match the Cc field specifically",
+            ));
         }
         FilterCondition::Subject(value) => {
             let target = predicate_target(conditions, exceptions, inverted);
@@ -524,6 +534,32 @@ mod tests {
         assert_eq!(graph.actions.move_to_folder.as_deref(), Some("archive"));
         assert_eq!(graph.actions.mark_as_read, Some(true));
         assert_eq!(graph.actions.stop_processing_rules, Some(true));
+    }
+
+    #[test]
+    fn recipient_maps_to_recipient_contains() {
+        let (conditions, _) = predicates_from_condition(
+            &FilterCondition::Recipient("team@example.com".to_string()),
+            AccountOperation::FilterCreate,
+        )
+        .expect("recipient maps");
+        assert_eq!(
+            conditions.recipient_contains,
+            vec!["team@example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn cc_condition_is_rejected_not_widened() {
+        // Graph has no Cc-specific predicate; folding Cc into
+        // recipientContains would silently widen the rule to any
+        // recipient, so it must be rejected.
+        let err = predicates_from_condition(
+            &FilterCondition::Cc("team@example.com".to_string()),
+            AccountOperation::FilterCreate,
+        )
+        .expect_err("cc rejected");
+        assert_eq!(err.operation(), Some(AccountOperation::FilterCreate));
     }
 
     #[test]
