@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 
-use crate::ids::ObjectId;
+use crate::ids::{MailboxId, ObjectId};
 
 /// Opaque handle to a server-side uploaded attachment.
 ///
@@ -85,6 +85,44 @@ pub struct AttachmentInline {
     pub inline: bool,
 }
 
+/// Send-as / send-on-behalf-of identity for a shared or delegate
+/// mailbox. `None` on `SendRequest::send_as` is an ordinary personal
+/// send. Distinct from `SendRequest::from` (the author/From *header*):
+/// `send_as` selects the *sending mailbox / API path*, which on some
+/// providers (Microsoft Graph) is a routing dimension separate from
+/// the From header. Gated by `PimMethodSupport.send_as`; a request
+/// carrying `Some(..)` on a provider with `send_as == false` is
+/// rejected `Unsupported(Send)`, never silently sent from the
+/// authenticated user's own mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SendAs {
+    /// Send **as** the shared mailbox: the mailbox is both the author
+    /// (`From`) and the sender. The authenticated user must hold
+    /// Send-As rights on it; the recipient sees only the shared
+    /// mailbox. `As` *forces* `from` to the mailbox - any
+    /// `SendRequest::from` the consumer set is overridden, because the
+    /// whole contract of `As` is "the recipient sees only the shared
+    /// mailbox." A consumer that wants `from` to diverge from the
+    /// sending mailbox wants `OnBehalfOf`, not `As`.
+    As(MailboxId),
+    /// Send **on behalf of** the shared mailbox: the mailbox is the
+    /// author (`From`), the authenticated user is the sender
+    /// (`Sender`). The recipient sees "user on behalf of mailbox".
+    OnBehalfOf(MailboxId),
+}
+
+impl SendAs {
+    /// The shared mailbox identity, regardless of mode - the
+    /// `/users/{id}` routing key.
+    #[must_use]
+    pub fn mailbox(&self) -> &MailboxId {
+        match self {
+            Self::As(m) | Self::OnBehalfOf(m) => m,
+        }
+    }
+}
+
 /// Top-level shape `Account::send_message` accepts.
 ///
 /// `identity` selects which sending identity to attach (relevant for
@@ -136,6 +174,11 @@ pub struct SendRequest {
     /// absolute wall-clock instant; the provider boundary validates it
     /// is in the future and within the provider's max-delay window.
     pub scheduled: Option<std::time::SystemTime>,
+    /// Send-as / send-on-behalf-of a shared or delegate mailbox.
+    /// `None` is an ordinary personal send. See `SendAs`. Honored only
+    /// where `capabilities().pim_methods.send_as` is `true` (Graph);
+    /// `Some(..)` elsewhere is rejected `Unsupported(Send)`.
+    pub send_as: Option<SendAs>,
 }
 
 /// Validate a requested scheduled-send instant at the provider
@@ -275,5 +318,29 @@ mod scheduled_send_tests {
         let future = SystemTime::now() + Duration::from_secs(120);
         assert!(validate_scheduled(future, Some(Duration::from_secs(3600))).is_ok());
         assert!(validate_scheduled(future, None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod send_as_tests {
+    use super::{SendAs, SendRequest};
+    use crate::capabilities::PimMethodSupport;
+    use crate::ids::MailboxId;
+
+    #[test]
+    fn send_as_defaults_none() {
+        assert!(SendRequest::default().send_as.is_none());
+    }
+
+    #[test]
+    fn send_as_capability_defaults_false() {
+        assert!(!PimMethodSupport::default().send_as);
+    }
+
+    #[test]
+    fn send_as_mailbox_accessor() {
+        let mailbox = MailboxId("shared@contoso.com".to_string());
+        assert_eq!(SendAs::As(mailbox.clone()).mailbox(), &mailbox);
+        assert_eq!(SendAs::OnBehalfOf(mailbox.clone()).mailbox(), &mailbox);
     }
 }

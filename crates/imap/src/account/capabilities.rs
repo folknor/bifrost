@@ -80,6 +80,11 @@ pub(crate) fn build_capabilities(
             // is `false`; an unsupporting relay surfaces a runtime
             // `Unsupported(Send)` from the smtp boundary.
             scheduled_send: false,
+            // Graph-style shared-mailbox send routing is not modeled over
+            // SMTP; a shared-mailbox send is `request.from` + relay
+            // authorization. A `send_as` request is rejected at the
+            // boundary.
+            send_as: false,
             search: has_thread_references,
             search_messages: true,
             containers_list: true,

@@ -5,9 +5,9 @@ use base64::Engine;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerId,
     ContainerKind, DraftHandle, DraftPatch, ErrorScope, FolderRole, HydrationProjection, Identity,
-    IdentityId, Importance, LabelId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind,
-    ProtocolKind, Provenance, SearchFilter, SearchRequest, ThreadHydration, ThreadId,
-    VacationConfig,
+    IdentityId, Importance, LabelId, MailboxId, Message, MutationTarget, ObjectId, Page,
+    ProtocolErrorKind, ProtocolKind, Provenance, SearchFilter, SearchRequest, SendAs,
+    ThreadHydration, ThreadId, VacationConfig,
 };
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -18,10 +18,11 @@ use crate::types::{
 };
 
 use super::GraphAccount;
+use super::GraphClient;
 use super::blob::blob_handle_from_graph_attachment;
 use super::graph_error::{
-    GraphErrorContext, into_account_error, mutation_item_outcome, protocol_violation,
-    unsupported_account_error,
+    GraphErrorContext, into_account_error, invalid_account_error, mutation_item_outcome,
+    protocol_violation, unsupported_account_error,
 };
 use super::inventory::graph_etag;
 
@@ -271,15 +272,86 @@ pub(crate) async fn send_message(
         bifrost_types::validate_scheduled(at, None)?;
     }
     let scheduled = request.scheduled;
-    let message = message_from_send_request(&request)?;
-    let draft = create_draft_message(&account, message).await?;
+    // Resolve the API-path client up front: a personal send uses the
+    // primary `/me` client; a send-as routes the entire
+    // draft-create-stamp-send cycle through the shared mailbox's
+    // `/users/{id}` client so the draft is owned by the shared mailbox.
+    let client = match &request.send_as {
+        None => &account.client,
+        Some(send_as) => account
+            .shared_clients
+            .get(&send_as.mailbox().0)
+            .ok_or_else(|| send_as_unknown_mailbox(send_as.mailbox()))?,
+    };
+    let mut message = message_from_send_request(&request)?;
+    if let Some(send_as) = &request.send_as {
+        apply_send_as(&mut message, send_as, account.user_email.as_deref());
+    }
+    let draft = create_draft_message(client, message).await?;
     if let Some(at) = scheduled {
         // Stamp PidTagDeferredSendTime on the draft before send so
         // Graph queues it for deferred delivery.
-        stamp_deferred_send_time(&account, &draft, at, AccountOperation::Send).await?;
+        stamp_deferred_send_time(client, &draft, at, AccountOperation::Send).await?;
     }
-    send_draft_message(&account, &draft).await?;
+    send_draft_message(client, &draft).await?;
     Ok(ObjectId(draft.0))
+}
+
+/// Stamp Graph's `from` / `sender` fields from a `SendAs` directive.
+/// `from` is the author header; `sender` is the on-behalf-of
+/// discriminator. The two arms differ deliberately on `from`:
+/// `As` overrides any consumer-set `from` (`insert`), because its
+/// contract is author == sender == mailbox; `OnBehalfOf` honors a
+/// consumer-set `from` (`entry(..).or_insert_with`), filling it only
+/// when absent, because an explicit author is a legitimate divergence
+/// there.
+fn apply_send_as(message: &mut Value, send_as: &SendAs, user_email: Option<&str>) {
+    let mailbox = send_as.mailbox();
+    let mailbox_recipient = json!({ "emailAddress": { "address": mailbox.0 } });
+    // `message_from_draft_patch` always returns `Value::Object`.
+    let obj = message.as_object_mut().expect("message is an object");
+    match send_as {
+        SendAs::As(_) => {
+            obj.insert("from".to_string(), mailbox_recipient.clone());
+            obj.insert("sender".to_string(), mailbox_recipient);
+        }
+        SendAs::OnBehalfOf(_) => {
+            obj.entry("from")
+                .or_insert_with(|| mailbox_recipient.clone());
+            // When the config carries the authenticated user's own
+            // address, stamp it as `sender`; otherwise omit `sender`
+            // and let Graph populate it from the authenticated context.
+            if let Some(me) = user_email {
+                obj.insert(
+                    "sender".to_string(),
+                    json!({ "emailAddress": { "address": me } }),
+                );
+            }
+        }
+        // `SendAs` is `#[non_exhaustive]`; a future mode falls back to
+        // the most conservative stamping (author == sender == mailbox),
+        // so a new variant can never leak the authenticated user's own
+        // mailbox as the visible sender.
+        _ => {
+            obj.insert("from".to_string(), mailbox_recipient.clone());
+            obj.insert("sender".to_string(), mailbox_recipient);
+        }
+    }
+}
+
+/// A `send_as` request targeting a mailbox not registered on this
+/// account (`shared_clients` is seeded at construction). The provider
+/// supports send-as; this specific mailbox is just not configured, so
+/// it is a caller error (`Request(Malformed)`), not `Unsupported`.
+#[must_use]
+fn send_as_unknown_mailbox(mailbox: &MailboxId) -> AccountError {
+    invalid_account_error(
+        AccountOperation::Send,
+        format!(
+            "shared mailbox not configured on this account: {}",
+            mailbox.0
+        ),
+    )
 }
 
 /// MAPI proptag form for `PidTagDeferredSendTime` (`PT_SYSTIME 0x3FEF`),
@@ -290,19 +362,18 @@ const DEFERRED_SEND_TIME_PROPERTY_ID: &str = "SystemTime 0x3FEF";
 /// serialized as ISO-8601 UTC. Used both by the scheduled send path and
 /// by `reschedule_send` (Graph reschedule is an in-place PATCH).
 async fn stamp_deferred_send_time(
-    account: &GraphAccount,
+    client: &GraphClient,
     draft: &DraftHandle,
     at: std::time::SystemTime,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let path = format!(
         "{}/messages/{}",
-        account.client.api_path_prefix(),
+        client.api_path_prefix(),
         bifrost_net::url::encode_component(&draft.0)
     );
     let body = deferred_send_time_body(at);
-    account
-        .client
+    client
         .patch(&path, &body)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(operation)))
@@ -356,7 +427,7 @@ pub(crate) async fn reschedule_send(
     // Graph reschedule is an in-place PATCH of the deferred-send time.
     let draft = DraftHandle(handle.0.clone());
     stamp_deferred_send_time(
-        &account,
+        &account.client,
         &draft,
         scheduled,
         AccountOperation::RescheduleSend,
@@ -377,7 +448,7 @@ pub(crate) async fn draft_create(
         return Err(unsupported_account_error(AccountOperation::DraftCreate));
     }
     let message = message_from_draft_patch(&patch, true)?;
-    create_draft_message(&account, message).await
+    create_draft_message(&account.client, message).await
 }
 
 pub(crate) async fn draft_update(
@@ -419,7 +490,7 @@ pub(crate) async fn draft_send(
     account: GraphAccount,
     draft: DraftHandle,
 ) -> Result<ObjectId, AccountError> {
-    send_draft_message(&account, &draft).await?;
+    send_draft_message(&account.client, &draft).await?;
     Ok(ObjectId(draft.0))
 }
 
@@ -1189,11 +1260,11 @@ fn graph_attachment_from_inline(attachment: &AttachmentInline) -> Result<Value, 
 }
 
 async fn create_draft_message(
-    account: &GraphAccount,
+    client: &GraphClient,
     message: Value,
 ) -> Result<DraftHandle, AccountError> {
-    let path = format!("{}/messages", account.client.api_path_prefix());
-    let created: Value = account.client.post(&path, &message).await.map_err(|e| {
+    let path = format!("{}/messages", client.api_path_prefix());
+    let created: Value = client.post(&path, &message).await.map_err(|e| {
         into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftCreate))
     })?;
     let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
@@ -1206,17 +1277,13 @@ async fn create_draft_message(
     Ok(DraftHandle(id.to_string()))
 }
 
-async fn send_draft_message(
-    account: &GraphAccount,
-    draft: &DraftHandle,
-) -> Result<(), AccountError> {
+async fn send_draft_message(client: &GraphClient, draft: &DraftHandle) -> Result<(), AccountError> {
     let path = format!(
         "{}/messages/{}/send",
-        account.client.api_path_prefix(),
+        client.api_path_prefix(),
         bifrost_net::url::encode_component(&draft.0)
     );
-    account
-        .client
+    client
         .post_empty(&path)
         .await
         .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))
@@ -1745,6 +1812,109 @@ mod tests {
             crate::account::PushMode::GraphSubscriptions,
         );
         assert!(caps.pim_methods.scheduled_send);
+    }
+
+    #[test]
+    fn send_as_capability_is_true() {
+        let caps = crate::account::capabilities::build_capabilities(
+            crate::account::PushMode::GraphSubscriptions,
+        );
+        assert!(caps.pim_methods.send_as);
+    }
+
+    fn mailbox_address(value: &Value) -> Option<&str> {
+        value
+            .get("emailAddress")
+            .and_then(|e| e.get("address"))
+            .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn apply_send_as_as_sets_from_and_sender() {
+        let mut message = json!({});
+        let send_as = SendAs::As(MailboxId("shared@contoso.com".to_string()));
+        apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
+        assert_eq!(
+            mailbox_address(message.get("from").expect("from")),
+            Some("shared@contoso.com")
+        );
+        assert_eq!(
+            mailbox_address(message.get("sender").expect("sender")),
+            Some("shared@contoso.com")
+        );
+    }
+
+    #[test]
+    fn apply_send_as_on_behalf_sets_sender_to_user() {
+        let mut message = json!({});
+        let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+        apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
+        assert_eq!(
+            mailbox_address(message.get("from").expect("from")),
+            Some("shared@contoso.com")
+        );
+        assert_eq!(
+            mailbox_address(message.get("sender").expect("sender")),
+            Some("user@contoso.com")
+        );
+    }
+
+    #[test]
+    fn apply_send_as_on_behalf_omits_sender_without_user_email() {
+        let mut message = json!({});
+        let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+        apply_send_as(&mut message, &send_as, None);
+        assert_eq!(
+            mailbox_address(message.get("from").expect("from")),
+            Some("shared@contoso.com")
+        );
+        assert!(message.get("sender").is_none());
+    }
+
+    #[test]
+    fn apply_send_as_on_behalf_honors_explicit_from() {
+        let mut message = json!({
+            "from": { "emailAddress": { "address": "author@contoso.com" } }
+        });
+        let send_as = SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string()));
+        apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
+        // Explicit author survives; only sender is stamped.
+        assert_eq!(
+            mailbox_address(message.get("from").expect("from")),
+            Some("author@contoso.com")
+        );
+        assert_eq!(
+            mailbox_address(message.get("sender").expect("sender")),
+            Some("user@contoso.com")
+        );
+    }
+
+    #[test]
+    fn apply_send_as_as_overrides_explicit_from() {
+        let mut message = json!({
+            "from": { "emailAddress": { "address": "author@contoso.com" } }
+        });
+        let send_as = SendAs::As(MailboxId("shared@contoso.com".to_string()));
+        apply_send_as(&mut message, &send_as, Some("user@contoso.com"));
+        // `As` forces author == sender == mailbox.
+        assert_eq!(
+            mailbox_address(message.get("from").expect("from")),
+            Some("shared@contoso.com")
+        );
+        assert_eq!(
+            mailbox_address(message.get("sender").expect("sender")),
+            Some("shared@contoso.com")
+        );
+    }
+
+    #[test]
+    fn send_as_unknown_mailbox_is_malformed() {
+        let err = send_as_unknown_mailbox(&MailboxId("nobody@contoso.com".to_string()));
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
     }
 
     #[test]

@@ -296,14 +296,18 @@ at spec time.
   absent from `Cargo.lock`); full CardDAV `sync-collection` parity with CalDAV
   is a named follow-up.
 
-### A8 - Provider-wart absorption sweep - PARTIALLY LANDED (OPEN)
+### A8 - Provider-wart absorption sweep - LANDED (closed)
 
 - Intent: anywhere a wart would otherwise force a ratatoskr special-case,
   bifrost absorbs it behind the uniform surface or expresses a clean capability
   flag. Immutable provider limits become flags, never consumer branches.
 - A8 is a *sweep* spanning the port-map's Groups A-D, not a single landing. The
-  first slice of independent/unblocked warts has landed; the rest stays tracked
-  here and in the port-map's A8 tables. The brick is OPEN until its tail closes.
+  first slice of independent/unblocked warts landed first; C-3 (the send-path
+  tail, gated on A5a) was the last bifrost-side brick and is now landed, so A8 is
+  **closed**. The only residue is **A-6** (Gmail `CATEGORY_*` bundling - explicit
+  consumer policy, not bifrost work), Group D (already-absorbed transport quirks),
+  and the per-crate N-item cleanups already tracked in `TODO.md` (`graph-S1`,
+  `graph-N3`, etc.) - none of which are A8 deliverables.
 - LANDED (first slice): the independent warts unblocked by A1-A7. Delivered as
   one coherent landing:
   - **graph-N1 / B-2** - Graph `remove_from_container` returns
@@ -333,22 +337,34 @@ at spec time.
     ratatoskr's `match source:&str` / `match CalendarProvider` / six-per-provider
     free fns now that A7 landed the CalDAV/CardDAV legs. Resolved on the
     bifrost side; the consumer rewrite is Track B (B4/B6/B8).
-- STILL OPEN (tracked, NOT closed by the first slice):
-  - **GAL / A-2** - the org directory-search primitive is split out into its own
-    sibling brick (A9 below). It is a new primitive with two substantial,
-    asymmetric provider backends, not a flag; it does not ride A8.
-  - **C-3** - Graph shared-mailbox send / send-as identity. Gated on A5a's
-    foreign-mailbox routing (now landed); the send-as leg itself is still open.
+- LANDED (final slice - C-3, the send-path tail):
+  - **C-3** - Graph shared-mailbox send-as / send-on-behalf-of. Gated on A5a's
+    foreign-mailbox routing (landed); the send-as leg landed as: a typed
+    `SendAs::{As, OnBehalfOf}(MailboxId)` enum + `SendRequest::send_as` +
+    `PimMethodSupport.send_as` flag (`bifrost-types`); the Graph backend resolves
+    the routed `shared_clients` `&GraphClient` up front and threads it through
+    `create_draft_message` / `stamp_deferred_send_time` / `send_draft_message`,
+    with an `apply_send_as` helper stamping `from`/`sender` (`As` forces both to
+    the mailbox; `OnBehalfOf` keeps `from` = mailbox and `sender` = `user_email`,
+    omitted when `None`) and a `send_as_unknown_mailbox` -> `Request(Malformed)`
+    for an unregistered mailbox; IMAP/Google/JMAP each reject a `Some(send_as)`
+    with `Unsupported(Send)` (a one-line guard at the top of `send_message`). The
+    draft-backed path is kept (not `/users/{id}/sendMail`), so the port-map's
+    inline-only-attachments note never applies. Scoped-out follow-ups filed:
+    `c3-1` (JMAP native foreign-account submission) and `c3-2` (shared-mailbox
+    send over SMTP for IMAP-shaped accounts) in `TODO.md`. The spec was retired
+    at landing; durable record is git history + `reference/graph.md`.
+- STILL OPEN (NOT A8 deliverables - residue only):
   - **A-6** - Gmail `CATEGORY_*` bundling priority. POLICY: the ML categories are
     surfaced uniformly already; the bundling heuristic stays a ratatoskr consumer
-    decision. No bifrost surface change.
-  - **The Track-B-driven tail** - warts that only surface once ratatoskr
-    exercises the uniform surface land near the end of Track B, not here.
-  - **graph-S1 / graph-N3** - Group D transport quirks, tied to a net/sync
-    per-account-limiter decision; outside this slice's blast radius.
-- Depends on: known warts independent; B-driven warts land last.
-- TODO: `graph-S1`, `graph-N3`, and the broader per-crate N-item cleanups
-  (`graph-N1` is now closed and removed from `TODO.md`).
+    decision. No bifrost surface change - explicitly NOT bifrost work.
+  - **Group D** - already-absorbed transport quirks (`$batch <= 20`, `If-Match`,
+    push capability, 429/Retry-After, blob range); nothing to land.
+  - **graph-S1 / graph-N3 and the per-crate N-item cleanups** - tracked in
+    `TODO.md`, not A8 deliverables; none block ratatoskr.
+- Depends on: known warts independent; C-3 needed A5a (landed). All landed.
+- TODO: `graph-S1`, `graph-N3`, `c3-1`, `c3-2`, and the broader per-crate N-item
+  cleanups (`graph-N1` is closed and removed from `TODO.md`).
 
 ### A9 - Global Address List / directory search
 
@@ -390,10 +406,19 @@ A1 is the literal first task - it gates everything. Then:
   A5a (Graph delegate + JMAP shared), and A5b (EWS public folders, size L) - have
   landed, so A5 is closed.
 - A7 is independent.
-- A8's known warts are independent; its first independent slice has landed
-  (importance, MDN, `remove_from_container` polish, draft-update confirm,
-  contacts/calendar/vacation verification), and its B-driven tail closes near the
-  end. A9 (GAL) is standalone and can land any time.
+- A8's known warts are independent; its first slice landed (importance, MDN,
+  `remove_from_container` polish, draft-update confirm, contacts/calendar/vacation
+  verification) and its final brick C-3 (send-as, gated on A5a) has now landed, so
+  A8 is closed. A9 (GAL) is standalone and landed.
+
+**All Track A bricks (A1-A9) are LANDED.** C-3 was the last adoption brick; with
+it, every capability ratatoskr ships is reachable through the uniform `Account`
+surface or a declarative `AccountCapabilities` flag, with no provider special-case
+leaking up. The remaining named follow-ups (A8's A-6 consumer policy, the
+per-crate `TODO.md` N-items, the A5b/A7/A9/C-3 scoped-out follow-ups) are
+non-blocking; bifrost is adoptable. Track B (the ratatoskr-side rewrite onto this
+surface) is the cross-repo work that follows, tracked in ratatoskr's
+`plans/bifrost-migration.md`.
 
 Downstream stakes (Track B dependents, from the migration plan): A1 unblocks all
 of Track B; A2/A4 -> send and drafts (B5); A3 -> the sync consumer body store

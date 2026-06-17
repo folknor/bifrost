@@ -338,6 +338,31 @@ Nits:
   richer substring directory match than the current `startswith` prefix
   `$filter`, if needed.
 
+## C-3 (Graph send-as) follow-ups
+
+Scoped out of C-3 (the Graph shared-mailbox send-as / send-on-behalf-of brick)
+to keep its blast radius on the Graph send path. C-3 landed the typed
+`SendRequest::send_as` surface and the Graph backend; the two below are real
+provider capabilities ratatoskr will eventually wire, currently rejected with
+`Unsupported(Send)`.
+
+- **c3-1 (jmap)** JMAP native foreign-account submission. JMAP can submit on
+  behalf of a shared mailbox via an `EmailSubmission/set` against a foreign
+  `accountId` - real surface (the per-accountId `ifInState` state store from A5a
+  is shaped for it), but the mutation path is unwired (the same A5a-scoped-out
+  foreign-account-mutation exclusion). C-3 rejects a `Some(send_as)` on JMAP with
+  `Unsupported(Send)`; a later brick wires the foreign-submission path so JMAP
+  honors `send_as` natively. Coupled with the A5a foreign-mutation follow-up.
+- **c3-2 (imap/smtp)** Shared-mailbox send over SMTP for IMAP-shaped accounts.
+  C-3 rejects a `Some(send_as)` on IMAP because Graph-style mailbox routing has no
+  SMTP analog. A shared-mailbox send over SMTP is the consumer setting
+  `request.from` to the shared address and letting the relay's Send-As policy
+  authorize it - that path already works and needs no `send_as`. If a consumer
+  later wants `send_as` to map onto an SMTP `From:`/`MAIL FROM` choice (so the
+  uniform surface carries shared-mailbox send for IMAP-shaped accounts too),
+  decide whether IMAP honors `send_as` by translating it to a `from` override or
+  whether it stays a deliberate `Unsupported`. Today: deliberate `Unsupported`.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

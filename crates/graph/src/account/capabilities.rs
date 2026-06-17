@@ -50,6 +50,9 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             // Mailbox-backed Graph accounts always support deferred
             // send via the PidTagDeferredSendTime extended property.
             scheduled_send: true,
+            // Graph routes a shared-mailbox send through the mailbox's
+            // /users/{id} draft-create-and-send and stamps from/sender.
+            send_as: true,
             search: true,
             search_messages: true,
             containers_list: true,

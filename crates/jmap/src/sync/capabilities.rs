@@ -131,6 +131,10 @@ pub(crate) fn build(
             draft_discard: true,
             draft_send: support.submission,
             scheduled_send: support.submission && support.max_delayed_send > 0,
+            // JMAP foreign-accountId submission (send-on-behalf) is the
+            // A5a-scoped-out foreign-mutation follow-up, not yet wired; a
+            // `send_as` request is rejected at the boundary.
+            send_as: false,
             search: true,
             search_messages: true,
             containers_list: true,

@@ -183,6 +183,14 @@ pub struct PimMethodSupport {
     /// `reschedule_send`. `false` -> a scheduled request is rejected
     /// `Unsupported(Send)` and the two primitives return `Unsupported`.
     pub scheduled_send: bool,
+    /// Native send-as / send-on-behalf-of routing for a shared or
+    /// delegate mailbox (Microsoft Graph: route the draft-create-and-send
+    /// through the shared mailbox's `/users/{id}` client and stamp the
+    /// `from`/`sender` fields). Gates `SendRequest::send_as`. `true` only
+    /// on Graph; `false` everywhere else -> a `Some(send_as)` request is
+    /// rejected `Unsupported(Send)`, never silently sent from the
+    /// authenticated user's own mailbox.
+    pub send_as: bool,
     // Search primitives.
     pub search: bool,
     pub search_messages: bool,

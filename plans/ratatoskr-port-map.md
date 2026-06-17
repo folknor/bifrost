@@ -583,10 +583,18 @@ CardDAV directory-gateway leg is a named follow-up, not part of A9).
 C-1 IMAP-send-via-SMTP = **A2**. C-2 scheduled send (three unwired provider entry
 points off the uniform trait; JMAP `maxDelayedSend` gate is the textbook
 "immutable limit -> flag") = **A4**, including the cancel/reschedule gap above.
-C-3 Graph shared-mailbox send (`send_as_shared_mailbox`, `send_on_behalf_of`,
-inline-only attachments on `/users/{id}`) builds on **A5a** (landed
-foreign-mailbox routing) + a send-as identity parameter on the send surface;
-the send-as leg itself is still open.
+C-3 Graph shared-mailbox send (`send_as_shared_mailbox`, `send_on_behalf_of`) =
+**RESOLVED (A8 tail, gated on A5a's foreign-mailbox routing)**. Landed as a typed
+`SendAs::{As, OnBehalfOf}(MailboxId)` identity on `SendRequest::send_as` +
+`PimMethodSupport.send_as` flag; the Graph backend routes the
+create/deferred-stamp/send cycle through the shared mailbox's `shared_clients`
+`&GraphClient` and `apply_send_as` stamps `from`/`sender`. The
+inline-only-attachments constraint on `/users/{id}/sendMail` never applies because
+bifrost keeps the draft-backed path (`POST /messages` then `.../send`), which
+accepts attachments uniformly with a primary-mailbox send. IMAP/Google/JMAP reject
+a `Some(send_as)` with `Unsupported(Send)`. Scoped-out follow-ups: `c3-1` (JMAP
+native foreign-account submission) and `c3-2` (shared-mailbox send over SMTP for
+IMAP-shaped accounts) in `TODO.md`.
 
 ### Group D - transport quirks, mostly ALREADY absorbed
 
@@ -606,15 +614,16 @@ Graph-importance intent expansion (B-1, densest) - RESOLVED (A8): uniform
 `Importance` + `set_importance`. 3. Scheduled send (C-2 / A4) - landed. 4. IMAP
 send (C-1 / A2) - landed. 5. Contacts/calendar/auto-response dispatch (A-3/4/5) -
 RESOLVED on the bifrost side once the primitives + A7 landed; consumer rewrite is
-Track B. (Cloud attachments, the former top priority A-1 / A6, has landed.) Still
-open under A8: C-3 (builds on A5a, now landed; send-as leg still open), A-6
-(policy), graph-S1/graph-N3, and the Track-B-driven tail.
+Track B. 6. Graph send-as (C-3 / A8 tail, gated on A5a) - RESOLVED (landed); the
+last A8 brick. (Cloud attachments, the former top priority A-1 / A6, has landed.)
+**A8 is now closed.** Residue (not A8 deliverables): A-6 (consumer policy),
+graph-S1/graph-N3 (`TODO.md` cleanups).
 
 **Independence:** standalone now - graph-S1, graph-N3, A-6 (policy). RESOLVED -
 A-2 (brick A9, landed). RESOLVED (A8) - B-1 (importance), B-2 (`graph-N1`),
-B-3 (draft-update new-id confirm), B-4 (MDN). Needs A1 - A6, A3, A2. Chained - A4 needs A2; C-3
-builds on A5a (landed); A-4/A-5 CalDAV/CardDAV legs needed A7 (now landed, so
-A-3/4/5 are RESOLVED on the bifrost side).
+B-3 (draft-update new-id confirm), B-4 (MDN), C-3 (Graph send-as). Needs A1 - A6,
+A3, A2. Chained - A4 needs A2; C-3 built on A5a (landed); A-4/A-5 CalDAV/CardDAV
+legs needed A7 (landed, so A-3/4/5 are RESOLVED on the bifrost side).
 
 ---
 
@@ -626,8 +635,9 @@ how a foreign/shared mailbox is modeled before any A5 porting.
 **Unwired-but-required surface (the roadmap).** Present in the clone, zero callers,
 all things ratatoskr will wire against bifrost's ideal surface: cloud-attachment
 upload (A6), scheduled send + cancel + reschedule (A4), send-as / on-behalf (C-3,
-gated on A5a now landed), raw-message fetch (A3), GAL (A8 A-2). Upside: no
-back-compat constraint - design the ideal uniform surface.
+landed - `SendRequest::send_as`), raw-message fetch (A3), GAL (A8 A-2). All now
+landed on the bifrost side. Upside: no back-compat constraint - the ideal uniform
+surface was designed free of any old shape.
 
 **Bugs worth fixing inside the relevant brick (not separate work):**
 - IMAP/SMTP stale-token-at-construction (A1).
@@ -650,8 +660,13 @@ enum parallels `MailProviderKind` (divergence risk); contact dispatch keys on a
 2. **A2** then **A4** (A4 includes cancel/reschedule).
 3. **A3** and **A6** after A1, independent of each other.
 4. **A5** - scope-vs-Account decision RESOLVED (cursor-resident `Folder`, no new
-   variant). **A5c (IMAP NAMESPACE)** and **A5a (Graph delegate + JMAP shared)**
-   LANDED; only **A5b (EWS, size-L unknown)** remains.
-5. **A7** - independent; fold the DAV robustness guards in.
-6. **A8** - standalone warts anytime; B-driven tail closes near the end.
-   **GAL (A-2)** was pulled out as its own brick **A9** - RESOLVED, landed.
+   variant). **A5c (IMAP NAMESPACE)**, **A5a (Graph delegate + JMAP shared)**, and
+   **A5b (EWS public folders)** all LANDED.
+5. **A7** - independent; fold the DAV robustness guards in. LANDED.
+6. **A8** - standalone warts landed first; the send-path tail **C-3** (Graph
+   send-as, gated on A5a) landed last and closes A8. **GAL (A-2)** was pulled out
+   as its own brick **A9** - RESOLVED, landed.
+
+**All Track A bricks (A1-A9) are LANDED.** C-3 was the final brick; bifrost is
+adoptable. The next work is Track B (the ratatoskr-side rewrite), tracked in
+ratatoskr's `plans/bifrost-migration.md`, not here.

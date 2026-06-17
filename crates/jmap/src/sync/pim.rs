@@ -182,6 +182,21 @@ fn importance_sets_important_keyword(level: Importance) -> bool {
     matches!(level, Importance::High)
 }
 
+/// JMAP foreign-accountId submission (send-on-behalf via a foreign
+/// `accountId`) is the A5a-scoped-out foreign-mutation follow-up, not
+/// yet wired. A `send_as` request is rejected `Unsupported(Send)`
+/// rather than silently sent from the authenticated user's own
+/// mailbox.
+fn send_as_guard(request: &bifrost_types::SendRequest) -> Option<AccountError> {
+    request.send_as.is_some().then(|| {
+        super::error::unsupported_error(
+            AccountOperation::Send,
+            None,
+            "JMAP foreign-account send-as is not wired",
+        )
+    })
+}
+
 pub(crate) fn send_message(
     mail: MailAccount,
     email_states: StateMap,
@@ -190,6 +205,9 @@ pub(crate) fn send_message(
     request: bifrost_types::SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
+        if let Some(err) = send_as_guard(&request) {
+            return Err(err);
+        }
         let identity = request.identity.clone();
         let scheduled = request.scheduled;
         if let Some(at) = scheduled {
@@ -2097,5 +2115,22 @@ mod tests {
         assert!(importance_sets_important_keyword(Importance::High));
         assert!(!importance_sets_important_keyword(Importance::Normal));
         assert!(!importance_sets_important_keyword(Importance::Low));
+    }
+
+    #[test]
+    fn send_as_rejected_unsupported() {
+        let mut request = bifrost_types::SendRequest::default();
+        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+            "shared@contoso.com".to_string(),
+        )));
+        let err = send_as_guard(&request).expect("send_as request must be rejected");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
+
+        // A personal send passes the guard.
+        assert!(send_as_guard(&bifrost_types::SendRequest::default()).is_none());
     }
 }

@@ -96,20 +96,19 @@ sentinel routed through `/me/events/{id}`. Contact search uses exact email
 
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
-The `account` module path is public (the conformance test and consumers
-construct the factory through it); helper modules and `GraphAccount` stay
-crate-private. `GraphClient` is public only as factory input. `new` /
+The `account` module path is public (consumers construct the factory
+through it); helper modules and `GraphAccount` stay crate-private. `GraphClient` is public only as factory input. `new` /
 `with_api_base*` take a raw token; `with_source` / `with_account_net` take
 a shared `Arc<dyn TokenSource>` that `attach_account` hands to bifrost-net.
 
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
 `PushEndpoint`, a `shared_mailboxes: Vec<String>`, and a `public_folders` flag.
-`with_push_endpoint(url)` selects `PushMode::GraphSubscriptions`;
-`with_ews_streaming()` selects `PushMode::EwsStreaming` and clears the endpoint;
-default webhook-mode without an endpoint makes `push_subscribe` return
-`Error::MissingCoreCapability`. `with_shared_mailbox(id)` registers a
-delegate/shared mailbox by its `/users/{id}` routing key. `with_public_folders()`
-opts in to public-folder discovery/sync (default off).
+`with_push_endpoint(url)` selects `GraphSubscriptions`; `with_ews_streaming()`
+selects `EwsStreaming` and clears the endpoint; default webhook-mode without an
+endpoint makes `push_subscribe` return `Error::MissingCoreCapability`.
+`with_shared_mailbox(id)` registers a delegate/shared mailbox by its
+`/users/{id}` routing key. `with_public_folders()` opts in to public-folder
+discovery/sync (default off).
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to `bifrost-net`
 under the engine `AccountId`, validates the token with a `users/me` profile
@@ -171,7 +170,7 @@ selecting against the same token.
   InvalidDeltaToken).
 - `pim_methods`: true for the container/category/extended-property/
   importance/is-read writes, send/draft lifecycle, `scheduled_send`,
-  search, mail folder CRUD, `identities_list`, vacation, typed hydration,
+  `send_as`, search, mail folder CRUD, `identities_list`, vacation, typed hydration,
   contact/calendar primitives, `directory_search` (org directory via
   `/users`), and `host_attachment`. False for
   `remove_from_container`, `set_keyword`, `set_label_membership`,
@@ -231,14 +230,12 @@ Supported scopes:
 
 - `FolderType { folder, Email }` -> initial URL
   `/{prefix}/mailFolders/{folder}/messages/delta?$select=...&$top=50`
-  (`MESSAGE_SELECT`). `inventory_entry_from_value` pulls id,
-  conversationId (thread), change-key (etag), Message-ID / References /
-  In-Reply-To from `internetMessageHeaders`, and a flags hash from
-  `isRead` / `flag.flagStatus` / `categories`. `size` is `None` (no
-  stable byte count on this projection).
-- `FolderType { folder, Event | CalendarEvent }` -> calendarView delta
-  over a [-90d, +365d] window (`EVENT_SELECT`); thread / message-id
-  fields are empty.
+  (`MESSAGE_SELECT`). `inventory_entry_from_value` pulls id, conversationId
+  (thread), change-key (etag), Message-ID / References / In-Reply-To from
+  `internetMessageHeaders`, and a flags hash from `isRead` / `flag.flagStatus`
+  / `categories`. `size` is `None` on this projection.
+- `FolderType { folder, Event | CalendarEvent }` -> calendarView delta over
+  a [-90d, +365d] window (`EVENT_SELECT`); thread/message-id fields empty.
 - `FolderType { folder, Contact }` -> initial URL
   `/{prefix}/contactFolders/{folder}/contacts/delta?$select=...&$top=250`
   (`CONTACT_SELECT`).
@@ -284,13 +281,13 @@ codec (`encode_foreign(mailbox, folder)` joins on `\u{1f}`,
 `parse_folder` splits it back into `ParsedFolder::{Primary, Foreign}`).
 No new `CursorScope` variant. `client_for_scope(scope)` selects the
 `shared_clients` entry when the folder parses foreign, else the primary
-client; `owner_of_scope(scope)` returns the `MailboxId` owner tag for a
-foreign scope, `None` for primary. `discover_cursor_scopes_inner` lists the
-primary then each shared mailbox's folders, emitting foreign-namespaced
-`FolderType` scopes; a per-mailbox permission denial skips with a `Warning`. `discover_memberships_inner` emits the foreign
-`MembershipScope::Mailbox(owner)` owner tag alongside the folder membership, and
-`inventory_stream` stamps it onto every foreign-scope item (the engine covering
-rule cannot form it). `initial_delta_url` reads the prefix from
+client; `owner_of_scope(scope)` returns the `MailboxId` owner for a foreign
+scope, `None` for primary. `discover_cursor_scopes_inner` lists the primary
+then each shared mailbox's folders, emitting foreign-namespaced `FolderType`
+scopes; a per-mailbox permission denial skips with a `Warning`.
+`discover_memberships_inner` emits the foreign `MembershipScope::Mailbox(owner)`
+tag with the folder membership, and `inventory_stream` stamps it onto every
+foreign-scope item (the engine covering rule cannot form it). `initial_delta_url` reads the prefix from
 `client_for_scope` and the native id from `parse_folder`, so the mailbox rides
 in `/users/{id}` and the native id in `/mailFolders/{id}`.
 
@@ -388,13 +385,22 @@ Mail mutation primitives live in `pim.rs`, per-message, fanning out a
 onto `Message.importance` (absent/unrecognized -> `Normal`).
 
 Send / draft lifecycle is draft-backed so the trait returns an id: `POST
-/messages` create, `POST /messages/{id}/send` send, return the draft id.
+/messages` create, `POST /messages/{id}/send` send (`202` no-body; the Sent
+Items id is rediscovered via sync/search), returning the draft id.
 Inline attachments encode into `fileAttachment` JSON; standalone
 `attachment_upload` is unsupported (over-limit -> `host_attachment` ->
 OneDrive); `draft_update` patches mutable fields (no attachment replace).
 Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`,
 ISO-8601 UTC) onto the draft between create and send for a future
 `scheduled`; the draft id is the cancel/reschedule handle.
+
+`SendRequest::send_as` (gated by `pim_methods.send_as`, Graph only) routes
+create/deferred-stamp/send through the shared mailbox's `shared_clients`
+entry (keyed by `MailboxId`); the three helpers take an explicit
+`&GraphClient`. `apply_send_as` stamps `from`/`sender`: `As` forces both to
+the mailbox; `OnBehalfOf` keeps `from` = mailbox (honoring an explicit
+`from`), `sender` = `user_email` (omitted when `None`). An unconfigured
+mailbox is `Request(Malformed)`.
 
 Search uses `/messages` (`$filter`/`$search`/`$top`, `@odata.nextLink` as
 the opaque page cursor); message search returns native ids, thread search
@@ -450,13 +456,12 @@ for `fileAttachment` (item/reference false); no pre-download digest.
 `GraphError` into an `AccountError` via `try_build`. `GraphErrorContext
 { protocol, operation, scope }` threads the operation so `recovery::derive`
 computes `RecoveryClass` (no private recovery table). `GraphErrorContext::ews(op)`
-is the EWS constructor; `ews_error_to_account_error` routes `EwsError::Transport`
-through `bifrost_net::into_account_error`, maps `EwsError::HttpStatus` through
-the same `response_to_account_error` path REST uses, classifies
-`EwsError::SoapFault` onto `SoapFaultCode` (Server -> Unavailable,
-Client/MustUnderstand/VersionMismatch -> 400, Unknown -> ContractViolation), and
-routes `EwsError::MalformedXml` to `Protocol(ParseFailed)`. EWS errors stamp
-`Protocol::Ews`.
+is the EWS constructor; `ews_error_to_account_error` routes
+`EwsError::Transport` through `bifrost_net::into_account_error`, `HttpStatus`
+through the REST `response_to_account_error` path, `SoapFault` onto
+`SoapFaultCode` (Server -> Unavailable, Client/MustUnderstand/VersionMismatch
+-> 400, Unknown -> ContractViolation), and `MalformedXml` to
+`Protocol(ParseFailed)`. EWS errors stamp `Protocol::Ews`.
 
 Known Graph vocabulary lands on typed `WireCause::Graph(GraphSignal::*)` variants
 (auth/access/throttle/cursor codes; see `classify`). `GraphSignal::Unknown
@@ -469,10 +474,10 @@ Mapping highlights:
 
 - `Gone` / 410 / `InvalidDeltaToken` / `SyncStateNotFound` ->
   `SyncState(CursorInvalid)` -> `Engine(RestartScope(scope))`.
-- `TooManyRequests` / 429 -> `Server(RateLimited)`, `throttle_scope:
-  Tenant`, `retry_hint: After(_)` from `Retry-After` (seconds + HTTP-date
-  via `bifrost_net::parse_retry_after`); 503 / 504 ->
-  `Server(Unavailable)` -> `Retry::SameRequest`.
+- `TooManyRequests` / 429 -> `Server(RateLimited)`, `throttle_scope: Tenant`,
+  `retry_hint: After(_)` from `Retry-After` (seconds + HTTP-date via
+  `bifrost_net::parse_retry_after`); 503 / 504 -> `Server(Unavailable)` ->
+  `Retry::SameRequest`.
 - `InvalidAuthenticationToken` / 401 ->
   `Authentication(ReauthorizationRequired)` -> `AuthLost`;
   `AdminConsentRequired` -> `Authorization(AdminConsentRequired)` ->
@@ -505,24 +510,19 @@ engine continues past a referenceAttachment in a mixed batch.
 - Discovery is mail-only (+ opt-in public folders); event/contact cursors
   are engine-constructed.
 - `scope_lifecycle_stream` is empty; folder creates/renames/deletes are
-  observed only at reopen. Foreign mailboxes are config-supplied
-  (`with_shared_mailbox`); live delegate enumeration (Autodiscover parser
-  landed, unwired) and shared-mailbox send-as are follow-ups / C-3.
+  observed only at reopen. Live delegate enumeration (Autodiscover parser
+  landed, unwired) and foreign-mailbox draft mutations are follow-ups
+  (shared-mailbox send-as is wired, C-3).
 - Public folders are poll-only (no push) and side-table-free: the deletion
-  baseline rides in the cursor, capped at 10_000 items/folder (above it:
-  additions-only). A `CheckpointStore`-backed baseline, and item-class support
-  beyond `<t:Message>` (so `IPF.Appointment`/`IPF.Contact` folders sync items),
-  are named follow-ups.
+  baseline rides in the cursor, capped at 10_000 items/folder (above:
+  additions-only). A `CheckpointStore`-backed baseline and item-class support
+  beyond `<t:Message>` are named follow-ups.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
-  requires a public HTTPS endpoint (else `Error::MissingCoreCapability`).
+  needs a public HTTPS endpoint (else `Error::MissingCoreCapability`).
 - Blob range per-handle (fileAttachment only); delta-token expiry reactive (410
-  / 400 InvalidDeltaToken -> `RestartScope`); `MutationReplaySafety::None`
-  (`IdempotencyKey` held, not sent; read-back guard beyond `If-Match`).
-- Unsupported: `remove_from_container`, keyword/label-membership writes,
+  / 400 InvalidDeltaToken -> `RestartScope`); `MutationReplaySafety::None`.
+- Unsupported: `remove_from_container`, keyword/label writes,
   standalone `attachment_upload`, `identity_update`, `quota_get`.
-- `send_message`/`draft_send` return the draft id (send is `202` no-body; Sent
-  Items id rediscovered via sync/search); `draft_update` takes inline
-  `fileAttachment`, rejects pre-uploaded handles.
 - Inbox rules are conjunction-shaped (`And` -> conditions, `Not` -> exceptions);
   `Or`, date ranges, remove-label, mark-unread, star, keyword, reject actions
   are rejected by local validation.

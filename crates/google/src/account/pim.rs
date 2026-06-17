@@ -132,6 +132,9 @@ pub(crate) fn send_message(
         if let Some(err) = scheduled_send_guard(&request) {
             return Err(err);
         }
+        if let Some(err) = send_as_guard(&request) {
+            return Err(err);
+        }
         let doc = MailDocument::from_send(request, &default_address);
         let raw = render_message(&doc, &default_address, true)?;
         let message = client
@@ -1203,6 +1206,16 @@ pub(crate) fn reschedule_send_unsupported() -> AccountFuture<Result<ObjectId, Ac
     Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::RescheduleSend)) })
 }
 
+/// Gmail has no delegate-send REST surface in scope; a `send_as`
+/// request is rejected `Unsupported(Send)` rather than silently sent
+/// from the authenticated user's own mailbox.
+fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
+    request
+        .send_as
+        .is_some()
+        .then(|| unsupported(bifrost_types::AccountOperation::Send))
+}
+
 fn unsupported(op: bifrost_types::AccountOperation) -> AccountError {
     error::into_account_error(
         crate::error::Error::unsupported(op),
@@ -1242,6 +1255,23 @@ mod tests {
 
         // An immediate send passes the guard.
         assert!(scheduled_send_guard(&SendRequest::default()).is_none());
+    }
+
+    #[test]
+    fn send_as_rejected_unsupported() {
+        let mut request = SendRequest::default();
+        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+            "shared@contoso.com".to_string(),
+        )));
+        let err = send_as_guard(&request).expect("send_as request must be rejected");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(bifrost_types::AccountOperation::Send)
+        ));
+        assert_eq!(err.operation(), Some(bifrost_types::AccountOperation::Send));
+
+        // A personal send passes the guard.
+        assert!(send_as_guard(&SendRequest::default()).is_none());
     }
 
     #[test]

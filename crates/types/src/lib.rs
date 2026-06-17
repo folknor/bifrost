@@ -70,8 +70,8 @@ pub use filter::{
 
 // Mail composition types.
 pub use compose::{
-    Address, AttachmentHandle, AttachmentInline, DraftHandle, DraftPatch, IdentityId, SendRequest,
-    validate_scheduled,
+    Address, AttachmentHandle, AttachmentInline, DraftHandle, DraftPatch, IdentityId, SendAs,
+    SendRequest, validate_scheduled,
 };
 
 // Shared RFC 5322 / MIME assembler.

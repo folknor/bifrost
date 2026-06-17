@@ -143,6 +143,16 @@ fn importance_sets_important_keyword(level: Importance) -> bool {
     matches!(level, Importance::High)
 }
 
+/// IMAP/SMTP does not do Graph-style shared-mailbox send routing; a
+/// `send_as` request is rejected `Unsupported(Send)` rather than
+/// silently sent from the authenticated user's own mailbox.
+fn send_as_guard(request: &SendRequest) -> Option<AccountError> {
+    request
+        .send_as
+        .is_some()
+        .then(|| super::error::unsupported(AccountOperation::Send))
+}
+
 pub(crate) fn unsupported_unit(
     operation: bifrost_types::AccountOperation,
 ) -> AccountFuture<Result<(), AccountError>> {
@@ -202,6 +212,13 @@ pub(crate) fn send_message(
     request: SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
+        // Graph-style shared-mailbox send routing is not modeled over
+        // SMTP (a shared-mailbox send is `request.from` + relay
+        // authorization). Reject a `send_as` before the submission check
+        // so the contract stays uniform with the other providers.
+        if let Some(err) = send_as_guard(&request) {
+            return Err(err);
+        }
         let Some(submission) = account.submission.clone() else {
             return Err(super::error::unsupported(AccountOperation::Send));
         };
@@ -1705,6 +1722,23 @@ mod tests {
         assert!(importance_sets_important_keyword(Importance::High));
         assert!(!importance_sets_important_keyword(Importance::Normal));
         assert!(!importance_sets_important_keyword(Importance::Low));
+    }
+
+    #[test]
+    fn send_as_rejected_unsupported() {
+        let mut request = SendRequest::default();
+        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
+            "shared@contoso.com".to_string(),
+        )));
+        let err = send_as_guard(&request).expect("send_as request must be rejected");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
+
+        // A personal send passes the guard.
+        assert!(send_as_guard(&SendRequest::default()).is_none());
     }
 
     #[tokio::test]

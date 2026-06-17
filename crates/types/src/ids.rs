@@ -20,7 +20,11 @@ pub struct FolderId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LabelId(pub String);
 
-/// JMAP mailbox identifier.
+/// A mailbox identifier. Either a JMAP mailbox id, or - post-A5a, on the
+/// Graph crate - the shared/delegate-mailbox routing key (an SMTP address /
+/// `/users/{id}` path segment) that selects a foreign-mailbox client. On the
+/// public send surface this is the `SendAs` mailbox identity that the Graph
+/// backend routes a draft-create-and-send through.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MailboxId(pub String);
 
