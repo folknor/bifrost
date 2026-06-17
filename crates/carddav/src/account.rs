@@ -911,7 +911,7 @@ impl Account for CardDavAccount {
         Box::pin(async move {
             let offset =
                 decode_offset_cursor(request.page_cursor.clone(), AccountOperation::ContactSearch)?;
-            let needle = request.query.to_ascii_lowercase();
+            let needle = request.query.to_lowercase();
             let cards = if needle.is_empty() {
                 Self::hydrated_contacts(
                     &client,
@@ -1379,7 +1379,10 @@ fn contact_matches(contact: &ContactCard, needle: &str) -> bool {
 }
 
 fn contains(value: &str, needle: &str) -> bool {
-    value.to_ascii_lowercase().contains(needle)
+    // Unicode case folding (matching CalDAV's `event_matches`) so a
+    // search needle matches differently-cased non-ASCII letters in
+    // international names; `to_ascii_lowercase` only folds A-Z.
+    value.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -1645,5 +1648,36 @@ mod tests {
         assert!(contact_matches(&contact, "analytical way"));
         assert!(contact_matches(&contact, "algorithm"));
         assert!(!contact_matches(&contact, "missing"));
+    }
+
+    #[test]
+    fn contact_search_folds_non_ascii_case() {
+        // The needle is lowercased by the search path; matching must use
+        // Unicode case folding so a non-ASCII capital (here the Nordic
+        // `Å`) in the stored value matches its lowercase form. With
+        // `to_ascii_lowercase` the `Å`/`å` pair would not fold and the
+        // match would be missed.
+        let contact = ContactCard {
+            id: ContactId("/book/aase.vcf".to_string()),
+            address_book_id: Some(AddressBookId("/book/".to_string())),
+            native_id: "/book/aase.vcf".to_string(),
+            etag: None,
+            provenance: ContactProvenance {
+                provider: ProtocolKind::CardDav,
+                native: "/book/aase.vcf".to_string(),
+                address_book_native: Some("/book/".to_string()),
+            },
+            display_name: Some("Åse Bø".to_string()),
+            emails: Vec::new(),
+            phones: Vec::new(),
+            organizations: Vec::new(),
+            addresses: Vec::new(),
+            notes: None,
+            photo_url: None,
+            photo: None,
+        };
+
+        let needle = "åse".to_lowercase();
+        assert!(contact_matches(&contact, &needle));
     }
 }

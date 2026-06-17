@@ -1074,10 +1074,15 @@ fn apply_sync_report(
     for entry in entries {
         let uri = client.resolve_url(&entry.uri);
         if matches!(entry.status, Some(404 | 410)) {
+            // Only emit a Destroyed event for an href the prior snapshot
+            // actually held. A 404/410 sync-report entry for an unknown
+            // href (a resource created and deleted between polls, or one
+            // the consumer never saw) would otherwise surface a phantom
+            // delete for an id the consumer has no record of.
             if let Some(index) = current.entries.iter().position(|known| known.uri == uri) {
                 current.entries.remove(index);
+                changes.push(object_change(&uri, ObjectChangeKind::Destroyed));
             }
-            changes.push(object_change(&uri, ObjectChangeKind::Destroyed));
             continue;
         }
         let resolved = EventSnapshotEntry {
@@ -1667,5 +1672,38 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.entries.len(), 2);
+    }
+
+    #[test]
+    fn sync_report_404_for_unknown_href_emits_no_destroyed() {
+        let client = CalDavClient::new(&CalDavConfig {
+            base_url: "https://dav.example.test".to_string(),
+            credentials: CalDavCredentials::bearer("token"),
+        })
+        .expect("client");
+        let mut snapshot = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: Some("token-1".to_string()),
+            entries: vec![EventSnapshotEntry {
+                uri: "https://dav.example.test/cal/one.ics".to_string(),
+                etag: Some("e".to_string()),
+            }],
+            failed_hrefs: Vec::new(),
+        };
+
+        // A 404/410 entry for an href the snapshot never held (created and
+        // deleted between polls) must not surface a phantom Destroyed.
+        let changes = apply_sync_report(
+            &client,
+            &mut snapshot,
+            vec![crate::parse::CalDavSyncEntry {
+                uri: "/cal/ghost.ics".to_string(),
+                etag: None,
+                status: Some(404),
+            }],
+        );
+
+        assert!(changes.is_empty());
+        assert_eq!(snapshot.entries.len(), 1);
     }
 }

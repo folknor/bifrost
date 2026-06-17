@@ -238,19 +238,48 @@ pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String>
     let mut reader = Reader::from_str(xml);
     let mut stack: Vec<String> = Vec::new();
     let mut text = String::new();
+    // Track the ctag and status of the propstat currently being read,
+    // and commit the ctag only when its propstat reports success. A
+    // stale `getctag` returned inside a failed (non-2xx) propstat must
+    // not feed the short-circuit, or a server emitting an old ctag in a
+    // failed block would suppress a real change (false-positive
+    // short-circuit). Mirrors the depth-1 parser's success gating.
+    let mut propstat_ctag: Option<String> = None;
+    let mut propstat_success: Option<bool> = None;
+    let mut committed: Option<String> = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(element)) => {
-                stack.push(local_name(element.name().as_ref()));
+                let name = local_name(element.name().as_ref());
+                if name == "propstat" {
+                    propstat_ctag = None;
+                    propstat_success = None;
+                }
+                stack.push(name);
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
-                if parent == Some("prop") && name == "getctag" {
-                    return Ok(trimmed(&text));
+                match (parent, name.as_str()) {
+                    (Some("prop"), "getctag") => propstat_ctag = trimmed(&text),
+                    (Some("propstat"), "status") => {
+                        propstat_success = Some(is_success_status(&text));
+                    }
+                    _ => {}
+                }
+                if name == "propstat" {
+                    // Absent status defaults to success, matching
+                    // `ResponseParts::commit_propstat`.
+                    if propstat_success.unwrap_or(true)
+                        && let Some(ctag) = propstat_ctag.take()
+                    {
+                        committed = Some(ctag);
+                    }
+                    propstat_ctag = None;
+                    propstat_success = None;
                 }
                 stack.pop();
                 text.clear();
@@ -261,7 +290,7 @@ pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String>
         }
     }
 
-    Ok(None)
+    Ok(committed)
 }
 
 pub(crate) fn extract_href_property(
@@ -327,10 +356,19 @@ fn trimmed(text: &str) -> Option<String> {
 }
 
 fn is_success_status(value: &str) -> bool {
+    // Parse the first whitespace-delimited token that is a 3-digit-ish
+    // numeric code and test the 2xx range, rather than positionally
+    // assuming the leading `HTTP/x` token is present. A status line that
+    // omits the protocol token (`200 OK`) would otherwise have its code
+    // read as the word `OK` and be misclassified as a failed propstat.
+    // Matches CalDAV's `status_code` + `200..=299` check.
+    status_code(value).is_some_and(|code| matches!(code, 200..=299))
+}
+
+fn status_code(value: &str) -> Option<u16> {
     value
         .split_whitespace()
-        .nth(1)
-        .is_some_and(|code| code.starts_with('2'))
+        .find_map(|part| part.parse::<u16>().ok())
 }
 
 fn normalize_etag(text: &str) -> Option<String> {
@@ -633,6 +671,62 @@ END:VCARD</C:address-data>
 
         let ctag = parse_collection_ctag(xml).expect("valid XML");
         assert_eq!(ctag.as_deref(), Some("ctag-7"));
+    }
+
+    #[test]
+    fn is_success_status_parses_code_without_protocol_token() {
+        // A status line missing the leading `HTTP/x` token must still
+        // classify on the numeric code, not positionally read the second
+        // whitespace token (which would be `OK`).
+        assert!(is_success_status("200 OK"));
+        assert!(is_success_status("HTTP/1.1 207 Multi-Status"));
+        assert!(!is_success_status("404 Not Found"));
+        assert!(!is_success_status("HTTP/1.1 404 Not Found"));
+    }
+
+    #[test]
+    fn parse_collection_ctag_ignores_failed_propstat() {
+        // A getctag returned inside a non-2xx propstat is stale and must
+        // not feed the short-circuit; only a success propstat commits.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop>
+        <CS:getctag>stale-ctag</CS:getctag>
+      </D:prop>
+      <D:status>HTTP/1.1 403 Forbidden</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        assert!(parse_collection_ctag(xml).expect("valid XML").is_none());
+    }
+
+    #[test]
+    fn parse_collection_ctag_prefers_success_propstat() {
+        // Failed propstat carries a stale ctag; the success propstat
+        // carries the live one - the live one wins.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/">
+  <D:response>
+    <D:href>/contacts/personal/</D:href>
+    <D:propstat>
+      <D:prop><CS:getctag>stale-ctag</CS:getctag></D:prop>
+      <D:status>HTTP/1.1 403 Forbidden</D:status>
+    </D:propstat>
+    <D:propstat>
+      <D:prop><CS:getctag>live-ctag</CS:getctag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        assert_eq!(
+            parse_collection_ctag(xml).expect("valid XML").as_deref(),
+            Some("live-ctag")
+        );
     }
 
     #[test]
