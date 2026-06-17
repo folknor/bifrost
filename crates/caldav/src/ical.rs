@@ -638,15 +638,138 @@ fn push_vtimezones(lines: &mut Vec<String>, event: &EventCreate) {
         }
     }
     for tzid in tzids {
+        // Anchor the offset at whichever event time carries this zone (start
+        // preferred), so the emitted VTIMEZONE matches the instant the server
+        // will resolve the DTSTART/DTEND against.
+        let anchor = [&event.start, &event.end]
+            .into_iter()
+            .find(|time| time.timezone.as_deref() == Some(tzid.as_str()))
+            .and_then(event_naive_local);
+
+        // Resolve the real UTC offset for the event's instant. `canonical_tzid`
+        // folds Windows/Exchange names ("W. Europe Standard Time") to IANA so
+        // the name parses to a `chrono_tz::Tz`. An unknown zone, or a value we
+        // cannot parse to a naive wall-clock, falls through to `None`.
+        let offset = tzid_offset_for_naive(&tzid, anchor);
+
         lines.push("BEGIN:VTIMEZONE".to_string());
         lines.push(format!("TZID:{}", escape_text(&tzid)));
-        lines.push("BEGIN:STANDARD".to_string());
-        lines.push("DTSTART:19700101T000000".to_string());
-        lines.push("TZOFFSETFROM:+0000".to_string());
-        lines.push("TZOFFSETTO:+0000".to_string());
-        lines.push("END:STANDARD".to_string());
+        // A single STANDARD block carrying the correct offset for the event's
+        // instant. This is approximate for a recurring event that spans a DST
+        // transition (off by the DST delta on the far side of the transition),
+        // but strictly better than the previous fixed `+0000` UTC stub, which
+        // made servers that trust the supplied VTIMEZONE read an Oslo
+        // wall-clock time as UTC and shift the event by the real offset
+        // (1-2h). Full STANDARD/DAYLIGHT transition rules are not generated;
+        // most servers re-resolve the TZID by name regardless. An unknown /
+        // unparseable zone omits the offset sub-block rather than emit a
+        // misleading `+0000`: the bare VTIMEZONE still names the TZID for
+        // servers that resolve it themselves, and we avoid asserting a wrong
+        // offset.
+        if let Some(offset) = offset {
+            lines.push("BEGIN:STANDARD".to_string());
+            lines.push("DTSTART:19700101T000000".to_string());
+            lines.push(format!("TZOFFSETFROM:{offset}"));
+            lines.push(format!("TZOFFSETTO:{offset}"));
+            lines.push("END:STANDARD".to_string());
+        }
         lines.push("END:VTIMEZONE".to_string());
     }
+}
+
+/// Derive the wall-clock `NaiveDateTime` an event time names. With a TZID the
+/// stored value is a local wall-clock instant (mirrors `push_time`, which
+/// strips the trailing `Z` and emits the date/time verbatim under the zone).
+fn event_naive_local(time: &EventTime) -> Option<chrono::NaiveDateTime> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
+        return Some(parsed.naive_local());
+    }
+    // Fall back to parsing a bare iCalendar-style `YYYYMMDDTHHMMSS[Z]` value.
+    let raw = time.value.replace(['-', ':'], "");
+    let raw = raw.trim_end_matches('Z');
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y%m%dT%H%M%S").ok()
+}
+
+/// Resolve the iCalendar UTC-offset string (`+HHMM` / `-HHMM`) for `tzid` at
+/// the given wall-clock instant, or `None` if the zone is unknown.
+///
+/// LocalResult discipline mirrors ratatoskr's `resolve_local_to_timestamp`:
+/// `Single` is used directly; `Ambiguous` (fall-back) picks the earlier
+/// instant (matches Outlook/Google/Apple); `None` (spring-forward gap) walks
+/// past the gap and uses the post-gap offset.
+fn tzid_offset_for_naive(tzid: &str, naive: Option<chrono::NaiveDateTime>) -> Option<String> {
+    use chrono::{LocalResult, Offset, TimeZone};
+
+    let tz: chrono_tz::Tz = canonical_tzid(tzid).parse().ok()?;
+    // With no usable anchor, fall back to the Unix epoch so we still emit the
+    // zone's standard-time offset rather than nothing.
+    let naive = naive.unwrap_or_else(|| {
+        chrono::DateTime::from_timestamp(0, 0)
+            .expect("epoch is representable")
+            .naive_utc()
+    });
+
+    let offset = match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt.offset().fix(),
+        LocalResult::Ambiguous(early, _late) => early.offset().fix(),
+        LocalResult::None => resolve_offset_through_gap(tz, naive)?,
+    };
+    Some(format_utc_offset(offset))
+}
+
+/// Spring-forward gap: walk back to the last valid wall clock and forward to
+/// the first, shift `naive` past the gap by the gap width, and take the
+/// resulting (post-gap) offset. Mirrors ratatoskr's `resolve_through_gap`.
+fn resolve_offset_through_gap(
+    tz: chrono_tz::Tz,
+    naive: chrono::NaiveDateTime,
+) -> Option<chrono::FixedOffset> {
+    use chrono::{Duration, LocalResult, Offset, TimeZone};
+
+    const MAX_PROBE_MINUTES: i64 = 60 * 48;
+
+    let mut backward = 0i64;
+    let gap_start = loop {
+        backward += 1;
+        if backward > MAX_PROBE_MINUTES {
+            return None;
+        }
+        if !matches!(
+            tz.from_local_datetime(&(naive - Duration::minutes(backward))),
+            LocalResult::None
+        ) {
+            break backward;
+        }
+    };
+    let mut forward = 0i64;
+    let gap_end = loop {
+        forward += 1;
+        if forward > MAX_PROBE_MINUTES {
+            return None;
+        }
+        if !matches!(
+            tz.from_local_datetime(&(naive + Duration::minutes(forward))),
+            LocalResult::None
+        ) {
+            break forward;
+        }
+    };
+
+    let gap_width = gap_start + gap_end - 1;
+    let shifted = naive.checked_add_signed(Duration::minutes(gap_width))?;
+    match tz.from_local_datetime(&shifted) {
+        LocalResult::Single(dt) => Some(dt.offset().fix()),
+        LocalResult::Ambiguous(_early, late) => Some(late.offset().fix()),
+        LocalResult::None => None,
+    }
+}
+
+/// Format a `FixedOffset` as the iCalendar UTC-offset form `+HHMM` / `-HHMM`.
+fn format_utc_offset(offset: chrono::FixedOffset) -> String {
+    let total = offset.local_minus_utc();
+    let sign = if total < 0 { '-' } else { '+' };
+    let abs = total.abs();
+    format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
 fn push_time(
@@ -1301,10 +1424,107 @@ mod tests {
         assert!(body.contains("BEGIN:VTIMEZONE"));
         assert!(body.contains("TZID:Europe/Oslo"));
         assert!(body.contains("BEGIN:STANDARD"));
-        assert!(body.contains("TZOFFSETFROM:+0000"));
-        assert!(body.contains("TZOFFSETTO:+0000"));
+        // June 2 is summer time in Oslo: CEST = +0200. Previously this stub
+        // asserted +0000, which encoded the very bug being fixed (a server
+        // trusting the VTIMEZONE read the wall-clock as UTC and shifted the
+        // event by 2h).
+        assert!(body.contains("TZOFFSETFROM:+0200"));
+        assert!(body.contains("TZOFFSETTO:+0200"));
         assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260602T120000"));
         assert!(body.contains("DTEND;TZID=Europe/Oslo:20260602T130000"));
+    }
+
+    #[test]
+    fn vtimezone_offset_tracks_winter_standard_time() {
+        let body = create_to_ical(
+            &EventCreate {
+                calendar_id: CalendarId("/cal/".to_string()),
+                title: None,
+                description: None,
+                location: None,
+                start: EventTime {
+                    value: "2026-01-15T12:00:00Z".to_string(),
+                    timezone: Some("Europe/Oslo".to_string()),
+                },
+                end: EventTime {
+                    value: "2026-01-15T13:00:00Z".to_string(),
+                    timezone: Some("Europe/Oslo".to_string()),
+                },
+                is_all_day: false,
+                status: EventStatus::Confirmed,
+                availability: EventAvailability::Busy,
+                visibility: EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: EventRecurrence::default(),
+            },
+            "uid-1",
+        );
+
+        // January is winter time in Oslo: CET = +0100.
+        assert!(body.contains("TZOFFSETTO:+0100"));
+        assert!(body.contains("DTSTART;TZID=Europe/Oslo:20260115T120000"));
+    }
+
+    #[test]
+    fn vtimezone_unknown_zone_omits_offset_block() {
+        let body = create_to_ical(
+            &EventCreate {
+                calendar_id: CalendarId("/cal/".to_string()),
+                title: None,
+                description: None,
+                location: None,
+                start: EventTime {
+                    value: "2026-06-02T12:00:00Z".to_string(),
+                    timezone: Some("Custom/Bogus".to_string()),
+                },
+                end: EventTime {
+                    value: "2026-06-02T13:00:00Z".to_string(),
+                    timezone: Some("Custom/Bogus".to_string()),
+                },
+                is_all_day: false,
+                status: EventStatus::Confirmed,
+                availability: EventAvailability::Busy,
+                visibility: EventVisibility::Default,
+                organizer: None,
+                attendees: Vec::new(),
+                recurrence: EventRecurrence::default(),
+            },
+            "uid-1",
+        );
+
+        // The bare VTIMEZONE still names the zone for servers that resolve it
+        // themselves, but we never assert a misleading offset for an unknown
+        // zone.
+        assert!(body.contains("BEGIN:VTIMEZONE"));
+        assert!(body.contains("TZID:Custom/Bogus"));
+        assert!(!body.contains("TZOFFSETTO"));
+        assert!(!body.contains("BEGIN:STANDARD"));
+    }
+
+    #[test]
+    fn tzid_offset_resolves_known_zone_and_instant() {
+        let summer = NaiveDate::from_ymd_opt(2026, 6, 2)
+            .and_then(|d| d.and_hms_opt(12, 0, 0))
+            .expect("valid");
+        let winter = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .and_then(|d| d.and_hms_opt(12, 0, 0))
+            .expect("valid");
+        assert_eq!(
+            tzid_offset_for_naive("Europe/Oslo", Some(summer)).as_deref(),
+            Some("+0200")
+        );
+        assert_eq!(
+            tzid_offset_for_naive("Europe/Oslo", Some(winter)).as_deref(),
+            Some("+0100")
+        );
+        // Windows/Exchange alias folds to IANA before parsing.
+        assert_eq!(
+            tzid_offset_for_naive("W. Europe Standard Time", Some(summer)).as_deref(),
+            Some("+0200")
+        );
+        // Unknown zone yields no offset (graceful fallback, not +0000).
+        assert_eq!(tzid_offset_for_naive("Custom/Bogus", Some(summer)), None);
     }
 
     #[test]

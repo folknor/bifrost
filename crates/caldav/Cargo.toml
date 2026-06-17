@@ -24,6 +24,7 @@ bifrost-types = { path = "../types" }
 bytes = { workspace = true }
 caldata = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = "0.10.4"
 futures = { workspace = true }
 quick-xml = "0.40.1"
 reqwest = { workspace = true, features = ["native-tls"] }
