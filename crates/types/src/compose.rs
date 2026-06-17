@@ -287,7 +287,11 @@ mod scheduled_send_tests {
 
     #[test]
     fn scheduled_send_idempotency_placement() {
-        assert!(AccountOperation::CancelScheduledSend.is_idempotent());
+        // Both scheduled-send mutators are non-idempotent: an in-flight
+        // drop on either must reconcile, not blind-retry. (Cancel was
+        // previously treated idempotent, diverging from its RescheduleSend
+        // sibling and from the wider destructive-op family.)
+        assert!(!AccountOperation::CancelScheduledSend.is_idempotent());
         assert!(!AccountOperation::RescheduleSend.is_idempotent());
     }
 

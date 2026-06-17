@@ -189,18 +189,41 @@ pub enum AccountOperation {
 impl AccountOperation {
     #[must_use]
     pub fn is_idempotent(self) -> bool {
+        // The non-idempotent set is every operation whose blind same-request
+        // retry could double-apply a side effect: sends, creates, moves,
+        // destroys/expunges/discards, attachment uploads, and the draft /
+        // container / contact / event / filter / identity / vacation
+        // writers. For these, an in-flight transport drop must route to
+        // `Reconcile` (probe the target), not a blind `Retry(SameRequest)`.
+        //
+        // Destroy/expunge/discard are non-idempotent here even though a
+        // re-delete of an already-gone object reaches the same end state:
+        // an in-flight drop has no proof the destroy reached the server,
+        // and the reconcile lane is the correct uniform "did my mutation
+        // land?" handling. Moves are non-idempotent for the same reason
+        // (the source may already be gone).
+        //
+        // Absolute-state writes are idempotent and stay OUT of this set:
+        // re-applying `UpdateFlags` / `SetKeyword` / `SetLabelMembership` /
+        // `SetCategory` / `SetExtendedProperty` / `SetImportance` /
+        // `SetIsRead` drives the target to the same value, so a blind retry
+        // is safe (pinned by the JMAP `UpdateFlags` contract test).
+        // Read-only and discovery operations are idempotent by omission.
         !matches!(
             self,
             Self::PushSubscribe
                 | Self::Send
                 | Self::BulkMove
+                | Self::BulkDestroy
                 | Self::AddToContainer
                 | Self::RemoveFromContainer
                 | Self::AttachmentUpload
                 | Self::HostAttachment
                 | Self::DraftCreate
                 | Self::DraftUpdate
+                | Self::DraftDiscard
                 | Self::DraftSend
+                | Self::CancelScheduledSend
                 | Self::RescheduleSend
                 | Self::ContainerCreate
                 | Self::ContainerRename
@@ -218,6 +241,7 @@ impl AccountOperation {
                 | Self::EventUpdate
                 | Self::EventDelete
                 | Self::EventRsvp
+                | Self::Expunge
         )
     }
 }
@@ -263,5 +287,57 @@ mod tests {
         // A directory search is a read; a transport drop mid-search is safely
         // retryable, so it stays idempotent by omission from the exclusion set.
         assert!(AccountOperation::DirectorySearch.is_idempotent());
+    }
+
+    #[test]
+    fn destructive_ops_are_not_idempotent() {
+        // An in-flight drop on any of these must reconcile (probe the
+        // target), not blind-retry. Regression guard for the table that
+        // previously treated destroys/expunge/discard as idempotent while
+        // moves were correctly excluded (shortlist #4).
+        for op in [
+            AccountOperation::BulkDestroy,
+            AccountOperation::Expunge,
+            AccountOperation::DraftDiscard,
+            AccountOperation::CancelScheduledSend,
+            AccountOperation::BulkMove,
+        ] {
+            assert!(!op.is_idempotent(), "{op:?} must be non-idempotent");
+        }
+    }
+
+    #[test]
+    fn absolute_state_writes_stay_idempotent() {
+        // Setting a flag/label/importance to an absolute target value is
+        // idempotent: a blind same-request retry drives the target to the
+        // same state. These must NOT be in the non-idempotent set (pinned by
+        // the JMAP `UpdateFlags` contract test).
+        for op in [
+            AccountOperation::UpdateFlags,
+            AccountOperation::SetKeyword,
+            AccountOperation::SetLabelMembership,
+            AccountOperation::SetCategory,
+            AccountOperation::SetExtendedProperty,
+            AccountOperation::SetImportance,
+            AccountOperation::SetIsRead,
+        ] {
+            assert!(op.is_idempotent(), "{op:?} must stay idempotent");
+        }
+    }
+
+    #[test]
+    fn read_only_ops_remain_idempotent() {
+        for op in [
+            AccountOperation::Discover,
+            AccountOperation::SyncInventory,
+            AccountOperation::SyncChanges,
+            AccountOperation::Hydrate,
+            AccountOperation::OpenBlob,
+            AccountOperation::Search,
+            AccountOperation::ContactGet,
+            AccountOperation::QuotaGet,
+        ] {
+            assert!(op.is_idempotent(), "{op:?} must stay idempotent");
+        }
     }
 }

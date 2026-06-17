@@ -739,12 +739,23 @@ fn transient_retry_or_reconcile(
     throttle_scope: Option<ThrottleScope>,
 ) -> RecoveryClass {
     match tx_state {
-        TransmissionState::InFlight if !idempotent => RecoveryClass::Reconcile(ReconcileAdvice {
-            reason: ReconcileReason::TransportDropAfterSend,
-            guidance: ReconcileGuidance {
-                actions: vec![ReconcileAction::CheckTarget],
-            },
-        }),
+        // Only `InFlight` (transport dropped after the request went out, no
+        // response) on a non-idempotent op reconciles: the side effect may
+        // have landed but we have no acknowledgement, so a blind same-request
+        // retry could double-apply. `Acknowledged` is different: the server
+        // returned a complete response, so an ack-then-transient-fail is a
+        // commit-rejection (nothing committed), safe to retry the same
+        // request. This matches reference/error-model.md: `Unsent`/
+        // `Acknowledged`, or `InFlight`+idempotent -> `Retry(SameRequest)`;
+        // `InFlight`+non-idempotent -> `Reconcile`.
+        TransmissionState::InFlight if !idempotent => {
+            RecoveryClass::Reconcile(ReconcileAdvice {
+                reason: ReconcileReason::TransportDropAfterSend,
+                guidance: ReconcileGuidance {
+                    actions: vec![ReconcileAction::CheckTarget],
+                },
+            })
+        }
         TransmissionState::Unsent
         | TransmissionState::InFlight
         | TransmissionState::Acknowledged => RecoveryClass::Retry(RetryAdvice {
@@ -869,10 +880,13 @@ mod tests {
 
     #[test]
     fn idempotent_inflight_transport_retries() {
+        // SyncChanges is a read; an in-flight transport drop is safely
+        // re-driven. (UpdateFlags used to stand in for "idempotent" here,
+        // but flag writes are now correctly in the non-idempotent set.)
         let recovery = derive(
             &AccountErrorKind::Transport(super::super::kind::TransportErrorKind::Network),
             None,
-            Some(AccountOperation::UpdateFlags),
+            Some(AccountOperation::SyncChanges),
             &transport_chain(TransmissionState::InFlight),
             None,
             None,
@@ -1060,6 +1074,86 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn quota_acknowledged_non_idempotent_retries_same_request() {
+        // Per reference/error-model.md, a `Server(QuotaExhausted)` carrying an
+        // `Attempt(Acknowledged)` retries the same request even for a
+        // non-idempotent send: an ack-then-transient-fail is a commit
+        // rejection (the server returned a complete response, nothing
+        // committed), so it is safe to re-send. Only `InFlight` (no
+        // acknowledgement) + non-idempotent reconciles.
+        let recovery = derive(
+            &AccountErrorKind::Server(ServerErrorKind::QuotaExhausted),
+            None,
+            Some(AccountOperation::Send),
+            &CauseChain::new(vec![
+                Cause::Server(ServerCause::QuotaExhausted { retry_hint: None }),
+                Cause::Attempt(AttemptCause {
+                    transmission_state: TransmissionState::Acknowledged,
+                }),
+            ]),
+            Some(ThrottleScope::Account),
+            None,
+        );
+
+        assert!(matches!(
+            recovery,
+            RecoveryClass::Retry(RetryAdvice {
+                disposition: RetryDisposition::SameRequest,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inflight_non_idempotent_send_reconciles() {
+        // The reconcile case the helper does cover: a transport drop with no
+        // acknowledgement (`InFlight`) on a non-idempotent send may have
+        // landed, so probe the target instead of blind-retrying.
+        let recovery = derive(
+            &AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            None,
+            Some(AccountOperation::Send),
+            &CauseChain::new(vec![
+                Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+                Cause::Attempt(AttemptCause {
+                    transmission_state: TransmissionState::InFlight,
+                }),
+            ]),
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            recovery,
+            RecoveryClass::Reconcile(ReconcileAdvice {
+                reason: ReconcileReason::TransportDropAfterSend,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rate_limited_acknowledged_idempotent_still_retries() {
+        // An idempotent read that the server acknowledged then rate-limited
+        // is still safely retryable.
+        let recovery = derive(
+            &AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            None,
+            Some(AccountOperation::SyncChanges),
+            &CauseChain::new(vec![
+                Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+                Cause::Attempt(AttemptCause {
+                    transmission_state: TransmissionState::Acknowledged,
+                }),
+            ]),
+            None,
+            None,
+        );
+
+        assert!(recovery.is_retryable());
     }
 
     #[test]

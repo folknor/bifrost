@@ -70,6 +70,24 @@ pub fn route_typed_scope<'a>(
 /// A sub-account discovery error is folded into a `Warning` rather than
 /// terminating the merged stream: the engine re-runs discovery on every
 /// reopen, so a transient sub failure self-heals.
+///
+/// Two deliberate properties of this fan-in, called out because they are
+/// not obvious from the signature:
+///
+/// - **Sub-account checkpoints are dropped.** Each sub's discovery stream
+///   may carry its own `Batch.checkpoint` / `Done(Some(..))` cursor, but
+///   the merged batch emits `checkpoint: None` and `Done(None)`.
+///   Discovery is a stateless re-enumeration the engine reruns on every
+///   reopen, so there is no merged cursor to persist; a sub's per-stream
+///   checkpoint has no meaning once its items are folded into the
+///   composing account's single discovery batch.
+/// - **Subs are drained sequentially, fully buffered.** There is no
+///   per-sub timeout and the first byte is delayed until every sub has
+///   reached `Done`/`Terminated`. A sub that never terminates blocks the
+///   whole merged stream. This is a constraint of `bifrost-types` having
+///   no async runtime / timer of its own (see the module-tail note); a
+///   timeout would have to be imposed by the composing crate around the
+///   per-sub `discover` closure it supplies, not here.
 pub fn merge_scope_streams<T, F>(
     items: Vec<T>,
     warnings: Vec<Warning>,
