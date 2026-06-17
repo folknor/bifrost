@@ -290,6 +290,27 @@ foreign-scope item (the engine covering rule cannot form it).
 from `parse_folder`, so the mailbox rides in `/users/{id}`, the id in
 `/mailFolders/{id}`.
 
+Per-message routing rides the same codec applied to the *message* id.
+`foreign.rs::encode_message_id(scope, native)` foreign-encodes the message id
+(`{mailbox}\u{1f}{native}`) when the scope parses foreign, and leaves a primary
+message bare; `parse_message_id` -> `ParsedMessageId::{Primary, Foreign}` with
+`.native_id()` / `.owner()`. The id is minted encoded at every projection site
+(`inventory_entry_from_value`, and the `changes` Added/Updated/Removed ids) so
+one logical message carries identical bytes everywhere - the consumer uses it
+as a stable primary key, and a shared-mailbox message never also surfaces bare
+via `/me`. Every per-message request decodes it and routes via
+`client_for_owner(parsed.owner())` using `parsed.native_id()`: hydration
+(`get.rs hydrate_url_for_id`), blob + raw (`blob.rs`), mutations (`mutate.rs`
+flag/move/destroy and the `pim.rs` writes), and the typed `message_hydrate` /
+`thread_hydrate`. A foreign id builds `/users/{owner}/messages/{native}`, a
+primary id `/me/messages/{id}`. `bulk_move` also decodes the destination
+`FolderId` (the `destinationId` body must be the native id) and rejects a
+cross-mailbox move - destination owner != source owner - as `Request(Malformed)`,
+since one endpoint can't express it. The etag cache stays keyed by the encoded
+id; only the URL uses the native id. `push.rs resource_for_scope` routes a
+foreign subscription via `client_for_scope` + the native folder id, never
+percent-encoding a raw `\u{1f}` id into the URL.
+
 Revocation isolation: `graph_shared_scope_error(error, scope, owner, ctx)`
 quarantines just the foreign scope when the failure is
 `Authorization(PermissionDenied)` and `owner.is_some()` ->
@@ -511,8 +532,10 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
   are engine-constructed.
 - `scope_lifecycle_stream` is empty; folder creates/renames/deletes are
   observed only at reopen. Live delegate enumeration (Autodiscover parser
-  landed, unwired) and foreign-mailbox draft mutations are follow-ups
-  (shared-mailbox send-as is wired, C-3).
+  landed, unwired) is a follow-up. Shared-mailbox routing is otherwise
+  complete: send-as (C-3), read paths and message mutations
+  (flag/move/destroy, drafts) all route to the owning mailbox via the
+  encoded message id.
 - Public folders are poll-only (no push) and side-table-free: the deletion
   baseline rides in the cursor, capped at 10_000 items/folder (above:
   additions-only). A `CheckpointStore`-backed baseline and item-class support

@@ -64,8 +64,8 @@ pub(crate) async fn set_category(
     )
     .await?;
     let mut patches = Vec::new();
-    for message in values {
-        let id = object_id_from_value(&message, AccountOperation::SetCategory)?;
+    for ResolvedMessage { routing_id, value: message } in values {
+        let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetCategory,
@@ -113,8 +113,8 @@ pub(crate) async fn set_extended_property(
             )
             .await?;
             let mut patches = Vec::new();
-            for message in values {
-                let id = object_id_from_value(&message, AccountOperation::SetExtendedProperty)?;
+            for ResolvedMessage { routing_id, value: message } in values {
+                let id = routing_id;
                 let etag = graph_etag(&message).ok_or_else(|| {
                     pim_protocol_error(
                         AccountOperation::SetExtendedProperty,
@@ -160,17 +160,18 @@ async fn delete_extended_property(
     property_id: &str,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
     for (index, id) in ids.iter().enumerate() {
+        // `ids` are the caller-supplied (possibly foreign-encoded) routing
+        // ids; route the clear DELETE to the owning mailbox.
+        let suffix = format!(
+            "/singleValueExtendedProperties/{}",
+            bifrost_net::url::encode_component(property_id)
+        );
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "DELETE".to_string(),
-            url: format!(
-                "{prefix}/messages/{}/singleValueExtendedProperties/{}",
-                bifrost_net::url::encode_component(&id.0),
-                bifrost_net::url::encode_component(property_id),
-            ),
+            url: message_batch_url(account, id, &suffix),
             body: None,
             headers: None,
         });
@@ -191,8 +192,8 @@ pub(crate) async fn set_is_read(
     )
     .await?;
     let mut patches = Vec::new();
-    for message in values {
-        let id = object_id_from_value(&message, AccountOperation::SetIsRead)?;
+    for ResolvedMessage { routing_id, value: message } in values {
+        let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetIsRead,
@@ -227,8 +228,8 @@ pub(crate) async fn set_importance(
     .await?;
     let body = graph_importance_body(level);
     let mut patches = Vec::new();
-    for message in values {
-        let id = object_id_from_value(&message, AccountOperation::SetImportance)?;
+    for ResolvedMessage { routing_id, value: message } in values {
+        let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
                 AccountOperation::SetImportance,
@@ -845,15 +846,40 @@ async fn resolve_target_ids(
     }
 }
 
+/// A resolved message for a write: the routing id (the caller-supplied,
+/// possibly foreign-encoded `ObjectId` that the conditioned write must
+/// route by) paired with its fetched value (carrying the etag/body). For
+/// a `Thread` target the routing id is the native id the server listed -
+/// thread queries run against `/me`, so those items are primary-mailbox.
+struct ResolvedMessage {
+    routing_id: ObjectId,
+    value: Value,
+}
+
 async fn resolve_target_values(
     account: &GraphAccount,
     target: MutationTarget,
     select: &str,
     operation: AccountOperation,
-) -> Result<Vec<Value>, AccountError> {
+) -> Result<Vec<ResolvedMessage>, AccountError> {
     match target {
-        MutationTarget::Message(id) => Ok(vec![fetch_message_value(account, &id, select).await?]),
-        MutationTarget::Thread(thread) => message_values_for_thread(account, &thread, select).await,
+        MutationTarget::Message(id) => {
+            let value = fetch_message_value(account, &id, select).await?;
+            Ok(vec![ResolvedMessage {
+                routing_id: id,
+                value,
+            }])
+        }
+        MutationTarget::Thread(thread) => {
+            let values = message_values_for_thread(account, &thread, select).await?;
+            values
+                .into_iter()
+                .map(|value| {
+                    let routing_id = object_id_from_value(&value, operation)?;
+                    Ok(ResolvedMessage { routing_id, value })
+                })
+                .collect()
+        }
         _ => Err(unsupported_account_error(operation)),
     }
 }
@@ -863,17 +889,26 @@ async fn fetch_message_value(
     id: &ObjectId,
     select: &str,
 ) -> Result<Value, AccountError> {
+    // Decode the (possibly foreign-encoded) id so a shared-mailbox
+    // message reads from `/users/{owner}/messages/{native}`; a primary
+    // (bare) id stays on `/me`. This makes the typed `message_hydrate`
+    // and every pim read-modify-write that starts from `fetch_message_value`
+    // mailbox-correct.
+    let parsed = super::foreign::parse_message_id(id);
+    let client = account.client_for_owner(parsed.owner());
     let path = format!(
         "{}/messages/{}?{}",
-        account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&id.0),
+        client.api_path_prefix(),
+        bifrost_net::url::encode_component(parsed.native_id()),
         select_query(select)
     );
-    let value =
-        account.client.get_json(&path).await.map_err(|e| {
-            into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate))
-        })?;
-    cache_etag(account, &value, AccountOperation::Hydrate).await?;
+    let value = client.get_json(&path).await.map_err(|e| {
+        into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate))
+    })?;
+    // Cache the etag under the encoded id (the key the mutation paths
+    // look up), preserving the owner so the conditioned write routes
+    // back to the same mailbox.
+    cache_etag_for(account, id, &value).await;
     Ok(value)
 }
 
@@ -912,12 +947,26 @@ async fn fetch_paged_values(
     Ok(values)
 }
 
+/// Build a per-message `$batch` request URL, decoding the (possibly
+/// foreign-encoded) id and routing to the owning mailbox: a shared-mailbox
+/// message yields `/users/{owner}/messages/{native}{suffix}`, a primary
+/// (bare) id `/me/messages/{id}{suffix}`. `suffix` is the trailing path
+/// segment after the message id (`""`, `"/move"`, or a
+/// `/singleValueExtendedProperties/...` clear). The `$batch` envelope is
+/// always posted on the primary client; routing rides entirely in the
+/// per-item URL prefix, mirroring the read paths in `get.rs`.
+fn message_batch_url(account: &GraphAccount, id: &ObjectId, suffix: &str) -> String {
+    let parsed = super::foreign::parse_message_id(id);
+    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+    format!("{prefix}/messages/{enc_id}{suffix}")
+}
+
 async fn patch_messages(
     account: &GraphAccount,
     patches: Vec<MessagePatch>,
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
-    let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
     let mut targets = Vec::new();
     for (index, patch) in patches.iter().enumerate() {
@@ -926,10 +975,7 @@ async fn patch_messages(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "PATCH".to_string(),
-            url: format!(
-                "{prefix}/messages/{}",
-                bifrost_net::url::encode_component(&patch.id.0)
-            ),
+            url: message_batch_url(account, &patch.id, ""),
             body: Some(patch.body.clone()),
             headers: Some(headers),
         });
@@ -945,11 +991,19 @@ async fn move_messages(
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
-    let prefix = account.client.api_path_prefix();
+    // The destination may itself be foreign-encoded (a shared-mailbox
+    // folder); the `move` body's `destinationId` must carry the native
+    // folder id, never a `\u{1f}`-bearing one. Decode once up front.
+    let dest = super::foreign::parse_folder(&bifrost_types::FolderId(destination.to_string()));
     let mut requests = Vec::new();
     let mut targets = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        let id = object_id_from_value(value, operation)?;
+    // `ids[i]` is the caller-supplied (possibly foreign-encoded) routing
+    // id; `values[i]` is its fetched value (etag). Route the request by
+    // the routing id so a shared-mailbox message moves under
+    // `/users/{owner}`, and guard that the destination folder belongs to
+    // the same mailbox - a cross-mailbox move is not expressible against
+    // one endpoint.
+    for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
         let etag = graph_etag(value).ok_or_else(|| {
             pim_protocol_error(
                 operation,
@@ -957,19 +1011,27 @@ async fn move_messages(
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
+        let source_owner = super::foreign::parse_message_id(id).owner().map(str::to_string);
+        if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
+            return Err(pim_protocol_error(
+                operation,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!(
+                    "Graph move for {} targets a folder in a different mailbox than the message",
+                    id.0
+                ),
+            ));
+        }
         let mut headers = HashMap::new();
         headers.insert("If-Match".to_string(), etag);
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "POST".to_string(),
-            url: format!(
-                "{prefix}/messages/{}/move",
-                bifrost_net::url::encode_component(&id.0)
-            ),
-            body: Some(json!({ "destinationId": destination })),
+            url: message_batch_url(account, id, "/move"),
+            body: Some(json!({ "destinationId": dest.native_id() })),
             headers: Some(headers),
         });
-        targets.push(id);
+        targets.push(id.clone());
     }
     submit_write_batch_with_targets(account, requests, &targets, false, operation).await
 }
@@ -980,11 +1042,11 @@ async fn destroy_messages(
     operation: AccountOperation,
 ) -> Result<(), AccountError> {
     let values = message_values_for_ids(account, ids, "id,changeKey").await?;
-    let prefix = account.client.api_path_prefix();
     let mut requests = Vec::new();
     let mut targets = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        let id = object_id_from_value(value, operation)?;
+    // Route each DELETE by the caller-supplied (possibly foreign-encoded)
+    // routing id `ids[i]`, paired with its fetched etag `values[i]`.
+    for (index, (id, value)) in ids.iter().zip(values.iter()).enumerate() {
         let mut headers = HashMap::new();
         if let Some(etag) = graph_etag(value) {
             headers.insert("If-Match".to_string(), etag);
@@ -992,14 +1054,11 @@ async fn destroy_messages(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "DELETE".to_string(),
-            url: format!(
-                "{prefix}/messages/{}",
-                bifrost_net::url::encode_component(&id.0)
-            ),
+            url: message_batch_url(account, id, ""),
             body: None,
             headers: (!headers.is_empty()).then_some(headers),
         });
-        targets.push(id);
+        targets.push(id.clone());
     }
     submit_write_batch_with_targets(account, requests, &targets, true, operation).await
 }
@@ -1134,17 +1193,16 @@ async fn submit_write_batch_with_targets(
     Ok(())
 }
 
-async fn cache_etag(
-    account: &GraphAccount,
-    value: &Value,
-    operation: AccountOperation,
-) -> Result<(), AccountError> {
+/// Cache the message etag under the caller-supplied (possibly
+/// foreign-encoded) id - the same key the mutation paths look up - so a
+/// conditioned write on a shared-mailbox message finds its etag and
+/// routes back to the owning mailbox. Keying by the native id from the
+/// response body instead would lose the owner and orphan the cache entry.
+async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value: &Value) {
     let Some(etag) = graph_etag(value) else {
-        return Ok(());
+        return;
     };
-    let id = object_id_from_value(value, operation)?;
-    account.etag_index.write().await.insert(id.0, etag);
-    Ok(())
+    account.etag_index.write().await.insert(id.0.clone(), etag);
 }
 
 fn object_id_from_value(
@@ -1991,6 +2049,53 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::account::PushMode;
+    use crate::account::foreign::{encode_foreign, encode_message_id};
+    use crate::client::GraphClient;
+    use bifrost_types::{CursorScope, ObjectType};
+
+    fn shared_account() -> GraphAccount {
+        GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        )
+    }
+
+    fn foreign_message_id(mailbox: &str, folder: &str, native: &str) -> ObjectId {
+        let scope = CursorScope::FolderType {
+            folder: encode_foreign(mailbox, folder),
+            ty: ObjectType::Email,
+        };
+        encode_message_id(&scope, native)
+    }
+
+    #[test]
+    fn message_batch_url_routes_foreign_id_to_owner_with_native_id() {
+        let account = shared_account();
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        // Per-message PATCH / DELETE (suffix "") and the move suffix both
+        // route to `/users/{owner}/messages/{native}` with no `\u{1f}`.
+        assert_eq!(
+            message_batch_url(&account, &id, ""),
+            "/users/shared%40contoso.com/messages/AAMkmsg"
+        );
+        assert_eq!(
+            message_batch_url(&account, &id, "/move"),
+            "/users/shared%40contoso.com/messages/AAMkmsg/move"
+        );
+        assert!(!message_batch_url(&account, &id, "").contains('\u{1f}'));
+    }
+
+    #[test]
+    fn message_batch_url_keeps_primary_id_on_me() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        assert_eq!(
+            message_batch_url(&account, &id, ""),
+            "/me/messages/AAMkmsg"
+        );
+    }
 
     #[test]
     fn maps_well_known_folder_roles() {

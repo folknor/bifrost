@@ -110,8 +110,6 @@ Per-crate architecture and conventions. Single source of truth for current code 
 
 **Before working in a crate, read its `reference/<crate>.md` first.** These docs are kept in sync with the code and exist precisely so agents do not have to rediscover module layout, trait surfaces, or invariants from scratch. Skipping the read is how mistakes that the reference would have flagged get made.
 
-**Each `reference/*.md` file must stay under 30,000 bytes.** They are read into context on every relevant task; bloat is a tax paid by every future agent. If a doc is approaching the cap, cut prose before adding more - prefer engineering density over exhaustive coverage, and lean on the code as the authoritative source for anything that can be derived from it.
-
 - `reference/error-model.md` - cross-cutting `AccountError` contract every protocol crate produces and `bifrost-sync` reads: opaque builder funnel (`try_build` invariants), `AccountErrorKind` + message-key namespace, `RecoveryClass` and the central `derive` mapping, cause chain + transmission evidence, three-lane `BatchOutcome`, diagnostics consent tiers. The shared target the per-crate error mappings below map onto.
 - `reference/jmap.md` - bifrost-jmap dispatch, transport, module pattern, capabilities, error model, and the `Account` impl under `crates/jmap/src/sync/` (cursor envelope, inventory / changes / hydration, WebSocket push, mutation pipeline, recovery taxonomy).
 - `reference/imap.md` - bifrost-imap driver model, cancellation safety, streaming FETCH, typed IDs, auth, and the account layer under `crates/imap/src/account/` (QRESYNC / CONDSTORE / Basic cursor strategy, per-folder modseq cache, opportunistic `STORE UNCHANGEDSINCE`).

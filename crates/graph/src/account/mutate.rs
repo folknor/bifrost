@@ -127,13 +127,16 @@ async fn submit_batch(
         }
         let Some(request) = request_for_mutation(account, id, kind, &etags)? else {
             // `request_for_mutation` returns `Ok(None)` when the
-            // mutation cannot be built. For `Move` kinds the only
-            // reason this fires (etag is preflight-checked above) is
-            // a destination that isn't a folder - a caller-side
-            // malformed request. Classify as `Request(Malformed)` so
-            // recovery routes to `ClientBug` rather than the
-            // misleading `Unsupported(BulkMove)` shape that suggests
-            // the protocol doesn't support moves at all. (graph-F4)
+            // mutation cannot be built. For `Move` kinds the etag is
+            // preflight-checked above, so this fires either because the
+            // destination isn't a folder, or because the destination
+            // folder belongs to a different mailbox than the source (a
+            // cross-mailbox move is not expressible against one
+            // `/users/{owner}` endpoint). Both are caller-side malformed
+            // requests. Classify as `Request(Malformed)` so recovery
+            // routes to `ClientBug` rather than the misleading
+            // `Unsupported(BulkMove)` shape that suggests the protocol
+            // doesn't support moves at all. (graph-F4 / F1b)
             preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
                 BatchItemId(id.0.clone()),
                 super::graph_error::protocol_violation(
@@ -141,7 +144,7 @@ async fn submit_batch(
                     operation_for_kind(kind),
                     Some(bifrost_types::ErrorScope::Message { id: id.0.clone() }),
                     format!(
-                        "Graph Move request for {} did not resolve to a folder destination",
+                        "Graph Move request for {} did not resolve to a same-mailbox folder destination",
                         id.0
                     ),
                 ),
@@ -265,13 +268,20 @@ async fn refresh_missing_etags(
         return Vec::new();
     }
 
-    let prefix = account.client.api_path_prefix();
     let mut refreshed = Vec::new();
     let mut failed = Vec::new();
     for id in missing {
-        let enc_id = bifrost_net::url::encode_component(&id.0);
+        // Decode the (possibly foreign-encoded) id so the etag refresh
+        // hits the owning mailbox: a shared-mailbox message lives under
+        // `/users/{owner}/messages/{native}`, not `/me`. The cache key
+        // stays the encoded `id.0` (F1's etag_index keying), only the
+        // request URL uses the native id + owner prefix.
+        let parsed = super::foreign::parse_message_id(&id);
+        let client = account.client_for_owner(parsed.owner());
+        let prefix = client.api_path_prefix();
+        let enc_id = bifrost_net::url::encode_component(parsed.native_id());
         let path = format!("{prefix}/messages/{enc_id}?$select=id");
-        match account.client.get_json::<Value>(&path).await {
+        match client.get_json::<Value>(&path).await {
             Ok(value) => {
                 if let Some(etag) = graph_etag(&value) {
                     etags.insert(id.0.clone(), etag.clone());
@@ -326,8 +336,14 @@ fn request_for_mutation(
     kind: &MutationKind,
     etags: &HashMap<String, String>,
 ) -> Result<Option<BatchRequestItem>, crate::error::GraphError> {
-    let enc_id = bifrost_net::url::encode_component(&id.0);
-    let prefix = account.client.api_path_prefix();
+    // Decode the (possibly foreign-encoded) id and route to the owning
+    // mailbox: a shared-mailbox item builds `/users/{owner}/messages/{native}`,
+    // a primary item `/me/messages/{id}`. The etag cache is keyed by the
+    // encoded `id.0` (F1's etag_index), so the lookups below use `id.0`;
+    // only the URL is built from the decoded native id + owner prefix.
+    let parsed = super::foreign::parse_message_id(id);
+    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
     let mut headers = HashMap::new();
     match kind {
         MutationKind::SetFlags(op) => {
@@ -350,12 +366,25 @@ fn request_for_mutation(
             let Some(folder) = folder_destination(destination.clone()) else {
                 return Ok(None);
             };
+            // The destination folder id is itself a (possibly
+            // foreign-encoded) FolderId. Decode it: `destinationId` must
+            // carry the native folder id (a `\u{1f}`-bearing id is not a
+            // valid Graph folder id), and the destination must belong to
+            // the same mailbox as the source. A cross-mailbox move is not
+            // expressible against one `/users/{owner}` (or `/me`) endpoint,
+            // so reject it as a malformed request rather than emit a wrong
+            // one - returning `None` routes through the caller's
+            // `Request(Malformed)` lane.
+            let dest = super::foreign::parse_folder(&folder);
+            if dest.foreign().map(|f| f.mailbox.as_str()) != parsed.owner() {
+                return Ok(None);
+            }
             headers.insert("If-Match".to_string(), etag.clone());
             Ok(Some(BatchRequestItem {
                 id: "0".to_string(),
                 method: "POST".to_string(),
                 url: format!("{prefix}/messages/{enc_id}/move"),
-                body: Some(json!({ "destinationId": folder.0 })),
+                body: Some(json!({ "destinationId": dest.native_id() })),
                 headers: Some(headers),
             }))
         }
@@ -452,6 +481,139 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::PushMode;
+    use crate::account::foreign::{encode_foreign, encode_message_id};
+    use crate::client::GraphClient;
+    use bifrost_types::{CursorScope, FolderId, ObjectType};
+
+    fn shared_account() -> GraphAccount {
+        GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        )
+    }
+
+    fn foreign_message_id(mailbox: &str, folder: &str, native: &str) -> ObjectId {
+        let scope = CursorScope::FolderType {
+            folder: encode_foreign(mailbox, folder),
+            ty: ObjectType::Email,
+        };
+        encode_message_id(&scope, native)
+    }
+
+    fn etag_map(id: &ObjectId) -> HashMap<String, String> {
+        let mut etags = HashMap::new();
+        etags.insert(id.0.clone(), "W/\"CK1\"".to_string());
+        etags
+    }
+
+    #[test]
+    fn foreign_flag_mutation_routes_to_owner_with_native_id() {
+        let account = shared_account();
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        let etags = etag_map(&id);
+        let request = request_for_mutation(
+            &account,
+            &id,
+            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &etags,
+        )
+        .expect("builds")
+        .expect("some request");
+        assert_eq!(
+            request.url,
+            "/users/shared%40contoso.com/messages/AAMkmsg"
+        );
+        assert!(!request.url.contains('\u{1f}'), "{}", request.url);
+    }
+
+    #[test]
+    fn primary_flag_mutation_stays_on_me() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        let etags = etag_map(&id);
+        let request = request_for_mutation(
+            &account,
+            &id,
+            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &etags,
+        )
+        .expect("builds")
+        .expect("some request");
+        assert_eq!(request.url, "/me/messages/AAMkmsg");
+    }
+
+    #[test]
+    fn foreign_destroy_routes_to_owner() {
+        let account = shared_account();
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        let request = request_for_mutation(&account, &id, &MutationKind::Destroy, &HashMap::new())
+            .expect("builds")
+            .expect("some request");
+        assert_eq!(request.method, "DELETE");
+        assert_eq!(
+            request.url,
+            "/users/shared%40contoso.com/messages/AAMkmsg"
+        );
+    }
+
+    #[test]
+    fn bulk_move_routes_to_owner_with_native_destination_folder() {
+        let account = shared_account();
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        let etags = etag_map(&id);
+        // The destination folder belongs to the same shared mailbox.
+        let destination =
+            MembershipScope::Folder(encode_foreign("shared@contoso.com", "AAMkdest"));
+        let request =
+            request_for_mutation(&account, &id, &MutationKind::Move(destination), &etags)
+                .expect("builds")
+                .expect("some request");
+        assert_eq!(
+            request.url,
+            "/users/shared%40contoso.com/messages/AAMkmsg/move"
+        );
+        // The move body's destinationId is the native folder id, not the
+        // `\u{1f}`-encoded FolderId.
+        assert_eq!(
+            request.body,
+            Some(json!({ "destinationId": "AAMkdest" }))
+        );
+    }
+
+    #[test]
+    fn cross_mailbox_move_fails_cleanly() {
+        let account = shared_account();
+        // Source message in the shared mailbox, destination in the primary
+        // mailbox: not expressible against one endpoint -> None (the caller
+        // turns this into a Request(Malformed) failure).
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        let etags = etag_map(&id);
+        let primary_dest = MembershipScope::Folder(FolderId("inbox".to_string()));
+        assert!(
+            request_for_mutation(&account, &id, &MutationKind::Move(primary_dest), &etags)
+                .expect("builds")
+                .is_none()
+        );
+
+        // The mirror: a primary source moving into a shared-mailbox folder
+        // is equally inexpressible.
+        let primary_id = ObjectId("AAMkmsg".to_string());
+        let primary_etags = etag_map(&primary_id);
+        let foreign_dest =
+            MembershipScope::Folder(encode_foreign("shared@contoso.com", "AAMkdest"));
+        assert!(
+            request_for_mutation(
+                &account,
+                &primary_id,
+                &MutationKind::Move(foreign_dest),
+                &primary_etags,
+            )
+            .expect("builds")
+            .is_none()
+        );
+    }
 
     #[test]
     fn batch_ids_are_assigned_in_order() {
