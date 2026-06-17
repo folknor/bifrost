@@ -26,7 +26,7 @@ use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
 use crate::client::{CardDavClient, PutCondition, contact_scope, local_error, unsupported_error};
 use crate::parse::{AddressBookCollection, CardDavFetchedVCard};
-use crate::vcard::{contact_from_vcard, vcard_from_create, vcard_from_patch};
+use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
 
 const CONTACT_PAGE_SIZE: usize = 250;
 const CURSOR_ENVELOPE_VERSION: u32 = 1;
@@ -106,12 +106,13 @@ impl CardDavAccount {
             contact_addressbook_url(&client, &contact).unwrap_or(default_addressbook_url)
         };
         let card = Self::fetch_contact_resource(&client, &addressbook, &contact, operation).await?;
-        Ok(contact_from_vcard(
+        contact_from_vcard(
             card.uri,
             Some(AddressBookId(addressbook)),
             card.etag,
             &card.data,
-        ))
+        )
+        .map_err(|error| project_error(operation, &error))
     }
 
     async fn fetch_contact_resource(
@@ -148,13 +149,17 @@ impl CardDavAccount {
             .fetch_vcards(&addressbook, &uris, operation)
             .await?
             .into_iter()
-            .map(|card| {
+            // A single malformed vCard degrades to a skip rather than failing
+            // the whole listing; the resource stays in the snapshot and is
+            // retried on a later poll.
+            .filter_map(|card| {
                 contact_from_vcard(
                     card.uri,
                     Some(AddressBookId(addressbook.clone())),
                     card.etag,
                     &card.data,
                 )
+                .ok()
             })
             .collect();
         Ok(cards)
@@ -173,13 +178,14 @@ impl CardDavAccount {
             .await?
             .into_iter()
             .filter(|card| seen.insert(card.uri.clone()))
-            .map(|card| {
+            .filter_map(|card| {
                 contact_from_vcard(
                     card.uri,
                     Some(AddressBookId(addressbook.clone())),
                     card.etag,
                     &card.data,
                 )
+                .ok()
             })
             .collect();
         Ok(cards)
@@ -206,13 +212,14 @@ impl CardDavAccount {
             .fetch_vcards(&addressbook, &uris, operation)
             .await?
             .into_iter()
-            .map(|card| {
+            .filter_map(|card| {
                 contact_from_vcard(
                     card.uri,
                     Some(AddressBookId(addressbook.clone())),
                     card.etag,
                     &card.data,
                 )
+                .ok()
             })
             .collect::<Vec<_>>();
         Ok(Page {
@@ -876,7 +883,8 @@ impl Account for CardDavAccount {
                 Some(AddressBookId(addressbook)),
                 raw.etag.clone(),
                 &raw.data,
-            );
+            )
+            .map_err(|error| project_error(AccountOperation::ContactUpdate, &error))?;
             let data = vcard_from_patch(&current, &raw.data, &patch);
             let url = client.resolve_url(&contact.0);
             client
@@ -1054,6 +1062,15 @@ fn same_collection_url(left: &str, right: &str) -> bool {
 
 fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
     etag.map_or(PutCondition::None, PutCondition::IfMatch)
+}
+
+/// Map a vCard projection failure to an `AccountError` for the single-resource
+/// paths (get/update), where there is no listing to degrade a skip into.
+fn project_error(operation: AccountOperation, error: &VCardParseError) -> AccountError {
+    local_error(
+        operation,
+        format!("CardDAV vCard could not be parsed: {}", error.0),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

@@ -37,7 +37,31 @@ contact primitives.
   use element-stack parent checks so nested same-name properties do not
   overwrite response-level hrefs.
 - `vcard.rs` - small vCard projection between DAV resources and
-  `bifrost-types` contact cards.
+  `bifrost-types` contact cards. **Parse-in** uses caldata's `LineReader`
+  for RFC 6350 line unfolding (deletes exactly one leading WSP, not the
+  whole run), then a faithful quoted-parameter splitter (`split_content_line`)
+  that handles parameter values containing `:`/`;`/`,` and keeps every TYPE
+  value (caldata's public `get_param` exposes only the first). vCard 3.0
+  bare-param shorthand (`EMAIL;WORK:`) is read as a bare TYPE value.
+  Projection is fallible: a malformed body (unterminated quoted parameter,
+  missing value, invalid UTF-8 in a folded run) returns a `VCardParseError`.
+  Bulk listing/search degrade a single bad resource to a `filter_map` skip;
+  single-resource get/update surface it as a local error.
+  **Serialize/patch** keeps the hand-rolled verbatim-preserving splice:
+  preserved (unmodeled) lines are re-emitted byte for byte on their physical
+  line groups - no unfold/refold - and only freshly emitted lines are folded
+  (the 75-octet budget reserves the continuation space). Version is detected
+  from the card's VERSION line so emitted TYPE/PREF and PHOTO forms match
+  (4.0 `PREF=1` + `PHOTO:data:image/<t>;base64,...`; 3.0 `TYPE=PREF` +
+  `PHOTO;ENCODING=b;TYPE=...`). vCard group prefixes (`item1.EMAIL` /
+  `item1.X-ABLabel`) are carried onto rewritten EMAIL/TEL/ADR lines so an
+  Apple-Contacts label stays bound. ADR po-box/extended components are
+  preserved as leading entries of the ordered `street` vector rather than
+  zeroed; ORG `;`-structure is preserved (the shared model lacks dedicated
+  po-box/extended and ORG-component slots - a types change, out of scope
+  here, would make these fully structural). The create path emits a minimal
+  `N` (mandatory in 3.0). A present-but-empty value is still
+  indistinguishable from absent (the shared limitation calcard also has).
 - `capabilities.rs` - contact-only `AccountCapabilities`.
 
 ## Account behavior
@@ -74,8 +98,10 @@ Supported contact primitives:
   substantial provider-specific unknown.
 
 CardDAV maps ADR postal addresses through the shared `ContactAddress`
-model and inline vCard 3 `PHOTO;ENCODING=b` data through shared
-`ContactPhoto`. CardDAV preserves inline PHOTO data on unrelated updates.
+model and inline PHOTO data through shared `ContactPhoto`, accepting both
+the vCard 3.0 `PHOTO;ENCODING=b` form and the vCard 4.0 `PHOTO:data:` URI
+form on read and emitting the form matching the card's version on write.
+CardDAV preserves inline PHOTO data on unrelated updates.
 
 Cursor support is contact-only. `discover_cursor_scopes` returns
 `CursorScope::Type(ObjectType::Contact)`. `establish_initial_cursor`
