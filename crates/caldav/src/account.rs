@@ -107,12 +107,15 @@ impl CalDavAccount {
                 .try_build()
                 .unwrap_or(error)
         })?;
-        Ok(event_from_ical(
-            fetched.uri,
+        event_from_ical(
+            fetched.uri.clone(),
             CalendarId(calendar_url),
             fetched.etag,
             &fetched.data,
-        ))
+        )
+        .map_err(|_| {
+            crate::client::local_error(operation, "CalDAV resource is not valid iCalendar")
+        })
     }
 
     async fn event_snapshot(
@@ -696,13 +699,16 @@ impl Account for CalDavAccount {
                 .query_events_in_range(&calendar_url, range_start.as_deref(), range_end.as_deref())
                 .await?
                 .into_iter()
-                .map(|event| {
+                .filter_map(|event| {
+                    // A single malformed resource degrades to a skip rather
+                    // than failing the whole range query.
                     event_from_ical(
                         event.uri,
                         CalendarId(calendar_url.clone()),
                         event.etag,
                         &event.data,
                     )
+                    .ok()
                 })
                 .filter(|event| event_in_range(event, &range.start, &range.end))
                 .collect::<Vec<_>>();
@@ -873,13 +879,16 @@ impl Account for CalDavAccount {
             let mut events = fetched
                 .into_iter()
                 .filter(|event| seen.insert(event.uri.clone()))
-                .map(|event| {
+                .filter_map(|event| {
+                    // Skip a single unparseable resource rather than failing
+                    // the entire search.
                     event_from_ical(
                         event.uri,
                         CalendarId(calendar_url.clone()),
                         event.etag,
                         &event.data,
                     )
+                    .ok()
                 })
                 .filter(|event| event_matches(event, &needle))
                 .collect::<Vec<_>>();

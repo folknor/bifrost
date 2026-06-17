@@ -3,34 +3,43 @@ use bifrost_types::{
     EventCreate, EventId, EventOrganizer, EventPatch, EventRecurrence, EventStatus, EventTime,
     EventVisibility, ProtocolKind, RsvpStatus,
 };
+use caldata::ContentLineParser;
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use uuid::Uuid;
+
+/// Projection failed because the resource body could not be tokenized into
+/// content lines (unclosed quoted parameter, missing property name/value,
+/// invalid UTF-8). The caller degrades a single bad `.ics` to a per-resource
+/// skip routed through `failed_hrefs` rather than failing the whole sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IcalParseError(pub(crate) String);
 
 pub(crate) fn event_from_ical(
     uri: String,
     calendar_id: CalendarId,
     etag: Option<String>,
     data: &str,
-) -> CalendarEvent {
-    let props = parse_vevent(data);
+) -> Result<CalendarEvent, IcalParseError> {
+    let props = parse_vevent(data)?;
     let uid = props.first("UID").map(ToString::to_string);
     let title = props.first("SUMMARY").map(unescape_text);
     let description = props.first("DESCRIPTION").map(unescape_text);
     let location = props.first("LOCATION").map(unescape_text);
-    let start = props
-        .first_with_name("DTSTART")
+    // A real-world emitter (Outlook bridges, some CalDAV servers) can send a
+    // TZID DTSTART paired with a floating fallback DTSTART. caldata's typed
+    // builder would reject that as a singleton conflict; tokenizing instead
+    // lets us keep the event and pick the most specific candidate (VALUE=DATE
+    // > TZID > UTC > floating) rather than blindly taking document order.
+    let dtstart = pick_datetime(&props.all_with_name("DTSTART"));
+    let dtend = pick_datetime(&props.all_with_name("DTEND"));
+    let start = dtstart
         .map(|prop| event_time_from_property(prop, false))
         .unwrap_or_else(default_time);
-    let end = props
-        .first_with_name("DTEND")
+    let end = dtend
         .map(|prop| event_time_from_property(prop, true))
         .unwrap_or_else(default_time);
-    let is_all_day = props
-        .first_with_name("DTSTART")
-        .is_some_and(Prop::value_type_date)
-        || props
-            .first_with_name("DTEND")
-            .is_some_and(Prop::value_type_date);
+    let is_all_day = dtstart.is_some_and(Prop::value_type_date)
+        || dtend.is_some_and(Prop::value_type_date);
     let organizer = props
         .first_with_name("ORGANIZER")
         .and_then(organizer_from_property);
@@ -53,7 +62,7 @@ pub(crate) fn event_from_ical(
             .collect(),
         recurrence_id: props.first("RECURRENCE-ID").map(ToString::to_string),
     };
-    CalendarEvent {
+    Ok(CalendarEvent {
         id: EventId(uri.clone()),
         calendar_id: calendar_id.clone(),
         native_id: uri.clone(),
@@ -79,7 +88,7 @@ pub(crate) fn event_from_ical(
         recurrence,
         html_link: None,
         raw_ical: Some(data.to_string()),
-    }
+    })
 }
 
 pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
@@ -298,56 +307,65 @@ pub(crate) fn new_uid() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn parse_vevent(data: &str) -> Props {
+/// Project the first VEVENT's properties using caldata's streaming content
+/// line tokenizer. caldata unfolds (stripping exactly one WSP per RFC 5545
+/// sec 3.1, not the whole leading run the old hand-rolled unfolder ate) and
+/// splits quoted parameter values that legally contain `:`/`;`/`,` - both
+/// classes of bug the previous `split_once(':')` path had. Values are stored
+/// raw (caldata never unescapes); text fields are unescaped at the point we
+/// read them into the model.
+fn parse_vevent(data: &str) -> Result<Props, IcalParseError> {
     let mut props = Vec::new();
     let mut in_event = false;
-    for line in unfold_lines(data) {
-        let Some((raw_name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let mut name_parts = raw_name.split(';');
-        let name = name_parts.next().unwrap_or_default().to_ascii_uppercase();
-        if name == "BEGIN" && value.eq_ignore_ascii_case("VEVENT") {
+    let mut seen_event = false;
+    for line in ContentLineParser::from_slice(data.as_bytes()) {
+        let line = line.map_err(|error| IcalParseError(error.to_string()))?;
+        let name = line.name;
+        if name == "BEGIN" && line.value.eq_ignore_ascii_case("VEVENT") {
+            // Only the first VEVENT is projected (the master); override
+            // instances are preserved verbatim on the patch path.
+            if seen_event {
+                break;
+            }
             in_event = true;
+            seen_event = true;
             continue;
         }
-        if name == "END" && value.eq_ignore_ascii_case("VEVENT") {
+        if name == "END" && line.value.eq_ignore_ascii_case("VEVENT") {
             break;
         }
         if !in_event {
             continue;
         }
-        let params = name_parts
-            .filter_map(|part| part.split_once('='))
-            .map(|(key, value)| {
-                (
-                    key.to_ascii_uppercase(),
-                    value.trim_matches('"').to_string(),
-                )
-            })
-            .collect();
         props.push(Prop {
             name,
-            params,
-            value: value.to_string(),
+            params: line.params,
+            value: line.value,
         });
     }
-    Props(props)
+    Ok(Props(props))
 }
 
-fn unfold_lines(data: &str) -> Vec<String> {
-    let mut lines = Vec::<String>::new();
-    for raw in data.lines() {
-        let line = raw.trim_end_matches('\r');
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(last) = lines.last_mut() {
-                last.push_str(line.trim_start());
-            }
-        } else {
-            lines.push(line.to_string());
-        }
+/// Order DTSTART/DTEND candidates by descending specificity so a duplicate
+/// property does not silently project to document order. Mirrors ratatoskr's
+/// precedence ladder: VALUE=DATE > TZID > UTC (`Z`) > floating.
+fn pick_datetime<'a>(candidates: &[&'a Prop]) -> Option<&'a Prop> {
+    candidates
+        .iter()
+        .copied()
+        .max_by_key(|prop| datetime_specificity(prop))
+}
+
+fn datetime_specificity(prop: &Prop) -> u8 {
+    if prop.value_type_date() {
+        3
+    } else if prop.param("TZID").is_some() {
+        2
+    } else if prop.value.ends_with('Z') {
+        1
+    } else {
+        0
     }
-    lines
 }
 
 #[derive(Debug)]
@@ -377,16 +395,13 @@ impl Props {
 #[derive(Debug)]
 struct Prop {
     name: String,
-    params: Vec<(String, String)>,
+    params: caldata::parser::ContentLineParams,
     value: String,
 }
 
 impl Prop {
     fn param(&self, name: &str) -> Option<&str> {
-        self.params
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+        self.params.get_param(name)
     }
 
     fn value_type_date(&self) -> bool {
@@ -396,13 +411,25 @@ impl Prop {
 }
 
 fn event_time_from_property(prop: &Prop, is_end: bool) -> EventTime {
+    let tzid = prop.param("TZID");
     EventTime {
-        value: format_ical_time(&prop.value, prop.value_type_date(), is_end),
-        timezone: prop.param("TZID").map(ToString::to_string),
+        value: format_ical_time(&prop.value, prop.value_type_date(), is_end, tzid.is_some()),
+        // Map Microsoft/Windows zone names ("W. Europe Standard Time") to
+        // their IANA equivalent when caldata's table knows them; otherwise
+        // pass the TZID through verbatim.
+        timezone: tzid.map(canonical_tzid),
     }
 }
 
-fn format_ical_time(value: &str, is_date: bool, is_end: bool) -> String {
+/// Resolve a raw TZID to its IANA name when it is a known Microsoft/Windows
+/// zone alias, leaving already-IANA (or unknown) names untouched.
+fn canonical_tzid(tzid: &str) -> String {
+    caldata::types::get_proprietary_tzid(tzid)
+        .map(|tz| tz.name().to_string())
+        .unwrap_or_else(|| tzid.to_string())
+}
+
+fn format_ical_time(value: &str, is_date: bool, is_end: bool, has_tzid: bool) -> String {
     if is_date && value.len() == 8 {
         if is_end
             && let Ok(date) = NaiveDate::parse_from_str(value, "%Y%m%d")
@@ -427,10 +454,17 @@ fn format_ical_time(value: &str, is_date: bool, is_end: bool) -> String {
         if value.ends_with('Z') {
             return formatted;
         }
-        if suffix.is_empty() {
+        if !suffix.is_empty() {
+            if let Ok(time) = DateTime::parse_from_rfc3339(&formatted) {
+                formatted = time.to_rfc3339();
+            }
+            return formatted;
+        }
+        // A TZID-bearing local time is a wall-clock value, not UTC: leave it
+        // bare so the `timezone` field is the sole source of the zone. Only a
+        // truly floating time (no TZID, no offset) is normalized to UTC `Z`.
+        if !has_tzid {
             formatted.push('Z');
-        } else if let Ok(time) = DateTime::parse_from_rfc3339(&formatted) {
-            formatted = time.to_rfc3339();
         }
         return formatted;
     }
@@ -685,55 +719,66 @@ fn classification(visibility: EventVisibility) -> Option<&'static str> {
     }
 }
 
+/// Splice replacements into the first VEVENT operating on *physical* lines.
+///
+/// The previous implementation unfolded the whole document and re-folded it,
+/// so every preserved/unmodeled line was re-wrapped at column 75 and (via the
+/// old WSP-eating unfolder) could lose characters. Here untouched logical
+/// lines - including their original fold continuations - are emitted byte for
+/// byte; only the freshly emitted replacement lines are folded. A long
+/// preserved value therefore round-trips losslessly through an update.
 fn replace_first_vevent_properties(
     raw_ical: &str,
     replace_names: &[&str],
     replacements: Vec<String>,
 ) -> String {
-    let mut lines = Vec::new();
+    let mut out = String::new();
+    let mut replacements = Some(replacements);
     let mut in_first_event = false;
     let mut finished_first_event = false;
-    for line in unfold_lines(raw_ical) {
-        let name = ical_line_name(&line);
+    for group in logical_line_groups(raw_ical) {
+        let name = ical_line_name(group.logical_head());
         if name == Some("BEGIN")
-            && line_value(&line).is_some_and(|value| value.eq_ignore_ascii_case("VEVENT"))
+            && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
             && !finished_first_event
         {
             in_first_event = true;
-            lines.push(line);
+            group.push_verbatim(&mut out);
             continue;
         }
         if in_first_event
             && name == Some("END")
-            && line_value(&line).is_some_and(|value| value.eq_ignore_ascii_case("VEVENT"))
+            && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
         {
-            lines.extend(replacements.clone());
+            if let Some(replacements) = replacements.take() {
+                out.push_str(&fold_ical_lines(replacements));
+            }
             in_first_event = false;
             finished_first_event = true;
-            lines.push(line);
+            group.push_verbatim(&mut out);
             continue;
         }
         if in_first_event && name.is_some_and(|name| replace_names.contains(&name)) {
             continue;
         }
-        lines.push(line);
+        group.push_verbatim(&mut out);
     }
-    fold_ical_lines(lines)
+    out
 }
 
 fn has_recurrence_override_vevent(raw_ical: &str) -> bool {
     let mut in_event = false;
-    for line in unfold_lines(raw_ical) {
-        let name = ical_line_name(&line);
-        if name == Some("BEGIN")
-            && line_value(&line).is_some_and(|value| value.eq_ignore_ascii_case("VEVENT"))
+    for group in logical_line_groups(raw_ical) {
+        let head = group.logical_head();
+        let name = ical_line_name(head);
+        if name == Some("BEGIN") && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
         {
             in_event = true;
             continue;
         }
         if in_event
             && name == Some("END")
-            && line_value(&line).is_some_and(|value| value.eq_ignore_ascii_case("VEVENT"))
+            && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
         {
             in_event = false;
             continue;
@@ -743,6 +788,47 @@ fn has_recurrence_override_vevent(raw_ical: &str) -> bool {
         }
     }
     false
+}
+
+/// One logical content line as a run of physical lines: the head plus any
+/// folded continuation lines (those starting with SPACE or TAB). Carries its
+/// own trailing newline shape so it can be re-emitted verbatim.
+struct LineGroup<'a> {
+    physical: Vec<&'a str>,
+}
+
+impl<'a> LineGroup<'a> {
+    fn logical_head(&self) -> &'a str {
+        self.physical.first().copied().unwrap_or_default()
+    }
+
+    fn push_verbatim(&self, out: &mut String) {
+        for line in &self.physical {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+}
+
+/// Group `raw_ical` into logical lines without unfolding their content, so
+/// preserved lines can be re-emitted byte for byte. CR is trimmed from each
+/// physical line and re-added on emit; folding markers (leading WSP) stay
+/// attached to the continuation lines they belong to.
+fn logical_line_groups(raw_ical: &str) -> Vec<LineGroup<'_>> {
+    let mut groups: Vec<LineGroup<'_>> = Vec::new();
+    for raw in raw_ical.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if (line.starts_with(' ') || line.starts_with('\t'))
+            && let Some(last) = groups.last_mut()
+        {
+            last.physical.push(line);
+        } else {
+            groups.push(LineGroup {
+                physical: vec![line],
+            });
+        }
+    }
+    groups
 }
 
 fn ical_line_name(line: &str) -> Option<&str> {
@@ -784,12 +870,32 @@ fn escape_text(value: &str) -> String {
         .replace(';', "\\;")
 }
 
+/// Single left-to-right scan rather than an ordering-dependent chain of
+/// `replace()` calls. A chain mis-handles adjacency such as `\\n` (backslash
+/// followed by a literal `n`), which a multi-pass replace would turn into a
+/// backslash plus newline. RFC 5545 sec 3.3.11 escapes only: `\\`, `\;`,
+/// `\,`, and `\N`/`\n` (newline); any other backslash pair is kept verbatim.
 fn unescape_text(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n' | 'N') => out.push('\n'),
+            Some(',') => out.push(','),
+            Some(';') => out.push(';'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn escape_param(value: &str) -> String {
@@ -809,9 +915,21 @@ fn escape_param(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Test shim: the production projector is fallible (malformed bodies
+    /// degrade to a per-resource skip); these tests feed well-formed input
+    /// and expect a successful projection.
+    fn parse_event(
+        uri: String,
+        calendar_id: CalendarId,
+        etag: Option<String>,
+        data: &str,
+    ) -> CalendarEvent {
+        event_from_ical(uri, calendar_id, etag, data).expect("valid iCalendar projects")
+    }
+
     #[test]
     fn parses_basic_vevent() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             Some("e1".to_string()),
@@ -826,7 +944,7 @@ mod tests {
 
     #[test]
     fn parses_numeric_offset_datetime() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -838,18 +956,134 @@ mod tests {
     }
 
     #[test]
-    fn parses_tzid_datetime_as_rfc3339_with_timezone_metadata() {
-        let event = event_from_ical(
+    fn parses_tzid_datetime_as_wall_clock_with_timezone_metadata() {
+        // Previously this test enshrined the false-`Z` bug, asserting the
+        // wall-clock value was tagged UTC. A TZID-bearing local time is NOT
+        // UTC: the value must stay bare and the zone lives in `timezone`.
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=Europe/Oslo:20260602T120000\r\nDTEND;TZID=Europe/Oslo:20260602T130000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         );
 
-        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.start.value, "2026-06-02T12:00:00");
+        assert!(!event.start.value.ends_with('Z'));
         assert_eq!(event.start.timezone.as_deref(), Some("Europe/Oslo"));
-        assert_eq!(event.end.value, "2026-06-02T13:00:00Z");
+        assert_eq!(event.end.value, "2026-06-02T13:00:00");
         assert_eq!(event.end.timezone.as_deref(), Some("Europe/Oslo"));
+    }
+
+    #[test]
+    fn maps_windows_tzid_to_iana() {
+        // caldata ships the Microsoft/CLDR zone table; a Windows zone name
+        // must surface as its IANA equivalent, not the opaque vendor string.
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=W. Europe Standard Time:20260602T120000\r\nDTEND;TZID=W. Europe Standard Time:20260602T130000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.start.timezone.as_deref(), Some("Europe/Berlin"));
+        assert_eq!(event.start.value, "2026-06-02T12:00:00");
+    }
+
+    #[test]
+    fn duplicate_dtstart_prefers_most_specific_candidate() {
+        // Outlook bridges emit a floating-fallback DTSTART alongside the
+        // TZID one. caldata's typed builder would reject the duplicate; the
+        // tokenizer path keeps the event and picks the TZID candidate.
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000\r\nDTSTART;TZID=Europe/Oslo:20260602T130000\r\nDTEND:20260602T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.start.timezone.as_deref(), Some("Europe/Oslo"));
+        assert_eq!(event.start.value, "2026-06-02T13:00:00");
+    }
+
+    #[test]
+    fn quoted_parameter_with_colon_and_semicolon_parses() {
+        // A quoted CN containing `,` and a quoted TZID containing `:`/`;`
+        // must not be mis-split on the first `:` (the old parser bug).
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\"Custom:Zone;X\":20260602T120000\r\nATTENDEE;CN=\"Doe, John\";PARTSTAT=ACCEPTED:mailto:john@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.start.value, "2026-06-02T12:00:00");
+        assert_eq!(event.start.timezone.as_deref(), Some("Custom:Zone;X"));
+        assert_eq!(event.attendees.len(), 1);
+        assert_eq!(event.attendees[0].name.as_deref(), Some("Doe, John"));
+        assert_eq!(event.attendees[0].email, "john@example.test");
+        assert_eq!(event.attendees[0].status, RsvpStatus::Accepted);
+    }
+
+    #[test]
+    fn malformed_resource_degrades_to_skip_not_hard_failure() {
+        // An unterminated quoted parameter is a tokenizer error; the
+        // projector returns Err so the caller can route the resource to
+        // failed_hrefs instead of failing the whole sync.
+        let result = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART;TZID=\"unterminated:20260602T120000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn long_preserved_line_round_trips_losslessly_through_update() {
+        // The H round-trip bug: a long folded preserved value must come back
+        // byte-identical after a patch that does not touch it. We feed a
+        // DESCRIPTION pre-folded at a non-75 column and assert the unfolded
+        // value survives a SUMMARY-only patch.
+        let long_value = "x:    y ".repeat(40);
+        let mut body = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nDESCRIPTION:");
+        // Fold the description manually at column ~40 so a refold would move
+        // the boundaries (and the old WSP-eating unfolder would drop the
+        // run-of-spaces after the colon).
+        for (index, chunk) in long_value.as_bytes().chunks(40).enumerate() {
+            if index > 0 {
+                body.push_str("\r\n ");
+            }
+            body.push_str(std::str::from_utf8(chunk).unwrap());
+        }
+        body.push_str("\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            Some("e1".to_string()),
+            &body,
+        );
+        let original_description = current.description.clone();
+        assert_eq!(original_description.as_deref(), Some(long_value.as_str()));
+
+        let patched = patch_to_ical(
+            &current,
+            &EventPatch {
+                title: Some(Some("New".to_string())),
+                ..EventPatch::default()
+            },
+        )
+        .expect("title patch should serialize");
+
+        let reparsed = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &patched,
+        );
+        assert!(patched.contains("SUMMARY:New"));
+        assert_eq!(reparsed.description, original_description);
     }
 
     #[test]
@@ -882,7 +1116,7 @@ mod tests {
         assert!(body.contains("DTSTART;VALUE=DATE:20260602"));
         assert!(body.contains("DTEND;VALUE=DATE:20260603"));
 
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -894,7 +1128,7 @@ mod tests {
 
     #[test]
     fn dtend_date_marks_event_all_day() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -907,7 +1141,7 @@ mod tests {
 
     #[test]
     fn parses_recurrence_properties_from_master_vevent() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -925,7 +1159,7 @@ mod tests {
 
     #[test]
     fn multi_vevent_projection_reads_only_first_vevent() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1107,7 +1341,7 @@ mod tests {
 
     #[test]
     fn patch_preserves_unmodeled_vevent_properties() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             Some("e1".to_string()),
@@ -1134,7 +1368,7 @@ mod tests {
 
     #[test]
     fn patch_preserves_non_event_calendar_components() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             Some("e1".to_string()),
@@ -1158,7 +1392,7 @@ mod tests {
 
     #[test]
     fn parses_transparency_and_classification() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1171,7 +1405,7 @@ mod tests {
 
     #[test]
     fn missing_transparency_and_classification_default_to_unknown_and_default() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1184,7 +1418,7 @@ mod tests {
 
     #[test]
     fn patch_replaces_transparency_and_classification() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             Some("e1".to_string()),
@@ -1208,7 +1442,7 @@ mod tests {
         assert!(body.contains("SUMMARY:Keep"));
 
         // Round-trips back to the modeled values written by the patch.
-        let updated = event_from_ical(
+        let updated = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1220,7 +1454,7 @@ mod tests {
 
     #[test]
     fn patch_clearing_visibility_to_default_strips_class() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1241,7 +1475,7 @@ mod tests {
 
     #[test]
     fn patch_clear_removes_only_targeted_scalar_property() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1265,7 +1499,7 @@ mod tests {
 
     #[test]
     fn rsvp_patch_updates_matching_attendee_only() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1282,7 +1516,7 @@ mod tests {
 
     #[test]
     fn rsvp_patch_rejects_missing_authenticated_attendee() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1297,7 +1531,7 @@ mod tests {
 
     #[test]
     fn rsvp_reply_ical_builds_itip_reply() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1306,7 +1540,25 @@ mod tests {
 
         let body = rsvp_reply_ical(&current, RsvpStatus::Accepted, "ada@example.test")
             .expect("itip reply");
-        let unfolded = unfold_lines(&body).join("\n");
+        let unfolded = logical_line_groups(&body)
+            .iter()
+            .map(|group| {
+                group
+                    .physical
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        if index == 0 {
+                            (*line).to_string()
+                        } else {
+                            // Strip exactly one leading fold WSP.
+                            line[1..].to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(unfolded.contains("METHOD:REPLY"));
         assert!(unfolded.contains("UID:u1"));
@@ -1318,7 +1570,7 @@ mod tests {
 
     #[test]
     fn recurrence_patch_replaces_stale_recurrence_lines() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1348,7 +1600,7 @@ mod tests {
 
     #[test]
     fn recurrence_patch_rejects_override_vevents() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1374,7 +1626,7 @@ mod tests {
 
     #[test]
     fn scalar_patch_preserves_override_vevents() {
-        let current = event_from_ical(
+        let current = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
@@ -1440,7 +1692,7 @@ mod tests {
 
     #[test]
     fn ignores_non_mailto_attendees() {
-        let event = event_from_ical(
+        let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,

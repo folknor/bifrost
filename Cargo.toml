@@ -50,6 +50,7 @@ percent-encoding = "2.3"
 
 # Parsing
 nom = "8"
+caldata = "0.15"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

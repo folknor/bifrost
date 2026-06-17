@@ -36,8 +36,28 @@ calendar primitives.
   Event listing and multiget parsers use element-stack parent checks so
   nested same-name properties do not overwrite response-level hrefs or
   propstat status.
-- `ical.rs` - small iCalendar projection between DAV resources and
-  `bifrost-types` calendar events.
+- `ical.rs` - iCalendar projection between DAV resources and
+  `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
+  `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
+  and quoted-parameter splitting that tolerates `:`/`;`/`,` inside quoted
+  values). Values are stored raw by caldata; text fields (summary,
+  description, location, CN) are unescaped at read time via a single
+  left-to-right scan. Only the first VEVENT (the master) is projected.
+  Tokenizing rather than using caldata's typed builder means strict
+  singleton enforcement never hard-fails ingest: a duplicate DTSTART is
+  resolved with a precedence picker (VALUE=DATE > TZID > UTC > floating)
+  rather than rejected. A genuinely malformed body (unterminated quoted
+  parameter, missing name/value, invalid UTF-8) returns an error;
+  `event_from_ical` is fallible and the listing/search paths degrade a
+  single bad resource to a skip, while `event_get`/`event_update` surface a
+  local error. A TZID-bearing local time projects as a bare wall-clock value
+  (no false `Z`) with the zone in `timezone`; Microsoft/Windows zone names
+  (e.g. `W. Europe Standard Time`) are mapped to IANA via caldata's
+  proprietary-TZID table. Serialization-out (create/patch/RSVP) stays
+  hand-rolled and verbatim-preserving: patches splice on *physical* lines,
+  folding only newly emitted lines, so long preserved/unmodeled values
+  round-trip byte for byte. VTIMEZONE generation remains a conservative
+  fixed-offset stub.
 - `capabilities.rs` - calendar-only `AccountCapabilities`.
 
 ## Account behavior
