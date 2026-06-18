@@ -1341,7 +1341,8 @@ mod tests {
     #[test]
     fn unregistered_foreign_scope_disables_scope() {
         use bifrost_types::EngineDirective;
-        let scope = CursorScope::Folder(super::super::foreign::encode_foreign("acct-gone", "mbx-1"));
+        let scope =
+            CursorScope::Folder(super::super::foreign::encode_foreign("acct-gone", "mbx-1"));
         let err = unregistered_foreign_scope(scope.clone(), AccountOperation::SyncChanges);
         assert_eq!(
             err.kind(),

@@ -64,7 +64,11 @@ pub(crate) async fn set_category(
     )
     .await?;
     let mut patches = Vec::new();
-    for ResolvedMessage { routing_id, value: message } in values {
+    for ResolvedMessage {
+        routing_id,
+        value: message,
+    } in values
+    {
         let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
@@ -113,7 +117,11 @@ pub(crate) async fn set_extended_property(
             )
             .await?;
             let mut patches = Vec::new();
-            for ResolvedMessage { routing_id, value: message } in values {
+            for ResolvedMessage {
+                routing_id,
+                value: message,
+            } in values
+            {
                 let id = routing_id;
                 let etag = graph_etag(&message).ok_or_else(|| {
                     pim_protocol_error(
@@ -192,7 +200,11 @@ pub(crate) async fn set_is_read(
     )
     .await?;
     let mut patches = Vec::new();
-    for ResolvedMessage { routing_id, value: message } in values {
+    for ResolvedMessage {
+        routing_id,
+        value: message,
+    } in values
+    {
         let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
@@ -228,7 +240,11 @@ pub(crate) async fn set_importance(
     .await?;
     let body = graph_importance_body(level);
     let mut patches = Vec::new();
-    for ResolvedMessage { routing_id, value: message } in values {
+    for ResolvedMessage {
+        routing_id,
+        value: message,
+    } in values
+    {
         let id = routing_id;
         let etag = graph_etag(&message).ok_or_else(|| {
             pim_protocol_error(
@@ -902,9 +918,10 @@ async fn fetch_message_value(
         bifrost_net::url::encode_component(parsed.native_id()),
         select_query(select)
     );
-    let value = client.get_json(&path).await.map_err(|e| {
-        into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate))
-    })?;
+    let value = client
+        .get_json(&path)
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Hydrate)))?;
     // Cache the etag under the encoded id (the key the mutation paths
     // look up), preserving the owner so the conditioned write routes
     // back to the same mailbox.
@@ -1011,7 +1028,9 @@ async fn move_messages(
                 format!("Graph message {} did not expose an etag", id.0),
             )
         })?;
-        let source_owner = super::foreign::parse_message_id(id).owner().map(str::to_string);
+        let source_owner = super::foreign::parse_message_id(id)
+            .owner()
+            .map(str::to_string);
         if dest.foreign().map(|f| f.mailbox.as_str()) != source_owner.as_deref() {
             return Err(pim_protocol_error(
                 operation,
@@ -1487,10 +1506,7 @@ fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountEr
     // expressed as KQL and AND-combined with any raw `provider_query`.
     // Otherwise the OData `$filter` path stays in force, and a bare
     // `provider_query` (no structured filter) still goes through `$search`.
-    let needs_search = request
-        .filter
-        .as_ref()
-        .is_some_and(filter_requires_search);
+    let needs_search = request.filter.as_ref().is_some_and(filter_requires_search);
     if needs_search {
         let mut kql_parts = Vec::new();
         if let Some(filter) = &request.filter {
@@ -1568,10 +1584,7 @@ fn kql_filter(filter: &SearchFilter) -> Result<String, AccountError> {
         SearchFilter::From(value) => Ok(format!("from:{}", kql_quoted(value))),
         // KQL `to:` and `cc:` cover the recipient set; there is no KQL
         // bcc property, matching Graph's search surface.
-        SearchFilter::To(value) => Ok(format!(
-            "(to:{0} OR cc:{0})",
-            kql_quoted(value)
-        )),
+        SearchFilter::To(value) => Ok(format!("(to:{0} OR cc:{0})", kql_quoted(value))),
         SearchFilter::Subject(value) => Ok(format!("subject:{}", kql_quoted(value))),
         SearchFilter::Body(value) => Ok(format!("body:{}", kql_quoted(value))),
         SearchFilter::Has(value) => {
@@ -2091,10 +2104,7 @@ mod tests {
     fn message_batch_url_keeps_primary_id_on_me() {
         let account = shared_account();
         let id = ObjectId("AAMkmsg".to_string());
-        assert_eq!(
-            message_batch_url(&account, &id, ""),
-            "/me/messages/AAMkmsg"
-        );
+        assert_eq!(message_batch_url(&account, &id, ""), "/me/messages/AAMkmsg");
     }
 
     #[test]
@@ -2331,9 +2341,7 @@ mod tests {
         assert!(!url.contains("$filter="), "{url}");
         assert_eq!(
             search_param(&url),
-            bifrost_net::url::encode_component(
-                "\"(from:\"alice\") AND (received>=1970-01-01)\""
-            )
+            bifrost_net::url::encode_component("\"(from:\"alice\") AND (received>=1970-01-01)\"")
         );
     }
 
@@ -2348,9 +2356,7 @@ mod tests {
         assert!(!url.contains("$filter="), "{url}");
         assert_eq!(
             search_param(&url),
-            bifrost_net::url::encode_component(
-                "\"(from:\"alice\") AND (importance:high)\""
-            )
+            bifrost_net::url::encode_component("\"(from:\"alice\") AND (importance:high)\"")
         );
     }
 

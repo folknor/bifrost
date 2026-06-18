@@ -748,14 +748,12 @@ fn transient_retry_or_reconcile(
         // request. This matches reference/error-model.md: `Unsent`/
         // `Acknowledged`, or `InFlight`+idempotent -> `Retry(SameRequest)`;
         // `InFlight`+non-idempotent -> `Reconcile`.
-        TransmissionState::InFlight if !idempotent => {
-            RecoveryClass::Reconcile(ReconcileAdvice {
-                reason: ReconcileReason::TransportDropAfterSend,
-                guidance: ReconcileGuidance {
-                    actions: vec![ReconcileAction::CheckTarget],
-                },
-            })
-        }
+        TransmissionState::InFlight if !idempotent => RecoveryClass::Reconcile(ReconcileAdvice {
+            reason: ReconcileReason::TransportDropAfterSend,
+            guidance: ReconcileGuidance {
+                actions: vec![ReconcileAction::CheckTarget],
+            },
+        }),
         TransmissionState::Unsent
         | TransmissionState::InFlight
         | TransmissionState::Acknowledged => RecoveryClass::Retry(RetryAdvice {

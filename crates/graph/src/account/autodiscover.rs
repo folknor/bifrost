@@ -352,7 +352,9 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
                         "ErrorMessage" if out.error_message.is_none() && !trimmed.is_empty() => {
                             out.error_message = Some(trimmed.to_string());
                         }
-                        "RedirectTarget" if out.redirect_target.is_none() && !trimmed.is_empty() => {
+                        "RedirectTarget"
+                            if out.redirect_target.is_none() && !trimmed.is_empty() =>
+                        {
                             out.redirect_target = Some(trimmed.to_string());
                         }
                         _ => {}

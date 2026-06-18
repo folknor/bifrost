@@ -372,12 +372,7 @@ mod tests {
         // classified `ConcurrencyConflict -> Retry::AfterStateRefresh`.
         let err = crate::Error::Method(state_mismatch_method_error());
         let ids = vec![ObjectId("m1".into()), ObjectId("m2".into())];
-        let batch = state_mismatch_failed_batch(
-            err,
-            &MutationKind::Destroy,
-            ids,
-            Instant::now(),
-        );
+        let batch = state_mismatch_failed_batch(err, &MutationKind::Destroy, ids, Instant::now());
 
         assert_eq!(batch.items.len(), 2);
         for (idx, item) in batch.items.iter().enumerate() {

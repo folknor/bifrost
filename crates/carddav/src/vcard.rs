@@ -193,11 +193,7 @@ fn group_for(groups: &[String], index: usize) -> Option<&str> {
     groups.get(index).map(String::as_str)
 }
 
-fn append_contact_fields(
-    lines: &mut Vec<String>,
-    contact: &ContactCreate,
-    version: VCardVersion,
-) {
+fn append_contact_fields(lines: &mut Vec<String>, contact: &ContactCreate, version: VCardVersion) {
     append_fn(lines, contact.display_name.as_deref());
     append_emails(lines, &contact.emails, version, &[]);
     append_phones(lines, &contact.phones, version, &[]);
@@ -228,7 +224,10 @@ fn append_emails(
     for (index, email) in emails.iter().enumerate() {
         let prefix = group_prefix(group_for(groups, index));
         let params = type_param(email.kind.as_deref(), email.is_primary, version);
-        lines.push(format!("{prefix}EMAIL{params}:{}", escape_text(&email.value)));
+        lines.push(format!(
+            "{prefix}EMAIL{params}:{}",
+            escape_text(&email.value)
+        ));
     }
 }
 
@@ -758,7 +757,10 @@ fn is_primary(params: &[(String, Vec<String>)]) -> bool {
         if key == "PREF" {
             return true;
         }
-        key == "TYPE" && values.iter().any(|value| value.eq_ignore_ascii_case("PREF"))
+        key == "TYPE"
+            && values
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case("PREF"))
     })
 }
 
@@ -836,9 +838,9 @@ fn unescape_text(value: &str) -> String {
 /// Extract a photo URL from a PHOTO value. A 4.0 `data:` URI is inline binary,
 /// not a remote URL, so it is excluded here and handled by `inline_photo`.
 fn photo_url(value: &str, params: &[(String, Vec<String>)]) -> Option<String> {
-    let is_uri_value = params
-        .iter()
-        .any(|(key, values)| key == "VALUE" && values.iter().any(|v| v.eq_ignore_ascii_case("uri")));
+    let is_uri_value = params.iter().any(|(key, values)| {
+        key == "VALUE" && values.iter().any(|v| v.eq_ignore_ascii_case("uri"))
+    });
     let unescaped = unescape_text(value);
     if unescaped.starts_with("data:") {
         return None;
@@ -870,7 +872,8 @@ fn inline_photo(value: &str, params: &[(String, Vec<String>)]) -> Option<Contact
     // 3.0 inline form: PHOTO;ENCODING=b;TYPE=PNG:<base64>
     let has_inline_encoding = params.iter().any(|(key, values)| {
         let first = values.first().map(String::as_str).unwrap_or_default();
-        (key == "ENCODING" && (first.eq_ignore_ascii_case("b") || first.eq_ignore_ascii_case("BASE64")))
+        (key == "ENCODING"
+            && (first.eq_ignore_ascii_case("b") || first.eq_ignore_ascii_case("BASE64")))
             || (key == "VALUE" && first.eq_ignore_ascii_case("BINARY"))
     });
     if !has_inline_encoding {
@@ -1208,12 +1211,7 @@ mod tests {
         // Patching the emails must keep the group on the rewritten EMAIL so the
         // X-ABLabel (preserved verbatim) stays bound to it.
         let source = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada\r\nitem1.EMAIL;TYPE=INTERNET:old@example.test\r\nitem1.X-ABLabel:Work\r\nEND:VCARD\r\n";
-        let current = parse_contact(
-            "/ab/1.vcf".to_string(),
-            None,
-            None,
-            source,
-        );
+        let current = parse_contact("/ab/1.vcf".to_string(), None, None, source);
         let updated = vcard_from_patch(
             &current,
             source,
@@ -1238,8 +1236,9 @@ mod tests {
         // patch that does not touch it: no unfold/refold of unmodeled lines.
         let long_value = "x:    y ".repeat(40);
         let escaped = long_value.replace(',', "\\,");
-        let mut source =
-            String::from("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEMAIL;TYPE=work:old@example.test\r\nNOTE:");
+        let mut source = String::from(
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEMAIL;TYPE=work:old@example.test\r\nNOTE:",
+        );
         for (index, chunk) in escaped.as_bytes().chunks(40).enumerate() {
             if index > 0 {
                 source.push_str("\r\n ");

@@ -38,8 +38,8 @@ pub(crate) fn event_from_ical(
     let end = dtend
         .map(|prop| event_time_from_property(prop, true))
         .unwrap_or_else(default_time);
-    let is_all_day = dtstart.is_some_and(Prop::value_type_date)
-        || dtend.is_some_and(Prop::value_type_date);
+    let is_all_day =
+        dtstart.is_some_and(Prop::value_type_date) || dtend.is_some_and(Prop::value_type_date);
     let organizer = props
         .first_with_name("ORGANIZER")
         .and_then(organizer_from_property);
@@ -894,7 +894,8 @@ fn has_recurrence_override_vevent(raw_ical: &str) -> bool {
     for group in logical_line_groups(raw_ical) {
         let head = group.logical_head();
         let name = ical_line_name(head);
-        if name == Some("BEGIN") && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
+        if name == Some("BEGIN")
+            && line_value(head).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
         {
             in_event = true;
             continue;
@@ -1169,7 +1170,9 @@ mod tests {
         // DESCRIPTION pre-folded at a non-75 column and assert the unfolded
         // value survives a SUMMARY-only patch.
         let long_value = "x:    y ".repeat(40);
-        let mut body = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nDESCRIPTION:");
+        let mut body = String::from(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nDESCRIPTION:",
+        );
         // Fold the description manually at column ~40 so a refold would move
         // the boundaries (and the old WSP-eating unfolder would drop the
         // run-of-spaces after the colon).

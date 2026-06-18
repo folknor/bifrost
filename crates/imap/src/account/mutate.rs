@@ -515,7 +515,15 @@ async fn apply_patch(
             if !matches!(first, StoreWireOutcome::Applied) {
                 return Ok(first);
             }
-            store_flags(conn, set, StoreOperation::RemoveSilent, remove, None, timeout).await
+            store_flags(
+                conn,
+                set,
+                StoreOperation::RemoveSilent,
+                remove,
+                None,
+                timeout,
+            )
+            .await
         }
     }
 }
@@ -799,9 +807,7 @@ mod tests {
         );
         // Every item is Failed - none Uncertain, none Succeeded.
         assert!(
-            outcomes
-                .iter()
-                .all(|o| matches!(o, ItemOutcome::Failed(_))),
+            outcomes.iter().all(|o| matches!(o, ItemOutcome::Failed(_))),
             "PendingRetry conflict must surface as Failed, never Uncertain"
         );
         // The conflicting UID (2) carries ConcurrencyConflict.
@@ -811,7 +817,10 @@ mod tests {
                 AccountErrorKind::ConcurrencyConflict
             ))
         });
-        assert!(has_conflict, "conflicting UID must surface ConcurrencyConflict");
+        assert!(
+            has_conflict,
+            "conflicting UID must surface ConcurrencyConflict"
+        );
     }
 
     #[test]

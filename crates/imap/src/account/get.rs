@@ -54,8 +54,7 @@ pub(crate) fn get_stream(
         // ordering is reproducible run-to-run (a `HashMap` iteration order
         // is not). Within a folder the UID FETCH order is server-driven;
         // only the folder grouping is sorted here.
-        let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> =
-            grouped.into_values().collect();
+        let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> = grouped.into_values().collect();
         groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (folder, ids) in groups {
             match run_folder_get(&account, &folder, ids.clone(), projection, &tx).await {
@@ -142,10 +141,8 @@ async fn run_folder_get(
                 err,
                 folder,
                 shared_owner.as_ref(),
-                super::error::ImapErrorContext::operation(
-                    bifrost_types::AccountOperation::Hydrate,
-                )
-                .with_folder_scope(folder),
+                super::error::ImapErrorContext::operation(bifrost_types::AccountOperation::Hydrate)
+                    .with_folder_scope(folder),
             )));
         }
         Err(err) => return Err(err.into()),

@@ -1164,11 +1164,7 @@ mod test {
         // failure reply on the next read.
         assert_eq!(
             mechanism
-                .response_with_token(
-                    &credentials,
-                    Some(r#"{"status":"401"}"#),
-                    Some(token)
-                )
+                .response_with_token(&credentials, Some(r#"{"status":"401"}"#), Some(token))
                 .unwrap(),
             "\x01"
         );

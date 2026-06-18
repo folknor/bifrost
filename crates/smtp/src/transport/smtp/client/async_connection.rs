@@ -1659,7 +1659,11 @@ impl AsyncSmtpConnection {
                 self,
                 SmtpCommandPhase::Auth
             );
-            response = try_smtp!(self.command(continuation).await, self, SmtpCommandPhase::Auth);
+            response = try_smtp!(
+                self.command(continuation).await,
+                self,
+                SmtpCommandPhase::Auth
+            );
         }
 
         if challenges == 0 {

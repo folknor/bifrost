@@ -2092,7 +2092,10 @@ body text\r\n";
             Ok(part) => part,
             Err(_) => panic!("AND with In is accepted"),
         };
-        assert_eq!(part.folder.as_ref().map(MailboxName::as_str), Some("Archive"));
+        assert_eq!(
+            part.folder.as_ref().map(MailboxName::as_str),
+            Some("Archive")
+        );
     }
 
     #[test]

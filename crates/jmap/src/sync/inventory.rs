@@ -218,10 +218,7 @@ fn foreign_email_inventory(
 /// foreign native mailbox id (e.g. `inbox`) collides with the primary's
 /// identical id in the engine's membership index and the two accounts'
 /// messages conflate.
-fn qualify_foreign_memberships(
-    memberships: &mut Vec<MembershipScope>,
-    owner: &TypesMailboxId,
-) {
+fn qualify_foreign_memberships(memberships: &mut Vec<MembershipScope>, owner: &TypesMailboxId) {
     for membership in memberships.iter_mut() {
         if let MembershipScope::Mailbox(native) = membership {
             *membership =

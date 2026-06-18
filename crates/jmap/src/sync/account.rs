@@ -655,11 +655,19 @@ impl Account for JmapAccount {
         // The `EmailSubmission/set` and the Sent-folder move both target
         // the resolved submission account, not necessarily `self.mail`.
         let account_id = submission.id_str().to_string();
-        pim::draft_send(submission, Arc::clone(&self.email_states), account_id, draft)
+        pim::draft_send(
+            submission,
+            Arc::clone(&self.email_states),
+            account_id,
+            draft,
+        )
     }
 
     fn cancel_scheduled_send(&self, handle: ObjectId) -> AccountFuture<Result<(), AccountError>> {
-        let cancellable = self.submission.clone().filter(|_| self.max_delayed_send != 0);
+        let cancellable = self
+            .submission
+            .clone()
+            .filter(|_| self.max_delayed_send != 0);
         let Some(submission) = cancellable else {
             let err = super::error::unsupported_error(
                 AccountOperation::CancelScheduledSend,
@@ -678,7 +686,10 @@ impl Account for JmapAccount {
         handle: ObjectId,
         scheduled: std::time::SystemTime,
     ) -> AccountFuture<Result<ObjectId, AccountError>> {
-        let reschedulable = self.submission.clone().filter(|_| self.max_delayed_send != 0);
+        let reschedulable = self
+            .submission
+            .clone()
+            .filter(|_| self.max_delayed_send != 0);
         let Some(submission) = reschedulable else {
             let err = super::error::unsupported_error(
                 AccountOperation::RescheduleSend,

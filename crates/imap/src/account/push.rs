@@ -216,8 +216,7 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             let idle_result = conn
                 .idle(account.config.idle_timeout, round_cancel.clone())
                 .await;
-            let interrupted_by_resubscribe =
-                round_cancel.is_cancelled() && !cancel.is_cancelled();
+            let interrupted_by_resubscribe = round_cancel.is_cancelled() && !cancel.is_cancelled();
             nudge.abort();
             match idle_result {
                 Ok(_) if interrupted_by_resubscribe => {

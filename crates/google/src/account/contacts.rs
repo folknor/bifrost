@@ -1571,7 +1571,9 @@ mod tests {
     fn is_directory_absence_classifies_absence_vs_refusal() {
         // PermissionDenied / InsufficientScope == "no directory" (absence).
         assert!(is_directory_absence(&directory_403("forbidden")));
-        assert!(is_directory_absence(&directory_403("insufficientPermissions")));
+        assert!(is_directory_absence(&directory_403(
+            "insufficientPermissions"
+        )));
         // notAuthorizedToAccessThisResource classifies as PermissionDenied,
         // so on a first-page probe it reads as absence (documented swallow
         // set); the first-page gate keeps it from masking later pages.

@@ -425,9 +425,8 @@ mod tests {
         let client_first_bare = "n=user,r=fyko+d2lbbFgONRv9qkxdawL";
         // i= one above the ceiling; must be rejected before PBKDF2 runs.
         let i = u64::from(MAX_SCRAM_ITERATIONS) + 1;
-        let server_first = format!(
-            "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i={i}"
-        );
+        let server_first =
+            format!("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i={i}");
         let err = scram_client_final(
             ScramHash::Sha256,
             "pencil",

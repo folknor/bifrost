@@ -262,7 +262,10 @@ async fn fetch_raw_stream(
     let client = account.client_for_owner(parsed.owner());
     let prefix = client.api_path_prefix();
     let enc_message_id = bifrost_net::url::encode_component(parsed.native_id());
-    let url = format!("{}{prefix}/messages/{enc_message_id}/$value", client.api_base());
+    let url = format!(
+        "{}{prefix}/messages/{enc_message_id}/$value",
+        client.api_base()
+    );
     let account_net = client.account_net().ok_or_else(|| {
         Box::new(crate::error::GraphError::Net(bifrost_net::Error::Network {
             message: "Graph client is not attached to an account".to_string(),

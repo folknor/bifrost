@@ -106,7 +106,10 @@ mod tests {
     #[test]
     fn oauthbearer_payload_strips_embedded_frame_delimiter() {
         let payload = oauthbearer_payload("id\x01entity", "tok\x01en");
-        assert_eq!(payload.as_str(), "n,a=identity,\x01auth=Bearer token\x01\x01");
+        assert_eq!(
+            payload.as_str(),
+            "n,a=identity,\x01auth=Bearer token\x01\x01"
+        );
         assert_eq!(payload.as_str().matches('\x01').count(), 3);
     }
 

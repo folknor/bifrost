@@ -521,10 +521,7 @@ mod tests {
         )
         .expect("builds")
         .expect("some request");
-        assert_eq!(
-            request.url,
-            "/users/shared%40contoso.com/messages/AAMkmsg"
-        );
+        assert_eq!(request.url, "/users/shared%40contoso.com/messages/AAMkmsg");
         assert!(!request.url.contains('\u{1f}'), "{}", request.url);
     }
 
@@ -552,10 +549,7 @@ mod tests {
             .expect("builds")
             .expect("some request");
         assert_eq!(request.method, "DELETE");
-        assert_eq!(
-            request.url,
-            "/users/shared%40contoso.com/messages/AAMkmsg"
-        );
+        assert_eq!(request.url, "/users/shared%40contoso.com/messages/AAMkmsg");
     }
 
     #[test]
@@ -564,22 +558,17 @@ mod tests {
         let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
         let etags = etag_map(&id);
         // The destination folder belongs to the same shared mailbox.
-        let destination =
-            MembershipScope::Folder(encode_foreign("shared@contoso.com", "AAMkdest"));
-        let request =
-            request_for_mutation(&account, &id, &MutationKind::Move(destination), &etags)
-                .expect("builds")
-                .expect("some request");
+        let destination = MembershipScope::Folder(encode_foreign("shared@contoso.com", "AAMkdest"));
+        let request = request_for_mutation(&account, &id, &MutationKind::Move(destination), &etags)
+            .expect("builds")
+            .expect("some request");
         assert_eq!(
             request.url,
             "/users/shared%40contoso.com/messages/AAMkmsg/move"
         );
         // The move body's destinationId is the native folder id, not the
         // `\u{1f}`-encoded FolderId.
-        assert_eq!(
-            request.body,
-            Some(json!({ "destinationId": "AAMkdest" }))
-        );
+        assert_eq!(request.body, Some(json!({ "destinationId": "AAMkdest" })));
     }
 
     #[test]

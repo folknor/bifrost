@@ -130,9 +130,7 @@ pub(crate) fn encode_message_id(scope: &CursorScope, native: &str) -> ObjectId {
     match scope {
         CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
             match parse_folder(folder).foreign() {
-                Some(foreign) => {
-                    ObjectId(format!("{}{FOREIGN_SEP}{native}", foreign.mailbox))
-                }
+                Some(foreign) => ObjectId(format!("{}{FOREIGN_SEP}{native}", foreign.mailbox)),
                 None => ObjectId(native.to_string()),
             }
         }

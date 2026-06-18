@@ -1722,11 +1722,8 @@ mod tests {
                 .is_none()
         );
         assert!(
-            graph_recurrence_from_rrule(
-                "FREQ=YEARLY;BYMONTH=6;BYDAY=MO",
-                "2026-06-02".to_string()
-            )
-            .is_none()
+            graph_recurrence_from_rrule("FREQ=YEARLY;BYMONTH=6;BYDAY=MO", "2026-06-02".to_string())
+                .is_none()
         );
     }
 
