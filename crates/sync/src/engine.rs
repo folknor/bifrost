@@ -466,11 +466,8 @@ impl SyncEngine {
         let bf_cursors = Arc::clone(&cursors);
         let bf_live = Arc::clone(&live_supersedes);
         let bf_shutdown = shutdown.clone();
-        let bf_aid = account_id.clone();
-        let bf_store = Arc::clone(&self.checkpoints);
         let bf_changes = changes_tx.clone();
         let bf_config = self.config.backfill;
-        let bf_control = control.clone();
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
                 bf_account,
@@ -478,10 +475,7 @@ impl SyncEngine {
                 bf_live,
                 backfill_registry_handle,
                 bf_shutdown,
-                bf_aid,
-                bf_store,
                 Some(bf_changes),
-                bf_control,
                 bf_config,
             )
             .await;
@@ -1273,17 +1267,13 @@ async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) 
 /// The runner uses the slot's shared `LiveSupersedes` set so live
 /// `Created` events from the multiplexer skip over inventory entries
 /// the user has already seen.
-#[allow(clippy::too_many_arguments)]
 async fn run_backfill_orchestrator(
     account: Arc<ArcSwap<Arc<dyn Account>>>,
     cursors: Arc<CursorRegistry>,
     live: Arc<LiveSupersedes>,
     registry: Arc<BackfillRegistry>,
     shutdown: CancellationToken,
-    account_id: AccountId,
-    store: Arc<DynCheckpointStore>,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
-    control: SyncControl,
     config: BackfillConfig,
 ) {
     let scopes = cursors.all_scopes();
@@ -1306,10 +1296,7 @@ async fn run_backfill_orchestrator(
                         scope.clone(),
                         partition,
                         live.as_ref(),
-                        &account_id,
-                        Arc::clone(&store),
                         changes_tx.clone(),
-                        Some(control.clone()),
                         crate::cursor::ENGINE_VERSION,
                     )
                     .await
@@ -1347,10 +1334,7 @@ async fn run_backfill_orchestrator(
                         scope.clone(),
                         partition,
                         live.as_ref(),
-                        &account_id,
-                        Arc::clone(&store),
                         changes_tx.clone(),
-                        Some(control.clone()),
                         crate::cursor::ENGINE_VERSION,
                     )
                     .await
@@ -2383,10 +2367,7 @@ mod tests {
         let hi = Duration::from_millis(1_200);
         for _ in 0..10_000 {
             let j = jittered(base);
-            assert!(
-                j >= lo && j <= hi,
-                "jitter {j:?} outside ±20% of {base:?}"
-            );
+            assert!(j >= lo && j <= hi, "jitter {j:?} outside ±20% of {base:?}");
         }
     }
 

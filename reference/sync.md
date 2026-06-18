@@ -190,9 +190,19 @@ carries `{ scope, event: Arc<SyncEvent<Change>>, checkpoint }`.
 ## Backfill
 
 `BackfillRunner::run_partition` walks
-`inventory_partition_stream(scope, partition)` and emits
-`BackfillCheckpoint`s at partition boundaries via
-`CheckpointStore::put_backfill`. The orchestrator spawns runners
+`inventory_partition_stream(scope, partition)` and broadcasts each
+page as a synthetic `Batch` carrying a `BackfillCheckpoint`. It does
+NOT write to `CheckpointStore`: durable persistence is
+consumer-ack-deferred, exactly like `drive_changes_stream`. The
+consumer persists the page items, then calls
+`SyncEngine::ack_checkpoint` with the `Checkpoint::Backfill`; the
+ack writer routes that to `CheckpointStore::put_backfill`. This keeps
+at-least-once intact for cold-start hydration - a crash between
+broadcast and the consumer's write re-walks the partition on restart
+(the orchestrator always restarts a scope from its first partition),
+so no inventory page is lost. An eager engine-side write would let the
+store record progress the consumer never durably persisted, losing
+that page's objects permanently. The orchestrator spawns runners
 from `discover_cursor_scopes()` and plans partitions from
 `Account::inventory_partitioning(scope)`. The partitioner
 (`backfill/partitioner.rs::plan`) handles three strategies:
@@ -201,9 +211,10 @@ from `discover_cursor_scopes()` and plans partitions from
 chunking). `Full` falls through as a single partition; JMAP
 Email currently advertises open-ended `PageCount`.
 
-Backfill persistence calls `SyncControl::record_checkpoint` only
-after `CheckpointStore::put_backfill` succeeds, so pause and
-checkpoint waiters observe durable boundaries.
+Pause and checkpoint waiters observe backfill boundaries through the
+ack writer: it calls `SyncControl::record_checkpoint` after the
+consumer-acked `put_backfill` lands, so waiters wake on a durable,
+consumer-acknowledged boundary - identical to the change-cursor path.
 
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
 the multiplexer feeds with live `Created` ids so cold-start
@@ -212,8 +223,10 @@ showed. Default cap `LIVE_SUPERSEDES_DEFAULT_CAP = 100_000`;
 overflow drops the oldest insertion.
 
 `BackfillCheckpointWriter` (in `backfill/checkpoint.rs`) is a
-thin wrapper over `CheckpointStore::put_backfill` so the runner
-does not need to know the persistence shape.
+thin wrapper over `CheckpointStore::put_backfill`. The runner no
+longer persists (the ack writer does), so the wrapper is unused on
+the hot path today; it remains as a typed helper for consumer-side
+store wiring.
 
 ## Push
 
@@ -357,12 +370,12 @@ until then. See `scheduler/mod.rs` module docs.
 counter, pause/resume token, and the boundary channel.
 `record_checkpoint` wakes `pause().await` and
 `checkpoint_now().await` waiters parked on
-`boundary_recipient.notified()`. It is fired by:
-
-- backfill, after `CheckpointStore::put_backfill` succeeds
-  (`backfill/runner.rs`).
-- the ack writer, after `put_change_cursor` /
-  `put_backfill` succeeds for an `AckRequest` (`engine.rs`).
+`boundary_recipient.notified()`. It is fired by the ack writer after
+`put_change_cursor` / `put_backfill` succeeds for an `AckRequest`
+(`engine.rs`). Both the change-cursor and backfill paths are
+consumer-ack-deferred, so every recorded boundary is one the consumer
+has durably acknowledged; the backfill runner no longer writes or
+records checkpoints itself.
 
 The mutation pipeline records counters, not checkpoints; it does
 not call `record_checkpoint`.

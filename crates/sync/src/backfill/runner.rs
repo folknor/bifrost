@@ -1,26 +1,40 @@
 //! Backfill partition runner.
 //!
-//! Walks `inventory_stream(scope)` and forwards each `Batch` as a
-//! `MultiplexerEvent` carrying `Change::ObjectChange::Created` items
-//! plus a `BackfillCheckpoint` checkpoint. Persists the checkpoint via
-//! `CheckpointStore::put_backfill` at every page boundary. The runner
-//! uses `LiveSupersedes` to skip ids the live `changes_stream` has
-//! already announced.
+//! Walks `inventory_partition_stream(scope)` and forwards each `Batch`
+//! as a `MultiplexerEvent` carrying `Change::ObjectChange::Created`
+//! items plus a `BackfillCheckpoint` checkpoint. The runner uses
+//! `LiveSupersedes` to skip ids the live `changes_stream` has already
+//! announced.
+//!
+//! ## Checkpoint-durability contract
+//!
+//! Durable persistence is consumer-ack-deferred, mirroring
+//! `drive_changes_stream`. The runner broadcasts each page and its
+//! `BackfillCheckpoint` but does NOT write to `CheckpointStore`. The
+//! consumer atomically persists the page items in their own store, then
+//! calls `SyncEngine::ack_checkpoint` with the `Checkpoint::Backfill`;
+//! the per-account ack writer routes that to
+//! `CheckpointStore::put_backfill` and fires `record_checkpoint` to wake
+//! pause / checkpoint waiters on a durable boundary.
+//!
+//! This closes the at-least-once gap an eager engine-side write would
+//! open: a crash between broadcast and the consumer's write re-walks the
+//! partition on restart (the orchestrator always restarts a scope from
+//! its first partition), so no inventory page is lost. An eager write
+//! would let the store record progress the consumer never durably
+//! persisted, permanently losing that page's objects on cold start.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use bifrost_types::{
-    Account, AccountId, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint,
-    CursorScope, InventoryEntry, InventoryPartition, ObjectChange, ObjectChangeKind, ObjectId,
-    SyncEvent,
+    Account, BackfillCheckpoint, BackfillProgress, Batch, Change, Checkpoint, CursorScope,
+    InventoryEntry, InventoryPartition, ObjectChange, ObjectChangeKind, ObjectId, SyncEvent,
 };
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
 
-use crate::control::SyncControl;
-use crate::cursor::store::DynCheckpointStore;
 use crate::error::Error;
 use crate::multiplexer::MultiplexerEvent;
 
@@ -141,19 +155,16 @@ impl BackfillRunner {
     /// Walk one inventory pass to completion. Forwards each `Batch`
     /// onto the per-account `changes_tx` broadcast as
     /// `Change::ObjectChange::Created` (skipping ids in
-    /// `LiveSupersedes`) and persists a `BackfillCheckpoint` at every
-    /// page boundary via `CheckpointStore::put_backfill`. Returns the
-    /// total count of entries kept after the supersedes filter.
-    #[allow(clippy::too_many_arguments)]
+    /// `LiveSupersedes`), each page carrying a `BackfillCheckpoint`.
+    /// Does NOT write to `CheckpointStore`: durable advance is
+    /// consumer-ack-driven (see module docs). Returns the total count of
+    /// entries kept after the supersedes filter.
     pub async fn run_partition(
         account: &dyn Account,
         scope: CursorScope,
         partition: InventoryPartition,
         live: &LiveSupersedes,
-        account_id: &AccountId,
-        store: Arc<DynCheckpointStore>,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
-        control: Option<SyncControl>,
         envelope_version: u32,
     ) -> Result<BackfillPartitionOutcome, Error> {
         let partition_key = partition_key(&partition);
@@ -169,20 +180,21 @@ impl BackfillRunner {
                     let kept_count = u64::try_from(kept.len()).unwrap_or(u64::MAX);
                     kept_total = kept_total.saturating_add(kept_count);
 
-                    // Build the BackfillCheckpoint for this page.
-                    let bf = BackfillCheckpoint {
-                        scope: scope.clone(),
-                        partition: partition_key.clone(),
-                        progress_marker: None,
-                        progress: BackfillProgress {
-                            items_done: kept_total,
-                            items_estimated: None,
-                        },
-                        envelope_version,
-                    };
-
-                    // Forward as a synthetic Batch on the broadcast.
+                    // Forward the page as a synthetic Batch carrying a
+                    // BackfillCheckpoint. Durable persistence awaits the
+                    // consumer ack (see module docs); the runner never
+                    // writes to CheckpointStore.
                     if let Some(tx) = &changes_tx {
+                        let bf = BackfillCheckpoint {
+                            scope: scope.clone(),
+                            partition: partition_key.clone(),
+                            progress_marker: None,
+                            progress: BackfillProgress {
+                                items_done: kept_total,
+                                items_estimated: None,
+                            },
+                            envelope_version,
+                        };
                         let changes: Vec<Change> = kept
                             .into_iter()
                             .map(|entry| {
@@ -202,15 +214,9 @@ impl BackfillRunner {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(Checkpoint::Backfill(bf.clone())),
+                            checkpoint: Some(Checkpoint::Backfill(bf)),
                         };
                         let _ = tx.send(me);
-                    }
-
-                    // Persist at every page boundary.
-                    store.put_backfill(account_id, bf.clone()).await?;
-                    if let Some(control) = &control {
-                        control.record_checkpoint(Checkpoint::Backfill(bf)).await;
                     }
                 }
                 SyncEvent::Done(_) => break,
