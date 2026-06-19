@@ -136,6 +136,40 @@ fn optional_i64(value: Option<i64>) -> String {
     value.map(|v| v.to_string()).unwrap_or_default()
 }
 
+/// Parse a durable `Page` partition key back into its `[from, to)`
+/// bounds. The inverse of `partition_key` for
+/// `InventoryPartition::Page`; returns `None` for any other partition
+/// kind or a malformed key. The backfill orchestrator uses it to resume
+/// an open-ended page walk from the furthest durably-checkpointed window
+/// rather than re-walking from page 0 on every re-attach.
+#[must_use]
+pub fn parse_page_partition(partition: &Partition) -> Option<(u32, u32)> {
+    let text = std::str::from_utf8(&partition.0).ok()?;
+    let rest = text.strip_prefix("page:")?;
+    let (from, to) = rest.split_once(':')?;
+    Some((from.parse().ok()?, to.parse().ok()?))
+}
+
+/// Sentinel partition key marking an open-ended page scope as fully
+/// exhausted. It does not name a window (no `from:to`); it is a durable
+/// "backfill is done" flag the orchestrator writes via the normal
+/// consumer-ack path on completion. Distinct from every real `page:F:T`
+/// key so it never collides with a window checkpoint, and ordered to win
+/// `get_backfill`'s "latest by items_done" query (the marker carries the
+/// total items walked, >= any single window's count) so a completed scope
+/// is recognised and skipped without re-walking.
+#[must_use]
+pub fn completion_partition() -> Partition {
+    Partition(b"complete".to_vec())
+}
+
+/// True if `partition` is the completion sentinel from
+/// `completion_partition`.
+#[must_use]
+pub fn is_completion_partition(partition: &Partition) -> bool {
+    partition.0 == b"complete"
+}
+
 /// Plan a partition list for the given policy.
 ///
 /// `now` is taken as a parameter so tests are deterministic. The
@@ -323,6 +357,40 @@ mod tests {
             }),
             Partition(b"time::123".to_vec())
         );
+    }
+
+    #[test]
+    fn page_partition_key_round_trips() {
+        let partition = InventoryPartition::Page {
+            from: 500,
+            to: 1000,
+        };
+        let key = partition_key(&partition);
+        assert_eq!(parse_page_partition(&key), Some((500, 1000)));
+    }
+
+    #[test]
+    fn parse_page_partition_rejects_other_kinds() {
+        assert_eq!(
+            parse_page_partition(&partition_key(&InventoryPartition::Uid { from: 7, to: 9 })),
+            None
+        );
+        assert_eq!(
+            parse_page_partition(&partition_key(&InventoryPartition::Full)),
+            None
+        );
+        assert_eq!(parse_page_partition(&Partition(b"page:1".to_vec())), None);
+        assert_eq!(parse_page_partition(&Partition(b"page:a:b".to_vec())), None);
+    }
+
+    #[test]
+    fn completion_sentinel_is_distinct_from_pages() {
+        let complete = completion_partition();
+        assert!(is_completion_partition(&complete));
+        assert_eq!(parse_page_partition(&complete), None);
+        assert!(!is_completion_partition(&partition_key(
+            &InventoryPartition::Page { from: 0, to: 500 }
+        )));
     }
 
     #[test]

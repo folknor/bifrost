@@ -14,10 +14,11 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use bifrost_types::{
     Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountId,
-    AccountStream, ChangeCursor, Checkpoint, CursorEstablishment, CursorScope, DiagnosticText,
-    EngineDirective, ErrorScope, InvalidationSink, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, MembershipScope, MutationSuccess, PauseReason, Priority, ReconcileAction,
-    ReconcileAdvice, RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
+    AccountStream, BackfillCheckpoint, BackfillProgress, Batch, ChangeCursor, Checkpoint,
+    CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
+    InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
+    MutationSuccess, PageBoundary, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
+    RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -464,16 +465,20 @@ impl SyncEngine {
         let live_supersedes = Arc::new(LiveSupersedes::new());
         let backfill_registry_handle = Arc::clone(&self.backfill_registry);
         let bf_account = Arc::clone(&current);
+        let bf_account_id = account_id.clone();
         let bf_cursors = Arc::clone(&cursors);
         let bf_live = Arc::clone(&live_supersedes);
+        let bf_store = Arc::clone(&self.checkpoints);
         let bf_shutdown = shutdown.clone();
         let bf_changes = changes_tx.clone();
         let bf_config = self.config.backfill;
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
                 bf_account,
+                bf_account_id,
                 bf_cursors,
                 bf_live,
+                bf_store,
                 backfill_registry_handle,
                 bf_shutdown,
                 Some(bf_changes),
@@ -1403,10 +1408,22 @@ async fn await_worker_until(deadline: tokio::time::Instant, worker: WorkerTask) 
 /// The runner uses the slot's shared `LiveSupersedes` set so live
 /// `Created` events from the multiplexer skip over inventory entries
 /// the user has already seen.
+///
+/// Resume: the in-memory `BackfillRegistry` is wiped on detach, so the
+/// only durable record of backfill progress is the consumer-acked
+/// `BackfillCheckpoint` in the `CheckpointStore`. Before walking an
+/// open-ended page scope the orchestrator reads that checkpoint back via
+/// `get_backfill` and either skips a scope whose final short page is
+/// already persisted (the steady-state delta case - it must not re-walk
+/// at all) or resumes after the furthest durably-checkpointed full page
+/// instead of re-paginating from page 0 on every re-attach.
+#[allow(clippy::too_many_arguments)]
 async fn run_backfill_orchestrator(
     account: Arc<ArcSwap<Arc<dyn Account>>>,
+    account_id: AccountId,
     cursors: Arc<CursorRegistry>,
     live: Arc<LiveSupersedes>,
+    store: Arc<DynCheckpointStore>,
     registry: Arc<BackfillRegistry>,
     shutdown: CancellationToken,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
@@ -1417,11 +1434,11 @@ async fn run_backfill_orchestrator(
         if shutdown.is_cancelled() {
             return;
         }
-        registry.mark(scope.clone(), BackfillState::Running);
         let acc_arc = account.load_full();
         let acc: &dyn Account = acc_arc.as_ref().as_ref();
         match backfill_plan_for(acc, &scope, config) {
             BackfillPlan::Fixed(partitions) => {
+                registry.mark(scope.clone(), BackfillState::Running);
                 let mut completed = true;
                 for partition in partitions {
                     if shutdown.is_cancelled() {
@@ -1457,8 +1474,34 @@ async fn run_backfill_orchestrator(
                 );
             }
             BackfillPlan::OpenPages { chunk } => {
-                let mut completed = true;
+                // Resume from durable progress instead of page 0. The
+                // persisted checkpoint is consumer-acked, so anything it
+                // covers is safe to skip; we never skip a window the consumer
+                // has not durably persisted.
                 let mut from = 0_u32;
+                match store.get_backfill(&account_id, &scope).await {
+                    Ok(opt) => match open_pages_resume(opt.as_ref()) {
+                        OpenPagesResume::Skip => {
+                            registry.mark(scope.clone(), BackfillState::Completed);
+                            continue;
+                        }
+                        OpenPagesResume::ResumeFrom(position) => from = position,
+                    },
+                    Err(err) => {
+                        // A read failure is not authoritative; fall back to a
+                        // full walk rather than risk skipping unpersisted
+                        // pages.
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            scope = ?scope,
+                            error = %err,
+                            "backfill resume read failed; re-walking from page 0"
+                        );
+                    }
+                }
+                registry.mark(scope.clone(), BackfillState::Running);
+                let mut completed = true;
+                let mut total_seen = 0_u64;
                 loop {
                     if shutdown.is_cancelled() {
                         return;
@@ -1490,6 +1533,7 @@ async fn run_backfill_orchestrator(
                             if outcome.seen == 0 {
                                 break;
                             }
+                            total_seen = total_seen.saturating_add(outcome.seen);
                             from = to;
                         }
                         Err(err) => {
@@ -1504,6 +1548,19 @@ async fn run_backfill_orchestrator(
                         }
                     }
                 }
+                if completed {
+                    // Persist a durable completion marker through the same
+                    // consumer-ack path the page batches use: broadcast it,
+                    // the consumer persists+acks, the ack writer calls
+                    // put_backfill. Because it rides behind every page in the
+                    // ordered stream, the marker only lands durably after the
+                    // consumer has persisted every page - so a crash before
+                    // completion re-walks rather than recording a false
+                    // "done". On the next attach get_backfill returns this
+                    // marker (its total-walked count wins the "latest by
+                    // items_done" query) and the scope is skipped entirely.
+                    emit_backfill_complete(changes_tx.as_ref(), &scope, total_seen);
+                }
                 registry.mark(
                     scope.clone(),
                     if completed {
@@ -1515,6 +1572,88 @@ async fn run_backfill_orchestrator(
             }
         }
     }
+}
+
+/// Resume decision for an open-ended page scope, derived purely from the
+/// durably-persisted (consumer-acked) backfill checkpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum OpenPagesResume {
+    /// Inventory was exhausted on a prior run; do not walk at all.
+    Skip,
+    /// Begin (or resume) the page walk at this position.
+    ResumeFrom(u32),
+}
+
+/// Map the persisted backfill checkpoint to a resume decision.
+///
+/// - The completion sentinel means a prior run reached exhaustion and the
+///   consumer acked it: skip entirely.
+/// - A short final `page:F:T` (`items_done < T - F`) means inventory ran
+///   out inside that window even though no completion marker landed (e.g.
+///   the consumer never acked it): still exhausted, so skip.
+/// - A full `page:F:T` means there may be more after it: resume at `T`.
+/// - No checkpoint, or an unrecognised partition kind, starts fresh at 0.
+///
+/// Resume never skips a window the consumer has not durably persisted,
+/// because `get_backfill` only ever returns consumer-acked checkpoints.
+fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> OpenPagesResume {
+    let Some(checkpoint) = checkpoint else {
+        return OpenPagesResume::ResumeFrom(0);
+    };
+    if crate::backfill::partitioner::is_completion_partition(&checkpoint.partition) {
+        return OpenPagesResume::Skip;
+    }
+    if let Some((from, to)) =
+        crate::backfill::partitioner::parse_page_partition(&checkpoint.partition)
+    {
+        let width = u64::from(to.saturating_sub(from));
+        if checkpoint.progress.items_done < width {
+            return OpenPagesResume::Skip;
+        }
+        return OpenPagesResume::ResumeFrom(to);
+    }
+    OpenPagesResume::ResumeFrom(0)
+}
+
+/// Broadcast a durable backfill-completion marker for an open-ended page
+/// scope. The marker is a synthetic empty `Batch` carrying a
+/// `BackfillCheckpoint` on the `completion_partition` sentinel key; it
+/// flows through the consumer-ack path exactly like a page batch, so the
+/// store only records completion after the consumer has durably persisted
+/// every page. `total_seen` is stamped as `items_done` (and
+/// `items_estimated`) so the marker wins `get_backfill`'s "latest by
+/// items_done" query and the scope is recognised as complete on re-attach.
+fn emit_backfill_complete(
+    changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
+    scope: &CursorScope,
+    total_seen: u64,
+) {
+    let Some(tx) = changes_tx else {
+        return;
+    };
+    let marker = BackfillCheckpoint {
+        scope: scope.clone(),
+        partition: crate::backfill::partitioner::completion_partition(),
+        progress_marker: None,
+        progress: BackfillProgress {
+            items_done: total_seen,
+            items_estimated: Some(total_seen),
+        },
+        envelope_version: crate::cursor::ENGINE_VERSION,
+    };
+    let batch: Batch<bifrost_types::Change> = Batch {
+        items: Vec::new(),
+        page_boundary: PageBoundary::Final,
+        server_latency: Duration::ZERO,
+        bytes_in: 0,
+        checkpoint: Some(Checkpoint::Backfill(marker.clone())),
+    };
+    let event = MultiplexerEvent {
+        scope: scope.clone(),
+        event: Arc::new(SyncEvent::Batch(batch)),
+        checkpoint: Some(Checkpoint::Backfill(marker)),
+    };
+    let _ = tx.send(event);
 }
 
 enum BackfillPlan {
@@ -2599,5 +2738,74 @@ mod tests {
             cursors.scopes_for_membership(&MembershipScope::Folder(FolderId("INBOX".into()))),
             vec![sibling]
         );
+    }
+
+    /// Build a backfill checkpoint on a given partition key + progress for
+    /// the open-pages resume tests.
+    #[cfg(test)]
+    fn checkpoint_on(
+        partition: bifrost_types::Partition,
+        items_done: u64,
+    ) -> bifrost_types::BackfillCheckpoint {
+        bifrost_types::BackfillCheckpoint {
+            scope: CursorScope::Type(ObjectType::Email),
+            partition,
+            progress_marker: None,
+            progress: bifrost_types::BackfillProgress {
+                items_done,
+                items_estimated: None,
+            },
+            envelope_version: 1,
+        }
+    }
+
+    #[test]
+    fn open_pages_resume_no_checkpoint_starts_fresh() {
+        use super::{OpenPagesResume, open_pages_resume};
+        assert_eq!(open_pages_resume(None), OpenPagesResume::ResumeFrom(0));
+    }
+
+    #[test]
+    fn open_pages_resume_completion_marker_skips() {
+        use super::{OpenPagesResume, open_pages_resume};
+        let ck = checkpoint_on(crate::backfill::partitioner::completion_partition(), 1234);
+        assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::Skip);
+    }
+
+    #[test]
+    fn open_pages_resume_short_final_page_skips() {
+        use super::{OpenPagesResume, open_pages_resume};
+        // A 256-of-500 page means inventory ran out inside the window.
+        let key =
+            crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
+                from: 0,
+                to: 500,
+            });
+        let ck = checkpoint_on(key, 256);
+        assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::Skip);
+    }
+
+    #[test]
+    fn open_pages_resume_full_page_resumes_after_it() {
+        use super::{OpenPagesResume, open_pages_resume};
+        let key =
+            crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Page {
+                from: 500,
+                to: 1000,
+            });
+        let ck = checkpoint_on(key, 500);
+        assert_eq!(
+            open_pages_resume(Some(&ck)),
+            OpenPagesResume::ResumeFrom(1000)
+        );
+    }
+
+    #[test]
+    fn open_pages_resume_unrecognised_partition_starts_fresh() {
+        use super::{OpenPagesResume, open_pages_resume};
+        let key =
+            crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Full);
+        let ck = checkpoint_on(key, 7);
+        assert_eq!(open_pages_resume(Some(&ck)), OpenPagesResume::ResumeFrom(0));
     }
 }

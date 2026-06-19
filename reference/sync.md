@@ -222,6 +222,41 @@ partial page and the next pass comes back empty. Terminating on a short
 page instead would let a server whose query cap sits below `chunk`
 truncate cold-start hydration after one page.
 
+Resume: the `BackfillRegistry` (`BackfillState::Pending/Running/Completed`)
+is in-memory only and is wiped when the slot is torn down, so it cannot
+carry completion across an attach -> detach -> re-attach cycle. The sole
+durable record is the consumer-acked `BackfillCheckpoint` in the
+`CheckpointStore`. On completion the orchestrator broadcasts a durable
+completion marker - a synthetic empty `Batch` whose `BackfillCheckpoint`
+sits on the `completion_partition` sentinel key (`partitioner::
+completion_partition`, distinct from every `page:F:T` key) carrying the
+total items walked as `items_done`. It rides the same consumer-ack path as
+the page batches (`emit_backfill_complete` -> broadcast -> consumer
+persist+ack -> ack writer `put_backfill`), and because it is ordered
+behind every page it only lands durably after the consumer has persisted
+all of them - a crash before completion re-walks rather than recording a
+false "done". Its total-walked count wins `get_backfill`'s "latest by
+`items_done`" query, so on re-attach the marker is the checkpoint returned.
+
+Before walking an `OpenPages` scope the orchestrator reads
+`get_backfill(account, scope)` and runs the persisted checkpoint through
+the pure `open_pages_resume` decision:
+- completion sentinel -> **skip entirely** (mark `Completed`, no inventory
+  call) - the steady-state delta case for a scope of any size;
+- a short final `page:F:T` (`items_done < T - F`) -> also skip (inventory
+  ran out inside that window even if no marker landed, e.g. the consumer
+  never acked it);
+- a full `page:F:T` -> resume the walk at `T` rather than page 0;
+- no checkpoint or an unrecognised partition kind -> start fresh at 0.
+Because `get_backfill` returns a consumer-acked checkpoint, resume never
+skips a window the consumer has not durably persisted; a read error falls
+back to a full page-0 walk. (The marker's count ties a single full page
+only when the whole scope fit in one page with no live-supersedes
+overlap - the lone residual case, which costs one extra empty page request
+on re-attach, never a re-walk.) `Fixed` plans (`Full` / `TimeWindowed` /
+`UidRange`) do not yet consult `get_backfill`; their resume is a separate
+follow-up.
+
 Pause and checkpoint waiters observe backfill boundaries through the
 ack writer: it calls `SyncControl::record_checkpoint` after the
 consumer-acked `put_backfill` lands, so waiters wake on a durable,
