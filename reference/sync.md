@@ -336,6 +336,52 @@ currently empty (reserved for future push-only knobs; the
 per-account `WatchEvent` mpsc capacity lives on
 `MultiplexerConfig::watch_capacity`).
 
+## Hydration passthrough
+
+The change and inventory streams the engine broadcasts are
+projection-only. A `Change` carries `{ id, kind }`; an `InventoryEntry`
+carries a fingerprint and threading headers, never message content. A
+consumer that turns those signals into real rows (message bodies,
+attachment bytes, parsed threads) must fetch full content out-of-band.
+The `Account` handle that can do so lives behind `slot.current`
+(`ArcSwap<Arc<dyn Account>>`) and is otherwise private, so `SyncEngine`
+exposes a read-only passthrough cluster as the consumer's single door
+to hydration:
+
+- `get_stream(account, ids, projection)` -> `Account::get_stream`. The
+  primary entry: streams `ItemOutcome<HydratedObject>` for a stream of
+  ids at a chosen `Projection`.
+- `message_hydrate(account, id, projection)` -> `Account::message_hydrate`.
+  One parsed `Message` at a `HydrationProjection`.
+- `thread_hydrate(account, thread)` -> `Account::thread_hydrate`.
+- `open_raw_rfc822(account, id)` -> `Account::open_raw_rfc822`. Verbatim
+  server-assembled MIME octets.
+- `open_blob(account, handle)` / `open_blob_range(account, handle, range)`
+  -> the matching `Account` blob openers.
+
+Two deliberate properties:
+
+- **Always-live handle.** Every method resolves through the private
+  `live_account` helper, i.e. `ArcSwap::load_full`, so a hydrate issued
+  after a `RestartAccount` reopen runs against the freshly-installed
+  connection, never a stale snapshot the consumer cached. This is the
+  same discipline the spawned workers follow on their hot paths. The
+  forwarded methods return `'static` streams / futures that capture
+  their own internal `Arc` clones, so they outlive the short-lived
+  handle resolved per call; an unattached account yields
+  `Error::AccountNotAttached` up front.
+- **Read surface only.** Mutations stay funnelled through
+  `bulk_set_flags` so the idempotency / read-back / recovery pipeline
+  remains the one chokepoint for writes; cursor and push driving stay
+  engine-owned. Handing out a raw `Arc<dyn Account>` would leak both the
+  write surface and the reopen-snapshot discipline, so the engine does
+  not - it forwards the read methods explicitly instead.
+
+These calls do not pass through the `Scheduler` / `BudgetGate` (neither
+does any production path today; see below). Consumer-driven hydration
+and engine-driven backfill share the same underlying client, where
+`bifrost-net` is the rate-limit chokepoint.
+
 ## Scheduler + budget
 
 `Scheduler` is a strict-priority gate (not an executor) with four
@@ -528,7 +574,8 @@ crates/sync/src/
   engine.rs               // SyncEngine, SyncEngineBuilder,
                           // attach/detach/reopen/shutdown,
                           // ack_checkpoint, ack_writer,
-                          // handle_recovery, scope_covers_membership
+                          // handle_recovery, scope_covers_membership,
+                          // live_account + hydration passthrough
   control.rs              // SyncControl + record_checkpoint hook
   error.rs                // engine Error wrapping AccountError + Warning
   types.rs                // EngineConfig, MultiplexerConfig,

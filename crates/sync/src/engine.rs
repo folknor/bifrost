@@ -3,8 +3,9 @@
 //! Holds an `Arc<dyn AccountFactory>` per attached account, drives one
 //! multiplexer / backfill / push reconciler / mutation pipeline per
 //! slot, and exposes the engine's public surface: `attach`, `detach`,
-//! `account_changes_stream`, `bulk_*` campaign entry points,
-//! `invalidation_sink`.
+//! `account_changes_stream`, `bulk_*` campaign entry points, the
+//! read-only hydration passthrough (`get_stream`, `message_hydrate`,
+//! `open_blob`, `open_raw_rfc822`, ...), `invalidation_sink`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1090,6 +1091,141 @@ impl SyncEngine {
             totals.failed_terminal = totals.failed_terminal.saturating_add(outcome.still_failed);
         }
         Ok(totals)
+    }
+
+    // ---------- hydration passthrough ----------
+    //
+    // The change and inventory streams the engine broadcasts are
+    // projection-only: a `Change` carries `{ id, kind }` and an
+    // inventory entry carries a fingerprint, never message content. A
+    // consumer that turns those signals into real rows therefore has to
+    // fetch full content out-of-band. The `Account` handle that can do
+    // so lives behind the slot's `ArcSwap` and is otherwise private, so
+    // the engine exposes this read-only passthrough cluster as the
+    // consumer's single door to hydration.
+    //
+    // Two deliberate properties:
+    //
+    // - Every method resolves the handle through `live_account`, i.e.
+    //   `ArcSwap::load_full`, so a hydrate issued after a reopen runs
+    //   against the freshly-installed connection, never a stale snapshot
+    //   the consumer cached. This is the same discipline the spawned
+    //   workers follow on their hot paths.
+    // - Only the *read* surface is forwarded. Mutations stay funnelled
+    //   through `bulk_set_flags` (and its siblings) so the idempotency /
+    //   read-back / recovery pipeline remains the one chokepoint for
+    //   writes; cursor and push driving stay engine-owned. Handing out a
+    //   raw `Arc<dyn Account>` would leak both, so we do not.
+    //
+    // The forwarded methods return `'static` streams / futures that
+    // capture their own internal `Arc` clones, so they outlive the
+    // short-lived handle resolved per call.
+
+    /// Resolve the live `Account` handle for an attached account.
+    ///
+    /// Loads through the slot's `ArcSwap` so the caller sees the handle
+    /// installed by the most recent reopen. Errors with
+    /// `AccountNotAttached` when no slot exists for `account_id`.
+    fn live_account(&self, account_id: &AccountId) -> Result<Arc<Arc<dyn Account>>, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|r| Arc::clone(r.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        Ok(slot.current.load_full())
+    }
+
+    /// Hydrate a stream of known ids at a chosen projection.
+    ///
+    /// Forwards to [`Account::get_stream`]. The input ids are streamed
+    /// so a long fetch pass backpressures cleanly; per-item results flow
+    /// through `ItemOutcome<HydratedObject>` (`Succeeded` / `Failed` /
+    /// `Uncertain`) on the returned stream. This is the primary entry
+    /// for turning a broadcast `Change` into real content.
+    pub fn get_stream(
+        &self,
+        account_id: &AccountId,
+        ids: AccountStream<bifrost_types::ObjectId>,
+        projection: bifrost_types::Projection,
+    ) -> Result<AccountStream<SyncEvent<ItemOutcome<bifrost_types::HydratedObject>>>, Error> {
+        Ok(self.live_account(account_id)?.get_stream(ids, projection))
+    }
+
+    /// Hydrate a single message at a specific projection level.
+    ///
+    /// Forwards to [`Account::message_hydrate`]. Prefer this over a
+    /// one-id `get_stream` when the consumer wants a parsed `Message`
+    /// rather than the raw projection envelope. Protocol errors surface
+    /// as `Error::Account`; an unattached account yields
+    /// `AccountNotAttached`.
+    pub async fn message_hydrate(
+        &self,
+        account_id: &AccountId,
+        message: bifrost_types::ObjectId,
+        projection: bifrost_types::HydrationProjection,
+    ) -> Result<bifrost_types::Message, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .message_hydrate(message, projection)
+            .await?)
+    }
+
+    /// Hydrate every message in a thread.
+    ///
+    /// Forwards to [`Account::thread_hydrate`]. The protocol crate picks
+    /// the threading primitive for its backend (JMAP `Thread/get`, IMAP
+    /// `THREAD REFERENCES`, Gmail `threads.get`, Graph conversation API).
+    pub async fn thread_hydrate(
+        &self,
+        account_id: &AccountId,
+        thread: bifrost_types::ThreadId,
+    ) -> Result<bifrost_types::ThreadHydration, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .thread_hydrate(thread)
+            .await?)
+    }
+
+    /// Open a message's assembled RFC822 octets for streaming download.
+    ///
+    /// Forwards to [`Account::open_raw_rfc822`]. Yields the verbatim
+    /// server-assembled MIME bytes (never re-encoded), gated by
+    /// `capabilities().pim_methods.open_raw_rfc822`; an account whose
+    /// flag is false terminates the stream with `Unsupported`.
+    pub fn open_raw_rfc822(
+        &self,
+        account_id: &AccountId,
+        message: bifrost_types::ObjectId,
+    ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
+        Ok(self.live_account(account_id)?.open_raw_rfc822(message))
+    }
+
+    /// Open a blob for streaming download.
+    ///
+    /// Forwards to [`Account::open_blob`]. Used to pull attachment or
+    /// inline-part bytes referenced by a hydrated object's `blobs`.
+    pub fn open_blob(
+        &self,
+        account_id: &AccountId,
+        handle: bifrost_types::BlobHandle,
+    ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
+        Ok(self.live_account(account_id)?.open_blob(handle))
+    }
+
+    /// Open a byte range of a blob for streaming download.
+    ///
+    /// Forwards to [`Account::open_blob_range`]. Errors with
+    /// `Unsupported(OpenBlobRange)` on the stream where the blob's
+    /// capability flag is false.
+    pub fn open_blob_range(
+        &self,
+        account_id: &AccountId,
+        handle: bifrost_types::BlobHandle,
+        range: bifrost_types::ByteRange,
+    ) -> Result<AccountStream<SyncEvent<bytes::Bytes>>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .open_blob_range(handle, range))
     }
 
     /// Scheduler handle for advanced consumers (tests, instrumentation).
