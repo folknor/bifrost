@@ -150,14 +150,15 @@ pub fn parse_page_partition(partition: &Partition) -> Option<(u32, u32)> {
     Some((from.parse().ok()?, to.parse().ok()?))
 }
 
-/// Sentinel partition key marking an open-ended page scope as fully
-/// exhausted. It does not name a window (no `from:to`); it is a durable
-/// "backfill is done" flag the orchestrator writes via the normal
-/// consumer-ack path on completion. Distinct from every real `page:F:T`
-/// key so it never collides with a window checkpoint, and ordered to win
-/// `get_backfill`'s "latest by items_done" query (the marker carries the
-/// total items walked, >= any single window's count) so a completed scope
-/// is recognised and skipped without re-walking.
+/// Sentinel partition key marking a scope's backfill as fully exhausted.
+/// It does not name a window (no `from:to`); it is a durable "backfill is
+/// done" flag the orchestrator writes via the normal consumer-ack path on
+/// completion, for both fixed plans and open-ended page walks. Distinct
+/// from every real `page:F:T` / `uid:F:T` / `time:F:T` key so it never
+/// collides with a partition checkpoint. The orchestrator stamps it with
+/// `items_done = total_walked + 1` so it strictly wins `get_backfill`'s
+/// "latest by items_done" query and a completed scope is recognised and
+/// skipped without re-walking.
 #[must_use]
 pub fn completion_partition() -> Partition {
     Partition(b"complete".to_vec())

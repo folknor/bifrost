@@ -1438,13 +1438,37 @@ async fn run_backfill_orchestrator(
         let acc: &dyn Account = acc_arc.as_ref().as_ref();
         match backfill_plan_for(acc, &scope, config) {
             BackfillPlan::Fixed(partitions) => {
+                // Skip a scope whose backfill already completed on a prior
+                // run. A fixed plan has no positional "resume from here"
+                // (its partitions are a known, finite set, not an open page
+                // walk), so the durable signal is binary: the completion
+                // marker is present (skip the whole plan) or it is not
+                // (walk every partition; re-emitting acked pages is
+                // idempotent, so a crash mid-plan simply re-walks).
+                match store.get_backfill(&account_id, &scope).await {
+                    Ok(opt) => {
+                        if backfill_complete_recorded(opt.as_ref()) {
+                            registry.mark(scope.clone(), BackfillState::Completed);
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "bifrost.sync.backfill",
+                            scope = ?scope,
+                            error = %err,
+                            "backfill resume read failed; re-walking all partitions"
+                        );
+                    }
+                }
                 registry.mark(scope.clone(), BackfillState::Running);
                 let mut completed = true;
+                let mut total_seen = 0_u64;
                 for partition in partitions {
                     if shutdown.is_cancelled() {
                         return;
                     }
-                    if let Err(err) = BackfillRunner::run_partition(
+                    match BackfillRunner::run_partition(
                         acc,
                         scope.clone(),
                         partition,
@@ -1454,15 +1478,23 @@ async fn run_backfill_orchestrator(
                     )
                     .await
                     {
-                        tracing::warn!(
-                            target: "bifrost.sync.backfill",
-                            scope = ?scope,
-                            error = %err,
-                            "backfill partition failed; leaving scope Pending"
-                        );
-                        completed = false;
-                        break;
+                        Ok(outcome) => {
+                            total_seen = total_seen.saturating_add(outcome.seen);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "bifrost.sync.backfill",
+                                scope = ?scope,
+                                error = %err,
+                                "backfill partition failed; leaving scope Pending"
+                            );
+                            completed = false;
+                            break;
+                        }
                     }
+                }
+                if completed {
+                    emit_backfill_complete(changes_tx.as_ref(), &scope, total_seen);
                 }
                 registry.mark(
                     scope.clone(),
@@ -1584,6 +1616,16 @@ enum OpenPagesResume {
     ResumeFrom(u32),
 }
 
+/// True if the persisted checkpoint is the durable completion marker: a
+/// prior run walked the whole scope to exhaustion and the consumer acked
+/// it. The single skip-on-complete signal shared by fixed and open-ended
+/// plans; `get_backfill` only ever returns consumer-acked checkpoints, so
+/// a marker means every page the consumer needed was durably persisted.
+fn backfill_complete_recorded(checkpoint: Option<&BackfillCheckpoint>) -> bool {
+    checkpoint
+        .is_some_and(|ck| crate::backfill::partitioner::is_completion_partition(&ck.partition))
+}
+
 /// Map the persisted backfill checkpoint to a resume decision.
 ///
 /// - The completion sentinel means a prior run reached exhaustion and the
@@ -1597,12 +1639,12 @@ enum OpenPagesResume {
 /// Resume never skips a window the consumer has not durably persisted,
 /// because `get_backfill` only ever returns consumer-acked checkpoints.
 fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> OpenPagesResume {
+    if backfill_complete_recorded(checkpoint) {
+        return OpenPagesResume::Skip;
+    }
     let Some(checkpoint) = checkpoint else {
         return OpenPagesResume::ResumeFrom(0);
     };
-    if crate::backfill::partitioner::is_completion_partition(&checkpoint.partition) {
-        return OpenPagesResume::Skip;
-    }
     if let Some((from, to)) =
         crate::backfill::partitioner::parse_page_partition(&checkpoint.partition)
     {
@@ -1615,14 +1657,19 @@ fn open_pages_resume(checkpoint: Option<&BackfillCheckpoint>) -> OpenPagesResume
     OpenPagesResume::ResumeFrom(0)
 }
 
-/// Broadcast a durable backfill-completion marker for an open-ended page
-/// scope. The marker is a synthetic empty `Batch` carrying a
-/// `BackfillCheckpoint` on the `completion_partition` sentinel key; it
-/// flows through the consumer-ack path exactly like a page batch, so the
-/// store only records completion after the consumer has durably persisted
-/// every page. `total_seen` is stamped as `items_done` (and
-/// `items_estimated`) so the marker wins `get_backfill`'s "latest by
-/// items_done" query and the scope is recognised as complete on re-attach.
+/// Broadcast a durable backfill-completion marker for a scope. The marker
+/// is a synthetic empty `Batch` carrying a `BackfillCheckpoint` on the
+/// `completion_partition` sentinel key; it flows through the consumer-ack
+/// path exactly like a page batch, so the store only records completion
+/// after the consumer has durably persisted every page. A crash before the
+/// marker is acked therefore re-walks rather than recording a false "done".
+///
+/// `items_done` is set one past `total_seen` so the marker strictly wins
+/// `get_backfill`'s "latest by items_done" query regardless of how a store
+/// breaks ties: every per-partition checkpoint records its forwarded count
+/// (`<= total_seen`), so `total_seen + 1` is guaranteed larger and the
+/// marker is the row returned on re-attach. The honest total rides in
+/// `items_estimated`.
 fn emit_backfill_complete(
     changes_tx: Option<&broadcast::Sender<MultiplexerEvent>>,
     scope: &CursorScope,
@@ -1636,7 +1683,7 @@ fn emit_backfill_complete(
         partition: crate::backfill::partitioner::completion_partition(),
         progress_marker: None,
         progress: BackfillProgress {
-            items_done: total_seen,
+            items_done: total_seen.saturating_add(1),
             items_estimated: Some(total_seen),
         },
         envelope_version: crate::cursor::ENGINE_VERSION,
@@ -2757,6 +2804,23 @@ mod tests {
             },
             envelope_version: 1,
         }
+    }
+
+    #[test]
+    fn backfill_complete_recorded_detects_sentinel() {
+        use super::backfill_complete_recorded;
+        assert!(!backfill_complete_recorded(None));
+
+        let marker = checkpoint_on(crate::backfill::partitioner::completion_partition(), 99);
+        assert!(backfill_complete_recorded(Some(&marker)));
+
+        // A real partition checkpoint (e.g. a fully-walked Full plan) is
+        // not the completion signal.
+        let full = checkpoint_on(
+            crate::backfill::partitioner::partition_key(&bifrost_types::InventoryPartition::Full),
+            99,
+        );
+        assert!(!backfill_complete_recorded(Some(&full)));
     }
 
     #[test]

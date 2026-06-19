@@ -229,33 +229,38 @@ durable record is the consumer-acked `BackfillCheckpoint` in the
 `CheckpointStore`. On completion the orchestrator broadcasts a durable
 completion marker - a synthetic empty `Batch` whose `BackfillCheckpoint`
 sits on the `completion_partition` sentinel key (`partitioner::
-completion_partition`, distinct from every `page:F:T` key) carrying the
-total items walked as `items_done`. It rides the same consumer-ack path as
-the page batches (`emit_backfill_complete` -> broadcast -> consumer
-persist+ack -> ack writer `put_backfill`), and because it is ordered
-behind every page it only lands durably after the consumer has persisted
-all of them - a crash before completion re-walks rather than recording a
-false "done". Its total-walked count wins `get_backfill`'s "latest by
-`items_done`" query, so on re-attach the marker is the checkpoint returned.
+completion_partition`, distinct from every `page:F:T` / `uid:F:T` /
+`time:F:T` key). It rides the same consumer-ack path as the page batches
+(`emit_backfill_complete` -> broadcast -> consumer persist+ack -> ack
+writer `put_backfill`), and because it is ordered behind every page it
+only lands durably after the consumer has persisted all of them - a crash
+before completion re-walks rather than recording a false "done". Its
+`items_done` is stamped at `total_walked + 1` (the honest total rides in
+`items_estimated`) so it strictly wins `get_backfill`'s "latest by
+`items_done`" query regardless of how a store breaks ties, and on
+re-attach the marker is the checkpoint returned.
 
-Before walking an `OpenPages` scope the orchestrator reads
-`get_backfill(account, scope)` and runs the persisted checkpoint through
-the pure `open_pages_resume` decision:
-- completion sentinel -> **skip entirely** (mark `Completed`, no inventory
-  call) - the steady-state delta case for a scope of any size;
-- a short final `page:F:T` (`items_done < T - F`) -> also skip (inventory
-  ran out inside that window even if no marker landed, e.g. the consumer
-  never acked it);
-- a full `page:F:T` -> resume the walk at `T` rather than page 0;
-- no checkpoint or an unrecognised partition kind -> start fresh at 0.
+This skip-on-complete signal is uniform across plan kinds; the difference
+is whether positional resume is also possible:
+
+- **`OpenPages`** (JMAP Email): the orchestrator runs the persisted
+  checkpoint through the pure `open_pages_resume` decision - completion
+  sentinel -> **skip entirely**; a short final `page:F:T`
+  (`items_done < T - F`) -> also skip (inventory ran out inside that window
+  even if no marker landed, e.g. the consumer never acked it); a full
+  `page:F:T` -> resume the walk at `T` rather than page 0; no checkpoint or
+  an unrecognised partition kind -> start fresh at 0.
+- **`Fixed`** (`Full` / `TimeWindowed` / `UidRange`): the partition list is
+  a known finite set with no positional "resume from here", so the signal
+  is binary - the completion marker is present (`backfill_complete_recorded`
+  -> **skip the whole plan**, no inventory call) or it is not (walk every
+  partition). A crash mid-plan leaves no marker and re-walks all partitions
+  on re-attach; re-emitting consumer-acked pages is idempotent, so nothing
+  is lost. Positional mid-plan resume is a possible future refinement.
+
 Because `get_backfill` returns a consumer-acked checkpoint, resume never
 skips a window the consumer has not durably persisted; a read error falls
-back to a full page-0 walk. (The marker's count ties a single full page
-only when the whole scope fit in one page with no live-supersedes
-overlap - the lone residual case, which costs one extra empty page request
-on re-attach, never a re-walk.) `Fixed` plans (`Full` / `TimeWindowed` /
-`UidRange`) do not yet consult `get_backfill`; their resume is a separate
-follow-up.
+back to a full walk.
 
 Pause and checkpoint waiters observe backfill boundaries through the
 ack writer: it calls `SyncControl::record_checkpoint` after the
