@@ -213,7 +213,7 @@ Validation rules in `state::decode`:
 
 Supported scopes for `inventory_stream` and `changes_stream`:
 
-- `CursorScope::Type(ObjectType::Email)` - inventory paginates `Email/query` (`receivedAt` desc) then `Email/get` with a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` emitting Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes `Page { from, to }` for Email only.
+- `CursorScope::Type(ObjectType::Email)` - inventory paginates `Email/query` (`receivedAt` desc) then `Email/get` with a fixed property set (Id, MailboxIds, ThreadId, BlobId, Size, Keywords, MessageId, References, InReplyTo, ReceivedAt). Changes use `Email/changes` emitting Created/Updated/Destroyed `ObjectChange`s. `inventory_partitioning` exposes `Page { from, to }` for Email only. The page-windowed stream (`email_inventory_page`) pages `Email/query` internally to fill its `[from, to)` window, advancing position by the count the server actually returned and stopping only on an empty query page - a server whose query page cap is below the window width must not be read as end-of-inventory (it would truncate the backfill), so a short page is never the terminal signal.
 - `CursorScope::Type(ObjectType::Mailbox)` - inventory is a single `Mailbox/get` (Id, Name, ParentId, Role, SortOrder, totals, unread counts, IsSubscribed). Changes use `Mailbox/changes`.
 - `CursorScope::Type(ObjectType::Thread)` - changes use `Thread/changes`; inventory fatals (thread inventory derives from email inventory).
 - `CursorScope::Query(_)` - changes use `Email/queryChanges` and surface `ScopeChange` events; inventory fatals (registered query definitions are out of scope for the v1 trait).

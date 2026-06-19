@@ -1476,7 +1476,18 @@ async fn run_backfill_orchestrator(
                     .await
                     {
                         Ok(outcome) => {
-                            if outcome.seen < u64::from(chunk) {
+                            // Terminate only on a genuinely empty page, never
+                            // on a merely short one. A partition stream whose
+                            // server caps a page below the requested `chunk`
+                            // (e.g. a JMAP Email/query cap below the window
+                            // width) returns fewer entries than asked for;
+                            // treating that as exhaustion silently drops every
+                            // later page. The Page partition stream fills its
+                            // window by paging internally past any such cap, so
+                            // an empty window is the unambiguous end-of-inventory
+                            // boundary - a short window means the final partial
+                            // page, and the next pass returns empty.
+                            if outcome.seen == 0 {
                                 break;
                             }
                             from = to;

@@ -211,6 +211,17 @@ from `discover_cursor_scopes()` and plans partitions from
 chunking). `Full` falls through as a single partition; JMAP
 Email currently advertises open-ended `PageCount`.
 
+Open-ended `PageCount` (`total: None`) drives `BackfillPlan::OpenPages`:
+the orchestrator walks `Page { from, to }` windows of width `chunk`,
+advancing `from = to` each pass, and terminates only when a pass returns
+a genuinely empty page (`outcome.seen == 0`), never on a merely short
+one. The contract this rests on: an `OpenPages` partition stream MUST
+fill its window (paging internally past any server-side page cap below
+the window width) so that a short window is unambiguously the final
+partial page and the next pass comes back empty. Terminating on a short
+page instead would let a server whose query cap sits below `chunk`
+truncate cold-start hydration after one page.
+
 Pause and checkpoint waiters observe backfill boundaries through the
 ack writer: it calls `SyncControl::record_checkpoint` after the
 consumer-acked `put_backfill` lands, so waiters wake on a durable,
