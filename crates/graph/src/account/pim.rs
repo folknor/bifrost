@@ -1728,9 +1728,9 @@ fn select_query(select: &str) -> String {
 
 fn hydrate_select(expand_attachments: bool) -> &'static str {
     if expand_attachments {
-        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments"
+        "$select=id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey&$expand=attachments"
     } else {
-        "id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey"
+        "id,conversationId,subject,bodyPreview,body,uniqueBody,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,sentDateTime,parentFolderId,isRead,importance,categories,flag,internetMessageHeaders,internetMessageId,hasAttachments,changeKey"
     }
 }
 
