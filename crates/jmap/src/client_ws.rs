@@ -84,12 +84,6 @@ enum WebSocketPushDisableType {
     WebSocketPushDisable,
 }
 
-#[derive(Deserialize, Debug)]
-pub(crate) struct WebSocketPushObject {
-    #[serde(flatten)]
-    pub(crate) push: PushObject,
-}
-
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebSocketError {
     #[serde(rename = "requestId")]
@@ -103,13 +97,21 @@ pub(crate) struct WebSocketError {
     limit: Option<String>,
 }
 
+// RFC 8887 frames carry exactly one `@type` discriminator. This
+// enum's tag consumes it, so the payload variants must inline the
+// post-tag fields directly. A nested `#[serde(tag = "@type")]` type
+// (e.g. `PushObject`) would look for a second `@type` that the wire
+// never sends and fail with `protocol.parse-failed`. The match arm
+// below rebuilds a `PushObject` for the downstream stream output.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "@type")]
 enum WebSocketMessage_ {
     Response(WebSocketResponse),
-    StateChange(WebSocketPushObject),
+    StateChange {
+        changed: HashMap<String, HashMap<DataType, String>>,
+    },
     #[cfg(feature = "calendars")]
-    CalendarAlert(WebSocketPushObject),
+    CalendarAlert(crate::CalendarAlert),
     RequestError(WebSocketError),
 }
 
@@ -200,12 +202,12 @@ impl Client {
                                         Err(e) => yield Err(crate::Error::ResponseDecode(e)),
                                     }
                                 }
-                                WebSocketMessage_::StateChange(push) => {
-                                    yield Ok(WebSocketMessage::PushNotification(push.push))
+                                WebSocketMessage_::StateChange { changed } => {
+                                    yield Ok(WebSocketMessage::PushNotification(PushObject::StateChange { changed }))
                                 }
                                 #[cfg(feature = "calendars")]
-                                WebSocketMessage_::CalendarAlert(push) => {
-                                    yield Ok(WebSocketMessage::PushNotification(push.push))
+                                WebSocketMessage_::CalendarAlert(alert) => {
+                                    yield Ok(WebSocketMessage::PushNotification(PushObject::CalendarAlert(alert)))
                                 }
                                 WebSocketMessage_::RequestError(err) => yield Err(ProblemDetails::from(err).into()),
                             },
@@ -385,5 +387,24 @@ mod tests {
             err,
             crate::Error::WebSocketSetup(crate::WebSocketSetupError::Subprotocol(_))
         ));
+    }
+
+    // A real RFC 8887 StateChange frame carries exactly one `@type`.
+    // The outer enum tag consumes it, so the variant must inline
+    // `changed` directly; a nested `#[serde(tag = "@type")]` payload
+    // would demand a second `@type` the wire never sends.
+    #[test]
+    fn deserializes_single_type_state_change_frame() {
+        let frame = r#"{"@type":"StateChange","changed":{"u1138":{"Mailbox":"f9a8d3"}}}"#;
+
+        let message: WebSocketMessage_ = serde_json::from_str(frame).unwrap();
+
+        let WebSocketMessage_::StateChange { changed } = message else {
+            panic!("expected StateChange variant, got {message:?}");
+        };
+
+        let by_type = changed.get("u1138").expect("account entry present");
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type.values().next().map(String::as_str), Some("f9a8d3"));
     }
 }
