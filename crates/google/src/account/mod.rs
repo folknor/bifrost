@@ -83,6 +83,30 @@ impl GoogleAccountFactory {
         Self::from_client(GmailClient::with_source(source))
     }
 
+    /// Construct a Google factory from a bearer access token, redirecting
+    /// the Gmail API base. Test seam mirroring `bifrost-graph`'s
+    /// `GraphClient::with_api_base`: lets a harness point Gmail requests at a
+    /// mock endpoint instead of `www.googleapis.com`.
+    #[must_use]
+    pub fn from_access_token_with_api_base(
+        access_token: impl Into<String>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        Self::from_client(GmailClient::with_api_base(api_base, access_token))
+    }
+
+    /// Construct a Google factory from a shared token source, redirecting the
+    /// Gmail API base. Test seam mirroring `bifrost-graph`'s
+    /// `GraphClient::with_source`: combines a live `OAuthRefresher` (or any
+    /// `TokenSource`) with a mock Gmail endpoint.
+    #[must_use]
+    pub fn from_token_source_with_api_base(
+        source: Arc<dyn TokenSource>,
+        api_base: impl Into<String>,
+    ) -> Self {
+        Self::from_client(GmailClient::with_api_base_and_source(api_base, source))
+    }
+
     /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {

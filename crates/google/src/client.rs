@@ -33,7 +33,12 @@ impl GmailClient {
         Self::with_api_base(GMAIL_API_BASE, access_token)
     }
 
-    fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
+    // pub(crate): the factory's `from_access_token_with_api_base` test seam
+    // builds a bearer-token client against a redirected Gmail base.
+    pub(crate) fn with_api_base(
+        api_base: impl Into<String>,
+        access_token: impl Into<String>,
+    ) -> Self {
         let token_source: Arc<dyn TokenSource> =
             Arc::new(StaticTokenSource::new(access_token, None));
         Self::with_api_base_and_source(api_base, token_source)
@@ -46,7 +51,10 @@ impl GmailClient {
         Self::with_api_base_and_source(GMAIL_API_BASE, source)
     }
 
-    fn with_api_base_and_source(
+    // pub(crate): the factory's `from_token_source_with_api_base` test seam
+    // routes a refresher-backed client at a redirected Gmail base, mirroring
+    // bifrost-graph's `with_source`.
+    pub(crate) fn with_api_base_and_source(
         api_base: impl Into<String>,
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
