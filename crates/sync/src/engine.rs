@@ -1098,6 +1098,274 @@ impl SyncEngine {
         Ok(totals)
     }
 
+    /// Drive a single-account bulk-move campaign against an attached
+    /// account, routing every target into `destination`.
+    ///
+    /// Shares the idempotency / retry / recovery loop with
+    /// [`Self::bulk_set_flags`] (see [`Self::run_bulk_pipeline`]); the
+    /// only differences are the wire op (`Account::bulk_move`) and the
+    /// read-back guard, which reconciles against container membership
+    /// rather than a flag set. Like `bulk_set_flags`, this is the
+    /// volume path where the read-back guard and idempotency key matter,
+    /// so it is NOT a one-shot direct call.
+    pub async fn bulk_move(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::ObjectId>,
+        destination: MembershipScope,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            targets,
+            BulkPipelineOp::Move(destination),
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
+    /// Drive a single-account bulk-destroy campaign against an attached
+    /// account.
+    ///
+    /// Shares the idempotency / retry / recovery loop with
+    /// [`Self::bulk_set_flags`] (see [`Self::run_bulk_pipeline`]); the
+    /// wire op is `Account::bulk_destroy` and the read-back guard
+    /// reconciles against object *absence* (a destroyed id no longer
+    /// hydrates). NOT a one-shot direct call, for the same reason as
+    /// `bulk_set_flags`.
+    pub async fn bulk_destroy(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::ObjectId>,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.run_bulk_pipeline(
+            account_id,
+            targets,
+            BulkPipelineOp::Destroy,
+            vendor,
+            protocol,
+        )
+        .await
+    }
+
+    /// Shared bulk-mutation pipeline backing [`Self::bulk_move`] and
+    /// [`Self::bulk_destroy`].
+    ///
+    /// Mirrors [`Self::bulk_set_flags`] exactly - idempotency-key
+    /// vending, the per-id `classify_item_outcome` accumulation, the
+    /// retry loop, the stream-terminated recovery dispatch
+    /// (Retry / Reconcile / Engine / Terminal), and the final read-back
+    /// guard - with two op-specific seams: the wire submit call and the
+    /// matching read-back guard. `bulk_set_flags` deliberately keeps its
+    /// own copy of the loop (its read-back is `FlagOp`-shaped); this
+    /// helper is the move/destroy counterpart whose read-back is
+    /// membership/absence-shaped.
+    async fn run_bulk_pipeline(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::ObjectId>,
+        op: BulkPipelineOp,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
+        use crate::recovery::{RecoveryPlan, plan_recovery};
+        let slot = self
+            .accounts
+            .get(account_id)
+            .map(|r| Arc::clone(r.value()))
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        let max_retries = self.config.mutation_max_retries;
+
+        let key = vendor.next(protocol);
+
+        let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
+        let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
+        let mut readback_ids: Vec<bifrost_types::ObjectId> = Vec::new();
+        let mut dedupe_count: u64 = 0;
+        let mut remaining: Vec<bifrost_types::ObjectId> = targets;
+        let mut attempt: u32 = 0;
+        let mut retry_advice: Option<RetryAdvice> = None;
+        let mut blocked_by_engine: bool = false;
+
+        loop {
+            if let Some(advice) = retry_advice.take() {
+                let delay = crate::recovery::retry_delay(
+                    &advice,
+                    std::time::SystemTime::now(),
+                    Duration::from_secs(1),
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            let account = slot.current.load_full();
+            let target_stream: AccountStream<bifrost_types::ObjectId> =
+                Box::pin(futures::stream::iter(remaining.clone()));
+            let mut stream = match &op {
+                BulkPipelineOp::Move(destination) => {
+                    account.bulk_move(target_stream, destination.clone(), key.clone())
+                }
+                BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
+            };
+            retry_ids.clear();
+            readback_ids.clear();
+            let mut stream_termination_advice: Option<RetryAdvice> = None;
+
+            while let Some(event) = stream.next().await {
+                match event {
+                    bifrost_types::SyncEvent::Batch(batch) => {
+                        for item in batch.items {
+                            classify_item_outcome(
+                                item,
+                                &mut outcomes,
+                                &mut retry_ids,
+                                &mut readback_ids,
+                                &mut dedupe_count,
+                            );
+                        }
+                    }
+                    bifrost_types::SyncEvent::Terminated(err) => {
+                        let original = err.clone();
+                        match plan_recovery(err) {
+                            RecoveryPlan::Retry(advice) => {
+                                stream_termination_advice = Some(advice);
+                                break;
+                            }
+                            RecoveryPlan::Reconcile(advice) => {
+                                let mut wants_dedupe = false;
+                                for action in &advice.guidance.actions {
+                                    match action {
+                                        ReconcileAction::CheckTarget => {}
+                                        ReconcileAction::DedupeByClientId => wants_dedupe = true,
+                                        _ => {}
+                                    }
+                                }
+                                for id in &remaining {
+                                    if !matches!(
+                                        outcomes.get(id),
+                                        Some(
+                                            MutationBucket::Applied
+                                                | MutationBucket::Skipped
+                                                | MutationBucket::FailedTerminal
+                                        )
+                                    ) {
+                                        readback_ids.push(id.clone());
+                                        outcomes
+                                            .insert(id.clone(), MutationBucket::PendingReadback);
+                                    }
+                                }
+                                if wants_dedupe {
+                                    dedupe_count = dedupe_count.saturating_add(1);
+                                    let warning = bifrost_types::Warning::user_safe(
+                                        bifrost_types::WarningKind::OperatorAttentionNeeded,
+                                        "reconcile requested dedupe-by-client-id; consumer must dedupe",
+                                    );
+                                    let me = MultiplexerEvent {
+                                        scope: CursorScope::Account,
+                                        event: Arc::new(SyncEvent::Warning(warning)),
+                                        checkpoint: None,
+                                    };
+                                    let _ = slot.multiplexer.changes_tx.send(me);
+                                }
+                                break;
+                            }
+                            RecoveryPlan::Engine(directive) => {
+                                let directive_scope =
+                                    crate::recovery::directive_target_scope(&directive);
+                                let _ = slot
+                                    .reopen_tx
+                                    .send(ReopenRequest::Recovery {
+                                        scope: directive_scope,
+                                        error: original,
+                                    })
+                                    .await;
+                                blocked_by_engine = true;
+                                for id in &remaining {
+                                    if !matches!(
+                                        outcomes.get(id),
+                                        Some(
+                                            MutationBucket::Applied
+                                                | MutationBucket::Skipped
+                                                | MutationBucket::FailedTerminal
+                                        )
+                                    ) {
+                                        outcomes
+                                            .insert(id.clone(), MutationBucket::BlockedByEngine);
+                                    }
+                                }
+                                break;
+                            }
+                            RecoveryPlan::Terminal(fatal) => {
+                                return Err(Error::Account(fatal.into_inner()));
+                            }
+                        }
+                    }
+                    bifrost_types::SyncEvent::Done(_) => break,
+                    bifrost_types::SyncEvent::Progress(_)
+                    | bifrost_types::SyncEvent::Warning(_) => {}
+                    _ => {}
+                }
+            }
+
+            if blocked_by_engine {
+                break;
+            }
+
+            attempt = attempt.saturating_add(1);
+            let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
+            let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
+                .iter()
+                .filter(|id| retry_set.contains(*id))
+                .cloned()
+                .collect();
+            if attempt < max_retries && !next_remaining.is_empty() {
+                retry_advice = stream_termination_advice;
+                std::mem::swap(&mut remaining, &mut next_remaining);
+                continue;
+            }
+            for id in &retry_set {
+                readback_ids.push(id.clone());
+                outcomes.insert(id.clone(), MutationBucket::PendingRetry);
+            }
+            break;
+        }
+
+        let mut totals = counters_from_outcomes(&outcomes);
+        for _ in 0..dedupe_count {
+            totals.record_dedupe_by_client_id();
+        }
+        if !readback_ids.is_empty() {
+            let account = slot.current.load_full();
+            let outcome = match &op {
+                BulkPipelineOp::Move(destination) => {
+                    crate::mutation::run_move_readback_guard(
+                        account.as_ref().as_ref(),
+                        readback_ids,
+                        destination,
+                    )
+                    .await?
+                }
+                BulkPipelineOp::Destroy => {
+                    crate::mutation::run_destroy_readback_guard(
+                        account.as_ref().as_ref(),
+                        readback_ids,
+                    )
+                    .await?
+                }
+            };
+            totals.pending_retry = totals
+                .pending_retry
+                .saturating_sub(outcome.skipped)
+                .saturating_sub(outcome.still_failed);
+            totals.skipped = totals.skipped.saturating_add(outcome.skipped);
+            totals.failed_terminal = totals.failed_terminal.saturating_add(outcome.still_failed);
+        }
+        Ok(totals)
+    }
+
     // ---------- hydration passthrough ----------
     //
     // The change and inventory streams the engine broadcasts are
@@ -1231,6 +1499,308 @@ impl SyncEngine {
         Ok(self
             .live_account(account_id)?
             .open_blob_range(handle, range))
+    }
+
+    // ---------- mutation passthrough (direct) ----------
+    //
+    // The write-side companion to the read-only hydration cluster above:
+    // the single-object conveniences, membership primitives, and
+    // container CRUD a consumer needs to drive object-level mutations
+    // against the live attached connection without holding the
+    // engine-private `Arc<dyn Account>`. Like the read cluster, every
+    // method resolves through `live_account` (so a mutation issued after
+    // a reopen runs against the freshly-installed connection, never a
+    // stale snapshot the consumer cached) and forwards to the matching
+    // `Account` method 1:1, inventing no new semantics.
+    //
+    // These are DIRECT - one wire op each - and deliberately bypass the
+    // idempotency / read-back / recovery pipeline. That pipeline guards
+    // the *volume* mutations (`bulk_set_flags`, `bulk_move`,
+    // `bulk_destroy`), where a partial-apply replay across a retry would
+    // corrupt state and the read-back guard earns its keep. A
+    // single-object convenience carries no batch idempotency key and is
+    // cheap to reissue, so routing it through the pipeline would buy
+    // nothing. An unattached account yields `Error::AccountNotAttached`
+    // up front; the forwarded `Account` future is `'static` and captures
+    // its own `Arc` clones, so it outlives the short-lived handle
+    // resolved per call.
+
+    /// Toggle the starred / flagged bit on `target`. Forwards to
+    /// [`Account::set_starred`].
+    pub async fn set_starred(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        starred: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_starred(target, starred)
+            .await?)
+    }
+
+    /// Set or clear `target`'s read state. Forwards to
+    /// [`Account::set_read`].
+    pub async fn set_read(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        is_read: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_read(target, is_read)
+            .await?)
+    }
+
+    /// Apply `label` to `target`. Forwards to [`Account::apply_label`],
+    /// which dispatches by `label.provenance` to the right primitive.
+    pub async fn apply_label(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        label: bifrost_types::Label,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .apply_label(target, label)
+            .await?)
+    }
+
+    /// Remove `label` from `target`. Forwards to
+    /// [`Account::remove_label`].
+    pub async fn remove_label(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        label: bifrost_types::Label,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .remove_label(target, label)
+            .await?)
+    }
+
+    /// Mark `message` as replied. Forwards to [`Account::mark_replied`].
+    pub async fn mark_replied(
+        &self,
+        account_id: &AccountId,
+        message: bifrost_types::ObjectId,
+    ) -> Result<(), Error> {
+        Ok(self.live_account(account_id)?.mark_replied(message).await?)
+    }
+
+    /// Mark `message` as forwarded. Forwards to
+    /// [`Account::mark_forwarded`].
+    pub async fn mark_forwarded(
+        &self,
+        account_id: &AccountId,
+        message: bifrost_types::ObjectId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .mark_forwarded(message)
+            .await?)
+    }
+
+    /// Persist that an MDN (read receipt) was dispatched for `message`.
+    /// Forwards to [`Account::mark_mdn_sent`].
+    pub async fn mark_mdn_sent(
+        &self,
+        account_id: &AccountId,
+        message: bifrost_types::ObjectId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .mark_mdn_sent(message)
+            .await?)
+    }
+
+    /// Move a thread between containers. Forwards to
+    /// [`Account::move_thread`]; the protocol crate composes the
+    /// add-then-remove pair against its own `Arc`-shaped handle.
+    pub async fn move_thread(
+        &self,
+        account_id: &AccountId,
+        thread: bifrost_types::ThreadId,
+        target: bifrost_types::ContainerId,
+        source: Option<bifrost_types::ContainerId>,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .move_thread(thread, target, source)
+            .await?)
+    }
+
+    /// Move a thread to Trash, or delete-permanently if already in Trash.
+    /// Forwards to [`Account::delete_thread`].
+    pub async fn delete_thread(
+        &self,
+        account_id: &AccountId,
+        thread: bifrost_types::ThreadId,
+        current: Option<bifrost_types::ContainerId>,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .delete_thread(thread, current)
+            .await?)
+    }
+
+    /// Add `target` to `container`. Forwards to
+    /// [`Account::add_to_container`].
+    pub async fn add_to_container(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        container: bifrost_types::ContainerId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .add_to_container(target, container)
+            .await?)
+    }
+
+    /// Remove `target` from `container`. Forwards to
+    /// [`Account::remove_from_container`]. Providers without a symmetric
+    /// remove (Graph) surface `Unsupported(RemoveFromContainer)`.
+    pub async fn remove_from_container(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        container: bifrost_types::ContainerId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .remove_from_container(target, container)
+            .await?)
+    }
+
+    /// Set or clear `target`'s read state. The membership-primitive
+    /// spelling; forwards to [`Account::set_is_read`].
+    pub async fn set_is_read(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        is_read: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_is_read(target, is_read)
+            .await?)
+    }
+
+    /// Set or clear a single IMAP / JMAP keyword on `target`. Forwards to
+    /// [`Account::set_keyword`].
+    pub async fn set_keyword(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        keyword: String,
+        value: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_keyword(target, keyword, value)
+            .await?)
+    }
+
+    /// Set or clear membership in a Gmail-style label. Forwards to
+    /// [`Account::set_label_membership`].
+    pub async fn set_label_membership(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        label: bifrost_types::ContainerId,
+        value: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_label_membership(target, label, value)
+            .await?)
+    }
+
+    /// Set or clear a Graph category on `target`. Forwards to
+    /// [`Account::set_category`].
+    pub async fn set_category(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        category: String,
+        value: bool,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_category(target, category, value)
+            .await?)
+    }
+
+    /// Set `target`'s importance to exactly `level`. Forwards to
+    /// [`Account::set_importance`].
+    pub async fn set_importance(
+        &self,
+        account_id: &AccountId,
+        target: bifrost_types::MutationTarget,
+        level: bifrost_types::Importance,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .set_importance(target, level)
+            .await?)
+    }
+
+    /// Create a new container of `kind` named `name` under `parent`.
+    /// Forwards to [`Account::container_create`]; returns the
+    /// engine-facing id.
+    pub async fn container_create(
+        &self,
+        account_id: &AccountId,
+        kind: bifrost_types::ContainerKind,
+        name: String,
+        parent: Option<bifrost_types::ContainerId>,
+    ) -> Result<bifrost_types::ContainerId, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .container_create(kind, name, parent)
+            .await?)
+    }
+
+    /// Rename a container. Forwards to [`Account::container_rename`].
+    pub async fn container_rename(
+        &self,
+        account_id: &AccountId,
+        container: bifrost_types::ContainerId,
+        name: String,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .container_rename(container, name)
+            .await?)
+    }
+
+    /// Move a container under a new parent. Forwards to
+    /// [`Account::container_move`].
+    pub async fn container_move(
+        &self,
+        account_id: &AccountId,
+        container: bifrost_types::ContainerId,
+        new_parent: Option<bifrost_types::ContainerId>,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .container_move(container, new_parent)
+            .await?)
+    }
+
+    /// Delete a container. Forwards to [`Account::container_delete`].
+    pub async fn container_delete(
+        &self,
+        account_id: &AccountId,
+        container: bifrost_types::ContainerId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .container_delete(container)
+            .await?)
     }
 
     /// Scheduler handle for advanced consumers (tests, instrumentation).
@@ -2556,6 +3126,20 @@ impl Drop for SyncEngine {
         //     and any unacknowledged cursor advances are lost.
         self.root_cancel.cancel();
     }
+}
+
+/// Which bulk mutation a [`SyncEngine::run_bulk_pipeline`] run drives.
+///
+/// Selects the two op-specific seams in the shared pipeline: the wire
+/// submit call (`Account::bulk_move` vs `Account::bulk_destroy`) and the
+/// matching read-back guard (membership vs absence). Everything else in
+/// the idempotency / retry / recovery loop is identical to
+/// `bulk_set_flags`.
+enum BulkPipelineOp {
+    /// Route every target into `destination` via `Account::bulk_move`.
+    Move(MembershipScope),
+    /// Destroy every target via `Account::bulk_destroy`.
+    Destroy,
 }
 
 /// Per-id mutation bookkeeping bucket. Reflects the campaign's final

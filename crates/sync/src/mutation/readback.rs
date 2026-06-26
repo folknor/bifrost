@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    Account, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome, ObjectId, Projection,
-    SyncEvent,
+    Account, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome, MembershipScope, ObjectId,
+    Projection, SyncEvent,
 };
 use futures::stream::{self, StreamExt};
 
@@ -112,6 +112,119 @@ pub(crate) fn matches_target_set(observed: &HashSet<String>, op: &FlagOp) -> boo
         // `Failed` outcome stands.
         _ => false,
     }
+}
+
+/// Read-back guard for a bulk-move campaign.
+///
+/// The flag guard cannot reconcile a move: the post-mutation signal is
+/// container membership, not a flag set. This guard re-fetches each
+/// unresolved id at `Projection::Metadata` (whose hydrated shape carries
+/// the object's `memberships`) and checks whether `destination` is now
+/// present:
+///
+/// - membership contains `destination` -> the move landed (possibly on
+///   the pre-retry attempt); downgrade the apparent failure to `Skipped`.
+/// - membership does not contain it -> the protocol's `Failed` outcome
+///   stands (`still_failed`).
+/// - the hydration itself `Failed` / `Uncertain`, or came back at the
+///   wrong projection -> `uncertain`; the original `Failed` stands.
+pub async fn run_move_readback_guard(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+    destination: &MembershipScope,
+) -> Result<ReadbackOutcome, Error> {
+    let input = stream::iter(ids).boxed();
+    let mut stream = account.get_stream(input, Projection::Metadata);
+    let mut outcome = ReadbackOutcome::default();
+    while let Some(event) = stream.next().await {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for item in batch.items {
+                    match item {
+                        ItemOutcome::Succeeded(success) => {
+                            if membership_contains(&success.output, destination) {
+                                outcome.skipped = outcome.skipped.saturating_add(1);
+                            } else {
+                                outcome.still_failed = outcome.still_failed.saturating_add(1);
+                            }
+                        }
+                        ItemOutcome::Failed(_) | ItemOutcome::Uncertain(_) => {
+                            outcome.uncertain = outcome.uncertain.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            SyncEvent::Terminated(err) => {
+                return Err(Error::Account(err));
+            }
+            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+            _ => {}
+        }
+    }
+    Ok(outcome)
+}
+
+/// Read-back guard for a bulk-destroy campaign.
+///
+/// A destroy succeeds when the object is *gone*, so the reconciliation
+/// is the inverse of the flag guard. This guard re-fetches each
+/// unresolved id at `Projection::Metadata`:
+///
+/// - the fetch `Succeeded` -> the object is still hydratable, so the
+///   destroy did NOT land; the `Failed` outcome stands (`still_failed`).
+/// - the fetch `Failed` -> the server no longer returns the id, i.e. it
+///   was destroyed (possibly on the pre-retry attempt); downgrade to
+///   `Skipped`.
+/// - the fetch was `Uncertain` -> `uncertain`; the original `Failed`
+///   stands.
+///
+/// An id the protocol simply omits from the hydrated stream (rather than
+/// emitting `Failed` for) produces no outcome here and stays counted as
+/// `pending_retry`. That is the conservative bias: a destroy is only
+/// reclassified as `Skipped` on an explicit not-found signal.
+pub async fn run_destroy_readback_guard(
+    account: &dyn Account,
+    ids: Vec<ObjectId>,
+) -> Result<ReadbackOutcome, Error> {
+    let input = stream::iter(ids).boxed();
+    let mut stream = account.get_stream(input, Projection::Metadata);
+    let mut outcome = ReadbackOutcome::default();
+    while let Some(event) = stream.next().await {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for item in batch.items {
+                    match item {
+                        ItemOutcome::Succeeded(_) => {
+                            outcome.still_failed = outcome.still_failed.saturating_add(1);
+                        }
+                        ItemOutcome::Failed(_) => {
+                            outcome.skipped = outcome.skipped.saturating_add(1);
+                        }
+                        ItemOutcome::Uncertain(_) => {
+                            outcome.uncertain = outcome.uncertain.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            SyncEvent::Terminated(err) => {
+                return Err(Error::Account(err));
+            }
+            SyncEvent::Progress(_) | SyncEvent::Warning(_) => {}
+            _ => {}
+        }
+    }
+    Ok(outcome)
+}
+
+fn membership_contains(hydrated: &HydratedObject, destination: &MembershipScope) -> bool {
+    let HydratedObjectKind::Metadata(entry) = &hydrated.kind else {
+        // Wrong projection - cannot reconcile. Be safe: treat as not
+        // matched so the original `Failed` outcome stands.
+        return false;
+    };
+    entry.memberships.iter().any(|m| m == destination)
 }
 
 #[cfg(test)]
