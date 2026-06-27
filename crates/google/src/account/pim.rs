@@ -793,6 +793,10 @@ fn archive_container() -> Container {
         // color and is not a Gmail-native system label.
         style: None,
         system: false,
+        // Gmail has no per-folder JMAP ACL or subscription model; only
+        // JMAP populates these.
+        rights: None,
+        is_subscribed: None,
     }
 }
 
@@ -824,6 +828,10 @@ fn container_from_label(label: &GmailLabel) -> Container {
         // Gmail's system-label-as-folder split, which `role` alone
         // (INBOX/SENT/DRAFT/TRASH/SPAM only) cannot.
         system: label_is_system(label),
+        // Gmail has no per-folder JMAP ACL or subscription model; only
+        // JMAP populates these.
+        rights: None,
+        is_subscribed: None,
     }
 }
 

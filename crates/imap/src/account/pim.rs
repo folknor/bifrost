@@ -1626,6 +1626,10 @@ fn containers_snapshot(account: &ImapAccount) -> Vec<Container> {
                 // folder-ness and there is no Gmail-style hidden split
                 // for `system` to surface.
                 system: false,
+                // IMAP has no per-folder JMAP ACL or subscription model
+                // on this surface; only JMAP populates these.
+                rights: None,
+                is_subscribed: None,
             }
         })
         .collect()

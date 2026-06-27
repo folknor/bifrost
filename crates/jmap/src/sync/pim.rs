@@ -3,9 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, Container, ContainerId, ContainerKind, FolderRole, HydrationProjection,
-    Importance, LabelId, Message, MutationTarget, ObjectId, Page, Provenance, QuotaInfo,
-    SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
+    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerRights, FolderRole,
+    HydrationProjection, Importance, LabelId, Message, MutationTarget, ObjectId, Page, Provenance,
+    QuotaInfo, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
 };
 /// Convert a crate-internal error to `AccountError` with the correct
 /// `AccountOperation` for this call site. Every call site in this
@@ -47,7 +47,7 @@ use crate::email::{
 use crate::email_submission::{Address as SubmissionAddress, EmailSubmissionSet, UndoStatus};
 use crate::identity::{IdentityGet, IdentityId as JmapIdentityId, IdentitySet};
 use crate::mailbox::{
-    Mailbox, MailboxGet, MailboxId, MailboxSet, Property as MailboxProperty, Role,
+    Mailbox, MailboxGet, MailboxId, MailboxRights, MailboxSet, Property as MailboxProperty, Role,
 };
 use crate::quota::{Property as QuotaProperty, QuotaGet};
 use crate::thread::{ThreadGet, ThreadId as JmapThreadId};
@@ -1361,6 +1361,8 @@ async fn fetch_mailboxes(
             MailboxProperty::Name,
             MailboxProperty::ParentId,
             MailboxProperty::Role,
+            MailboxProperty::MyRights,
+            MailboxProperty::IsSubscribed,
         ]))
         .await
         .map_err(to_acct_err(op))?
@@ -1377,6 +1379,8 @@ fn container_from_mailbox(mut mailbox: Mailbox) -> Option<Container> {
         .parent_id()
         .map(|parent| ContainerId(parent.to_string()));
     let role = map_role(mailbox.role());
+    let rights = mailbox.my_rights().map(rights_from_mailbox);
+    let is_subscribed = mailbox.is_subscribed();
     Some(Container {
         id: ContainerId(native.clone()),
         kind: ContainerKind::Folder,
@@ -1395,7 +1399,29 @@ fn container_from_mailbox(mut mailbox: Mailbox) -> Option<Container> {
         // folder-shaped JMAP that is exactly what `role` already
         // captures, so there is no hidden split to surface.
         system: role.is_some(),
+        // JMAP's `Mailbox.myRights` / `Mailbox.isSubscribed` carry the
+        // per-folder ACL and subscription state the shared-mailbox
+        // sidebar gates submit on; other providers leave these `None`.
+        rights,
+        is_subscribed,
     })
+}
+
+/// Map the JMAP `Mailbox/myRights` object onto the unified
+/// [`ContainerRights`]. JMAP always emits every member as a concrete
+/// boolean when it emits the object at all, so each maps to `Some(_)`.
+fn rights_from_mailbox(rights: &MailboxRights) -> ContainerRights {
+    ContainerRights {
+        may_read_items: Some(rights.may_read_items()),
+        may_add_items: Some(rights.may_add_items()),
+        may_remove_items: Some(rights.may_remove_items()),
+        may_set_seen: Some(rights.may_set_seen()),
+        may_set_keywords: Some(rights.may_set_keywords()),
+        may_create_child: Some(rights.may_create_child()),
+        may_rename: Some(rights.may_rename()),
+        may_delete: Some(rights.may_delete()),
+        may_submit: Some(rights.may_submit()),
+    }
 }
 
 fn map_role(role: Option<&Role>) -> Option<FolderRole> {

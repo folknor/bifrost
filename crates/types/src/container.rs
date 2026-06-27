@@ -77,6 +77,46 @@ impl ContainerStyle {
     }
 }
 
+/// Per-folder access rights a protocol surfaces for a container.
+///
+/// Each field maps one-to-one onto an RFC 8621 `Mailbox/myRights`
+/// member: the rights the authenticated principal holds on this
+/// mailbox. The load-bearing consumer use is shared-mailbox
+/// submit-gating - `may_submit` tells the UI whether the principal is
+/// allowed to send from this mailbox, and the other members gate
+/// read / add / remove / flag / child-create / rename / delete.
+///
+/// Every field is `Option<bool>`: `Some(b)` is the value the protocol
+/// reported, `None` means the protocol did not report that member.
+/// Only JMAP populates this (from `Mailbox.myRights`); folder-shaped
+/// protocols without a per-folder ACL model (IMAP, Graph) and
+/// label-shaped Gmail leave `Container::rights` `None` entirely.
+///
+/// Not `#[non_exhaustive]` because protocol Account impls construct
+/// `ContainerRights` directly when populating containers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ContainerRights {
+    /// `mayReadItems`: may read the messages in this mailbox.
+    pub may_read_items: Option<bool>,
+    /// `mayAddItems`: may add messages to this mailbox.
+    pub may_add_items: Option<bool>,
+    /// `mayRemoveItems`: may remove messages from this mailbox.
+    pub may_remove_items: Option<bool>,
+    /// `maySetSeen`: may set the `$seen` keyword on messages here.
+    pub may_set_seen: Option<bool>,
+    /// `maySetKeywords`: may set any keyword (other than `$seen`) on
+    /// messages here.
+    pub may_set_keywords: Option<bool>,
+    /// `mayCreateChild`: may create a child mailbox under this one.
+    pub may_create_child: Option<bool>,
+    /// `mayRename`: may rename this mailbox or move it.
+    pub may_rename: Option<bool>,
+    /// `mayDelete`: may delete this mailbox.
+    pub may_delete: Option<bool>,
+    /// `maySubmit`: may submit (send) messages from this mailbox.
+    pub may_submit: Option<bool>,
+}
+
 /// Wire-level provenance for a container or label id.
 ///
 /// Carries enough context for the consumer to know which protocol
@@ -162,6 +202,17 @@ pub struct Container {
     /// Folder-shaped protocols where `role` already fully determines
     /// folder-ness leave it `false`. Defaults to `false`.
     pub system: bool,
+    /// Per-folder access rights, when the protocol surfaces them. Only
+    /// JMAP populates this (from `Mailbox.myRights`); IMAP, Graph, and
+    /// Gmail have no per-folder ACL model on this surface and leave it
+    /// `None`. Drives shared-mailbox submit-gating in the consumer. See
+    /// [`ContainerRights`]. Defaults to `None`.
+    pub rights: Option<ContainerRights>,
+    /// Subscription state, when the protocol surfaces it. Only JMAP
+    /// populates this (from `Mailbox.isSubscribed`); other providers
+    /// leave it `None`. `Some(true)`/`Some(false)` is the value the
+    /// protocol reported. Defaults to `None`.
+    pub is_subscribed: Option<bool>,
 }
 
 impl Container {
@@ -190,6 +241,8 @@ impl Container {
             parent,
             style: None,
             system: false,
+            rights: None,
+            is_subscribed: None,
         }
     }
 
@@ -204,6 +257,24 @@ impl Container {
     #[must_use]
     pub fn with_system(mut self, system: bool) -> Self {
         self.system = system;
+        self
+    }
+
+    /// Set the per-folder access rights. Only the JMAP Account impl
+    /// layers this on (from `Mailbox.myRights`); other providers leave
+    /// it `None`.
+    #[must_use]
+    pub fn with_rights(mut self, rights: Option<ContainerRights>) -> Self {
+        self.rights = rights;
+        self
+    }
+
+    /// Set the subscription state. Only the JMAP Account impl layers
+    /// this on (from `Mailbox.isSubscribed`); other providers leave it
+    /// `None`.
+    #[must_use]
+    pub fn with_subscription(mut self, is_subscribed: Option<bool>) -> Self {
+        self.is_subscribed = is_subscribed;
         self
     }
 }
@@ -337,8 +408,32 @@ mod tests {
         );
         assert!(c.style.is_none());
         assert!(!c.system);
+        assert!(c.rights.is_none());
+        assert!(c.is_subscribed.is_none());
         // native_id mirrors provenance.native.
         assert_eq!(c.native_id, "Label_42");
+    }
+
+    #[test]
+    fn container_builders_layer_rights_and_subscription() {
+        let rights = ContainerRights {
+            may_submit: Some(true),
+            may_read_items: Some(true),
+            ..ContainerRights::default()
+        };
+        let c = Container::new(
+            ContainerId("Label_42".to_string()),
+            ContainerKind::Folder,
+            None,
+            provenance(),
+            "Shared".to_string(),
+            None,
+        )
+        .with_rights(Some(rights.clone()))
+        .with_subscription(Some(true));
+        assert_eq!(c.rights.as_ref(), Some(&rights));
+        assert_eq!(c.rights.unwrap().may_submit, Some(true));
+        assert_eq!(c.is_subscribed, Some(true));
     }
 
     #[test]
