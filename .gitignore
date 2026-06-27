@@ -16,3 +16,4 @@ research
 
 # Local ratatoskr source snapshot used while porting Stage 3 / Stage 4.
 plans/ratatoskr-import/
+__pycache__
