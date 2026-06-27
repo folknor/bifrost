@@ -65,6 +65,21 @@ pub(crate) struct GmailLabel {
     pub(crate) name: String,
     #[serde(rename = "type")]
     pub(crate) label_type: Option<String>,
+    /// Label swatch, present only for user labels that have been
+    /// assigned a color. Gmail omits it for uncolored / system labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) color: Option<GmailLabelColor>,
+}
+
+/// Gmail label `color` object: a background / text color pair, each a
+/// `#rrggbb` hex string drawn from Gmail's fixed palette.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GmailLabelColor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) background_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) text_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

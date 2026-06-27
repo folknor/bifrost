@@ -678,6 +678,7 @@ impl Account for CardDavAccount {
         _kind: ContainerKind,
         _name: String,
         _parent: Option<ContainerId>,
+        _style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
         unsupported_future(AccountOperation::ContainerCreate)
     }
@@ -686,6 +687,7 @@ impl Account for CardDavAccount {
         &self,
         _container: ContainerId,
         _name: String,
+        _style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
         unsupported_future(AccountOperation::ContainerRename)
     }

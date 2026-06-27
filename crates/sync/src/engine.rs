@@ -1748,32 +1748,53 @@ impl SyncEngine {
             .await?)
     }
 
+    /// Enumerate an account's containers (folders, labels, mailboxes).
+    /// Forwards 1:1 to [`Account::containers_list`].
+    ///
+    /// The read companion to the container-mutation cluster below: like
+    /// every passthrough it resolves through `live_account` so a list
+    /// issued after a `RestartAccount` reopen runs against the freshly
+    /// installed connection, and yields `Error::AccountNotAttached` up
+    /// front when no live slot exists. Read-only, so it does not pass
+    /// through the idempotency / read-back pipeline.
+    pub async fn containers_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::Container>, Error> {
+        Ok(self.live_account(account_id)?.containers_list().await?)
+    }
+
     /// Create a new container of `kind` named `name` under `parent`.
     /// Forwards to [`Account::container_create`]; returns the
-    /// engine-facing id.
+    /// engine-facing id. `style` carries an optional initial color
+    /// (Gmail labels only; ignored by folder-shaped protocols).
     pub async fn container_create(
         &self,
         account_id: &AccountId,
         kind: bifrost_types::ContainerKind,
         name: String,
         parent: Option<bifrost_types::ContainerId>,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> Result<bifrost_types::ContainerId, Error> {
         Ok(self
             .live_account(account_id)?
-            .container_create(kind, name, parent)
+            .container_create(kind, name, parent, style)
             .await?)
     }
 
     /// Rename a container. Forwards to [`Account::container_rename`].
+    /// `style`, when `Some`, also recolors the container (Gmail labels
+    /// only; ignored by folder-shaped protocols).
     pub async fn container_rename(
         &self,
         account_id: &AccountId,
         container: bifrost_types::ContainerId,
         name: String,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> Result<(), Error> {
         Ok(self
             .live_account(account_id)?
-            .container_rename(container, name)
+            .container_rename(container, name, style)
             .await?)
     }
 

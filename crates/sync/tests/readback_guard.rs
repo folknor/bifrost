@@ -392,6 +392,7 @@ impl Account for FlagsAccount {
         _kind: ContainerKind,
         _name: String,
         _parent: Option<ContainerId>,
+        _style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
         Box::pin(async {
             Err(unsupported(
@@ -404,6 +405,7 @@ impl Account for FlagsAccount {
         &self,
         _container: ContainerId,
         _name: String,
+        _style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
         Box::pin(async {
             Err(unsupported(

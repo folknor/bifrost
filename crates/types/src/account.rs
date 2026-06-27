@@ -35,7 +35,9 @@ use crate::contact::{
     AddressBook, AddressBookId, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest,
 };
-use crate::container::{Container, ContainerId, ContainerKind, Label, MutationTarget};
+use crate::container::{
+    Container, ContainerId, ContainerKind, ContainerStyle, Label, MutationTarget,
+};
 use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycleEvent,
@@ -489,6 +491,10 @@ pub trait Account: Send + Sync {
     /// Create a new container of the given `kind` with `name` under
     /// `parent`. Returns the engine-facing id.
     ///
+    /// `style` carries an optional initial color. Only Gmail honors it
+    /// (labels are colorable); folder-shaped protocols with no color
+    /// concept accept and ignore it.
+    ///
     /// Contract: protocols that do not support nesting return
     /// `Err(AccountErrorKind::Unsupported)` when `parent` is `Some`.
     fn container_create(
@@ -496,13 +502,19 @@ pub trait Account: Send + Sync {
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
+        style: Option<ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>>;
 
     /// Rename a container.
+    ///
+    /// `style`, when `Some`, also recolors the container in the same
+    /// call (a Gmail label recolor). Folder-shaped protocols with no
+    /// color concept accept and ignore it.
     fn container_rename(
         &self,
         container: ContainerId,
         name: String,
+        style: Option<ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>>;
 
     /// Move a container under a new parent. Folder-kind only;

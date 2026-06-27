@@ -42,6 +42,41 @@ pub enum FolderRole {
     Spam,
 }
 
+/// Display color a protocol carries for a container or label.
+///
+/// Both fields are protocol-native color strings exactly as the wire
+/// surfaced them (Gmail label colors are `#rrggbb` hex). The pair lets
+/// the consumer reproduce the protocol's own label/folder swatch
+/// without re-deriving a palette.
+///
+/// Only Gmail populates this today, from the label's `color`
+/// (`backgroundColor` / `textColor`). Folder-shaped protocols (IMAP
+/// special-use, Graph mail folders, JMAP mailboxes) carry no container
+/// color and leave `Container::style` / `Label::style` `None`. Graph
+/// categories do carry a color, but a Graph category is a message flag,
+/// not a container, so it never reaches this surface.
+///
+/// Not `#[non_exhaustive]` because protocol Account impls construct
+/// `ContainerStyle` directly when populating containers and labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContainerStyle {
+    /// Background color (Gmail `color.backgroundColor`).
+    pub color_bg: String,
+    /// Foreground / text color (Gmail `color.textColor`).
+    pub color_fg: String,
+}
+
+impl ContainerStyle {
+    /// Construct a style from a background / foreground color pair.
+    #[must_use]
+    pub fn new(color_bg: impl Into<String>, color_fg: impl Into<String>) -> Self {
+        Self {
+            color_bg: color_bg.into(),
+            color_fg: color_fg.into(),
+        }
+    }
+}
+
 /// Wire-level provenance for a container or label id.
 ///
 /// Carries enough context for the consumer to know which protocol
@@ -115,6 +150,62 @@ pub struct Container {
     /// hierarchical mailboxes). `None` for top-level containers and
     /// for flat-namespace protocols.
     pub parent: Option<ContainerId>,
+    /// Display color, when the protocol surfaces one. Only Gmail
+    /// populates this (from the label's `color`); folder-shaped
+    /// protocols leave it `None`. See [`ContainerStyle`].
+    pub style: Option<ContainerStyle>,
+    /// `true` when the protocol marks this container as a native
+    /// system container. The load-bearing case is Gmail: it tags many
+    /// more labels as system (`CATEGORY_*`, `IMPORTANT`, `CHAT`, ...)
+    /// than ever receive a [`FolderRole`], so `role` alone cannot
+    /// reproduce Gmail's system-label-as-folder split - `system` can.
+    /// Folder-shaped protocols where `role` already fully determines
+    /// folder-ness leave it `false`. Defaults to `false`.
+    pub system: bool,
+}
+
+impl Container {
+    /// Construct a container with the system defaults
+    /// (`style = None`, `system = false`). Additive fields land here
+    /// with sensible defaults so call sites do not break when the
+    /// shape grows; recolor / system-tagging paths layer on top via
+    /// [`Container::with_style`] and [`Container::with_system`].
+    #[must_use]
+    pub fn new(
+        id: ContainerId,
+        kind: ContainerKind,
+        role: Option<FolderRole>,
+        provenance: Provenance,
+        name: String,
+        parent: Option<ContainerId>,
+    ) -> Self {
+        let native_id = provenance.native.clone();
+        Self {
+            id,
+            kind,
+            role,
+            provenance,
+            native_id,
+            name,
+            parent,
+            style: None,
+            system: false,
+        }
+    }
+
+    /// Set the display color.
+    #[must_use]
+    pub fn with_style(mut self, style: Option<ContainerStyle>) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set the native-system flag.
+    #[must_use]
+    pub fn with_system(mut self, system: bool) -> Self {
+        self.system = system;
+        self
+    }
 }
 
 /// Label shape parallel to `Container` for protocols that draw a
@@ -141,6 +232,50 @@ pub struct Label {
     /// Role, when the label plays a canonical one (Gmail STARRED,
     /// UNREAD, INBOX, etc.).
     pub role: Option<FolderRole>,
+    /// Display color, when the protocol surfaces one. Only Gmail
+    /// populates this (from the label's `color`). See
+    /// [`ContainerStyle`].
+    pub style: Option<ContainerStyle>,
+    /// `true` when the protocol marks this label as a native system
+    /// label. Mirrors [`Container::system`]; defaults to `false`.
+    pub system: bool,
+}
+
+impl Label {
+    /// Construct a label with the system defaults (`style = None`,
+    /// `system = false`). Additive fields default here so call sites
+    /// survive shape growth; recolor / system-tagging layer on via
+    /// [`Label::with_style`] and [`Label::with_system`].
+    #[must_use]
+    pub fn new(
+        id: ContainerId,
+        provenance: Provenance,
+        name: String,
+        role: Option<FolderRole>,
+    ) -> Self {
+        Self {
+            id,
+            provenance,
+            name,
+            role,
+            style: None,
+            system: false,
+        }
+    }
+
+    /// Set the display color.
+    #[must_use]
+    pub fn with_style(mut self, style: Option<ContainerStyle>) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Set the native-system flag.
+    #[must_use]
+    pub fn with_system(mut self, system: bool) -> Self {
+        self.system = system;
+        self
+    }
 }
 
 /// Mutation target shape used by every mail-mutation primitive.
@@ -175,5 +310,69 @@ impl MutationTarget {
     #[must_use]
     pub fn is_thread(&self) -> bool {
         matches!(self, Self::Thread(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provenance() -> Provenance {
+        Provenance {
+            provider: ProtocolKind::Gmail,
+            kind: ContainerKind::Label,
+            native: "Label_42".to_string(),
+        }
+    }
+
+    #[test]
+    fn container_new_defaults_style_none_and_system_false() {
+        let c = Container::new(
+            ContainerId("Label_42".to_string()),
+            ContainerKind::Label,
+            None,
+            provenance(),
+            "Work".to_string(),
+            None,
+        );
+        assert!(c.style.is_none());
+        assert!(!c.system);
+        // native_id mirrors provenance.native.
+        assert_eq!(c.native_id, "Label_42");
+    }
+
+    #[test]
+    fn container_builders_layer_style_and_system() {
+        let style = ContainerStyle::new("#fb4c2f", "#ffffff");
+        let c = Container::new(
+            ContainerId("Label_42".to_string()),
+            ContainerKind::Label,
+            None,
+            provenance(),
+            "Work".to_string(),
+            None,
+        )
+        .with_style(Some(style.clone()))
+        .with_system(true);
+        assert_eq!(c.style.as_ref(), Some(&style));
+        assert_eq!(c.style.unwrap().color_bg, "#fb4c2f");
+        assert!(c.system);
+    }
+
+    #[test]
+    fn label_new_defaults_then_builders_layer() {
+        let l = Label::new(
+            ContainerId("Label_42".to_string()),
+            provenance(),
+            "Work".to_string(),
+            None,
+        );
+        assert!(l.style.is_none());
+        assert!(!l.system);
+
+        let style = ContainerStyle::new("#16a766", "#000000");
+        let l = l.with_style(Some(style.clone())).with_system(true);
+        assert_eq!(l.style, Some(style));
+        assert!(l.system);
     }
 }

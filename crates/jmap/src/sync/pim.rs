@@ -638,6 +638,9 @@ pub(crate) fn container_create(
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
+    // JMAP mailboxes carry no container color; accepted for trait
+    // parity with the colorable (Gmail) path and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
@@ -677,6 +680,8 @@ pub(crate) fn container_rename(
     account_id: String,
     container: ContainerId,
     name: String,
+    // JMAP has no mailbox recolor; accepted for trait parity and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let mailbox = MailboxId::new(container.0);
@@ -1371,10 +1376,11 @@ fn container_from_mailbox(mut mailbox: Mailbox) -> Option<Container> {
     let parent = mailbox
         .parent_id()
         .map(|parent| ContainerId(parent.to_string()));
+    let role = map_role(mailbox.role());
     Some(Container {
         id: ContainerId(native.clone()),
         kind: ContainerKind::Folder,
-        role: map_role(mailbox.role()),
+        role,
         provenance: Provenance {
             provider: bifrost_types::ProtocolKind::Jmap,
             kind: ContainerKind::Folder,
@@ -1383,6 +1389,12 @@ fn container_from_mailbox(mut mailbox: Mailbox) -> Option<Container> {
         native_id: native,
         name: mailbox.name().unwrap_or("").to_string(),
         parent,
+        // JMAP mailboxes carry no container color.
+        style: None,
+        // A role-bearing mailbox is JMAP's native system notion; for
+        // folder-shaped JMAP that is exactly what `role` already
+        // captures, so there is no hidden split to surface.
+        system: role.is_some(),
     })
 }
 

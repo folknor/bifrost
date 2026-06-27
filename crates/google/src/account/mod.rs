@@ -540,16 +540,18 @@ impl Account for GoogleAccount {
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        pim::container_create(Arc::clone(&self.client), kind, name, parent)
+        pim::container_create(Arc::clone(&self.client), kind, name, parent, style)
     }
 
     fn container_rename(
         &self,
         container: ContainerId,
         name: String,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_rename(Arc::clone(&self.client), container, name)
+        pim::container_rename(Arc::clone(&self.client), container, name, style)
     }
 
     fn container_move(

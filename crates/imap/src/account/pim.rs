@@ -856,6 +856,9 @@ pub(crate) fn container_create(
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
+    // IMAP mailboxes carry no container color; accepted for trait
+    // parity with the colorable (Gmail) path and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if !matches!(kind, ContainerKind::Folder) {
@@ -876,6 +879,8 @@ pub(crate) fn container_rename(
     account: ImapAccount,
     container: ContainerId,
     name: String,
+    // IMAP has no mailbox recolor; accepted for trait parity and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let folder = folder_from_container(&container)?;
@@ -1614,6 +1619,13 @@ fn containers_snapshot(account: &ImapAccount) -> Vec<Container> {
                 native_id: native.clone(),
                 name: leaf_name(account, &entry.name),
                 parent: parent_id(entry.delimiter, &native),
+                // IMAP mailboxes carry no container color.
+                style: None,
+                // IMAP is folder-shaped: special-use folders already
+                // map into `role`, so `role` fully determines
+                // folder-ness and there is no Gmail-style hidden split
+                // for `system` to surface.
+                system: false,
             }
         })
         .collect()

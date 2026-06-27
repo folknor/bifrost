@@ -744,6 +744,7 @@ impl Account for JmapAccount {
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
         pim::container_create(
             self.mail.clone(),
@@ -752,6 +753,7 @@ impl Account for JmapAccount {
             kind,
             name,
             parent,
+            style,
         )
     }
 
@@ -759,6 +761,7 @@ impl Account for JmapAccount {
         &self,
         container: ContainerId,
         name: String,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
         pim::container_rename(
             self.mail.clone(),
@@ -766,6 +769,7 @@ impl Account for JmapAccount {
             self.mail.id_str().to_string(),
             container,
             name,
+            style,
         )
     }
 

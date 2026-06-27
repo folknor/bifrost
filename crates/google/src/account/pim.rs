@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bifrost_types::{
     AccountError, AccountFuture, AccountStream, Address, AttachmentHandle, AttachmentInline,
-    Container, ContainerId, ContainerKind, DraftHandle, DraftPatch, FolderRole,
+    Container, ContainerId, ContainerKind, ContainerStyle, DraftHandle, DraftPatch, FolderRole,
     HydrationProjection, Identity, IdentityId, IdentityPatch, Importance, Message, MutationTarget,
     ObjectId, Page, ProtocolKind, Provenance, QuotaInfo, SearchFilter, SearchRequest, SendRequest,
     ThreadHydration, ThreadId, VacationConfig,
@@ -16,7 +16,9 @@ use serde_json::json;
 use crate::client::GmailClient;
 use crate::encoding::decode_base64url_nopad;
 use crate::headers::find_header_value_case_insensitive;
-use crate::types::{GmailHeader, GmailLabel, GmailMessage, GmailPayload, GmailVacationSettings};
+use crate::types::{
+    GmailHeader, GmailLabel, GmailLabelColor, GmailMessage, GmailPayload, GmailVacationSettings,
+};
 
 use super::blobs;
 use super::error;
@@ -320,6 +322,7 @@ pub(crate) fn container_create(
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
+    style: Option<ContainerStyle>,
 ) -> AccountFuture<Result<ContainerId, AccountError>> {
     Box::pin(async move {
         if parent.is_some() || !matches!(kind, ContainerKind::Label) {
@@ -327,7 +330,11 @@ pub(crate) fn container_create(
                 bifrost_types::AccountOperation::ContainerCreate,
             ));
         }
-        let label = client.create_label(&name, None).await.map_err(|e| {
+        // Gmail's create takes (text_color, background_color).
+        let color = style
+            .as_ref()
+            .map(|s| (s.color_fg.as_str(), s.color_bg.as_str()));
+        let label = client.create_label(&name, color).await.map_err(|e| {
             account_error_for(
                 e,
                 error::GmailErrorContext::container(
@@ -343,6 +350,7 @@ pub(crate) fn container_rename(
     client: Arc<GmailClient>,
     container: ContainerId,
     name: String,
+    style: Option<ContainerStyle>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         if is_archive_id(&container.0) {
@@ -350,8 +358,14 @@ pub(crate) fn container_rename(
                 bifrost_types::AccountOperation::ContainerRename,
             ));
         }
+        // `update_label`'s color is `Option<Option<(text, bg)>>`: outer
+        // `None` leaves the color untouched, `Some(Some(..))` recolors.
+        // A recolor with no name change still rides this rename path.
+        let color = style
+            .as_ref()
+            .map(|s| Some((s.color_fg.as_str(), s.color_bg.as_str())));
         client
-            .update_label(&container.0, Some(&name), None)
+            .update_label(&container.0, Some(&name), color)
             .await
             .map_err(|e| {
                 account_error_for(
@@ -774,6 +788,11 @@ fn archive_container() -> Container {
         native_id: ARCHIVE_ID.to_string(),
         name: "Archive".to_string(),
         parent: None,
+        // Synthetic bifrost container (Gmail models archive as the
+        // absence of INBOX, not a real label), so it has no Gmail
+        // color and is not a Gmail-native system label.
+        style: None,
+        system: false,
     }
 }
 
@@ -798,7 +817,36 @@ fn container_from_label(label: &GmailLabel) -> Container {
         native_id: label.id.clone(),
         name: label.name.clone(),
         parent: None,
+        style: style_from_label_color(label.color.as_ref()),
+        // Gmail tags far more labels as system (CATEGORY_*, IMPORTANT,
+        // CHAT, ...) than ever receive a `role`, so carry the native
+        // `type == "system"` bit through so the consumer can reproduce
+        // Gmail's system-label-as-folder split, which `role` alone
+        // (INBOX/SENT/DRAFT/TRASH/SPAM only) cannot.
+        system: label_is_system(label),
     }
+}
+
+/// Map a Gmail label `color` object into a `ContainerStyle`. Yields
+/// `None` when the label has no color or the pair is incomplete; Gmail
+/// always emits both members when it emits the object at all, but we
+/// stay defensive against a partial payload.
+fn style_from_label_color(color: Option<&GmailLabelColor>) -> Option<ContainerStyle> {
+    let color = color?;
+    let bg = color.background_color.clone()?;
+    let fg = color.text_color.clone()?;
+    Some(ContainerStyle {
+        color_bg: bg,
+        color_fg: fg,
+    })
+}
+
+/// True iff Gmail marks the label `type == "system"`.
+fn label_is_system(label: &GmailLabel) -> bool {
+    label
+        .label_type
+        .as_deref()
+        .is_some_and(|label_type| label_type == "system")
 }
 
 async fn message_from_gmail(
@@ -1331,6 +1379,7 @@ mod tests {
             id: LABEL_INBOX.to_string(),
             name: "Inbox".to_string(),
             label_type: Some("system".to_string()),
+            color: None,
         };
         let container = container_from_label(&label);
         assert_eq!(container.role, Some(FolderRole::Inbox));
@@ -1339,10 +1388,55 @@ mod tests {
     }
 
     #[test]
+    fn user_label_color_round_trips_into_container_style() {
+        // Representative Gmail user-label payload carrying a color.
+        let raw = r##"{
+            "id": "Label_42",
+            "name": "Work",
+            "type": "user",
+            "color": { "backgroundColor": "#fb4c2f", "textColor": "#ffffff" }
+        }"##;
+        let label: GmailLabel = serde_json::from_str(raw).expect("parse label");
+
+        let container = container_from_label(&label);
+        let style = container.style.expect("user label color carries a style");
+        assert_eq!(style.color_bg, "#fb4c2f");
+        assert_eq!(style.color_fg, "#ffffff");
+        // A user label is not a Gmail system label.
+        assert!(!container.system);
+    }
+
+    #[test]
+    fn system_label_flagged_system_and_user_label_not() {
+        let system = GmailLabel {
+            id: "CATEGORY_PROMOTIONS".to_string(),
+            name: "Promotions".to_string(),
+            label_type: Some("system".to_string()),
+            color: None,
+        };
+        let user = GmailLabel {
+            id: "Label_42".to_string(),
+            name: "Work".to_string(),
+            label_type: Some("user".to_string()),
+            color: None,
+        };
+        // A CATEGORY_* label has no `role` yet is a Gmail system label:
+        // exactly the split that `system` carries and `role` cannot.
+        let system_container = container_from_label(&system);
+        assert!(system_container.system);
+        assert_eq!(system_container.role, None);
+        assert!(!container_from_label(&user).system);
+        // An uncolored label yields no style.
+        assert!(container_from_label(&user).style.is_none());
+    }
+
+    #[test]
     fn archive_container_is_explicit() {
         let container = archive_container();
         assert_eq!(container.id.0, ARCHIVE_ID);
         assert_eq!(container.role, Some(FolderRole::Archive));
+        assert!(container.style.is_none());
+        assert!(!container.system);
     }
 
     #[test]

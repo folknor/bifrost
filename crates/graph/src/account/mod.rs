@@ -703,18 +703,20 @@ impl Account for GraphAccount {
         kind: bifrost_types::ContainerKind,
         name: String,
         parent: Option<bifrost_types::ContainerId>,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<bifrost_types::ContainerId, AccountError>> {
         let account = self.clone();
-        Box::pin(async move { pim::container_create(account, kind, name, parent).await })
+        Box::pin(async move { pim::container_create(account, kind, name, parent, style).await })
     }
 
     fn container_rename(
         &self,
         container: bifrost_types::ContainerId,
         name: String,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
         let account = self.clone();
-        Box::pin(async move { pim::container_rename(account, container, name).await })
+        Box::pin(async move { pim::container_rename(account, container, name, style).await })
     }
 
     fn container_move(

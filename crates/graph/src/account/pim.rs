@@ -654,6 +654,10 @@ pub(crate) async fn container_create(
     kind: ContainerKind,
     name: String,
     parent: Option<ContainerId>,
+    // Graph mail folders carry no container color (Graph categories
+    // are message flags, not containers); accepted for trait parity
+    // with the colorable (Gmail) path and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> Result<ContainerId, AccountError> {
     if kind != ContainerKind::Folder {
         return Err(unsupported_account_error(AccountOperation::ContainerCreate));
@@ -683,6 +687,8 @@ pub(crate) async fn container_rename(
     account: GraphAccount,
     container: ContainerId,
     name: String,
+    // Graph has no mail-folder recolor; accepted for trait parity and ignored.
+    _style: Option<bifrost_types::ContainerStyle>,
 ) -> Result<(), AccountError> {
     let path = format!(
         "{}/mailFolders/{}",
@@ -2017,6 +2023,13 @@ fn container_from_folder(
         native_id: folder.id,
         name: folder.display_name.unwrap_or_else(|| id.0.clone()),
         parent: folder.parent_folder_id.map(ContainerId),
+        // Graph mail folders carry no container color (categories are
+        // message flags, not containers).
+        style: None,
+        // Graph is folder-shaped: well-known folders already map into
+        // `role`, so `role` fully determines folder-ness and there is
+        // no Gmail-style hidden split for `system` to surface.
+        system: false,
     }
 }
 

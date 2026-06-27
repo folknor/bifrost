@@ -581,16 +581,18 @@ impl Account for ImapAccount {
         kind: ContainerKind,
         name: String,
         parent: Option<ContainerId>,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<ContainerId, AccountError>> {
-        pim::container_create(self.clone(), kind, name, parent)
+        pim::container_create(self.clone(), kind, name, parent, style)
     }
 
     fn container_rename(
         &self,
         container: ContainerId,
         name: String,
+        style: Option<bifrost_types::ContainerStyle>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        pim::container_rename(self.clone(), container, name)
+        pim::container_rename(self.clone(), container, name, style)
     }
 
     fn container_move(

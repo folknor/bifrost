@@ -227,6 +227,7 @@ mod tests {
             id: "Label_1".to_string(),
             name: "Project".to_string(),
             label_type: Some("user".to_string()),
+            color: None,
         }];
         let canonical = canonical_flags(
             &[

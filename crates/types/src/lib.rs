@@ -81,7 +81,8 @@ pub use mime::{
 
 // Container / label / mutation-target types.
 pub use container::{
-    Container, ContainerId, ContainerKind, FolderRole, Label, MutationTarget, Provenance,
+    Container, ContainerId, ContainerKind, ContainerStyle, FolderRole, Label, MutationTarget,
+    Provenance,
 };
 
 // Address book and contact-card primitives.
