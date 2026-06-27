@@ -204,7 +204,18 @@ so no inventory page is lost. An eager engine-side write would let the
 store record progress the consumer never durably persisted, losing
 that page's objects permanently. The orchestrator spawns runners
 from `discover_cursor_scopes()` and plans partitions from
-`Account::inventory_partitioning(scope)`. The partitioner
+`Account::inventory_partitioning(scope)`. Before walking any scope the
+orchestrator parks on `wait_for_real_subscriber` (the same guard the
+deferred-inventory fusion path uses): cold-start pages broadcast onto
+the per-account channel during `attach`, but the consumer can only
+`account_changes_stream` after `attach` inserts the slot, and a
+`tokio::broadcast` receiver that joins late starts at the ring tail and
+never sees values sent before it subscribed (the slot's sentinel
+receiver keeps `receiver_count()` at 1, so the send "succeeds" in front
+of no real reader). For a `Ready`-cursor account whose entire cold start
+rides backfill (Gmail `CursorScope::Account`, JMAP
+`CursorScope::Type(Email)`) skipping the wait silently drops the initial
+inventory page and the consumer ingests zero objects. The partitioner
 (`backfill/partitioner.rs::plan`) handles three strategies:
 `TimeWindowed` (boundaries plus a final open-ended partition),
 `UidRange` (newest-first chunking), and `PageCount` (page-size

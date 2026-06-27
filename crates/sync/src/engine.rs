@@ -471,6 +471,7 @@ impl SyncEngine {
         let bf_store = Arc::clone(&self.checkpoints);
         let bf_shutdown = shutdown.clone();
         let bf_changes = changes_tx.clone();
+        let bf_subscriber_notify = Arc::clone(&subscriber_notify);
         let bf_config = self.config.backfill;
         spawn(tokio::spawn(async move {
             run_backfill_orchestrator(
@@ -482,6 +483,7 @@ impl SyncEngine {
                 backfill_registry_handle,
                 bf_shutdown,
                 Some(bf_changes),
+                bf_subscriber_notify,
                 bf_config,
             )
             .await;
@@ -2147,8 +2149,28 @@ async fn run_backfill_orchestrator(
     registry: Arc<BackfillRegistry>,
     shutdown: CancellationToken,
     changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
+    subscriber_notify: Arc<Notify>,
     config: BackfillConfig,
 ) {
+    // Cold-start backfill pages broadcast onto the per-account channel
+    // during `attach`, but a consumer can only call
+    // `account_changes_stream` after `attach` inserts the slot into
+    // `self.accounts`. A `tokio::broadcast` receiver that subscribes
+    // late starts at the ring's tail and never sees values sent before
+    // it joined (the slot's sentinel receiver keeps `receiver_count()`
+    // at 1, so the send "succeeds" yet lands in front of no real
+    // reader). For a `Ready`-cursor account whose entire cold start
+    // rides backfill - Gmail `CursorScope::Account`, JMAP
+    // `CursorScope::Type(Email)` - that silently drops the initial
+    // inventory page, so the consumer ingests zero objects. Park until a
+    // real subscriber arrives, exactly as
+    // `run_deferred_inventory_establishment` does for the fusion path,
+    // so the first page is observed rather than raced away. (sync-N3)
+    if let Some(tx) = &changes_tx
+        && !wait_for_real_subscriber(tx, &subscriber_notify, &shutdown).await
+    {
+        return;
+    }
     let scopes = cursors.all_scopes();
     for scope in scopes {
         if shutdown.is_cancelled() {
