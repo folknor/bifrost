@@ -500,6 +500,14 @@ impl Account for ImapAccount {
         pim::send_message(self.clone(), request)
     }
 
+    fn send_raw_message(
+        &self,
+        raw: bytes::Bytes,
+        save_to_sent: Option<bool>,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::send_raw_message(self.clone(), raw, save_to_sent)
+    }
+
     fn attachment_upload(
         &self,
         _bytes: AccountStream<Result<bytes::Bytes, AccountError>>,

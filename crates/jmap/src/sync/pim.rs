@@ -341,6 +341,84 @@ pub(crate) fn send_message(
     })
 }
 
+pub(crate) fn send_raw_message(
+    mail: MailAccount,
+    raw: Bytes,
+    save_to_sent: Option<bool>,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        // JMAP has no raw-bytes send. The pre-assembled RFC 5322 / RFC 8098
+        // octets are uploaded as a blob, imported into Drafts via
+        // `Email/import`, then submitted via `EmailSubmission/set`. The
+        // submission omits an explicit envelope, so the server derives
+        // MAIL FROM / RCPT TO from the message's own header fields
+        // (RFC 8621 §7) - no MIME parse needed on our side.
+        let draft_mailbox = role_mailbox(&mail, FolderRole::Drafts, AccountOperation::Send).await?;
+        let sent_mailbox = if save_to_sent == Some(false) {
+            None
+        } else {
+            Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
+        };
+
+        let blob = mail
+            .upload(raw.to_vec(), Some("message/rfc822"))
+            .await
+            .map_err(to_acct_err(AccountOperation::Send))?;
+
+        let mut import_req = crate::email::import::EmailImportRequest::new();
+        let import_create_id = {
+            let entry = import_req.email(blob.blob_id);
+            entry.mailbox_ids([draft_mailbox]);
+            entry.keywords([DRAFT_KEYWORD]);
+            entry.create_id()
+        };
+
+        let mut submission_set = EmailSubmissionSet::new();
+        submission_set
+            .create_with_id(SUBMISSION_CREATE_ID)
+            .undo_status(UndoStatus::Final);
+        if let Some(sent) = sent_mailbox {
+            submission_set
+                .on_success_update_email(SUBMISSION_CREATE_ID)
+                .mailbox_ids([sent]);
+        } else {
+            submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
+        }
+
+        let mut batch = mail.build();
+        let import_handle = batch
+            .call(import_req)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let email_ref = import_handle.result_reference(format!("/created/{import_create_id}/id"));
+        submission_set
+            .create_with_id(SUBMISSION_CREATE_ID)
+            .email_id_ref(email_ref);
+        let submission_handle = batch
+            .call(submission_set)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+
+        let mut response = batch
+            .send()
+            .await
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let mut import_response = response
+            .get(&import_handle)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let mut submission_response = response
+            .get(&submission_handle)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        // Surface a submission failure rather than reporting the import id
+        // as if the send committed.
+        submission_response
+            .created(SUBMISSION_CREATE_ID)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        let mut email = import_response
+            .created(&import_create_id)
+            .map_err(to_acct_err(AccountOperation::Send))?;
+        Ok(ObjectId(email.take_id().into_string()))
+    })
+}
+
 pub(crate) fn attachment_upload(
     mail: MailAccount,
     mut bytes: AccountStream<Result<Bytes, AccountError>>,
@@ -1442,6 +1520,14 @@ async fn build_email_create_from_send(
     request: bifrost_types::SendRequest,
     mailbox: MailboxId,
 ) -> Result<crate::email::EmailCreate, AccountError> {
+    // RFC 8098 read receipt: targets the resolved sender. JMAP carries
+    // arbitrary headers as structured Email properties, so this becomes a
+    // `Disposition-Notification-To` address header on the create. Captured
+    // before `request` is consumed field-by-field below.
+    let read_receipt_to = request
+        .request_read_receipt
+        .then(|| request.from.clone())
+        .flatten();
     let mut patch = bifrost_types::DraftPatch::default();
     patch.identity = request.identity;
     patch.from = Some(request.from);
@@ -1456,7 +1542,19 @@ async fn build_email_create_from_send(
     patch.attachments_uploaded = Some(request.attachments_uploaded);
     patch.in_reply_to = Some(request.in_reply_to);
     patch.references = Some(request.references);
-    build_email_create_from_draft(mail, patch, mailbox, AccountOperation::Send).await
+    let mut create =
+        build_email_create_from_draft(mail, patch, mailbox, AccountOperation::Send).await?;
+    if let Some(addr) = read_receipt_to {
+        create.header(
+            crate::email::Header {
+                name: "Disposition-Notification-To".to_string(),
+                form: crate::email::HeaderForm::Addresses,
+                all: false,
+            },
+            crate::email::HeaderValue::AsAddresses(vec![address_to_jmap(addr)]),
+        );
+    }
+    Ok(create)
 }
 
 async fn build_email_create_from_draft(
@@ -1695,12 +1793,22 @@ async fn build_body(
             .upload(attachment.data.to_vec(), Some(&attachment.mime))
             .await
             .map_err(to_acct_err(op))?;
-        attachments.push(
-            EmailBodyPart::new()
-                .with_blob_id(blob.blob_id)
-                .with_name(attachment.filename)
-                .with_content_type(attachment.mime),
-        );
+        let mut part = EmailBodyPart::new()
+            .with_blob_id(blob.blob_id)
+            .with_name(attachment.filename)
+            .with_content_type(attachment.mime);
+        // Carry the Content-ID so a `cid:` reference in the HTML body
+        // resolves to this part. JMAP's `cid` property is the bare token
+        // (no angle brackets); strip any the caller supplied.
+        if let Some(cid) = attachment.content_id.as_deref().map(|cid| {
+            cid.trim()
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_string()
+        }) && !cid.is_empty()
+        {
+            part = part.with_content_id(cid);
+        }
+        attachments.push(part);
     }
     for handle in uploaded {
         let (blob_id, mime) = decode_attachment_handle(&handle.0);

@@ -1803,6 +1803,135 @@ impl SyncEngine {
             .await?)
     }
 
+    // ---------- compose passthrough (direct) ----------
+    //
+    // The send / draft / scheduled-send companion to the mutation
+    // passthrough cluster above. Same discipline: every method resolves
+    // through `live_account` (so a compose issued after a reopen runs
+    // against the freshly-installed connection), forwards 1:1 to the
+    // matching `Account` method, invents no new semantics, and bails
+    // `AccountNotAttached` up front. The forwarded `Account` future is
+    // `'static` and captures its own `Arc` clones, so it outlives the
+    // short-lived handle resolved per call. Capability gating
+    // (`scheduled_send`, `send_as`) stays in the protocol crate exactly
+    // as the direct call would; a consumer reads `account_capabilities`
+    // below to decide whether to dispatch before paying the round trip.
+
+    /// Send an RFC 5322 message. Forwards to [`Account::send_message`].
+    pub async fn send_message(
+        &self,
+        account_id: &AccountId,
+        request: bifrost_types::SendRequest,
+    ) -> Result<bifrost_types::ObjectId, Error> {
+        Ok(self.live_account(account_id)?.send_message(request).await?)
+    }
+
+    /// Send pre-assembled RFC 5322 / RFC 8098 octets verbatim. Forwards to
+    /// [`Account::send_raw_message`]; the MDN submission lane.
+    pub async fn send_raw_message(
+        &self,
+        account_id: &AccountId,
+        raw: bytes::Bytes,
+        save_to_sent: Option<bool>,
+    ) -> Result<bifrost_types::ObjectId, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .send_raw_message(raw, save_to_sent)
+            .await?)
+    }
+
+    /// Create a new draft. Forwards to [`Account::draft_create`].
+    pub async fn draft_create(
+        &self,
+        account_id: &AccountId,
+        patch: bifrost_types::DraftPatch,
+    ) -> Result<bifrost_types::DraftHandle, Error> {
+        Ok(self.live_account(account_id)?.draft_create(patch).await?)
+    }
+
+    /// Update an existing draft. Forwards to [`Account::draft_update`].
+    pub async fn draft_update(
+        &self,
+        account_id: &AccountId,
+        draft: bifrost_types::DraftHandle,
+        patch: bifrost_types::DraftPatch,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .draft_update(draft, patch)
+            .await?)
+    }
+
+    /// Discard (delete) a draft without sending. Forwards to
+    /// [`Account::draft_discard`].
+    pub async fn draft_discard(
+        &self,
+        account_id: &AccountId,
+        draft: bifrost_types::DraftHandle,
+    ) -> Result<(), Error> {
+        Ok(self.live_account(account_id)?.draft_discard(draft).await?)
+    }
+
+    /// Convert a draft into a sent message. Forwards to
+    /// [`Account::draft_send`].
+    pub async fn draft_send(
+        &self,
+        account_id: &AccountId,
+        draft: bifrost_types::DraftHandle,
+    ) -> Result<bifrost_types::ObjectId, Error> {
+        Ok(self.live_account(account_id)?.draft_send(draft).await?)
+    }
+
+    /// Cancel a previously scheduled send. Forwards to
+    /// [`Account::cancel_scheduled_send`]; gated by
+    /// `capabilities().pim_methods.scheduled_send` at the protocol layer.
+    pub async fn cancel_scheduled_send(
+        &self,
+        account_id: &AccountId,
+        handle: bifrost_types::ObjectId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .cancel_scheduled_send(handle)
+            .await?)
+    }
+
+    /// Reschedule a previously scheduled send to a new instant. Forwards
+    /// to [`Account::reschedule_send`]; returns the (possibly new)
+    /// submission id.
+    pub async fn reschedule_send(
+        &self,
+        account_id: &AccountId,
+        handle: bifrost_types::ObjectId,
+        scheduled: std::time::SystemTime,
+    ) -> Result<bifrost_types::ObjectId, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .reschedule_send(handle, scheduled)
+            .await?)
+    }
+
+    /// Read the attached account's capabilities snapshot, as stashed at
+    /// attach time.
+    ///
+    /// Non-async: the engine clones `capabilities()` onto the slot during
+    /// `attach`, so this is an in-memory read, not a wire call. Lets a
+    /// consumer branch on `pim_methods.{scheduled_send, send_as}` (and the
+    /// rest) declaratively before dispatching a compose op, rather than
+    /// firing the call and translating an `Unsupported` back into a
+    /// disabled affordance. Errors with `AccountNotAttached` when no slot
+    /// exists for `account_id`.
+    pub fn account_capabilities(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<AccountCapabilities, Error> {
+        let slot = self
+            .accounts
+            .get(account_id)
+            .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
+        Ok(slot.capabilities.clone())
+    }
+
     /// Scheduler handle for advanced consumers (tests, instrumentation).
     #[must_use]
     pub fn scheduler(&self) -> Scheduler {

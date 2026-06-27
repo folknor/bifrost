@@ -446,6 +446,14 @@ impl Account for GoogleAccount {
         )
     }
 
+    fn send_raw_message(
+        &self,
+        raw: Bytes,
+        save_to_sent: Option<bool>,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        pim::send_raw_message(Arc::clone(&self.client), raw, save_to_sent)
+    }
+
     fn attachment_upload(
         &self,
         bytes: AccountStream<Result<Bytes, AccountError>>,

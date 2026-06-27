@@ -278,6 +278,41 @@ impl GraphClient {
         check_response_status(response)
     }
 
+    /// POST a base64-encoded RFC 5322 message to create a draft from raw
+    /// MIME (Graph's import-from-MIME path: `Content-Type: text/plain`,
+    /// body = the base64 of the MIME octets). Returns the created message
+    /// resource. Distinct from `post` because that path hardcodes a JSON
+    /// content type and serializes its body; raw MIME needs neither.
+    pub(crate) async fn post_mime<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        base64_mime: Bytes,
+    ) -> Result<T, GraphError> {
+        let url = self.api_url(path);
+        let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
+            GraphError::Net(bifrost_net::Error::Network {
+                message: "Graph request semaphore closed".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            })
+        })?;
+        let account_net = self.account_net().ok_or_else(|| {
+            GraphError::Net(bifrost_net::Error::Network {
+                message: "Graph client is not attached to an account".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            })
+        })?;
+        let response = account_net
+            .post(&url)
+            .header("Content-Type", "text/plain")
+            .body(base64_mime)
+            .send()
+            .await
+            .map_err(GraphError::Net)?;
+        parse_json_response(response)
+    }
+
     pub(crate) async fn patch<B: Serialize>(&self, path: &str, body: &B) -> Result<(), GraphError> {
         let url = self.api_url(path);
         let response = self.execute(&url, "PATCH", Some(body)).await?;

@@ -265,6 +265,35 @@ pub(crate) fn send_message(
     })
 }
 
+pub(crate) fn send_raw_message(
+    account: ImapAccount,
+    raw: bytes::Bytes,
+    save_to_sent: Option<bool>,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        let Some(submission) = account.submission.clone() else {
+            return Err(super::error::unsupported(AccountOperation::Send));
+        };
+
+        // The caller pre-assembled the RFC 5322 / RFC 8098 octets. Parse
+        // the envelope (From/Sender drive MAIL FROM; To/Cc/Bcc drive RCPT
+        // TO) out of the MIME headers and strip the Bcc header from the
+        // transmitted body, exactly as draft_send does for a saved draft.
+        let parsed = parse_draft_for_submission(&raw, submission.default_from())?;
+        submission
+            .send_rfc5322(&parsed.envelope, &parsed.body, None)
+            .await
+            .map_err(|err| restamp(err, AccountOperation::Send))?;
+
+        // Committed. Optionally append to Sent. The Sent copy keeps the
+        // verbatim caller bytes (Bcc header retained, the sender's record);
+        // only `parsed.body` strips Bcc for the wire.
+        let save = save_to_sent.unwrap_or_else(|| submission.save_to_sent_default());
+        let object_id = append_to_sent_or_fallback(&account, &raw, save, &parsed.message_id).await;
+        Ok(object_id)
+    })
+}
+
 pub(crate) fn draft_send(
     account: ImapAccount,
     draft: DraftHandle,
@@ -1844,6 +1873,9 @@ fn draft_patch_to_rfc5322(patch: &DraftPatch) -> Result<Vec<u8>, AccountError> {
         references: patch.references.as_deref().unwrap_or(&empty_strings),
         message_id: None,
         include_bcc_header: true,
+        // The draft path carries no read-receipt request (that field lives
+        // on SendRequest, not DraftPatch).
+        disposition_notification_to: None,
     };
     Ok(bifrost_types::render_rfc5322(&composed))
 }

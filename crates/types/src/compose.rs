@@ -83,6 +83,12 @@ pub struct AttachmentInline {
     /// Whether the consumer wants `Content-Disposition: inline`
     /// (preview-in-body) rather than `attachment`.
     pub inline: bool,
+    /// `Content-ID` (without angle brackets) to stamp on the rendered
+    /// MIME part. `Some(cid)` makes a `cid:<cid>` reference in the HTML
+    /// body resolve to this part, so an inline image survives the send;
+    /// `None` emits no `Content-ID` header. The renderer wraps the value
+    /// in angle brackets (`Content-ID: <cid>`) per RFC 2045 §7.
+    pub content_id: Option<String>,
 }
 
 /// Send-as / send-on-behalf-of identity for a shared or delegate
@@ -179,6 +185,15 @@ pub struct SendRequest {
     /// where `capabilities().pim_methods.send_as` is `true` (Graph);
     /// `Some(..)` elsewhere is rejected `Unsupported(Send)`.
     pub send_as: Option<SendAs>,
+    /// Request a read receipt (message disposition notification) for this
+    /// send. `true` makes each provider ask the recipient's MUA to confirm
+    /// the message was displayed: the SMTP/JMAP/IMAP/Gmail assemblers emit
+    /// a `Disposition-Notification-To` header (RFC 8098) targeting the
+    /// resolved `from` address, and Graph sets `isReadReceiptRequested`.
+    /// Defaults to `false` so existing callers are unaffected. Whether the
+    /// recipient honors the request is out of the sender's control on every
+    /// provider.
+    pub request_read_receipt: bool,
 }
 
 /// Validate a requested scheduled-send instant at the provider

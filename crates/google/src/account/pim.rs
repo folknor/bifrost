@@ -145,6 +145,25 @@ pub(crate) fn send_message(
     })
 }
 
+pub(crate) fn send_raw_message(
+    client: Arc<GmailClient>,
+    raw: Bytes,
+    _save_to_sent: Option<bool>,
+) -> AccountFuture<Result<ObjectId, AccountError>> {
+    Box::pin(async move {
+        // Gmail `messages.send` takes the verbatim RFC 5322 octets as a
+        // base64url (no-pad) string and learns recipients + Bcc from the
+        // message headers. It always files the result in Sent, so
+        // `save_to_sent` has no Gmail-side toggle (matches send_message).
+        let encoded = URL_SAFE_NO_PAD.encode(&raw);
+        let message = client
+            .send_message(&encoded, None)
+            .await
+            .map_err(|e| account_error_for(e, error::GmailErrorContext::send()))?;
+        Ok(ObjectId(message.id))
+    })
+}
+
 pub(crate) fn attachment_upload(
     _bytes: AccountStream<Result<Bytes, AccountError>>,
     _mime: String,
@@ -862,6 +881,7 @@ async fn document_from_message(
         in_reply_to: header_from(headers, "In-Reply-To"),
         references: references_from_header(header_from(headers, "References").as_deref()),
         thread_id: Some(message.thread_id.clone()),
+        request_read_receipt: false,
     })
 }
 
@@ -889,6 +909,7 @@ async fn attachment_inlines(
             mime: item.mime,
             data: Bytes::from(data),
             inline: item.inline,
+            content_id: item.content_id,
         });
     }
     Ok(attachments)
@@ -899,6 +920,7 @@ struct AttachmentRef {
     filename: String,
     mime: String,
     inline: bool,
+    content_id: Option<String>,
 }
 
 fn collect_attachment_refs(part: &GmailPayload, refs: &mut Vec<AttachmentRef>) {
@@ -910,11 +932,24 @@ fn collect_attachment_refs(part: &GmailPayload, refs: &mut Vec<AttachmentRef>) {
             filename: part.filename.clone(),
             mime: part.mime_type.clone(),
             inline: content_disposition_inline(&part.headers),
+            content_id: content_id_value(&part.headers),
         });
     }
     for child in &part.parts {
         collect_attachment_refs(child, refs);
     }
+}
+
+/// Extract the bare `Content-ID` value (angle brackets stripped) from a
+/// part's headers, so a hydrated draft re-render preserves the `cid:`
+/// linkage of an inline image.
+fn content_id_value(headers: &[GmailHeader]) -> Option<String> {
+    header_from(headers, "Content-ID").map(|value| {
+        value
+            .trim()
+            .trim_matches(|c| c == '<' || c == '>')
+            .to_string()
+    })
 }
 
 fn content_disposition_inline(headers: &[GmailHeader]) -> bool {
@@ -1021,6 +1056,9 @@ struct MailDocument {
     in_reply_to: Option<String>,
     references: Vec<String>,
     thread_id: Option<String>,
+    /// RFC 8098 read-receipt request, carried from `SendRequest`. Drafts
+    /// hydrated from an existing message default to `false`.
+    request_read_receipt: bool,
 }
 
 impl MailDocument {
@@ -1040,6 +1078,7 @@ impl MailDocument {
             in_reply_to: request.in_reply_to,
             references: request.references,
             thread_id: None,
+            request_read_receipt: request.request_read_receipt,
         };
         doc.ensure_from(default_address);
         doc
@@ -1061,6 +1100,9 @@ impl MailDocument {
             in_reply_to: patch.in_reply_to.flatten(),
             references: patch.references.unwrap_or_default(),
             thread_id: None,
+            // DraftPatch carries no read-receipt request; that field lives
+            // on SendRequest only.
+            request_read_receipt: false,
         };
         doc.ensure_from(default_address);
         doc
@@ -1157,6 +1199,9 @@ fn render_message(
         references: &doc.references,
         message_id: None,
         include_bcc_header: true,
+        // RFC 8098 read receipt targets the resolved sender. Gmail honors
+        // the header in the sent MIME. `None` when unrequested.
+        disposition_notification_to: doc.request_read_receipt.then_some(&from),
     };
     let raw = bifrost_types::render_rfc5322(&composed);
     Ok(URL_SAFE_NO_PAD.encode(&raw))

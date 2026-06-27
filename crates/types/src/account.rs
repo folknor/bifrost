@@ -368,6 +368,30 @@ pub trait Account: Send + Sync {
     /// configured `bifrost-smtp` transport.
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>>;
 
+    /// Send a pre-assembled RFC 5322 / RFC 8098 message verbatim. Unlike
+    /// [`send_message`](Self::send_message), the caller hands over the
+    /// already-serialized MIME octets and the provider routes them through
+    /// its submission path without re-rendering: Gmail `messages.send`
+    /// with `raw`; Graph create-from-MIME then send; JMAP `Email/import`
+    /// of the blob then `EmailSubmission/set`; IMAP SMTP submission with
+    /// the envelope parsed from the MIME headers. `save_to_sent` mirrors
+    /// [`SendRequest::save_to_sent`]: `None` leaves the choice to the
+    /// provider default.
+    ///
+    /// This is the lane for a structured `SendRequest` cannot express - a
+    /// pre-built `multipart/report` MDN (RFC 8098 read receipt). The
+    /// default impl returns `Unsupported(Send)` so non-mail accounts
+    /// (CalDAV, CardDAV) inherit it; the four mail protocol crates
+    /// override.
+    fn send_raw_message(
+        &self,
+        raw: Bytes,
+        save_to_sent: Option<bool>,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        let _ = (raw, save_to_sent);
+        Box::pin(async { Err(unsupported_error(AccountOperation::Send)) })
+    }
+
     /// Streaming upload of an attachment. Returns a handle the
     /// consumer references in subsequent `SendRequest` /
     /// `DraftPatch` payloads. The `mime` argument is the

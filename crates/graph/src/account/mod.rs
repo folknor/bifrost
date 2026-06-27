@@ -608,6 +608,15 @@ impl Account for GraphAccount {
         Box::pin(async move { pim::send_message(account, request).await })
     }
 
+    fn send_raw_message(
+        &self,
+        raw: Bytes,
+        save_to_sent: Option<bool>,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { pim::send_raw_message(account, raw, save_to_sent).await })
+    }
+
     fn attachment_upload(
         &self,
         _bytes: AccountStream<Result<Bytes, AccountError>>,

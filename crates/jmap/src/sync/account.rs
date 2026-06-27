@@ -590,6 +590,24 @@ impl Account for JmapAccount {
         )
     }
 
+    fn send_raw_message(
+        &self,
+        raw: bytes::Bytes,
+        save_to_sent: Option<bool>,
+    ) -> AccountFuture<Result<ObjectId, AccountError>> {
+        let Some(submission) = self.submission.clone() else {
+            let err = super::error::unsupported_error(
+                AccountOperation::Send,
+                None,
+                "JMAP submission capability not available",
+            );
+            return Box::pin(async move { Err(err) });
+        };
+        // Same submission-account routing as `send_message`: the import +
+        // EmailSubmission must both target the submission-capable account.
+        pim::send_raw_message(submission, raw, save_to_sent)
+    }
+
     fn attachment_upload(
         &self,
         bytes: AccountStream<Result<bytes::Bytes, AccountError>>,

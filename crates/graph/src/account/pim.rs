@@ -325,6 +325,34 @@ pub(crate) async fn send_message(
     )))
 }
 
+pub(crate) async fn send_raw_message(
+    account: GraphAccount,
+    raw: bytes::Bytes,
+    _save_to_sent: Option<bool>,
+) -> Result<ObjectId, AccountError> {
+    // Graph has no raw-MIME sendMail. It imports raw MIME by POSTing the
+    // base64 of the octets to `/messages` with `Content-Type: text/plain`,
+    // which creates a draft; we then send that draft. Graph always files
+    // the sent copy in Sent, so `save_to_sent` has no Graph-side toggle.
+    let client = &account.client;
+    let base64_mime = base64::engine::general_purpose::STANDARD.encode(&raw);
+    let path = format!("{}/messages", client.api_path_prefix());
+    let created: Value = client
+        .post_mime(&path, bytes::Bytes::from(base64_mime))
+        .await
+        .map_err(|e| into_account_error(e, GraphErrorContext::graph(AccountOperation::Send)))?;
+    let id = created.get("id").and_then(Value::as_str).ok_or_else(|| {
+        pim_protocol_error(
+            AccountOperation::Send,
+            None,
+            "Graph MIME import did not return an id",
+        )
+    })?;
+    let draft = DraftHandle(id.to_string());
+    send_draft_message(client, &draft).await?;
+    Ok(ObjectId(draft.0))
+}
+
 /// Reserved separator for the scheduled-send cancel/reschedule handle.
 /// A handle of the form `"<mailbox>\u{1f}<draft id>"` is a send-as
 /// scheduled draft owned by a shared mailbox; a plain id is a primary
@@ -1294,7 +1322,16 @@ fn message_from_send_request(request: &bifrost_types::SendRequest) -> Result<Val
     patch.attachments_uploaded = Some(request.attachments_uploaded.clone());
     patch.in_reply_to = request.in_reply_to.clone().map(Some);
     patch.references = Some(request.references.clone());
-    message_from_draft_patch(&patch, true)
+    let mut message = message_from_draft_patch(&patch, true)?;
+    // RFC 8098 read receipt: Graph models this as the message-level
+    // `isReadReceiptRequested` bit rather than a MIME header. Set it only
+    // when requested so existing sends are unaffected.
+    if request.request_read_receipt
+        && let Some(map) = message.as_object_mut()
+    {
+        map.insert("isReadReceiptRequested".to_string(), Value::Bool(true));
+    }
+    Ok(message)
 }
 
 fn message_from_draft_patch(
@@ -1411,13 +1448,31 @@ fn graph_recipient(address: &Address) -> Value {
 
 fn graph_attachment_from_inline(attachment: &AttachmentInline) -> Result<Value, AccountError> {
     let content_bytes = base64::engine::general_purpose::STANDARD.encode(&attachment.data);
-    Ok(json!({
+    let mut obj = json!({
         "@odata.type": "#microsoft.graph.fileAttachment",
         "name": attachment.filename.clone(),
         "contentType": attachment.mime.clone(),
         "isInline": attachment.inline,
         "contentBytes": content_bytes
-    }))
+    });
+    // Stamp the contentId so a `cid:` reference in the HTML body resolves
+    // to this fileAttachment (Graph's inline-image linkage). Bare value,
+    // angle brackets stripped, matching the structured-send contract.
+    let content_id = attachment
+        .content_id
+        .as_deref()
+        .map(|cid| {
+            cid.trim()
+                .trim_matches(|c| c == '<' || c == '>')
+                .to_string()
+        })
+        .filter(|cid| !cid.is_empty());
+    if let Some(content_id) = content_id
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert("contentId".to_string(), Value::String(content_id));
+    }
+    Ok(obj)
 }
 
 async fn create_draft_message(
@@ -2389,9 +2444,26 @@ mod tests {
             mime: "text/plain".to_string(),
             data: Bytes::from_static(b"hello"),
             inline: false,
+            content_id: None,
         };
         let value = graph_attachment_from_inline(&attachment).expect("attachment builds");
         assert_eq!(value["contentBytes"], json!("aGVsbG8="));
+        // No content_id -> no contentId key emitted.
+        assert!(value.get("contentId").is_none());
+    }
+
+    #[test]
+    fn inline_attachment_emits_content_id_when_set() {
+        let attachment = AttachmentInline {
+            filename: "logo.png".to_string(),
+            mime: "image/png".to_string(),
+            data: Bytes::from_static(b"img"),
+            inline: true,
+            content_id: Some("<logo@x>".to_string()),
+        };
+        let value = graph_attachment_from_inline(&attachment).expect("attachment builds");
+        // Angle brackets are stripped to the bare cid token.
+        assert_eq!(value["contentId"], json!("logo@x"));
     }
 
     #[test]

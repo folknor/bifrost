@@ -118,6 +118,10 @@ pub fn send_request_to_rfc5322(
         references: &request.references,
         message_id: Some(&message_id),
         include_bcc_header: false,
+        // Read-receipt request targets the resolved sender (the party who
+        // wants the disposition notification). `None` when unset so the
+        // header is absent by default.
+        disposition_notification_to: request.request_read_receipt.then_some(&from),
     };
 
     // The transmitted body drops `Bcc:` so blind recipients are never
@@ -170,6 +174,13 @@ pub struct ComposedMessage<'a> {
     /// send path leaves this `false`; the draft path sets it `true` so a
     /// saved draft preserves the blind-recipient list.
     pub include_bcc_header: bool,
+    /// `Disposition-Notification-To` target (RFC 8098). `Some(addr)`
+    /// emits the header so the recipient's MUA is asked to confirm
+    /// display; the send path sets this to the resolved `from` address
+    /// when `SendRequest::request_read_receipt` is set. `None` omits the
+    /// header (the default, and the draft path which carries no
+    /// read-receipt request).
+    pub disposition_notification_to: Option<&'a Address>,
 }
 
 /// Render the message headers and MIME body into raw RFC 5322 octets.
@@ -197,6 +208,15 @@ pub fn render_rfc5322(msg: &ComposedMessage<'_>) -> Vec<u8> {
         headers.push("To: undisclosed-recipients:;".to_string());
     }
     push_address_header(&mut headers, "Reply-To", msg.reply_to);
+    if let Some(notify) = msg.disposition_notification_to {
+        // RFC 8098 read-receipt request. The target is an address, so it
+        // goes through the same RFC 2047 / phrase encoding as From/To.
+        push_header(
+            &mut headers,
+            "Disposition-Notification-To",
+            &format_address(notify),
+        );
+    }
     if let Some(subject) = msg.subject {
         // `encode_header_value` already sanitizes its input and, for a
         // non-ASCII value, emits CRLF folds between encoded-words. Those
@@ -271,8 +291,20 @@ fn render_attachment_entity(attachment: &AttachmentInline) -> String {
         "attachment"
     };
     let filename = quote_param(&attachment.filename);
+    // Stamp `Content-ID: <cid>` (RFC 2045 §7) so a `cid:` reference in the
+    // HTML body resolves to this part. The value is sanitized and wrapped
+    // in angle brackets; absent when the consumer set no content_id.
+    let content_id = match attachment
+        .content_id
+        .as_deref()
+        .map(sanitize_header)
+        .filter(|cid| !cid.is_empty())
+    {
+        Some(cid) => format!("Content-ID: <{cid}>\r\n"),
+        None => String::new(),
+    };
     format!(
-        "Content-Type: {}; name=\"{filename}\"\r\nContent-Disposition: {disposition}; filename=\"{filename}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+        "Content-Type: {}; name=\"{filename}\"\r\nContent-Disposition: {disposition}; filename=\"{filename}\"\r\n{content_id}Content-Transfer-Encoding: base64\r\n\r\n{}\r\n",
         quote_param(&attachment.mime),
         wrap_base64(&attachment.data)
     )
@@ -595,6 +627,7 @@ mod tests {
                 mime: "text/plain".to_owned(),
                 data: Bytes::from_static(b"hello"),
                 inline: false,
+                content_id: None,
             }],
             ..SendRequest::default()
         };
@@ -784,6 +817,7 @@ mod tests {
                 mime: "text/plain".to_owned(),
                 data: Bytes::from_static(b"x"),
                 inline: false,
+                content_id: None,
             }],
             ..SendRequest::default()
         };
@@ -815,6 +849,77 @@ mod tests {
         assert!(rendered.message_id.ends_with("@example.com"));
         let raw = String::from_utf8(rendered.raw).expect("utf8");
         assert!(raw.contains(&format!("Message-ID: <{}>", rendered.message_id)));
+    }
+
+    #[test]
+    fn inline_attachment_content_id_emits_header() {
+        let request = SendRequest {
+            to: vec![addr(None, "a@example.com")],
+            body_html: Some("<img src=\"cid:logo@x\">".to_owned()),
+            attachments_inline: vec![AttachmentInline {
+                filename: "logo.png".to_owned(),
+                mime: "image/png".to_owned(),
+                data: Bytes::from_static(b"img"),
+                inline: true,
+                content_id: Some("logo@x".to_owned()),
+            }],
+            ..SendRequest::default()
+        };
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
+        let raw = String::from_utf8(rendered.raw).expect("utf8");
+        // The Content-ID is wrapped in angle brackets so the cid: URI in
+        // the HTML body resolves to this part.
+        assert!(raw.contains("Content-ID: <logo@x>"));
+    }
+
+    #[test]
+    fn no_content_id_emits_no_header() {
+        let request = SendRequest {
+            to: vec![addr(None, "a@example.com")],
+            body_text: Some("hi".to_owned()),
+            attachments_inline: vec![AttachmentInline {
+                filename: "a.txt".to_owned(),
+                mime: "text/plain".to_owned(),
+                data: Bytes::from_static(b"x"),
+                inline: false,
+                content_id: None,
+            }],
+            ..SendRequest::default()
+        };
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
+        let raw = String::from_utf8(rendered.raw).expect("utf8");
+        assert!(!raw.contains("Content-ID:"));
+    }
+
+    #[test]
+    fn read_receipt_request_emits_disposition_notification_header() {
+        let request = SendRequest {
+            to: vec![addr(None, "a@example.com")],
+            from: Some(addr(Some("Me"), "me@sender.test")),
+            body_text: Some("hi".to_owned()),
+            request_read_receipt: true,
+            ..SendRequest::default()
+        };
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "default@sender.test")).expect("renders");
+        let raw = String::from_utf8(rendered.raw).expect("utf8");
+        // The receipt target is the resolved From address.
+        assert!(raw.contains("Disposition-Notification-To: Me <me@sender.test>"));
+    }
+
+    #[test]
+    fn no_read_receipt_request_omits_header() {
+        let request = SendRequest {
+            to: vec![addr(None, "a@example.com")],
+            body_text: Some("hi".to_owned()),
+            ..SendRequest::default()
+        };
+        let rendered =
+            send_request_to_rfc5322(&request, &addr(None, "me@sender.test")).expect("renders");
+        let raw = String::from_utf8(rendered.raw).expect("utf8");
+        assert!(!raw.contains("Disposition-Notification-To:"));
     }
 
     #[test]
