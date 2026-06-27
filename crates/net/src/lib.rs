@@ -1,4 +1,12 @@
 #![forbid(unsafe_code)]
+// The transport `Error` preserves response evidence (HeaderMap + capped
+// body, inline and via FinalResponse) so the four protocol crates can
+// pattern-match status, headers, and body without a Box deref. The enum
+// is uniformly large rather than lopsided, so `large_enum_variant` (deny)
+// already passes and there is no cheap single-variant boxing win; boxing
+// to satisfy `result_large_err` would only add an allocation on the cold
+// error path. The error is intentionally large by design.
+#![allow(clippy::result_large_err)]
 //! Shared HTTP transport for the bifrost JMAP, Gmail, and Graph
 //! clients.
 //!
