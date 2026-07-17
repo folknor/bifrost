@@ -26,7 +26,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
-quick-xml = "0.40.1"
+quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["json", "native-tls", "stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

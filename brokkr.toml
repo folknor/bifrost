@@ -1,1 +1,4 @@
 project = "bifrost"
+
+[test]
+debug = true

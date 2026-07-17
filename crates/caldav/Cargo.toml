@@ -26,7 +26,7 @@ caldata = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = "0.10.4"
 futures = { workspace = true }
-quick-xml = "0.40.1"
+quick-xml = "0.41.0"
 reqwest = { workspace = true, features = ["native-tls"] }
 uuid = { workspace = true }
 
