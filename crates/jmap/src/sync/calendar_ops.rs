@@ -85,13 +85,8 @@ pub(crate) fn events_in_range(
 fn range_filter(range: &EventRange) -> QueryFilter<EventFilter> {
     QueryFilter::and(vec![
         QueryFilter::from(EventFilter::in_calendar(range.calendar_id.0.clone())),
-        QueryFilter::from(EventFilter::after(jmap_time_from_shared(
-            &range.start,
-            false,
-        ))),
-        QueryFilter::from(EventFilter::before(jmap_time_from_shared(
-            &range.end, false,
-        ))),
+        QueryFilter::from(EventFilter::after(jmap_utc_filter_time(&range.start))),
+        QueryFilter::from(EventFilter::before(jmap_utc_filter_time(&range.end))),
     ])
 }
 
@@ -983,6 +978,23 @@ fn jmap_time_from_shared(time: &EventTime, is_all_day: bool) -> String {
     time.value.clone()
 }
 
+// The JSCalendar event-query `after`/`before` filter conditions are
+// LocalDateTime values (draft-ietf-jmap-calendars-26 section 5.11.1): a bare
+// wall-clock string with no zone and no trailing `Z`, interpreted in the
+// query's `timeZone` argument, which defaults to Etc/UTC. A range boundary is
+// always a timed instant, so an offset-bearing RFC 3339 input is normalized to
+// UTC and rendered bare, matching that Etc/UTC default. Date-only or
+// unparseable values pass through untouched.
+fn jmap_utc_filter_time(time: &EventTime) -> String {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
+        return parsed
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+    }
+    time.value.clone()
+}
+
 fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> bool {
     if start.value.is_empty() || end.value.is_empty() {
         return true;
@@ -1318,6 +1330,17 @@ mod tests {
                 false,
             ),
             "2026-06-02T12:00:00"
+        );
+    }
+
+    #[test]
+    fn filter_time_normalizes_offset_to_bare_utc_local_datetime() {
+        assert_eq!(
+            jmap_utc_filter_time(&EventTime {
+                value: "2026-06-02T12:00:00+02:00".to_string(),
+                timezone: Some("Europe/Oslo".to_string()),
+            }),
+            "2026-06-02T10:00:00"
         );
     }
 

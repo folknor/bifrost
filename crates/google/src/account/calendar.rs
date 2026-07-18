@@ -18,11 +18,18 @@ use bifrost_types::{AccountError, AccountFuture, AccountOperation};
 const CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const EVENT_ID_SEPARATOR: &str = "::";
 
+fn calendar_api_base() -> String {
+    std::env::var("RATATOSKR_TEST_GCAL_ENDPOINT").map_or_else(
+        |_| CALENDAR_API_BASE.to_string(),
+        |endpoint| format!("{}/calendar/v3", endpoint.trim_end_matches('/')),
+    )
+}
+
 pub(crate) fn calendars_list(
     client: Arc<GmailClient>,
 ) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
     Box::pin(async move {
-        let url = format!("{CALENDAR_API_BASE}/users/me/calendarList");
+        let url = format!("{}/users/me/calendarList", calendar_api_base());
         let response: CalendarListResponse = client
             .get(&url)
             .await
@@ -57,7 +64,8 @@ pub(crate) fn events_in_range(
         let time_min = google_range_bound(&range.start, "timeMin")?;
         let time_max = google_range_bound(&range.end, "timeMax")?;
         let mut url = format!(
-            "{CALENDAR_API_BASE}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
+            "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
+            calendar_api_base(),
             bifrost_net::url::encode_component(&time_min),
             bifrost_net::url::encode_component(&time_max)
         );
@@ -100,7 +108,7 @@ pub(crate) fn create(
         reject_create_organizer(&event)?;
         let calendar_id = event.calendar_id.0.clone();
         let encoded = bifrost_net::url::encode_component(&calendar_id);
-        let url = format!("{CALENDAR_API_BASE}/calendars/{encoded}/events");
+        let url = format!("{}/calendars/{encoded}/events", calendar_api_base());
         let created: GoogleEvent = client
             .post(&url, &google_event_from_create(&event))
             .await
@@ -297,7 +305,8 @@ async fn search_one_calendar(
 ) -> Result<Page<CalendarEvent>, AccountError> {
     let encoded = bifrost_net::url::encode_component(&calendar_id);
     let mut url = format!(
-        "{CALENDAR_API_BASE}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
+        "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
+        calendar_api_base(),
         bifrost_net::url::encode_component(query)
     );
     if let Some(limit) = limit {
@@ -649,7 +658,8 @@ fn event_time(time: GoogleEventTime) -> EventTime {
 
 fn event_url(calendar_id: &str, event_id: &str) -> String {
     format!(
-        "{CALENDAR_API_BASE}/calendars/{}/events/{}",
+        "{}/calendars/{}/events/{}",
+        calendar_api_base(),
         bifrost_net::url::encode_component(calendar_id),
         bifrost_net::url::encode_component(event_id)
     )
