@@ -1,10 +1,10 @@
 use bifrost_types::{
     AttendeeRole, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee, EventAvailability,
-    EventCreate, EventId, EventOrganizer, EventPatch, EventRecurrence, EventStatus, EventTime,
-    EventVisibility, ProtocolKind, RsvpStatus,
+    EventCreate, EventId, EventOrganizer, EventPatch, EventRecurrence, EventReminder, EventStatus,
+    EventTime, EventVisibility, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 use caldata::ContentLineParser;
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// Projection failed because the resource body could not be tokenized into
@@ -14,13 +14,85 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IcalParseError(pub(crate) String);
 
+/// Project the master (first) VEVENT of a resource. Used by the direct
+/// `event_get` / `event_update` paths, which operate on the master.
 pub(crate) fn event_from_ical(
     uri: String,
     calendar_id: CalendarId,
     etag: Option<String>,
     data: &str,
 ) -> Result<CalendarEvent, IcalParseError> {
-    let props = parse_vevent(data)?;
+    let block = parse_vevents(data)?.into_iter().next().unwrap_or_default();
+    Ok(project_event(
+        EventId(uri.clone()),
+        uri,
+        calendar_id,
+        etag,
+        data,
+        block,
+    ))
+}
+
+/// Project *every* VEVENT in a resource: the master plus each
+/// recurrence override / cancellation. Each projected event carries its
+/// own `RECURRENCE-ID` (in `recurrence.recurrence_id`) and `STATUS`, so
+/// a `CANCELLED` override or a moved instance survives the range/search
+/// listing instead of being discarded with the rest of the resource.
+///
+/// Override instances share the resource's native id but take a
+/// recurrence-qualified `EventId` so they do not collide with the master
+/// in a consumer index; `native_id` / provenance stay the resource uri.
+pub(crate) fn events_from_ical(
+    uri: String,
+    calendar_id: CalendarId,
+    etag: Option<String>,
+    data: &str,
+) -> Result<Vec<CalendarEvent>, IcalParseError> {
+    let blocks = parse_vevents(data)?;
+    if blocks.is_empty() {
+        return Ok(vec![project_event(
+            EventId(uri.clone()),
+            uri,
+            calendar_id,
+            etag,
+            data,
+            VeventBlock::default(),
+        )]);
+    }
+    Ok(blocks
+        .into_iter()
+        .map(|block| {
+            let recurrence_id = block
+                .props
+                .iter()
+                .find(|prop| prop.name == "RECURRENCE-ID")
+                .map(|prop| prop.value.clone());
+            let id = match &recurrence_id {
+                Some(recurrence_id) => EventId(format!("{uri}#{recurrence_id}")),
+                None => EventId(uri.clone()),
+            };
+            project_event(
+                id,
+                uri.clone(),
+                calendar_id.clone(),
+                etag.clone(),
+                data,
+                block,
+            )
+        })
+        .collect())
+}
+
+fn project_event(
+    id: EventId,
+    uri: String,
+    calendar_id: CalendarId,
+    etag: Option<String>,
+    data: &str,
+    block: VeventBlock,
+) -> CalendarEvent {
+    let reminders = reminders_from_valarms(&block.alarms);
+    let props = Props(block.props);
     let uid = props.first("UID").map(ToString::to_string);
     let title = props.first("SUMMARY").map(unescape_text);
     let description = props.first("DESCRIPTION").map(unescape_text);
@@ -33,10 +105,10 @@ pub(crate) fn event_from_ical(
     let dtstart = pick_datetime(&props.all_with_name("DTSTART"));
     let dtend = pick_datetime(&props.all_with_name("DTEND"));
     let start = dtstart
-        .map(|prop| event_time_from_property(prop, false))
+        .map(event_time_from_property)
         .unwrap_or_else(default_time);
     let end = dtend
-        .map(|prop| event_time_from_property(prop, true))
+        .map(event_time_from_property)
         .unwrap_or_else(default_time);
     let is_all_day =
         dtstart.is_some_and(Prop::value_type_date) || dtend.is_some_and(Prop::value_type_date);
@@ -62,8 +134,8 @@ pub(crate) fn event_from_ical(
             .collect(),
         recurrence_id: props.first("RECURRENCE-ID").map(ToString::to_string),
     };
-    Ok(CalendarEvent {
-        id: EventId(uri.clone()),
+    CalendarEvent {
+        id,
         calendar_id: calendar_id.clone(),
         native_id: uri.clone(),
         uid,
@@ -85,10 +157,11 @@ pub(crate) fn event_from_ical(
         self_response: RsvpStatus::Unknown,
         organizer,
         attendees,
+        reminders,
         recurrence,
         html_link: None,
         raw_ical: Some(data.to_string()),
-    })
+    }
 }
 
 pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
@@ -103,8 +176,8 @@ pub(crate) fn create_to_ical(event: &EventCreate, uid: &str) -> String {
     push_optional(&mut lines, "SUMMARY", event.title.as_deref());
     push_optional(&mut lines, "DESCRIPTION", event.description.as_deref());
     push_optional(&mut lines, "LOCATION", event.location.as_deref());
-    push_time(&mut lines, "DTSTART", &event.start, event.is_all_day, false);
-    push_time(&mut lines, "DTEND", &event.end, event.is_all_day, true);
+    push_time(&mut lines, "DTSTART", &event.start, event.is_all_day);
+    push_time(&mut lines, "DTEND", &event.end, event.is_all_day);
     lines.push(format!("STATUS:{}", ical_event_status(event.status)));
     lines.push(format!("TRANSP:{}", transparency(event.availability)));
     if let Some(classification) = classification(event.visibility) {
@@ -169,18 +242,11 @@ pub(crate) fn patch_to_ical(
             "DTSTART",
             &merged.start,
             merged.is_all_day,
-            false,
         );
         replace_names.push("DTSTART");
     }
     if patch.end.is_some() || patch.is_all_day.is_some() {
-        push_time(
-            &mut replacements,
-            "DTEND",
-            &merged.end,
-            merged.is_all_day,
-            true,
-        );
+        push_time(&mut replacements, "DTEND", &merged.end, merged.is_all_day);
         replace_names.push("DTEND");
     }
     if let Some(status) = patch.status {
@@ -288,14 +354,8 @@ pub(crate) fn rsvp_reply_ical(
         format!("UID:{}", escape_text(uid)),
         format!("DTSTAMP:{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")),
     ];
-    push_time(
-        &mut lines,
-        "DTSTART",
-        &current.start,
-        current.is_all_day,
-        false,
-    );
-    push_time(&mut lines, "DTEND", &current.end, current.is_all_day, true);
+    push_time(&mut lines, "DTSTART", &current.start, current.is_all_day);
+    push_time(&mut lines, "DTEND", &current.end, current.is_all_day);
     lines.push(organizer_to_line(organizer));
     lines.push(attendee_to_line(&attendee));
     lines.push("END:VEVENT".to_string());
@@ -307,43 +367,123 @@ pub(crate) fn new_uid() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// Project the first VEVENT's properties using caldata's streaming content
-/// line tokenizer. caldata unfolds (stripping exactly one WSP per RFC 5545
-/// sec 3.1, not the whole leading run the old hand-rolled unfolder ate) and
-/// splits quoted parameter values that legally contain `:`/`;`/`,` - both
-/// classes of bug the previous `split_once(':')` path had. Values are stored
-/// raw (caldata never unescapes); text fields are unescaped at the point we
-/// read them into the model.
-fn parse_vevent(data: &str) -> Result<Props, IcalParseError> {
-    let mut props = Vec::new();
-    let mut in_event = false;
-    let mut seen_event = false;
+/// One VEVENT component: its top-level properties plus each nested
+/// VALARM's properties. RFC 5545 permits only VALARM sub-components
+/// inside a VEVENT, so any other nested `BEGIN` line stays a top-level
+/// property (harmless - nothing reads it).
+#[derive(Debug, Default)]
+struct VeventBlock {
+    props: Vec<Prop>,
+    alarms: Vec<Vec<Prop>>,
+}
+
+/// Tokenize a resource into every VEVENT block using caldata's streaming
+/// content line tokenizer. caldata unfolds (stripping exactly one WSP per
+/// RFC 5545 sec 3.1, not the whole leading run the old hand-rolled
+/// unfolder ate) and splits quoted parameter values that legally contain
+/// `:`/`;`/`,` - both classes of bug the previous `split_once(':')` path
+/// had. Values are stored raw (caldata never unescapes); text fields are
+/// unescaped at the point we read them into the model.
+///
+/// Every VEVENT is returned in document order (master first, then each
+/// recurrence override / cancellation), and each block's nested VALARMs
+/// are captured separately so reminders project without polluting the
+/// event's own property list.
+fn parse_vevents(data: &str) -> Result<Vec<VeventBlock>, IcalParseError> {
+    let mut blocks = Vec::new();
+    let mut current: Option<VeventBlock> = None;
+    let mut alarm: Option<Vec<Prop>> = None;
     for line in ContentLineParser::from_slice(data.as_bytes()) {
         let line = line.map_err(|error| IcalParseError(error.to_string()))?;
         let name = line.name;
         if name == "BEGIN" && line.value.eq_ignore_ascii_case("VEVENT") {
-            // Only the first VEVENT is projected (the master); override
-            // instances are preserved verbatim on the patch path.
-            if seen_event {
-                break;
-            }
-            in_event = true;
-            seen_event = true;
+            current = Some(VeventBlock::default());
             continue;
         }
         if name == "END" && line.value.eq_ignore_ascii_case("VEVENT") {
-            break;
-        }
-        if !in_event {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            alarm = None;
             continue;
         }
-        props.push(Prop {
+        let Some(block) = current.as_mut() else {
+            // Content outside any VEVENT (VTIMEZONE, VCALENDAR props).
+            continue;
+        };
+        if name == "BEGIN" && line.value.eq_ignore_ascii_case("VALARM") {
+            alarm = Some(Vec::new());
+            continue;
+        }
+        if name == "END" && line.value.eq_ignore_ascii_case("VALARM") {
+            if let Some(alarm) = alarm.take() {
+                block.alarms.push(alarm);
+            }
+            continue;
+        }
+        let prop = Prop {
             name,
             params: line.params,
             value: line.value,
-        });
+        };
+        match alarm.as_mut() {
+            Some(alarm) => alarm.push(prop),
+            None => block.props.push(prop),
+        }
     }
-    Ok(Props(props))
+    Ok(blocks)
+}
+
+/// Project each VALARM into an `EventReminder`, dropping alarms with no
+/// usable TRIGGER.
+fn reminders_from_valarms(alarms: &[Vec<Prop>]) -> Vec<EventReminder> {
+    alarms
+        .iter()
+        .filter_map(|alarm| reminder_from_valarm(alarm))
+        .collect()
+}
+
+fn reminder_from_valarm(alarm: &[Prop]) -> Option<EventReminder> {
+    let trigger_prop = alarm.iter().find(|prop| prop.name == "TRIGGER")?;
+    let trigger = trigger_from_property(trigger_prop)?;
+    let action = alarm
+        .iter()
+        .find(|prop| prop.name == "ACTION")
+        .map(|prop| prop.value.to_ascii_uppercase());
+    Some(EventReminder { trigger, action })
+}
+
+/// Read a VALARM TRIGGER. Default value type is DURATION (relative to
+/// the event start, or end when `RELATED=END`); `VALUE=DATE-TIME`
+/// (or a bare UTC date-time) is an absolute trigger.
+fn trigger_from_property(prop: &Prop) -> Option<ReminderTrigger> {
+    let value = prop.value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let looks_duration = value
+        .strip_prefix(['-', '+'])
+        .unwrap_or(value)
+        .starts_with('P');
+    let is_duration = match prop.param("VALUE") {
+        Some(kind) if kind.eq_ignore_ascii_case("DATE-TIME") => false,
+        Some(kind) if kind.eq_ignore_ascii_case("DURATION") => true,
+        _ => looks_duration,
+    };
+    if is_duration {
+        let relative_to = match prop.param("RELATED") {
+            Some(related) if related.eq_ignore_ascii_case("END") => ReminderRelativeTo::End,
+            _ => ReminderRelativeTo::Start,
+        };
+        Some(ReminderTrigger::Relative {
+            offset: value.to_string(),
+            relative_to,
+        })
+    } else {
+        Some(ReminderTrigger::Absolute(format_ical_time(
+            value, false, false,
+        )))
+    }
 }
 
 /// Order DTSTART/DTEND candidates by descending specificity so a duplicate
@@ -410,10 +550,10 @@ impl Prop {
     }
 }
 
-fn event_time_from_property(prop: &Prop, is_end: bool) -> EventTime {
+fn event_time_from_property(prop: &Prop) -> EventTime {
     let tzid = prop.param("TZID");
     EventTime {
-        value: format_ical_time(&prop.value, prop.value_type_date(), is_end, tzid.is_some()),
+        value: format_ical_time(&prop.value, prop.value_type_date(), tzid.is_some()),
         // Map Microsoft/Windows zone names ("W. Europe Standard Time") to
         // their IANA equivalent when caldata's table knows them; otherwise
         // pass the TZID through verbatim.
@@ -429,14 +569,13 @@ fn canonical_tzid(tzid: &str) -> String {
         .unwrap_or_else(|| tzid.to_string())
 }
 
-fn format_ical_time(value: &str, is_date: bool, is_end: bool, has_tzid: bool) -> String {
+fn format_ical_time(value: &str, is_date: bool, has_tzid: bool) -> String {
     if is_date && value.len() == 8 {
-        if is_end
-            && let Ok(date) = NaiveDate::parse_from_str(value, "%Y%m%d")
-            && let Some(date) = date.checked_sub_days(Days::new(1))
-        {
-            return date.format("%Y-%m-%d").to_string();
-        }
+        // All-day dates project verbatim. The iCalendar all-day DTEND is
+        // already exclusive and `EventTime`'s all-day contract is exclusive
+        // too, so an end date is NOT decremented to an inclusive last day
+        // (that would diverge from bifrost-google, which passes Google's
+        // exclusive end through verbatim).
         return format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]);
     }
     if value.len() >= 15 {
@@ -484,14 +623,10 @@ fn ical_offset_suffix(value: &str) -> String {
     String::new()
 }
 
-fn ical_time_from_event_time(time: &EventTime, is_all_day: bool, is_end: bool) -> String {
+fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
     if is_all_day {
-        if is_end
-            && let Ok(date) = NaiveDate::parse_from_str(&time.value, "%Y-%m-%d")
-            && let Some(date) = date.checked_add_days(Days::new(1))
-        {
-            return date.format("%Y%m%d").to_string();
-        }
+        // `EventTime`'s all-day end is exclusive, matching iCalendar's
+        // exclusive DTEND, so the date serializes verbatim - no +1 day.
         return time.value.replace('-', "");
     }
     if let Ok(parsed) = DateTime::parse_from_rfc3339(&time.value) {
@@ -772,14 +907,8 @@ fn format_utc_offset(offset: chrono::FixedOffset) -> String {
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-fn push_time(
-    lines: &mut Vec<String>,
-    name: &str,
-    time: &EventTime,
-    is_all_day: bool,
-    is_end: bool,
-) {
-    let value = ical_time_from_event_time(time, is_all_day, is_end);
+fn push_time(lines: &mut Vec<String>, name: &str, time: &EventTime, is_all_day: bool) {
+    let value = ical_time_from_event_time(time, is_all_day);
     if is_all_day {
         lines.push(format!("{name};VALUE=DATE:{value}"));
     } else if let Some(tzid) = &time.timezone {
@@ -1038,6 +1167,7 @@ fn escape_param(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     /// Test shim: the production projector is fallible (malformed bodies
     /// degrade to a per-resource skip); these tests feed well-formed input
@@ -1214,6 +1344,10 @@ mod tests {
 
     #[test]
     fn all_day_dtend_round_trips_as_exclusive_ical_end() {
+        // A single all-day event on 2026-06-02 is start 2026-06-02, end
+        // 2026-06-03 under the exclusive-end contract. It serializes to an
+        // exclusive iCalendar DTEND verbatim (no +1) and parses back
+        // verbatim (no -1).
         let body = create_to_ical(
             &EventCreate {
                 calendar_id: CalendarId("/cal/".to_string()),
@@ -1225,7 +1359,7 @@ mod tests {
                     timezone: None,
                 },
                 end: EventTime {
-                    value: "2026-06-02".to_string(),
+                    value: "2026-06-03".to_string(),
                     timezone: None,
                 },
                 is_all_day: true,
@@ -1249,11 +1383,13 @@ mod tests {
             &body,
         );
         assert_eq!(event.start.value, "2026-06-02");
-        assert_eq!(event.end.value, "2026-06-02");
+        assert_eq!(event.end.value, "2026-06-03");
     }
 
     #[test]
     fn dtend_date_marks_event_all_day() {
+        // The exclusive iCalendar all-day DTEND passes through verbatim
+        // into the exclusive `EventTime` end - no inclusive decrement.
         let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
@@ -1262,7 +1398,7 @@ mod tests {
         );
 
         assert!(event.is_all_day);
-        assert_eq!(event.end.value, "2026-06-02");
+        assert_eq!(event.end.value, "2026-06-03");
     }
 
     #[test]
@@ -1299,6 +1435,79 @@ mod tests {
             Some("FREQ=WEEKLY;COUNT=2")
         );
         assert_eq!(event.recurrence.recurrence_id, None);
+    }
+
+    #[test]
+    fn events_from_ical_projects_master_and_overrides() {
+        // The whole resource projects: master (RRULE) plus a moved
+        // override and a cancellation, each carrying its RECURRENCE-ID and
+        // STATUS. Overrides take a recurrence-qualified id but keep the
+        // resource native id.
+        let events = events_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Master\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260609T120000Z\r\nSUMMARY:Moved\r\nDTSTART:20260609T140000Z\r\nDTEND:20260609T150000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:u1\r\nRECURRENCE-ID:20260616T120000Z\r\nSTATUS:CANCELLED\r\nDTSTART:20260616T120000Z\r\nDTEND:20260616T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        )
+        .expect("valid iCalendar projects");
+
+        assert_eq!(events.len(), 3);
+
+        let master = &events[0];
+        assert_eq!(master.title.as_deref(), Some("Master"));
+        assert_eq!(master.id.0, "/cal/one.ics");
+        assert_eq!(master.recurrence.recurrence_id, None);
+        assert_eq!(
+            master.recurrence.rrule.as_deref(),
+            Some("FREQ=WEEKLY;COUNT=3")
+        );
+
+        let moved = &events[1];
+        assert_eq!(moved.title.as_deref(), Some("Moved"));
+        assert_eq!(moved.id.0, "/cal/one.ics#20260609T120000Z");
+        assert_eq!(moved.native_id, "/cal/one.ics");
+        assert_eq!(
+            moved.recurrence.recurrence_id.as_deref(),
+            Some("20260609T120000Z")
+        );
+
+        let cancelled = &events[2];
+        assert_eq!(cancelled.status, EventStatus::Cancelled);
+        assert_eq!(
+            cancelled.recurrence.recurrence_id.as_deref(),
+            Some("20260616T120000Z")
+        );
+    }
+
+    #[test]
+    fn valarm_projects_relative_and_absolute_reminders() {
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER;RELATED=END:PT5M\r\nEND:VALARM\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20260602T110000Z\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.reminders.len(), 3);
+        assert_eq!(
+            event.reminders[0].trigger,
+            ReminderTrigger::Relative {
+                offset: "-PT15M".to_string(),
+                relative_to: ReminderRelativeTo::Start,
+            }
+        );
+        assert_eq!(event.reminders[0].action.as_deref(), Some("DISPLAY"));
+        assert_eq!(
+            event.reminders[1].trigger,
+            ReminderTrigger::Relative {
+                offset: "PT5M".to_string(),
+                relative_to: ReminderRelativeTo::End,
+            }
+        );
+        assert_eq!(
+            event.reminders[2].trigger,
+            ReminderTrigger::Absolute("2026-06-02T11:00:00Z".to_string())
+        );
     }
 
     #[test]

@@ -611,6 +611,7 @@ pub(crate) async fn search(
         items: threads,
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -623,6 +624,7 @@ pub(crate) async fn search_messages(
         items: page.items.into_iter().map(|row| row.id).collect(),
         next_cursor: page.next_cursor,
         estimated_total: page.estimated_total,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -1542,6 +1544,7 @@ async fn search_message_rows(
         items: rows,
         next_cursor: page.next_link.map(String::into_bytes),
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 

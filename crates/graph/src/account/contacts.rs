@@ -81,6 +81,7 @@ async fn contact_page(
         items: page.value.into_iter().map(contact_from_graph).collect(),
         next_cursor: page.next_link.map(String::into_bytes),
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -213,6 +214,7 @@ pub(crate) async fn search(
         items,
         next_cursor,
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -275,6 +277,7 @@ pub(crate) async fn directory_search(
         items,
         next_cursor,
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 

@@ -98,10 +98,59 @@ pub enum AttendeeRole {
 /// Event timestamp represented as an RFC 3339 date-time string, or a
 /// provider-local all-day date in `YYYY-MM-DD` form when `is_all_day`
 /// is true.
+///
+/// All-day interpretation contract: for an all-day event `start` is the
+/// first day (inclusive) and `end` is **exclusive** - it names the first
+/// day *after* the last day the event covers, matching iCalendar's
+/// non-inclusive `DTEND` and Google Calendar's exclusive end date. A
+/// single all-day event on 2026-06-02 therefore has `start` `"2026-06-02"`
+/// and `end` `"2026-06-03"`. Providers must project all-day ends into this
+/// exclusive form (bifrost-caldav no longer decrements the iCalendar
+/// `DTEND`, bifrost-google passes Google's exclusive end through verbatim).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTime {
     pub value: String,
     pub timezone: Option<String>,
+}
+
+/// Whether a relative reminder offset is measured from the event start
+/// or end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReminderRelativeTo {
+    Start,
+    End,
+}
+
+/// When a reminder fires. Faithfully preserves the provider's trigger
+/// timing for event-detail display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReminderTrigger {
+    /// Fires at an offset relative to the event start or end. `offset`
+    /// is an RFC 5545 / ISO 8601 signed duration text (e.g. `-PT15M`
+    /// for fifteen minutes before the reference point).
+    Relative {
+        offset: String,
+        relative_to: ReminderRelativeTo,
+    },
+    /// Fires at an absolute instant, as an RFC 3339 / iCalendar UTC
+    /// date-time string.
+    Absolute(String),
+}
+
+/// A reminder / alarm attached to an event.
+///
+/// Read-only projection surfaced for event-detail display. Populated
+/// from iCalendar `VALARM` components (CalDAV) and JSCalendar `alerts`
+/// (JMAP); providers that do not expose reminders leave
+/// `CalendarEvent::reminders` empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventReminder {
+    /// When the reminder fires.
+    pub trigger: ReminderTrigger,
+    /// Provider action (`DISPLAY`, `EMAIL`, `AUDIO`, ...) when supplied.
+    pub action: Option<String>,
 }
 
 /// Event attendee.
@@ -154,6 +203,9 @@ pub struct CalendarEvent {
     pub self_response: RsvpStatus,
     pub organizer: Option<EventOrganizer>,
     pub attendees: Vec<EventAttendee>,
+    /// Reminders / alarms attached to the event. Read surface for
+    /// event-detail display; empty when the provider exposes none.
+    pub reminders: Vec<EventReminder>,
     pub recurrence: EventRecurrence,
     pub html_link: Option<String>,
     pub raw_ical: Option<String>,

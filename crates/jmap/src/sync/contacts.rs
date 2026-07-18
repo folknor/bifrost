@@ -77,6 +77,7 @@ pub(crate) fn list(
             items: cards,
             next_cursor,
             estimated_total: total,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -219,6 +220,7 @@ pub(crate) fn search(
             items: cards,
             next_cursor,
             estimated_total: total,
+            failed_ids: Vec::new(),
         })
     })
 }

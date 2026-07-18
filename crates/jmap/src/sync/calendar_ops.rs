@@ -1,8 +1,9 @@
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AttendeeRole, Calendar, CalendarEvent,
     CalendarId, CalendarProvenance, DiagnosticText, EventAttendee, EventAvailability, EventCreate,
-    EventId, EventOrganizer, EventPatch, EventRange, EventRecurrence, EventSearchRequest,
-    EventStatus, EventTime, EventVisibility, Page, ProtocolKind, RsvpStatus,
+    EventId, EventOrganizer, EventPatch, EventRange, EventRecurrence, EventReminder,
+    EventSearchRequest, EventStatus, EventTime, EventVisibility, Page, ProtocolKind,
+    ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use serde_json::{Map, Value, json};
@@ -76,6 +77,7 @@ pub(crate) fn events_in_range(
             items: events,
             next_cursor,
             estimated_total: total,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -245,6 +247,7 @@ pub(crate) fn search(
             items: events,
             next_cursor,
             estimated_total: total,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -336,6 +339,8 @@ fn event_from_jmap(event: JmapCalendarEvent) -> CalendarEvent {
     if let Some(dates) = event.excluded_dates() {
         exdate.extend(dates.keys().cloned());
     }
+    let alerts = event.alerts();
+    let reminders = reminders_from_alerts(alerts.as_value().copied());
     CalendarEvent {
         id: EventId(native.clone()),
         calendar_id: calendar_id.clone(),
@@ -359,6 +364,7 @@ fn event_from_jmap(event: JmapCalendarEvent) -> CalendarEvent {
         self_response: RsvpStatus::Unknown,
         organizer: organizer(event.participants()),
         attendees: attendees(event.participants()),
+        reminders,
         recurrence: EventRecurrence {
             rrule: event
                 .recurrence_rules()
@@ -873,6 +879,45 @@ fn organizer(participants: Option<&Map<String, Value>>) -> Option<EventOrganizer
         .next()
 }
 
+/// Project JSCalendar `alerts` into `EventReminder`s. Each alert's
+/// `trigger` is either an `OffsetTrigger` (relative to the event start or
+/// end) or an `AbsoluteTrigger` (a UTC instant); the alert `action`
+/// (`display` / `email`) is carried through uppercased.
+fn reminders_from_alerts(alerts: Option<&Map<String, Value>>) -> Vec<EventReminder> {
+    alerts
+        .into_iter()
+        .flat_map(Map::values)
+        .filter_map(reminder_from_alert)
+        .collect()
+}
+
+fn reminder_from_alert(value: &Value) -> Option<EventReminder> {
+    let alert = value.as_object()?;
+    let trigger = alert.get("trigger").and_then(Value::as_object)?;
+    let action = alert
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_uppercase);
+    let trigger = match trigger.get("@type").and_then(Value::as_str) {
+        Some("AbsoluteTrigger") => {
+            ReminderTrigger::Absolute(trigger.get("when").and_then(Value::as_str)?.to_string())
+        }
+        // OffsetTrigger is the default when @type is absent.
+        _ => {
+            let offset = trigger.get("offset").and_then(Value::as_str)?.to_string();
+            let relative_to = match trigger.get("relativeTo").and_then(Value::as_str) {
+                Some("end") => ReminderRelativeTo::End,
+                _ => ReminderRelativeTo::Start,
+            };
+            ReminderTrigger::Relative {
+                offset,
+                relative_to,
+            }
+        }
+    };
+    Some(EventReminder { trigger, action })
+}
+
 fn first_location(locations: Option<&Map<String, Value>>) -> Option<String> {
     locations
         .and_then(|locations| locations.values().next())
@@ -899,7 +944,10 @@ fn duration(start: &str, end: &str) -> String {
             NaiveDate::parse_from_str(end, "%Y-%m-%d"),
         )
     {
-        let days = end.signed_duration_since(start).num_days().max(0) + 1;
+        // `EventTime`'s all-day end is exclusive, so the JSCalendar
+        // duration is exactly end - start days (a single all-day event,
+        // start D / end D+1, is P1D).
+        let days = end.signed_duration_since(start).num_days().max(0);
         return format!("P{days}D");
     }
     let Ok(start) = DateTime::parse_from_rfc3339(start) else {
@@ -984,9 +1032,11 @@ fn end_from_start_duration(start: &str, duration: &str, is_all_day: bool) -> Str
     if (is_all_day || start.len() == 10)
         && let Ok(date) = NaiveDate::parse_from_str(start, "%Y-%m-%d")
     {
+        // `EventTime`'s all-day end is exclusive: end = start + duration
+        // days (a P1D JSCalendar all-day event, start D, ends D+1).
         let days = seconds.div_ceil(86_400);
         let end = date
-            .checked_add_days(chrono::Days::new(days.saturating_sub(1)))
+            .checked_add_days(chrono::Days::new(days))
             .unwrap_or(date);
         return end.format("%Y-%m-%d").to_string();
     }
@@ -1220,6 +1270,7 @@ mod tests {
             self_response: RsvpStatus::Unknown,
             organizer: None,
             attendees: Vec::new(),
+            reminders: Vec::new(),
             recurrence: EventRecurrence::default(),
             html_link: None,
             raw_ical: None,
@@ -1228,8 +1279,10 @@ mod tests {
 
     #[test]
     fn duration_handles_all_day_dates() {
-        assert_eq!(duration("2026-06-02", "2026-06-02"), "P1D");
-        assert_eq!(duration("2026-06-02", "2026-06-04"), "P3D");
+        // All-day ends are exclusive: a single all-day event is start D /
+        // end D+1 (P1D); a three-day event is start D / end D+3 (P3D).
+        assert_eq!(duration("2026-06-02", "2026-06-03"), "P1D");
+        assert_eq!(duration("2026-06-02", "2026-06-05"), "P3D");
     }
 
     #[test]
@@ -1238,9 +1291,10 @@ mod tests {
             end_from_start_duration("2026-06-02T12:00:00Z", "PT90M", false),
             "2026-06-02T13:30:00+00:00"
         );
+        // Exclusive end: start 2026-06-02 + P3D = 2026-06-05.
         assert_eq!(
             end_from_start_duration("2026-06-02", "P3D", true),
-            "2026-06-04"
+            "2026-06-05"
         );
     }
 
@@ -1280,7 +1334,9 @@ mod tests {
 
     #[test]
     fn range_filter_includes_all_day_on_window_start() {
-        let event = event("2026-06-02", "2026-06-02", true);
+        // Single all-day event on 2026-06-02 under the exclusive contract:
+        // start 2026-06-02, end 2026-06-03.
+        let event = event("2026-06-02", "2026-06-03", true);
 
         assert!(event_in_range(
             &event,
@@ -1561,6 +1617,56 @@ mod tests {
 
         assert_eq!(rdate, vec!["2026-06-03T12:00:00"]);
         assert_eq!(exdate, vec!["2026-06-04T12:00:00"]);
+    }
+
+    #[test]
+    fn alerts_project_offset_and_absolute_reminders() {
+        let alerts = serde_json::from_value(json!({
+            "a1": {
+                "@type": "Alert",
+                "trigger": {
+                    "@type": "OffsetTrigger",
+                    "offset": "-PT15M"
+                },
+                "action": "display"
+            },
+            "a2": {
+                "@type": "Alert",
+                "trigger": {
+                    "@type": "OffsetTrigger",
+                    "offset": "PT5M",
+                    "relativeTo": "end"
+                },
+                "action": "email"
+            },
+            "a3": {
+                "@type": "Alert",
+                "trigger": {
+                    "@type": "AbsoluteTrigger",
+                    "when": "2026-06-02T11:00:00Z"
+                }
+            }
+        }))
+        .expect("alerts");
+
+        let reminders = reminders_from_alerts(Some(&alerts));
+
+        assert_eq!(reminders.len(), 3);
+        assert!(reminders.iter().any(|reminder| reminder.trigger
+            == ReminderTrigger::Relative {
+                offset: "-PT15M".to_string(),
+                relative_to: ReminderRelativeTo::Start,
+            }
+            && reminder.action.as_deref() == Some("DISPLAY")));
+        assert!(reminders.iter().any(|reminder| reminder.trigger
+            == ReminderTrigger::Relative {
+                offset: "PT5M".to_string(),
+                relative_to: ReminderRelativeTo::End,
+            }
+            && reminder.action.as_deref() == Some("EMAIL")));
+        assert!(reminders.iter().any(|reminder| reminder.trigger
+            == ReminderTrigger::Absolute("2026-06-02T11:00:00Z".to_string())
+            && reminder.action.is_none()));
     }
 
     #[test]

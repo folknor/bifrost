@@ -54,7 +54,8 @@ pub use capabilities::{
 pub use calendar::{
     AttendeeRole, Calendar, CalendarEvent, CalendarId, CalendarProvenance, EventAttendee,
     EventAvailability, EventCreate, EventId, EventOrganizer, EventPatch, EventRange,
-    EventRecurrence, EventSearchRequest, EventStatus, EventTime, EventVisibility, RsvpStatus,
+    EventRecurrence, EventReminder, EventSearchRequest, EventStatus, EventTime, EventVisibility,
+    ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 
 // Cloud-storage attachment hosting.

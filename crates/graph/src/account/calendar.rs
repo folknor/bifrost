@@ -89,6 +89,7 @@ pub(crate) async fn events_in_range(
             .collect(),
         next_cursor: page.next_link.map(String::into_bytes),
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -322,6 +323,7 @@ async fn search_locally(
         items,
         next_cursor,
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -370,6 +372,7 @@ async fn search_with_graph_api(
         items,
         next_cursor,
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -492,6 +495,10 @@ fn event_from_graph(calendar_id: String, event: GraphEvent) -> CalendarEvent {
             .into_iter()
             .filter_map(attendee_from_graph)
             .collect(),
+        // Microsoft Graph reminders are not projected onto the shared read
+        // surface yet; other providers (CalDAV VALARM, JMAP alerts) supply
+        // them.
+        reminders: Vec::new(),
         recurrence: EventRecurrence {
             rrule: event.recurrence.as_ref().and_then(rrule_from_graph),
             recurrence_id: event.series_master_id,

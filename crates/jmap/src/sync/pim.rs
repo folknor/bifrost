@@ -582,6 +582,7 @@ pub(crate) fn search(
                 items: Vec::new(),
                 next_cursor: page.next_cursor,
                 estimated_total: page.estimated_total,
+                failed_ids: Vec::new(),
             });
         }
         let response = mail
@@ -602,6 +603,7 @@ pub(crate) fn search(
             items,
             next_cursor: page.next_cursor,
             estimated_total: page.estimated_total,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -621,6 +623,7 @@ pub(crate) fn search_messages(
                 .collect(),
             next_cursor: page.next_cursor,
             estimated_total: page.estimated_total,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -1467,6 +1470,7 @@ async fn search_email_ids(
         items: ids,
         next_cursor,
         estimated_total: total,
+        failed_ids: Vec::new(),
     })
 }
 

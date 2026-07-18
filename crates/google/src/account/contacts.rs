@@ -270,6 +270,7 @@ pub(crate) fn search(
             items,
             next_cursor: response.next_page_token.map(String::into_bytes),
             estimated_total: None,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -347,6 +348,7 @@ pub(crate) fn directory_search(
             items,
             next_cursor: response.next_page_token.map(String::into_bytes),
             estimated_total: None,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -537,6 +539,7 @@ fn page_from_people(
             .collect(),
         next_cursor: next_page_token.map(String::into_bytes),
         estimated_total: None,
+        failed_ids: Vec::new(),
     }
 }
 

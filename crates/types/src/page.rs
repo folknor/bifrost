@@ -21,6 +21,13 @@ pub struct Page<T> {
     /// Server-reported total when known. `None` when the protocol
     /// does not expose an estimate (most do not for search).
     pub estimated_total: Option<u64>,
+    /// Native identifiers of resources the provider fetched for this
+    /// page but could not materialize into an item - for example a
+    /// per-resource parse failure inside an otherwise successful
+    /// multi-status response. Surfacing them lets a consumer tell a
+    /// transient per-resource failure apart from a real remote
+    /// deletion. Empty for primitives that have no such notion.
+    pub failed_ids: Vec<String>,
 }
 
 impl<T> Page<T> {
@@ -31,6 +38,7 @@ impl<T> Page<T> {
             items,
             next_cursor: None,
             estimated_total: None,
+            failed_ids: Vec::new(),
         }
     }
 

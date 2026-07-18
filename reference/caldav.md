@@ -42,7 +42,16 @@ calendar primitives.
   and quoted-parameter splitting that tolerates `:`/`;`/`,` inside quoted
   values). Values are stored raw by caldata; text fields (summary,
   description, location, CN) are unescaped at read time via a single
-  left-to-right scan. Only the first VEVENT (the master) is projected.
+  left-to-right scan. `event_from_ical` projects the master (first VEVENT)
+  for direct get/update; `events_from_ical` projects *every* VEVENT (master
+  plus each recurrence override / CANCEL), carrying RECURRENCE-ID and STATUS
+  through, and is used by the range/search listing paths (override instances
+  take a recurrence-qualified `EventId` but keep the resource native id).
+  VALARM sub-components project into `CalendarEvent.reminders` (relative
+  DURATION or absolute DATE-TIME triggers). All-day ends follow the
+  exclusive `EventTime` contract: an iCalendar all-day DTEND is neither
+  decremented on read nor incremented on write (it matches bifrost-google's
+  verbatim exclusive end).
   Tokenizing rather than using caldata's typed builder means strict
   singleton enforcement never hard-fails ingest: a duplicate DTSTART is
   resolved with a precedence picker (VALUE=DATE > TZID > UTC > floating)
@@ -76,7 +85,13 @@ Supported calendar primitives:
   home, filtering `resourcetype` entries that contain `calendar`.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter and calendar-data hydration, followed by local
-  overlap filtering as a defensive guard.
+  overlap filtering as a defensive guard. The local guard is
+  recurrence-aware: a recurring master whose own interval sits outside the
+  window is retained when its RRULE can still yield an in-window occurrence
+  (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
+  before the window). Per-resource parse failures are not swallowed - the
+  failed `.ics` hrefs surface on `Page::failed_ids` so a consumer can tell a
+  transient failure apart from a real remote deletion.
 - `event_get` - direct `GET` of the event resource.
 - `event_create` - creates a VEVENT resource with a UUID-backed
   `.ics` path using `PUT`, including STATUS from shared lifecycle status,

@@ -4,13 +4,14 @@ use std::time::Instant;
 
 use bifrost_types::*;
 use bytes::Bytes;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use futures::{StreamExt, stream};
 
 use crate::capabilities::caldav_capabilities;
 use crate::client::{CalDavClient, PutCondition, event_scope, unsupported_error};
 use crate::ical::{
-    create_to_ical, event_from_ical, new_uid, patch_to_ical, rsvp_patch, rsvp_reply_ical,
+    create_to_ical, event_from_ical, events_from_ical, new_uid, patch_to_ical, rsvp_patch,
+    rsvp_reply_ical,
 };
 use crate::parse::CalendarCollection;
 use crate::{CalDavConfig, CalDavCredentials};
@@ -697,27 +698,38 @@ impl Account for CalDavAccount {
             let calendar_url = client.resolve_url(&range.calendar_id.0);
             let range_start = caldav_query_time(&range.start);
             let range_end = caldav_query_time(&range.end);
-            let mut events = client
+            let fetched = client
                 .query_events_in_range(&calendar_url, range_start.as_deref(), range_end.as_deref())
-                .await?
-                .into_iter()
-                .filter_map(|event| {
-                    // A single malformed resource degrades to a skip rather
-                    // than failing the whole range query.
-                    event_from_ical(
-                        event.uri,
-                        CalendarId(calendar_url.clone()),
-                        event.etag,
-                        &event.data,
-                    )
-                    .ok()
-                })
-                .filter(|event| event_in_range(event, &range.start, &range.end))
-                .collect::<Vec<_>>();
+                .await?;
+            let mut events = Vec::new();
+            // Per-resource parse failures are surfaced (not swallowed) so a
+            // consumer can tell a transient failure apart from a real remote
+            // deletion.
+            let mut failed = Vec::new();
+            for event in fetched {
+                match events_from_ical(
+                    event.uri.clone(),
+                    CalendarId(calendar_url.clone()),
+                    event.etag,
+                    &event.data,
+                ) {
+                    Ok(projected) => events.extend(
+                        projected
+                            .into_iter()
+                            .filter(|event| event_in_range(event, &range.start, &range.end)),
+                    ),
+                    Err(_) => failed.push(event.uri),
+                }
+            }
             if let Some(limit) = range.limit.and_then(|limit| usize::try_from(limit).ok()) {
                 events.truncate(limit);
             }
-            Ok(Page::single(events))
+            Ok(Page {
+                items: events,
+                next_cursor: None,
+                estimated_total: None,
+                failed_ids: failed,
+            })
         })
     }
 
@@ -881,16 +893,17 @@ impl Account for CalDavAccount {
             let mut events = fetched
                 .into_iter()
                 .filter(|event| seen.insert(event.uri.clone()))
-                .filter_map(|event| {
-                    // Skip a single unparseable resource rather than failing
-                    // the entire search.
-                    event_from_ical(
+                .flat_map(|event| {
+                    // Project all VEVENTs (master plus overrides); skip a
+                    // single unparseable resource rather than failing the
+                    // entire search.
+                    events_from_ical(
                         event.uri,
                         CalendarId(calendar_url.clone()),
                         event.etag,
                         &event.data,
                     )
-                    .ok()
+                    .unwrap_or_default()
                 })
                 .filter(|event| event_matches(event, &needle))
                 .collect::<Vec<_>>();
@@ -1281,7 +1294,53 @@ fn event_in_range(event: &CalendarEvent, start: &EventTime, end: &EventTime) -> 
     else {
         return true;
     };
-    event_start <= range_end && event_end >= range_start
+    let rrule = event.recurrence.rrule.as_deref().unwrap_or_default();
+    if rrule.is_empty() {
+        // Non-recurring: plain interval overlap.
+        return event_start <= range_end && event_end >= range_start;
+    }
+    // Recurring master: its own interval can sit entirely before the
+    // window while a later occurrence lands inside it. The server's
+    // time-range REPORT already expanded the RRULE and returned this
+    // resource because an occurrence overlaps, so the local guard must
+    // not drop it. Occurrences only run forward from the master start, so
+    // the series can reach the window unless it begins after the window
+    // ends, or provably ends (RRULE UNTIL) before the window starts.
+    if event_start > range_end {
+        return false;
+    }
+    if event_end >= range_start {
+        return true;
+    }
+    match rrule_until(rrule) {
+        Some(until) => until >= range_start,
+        // COUNT-bounded or open-ended series: without full expansion we
+        // trust the server's REPORT and retain the master.
+        None => true,
+    }
+}
+
+/// Parse the instant named by an RRULE `UNTIL=` part, if present. Handles
+/// both `YYYYMMDD` (date) and `YYYYMMDDTHHMMSS[Z]` (date-time) forms.
+fn rrule_until(rrule: &str) -> Option<DateTime<FixedOffset>> {
+    let value = rrule.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        key.eq_ignore_ascii_case("UNTIL").then_some(value)
+    })?;
+    parse_ical_instant(value.trim())
+}
+
+fn parse_ical_instant(value: &str) -> Option<DateTime<FixedOffset>> {
+    let zero = FixedOffset::east_opt(0)?;
+    if value.len() == 8 {
+        let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
+        return zero
+            .from_local_datetime(&date.and_time(NaiveTime::MIN))
+            .single();
+    }
+    let core = value.trim_end_matches('Z');
+    let naive = NaiveDateTime::parse_from_str(core, "%Y%m%dT%H%M%S").ok()?;
+    zero.from_local_datetime(&naive).single()
 }
 
 fn time_interval(
@@ -1381,10 +1440,17 @@ mod tests {
             self_response: RsvpStatus::Unknown,
             organizer: None,
             attendees: Vec::new(),
+            reminders: Vec::new(),
             recurrence: EventRecurrence::default(),
             html_link: None,
             raw_ical: None,
         }
+    }
+
+    fn recurring_event(start: &str, end: &str, rrule: &str) -> CalendarEvent {
+        let mut event = event(start, end, false);
+        event.recurrence.rrule = Some(rrule.to_string());
+        event
     }
 
     #[tokio::test]
@@ -1449,6 +1515,57 @@ mod tests {
             &event,
             &time("2026-06-02T00:00:00Z"),
             &time("2026-06-03T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_filter_retains_recurring_master_before_window() {
+        // A weekly master whose own interval sits a month before the
+        // window still has in-window occurrences; the recurrence-aware
+        // guard must keep it (the server's time-range REPORT already
+        // returned it).
+        let event = recurring_event(
+            "2026-05-04T12:00:00Z",
+            "2026-05-04T13:00:00Z",
+            "FREQ=WEEKLY",
+        );
+
+        assert!(event_in_range(
+            &event,
+            &time("2026-06-01T00:00:00Z"),
+            &time("2026-06-08T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_filter_drops_recurring_master_that_ended_before_window() {
+        // A bounded weekly series whose UNTIL is before the window start
+        // cannot reach it, so the guard drops the out-of-window master.
+        let event = recurring_event(
+            "2026-05-04T12:00:00Z",
+            "2026-05-04T13:00:00Z",
+            "FREQ=WEEKLY;UNTIL=20260525T120000Z",
+        );
+
+        assert!(!event_in_range(
+            &event,
+            &time("2026-06-01T00:00:00Z"),
+            &time("2026-06-08T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn range_filter_drops_recurring_master_starting_after_window() {
+        let event = recurring_event(
+            "2026-07-04T12:00:00Z",
+            "2026-07-04T13:00:00Z",
+            "FREQ=WEEKLY",
+        );
+
+        assert!(!event_in_range(
+            &event,
+            &time("2026-06-01T00:00:00Z"),
+            &time("2026-06-08T00:00:00Z")
         ));
     }
 

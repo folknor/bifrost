@@ -236,6 +236,7 @@ pub(crate) fn search(
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
+                    failed_ids: Vec::new(),
                 });
             }
             let page = search_one_calendar(
@@ -263,6 +264,7 @@ pub(crate) fn search(
                     items,
                     next_cursor: Some(encode_cross_calendar_cursor(calendar_id, &next_token)),
                     estimated_total: None,
+                    failed_ids: Vec::new(),
                 });
             }
             index += 1;
@@ -273,6 +275,7 @@ pub(crate) fn search(
                         .get(index)
                         .map(|calendar_id| encode_cross_calendar_cursor(calendar_id, &[])),
                     estimated_total: None,
+                    failed_ids: Vec::new(),
                 });
             }
         }
@@ -280,6 +283,7 @@ pub(crate) fn search(
             items,
             next_cursor: None,
             estimated_total: None,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -326,6 +330,7 @@ fn page_from_events(
         items,
         next_cursor: response.next_page_token.map(String::into_bytes),
         estimated_total: None,
+        failed_ids: Vec::new(),
     })
 }
 
@@ -445,6 +450,10 @@ fn event_from_google(
             .into_iter()
             .filter_map(attendee_from_google)
             .collect(),
+        // Google Calendar reminders are not projected onto the shared read
+        // surface yet; other providers (CalDAV VALARM, JMAP alerts) supply
+        // them.
+        reminders: Vec::new(),
         recurrence: EventRecurrence {
             rrule: event
                 .recurrence

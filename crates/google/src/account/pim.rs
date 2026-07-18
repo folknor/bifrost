@@ -272,6 +272,7 @@ pub(crate) fn search(
                 .collect(),
             next_cursor: next.map(String::into_bytes),
             estimated_total: None,
+            failed_ids: Vec::new(),
         })
     })
 }
@@ -298,6 +299,7 @@ pub(crate) fn search_messages(
                 .collect(),
             next_cursor: next.map(String::into_bytes),
             estimated_total: estimate.and_then(non_negative_i64),
+            failed_ids: Vec::new(),
         })
     })
 }
