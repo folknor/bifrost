@@ -448,9 +448,13 @@ Alongside the read-only hydration cluster, the engine forwards sibling
 **direct passthrough** clusters that resolve through the same
 `live_account` discipline and forward 1:1 to the matching `Account`
 method, inventing no new semantics: object-level mutation conveniences,
-compose / draft, container read + CRUD, and the **contact** cluster
+compose / draft, container read + CRUD, the **contact** cluster
 (`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
-`contact_update`, `contact_delete`, `directory_search`). Each mirrors the
+`contact_update`, `contact_delete`, `directory_search`), and the
+**server-filter** cluster (`filters_list`, `filter_create`,
+`filter_update`, `filter_delete`, `filter_validate`) - whose supported
+model a consumer reads off `capabilities().filter_rule_shape` and
+`capabilities().pim_methods` before dispatching. Each mirrors the
 `Account` trait's argument shapes but takes `account_id: &AccountId` and
 returns the engine `Error` (the trait's `AccountError` folds in through
 `?`); an unattached account yields `Error::AccountNotAttached` up front.

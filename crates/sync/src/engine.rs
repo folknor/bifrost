@@ -2059,6 +2059,64 @@ impl SyncEngine {
             .await?)
     }
 
+    /// List an account's server-side filter rules or scripts. Forwards
+    /// 1:1 to [`Account::filters_list`]; the supported model is
+    /// advertised through `capabilities().filter_rule_shape` and
+    /// per-method support through `capabilities().pim_methods`.
+    pub async fn filters_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::ServerFilter>, Error> {
+        Ok(self.live_account(account_id)?.filters_list().await?)
+    }
+
+    /// Create one server-side filter rule or script. Forwards to
+    /// [`Account::filter_create`].
+    pub async fn filter_create(
+        &self,
+        account_id: &AccountId,
+        filter: bifrost_types::ServerFilterCreate,
+    ) -> Result<bifrost_types::ServerFilterId, Error> {
+        Ok(self.live_account(account_id)?.filter_create(filter).await?)
+    }
+
+    /// Partially update one server-side filter rule or script. Forwards
+    /// to [`Account::filter_update`].
+    pub async fn filter_update(
+        &self,
+        account_id: &AccountId,
+        filter: bifrost_types::ServerFilterId,
+        patch: bifrost_types::ServerFilterPatch,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .filter_update(filter, patch)
+            .await?)
+    }
+
+    /// Delete one server-side filter rule or script. Forwards to
+    /// [`Account::filter_delete`].
+    pub async fn filter_delete(
+        &self,
+        account_id: &AccountId,
+        filter: bifrost_types::ServerFilterId,
+    ) -> Result<(), Error> {
+        Ok(self.live_account(account_id)?.filter_delete(filter).await?)
+    }
+
+    /// Validate a server-side filter payload without storing it. Forwards
+    /// to [`Account::filter_validate`].
+    pub async fn filter_validate(
+        &self,
+        account_id: &AccountId,
+        filter: bifrost_types::ServerFilterCreate,
+    ) -> Result<bifrost_types::FilterValidation, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .filter_validate(filter)
+            .await?)
+    }
+
     /// Read the attached account's capabilities snapshot, as stashed at
     /// attach time.
     ///
