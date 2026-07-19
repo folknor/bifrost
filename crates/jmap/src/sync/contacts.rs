@@ -1,7 +1,7 @@
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AddressBook, ContactAddress, ContactCard,
-    ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone,
-    ContactProvenance, ContactSearchRequest, Page, ProtocolKind,
+    ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
+    ContactPhone, ContactProvenance, ContactSearchRequest, Page, ProtocolKind,
 };
 use bifrost_types::{AddressBookId as SharedAddressBookId, DiagnosticText};
 use serde_json::{Map, Value, json};
@@ -67,17 +67,17 @@ pub(crate) fn list(
             query_response.ids().len(),
             query_response.total(),
         );
-        let cards = get_cards(
+        let hydrated = get_cards(
             &contacts,
             query_response.into_ids(),
             AccountOperation::ContactsList,
         )
         .await?;
         Ok(Page {
-            items: cards,
+            items: hydrated.cards,
             next_cursor,
             estimated_total: total,
-            failed_ids: Vec::new(),
+            failed_ids: hydrated.failed_ids,
         })
     })
 }
@@ -88,13 +88,14 @@ pub(crate) fn get(
 ) -> AccountFuture<Result<ContactCard, AccountError>> {
     Box::pin(async move {
         let contacts = require_contacts(contacts, AccountOperation::ContactGet)?;
-        let cards = get_cards(
+        let hydrated = get_cards(
             &contacts,
             vec![ContactCardId::new(contact.0)],
             AccountOperation::ContactGet,
         )
         .await?;
-        cards
+        hydrated
+            .cards
             .into_iter()
             .next()
             .ok_or_else(|| unsupported(AccountOperation::ContactGet, "JMAP contact was not found"))
@@ -141,6 +142,7 @@ pub(crate) fn update(
         let current_address_book = if patch.address_book_id.is_some() {
             get_cards(&contacts, vec![id.clone()], AccountOperation::ContactUpdate)
                 .await?
+                .cards
                 .into_iter()
                 .next()
                 .and_then(|card| card.address_book_id)
@@ -210,38 +212,58 @@ pub(crate) fn search(
             query_response.ids().len(),
             query_response.total(),
         );
-        let cards = get_cards(
+        let hydrated = get_cards(
             &contacts,
             query_response.into_ids(),
             AccountOperation::ContactSearch,
         )
         .await?;
         Ok(Page {
-            items: cards,
+            items: hydrated.cards,
             next_cursor,
             estimated_total: total,
-            failed_ids: Vec::new(),
+            failed_ids: hydrated.failed_ids,
         })
     })
+}
+
+/// A hydrated page of cards plus the native ids the server reported as
+/// `notFound`. An id that the query returned but `ContactCard/get` could
+/// not materialize is a transient per-resource hydration failure, not a
+/// deletion; it rides `Page::failed_ids` so the consumer preserves the
+/// row rather than destroying it.
+struct HydratedCards {
+    cards: Vec<ContactCard>,
+    failed_ids: Vec<String>,
 }
 
 async fn get_cards(
     contacts: &ContactAccount,
     ids: Vec<ContactCardId>,
     operation: AccountOperation,
-) -> Result<Vec<ContactCard>, AccountError> {
+) -> Result<HydratedCards, AccountError> {
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HydratedCards {
+            cards: Vec::new(),
+            failed_ids: Vec::new(),
+        });
     }
     let response = contacts
         .call(ContactCardGet::new().ids(ids))
         .await
         .map_err(to_acct_err(operation))?;
-    Ok(response
+    let failed_ids = response
+        .not_found()
+        .iter()
+        .cloned()
+        .map(ContactCardId::into_string)
+        .collect();
+    let cards = response
         .into_list()
         .into_iter()
         .map(contact_from_jmap)
-        .collect())
+        .collect();
+    Ok(HydratedCards { cards, failed_ids })
 }
 
 fn address_book_from_jmap(book: crate::address_book::AddressBook) -> AddressBook {
@@ -260,6 +282,7 @@ fn address_book_from_jmap(book: crate::address_book::AddressBook) -> AddressBook
             native,
             address_book_native: None,
         },
+        corpus: ContactCorpus::Main,
         is_default: book.is_default.unwrap_or(false),
         can_create_contacts: can_write,
         can_update_contacts: can_write,
@@ -294,6 +317,8 @@ fn contact_from_jmap(card: JmapContactCard) -> ContactCard {
             native,
             address_book_native: address_book_id.map(|id| id.0),
         },
+        // JMAP has no auto-collected corpus; every card is personal.
+        corpus: ContactCorpus::Main,
         display_name: display_name(card.name()),
         emails: emails(card.emails()),
         phones: phones(card.phones()),
@@ -758,6 +783,8 @@ mod tests {
 
         let contact = contact_from_jmap(card);
         assert_eq!(contact.id.0, "c1");
+        // JMAP has no auto-collected corpus; every card routes to Main.
+        assert_eq!(contact.corpus, ContactCorpus::Main);
         assert_eq!(contact.address_book_id.unwrap().0, "ab1");
         assert_eq!(contact.display_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(contact.emails[0].kind.as_deref(), Some("work"));

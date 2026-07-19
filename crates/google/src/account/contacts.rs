@@ -3,9 +3,9 @@ use std::sync::Arc;
 use base64::Engine;
 use bifrost_types::{
     AccessErrorKind, AccountError, AccountErrorKind, AccountFuture, AccountOperation, AddressBook,
-    AddressBookId, ContactCard, ContactCreate, ContactEmail, ContactId, ContactOrganization,
-    ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, Page,
-    ProtocolKind,
+    AddressBookId, ContactCard, ContactCorpus, ContactCreate, ContactEmail, ContactId,
+    ContactOrganization, ContactPatch, ContactPhone, ContactProvenance, ContactSearchRequest,
+    DirectoryCard, Page, ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -17,26 +17,38 @@ use super::non_empty;
 
 const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
 const CONTACTS_BOOK_ID: &str = "google:contacts";
+/// Synthetic address book that surfaces Google People `otherContacts`
+/// (auto-collected addresses harvested from mail traffic) as a distinct,
+/// `OtherAutoCollected`-corpus book so the consumer routes it to its own
+/// local store without matching on the provider.
+const OTHER_CONTACTS_BOOK_ID: &str = "google:other-contacts";
 const PERSON_FIELDS: &str = "names,emailAddresses,phoneNumbers,addresses,organizations,photos,biographies,memberships,metadata";
+/// `otherContacts.list` supports only this read-mask subset (no
+/// addresses / organizations / photos / biographies / memberships).
+const OTHER_CONTACTS_READ_MASK: &str = "names,emailAddresses,phoneNumbers,metadata";
 
 pub(crate) fn address_books_list(
     client: Arc<GmailClient>,
 ) -> AccountFuture<Result<Vec<AddressBook>, AccountError>> {
     Box::pin(async move {
-        let mut books = vec![AddressBook {
-            id: AddressBookId(CONTACTS_BOOK_ID.to_string()),
-            native_id: CONTACTS_BOOK_ID.to_string(),
-            name: "Google Contacts".to_string(),
-            provenance: ContactProvenance {
-                provider: ProtocolKind::Gmail,
-                native: CONTACTS_BOOK_ID.to_string(),
-                address_book_native: None,
+        let mut books = vec![
+            AddressBook {
+                id: AddressBookId(CONTACTS_BOOK_ID.to_string()),
+                native_id: CONTACTS_BOOK_ID.to_string(),
+                name: "Google Contacts".to_string(),
+                provenance: ContactProvenance {
+                    provider: ProtocolKind::Gmail,
+                    native: CONTACTS_BOOK_ID.to_string(),
+                    address_book_native: None,
+                },
+                corpus: ContactCorpus::Main,
+                is_default: true,
+                can_create_contacts: true,
+                can_update_contacts: true,
+                can_delete_contacts: true,
             },
-            is_default: true,
-            can_create_contacts: true,
-            can_update_contacts: true,
-            can_delete_contacts: true,
-        }];
+            other_contacts_address_book(),
+        ];
         let mut page_token = None;
         loop {
             let response: ContactGroupsResponse = client
@@ -65,6 +77,14 @@ pub(crate) fn list(
     page_cursor: Option<Vec<u8>>,
 ) -> AccountFuture<Result<Page<ContactCard>, AccountError>> {
     Box::pin(async move {
+        // The `otherContacts` corpus is served by a distinct People endpoint
+        // and carries the `OtherAutoCollected` discriminator; route to it
+        // before the personal-book validation, which does not accept the
+        // synthetic other-contacts id (it is read-only, not creatable/
+        // searchable through the personal paths).
+        if is_other_contacts_book(address_book.as_ref()) {
+            return list_other_contacts(&client, page_cursor).await;
+        }
         validate_address_book(address_book.as_ref(), AccountOperation::ContactsList)?;
         let group_filter = contact_group_filter(address_book.as_ref());
         let page_token = page_cursor
@@ -87,8 +107,42 @@ pub(crate) fn list(
             response.connections.unwrap_or_default(),
             response.next_page_token,
             group_filter,
+            ContactCorpus::Main,
         ))
     })
+}
+
+/// Page the People `otherContacts.list` corpus. otherContacts are
+/// auto-collected (never explicitly saved) addresses; they carry no
+/// groups and support only the `OTHER_CONTACTS_READ_MASK` subset, so
+/// there is no group filter here and the projected cards land under the
+/// synthetic other-contacts book with the `OtherAutoCollected` corpus.
+async fn list_other_contacts(
+    client: &GmailClient,
+    page_cursor: Option<Vec<u8>>,
+) -> Result<Page<ContactCard>, AccountError> {
+    let page_token = page_cursor
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
+    let mut url = format!(
+        "{PEOPLE_API_BASE}/otherContacts?readMask={}&pageSize=1000",
+        bifrost_net::url::encode_component(OTHER_CONTACTS_READ_MASK)
+    );
+    if let Some(token) = page_token {
+        url.push_str("&pageToken=");
+        url.push_str(&bifrost_net::url::encode_component(&token));
+    }
+    let response: OtherContactsResponse = client
+        .get(&url)
+        .await
+        .map_err(|error| collection_error(error, AccountOperation::ContactsList))?;
+    Ok(page_from_people(
+        response.other_contacts.unwrap_or_default(),
+        response.next_page_token,
+        None,
+        ContactCorpus::OtherAutoCollected,
+    ))
 }
 
 pub(crate) fn get(
@@ -97,7 +151,10 @@ pub(crate) fn get(
 ) -> AccountFuture<Result<ContactCard, AccountError>> {
     Box::pin(async move {
         let person = get_person(&client, &contact, AccountOperation::ContactGet).await?;
-        Ok(contact_from_person(person))
+        // Derive the corpus from the resource name: an `otherContacts/*`
+        // id is auto-collected, everything else is a personal contact.
+        let corpus = corpus_for_native(&contact.0);
+        Ok(contact_from_person(person, corpus))
     })
 }
 
@@ -264,7 +321,7 @@ pub(crate) fn search(
             .unwrap_or_default()
             .into_iter()
             .filter(|result| person_in_group(&result.person, group_filter))
-            .map(|result| contact_from_person(result.person))
+            .map(|result| contact_from_person(result.person, ContactCorpus::Main))
             .collect();
         Ok(Page {
             items,
@@ -530,16 +587,62 @@ fn page_from_people(
     people: Vec<Person>,
     next_page_token: Option<String>,
     group_filter: Option<&str>,
+    corpus: ContactCorpus,
 ) -> Page<ContactCard> {
     Page {
         items: people
             .into_iter()
             .filter(|person| person_in_group(person, group_filter))
-            .map(contact_from_person)
+            .map(|person| contact_from_person(person, corpus))
             .collect(),
         next_cursor: next_page_token.map(String::into_bytes),
         estimated_total: None,
         failed_ids: Vec::new(),
+    }
+}
+
+/// Synthetic address book for the `otherContacts` corpus. Read-only:
+/// auto-collected addresses cannot be created, updated, or deleted
+/// through the People contact endpoints, so every capability flag is
+/// false and the corpus discriminator is `OtherAutoCollected`.
+fn other_contacts_address_book() -> AddressBook {
+    AddressBook {
+        id: AddressBookId(OTHER_CONTACTS_BOOK_ID.to_string()),
+        native_id: OTHER_CONTACTS_BOOK_ID.to_string(),
+        name: "Other Contacts".to_string(),
+        provenance: ContactProvenance {
+            provider: ProtocolKind::Gmail,
+            native: OTHER_CONTACTS_BOOK_ID.to_string(),
+            address_book_native: None,
+        },
+        corpus: ContactCorpus::OtherAutoCollected,
+        is_default: false,
+        can_create_contacts: false,
+        can_update_contacts: false,
+        can_delete_contacts: false,
+    }
+}
+
+fn is_other_contacts_book(address_book: Option<&AddressBookId>) -> bool {
+    address_book.is_some_and(|book| book.0 == OTHER_CONTACTS_BOOK_ID)
+}
+
+/// The corpus a People resource name belongs to. `otherContacts/*`
+/// resource names are auto-collected; everything else is a personal
+/// contact.
+fn corpus_for_native(native: &str) -> ContactCorpus {
+    if native.starts_with("otherContacts/") {
+        ContactCorpus::OtherAutoCollected
+    } else {
+        ContactCorpus::Main
+    }
+}
+
+/// The synthetic address book id a contact of `corpus` is filed under.
+fn book_id_for_corpus(corpus: ContactCorpus) -> &'static str {
+    match corpus {
+        ContactCorpus::OtherAutoCollected => OTHER_CONTACTS_BOOK_ID,
+        _ => CONTACTS_BOOK_ID,
     }
 }
 
@@ -554,6 +657,7 @@ fn address_book_from_group(group: ContactGroup) -> Option<AddressBook> {
             native,
             address_book_native: None,
         },
+        corpus: ContactCorpus::Main,
         is_default: false,
         can_create_contacts: true,
         can_update_contacts: true,
@@ -585,8 +689,9 @@ fn person_in_group(person: &Person, group: Option<&str>) -> bool {
         })
 }
 
-fn contact_from_person(person: Person) -> ContactCard {
+fn contact_from_person(person: Person, corpus: ContactCorpus) -> ContactCard {
     let native = person.resource_name.unwrap_or_default();
+    let book_id = book_id_for_corpus(corpus);
     let display_name = person
         .names
         .as_ref()
@@ -594,14 +699,15 @@ fn contact_from_person(person: Person) -> ContactCard {
         .and_then(|name| name.display_name.clone());
     ContactCard {
         id: ContactId(native.clone()),
-        address_book_id: Some(AddressBookId(CONTACTS_BOOK_ID.to_string())),
+        address_book_id: Some(AddressBookId(book_id.to_string())),
         native_id: native.clone(),
         etag: person.etag,
         provenance: ContactProvenance {
             provider: ProtocolKind::Gmail,
             native,
-            address_book_native: Some(CONTACTS_BOOK_ID.to_string()),
+            address_book_native: Some(book_id.to_string()),
         },
+        corpus,
         display_name,
         emails: person
             .email_addresses
@@ -921,6 +1027,13 @@ struct PeopleConnectionsResponse {
     next_page_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OtherContactsResponse {
+    other_contacts: Option<Vec<Person>>,
+    next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateContactPhotoRequest {
@@ -1130,8 +1243,13 @@ mod tests {
             memberships: None,
         };
 
-        let card = contact_from_person(person);
+        let card = contact_from_person(person, ContactCorpus::Main);
         assert_eq!(card.id.0, "people/c1");
+        assert_eq!(card.corpus, ContactCorpus::Main);
+        assert_eq!(
+            card.address_book_id.as_ref().map(|book| book.0.as_str()),
+            Some(CONTACTS_BOOK_ID)
+        );
         assert_eq!(card.display_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(card.emails[0].kind.as_deref(), Some("work"));
         assert_eq!(card.emails[1].kind.as_deref(), Some("lab"));
@@ -1380,6 +1498,70 @@ mod tests {
         assert_eq!(book.id.0, "contactGroups/friends");
         assert_eq!(book.name, "Friends");
         assert!(!book.is_default);
+        // A real group is a personal-corpus book.
+        assert_eq!(book.corpus, ContactCorpus::Main);
+    }
+
+    #[test]
+    fn other_contacts_book_is_read_only_auto_collected_corpus() {
+        let book = other_contacts_address_book();
+
+        assert_eq!(book.id.0, OTHER_CONTACTS_BOOK_ID);
+        assert_eq!(book.corpus, ContactCorpus::OtherAutoCollected);
+        assert!(!book.is_default);
+        // otherContacts is read-only: no create / update / delete.
+        assert!(!book.can_create_contacts);
+        assert!(!book.can_update_contacts);
+        assert!(!book.can_delete_contacts);
+        assert!(is_other_contacts_book(Some(&AddressBookId(
+            OTHER_CONTACTS_BOOK_ID.to_string()
+        ))));
+        assert!(!is_other_contacts_book(Some(&AddressBookId(
+            CONTACTS_BOOK_ID.to_string()
+        ))));
+        assert!(!is_other_contacts_book(None));
+    }
+
+    #[test]
+    fn other_contacts_person_maps_to_auto_collected_card() {
+        // otherContacts.list returns bare People with only names/emails/phones;
+        // the projection routes them to the synthetic other-contacts book with
+        // the OtherAutoCollected corpus.
+        let response: OtherContactsResponse = serde_json::from_value(serde_json::json!({
+            "otherContacts": [{
+                "resourceName": "otherContacts/x1",
+                "emailAddresses": [{"value": "collected@example.test"}],
+                "names": [{"displayName": "Collected Person"}]
+            }],
+            "nextPageToken": "tok2"
+        }))
+        .expect("otherContacts response");
+
+        let page = page_from_people(
+            response.other_contacts.unwrap_or_default(),
+            response.next_page_token,
+            None,
+            ContactCorpus::OtherAutoCollected,
+        );
+
+        assert_eq!(page.next_cursor.as_deref(), Some(b"tok2".as_slice()));
+        let card = &page.items[0];
+        assert_eq!(card.id.0, "otherContacts/x1");
+        assert_eq!(card.corpus, ContactCorpus::OtherAutoCollected);
+        assert_eq!(
+            card.address_book_id.as_ref().map(|book| book.0.as_str()),
+            Some(OTHER_CONTACTS_BOOK_ID)
+        );
+        assert_eq!(card.emails[0].value, "collected@example.test");
+    }
+
+    #[test]
+    fn corpus_for_native_reads_other_contacts_resource_names() {
+        assert_eq!(
+            corpus_for_native("otherContacts/x1"),
+            ContactCorpus::OtherAutoCollected
+        );
+        assert_eq!(corpus_for_native("people/c1"), ContactCorpus::Main);
     }
 
     #[test]

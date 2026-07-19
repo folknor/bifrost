@@ -1,7 +1,8 @@
 use bifrost_types::{
     AccountError, AccountOperation, AddressBook, AddressBookId, ContactAddress, ContactCard,
-    ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone,
-    ContactProvenance, ContactSearchRequest, DirectoryCard, ErrorScope, Page, ProtocolKind,
+    ContactCorpus, ContactCreate, ContactEmail, ContactId, ContactOrganization, ContactPatch,
+    ContactPhone, ContactProvenance, ContactSearchRequest, DirectoryCard, ErrorScope, Page,
+    ProtocolKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ pub(crate) async fn address_books_list(
             native: DEFAULT_CONTACTS_ID.to_string(),
             address_book_native: None,
         },
+        corpus: ContactCorpus::Main,
         is_default: true,
         can_create_contacts: true,
         can_update_contacts: true,
@@ -414,6 +416,7 @@ fn folder_to_address_book(folder: GraphContactFolder) -> AddressBook {
             native: folder.id,
             address_book_native: None,
         },
+        corpus: ContactCorpus::Main,
         is_default: false,
         can_create_contacts: true,
         can_update_contacts: true,
@@ -463,6 +466,8 @@ fn contact_from_graph(contact: GraphContact) -> ContactCard {
             native: contact.id,
             address_book_native: contact.parent_folder_id,
         },
+        // Graph has no auto-collected corpus; every contact is personal.
+        corpus: ContactCorpus::Main,
         display_name: contact.display_name,
         emails: contact
             .email_addresses

@@ -1,7 +1,8 @@
 use base64::Engine;
 use bifrost_types::{
-    AddressBookId, ContactAddress, ContactCard, ContactCreate, ContactEmail, ContactId,
-    ContactOrganization, ContactPatch, ContactPhone, ContactPhoto, ContactProvenance, ProtocolKind,
+    AddressBookId, ContactAddress, ContactCard, ContactCorpus, ContactCreate, ContactEmail,
+    ContactId, ContactOrganization, ContactPatch, ContactPhone, ContactPhoto, ContactProvenance,
+    ProtocolKind,
 };
 use caldata::LineReader;
 
@@ -41,6 +42,9 @@ pub(crate) fn contact_from_vcard(
             native: uri,
             address_book_native: address_book_id.map(|id| id.0),
         },
+        // CardDAV has no auto-collected corpus; every vCard is a personal
+        // contact.
+        corpus: ContactCorpus::Main,
         display_name: parsed.display_name,
         emails: parsed.emails,
         phones: parsed.phones,

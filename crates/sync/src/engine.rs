@@ -1934,6 +1934,113 @@ impl SyncEngine {
             .await?)
     }
 
+    // ---------- contact passthrough (direct) ----------
+    //
+    // The contact companion to the container / compose passthrough
+    // clusters above. Same discipline: every method resolves through
+    // `live_account` (so a call issued after a `RestartAccount` reopen
+    // runs against the freshly-installed connection, never a stale
+    // snapshot the consumer cached), forwards 1:1 to the matching
+    // `Account` method, invents no new semantics, and yields
+    // `Error::AccountNotAttached` up front when no live slot exists. The
+    // forwarded `Account` future is `'static` and captures its own `Arc`
+    // clones, so it outlives the short-lived handle resolved per call.
+    // The address-book / contact reads are read-only, and the single
+    // contact mutations are direct one-wire-op conveniences, so - like the
+    // container / compose clusters - they deliberately bypass the
+    // idempotency / read-back / recovery pipeline that guards the volume
+    // mutations. Capability gating (`pim_methods.directory_search`, etc.)
+    // stays in the protocol crate; a consumer reads `account_capabilities`
+    // to decide whether to dispatch before paying the round trip.
+
+    /// List an account's address books / contact folders. Forwards 1:1 to
+    /// [`Account::address_books_list`].
+    pub async fn address_books_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::AddressBook>, Error> {
+        Ok(self.live_account(account_id)?.address_books_list().await?)
+    }
+
+    /// List contacts, optionally scoped to one address book, resuming from
+    /// a prior `Page::next_cursor`. Forwards to [`Account::contacts_list`].
+    pub async fn contacts_list(
+        &self,
+        account_id: &AccountId,
+        address_book: Option<bifrost_types::AddressBookId>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> Result<bifrost_types::Page<bifrost_types::ContactCard>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .contacts_list(address_book, page_cursor)
+            .await?)
+    }
+
+    /// Fetch one contact card by engine-facing id. Forwards to
+    /// [`Account::contact_get`].
+    pub async fn contact_get(
+        &self,
+        account_id: &AccountId,
+        contact: bifrost_types::ContactId,
+    ) -> Result<bifrost_types::ContactCard, Error> {
+        Ok(self.live_account(account_id)?.contact_get(contact).await?)
+    }
+
+    /// Create one contact card. Forwards to [`Account::contact_create`].
+    pub async fn contact_create(
+        &self,
+        account_id: &AccountId,
+        contact: bifrost_types::ContactCreate,
+    ) -> Result<bifrost_types::ContactId, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .contact_create(contact)
+            .await?)
+    }
+
+    /// Partially update one contact card. Forwards to
+    /// [`Account::contact_update`].
+    pub async fn contact_update(
+        &self,
+        account_id: &AccountId,
+        contact: bifrost_types::ContactId,
+        patch: bifrost_types::ContactPatch,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .contact_update(contact, patch)
+            .await?)
+    }
+
+    /// Delete one contact card. Forwards to [`Account::contact_delete`].
+    pub async fn contact_delete(
+        &self,
+        account_id: &AccountId,
+        contact: bifrost_types::ContactId,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .contact_delete(contact)
+            .await?)
+    }
+
+    /// Search the organization directory (Global Address List). Forwards
+    /// to [`Account::directory_search`]; gated by
+    /// `capabilities().pim_methods.directory_search` at the protocol layer.
+    /// The argument order mirrors the trait: `(query, limit, page_cursor)`.
+    pub async fn directory_search(
+        &self,
+        account_id: &AccountId,
+        query: String,
+        limit: Option<u32>,
+        page_cursor: Option<Vec<u8>>,
+    ) -> Result<bifrost_types::Page<bifrost_types::DirectoryCard>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .directory_search(query, limit, page_cursor)
+            .await?)
+    }
+
     /// Read the attached account's capabilities snapshot, as stashed at
     /// attach time.
     ///

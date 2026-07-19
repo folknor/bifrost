@@ -73,7 +73,13 @@ Supported contact primitives:
   `addressbook`.
 - `contacts_list` - `PROPFIND` depth 1 for vCard resources, local
   offset-cursor slicing of hrefs, then batched `addressbook-multiget`
-  `REPORT` hydration for only the requested page.
+  `REPORT` hydration for only the requested page. A hydrated vCard that
+  will not parse is recorded (by native uri) in `Page::failed_ids` via
+  the pure `partition_hydrated_vcards` helper rather than silently
+  dropped, so a consumer can tell a transient per-resource hydration
+  failure apart from a real remote deletion and preserve the row. Books
+  and cards carry `ContactCorpus::Main`; CardDAV has no auto-collected
+  corpus.
 - `contact_get` - single-resource multiget using the contact id as the
   DAV href.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed

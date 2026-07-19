@@ -444,6 +444,20 @@ does any production path today; see below). Consumer-driven hydration
 and engine-driven backfill share the same underlying client, where
 `bifrost-net` is the rate-limit chokepoint.
 
+Alongside the read-only hydration cluster, the engine forwards sibling
+**direct passthrough** clusters that resolve through the same
+`live_account` discipline and forward 1:1 to the matching `Account`
+method, inventing no new semantics: object-level mutation conveniences,
+compose / draft, container read + CRUD, and the **contact** cluster
+(`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
+`contact_update`, `contact_delete`, `directory_search`). Each mirrors the
+`Account` trait's argument shapes but takes `account_id: &AccountId` and
+returns the engine `Error` (the trait's `AccountError` folds in through
+`?`); an unattached account yields `Error::AccountNotAttached` up front.
+These are single-op conveniences and reads, so - like the container /
+compose clusters - they deliberately bypass the idempotency / read-back /
+recovery pipeline that guards the volume mutations.
+
 ## Scheduler + budget
 
 `Scheduler` is a strict-priority gate (not an executor) with four

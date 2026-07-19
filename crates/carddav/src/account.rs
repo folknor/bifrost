@@ -5,14 +5,14 @@ use std::time::Instant;
 use bifrost_types::{
     Account, AccountCapabilities, AccountError, AccountFuture, AccountId, AccountOperation,
     AccountStream, AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar,
-    CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCreate,
-    ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container, ContainerId,
-    ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry,
-    InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectChange, ObjectChangeKind, ObjectId, ObjectType,
+    CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus,
+    ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container,
+    ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
+    DirectoryCard, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
+    EventSearchRequest, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
+    Message, MutationSuccess, MutationTarget, ObjectChange, ObjectChangeKind, ObjectId, ObjectType,
     OpaqueChangeState, Page, PageBoundary, Priority, ProtocolKind, QuotaInfo, RsvpStatus,
     SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
     ServerFilterPatch, ServerVersion, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
@@ -86,6 +86,7 @@ impl CardDavAccount {
                 native,
                 address_book_native: None,
             },
+            corpus: ContactCorpus::Main,
             is_default: false,
             can_create_contacts: true,
             can_update_contacts: true,
@@ -208,26 +209,14 @@ impl CardDavAccount {
             .take(page_size)
             .map(|entry| entry.uri)
             .collect::<Vec<_>>();
-        let cards = client
-            .fetch_vcards(&addressbook, &uris, operation)
-            .await?
-            .into_iter()
-            .filter_map(|card| {
-                contact_from_vcard(
-                    card.uri,
-                    Some(AddressBookId(addressbook.clone())),
-                    card.etag,
-                    &card.data,
-                )
-                .ok()
-            })
-            .collect::<Vec<_>>();
+        let fetched = client.fetch_vcards(&addressbook, &uris, operation).await?;
+        let (cards, failed_ids) = partition_hydrated_vcards(&addressbook, fetched);
         Ok(Page {
             items: cards,
             next_cursor: (offset + page_size < total)
                 .then(|| (offset + page_size).to_string().into_bytes()),
             estimated_total: Some(estimated_total(total)),
-            failed_ids: Vec::new(),
+            failed_ids,
         })
     }
 
@@ -779,6 +768,7 @@ impl Account for CardDavAccount {
                         native,
                         address_book_native: None,
                     },
+                    corpus: ContactCorpus::Main,
                     is_default: true,
                     can_create_contacts: true,
                     can_update_contacts: true,
@@ -1347,6 +1337,36 @@ fn estimated_total(total: usize) -> u64 {
     u64::try_from(total).unwrap_or(u64::MAX)
 }
 
+/// Project a batch of hydrated vCard resources, splitting successful
+/// cards from the native ids of resources that could not be parsed.
+///
+/// A resource the server returned but whose body will not project is
+/// recorded in the returned `failed_ids` rather than dropped, so the
+/// consumer can tell a transient per-resource hydration failure apart
+/// from a real remote deletion and preserve the row instead of
+/// destroying it. The captured id is the same `uri` a successful card
+/// would carry as its native id.
+fn partition_hydrated_vcards(
+    addressbook: &str,
+    fetched: Vec<CardDavFetchedVCard>,
+) -> (Vec<ContactCard>, Vec<String>) {
+    let mut cards = Vec::new();
+    let mut failed_ids = Vec::new();
+    for card in fetched {
+        let native = card.uri.clone();
+        match contact_from_vcard(
+            card.uri,
+            Some(AddressBookId(addressbook.to_string())),
+            card.etag,
+            &card.data,
+        ) {
+            Ok(contact) => cards.push(contact),
+            Err(_) => failed_ids.push(native),
+        }
+    }
+    (cards, failed_ids)
+}
+
 fn contact_matches(contact: &ContactCard, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -1456,6 +1476,31 @@ mod tests {
             ),
             other => panic!("expected Terminated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn partition_hydrated_vcards_records_unparseable_ids() {
+        // A well-formed vCard projects into `items`; a malformed one is
+        // captured in `failed_ids` under its native uri rather than dropped,
+        // so the snapshot diff can preserve it instead of destroying it.
+        let good = CardDavFetchedVCard {
+            uri: "/ab/good.vcf".to_string(),
+            etag: Some("e1".to_string()),
+            data: "BEGIN:VCARD\r\nFN:Ada Lovelace\r\nEND:VCARD\r\n".to_string(),
+        };
+        let bad = CardDavFetchedVCard {
+            uri: "/ab/bad.vcf".to_string(),
+            etag: None,
+            // Unterminated quoted parameter: the projector rejects this body.
+            data: "BEGIN:VCARD\r\nEMAIL;TYPE=\"work:ada@example.test\r\nEND:VCARD\r\n".to_string(),
+        };
+
+        let (cards, failed_ids) = partition_hydrated_vcards("/ab/", vec![good, bad]);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].native_id, "/ab/good.vcf");
+        assert_eq!(cards[0].corpus, ContactCorpus::Main);
+        assert_eq!(failed_ids, vec!["/ab/bad.vcf".to_string()]);
     }
 
     #[test]
@@ -1637,6 +1682,7 @@ mod tests {
                 native: "/book/ada.vcf".to_string(),
                 address_book_native: Some("/book/".to_string()),
             },
+            corpus: ContactCorpus::Main,
             display_name: Some("Ada Lovelace".to_string()),
             emails: vec![bifrost_types::ContactEmail {
                 value: "ada@example.test".to_string(),
@@ -1688,6 +1734,7 @@ mod tests {
                 native: "/book/aase.vcf".to_string(),
                 address_book_native: Some("/book/".to_string()),
             },
+            corpus: ContactCorpus::Main,
             display_name: Some("Åse Bø".to_string()),
             emails: Vec::new(),
             phones: Vec::new(),

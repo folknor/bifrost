@@ -255,6 +255,17 @@ provenance dispatch for Gmail label ids.
 
 People contacts use `people/me/connections`, `people:get`,
 `people:createContact`, `people:updateContact`, and `people:deleteContact`.
+Auto-collected addresses (People `otherContacts.list`) are surfaced as a
+distinct corpus: a synthetic read-only address book `google:other-contacts`
+(no create / update / delete) appears in `address_books_list` carrying
+`ContactCorpus::OtherAutoCollected`, and a `contacts_list` scoped to that
+book id routes to `/v1/otherContacts` (read-mask limited to
+names / emails / phones / metadata), stamping each card
+`OtherAutoCollected`. Every other book, group, and card is
+`ContactCorpus::Main`; `contact_get` derives the corpus from the resource
+name (`otherContacts/*` -> auto-collected). The discriminator lets the
+consumer route the two corpora to distinct local stores without matching
+on the provider.
 Update fetches the raw `Person`, requires the server ETag, and replaces only
 fields named by the shared `ContactPatch`. Display-name updates rewrite the
 first modeled name's given/family split while preserving unmodeled People name

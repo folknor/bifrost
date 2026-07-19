@@ -88,9 +88,9 @@ pub use container::{
 
 // Address book and contact-card primitives.
 pub use contact::{
-    AddressBook, AddressBookId, ContactAddress, ContactCard, ContactCreate, ContactEmail,
-    ContactId, ContactOrganization, ContactPatch, ContactPhone, ContactPhoto, ContactProvenance,
-    ContactSearchRequest,
+    AddressBook, AddressBookId, ContactAddress, ContactCard, ContactCorpus, ContactCreate,
+    ContactEmail, ContactId, ContactOrganization, ContactPatch, ContactPhone, ContactPhoto,
+    ContactProvenance, ContactSearchRequest,
 };
 
 // Organization-directory (GAL) result type.
