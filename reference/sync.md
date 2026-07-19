@@ -450,11 +450,14 @@ Alongside the read-only hydration cluster, the engine forwards sibling
 method, inventing no new semantics: object-level mutation conveniences,
 compose / draft, container read + CRUD, the **contact** cluster
 (`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
-`contact_update`, `contact_delete`, `directory_search`), and the
+`contact_update`, `contact_delete`, `directory_search`), the
 **server-filter** cluster (`filters_list`, `filter_create`,
 `filter_update`, `filter_delete`, `filter_validate`) - whose supported
 model a consumer reads off `capabilities().filter_rule_shape` and
-`capabilities().pim_methods` before dispatching. Each mirrors the
+`capabilities().pim_methods` before dispatching - and the **settings**
+cluster (`identities_list`, `identity_update`, `vacation_get`,
+`vacation_set`, `quota_get`), whose per-method support a consumer reads
+off `capabilities().pim_methods`. Each mirrors the
 `Account` trait's argument shapes but takes `account_id: &AccountId` and
 returns the engine `Error` (the trait's `AccountError` folds in through
 `?`); an unattached account yields `Error::AccountNotAttached` up front.

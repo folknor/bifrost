@@ -2117,6 +2117,58 @@ impl SyncEngine {
             .await?)
     }
 
+    /// List the account's sending identities. Forwards 1:1 to
+    /// [`Account::identities_list`]; per-method support is advertised
+    /// through `capabilities().pim_methods`.
+    pub async fn identities_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::Identity>, Error> {
+        Ok(self.live_account(account_id)?.identities_list().await?)
+    }
+
+    /// Partially update one sending identity. Forwards to
+    /// [`Account::identity_update`].
+    pub async fn identity_update(
+        &self,
+        account_id: &AccountId,
+        identity: bifrost_types::IdentityId,
+        patch: bifrost_types::IdentityPatch,
+    ) -> Result<(), Error> {
+        Ok(self
+            .live_account(account_id)?
+            .identity_update(identity, patch)
+            .await?)
+    }
+
+    /// Read the vacation responder config, when supported. Forwards to
+    /// [`Account::vacation_get`].
+    pub async fn vacation_get(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<bifrost_types::VacationConfig>, Error> {
+        Ok(self.live_account(account_id)?.vacation_get().await?)
+    }
+
+    /// Replace the vacation responder config. Forwards to
+    /// [`Account::vacation_set`].
+    pub async fn vacation_set(
+        &self,
+        account_id: &AccountId,
+        config: bifrost_types::VacationConfig,
+    ) -> Result<(), Error> {
+        Ok(self.live_account(account_id)?.vacation_set(config).await?)
+    }
+
+    /// Read the storage quota readout, when supported. Forwards to
+    /// [`Account::quota_get`].
+    pub async fn quota_get(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<bifrost_types::QuotaInfo>, Error> {
+        Ok(self.live_account(account_id)?.quota_get().await?)
+    }
+
     /// Read the attached account's capabilities snapshot, as stashed at
     /// attach time.
     ///
