@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bifrost_types::{
-    Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountId,
-    AccountStream, BackfillCheckpoint, BackfillProgress, Batch, ChangeCursor, Checkpoint,
-    CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
+    Account, AccountCapabilities, AccountControl, AccountError, AccountFactory, AccountFuture,
+    AccountId, AccountStream, BackfillCheckpoint, BackfillProgress, Batch, ChangeCursor,
+    Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, PageBoundary, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
     RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
@@ -1501,6 +1501,24 @@ impl SyncEngine {
         Ok(self
             .live_account(account_id)?
             .open_blob_range(handle, range))
+    }
+
+    /// Host an over-limit attachment in the account's cloud drive and
+    /// return a shareable link, in one call.
+    ///
+    /// Forwards to [`Account::host_attachment`]. Gated by
+    /// `capabilities().pim_methods.host_attachment`; an account whose
+    /// flag is false resolves the future with
+    /// `Unsupported(HostAttachment)`. The synchronous `live_account`
+    /// resolution surfaces `AccountNotAttached` here, while the returned
+    /// `AccountFuture` surfaces the trait's `AccountError` when awaited.
+    pub fn host_attachment(
+        &self,
+        account_id: &AccountId,
+        bytes: bytes::Bytes,
+        meta: bifrost_types::CloudUploadMeta,
+    ) -> Result<AccountFuture<Result<bifrost_types::HostedAttachment, AccountError>>, Error> {
+        Ok(self.live_account(account_id)?.host_attachment(bytes, meta))
     }
 
     // ---------- mutation passthrough (direct) ----------
