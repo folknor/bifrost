@@ -15,7 +15,6 @@ use crate::client::GmailClient;
 use super::error::{self, GmailErrorContext};
 use super::non_empty;
 
-const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
 const CONTACTS_BOOK_ID: &str = "google:contacts";
 /// Synthetic address book that surfaces Google People `otherContacts`
 /// (auto-collected addresses harvested from mail traffic) as a distinct,
@@ -52,7 +51,10 @@ pub(crate) fn address_books_list(
         let mut page_token = None;
         loop {
             let response: ContactGroupsResponse = client
-                .get(&contact_groups_url(page_token.as_deref()))
+                .get(&contact_groups_url(
+                    client.people_base(),
+                    page_token.as_deref(),
+                ))
                 .await
                 .map_err(|error| collection_error(error, AccountOperation::AddressBooksList))?;
             books.extend(
@@ -92,7 +94,8 @@ pub(crate) fn list(
             .transpose()
             .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
         let mut url = format!(
-            "{PEOPLE_API_BASE}/people/me/connections?personFields={}&pageSize=1000",
+            "{}/people/me/connections?personFields={}&pageSize=1000",
+            client.people_base(),
             bifrost_net::url::encode_component(PERSON_FIELDS)
         );
         if let Some(token) = page_token {
@@ -126,7 +129,8 @@ async fn list_other_contacts(
         .transpose()
         .map_err(|error| local_error(AccountOperation::ContactsList, error.to_string()))?;
     let mut url = format!(
-        "{PEOPLE_API_BASE}/otherContacts?readMask={}&pageSize=1000",
+        "{}/otherContacts?readMask={}&pageSize=1000",
+        client.people_base(),
         bifrost_net::url::encode_component(OTHER_CONTACTS_READ_MASK)
     );
     if let Some(token) = page_token {
@@ -169,7 +173,8 @@ pub(crate) fn create(
         )?;
         let person = person_from_create(&contact);
         let url = format!(
-            "{PEOPLE_API_BASE}/people:createContact?personFields={}",
+            "{}/people:createContact?personFields={}",
+            client.people_base(),
             bifrost_net::url::encode_component(PERSON_FIELDS)
         );
         let person: Person = client
@@ -205,7 +210,8 @@ pub(crate) fn update(
             person.etag = Some(etag);
             let encoded = bifrost_net::url::encode_component(&contact.0);
             let url = format!(
-                "{PEOPLE_API_BASE}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
+                "{}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
+                client.people_base(),
                 bifrost_net::url::encode_component(&update_fields),
                 bifrost_net::url::encode_component(PERSON_FIELDS)
             );
@@ -227,7 +233,7 @@ async fn update_contact_photo(
 ) -> Result<(), AccountError> {
     let encoded = bifrost_net::url::encode_component(&contact.0);
     if let Some(photo) = photo {
-        let url = update_contact_photo_url(&encoded);
+        let url = update_contact_photo_url(client.people_base(), &encoded);
         let _: Person = client
             .post(&url, &update_contact_photo_request(photo))
             .await
@@ -235,7 +241,7 @@ async fn update_contact_photo(
                 contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
             })?;
     } else {
-        let url = delete_contact_photo_url(&encoded);
+        let url = delete_contact_photo_url(client.people_base(), &encoded);
         let _: Person = client
             .delete(&url)
             .await
@@ -247,16 +253,16 @@ async fn update_contact_photo(
     Ok(())
 }
 
-fn update_contact_photo_url(encoded_resource_name: &str) -> String {
+fn update_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
     // `updateContactPhoto` takes its field mask in the request body, not the
     // query string; the response is discarded here, so no `personFields`
     // query param is needed.
-    format!("{PEOPLE_API_BASE}/{encoded_resource_name}:updateContactPhoto")
+    format!("{people_base}/{encoded_resource_name}:updateContactPhoto")
 }
 
-fn delete_contact_photo_url(encoded_resource_name: &str) -> String {
+fn delete_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
     format!(
-        "{PEOPLE_API_BASE}/{encoded_resource_name}:deleteContactPhoto?personFields={}",
+        "{people_base}/{encoded_resource_name}:deleteContactPhoto?personFields={}",
         bifrost_net::url::encode_component(PERSON_FIELDS)
     )
 }
@@ -274,7 +280,8 @@ async fn get_person(
 ) -> Result<Person, AccountError> {
     let encoded = bifrost_net::url::encode_component(&contact.0);
     let url = format!(
-        "{PEOPLE_API_BASE}/{encoded}?personFields={}",
+        "{}/{encoded}?personFields={}",
+        client.people_base(),
         bifrost_net::url::encode_component(PERSON_FIELDS)
     );
     client
@@ -289,7 +296,7 @@ pub(crate) fn delete(
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
         let encoded = bifrost_net::url::encode_component(&contact.0);
-        let url = format!("{PEOPLE_API_BASE}/{encoded}:deleteContact");
+        let url = format!("{}/{encoded}:deleteContact", client.people_base());
         client
             .delete(&url)
             .await
@@ -307,10 +314,10 @@ pub(crate) fn search(
             AccountOperation::ContactSearch,
         )?;
         let _: PeopleSearchResponse = client
-            .get(&search_warmup_url())
+            .get(&search_warmup_url(client.people_base()))
             .await
             .map_err(|error| collection_error(error, AccountOperation::ContactSearch))?;
-        let url = search_url(&request)?;
+        let url = search_url(client.people_base(), &request)?;
         let response: PeopleSearchResponse = client
             .get(&url)
             .await
@@ -363,7 +370,7 @@ pub(crate) fn directory_search(
             // to the real query and let it produce the authoritative result
             // rather than failing the whole search on a warmup hiccup.
             if let Err(error) = client
-                .get::<DirectoryPeopleResponse>(&directory_search_warmup_url())
+                .get::<DirectoryPeopleResponse>(&directory_search_warmup_url(client.people_base()))
                 .await
             {
                 let err = collection_error(error, AccountOperation::DirectorySearch);
@@ -384,7 +391,8 @@ pub(crate) fn directory_search(
         // it as a clean empty page would silently truncate results. Past the
         // first page, all failures propagate.
         let is_first_page = page_cursor.is_none();
-        let url = directory_search_url(&query, limit, page_cursor.as_deref())?;
+        let url =
+            directory_search_url(client.people_base(), &query, limit, page_cursor.as_deref())?;
         let response: DirectoryPeopleResponse = match client.get(&url).await {
             Ok(response) => response,
             Err(error) => {
@@ -442,14 +450,15 @@ fn is_directory_absence(err: &AccountError) -> bool {
 const DIRECTORY_READ_MASK: &str = "names,emailAddresses,phoneNumbers,organizations";
 const DIRECTORY_SOURCES: &str = "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE";
 
-fn directory_search_warmup_url() -> String {
+fn directory_search_warmup_url(people_base: &str) -> String {
     format!(
-        "{PEOPLE_API_BASE}/people:searchDirectoryPeople?query=&readMask={}&sources={DIRECTORY_SOURCES}",
+        "{people_base}/people:searchDirectoryPeople?query=&readMask={}&sources={DIRECTORY_SOURCES}",
         bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
     )
 }
 
 fn directory_search_url(
+    people_base: &str,
     query: &str,
     limit: Option<u32>,
     page_cursor: Option<&[u8]>,
@@ -457,12 +466,12 @@ fn directory_search_url(
     let page_size = limit.unwrap_or(1000).min(1000);
     let mut url = if query.is_empty() {
         format!(
-            "{PEOPLE_API_BASE}/people:listDirectoryPeople?readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
+            "{people_base}/people:listDirectoryPeople?readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
             bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
         )
     } else {
         format!(
-            "{PEOPLE_API_BASE}/people:searchDirectoryPeople?query={}&readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
+            "{people_base}/people:searchDirectoryPeople?query={}&readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
             bifrost_net::url::encode_component(query),
             bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
         )
@@ -545,9 +554,9 @@ fn validate_address_book(
     Ok(())
 }
 
-fn contact_groups_url(page_token: Option<&str>) -> String {
+fn contact_groups_url(people_base: &str, page_token: Option<&str>) -> String {
     let mut url = format!(
-        "{PEOPLE_API_BASE}/contactGroups?groupFields={}&pageSize=1000",
+        "{people_base}/contactGroups?groupFields={}&pageSize=1000",
         bifrost_net::url::encode_component("metadata,name")
     );
     if let Some(token) = page_token {
@@ -557,16 +566,16 @@ fn contact_groups_url(page_token: Option<&str>) -> String {
     url
 }
 
-fn search_warmup_url() -> String {
+fn search_warmup_url(people_base: &str) -> String {
     format!(
-        "{PEOPLE_API_BASE}/people:searchContacts?query=&readMask={}",
+        "{people_base}/people:searchContacts?query=&readMask={}",
         bifrost_net::url::encode_component(PERSON_FIELDS)
     )
 }
 
-fn search_url(request: &ContactSearchRequest) -> Result<String, AccountError> {
+fn search_url(people_base: &str, request: &ContactSearchRequest) -> Result<String, AccountError> {
     let mut url = format!(
-        "{PEOPLE_API_BASE}/people:searchContacts?query={}&readMask={}",
+        "{people_base}/people:searchContacts?query={}&readMask={}",
         bifrost_net::url::encode_component(&request.query),
         bifrost_net::url::encode_component(PERSON_FIELDS)
     );
@@ -1419,9 +1428,16 @@ mod tests {
 
     #[test]
     fn contact_photo_patch_uses_people_photo_endpoint_payload() {
+        let people_base = "https://people.googleapis.com/v1";
         let encoded = bifrost_net::url::encode_component("people/c1");
-        assert!(update_contact_photo_url(&encoded).contains("people%2Fc1:updateContactPhoto"));
-        assert!(delete_contact_photo_url(&encoded).contains("people%2Fc1:deleteContactPhoto"));
+        assert!(
+            update_contact_photo_url(people_base, &encoded)
+                .contains("people%2Fc1:updateContactPhoto")
+        );
+        assert!(
+            delete_contact_photo_url(people_base, &encoded)
+                .contains("people%2Fc1:deleteContactPhoto")
+        );
 
         let payload = update_contact_photo_request(bifrost_types::ContactPhoto {
             data: vec![1, 2, 3, 4],
@@ -1480,8 +1496,9 @@ mod tests {
 
     #[test]
     fn contact_groups_url_includes_fields_and_page_token() {
-        let url = contact_groups_url(Some("next token"));
+        let url = contact_groups_url("https://people.mock.test/v1", Some("next token"));
 
+        assert!(url.starts_with("https://people.mock.test/v1/contactGroups"));
         assert!(url.contains("contactGroups?groupFields=metadata%2Cname"));
         assert!(url.contains("pageSize=1000"));
         assert!(url.contains("pageToken=next%20token"));
@@ -1599,14 +1616,18 @@ mod tests {
 
     #[test]
     fn search_url_includes_page_token_and_capped_page_size() {
-        let url = search_url(&ContactSearchRequest {
-            query: "Ada Lovelace".to_string(),
-            address_book_id: None,
-            page_cursor: Some(b"next token".to_vec()),
-            limit: Some(100),
-        })
+        let url = search_url(
+            "https://people.mock.test/v1",
+            &ContactSearchRequest {
+                query: "Ada Lovelace".to_string(),
+                address_book_id: None,
+                page_cursor: Some(b"next token".to_vec()),
+                limit: Some(100),
+            },
+        )
         .expect("search url");
 
+        assert!(url.starts_with("https://people.mock.test/v1/people:searchContacts"));
         assert!(url.contains("query=Ada%20Lovelace"));
         assert!(url.contains("pageSize=30"));
         assert!(url.contains("pageToken=next%20token"));
@@ -1614,8 +1635,9 @@ mod tests {
 
     #[test]
     fn search_warmup_url_uses_empty_query_and_read_mask() {
-        let url = search_warmup_url();
+        let url = search_warmup_url("https://people.mock.test/v1");
 
+        assert!(url.starts_with("https://people.mock.test/v1/people:searchContacts"));
         assert!(url.contains("people:searchContacts?query=&readMask="));
         assert!(url.contains("names%2CemailAddresses"));
         assert!(!url.contains("pageSize="));
@@ -1643,8 +1665,10 @@ mod tests {
 
     #[test]
     fn directory_search_empty_query_lists_directory_people() {
-        let url = directory_search_url("", Some(2000), None).expect("url");
+        let url =
+            directory_search_url("https://people.mock.test/v1", "", Some(2000), None).expect("url");
 
+        assert!(url.starts_with("https://people.mock.test/v1/people:listDirectoryPeople"));
         assert!(url.contains("people:listDirectoryPeople"));
         assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
         // limit caps at 1000.
@@ -1654,8 +1678,15 @@ mod tests {
 
     #[test]
     fn directory_search_nonempty_query_searches_directory_people() {
-        let url = directory_search_url("Ada Lovelace", None, Some(b"tok".as_slice())).expect("url");
+        let url = directory_search_url(
+            "https://people.mock.test/v1",
+            "Ada Lovelace",
+            None,
+            Some(b"tok".as_slice()),
+        )
+        .expect("url");
 
+        assert!(url.starts_with("https://people.mock.test/v1/people:searchDirectoryPeople"));
         assert!(url.contains("people:searchDirectoryPeople"));
         assert!(url.contains("query=Ada%20Lovelace"));
         assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
@@ -1664,8 +1695,9 @@ mod tests {
 
     #[test]
     fn directory_search_warmup_url_uses_empty_query() {
-        let url = directory_search_warmup_url();
+        let url = directory_search_warmup_url("https://people.mock.test/v1");
 
+        assert!(url.starts_with("https://people.mock.test/v1/people:searchDirectoryPeople"));
         assert!(url.contains("people:searchDirectoryPeople?query=&"));
         assert!(url.contains("sources=DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE"));
         assert!(!url.contains("pageSize="));

@@ -107,6 +107,24 @@ impl GoogleAccountFactory {
         Self::from_client(GmailClient::with_api_base_and_source(api_base, source))
     }
 
+    /// Redirect the People/contacts API base for opened accounts. Test seam
+    /// mirroring the Gmail-base overrides above, but for the third Google
+    /// surface: contacts, `otherContacts`, contact groups, directory search,
+    /// contact CRUD, and photo endpoints all live on `people.googleapis.com`
+    /// in production, a different host from both the Gmail mail base and the
+    /// Calendar base. This override is independent of those two, so a harness
+    /// can point People traffic at its mock endpoint while leaving the Gmail
+    /// and Calendar bases untouched. Composes with the `from_*_with_api_base`
+    /// constructors: build the factory with a redirected Gmail base, then call
+    /// this to also redirect People.
+    #[must_use]
+    pub fn with_people_api_base(self, people_base: impl Into<String>) -> Self {
+        Self {
+            client: Arc::new(self.client.with_people_base(people_base)),
+            pubsub: self.pubsub,
+        }
+    }
+
     /// Configure Gmail Cloud Pub/Sub watch ownership for opened accounts.
     #[must_use]
     pub fn with_pubsub_config(mut self, config: PubSubConfig) -> Self {

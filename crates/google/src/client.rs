@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use crate::{Error, Result};
 
 const GMAIL_API_BASE: &str = "https://www.googleapis.com/gmail/v1/users/me";
+const PEOPLE_API_BASE: &str = "https://people.googleapis.com/v1";
 const GOOGLE_API_QUOTA_PER_SECOND: f64 = 250.0;
 const GOOGLE_API_BURST: u32 = 250;
 const PEOPLE_API_QUOTA_PER_SECOND: f64 = 1.5;
@@ -25,6 +26,13 @@ struct ClientInner {
     net: AccountNet,
     parent_net: Net,
     api_base: String,
+    // People/contacts API base. A third, independent Google surface:
+    // Gmail mail lives on www.googleapis.com and Calendar on
+    // www.googleapis.com/calendar, but People contacts + directory live
+    // on people.googleapis.com, so this base is threaded separately from
+    // `api_base` (the Gmail mail base) rather than reusing it. Defaults to
+    // the production People base; a harness redirects it independently.
+    people_base: String,
     token_source: Arc<dyn TokenSource>,
 }
 
@@ -70,7 +78,25 @@ impl GmailClient {
                 net,
                 parent_net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
+                people_base: PEOPLE_API_BASE.to_string(),
                 token_source,
+            }),
+        }
+    }
+
+    // pub(crate): the factory's `with_people_api_base` test seam points the
+    // People/contacts base at a mock endpoint instead of
+    // people.googleapis.com, independently of the Gmail mail base. Returns a
+    // fresh client sharing the same net/token source with only the People
+    // base swapped.
+    pub(crate) fn with_people_base(&self, people_base: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                net: self.inner.net.clone(),
+                parent_net: self.inner.parent_net.clone(),
+                api_base: self.inner.api_base.clone(),
+                people_base: people_base.into().trim_end_matches('/').to_string(),
+                token_source: Arc::clone(&self.inner.token_source),
             }),
         }
     }
@@ -87,6 +113,7 @@ impl GmailClient {
                 net,
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
+                people_base: self.inner.people_base.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
             }),
         }
@@ -98,6 +125,10 @@ impl GmailClient {
 
     pub(crate) fn api_base(&self) -> &str {
         &self.inner.api_base
+    }
+
+    pub(crate) fn people_base(&self) -> &str {
+        &self.inner.people_base
     }
 
     #[cfg(test)]
@@ -299,6 +330,19 @@ mod tests {
     async fn trims_api_base() {
         let client = GmailClient::with_api_base("https://example.test/base/", "token");
         assert_eq!(client.api_base(), "https://example.test/base");
+    }
+
+    #[tokio::test]
+    async fn people_base_defaults_and_overrides_independently() {
+        let client = GmailClient::with_api_base("https://example.test/gmail", "token");
+        // People base defaults to production, independent of the Gmail base.
+        assert_eq!(client.people_base(), PEOPLE_API_BASE);
+
+        // Overriding People leaves the Gmail base untouched and trims the
+        // trailing slash like the Gmail base does.
+        let redirected = client.with_people_base("https://people.mock.test/v1/");
+        assert_eq!(redirected.people_base(), "https://people.mock.test/v1");
+        assert_eq!(redirected.api_base(), "https://example.test/gmail");
     }
 
     #[tokio::test]
