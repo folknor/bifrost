@@ -208,7 +208,7 @@ pub(crate) fn update(
             apply_patch_to_person(&mut person, &patch);
             person.resource_name = Some(contact.0.clone());
             person.etag = Some(etag);
-            let encoded = bifrost_net::url::encode_component(&contact.0);
+            let encoded = encode_resource_name_path(&contact.0);
             let url = format!(
                 "{}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
                 client.people_base(),
@@ -231,7 +231,7 @@ async fn update_contact_photo(
     contact: &ContactId,
     photo: Option<bifrost_types::ContactPhoto>,
 ) -> Result<(), AccountError> {
-    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let encoded = encode_resource_name_path(&contact.0);
     if let Some(photo) = photo {
         let url = update_contact_photo_url(client.people_base(), &encoded);
         let _: Person = client
@@ -273,12 +273,29 @@ fn update_contact_photo_request(photo: bifrost_types::ContactPhoto) -> UpdateCon
     }
 }
 
+/// Percent-encode a People resource name (e.g. `people/c1`) for placement
+/// in a URL path segment. A People resource name's `/` separators are real
+/// REST path separators - the People API serves
+/// `/v1/people/c1:updateContact`, not `/v1/people%2Fc1:updateContact`
+/// (which 404s) - so each `/`-delimited part is component-encoded and the
+/// parts are rejoined on a literal `/`. Any genuinely unsafe character
+/// inside a part is still escaped. This is deliberately not folded into
+/// `bifrost_net::url::encode_component`, whose other callers rely on it
+/// escaping `/` as a normal component character.
+fn encode_resource_name_path(resource_name: &str) -> String {
+    resource_name
+        .split('/')
+        .map(bifrost_net::url::encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 async fn get_person(
     client: &GmailClient,
     contact: &ContactId,
     operation: AccountOperation,
 ) -> Result<Person, AccountError> {
-    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let encoded = encode_resource_name_path(&contact.0);
     let url = format!(
         "{}/{encoded}?personFields={}",
         client.people_base(),
@@ -295,7 +312,7 @@ pub(crate) fn delete(
     contact: ContactId,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let encoded = bifrost_net::url::encode_component(&contact.0);
+        let encoded = encode_resource_name_path(&contact.0);
         let url = format!("{}/{encoded}:deleteContact", client.people_base());
         client
             .delete(&url)
@@ -1427,17 +1444,37 @@ mod tests {
     }
 
     #[test]
+    fn resource_name_path_keeps_slash_literal() {
+        // A People resource name's `/` is a real REST path separator: the
+        // People API serves `/v1/people/c1:updateContact`, and the buggy
+        // `%2F`-escaped form (`/v1/people%2Fc1...`) 404s. The helper must
+        // keep the slash literal while still escaping unsafe characters.
+        assert_eq!(encode_resource_name_path("people/c1"), "people/c1");
+        assert_eq!(
+            encode_resource_name_path("otherContacts/x1"),
+            "otherContacts/x1"
+        );
+        assert_eq!(
+            encode_resource_name_path("people/a b#c"),
+            "people/a%20b%23c"
+        );
+    }
+
+    #[test]
     fn contact_photo_patch_uses_people_photo_endpoint_payload() {
         let people_base = "https://people.googleapis.com/v1";
-        let encoded = bifrost_net::url::encode_component("people/c1");
+        let encoded = encode_resource_name_path("people/c1");
+        // The resource name renders with a literal `/`, matching the real
+        // People verb path (`/v1/people/c1:updateContactPhoto`).
         assert!(
             update_contact_photo_url(people_base, &encoded)
-                .contains("people%2Fc1:updateContactPhoto")
+                .contains("people/c1:updateContactPhoto")
         );
         assert!(
             delete_contact_photo_url(people_base, &encoded)
-                .contains("people%2Fc1:deleteContactPhoto")
+                .contains("people/c1:deleteContactPhoto")
         );
+        assert!(!update_contact_photo_url(people_base, &encoded).contains("people%2Fc1"));
 
         let payload = update_contact_photo_request(bifrost_types::ContactPhoto {
             data: vec![1, 2, 3, 4],
