@@ -676,6 +676,65 @@ mod tests {
     }
 
     #[test]
+    fn calendar_home_without_calendar_children_lists_empty() {
+        // Depth-1 PROPFIND on a calendar-home that is a plain collection with
+        // no calendar children: the home's own response carries no <calendar/>
+        // and there are no other collections. `calendars_list` maps this
+        // parse output 1:1, so an empty result here is what surfaces to the
+        // consumer as an empty calendar list (no fabricated placeholder).
+        let xml = r##"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/home/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/></D:resourcetype>
+        <D:displayname>Home</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"##;
+
+        let calendars = parse_calendar_collections(xml).expect("valid XML");
+        assert!(calendars.is_empty());
+    }
+
+    #[test]
+    fn calendar_home_that_is_itself_a_calendar_lists_one() {
+        // A CalDAV server whose calendar-home is itself a calendar collection
+        // (resourcetype includes <calendar/>) is returned by the same depth-1
+        // parse. This is the genuine case the removed placeholder-fallback was
+        // conflated with: it needs no fabrication because the home's own
+        // response already maps to one calendar keyed on the home href.
+        let xml = r##"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/home/</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>
+        <D:displayname>Home</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"##;
+
+        let calendars = parse_calendar_collections(xml).expect("valid XML");
+        assert_eq!(
+            calendars,
+            vec![CalendarCollection {
+                href: "/cal/home/".to_string(),
+                display_name: Some("Home".to_string()),
+                color: None,
+                can_edit: None,
+                sync_token: None,
+            }]
+        );
+    }
+
+    #[test]
     fn propfind_events_extracts_ics_resources() {
         let xml = r#"
 <D:multistatus xmlns:D="DAV:">

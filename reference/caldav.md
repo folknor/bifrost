@@ -82,7 +82,14 @@ calendar primitives.
 Supported calendar primitives:
 
 - `calendars_list` - `PROPFIND` depth 1 on the discovered calendar
-  home, filtering `resourcetype` entries that contain `calendar`.
+  home, filtering `resourcetype` entries that contain `calendar`. A home
+  that is itself a calendar collection is returned by that same depth-1
+  parse (its own response carries `<calendar/>`), so a home enumerating
+  zero calendar collections yields an EMPTY list rather than a fabricated
+  placeholder calendar. This lets a consumer distinguish a genuinely empty
+  backend (and reap stale calendars) from a real single calendar, and
+  avoids a phantom home-calendar whose `events_in_range` REPORT a
+  spec-correct server 404s.
 - `events_in_range` - `calendar-query` `REPORT` with a CalDAV
   `time-range` filter and calendar-data hydration, followed by local
   overlap filtering as a defensive guard. The local guard is

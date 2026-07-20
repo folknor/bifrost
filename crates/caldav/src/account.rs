@@ -665,24 +665,16 @@ impl Account for CalDavAccount {
                 .into_iter()
                 .map(|collection| Self::map_calendar(&client, collection))
                 .collect::<Vec<_>>();
-            if calendars.is_empty() {
-                let native = client.resolve_url(&home);
-                calendars.push(Calendar {
-                    id: CalendarId(native.clone()),
-                    native_id: native.clone(),
-                    name: "Calendar".to_string(),
-                    color: None,
-                    provenance: CalendarProvenance {
-                        provider: ProtocolKind::CalDav,
-                        native,
-                        calendar_native: None,
-                    },
-                    is_default: true,
-                    can_create_events: true,
-                    can_update_events: true,
-                    can_delete_events: true,
-                });
-            } else if let Some(first) = calendars.first_mut() {
+            // A calendar-home that enumerates zero calendar collections
+            // surfaces as an empty list, not a fabricated placeholder. The
+            // depth-1 PROPFIND above returns the home's own response too, so a
+            // home that is itself a calendar collection (resourcetype includes
+            // <calendar/>) is already mapped by the parse path. An empty result
+            // here therefore means a genuinely empty backend; reporting it as
+            // empty lets a consumer reap stale calendars rather than chase a
+            // phantom home-calendar whose events_in_range REPORT a spec-correct
+            // server 404s.
+            if let Some(first) = calendars.first_mut() {
                 first.is_default = true;
             }
             Ok(calendars)
