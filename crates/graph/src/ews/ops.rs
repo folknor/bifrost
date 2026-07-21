@@ -60,8 +60,17 @@ impl EwsClient {
 
     /// Fetch the full body + recipients of a single item. Part of the
     /// read-ops foundation; the poll/inventory paths sync via
-    /// `find_items` (IdOnly), so `get_item` is consumed by per-item
-    /// hydration once that path is wired.
+    /// `find_items` (IdOnly), so `get_item` is unwired - consumed by
+    /// per-item hydration once that path lands.
+    ///
+    /// The request body is message-shaped (`get_item_body` asks for
+    /// `message:ToRecipients`/`CcRecipients`), so it is only class-safe for
+    /// `<t:Message>`: a real Contact/CalendarItem GetItem would return
+    /// `ErrorInvalidPropertyRequest`. Making the shape class-conditional is
+    /// deferred with the hydration wiring - `get_item` takes only an id, so
+    /// the class is not even known here yet. The parser tolerates all three
+    /// classes (see `parse_get_item_response`); that tolerance is not a
+    /// claim of operational non-mail GetItem support.
     #[allow(dead_code)]
     pub(crate) async fn get_item(
         &self,
@@ -163,6 +172,10 @@ fn find_items_body(folder_id: &str, since: Option<&str>, offset: u32, max_entrie
     )
 }
 
+// Message-shaped: requests `message:ToRecipients`/`CcRecipients`, so this
+// body is only class-safe for `<t:Message>`. Non-mail GetItem is unwired
+// (sync runs through FindItem IdOnly); a class-conditional shape lands with
+// the per-item hydration path. See the `get_item` doc comment.
 #[allow(dead_code)]
 fn get_item_body(item_id: &str) -> String {
     let escaped_id = xml_escape(item_id);

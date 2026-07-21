@@ -112,6 +112,15 @@ pub(crate) struct PublicFolderCursor {
     /// hourly scan. Additive (`serde(default)` -> `false`).
     #[serde(default)]
     pub(crate) degraded: bool,
+    /// Item-class local-names (`Task`, `PostItem`, ...) already surfaced
+    /// in an unhandled-class `Warning` for this folder. Without this the
+    /// same class re-warns on every poll (the operator sees identical
+    /// noise hourly); recording the already-reported classes lets a poll
+    /// warn only on NEWLY-seen classes. Both the incremental poll and the
+    /// full scan contribute observed classes. Additive (`serde(default)`
+    /// -> empty; a v1 cursor re-warns once, then converges).
+    #[serde(default)]
+    pub(crate) warned_classes: Vec<String>,
 }
 
 /// Public-folder EWS routing context. Carried in the cursor so the
@@ -466,6 +475,7 @@ mod tests {
             live_ids: vec!["a".to_string(), "b".to_string()],
             boundary_ids: vec!["b".to_string()],
             degraded: false,
+            warned_classes: vec!["Task".to_string()],
         }
     }
 

@@ -1015,6 +1015,7 @@ mod tests {
             live_ids: Vec::new(),
             boundary_ids: Vec::new(),
             degraded: false,
+            warned_classes: Vec::new(),
         };
         encode_cursor(
             CursorScope::Folder(FolderId(folder.to_string())),

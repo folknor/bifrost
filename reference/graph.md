@@ -538,8 +538,12 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
   encoded message id.
 - Public folders are poll-only (no push) and side-table-free: the deletion
   baseline rides in the cursor, capped at 10_000 items/folder (above:
-  additions-only). A `CheckpointStore`-backed baseline and item-class support
-  beyond `<t:Message>` are named follow-ups.
+  additions-only). `CalendarItem` and `Contact` public folders sync at
+  identity level alongside `Message`; `Task`, `DistributionList`,
+  `PostItem`, and `MeetingRequest`/`Response`/`Cancellation` items are
+  dropped with a scoped operator warning. A `CheckpointStore`-backed
+  deletion baseline and support for those remaining item classes are named
+  follow-ups.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
   needs a public HTTPS endpoint (else `Error::MissingCoreCapability`).
 - Blob range per-handle (fileAttachment only); delta-token expiry reactive (410

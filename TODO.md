@@ -137,22 +137,35 @@ re-auditors don't re-raise them.)
   folder degrades to additions-only (no `Destroyed` emission). Restore
   reconcile for huge folders with a `CheckpointStore`-backed deletion
   baseline once bifrost owns that side table. (A5b v1 follow-up.)
+  BLOCKED (verified 2026-07-21): the side table does not exist and no
+  account-reachable path to one does. `CheckpointStore` lives in
+  `crates/sync/src/cursor/store.rs`, is held only by the engine, and is
+  never handed to `Account` impls; the graph crate does not depend on
+  `bifrost-sync` and so cannot name it; the trait exposes only change
+  cursors + backfill checkpoints keyed by `(account, scope[, partition])`,
+  no free-form key/value surface. Unblocking is a cross-crate prerequisite
+  epic - extend `CheckpointStore` with a generic side-table put/get and
+  thread a store handle into `Account::open` (touches `bifrost-types`,
+  `bifrost-sync`, and every account crate). Do not schedule A5b-1 until
+  that lands. Nothing is broken today: the degraded additions-only mode is
+  correct and covered by tests; this is a capability upgrade, not a fix.
 - **graph-A5b-2.** Wire delegate auto-discovery: the Autodiscover
   `alternativeMailboxes` parser + `discover_shared_mailboxes` entry point
   landed (tested) in `account/autodiscover.rs` but are unconsumed
   (`#[allow(dead_code)]`). Wire delegate *enumeration* into A5a's
   foreign-mailbox seeding (replacing config-supplied `with_shared_mailbox`)
   and drop the allows. (A5b-scoped-out, named in the A5b spec.)
-- **graph-A5b-3.** EWS item parsers handle only `<t:Message>`. The
-  `parse_find_items_response` / `parse_get_item_response` parsers in
-  `ews/parse.rs` enter their item-collection state on the `Message` element
-  alone, so a public folder whose `FolderClass` is `IPF.Appointment`
-  (`<t:CalendarItem>`) or `IPF.Contact` (`<t:Contact>`) is discovered as a
-  `CursorScope::Folder` scope but syncs zero items - FindFolder surfaces it,
-  FindItem returns the items, and the parser silently skips every non-Message
-  element. Add item-class support (parse `CalendarItem` / `Contact` element
-  bodies, project to the appropriate shared model) so non-mail public folders
-  actually sync. (A5b v1 follow-up; mail public folders work today.)
+- **graph-A5b-4.** The public-folder incremental poll uses
+  `DateTimeReceived` as its change watermark (`advance_watermark` /
+  `incremental_added_ids` in `account/public_folder.rs`). An in-place edit
+  that changes an item's change-key or read state WITHOUT moving its
+  received time is never re-emitted: the `DateTimeReceived >= watermark`
+  restriction excludes it, and the id-only full scan reconciles only
+  deletions (and untimestamped additions), not in-place edits. This
+  affects ALL public-folder classes, including `Message`, not just the
+  non-mail classes A5b-3 added. Fixing it needs a modification signal
+  (e.g. `LastModifiedTime`) or a different watermark model entirely - a
+  known poll-model limitation, not a regression.
 
 ## bifrost-sync
 

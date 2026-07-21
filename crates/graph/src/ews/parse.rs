@@ -74,6 +74,17 @@ pub(crate) struct FindItemsResult {
     pub(crate) items: Vec<EwsItem>,
     pub(crate) total_count: u32,
     pub(crate) includes_last: bool,
+    /// `RootFolder/@IndexedPagingOffset`: the server's own next-page
+    /// offset (in wire rows, counting every class), or `None` when the
+    /// server omits it (typically on the last page). Paging must advance
+    /// off this, never off `items.len()` - the parser drops unhandled
+    /// classes, so a parsed-item count under-advances a mixed page.
+    pub(crate) next_offset: Option<u32>,
+    /// Item-class element local-names seen in this page that the parser
+    /// does not collect (e.g. `Task`, `MeetingRequest`, `DistributionList`,
+    /// `PostItem`). Deduped, source order. The caller surfaces these as a
+    /// scoped `Warning` so the silent omission is visible.
+    pub(crate) unhandled_classes: Vec<String>,
 }
 
 fn malformed(detail: impl Into<String>) -> EwsError {
@@ -342,23 +353,39 @@ pub(crate) fn parse_get_folder_response(xml: &str) -> Result<EwsFolder, EwsError
 
 pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, EwsError> {
     let mut reader = Reader::from_str(xml);
-    // NOTE: only `<t:Message>` items are projected (non-Message classes -
-    // calendar/contact/task - are a documented follow-up), so `items.len()`
-    // can be < `total_count` (`TotalItemsInView`), which counts ALL
-    // classes. This is consistent for the public-folder cursor diff
-    // because the inventory establish pass drops the same classes, so the
-    // live-id baseline and the incremental poll both see Messages only; a
-    // mixed-class folder simply never tracks its non-Message items.
+    // Item-collection flips on any class in `is_item_tag` (Message /
+    // CalendarItem / Contact), so mail, calendar, and contact public
+    // folders all sync at the identity level. `total_count`
+    // (`TotalItemsInView`) counts EVERY class, so `items.len()` can still
+    // be < `total_count` when a folder holds classes this parser does not
+    // yet collect (e.g. `Task` from an `IPF.Task` folder). That stays
+    // consistent for the public-folder cursor diff: the inventory
+    // establish pass and the incremental poll run this same parser, so the
+    // live-id baseline and the poll observe the identical set of tracked
+    // classes.
     let mut items = Vec::new();
 
     let mut total_count: u32 = 0;
     let mut includes_last = false;
+    let mut next_offset: Option<u32> = None;
+    let mut unhandled_classes: Vec<String> = Vec::new();
 
-    let mut in_message = false;
+    let mut in_item = false;
     let mut in_from = false;
     let mut in_mailbox = false;
     let mut current_tag = String::new();
     let mut buf = String::new();
+
+    // Element nesting depth (open Start elements not yet closed). Used to
+    // pin `ItemId`/change-key capture to a DIRECT child of the top-level
+    // item element: an EWS `Mailbox` (organizer / attendee / sender) can
+    // legally carry a nested `ItemId`, and capturing it would overwrite
+    // the item's true identity. `item_depth` is the level of the currently
+    // open item element; `items_depth` is the level of the enclosing
+    // `<Items>` container (its direct children are the per-item elements).
+    let mut depth: i32 = 0;
+    let mut item_depth: i32 = 0;
+    let mut items_depth: Option<i32> = None;
 
     let mut item_id = String::new();
     let mut change_key: Option<String> = None;
@@ -375,9 +402,28 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
             Ok(Event::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = strip_ns(&name);
+                depth += 1;
 
-                if local == "Message" {
-                    in_message = true;
+                if local == "Items" {
+                    items_depth = Some(depth);
+                }
+                // A direct child of `<Items>` that is not a class we
+                // collect is an unhandled item class (Task, PostItem,
+                // MeetingRequest, DistributionList, ...). Record it once so
+                // the caller can surface the omission.
+                if let Some(id) = items_depth
+                    && depth == id + 1
+                    && !is_item_tag(local)
+                {
+                    let owned = local.to_string();
+                    if !unhandled_classes.contains(&owned) {
+                        unhandled_classes.push(owned);
+                    }
+                }
+
+                if is_item_tag(local) && !in_item {
+                    in_item = true;
+                    item_depth = depth;
                     item_id.clear();
                     change_key = None;
                     subject = None;
@@ -388,7 +434,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                     is_read = false;
                     item_class.clear();
                 }
-                if in_message && local == "From" {
+                if in_item && local == "From" {
                     in_from = true;
                 }
                 if in_from && local == "Mailbox" {
@@ -399,12 +445,15 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                         .parse()
                         .unwrap_or(0);
                     includes_last = extract_attribute(e, "IncludesLastItemInRange") == "true";
+                    next_offset = extract_attribute(e, "IndexedPagingOffset").parse().ok();
                 }
 
                 current_tag = local.to_string();
                 buf.clear();
 
-                if in_message && local == "ItemId" {
+                // Direct-child `ItemId` only (a Start `ItemId` sits one
+                // level below the item element).
+                if in_item && local == "ItemId" && depth == item_depth + 1 {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -412,7 +461,10 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
             Ok(Event::Empty(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = strip_ns(&name);
-                if in_message && local == "ItemId" {
+                // An Empty `ItemId` is a direct child of the currently-open
+                // element (at `depth`); accept it only when that element is
+                // the item itself.
+                if in_item && local == "ItemId" && depth == item_depth {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -421,6 +473,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                         .parse()
                         .unwrap_or(0);
                     includes_last = extract_attribute(e, "IncludesLastItemInRange") == "true";
+                    next_offset = extract_attribute(e, "IndexedPagingOffset").parse().ok();
                 }
             }
             Ok(Event::Text(ref e)) => push_text(e, &mut buf),
@@ -439,7 +492,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                     if local == "Mailbox" {
                         in_mailbox = false;
                     }
-                } else if in_message {
+                } else if in_item {
                     match current_tag.as_str() {
                         "Subject" => subject = Some(trimmed.to_string()),
                         "DateTimeReceived" => received_at = Some(trimmed.to_string()),
@@ -453,7 +506,7 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                 if local == "From" {
                     in_from = false;
                 }
-                if local == "Message" && in_message {
+                if is_item_tag(local) && in_item && depth == item_depth {
                     if !item_id.is_empty() {
                         items.push(EwsItem {
                             item_id: item_id.clone(),
@@ -470,11 +523,12 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                             cc_recipients: Vec::new(),
                         });
                     }
-                    in_message = false;
+                    in_item = false;
                 }
 
                 buf.clear();
                 current_tag.clear();
+                depth -= 1;
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(malformed(format!("FindItem parse failed: {e}"))),
@@ -486,19 +540,27 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
         items,
         total_count,
         includes_last,
+        next_offset,
+        unhandled_classes,
     })
 }
 
 pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     let mut reader = Reader::from_str(xml);
 
-    let mut in_message = false;
+    let mut in_item = false;
     let mut in_from = false;
     let mut in_to = false;
     let mut in_cc = false;
     let mut in_mailbox = false;
     let mut current_tag = String::new();
     let mut buf = String::new();
+
+    // Nesting depth, so `ItemId`/change-key capture pins to a direct child
+    // of the top-level item element - a recipient/organizer `Mailbox` can
+    // carry a nested `ItemId` that must not overwrite the item's identity.
+    let mut depth: i32 = 0;
+    let mut item_depth: i32 = 0;
 
     let mut item_id = String::new();
     let mut change_key: Option<String> = None;
@@ -520,11 +582,13 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
             Ok(Event::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = strip_ns(&name);
+                depth += 1;
 
-                if local == "Message" {
-                    in_message = true;
+                if is_item_tag(local) && !in_item {
+                    in_item = true;
+                    item_depth = depth;
                 }
-                if in_message {
+                if in_item {
                     match local {
                         "From" => in_from = true,
                         "ToRecipients" => in_to = true,
@@ -541,7 +605,8 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 current_tag = local.to_string();
                 buf.clear();
 
-                if in_message && local == "ItemId" {
+                // Direct-child `ItemId` only (Start form: one level below).
+                if in_item && local == "ItemId" && depth == item_depth + 1 {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -549,7 +614,9 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
             Ok(Event::Empty(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = strip_ns(&name);
-                if in_message && local == "ItemId" {
+                // Direct-child `ItemId` only (Empty form: child of the
+                // currently-open element at `depth`).
+                if in_item && local == "ItemId" && depth == item_depth {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -584,7 +651,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                             }
                         }
                     }
-                } else if in_message {
+                } else if in_item {
                     match current_tag.as_str() {
                         "Subject" => subject = Some(trimmed.to_string()),
                         "DateTimeReceived" => received_at = Some(trimmed.to_string()),
@@ -602,8 +669,20 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     _ => {}
                 }
 
+                // Close the item at its own depth, symmetric with the
+                // FindItem parser. `get_item` requests a single id and the
+                // result is built once after the loop, so this is not
+                // multi-item support: it prevents a field element appearing
+                // as a sibling AFTER the item element closes from bleeding
+                // into the already-captured item's accumulators (without the
+                // close, `in_item` stays true to EOF).
+                if is_item_tag(local) && in_item && depth == item_depth {
+                    in_item = false;
+                }
+
                 buf.clear();
                 current_tag.clear();
+                depth -= 1;
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(malformed(format!("GetItem parse failed: {e}"))),
@@ -650,6 +729,20 @@ fn is_folder_tag(local: &str) -> bool {
         local,
         "Folder" | "ContactsFolder" | "CalendarFolder" | "TasksFolder"
     )
+}
+
+/// Item-class elements the `FindItem` / `GetItem` parsers collect into an
+/// `EwsItem`. Mail (`Message`), calendar (`CalendarItem`), and contact
+/// (`Contact`) public folders all surface as `CursorScope::Folder`
+/// scopes, so all three must flip item-collection state or the folder
+/// discovers as a scope yet syncs zero items. Collection here is
+/// identity-level (id / change-key / `IsRead`); richer class-specific
+/// body projection (a contact has no `Subject`/`From`, an appointment
+/// sorts by start not received-time) is a deliberate follow-on. `Task`
+/// (from an `IPF.Task` folder, classified by `is_folder_tag`) is not
+/// collected yet - a named follow-on.
+fn is_item_tag(local: &str) -> bool {
+    matches!(local, "Message" | "CalendarItem" | "Contact")
 }
 
 fn apply_effective_right(rights: &mut EwsEffectiveRights, tag: &str, value: &str) {
@@ -890,6 +983,308 @@ mod tests {
             result.items[1].received_at.as_deref(),
             Some("2026-02-28T14:15:00Z")
         );
+    }
+
+    #[test]
+    fn parse_find_items_response_calendar_and_contact() {
+        // A mixed-class public folder: one Message, one CalendarItem, one
+        // Contact - all collectable - plus one Task the parser does not
+        // yet handle. `TotalItemsInView` counts every class (4), so
+        // `items.len()` stays at the 3 tracked classes.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                        xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:RootFolder TotalItemsInView="4" IncludesLastItemInRange="true">
+            <t:Items>
+              <t:Message>
+                <t:ItemId Id="AAMkMsg=" ChangeKey="CKM"/>
+                <t:Subject>Notice</t:Subject>
+                <t:ItemClass>IPM.Note</t:ItemClass>
+              </t:Message>
+              <t:CalendarItem>
+                <t:ItemId Id="AAMkCal=" ChangeKey="CKC"/>
+                <t:Subject>Team Standup</t:Subject>
+                <t:ItemClass>IPM.Appointment</t:ItemClass>
+              </t:CalendarItem>
+              <t:Contact>
+                <t:ItemId Id="AAMkCon=" ChangeKey="CKN"/>
+                <t:ItemClass>IPM.Contact</t:ItemClass>
+              </t:Contact>
+              <t:Task>
+                <t:ItemId Id="AAMkTask=" ChangeKey="CKT"/>
+                <t:ItemClass>IPM.Task</t:ItemClass>
+              </t:Task>
+            </t:Items>
+          </m:RootFolder>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let result = parse_find_items_response(xml).expect("parse should succeed");
+        // TotalItemsInView counts all four classes.
+        assert_eq!(result.total_count, 4);
+        // The Task is not collected: three tracked-class items only.
+        assert_eq!(result.items.len(), 3);
+        assert_eq!(result.items[0].item_id, "AAMkMsg=");
+        assert_eq!(result.items[0].item_class, "IPM.Note");
+        assert_eq!(result.items[1].item_id, "AAMkCal=");
+        assert_eq!(result.items[1].change_key.as_deref(), Some("CKC"));
+        assert_eq!(result.items[1].item_class, "IPM.Appointment");
+        assert_eq!(result.items[2].item_id, "AAMkCon=");
+        assert_eq!(result.items[2].change_key.as_deref(), Some("CKN"));
+        assert_eq!(result.items[2].item_class, "IPM.Contact");
+        // A CalendarItem/Contact without DateTimeReceived carries no
+        // watermark contribution.
+        assert!(result.items[1].received_at.is_none());
+        assert!(result.items[2].received_at.is_none());
+        assert!(
+            result.items.iter().all(|i| i.item_id != "AAMkTask="),
+            "Task must not be collected"
+        );
+        // The dropped Task class is surfaced for a scoped warning.
+        assert_eq!(result.unhandled_classes, vec!["Task".to_string()]);
+        // Last page (IncludesLastItemInRange=true), no paging offset.
+        assert!(result.includes_last);
+        assert_eq!(result.next_offset, None);
+    }
+
+    #[test]
+    fn parse_find_items_response_paging_offset() {
+        // A non-final page: the server reports its own next-page offset in
+        // wire rows via IndexedPagingOffset. Paging must advance off this,
+        // not off the two parsed Messages.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                        xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:RootFolder TotalItemsInView="500" IncludesLastItemInRange="false" IndexedPagingOffset="100">
+            <t:Items>
+              <t:Message>
+                <t:ItemId Id="AAMk1=" ChangeKey="CK1"/>
+              </t:Message>
+              <t:Task>
+                <t:ItemId Id="AAMkT=" ChangeKey="CKT"/>
+              </t:Task>
+              <t:Message>
+                <t:ItemId Id="AAMk2=" ChangeKey="CK2"/>
+              </t:Message>
+            </t:Items>
+          </m:RootFolder>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let result = parse_find_items_response(xml).expect("parse should succeed");
+        assert!(!result.includes_last);
+        // Server offset (100), NOT the two collected Messages.
+        assert_eq!(result.next_offset, Some(100));
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.unhandled_classes, vec!["Task".to_string()]);
+    }
+
+    #[test]
+    fn parse_find_items_response_nested_mailbox_item_id_ignored() {
+        // A CalendarItem whose Organizer and attendee Mailbox each carry a
+        // nested ItemId. Those must NOT overwrite the appointment's own
+        // identity - only the direct-child ItemId counts.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                        xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:RootFolder TotalItemsInView="1" IncludesLastItemInRange="true">
+            <t:Items>
+              <t:CalendarItem>
+                <t:ItemId Id="ROOT=" ChangeKey="ROOTCK"/>
+                <t:Subject>Planning</t:Subject>
+                <t:Organizer>
+                  <t:Mailbox>
+                    <t:Name>Alice</t:Name>
+                    <t:EmailAddress>alice@contoso.com</t:EmailAddress>
+                    <t:ItemId Id="ORGANIZER=" ChangeKey="ORGCK"/>
+                  </t:Mailbox>
+                </t:Organizer>
+                <t:RequiredAttendees>
+                  <t:Attendee>
+                    <t:Mailbox>
+                      <t:Name>Bob</t:Name>
+                      <t:EmailAddress>bob@contoso.com</t:EmailAddress>
+                      <t:ItemId Id="ATTENDEE=" ChangeKey="ATTCK"/>
+                    </t:Mailbox>
+                  </t:Attendee>
+                </t:RequiredAttendees>
+                <t:ItemClass>IPM.Appointment</t:ItemClass>
+              </t:CalendarItem>
+            </t:Items>
+          </m:RootFolder>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let result = parse_find_items_response(xml).expect("parse should succeed");
+        assert_eq!(result.items.len(), 1);
+        // Identity is the appointment's own ItemId, never a nested Mailbox one.
+        assert_eq!(result.items[0].item_id, "ROOT=");
+        assert_eq!(result.items[0].change_key.as_deref(), Some("ROOTCK"));
+        assert_eq!(result.items[0].item_class, "IPM.Appointment");
+    }
+
+    #[test]
+    fn parse_get_item_response_nested_mailbox_item_id_ignored() {
+        // A CalendarItem GetItem whose Organizer Mailbox carries a nested
+        // ItemId - identity must stay the appointment's, not the organizer's.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:CalendarItem>
+              <t:ItemId Id="APPT=" ChangeKey="APPTCK"/>
+              <t:Subject>Review</t:Subject>
+              <t:Organizer>
+                <t:Mailbox>
+                  <t:Name>Carol</t:Name>
+                  <t:EmailAddress>carol@contoso.com</t:EmailAddress>
+                  <t:ItemId Id="ORG=" ChangeKey="ORGCK"/>
+                </t:Mailbox>
+              </t:Organizer>
+              <t:ItemClass>IPM.Appointment</t:ItemClass>
+            </t:CalendarItem>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let item = parse_get_item_response(xml).expect("parse should succeed");
+        assert_eq!(item.item_id, "APPT=");
+        assert_eq!(item.change_key.as_deref(), Some("APPTCK"));
+    }
+
+    #[test]
+    fn parse_get_item_response_start_form_item_id() {
+        // The item's own ItemId as a Start+End pair (non-self-closing),
+        // exercising the `depth == item_depth + 1` Start-form guard, while
+        // a nested organizer ItemId in the SAME start form must not steal
+        // identity.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:CalendarItem>
+              <t:ItemId Id="APPT=" ChangeKey="APPTCK"></t:ItemId>
+              <t:Subject>Review</t:Subject>
+              <t:Organizer>
+                <t:Mailbox>
+                  <t:Name>Carol</t:Name>
+                  <t:EmailAddress>carol@contoso.com</t:EmailAddress>
+                  <t:ItemId Id="ORG=" ChangeKey="ORGCK"></t:ItemId>
+                </t:Mailbox>
+              </t:Organizer>
+              <t:ItemClass>IPM.Appointment</t:ItemClass>
+            </t:CalendarItem>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let item = parse_get_item_response(xml).expect("parse should succeed");
+        assert_eq!(item.item_id, "APPT=");
+        assert_eq!(item.change_key.as_deref(), Some("APPTCK"));
+    }
+
+    #[test]
+    fn parse_get_item_response_stray_field_after_item_close_ignored() {
+        // With `in_item` closed at the item's depth, a field element that
+        // appears as a sibling AFTER the item element closes does not bleed
+        // into the (already-captured) item's accumulators. Without the
+        // close, `in_item` would stay true and the stray `<t:Subject>`
+        // would overwrite the real subject.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:Message>
+              <t:ItemId Id="REAL=" ChangeKey="CK1"/>
+              <t:Subject>Real Subject</t:Subject>
+              <t:ItemClass>IPM.Note</t:ItemClass>
+            </t:Message>
+            <t:Subject>Stray Sibling Subject</t:Subject>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let item = parse_get_item_response(xml).expect("parse should succeed");
+        assert_eq!(item.item_id, "REAL=");
+        // The subject stays the item's own, not the stray sibling's.
+        assert_eq!(item.subject.as_deref(), Some("Real Subject"));
+    }
+
+    #[test]
+    fn parse_get_item_response_contact() {
+        // Parser-tolerance only: the GetItem parser flips item-collection
+        // state on `<t:Contact>` so a hydration response parses to identity
+        // rather than erroring. This does NOT imply operational non-mail
+        // GetItem: the request builder is still message-shaped and unwired
+        // (see `ops::get_item`); sync runs through FindItem IdOnly.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:Contact>
+              <t:ItemId Id="AAMkContact=" ChangeKey="CKContact"/>
+              <t:ItemClass>IPM.Contact</t:ItemClass>
+              <t:DisplayName>Jane Doe</t:DisplayName>
+            </t:Contact>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let item = parse_get_item_response(xml).expect("parse should succeed");
+        assert_eq!(item.item_id, "AAMkContact=");
+        assert_eq!(item.change_key.as_deref(), Some("CKContact"));
+        assert_eq!(item.item_class, "IPM.Contact");
+        assert!(item.to_recipients.is_empty());
+        assert!(item.cc_recipients.is_empty());
     }
 
     #[test]
