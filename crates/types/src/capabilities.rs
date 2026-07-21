@@ -186,8 +186,10 @@ pub struct PimMethodSupport {
     /// Native send-as / send-on-behalf-of routing for a shared or
     /// delegate mailbox (Microsoft Graph: route the draft-create-and-send
     /// through the shared mailbox's `/users/{id}` client and stamp the
-    /// `from`/`sender` fields). Gates `SendRequest::send_as`. `true` only
-    /// on Graph; `false` everywhere else -> a `Some(send_as)` request is
+    /// `from`/`sender` fields; JMAP routes through a foreign submission-
+    /// capable account). Gates `SendRequest::send_as`. `true` on Graph and
+    /// JMAP when a foreign submission-capable account is available; `false`
+    /// elsewhere -> a `Some(send_as)` request is
     /// rejected `Unsupported(Send)`, never silently sent from the
     /// authenticated user's own mailbox.
     pub send_as: bool,

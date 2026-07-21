@@ -257,6 +257,27 @@ pub(crate) fn unsupported_error(
         .expect("valid account error classification")
 }
 
+/// A send-as mailbox id that was not present in the successfully seeded
+/// foreign-account routing table. Consumers receive these ids from foreign
+/// membership ownership, so an unknown id is a malformed request.
+#[must_use]
+pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::MailboxId) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("send_as.mailbox"),
+            message: Some(DiagnosticText::support_only(format!(
+                "unknown foreign submission account {}",
+                mailbox.0
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(AccountOperation::Send)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Convenience for stream call sites that need to emit a
 /// `SyncEvent::Terminated(Unsupported(op))`. Callers pass the
 /// operation the stream is performing; the helper previously
@@ -1155,6 +1176,17 @@ mod tests {
             err.kind(),
             &AccountErrorKind::Unsupported(AccountOperation::HostAttachment)
         );
+    }
+
+    #[test]
+    fn send_as_unknown_account_is_malformed() {
+        let err = send_as_unknown_account(&bifrost_types::MailboxId("foreign-id".to_string()));
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert_eq!(err.operation(), Some(AccountOperation::Send));
+        assert!(err.recovery().is_terminal());
     }
 
     #[test]

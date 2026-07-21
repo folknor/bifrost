@@ -62,6 +62,13 @@ const DRAFT_KEYWORD: &str = "$draft";
 const SUBMISSION_CREATE_ID: &str = "submit0";
 const ATTACHMENT_HANDLE_PREFIX: &str = "jmap:";
 
+/// Foreign (shared/delegate) submission context selected by the account
+/// layer. `mail` already targets the foreign JMAP account.
+pub(crate) struct ForeignSubmission {
+    pub(crate) mode: bifrost_types::SendAs,
+    pub(crate) self_address: Option<bifrost_types::Address>,
+}
+
 pub(crate) fn add_to_container(
     mail: MailAccount,
     email_states: StateMap,
@@ -182,19 +189,22 @@ fn importance_sets_important_keyword(level: Importance) -> bool {
     matches!(level, Importance::High)
 }
 
-/// JMAP foreign-accountId submission (send-on-behalf via a foreign
-/// `accountId`) is the A5a-scoped-out foreign-mutation follow-up, not
-/// yet wired. A `send_as` request is rejected `Unsupported(Send)`
-/// rather than silently sent from the authenticated user's own
-/// mailbox.
-fn send_as_guard(request: &bifrost_types::SendRequest) -> Option<AccountError> {
-    request.send_as.is_some().then(|| {
-        super::error::unsupported_error(
-            AccountOperation::Send,
-            None,
-            "JMAP foreign-account send-as is not wired",
-        )
-    })
+/// Resolve From/Sender for a foreign submission. `OnBehalfOf` keeps an
+/// explicit consumer From for compatibility with Graph; otherwise the
+/// foreign identity supplies it. The envelope deliberately follows From.
+fn resolve_foreign_headers(
+    mode: &bifrost_types::SendAs,
+    ident: &bifrost_types::Address,
+    consumer_from: Option<bifrost_types::Address>,
+    self_address: Option<bifrost_types::Address>,
+) -> (bifrost_types::Address, Option<bifrost_types::Address>) {
+    match mode {
+        bifrost_types::SendAs::As(_) => (ident.clone(), None),
+        bifrost_types::SendAs::OnBehalfOf(_) => {
+            (consumer_from.unwrap_or_else(|| ident.clone()), self_address)
+        }
+        _ => (ident.clone(), None),
+    }
 }
 
 pub(crate) fn send_message(
@@ -202,13 +212,28 @@ pub(crate) fn send_message(
     email_states: StateMap,
     account_id: String,
     max_delayed_send: usize,
-    request: bifrost_types::SendRequest,
+    foreign: Option<ForeignSubmission>,
+    mut request: bifrost_types::SendRequest,
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
-        if let Some(err) = send_as_guard(&request) {
-            return Err(err);
-        }
-        let identity = request.identity.clone();
+        let personal_identity = request.identity.clone();
+        let identity = if let Some(foreign) = foreign.as_ref() {
+            let selected = foreign_sending_identity(&mail, request.identity.as_ref()).await?;
+            let ident_address = bifrost_types::Address {
+                name: selected.name,
+                address: selected.email,
+            };
+            let (from, sender) = resolve_foreign_headers(
+                &foreign.mode,
+                &ident_address,
+                request.from.take(),
+                foreign.self_address.clone(),
+            );
+            request.from = Some(from);
+            Some((JmapIdentityId::new(selected.id), sender))
+        } else {
+            None
+        };
         let scheduled = request.scheduled;
         if let Some(at) = scheduled {
             // A scheduled request on a relay with no delay window
@@ -241,7 +266,10 @@ pub(crate) fn send_message(
             Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
         };
 
-        let create = build_email_create_from_send(&mail, request, draft_mailbox).await?;
+        let mut create = build_email_create_from_send(&mail, request, draft_mailbox).await?;
+        if let Some((_, Some(sender))) = identity.as_ref() {
+            create.sender([address_to_jmap(sender.clone())]);
+        }
         let mut email_set = EmailSet::new();
         let email_create_id = email_set.create_item(create);
 
@@ -249,8 +277,10 @@ pub(crate) fn send_message(
         {
             let submit = submission_set.create_with_id(SUBMISSION_CREATE_ID);
             submit.undo_status(UndoStatus::Final);
-            if let Some(identity) = identity {
-                submit.identity_id(JmapIdentityId::new(identity.0));
+            if let Some((identity, _)) = identity.as_ref() {
+                submit.identity_id(identity.clone());
+            } else if let Some(identity) = personal_identity.as_ref() {
+                submit.identity_id(JmapIdentityId::new(identity.0.clone()));
             }
             if let Some(from) = envelope_from.as_ref()
                 && !envelope_recipients.is_empty()
@@ -812,6 +842,69 @@ pub(crate) fn identities_list(
         }
         Ok(identities)
     })
+}
+
+#[cfg_attr(test, derive(Debug))]
+struct ForeignIdentity {
+    id: String,
+    name: Option<String>,
+    email: String,
+}
+
+/// Select a concrete foreign identity. JMAP does not designate a default
+/// identity, so the first concrete address returned by the server is the
+/// documented best-effort convention. Wildcard identities cannot be used in
+/// an RFC 5322 From header.
+async fn foreign_sending_identity(
+    mail: &MailAccount,
+    requested: Option<&bifrost_types::IdentityId>,
+) -> Result<ForeignIdentity, AccountError> {
+    let get = IdentityGet::new().properties([
+        crate::identity::Property::Id,
+        crate::identity::Property::Name,
+        crate::identity::Property::Email,
+    ]);
+    let get = match requested {
+        Some(requested) => get.ids([JmapIdentityId::new(requested.0.clone())]),
+        None => get,
+    };
+    let response = mail
+        .call(get)
+        .await
+        .map_err(to_acct_err(AccountOperation::Send))?;
+    select_concrete_identity(response.into_list(), requested.is_some())
+}
+
+/// Pure identity selection: first row with a concrete (non-empty,
+/// non-wildcard) email. `requested` only shapes the rejection detail (the
+/// server was asked for a specific id, so an empty result means that id is
+/// absent or wildcard-only, not that the account has no identity at all).
+fn select_concrete_identity(
+    rows: Vec<crate::identity::Identity>,
+    requested: bool,
+) -> Result<ForeignIdentity, AccountError> {
+    let mut concrete = rows.into_iter().filter_map(|mut identity| {
+        let id = identity.take_id().into_string();
+        let email = identity.email()?.to_string();
+        (!id.is_empty() && !email.is_empty() && !email.contains('*')).then(|| ForeignIdentity {
+            id,
+            name: identity.name().map(str::to_string),
+            email,
+        })
+    });
+    if let Some(identity) = concrete.next() {
+        return Ok(identity);
+    }
+    let detail = if requested {
+        "requested foreign sending identity is absent or has no concrete email"
+    } else {
+        "foreign account advertises no sending identity"
+    };
+    Err(super::error::unsupported_error(
+        AccountOperation::Send,
+        None,
+        detail,
+    ))
 }
 
 pub(crate) fn identity_update(
@@ -2292,19 +2385,93 @@ mod tests {
     }
 
     #[test]
-    fn send_as_rejected_unsupported() {
-        let mut request = bifrost_types::SendRequest::default();
-        request.send_as = Some(bifrost_types::SendAs::As(bifrost_types::MailboxId(
-            "shared@contoso.com".to_string(),
-        )));
-        let err = send_as_guard(&request).expect("send_as request must be rejected");
+    fn resolve_foreign_headers_as_overrides_consumer_from() {
+        let identity = bifrost_types::Address::bare("shared@example.test");
+        let (from, sender) = resolve_foreign_headers(
+            &bifrost_types::SendAs::As(bifrost_types::MailboxId("foreign".to_string())),
+            &identity,
+            Some(bifrost_types::Address::bare("consumer@example.test")),
+            Some(bifrost_types::Address::bare("user@example.test")),
+        );
+        assert_eq!(from.address, "shared@example.test");
+        assert!(sender.is_none());
+    }
+
+    #[test]
+    fn resolve_foreign_headers_on_behalf_of_honors_consumer_from() {
+        let identity = bifrost_types::Address::bare("shared@example.test");
+        let (from, sender) = resolve_foreign_headers(
+            &bifrost_types::SendAs::OnBehalfOf(bifrost_types::MailboxId("foreign".to_string())),
+            &identity,
+            Some(bifrost_types::Address::bare("author@example.test")),
+            Some(bifrost_types::Address::bare("user@example.test")),
+        );
+        assert_eq!(from.address, "author@example.test");
+        assert_eq!(
+            sender.expect("known self address").address,
+            "user@example.test"
+        );
+    }
+
+    #[test]
+    fn resolve_foreign_headers_on_behalf_of_omits_unknown_sender() {
+        let identity = bifrost_types::Address::bare("shared@example.test");
+        let (from, sender) = resolve_foreign_headers(
+            &bifrost_types::SendAs::OnBehalfOf(bifrost_types::MailboxId("foreign".to_string())),
+            &identity,
+            None,
+            None,
+        );
+        assert_eq!(from.address, "shared@example.test");
+        assert!(sender.is_none());
+    }
+
+    fn identity_rows(json: serde_json::Value) -> Vec<crate::identity::Identity> {
+        serde_json::from_value(json).expect("identity rows deserialize")
+    }
+
+    #[test]
+    fn select_concrete_identity_takes_first_concrete_email() {
+        let rows = identity_rows(serde_json::json!([
+            {"id": "i0", "name": "Shared", "email": "shared@example.test"},
+            {"id": "i1", "email": "other@example.test"},
+        ]));
+        let picked = select_concrete_identity(rows, false).expect("first concrete identity");
+        assert_eq!(picked.id, "i0");
+        assert_eq!(picked.email, "shared@example.test");
+        assert_eq!(picked.name.as_deref(), Some("Shared"));
+    }
+
+    #[test]
+    fn select_concrete_identity_skips_wildcard_email() {
+        let rows = identity_rows(serde_json::json!([
+            {"id": "i0", "email": "*"},
+            {"id": "i1", "email": "*@example.test"},
+            {"id": "i2", "email": "concrete@example.test"},
+        ]));
+        let picked = select_concrete_identity(rows, false).expect("concrete over wildcard");
+        assert_eq!(picked.id, "i2");
+    }
+
+    #[test]
+    fn select_concrete_identity_empty_list_rejects_unsupported() {
+        let err = select_concrete_identity(Vec::new(), false).expect_err("no identity to send as");
         assert!(matches!(
             err.kind(),
             bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
         ));
-        assert_eq!(err.operation(), Some(AccountOperation::Send));
+    }
 
-        // A personal send passes the guard.
-        assert!(send_as_guard(&bifrost_types::SendRequest::default()).is_none());
+    #[test]
+    fn select_concrete_identity_requested_absent_rejects() {
+        // A by-id get that returns nothing usable is a distinct rejection
+        // detail from the empty-account case, but still `Unsupported(Send)`.
+        let rows = identity_rows(serde_json::json!([{"id": "i0", "email": "*"}]));
+        let err = select_concrete_identity(rows, true)
+            .expect_err("requested identity has no concrete email");
+        assert!(matches!(
+            err.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
     }
 }

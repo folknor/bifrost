@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -161,17 +161,6 @@ impl AccountFactory for JmapAccountFactory {
                 Some(caps) => caps.max_delayed_send(),
                 None => 0,
             };
-            let support = capabilities::PimSupport {
-                submission: submission.is_some(),
-                max_delayed_send,
-                vacation: vacation.is_some(),
-                quota: quota.is_some(),
-                sieve: sieve.is_some(),
-                contacts: contacts.is_some(),
-                calendar: calendars.is_some(),
-            };
-            let (caps, limits) = capabilities::build(&session, support)?;
-
             let email_state = mutation::probe_email_state(&mail).await.map_err(|err| {
                 super::error::into_account_error(
                     err,
@@ -238,6 +227,7 @@ impl AccountFactory for JmapAccountFactory {
             // primary and other foreign accounts still open).
             let foreign_ids = foreign_mail_account_ids(&client, &primary_id);
             let mut foreign_mail: HashMap<String, MailAccount> = HashMap::new();
+            let mut foreign_submission = HashSet::new();
             for foreign_id in foreign_ids {
                 let foreign_account =
                     MailAccount::new(client.clone(), JmapAccountId::new(&foreign_id));
@@ -260,6 +250,9 @@ impl AccountFactory for JmapAccountFactory {
                                 seed_states.insert(scope, encoded);
                             }
                         }
+                        if account_advertises_submission(&session, &foreign_id) {
+                            foreign_submission.insert(foreign_id.clone());
+                        }
                         foreign_mail.insert(foreign_id, foreign_account);
                     }
                     Err(_skip) => {
@@ -268,6 +261,21 @@ impl AccountFactory for JmapAccountFactory {
                     }
                 }
             }
+
+            // This gate is derived from the successfully seeded routing set,
+            // never merely from the session. A foreign account skipped during
+            // probing must not make us advertise an unreachable send-as path.
+            let support = capabilities::PimSupport {
+                submission: submission.is_some(),
+                max_delayed_send,
+                foreign_submission: !foreign_submission.is_empty(),
+                vacation: vacation.is_some(),
+                quota: quota.is_some(),
+                sieve: sieve.is_some(),
+                contacts: contacts.is_some(),
+                calendar: calendars.is_some(),
+            };
+            let (caps, limits) = capabilities::build(&session, support)?;
 
             let shutdown = CancellationToken::new();
             let ws = WsState::spawn(
@@ -281,6 +289,7 @@ impl AccountFactory for JmapAccountFactory {
                 client,
                 mail,
                 foreign_mail,
+                foreign_submission,
                 submission,
                 max_delayed_send,
                 vacation,
@@ -303,6 +312,14 @@ impl AccountFactory for JmapAccountFactory {
             Ok(Arc::new(account) as Arc<dyn Account>)
         })
     }
+}
+
+fn account_advertises_submission(session: &crate::core::session::Session, id: &str) -> bool {
+    session.account(id).is_some_and(|account| {
+        account
+            .capabilities()
+            .any(|uri| uri.as_str() == <capability::Submission as Capability>::URI)
+    })
 }
 
 async fn fetch_self_emails(client: &Client, credentials: &JmapCredentials) -> Vec<String> {

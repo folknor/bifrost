@@ -112,9 +112,10 @@ pub enum SendAs {
     /// mailbox." A consumer that wants `from` to diverge from the
     /// sending mailbox wants `OnBehalfOf`, not `As`.
     As(MailboxId),
-    /// Send **on behalf of** the shared mailbox: the mailbox is the
-    /// author (`From`), the authenticated user is the sender
-    /// (`Sender`). The recipient sees "user on behalf of mailbox".
+    /// Send **on behalf of** the shared mailbox: when the consumer does not
+    /// supply `from`, the mailbox is the author (`From`); the authenticated
+    /// user is the sender (`Sender`). A provider may preserve an explicit
+    /// consumer `from`. The recipient sees "user on behalf of mailbox".
     OnBehalfOf(MailboxId),
 }
 
@@ -182,7 +183,8 @@ pub struct SendRequest {
     pub scheduled: Option<std::time::SystemTime>,
     /// Send-as / send-on-behalf-of a shared or delegate mailbox.
     /// `None` is an ordinary personal send. See `SendAs`. Honored only
-    /// where `capabilities().pim_methods.send_as` is `true` (Graph);
+    /// where `capabilities().pim_methods.send_as` is `true` (Graph or JMAP
+    /// with a foreign submission-capable account);
     /// `Some(..)` elsewhere is rejected `Unsupported(Send)`.
     pub send_as: Option<SendAs>,
     /// Request a read receipt (message disposition notification) for this

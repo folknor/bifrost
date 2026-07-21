@@ -420,8 +420,9 @@ Scheduled send PATCHes `PidTagDeferredSendTime` (`SystemTime 0x3FEF`, ISO-8601
 UTC) onto the draft between create and send; the draft id is the
 cancel/reschedule handle.
 
-`SendRequest::send_as` (gated by `pim_methods.send_as`, Graph only) routes
-create/deferred-stamp/send through the shared mailbox's `shared_clients`
+`SendRequest::send_as` (gated by `pim_methods.send_as`; Graph and JMAP both
+advertise it, see `reference/jmap.md` for the JMAP foreign-submission leg)
+routes create/deferred-stamp/send through the shared mailbox's `shared_clients`
 entry (keyed by `MailboxId`); the three helpers take an explicit
 `&GraphClient`. `apply_send_as` stamps `from`/`sender`: `As` forces both to
 the mailbox; `OnBehalfOf` keeps `from` = mailbox (honoring an explicit

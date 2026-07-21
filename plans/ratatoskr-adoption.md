@@ -347,13 +347,16 @@ at spec time.
     with an `apply_send_as` helper stamping `from`/`sender` (`As` forces both to
     the mailbox; `OnBehalfOf` keeps `from` = mailbox and `sender` = `user_email`,
     omitted when `None`) and a `send_as_unknown_mailbox` -> `Request(Malformed)`
-    for an unregistered mailbox; IMAP/Google/JMAP each reject a `Some(send_as)`
-    with `Unsupported(Send)` (a one-line guard at the top of `send_message`). The
+    for an unregistered mailbox; IMAP/Google each reject a `Some(send_as)` with
+    `Unsupported(Send)` (a one-line guard at the top of `send_message`). The
     draft-backed path is kept (not `/users/{id}/sendMail`), so the port-map's
-    inline-only-attachments note never applies. Scoped-out follow-ups filed:
-    `c3-1` (JMAP native foreign-account submission) and `c3-2` (shared-mailbox
-    send over SMTP for IMAP-shaped accounts) in `TODO.md`. The spec was retired
-    at landing; durable record is git history + `reference/graph.md`.
+    inline-only-attachments note never applies. Scoped-out follow-up filed:
+    `c3-2` (shared-mailbox send over SMTP for IMAP-shaped accounts) in
+    `TODO.md`. JMAP native foreign-account submission (formerly `c3-1`) landed
+    separately: JMAP now honors `send_as` by routing the draft `Email/set` +
+    `EmailSubmission/set` to a seeded, submission-capable foreign account. The
+    specs were retired at landing; durable record is git history +
+    `reference/graph.md` / `reference/jmap.md`.
 - STILL OPEN (NOT A8 deliverables - residue only):
   - **A-6** - Gmail `CATEGORY_*` bundling priority. POLICY: the ML categories are
     surfaced uniformly already; the bundling heuristic stays a ratatoskr consumer
@@ -363,7 +366,7 @@ at spec time.
   - **graph-S1 / graph-N3 and the per-crate N-item cleanups** - tracked in
     `TODO.md`, not A8 deliverables; none block ratatoskr.
 - Depends on: known warts independent; C-3 needed A5a (landed). All landed.
-- TODO: `graph-S1`, `graph-N3`, `c3-1`, `c3-2`, and the broader per-crate N-item
+- TODO: `graph-S1`, `graph-N3`, `c3-2`, and the broader per-crate N-item
   cleanups (`graph-N1` is closed and removed from `TODO.md`).
 
 ### A9 - Global Address List / directory search

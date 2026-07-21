@@ -591,10 +591,11 @@ create/deferred-stamp/send cycle through the shared mailbox's `shared_clients`
 `&GraphClient` and `apply_send_as` stamps `from`/`sender`. The
 inline-only-attachments constraint on `/users/{id}/sendMail` never applies because
 bifrost keeps the draft-backed path (`POST /messages` then `.../send`), which
-accepts attachments uniformly with a primary-mailbox send. IMAP/Google/JMAP reject
-a `Some(send_as)` with `Unsupported(Send)`. Scoped-out follow-ups: `c3-1` (JMAP
-native foreign-account submission) and `c3-2` (shared-mailbox send over SMTP for
-IMAP-shaped accounts) in `TODO.md`.
+accepts attachments uniformly with a primary-mailbox send. IMAP/Google reject a
+`Some(send_as)` with `Unsupported(Send)`. JMAP now honors `send_as` natively by
+routing the draft `Email/set` + `EmailSubmission/set` to a seeded, submission-
+capable foreign account (see `reference/jmap.md`). Scoped-out follow-up: `c3-2`
+(shared-mailbox send over SMTP for IMAP-shaped accounts) in `TODO.md`.
 
 ### Group D - transport quirks, mostly ALREADY absorbed
 

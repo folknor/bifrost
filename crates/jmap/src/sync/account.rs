@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -12,9 +12,10 @@ use bifrost_types::{
     HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
     IdentityPatch, Importance, InventoryEntry, InventoryPartition, InventoryPartitioning,
     ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
-    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -39,6 +40,9 @@ pub(crate) struct JmapAccount {
     /// accounts that advertise the mail capability. A foreign `Folder`
     /// scope routes here via `mail_for_scope`.
     pub(crate) foreign_mail: Arc<HashMap<String, MailAccount>>,
+    /// Foreign mail accounts that were successfully seeded and advertise
+    /// `urn:ietf:params:jmap:submission`.
+    pub(crate) foreign_submission: Arc<HashSet<String>>,
     pub(crate) submission: Option<MailAccount>,
     /// `urn:ietf:params:jmap:submission` `maxDelayedSend` (seconds);
     /// `0` when the server advertises no scheduled-send window. Read by
@@ -74,6 +78,7 @@ impl JmapAccount {
         client: Client,
         mail: MailAccount,
         foreign_mail: HashMap<String, MailAccount>,
+        foreign_submission: HashSet<String>,
         submission: Option<MailAccount>,
         max_delayed_send: usize,
         vacation: Option<MailAccount>,
@@ -96,6 +101,7 @@ impl JmapAccount {
             client,
             mail,
             foreign_mail: Arc::new(foreign_mail),
+            foreign_submission: Arc::new(foreign_submission),
             submission,
             max_delayed_send,
             vacation,
@@ -567,6 +573,38 @@ impl Account for JmapAccount {
     }
 
     fn send_message(&self, request: SendRequest) -> AccountFuture<Result<ObjectId, AccountError>> {
+        if let Some(send_as) = request.send_as.as_ref() {
+            let id = send_as.mailbox().0.clone();
+            if let Err(err) = route_send_as(
+                send_as,
+                request.scheduled.is_some(),
+                self.foreign_mail.contains_key(&id),
+                self.foreign_submission.contains(&id),
+            ) {
+                return Box::pin(async move { Err(err) });
+            }
+            let mail = self
+                .foreign_mail
+                .get(&id)
+                .cloned()
+                .expect("route_send_as validated foreign_mail membership");
+            let self_address = self
+                .self_emails
+                .first()
+                .cloned()
+                .map(bifrost_types::Address::bare);
+            return pim::send_message(
+                mail,
+                Arc::clone(&self.email_states),
+                id,
+                0,
+                Some(pim::ForeignSubmission {
+                    mode: send_as.clone(),
+                    self_address,
+                }),
+                request,
+            );
+        }
         let Some(submission) = self.submission.clone() else {
             let err = super::error::unsupported_error(
                 AccountOperation::Send,
@@ -586,6 +624,7 @@ impl Account for JmapAccount {
             Arc::clone(&self.email_states),
             account_id,
             self.max_delayed_send,
+            None,
             request,
         )
     }
@@ -1121,16 +1160,92 @@ where
     }
 }
 
+/// Pure send-as routing decision. Returns `Ok(())` when the request may be
+/// dispatched to the foreign account named by `send_as`, or the boundary
+/// rejection otherwise. Precedence: scheduled foreign sends are refused
+/// first (their bare submission handles cannot be safely cancelled or
+/// rescheduled through the primary account); an id absent from the seeded
+/// routing table is a malformed request (the consumer got it from foreign
+/// membership ownership); a known-but-not-submission-capable id is
+/// unsupported.
+fn route_send_as(
+    send_as: &SendAs,
+    scheduled: bool,
+    known: bool,
+    submission_capable: bool,
+) -> Result<(), AccountError> {
+    if scheduled {
+        return Err(super::error::unsupported_error(
+            AccountOperation::Send,
+            None,
+            "scheduled foreign send is not supported",
+        ));
+    }
+    if !known {
+        return Err(super::error::send_as_unknown_account(send_as.mailbox()));
+    }
+    if !submission_capable {
+        return Err(super::error::unsupported_error(
+            AccountOperation::Send,
+            None,
+            "foreign account does not advertise submission",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
-    use bifrost_types::{CursorScope, MailboxId, MembershipScope, ObjectType, QueryId};
+    use bifrost_types::{
+        AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope, ObjectType,
+        QueryId, SendAs,
+    };
 
     use super::super::foreign;
     use super::{
         foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
+        route_send_as,
     };
+
+    fn as_shared() -> SendAs {
+        SendAs::As(MailboxId("foreign-id".to_string()))
+    }
+
+    #[test]
+    fn route_send_as_known_submission_capable_ok() {
+        assert!(route_send_as(&as_shared(), false, true, true).is_ok());
+    }
+
+    #[test]
+    fn route_send_as_scheduled_is_unsupported() {
+        let err = route_send_as(&as_shared(), true, true, true).expect_err("scheduled rejected");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+    }
+
+    #[test]
+    fn route_send_as_unknown_account_is_malformed() {
+        let err =
+            route_send_as(&as_shared(), false, false, false).expect_err("unknown id rejected");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+    }
+
+    #[test]
+    fn route_send_as_known_not_submission_capable_is_unsupported() {
+        let err =
+            route_send_as(&as_shared(), false, true, false).expect_err("no submission rejected");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::Send)
+        ));
+    }
 
     #[test]
     fn discover_emits_foreign_account_owner_membership() {

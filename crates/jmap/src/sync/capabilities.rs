@@ -61,6 +61,9 @@ pub(crate) struct PimSupport {
     /// `> 0` means the server accepts FUTURERELEASE hold parameters and
     /// gates `scheduled_send`.
     pub(crate) max_delayed_send: usize,
+    /// At least one successfully seeded foreign mail account also advertises
+    /// JMAP Submission, so native send-as routing is reachable.
+    pub(crate) foreign_submission: bool,
     pub(crate) vacation: bool,
     pub(crate) quota: bool,
     pub(crate) sieve: bool,
@@ -131,10 +134,7 @@ pub(crate) fn build(
             draft_discard: true,
             draft_send: support.submission,
             scheduled_send: support.submission && support.max_delayed_send > 0,
-            // JMAP foreign-accountId submission (send-on-behalf) is the
-            // A5a-scoped-out foreign-mutation follow-up, not yet wired; a
-            // `send_as` request is rejected at the boundary.
-            send_as: false,
+            send_as: support.foreign_submission,
             search: true,
             search_messages: true,
             containers_list: true,
@@ -242,6 +242,7 @@ mod tests {
             PimSupport {
                 submission: true,
                 max_delayed_send: 0,
+                foreign_submission: false,
                 vacation: true,
                 quota: true,
                 sieve: true,
@@ -309,6 +310,7 @@ mod tests {
             PimSupport {
                 submission: false,
                 max_delayed_send: 0,
+                foreign_submission: false,
                 vacation: false,
                 quota: false,
                 sieve: false,
@@ -356,6 +358,7 @@ mod tests {
         PimSupport {
             submission: true,
             max_delayed_send,
+            foreign_submission: false,
             vacation: false,
             quota: false,
             sieve: false,
@@ -377,6 +380,17 @@ mod tests {
             with_window.pim_methods.scheduled_send,
             "maxDelayedSend > 0 must enable scheduled_send"
         );
+    }
+
+    #[test]
+    fn send_as_capability_tracks_seeded_foreign_submission() {
+        let (unavailable, _) = build(&scheduled_session(), pim_support(0)).unwrap();
+        assert!(!unavailable.pim_methods.send_as);
+
+        let mut support = pim_support(0);
+        support.foreign_submission = true;
+        let (available, _) = build(&scheduled_session(), support).unwrap();
+        assert!(available.pim_methods.send_as);
     }
 
     #[test]
