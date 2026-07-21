@@ -109,13 +109,9 @@ impl GraphAccount {
         user_email: Option<String>,
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
-        let shared_clients = shared_mailboxes
-            .iter()
-            .map(|mailbox| (mailbox.clone(), client.for_shared_mailbox(mailbox.clone())))
-            .collect();
         Self {
+            shared_clients: Arc::new(shared_clients_map(&client, shared_mailboxes)),
             client,
-            shared_clients: Arc::new(shared_clients),
             capabilities: capabilities::build_capabilities(push_mode),
             push_endpoint,
             push_mode,
@@ -221,6 +217,7 @@ pub struct GraphAccountFactory {
     push_endpoint: Option<PushEndpoint>,
     shared_mailboxes: Vec<String>,
     public_folders: bool,
+    delegate_discovery: bool,
 }
 
 impl GraphAccountFactory {
@@ -232,6 +229,7 @@ impl GraphAccountFactory {
             push_endpoint: None,
             shared_mailboxes: Vec::new(),
             public_folders: false,
+            delegate_discovery: false,
         }
     }
 
@@ -250,11 +248,27 @@ impl GraphAccountFactory {
     /// Register a delegate/shared mailbox by its routing key (the SMTP
     /// address or user id Graph accepts at `/users/{id}`). The mailbox's
     /// folders are discovered, established, and synced alongside the
-    /// primary mailbox. Auto-discovery of delegated mailboxes is A5b
-    /// (Autodiscover/EWS); until then the consumer names them here.
+    /// primary mailbox. Manual registration is no longer the only path:
+    /// `with_delegate_discovery()` opt-in auto-enumerates delegates via
+    /// Exchange Autodiscover and merges them in additively.
     // pub: shared-mailbox consumers register foreign mailboxes before building the factory.
     pub fn with_shared_mailbox(mut self, mailbox: impl Into<String>) -> Self {
         self.shared_mailboxes.push(mailbox.into());
+        self
+    }
+
+    /// Opt in to Exchange Autodiscover delegate enumeration. Default off:
+    /// like `with_public_folders`, it costs Autodiscover round-trips at
+    /// `open`, so no existing Graph account pays for it uninvited. When
+    /// set, `open` queries the `alternativeMailboxes` Autodiscover
+    /// endpoint for the primary user's delegated mailboxes and seeds them
+    /// as foreign mailboxes ADDITIVELY to any `with_shared_mailbox`
+    /// entries (deduplicated by routing key). Discovery failure is
+    /// non-fatal: the account still opens with its config-supplied
+    /// mailboxes.
+    // pub: delegate-discovery consumers opt in before building the factory.
+    pub fn with_delegate_discovery(mut self) -> Self {
+        self.delegate_discovery = true;
         self
     }
 
@@ -285,6 +299,7 @@ impl AccountFactory for GraphAccountFactory {
         let push_endpoint = self.push_endpoint.clone();
         let shared_mailboxes = self.shared_mailboxes.clone();
         let public_folders = self.public_folders;
+        let delegate_discovery = self.delegate_discovery;
         Box::pin(async move {
             client.attach_account(account_id);
             let profile = client.get_profile().await.map_err(|e| {
@@ -296,14 +311,41 @@ impl AccountFactory for GraphAccountFactory {
                 )
             })?;
             let user_email = profile.mail.or(profile.user_principal_name);
-            let account = GraphAccount::new(
+            let mut account = GraphAccount::new(
                 client.clone(),
                 push_mode,
                 push_endpoint,
                 &shared_mailboxes,
                 public_folders,
-                user_email,
+                user_email.clone(),
             );
+
+            // Opt-in delegate enumeration: additive to config-supplied
+            // shared mailboxes, deduped by routing key. Autodiscover is a
+            // best-effort round-trip here - a failure (or the absence of a
+            // primary SMTP to query with) degrades to "no delegates
+            // found" and the account still opens with its configured
+            // mailboxes, rather than failing the whole open.
+            if delegate_discovery && let Some(email) = user_email.as_deref() {
+                match account.discover_shared_mailboxes(email).await {
+                    Ok(discovered) => {
+                        // Route the empty-discovery case through the same
+                        // helper as a non-empty one, so config-supplied
+                        // entries always get the empty-drop / dedup
+                        // normalization even when Autodiscover finds
+                        // nothing to add.
+                        let merged =
+                            autodiscover::merge_shared_mailboxes(&shared_mailboxes, &discovered);
+                        account.shared_clients = Arc::new(shared_clients_map(&client, &merged));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[Graph] delegate Autodiscover failed, opening with \
+                             config-supplied shared mailboxes only: {error:?}"
+                        );
+                    }
+                }
+            }
             let folders = client.list_mail_folders_recursive().await.map_err(|e| {
                 super::account::graph_error::into_account_error(
                     e,
@@ -975,6 +1017,18 @@ impl Account for GraphAccount {
             Ok(())
         })
     }
+}
+
+/// Build the `/users/{id}`-keyed foreign-mailbox client map from a list
+/// of routing keys (SMTP addresses or user ids). The map key is the
+/// exact string later looked up by `client_for_scope` / `client_for_owner`
+/// and minted into foreign scope/owner tags by `discover_cursor_scopes`,
+/// so seeding a key here is self-consistent with every routing site.
+fn shared_clients_map(client: &GraphClient, mailboxes: &[String]) -> HashMap<String, GraphClient> {
+    mailboxes
+        .iter()
+        .map(|mailbox| (mailbox.clone(), client.for_shared_mailbox(mailbox.clone())))
+        .collect()
 }
 
 fn sync_event_stream<T, F>(future: F) -> AccountStream<SyncEvent<T>>

@@ -51,8 +51,9 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
   watermark + throttled deletion-scan poll, inventory/changes streams,
   `EwsItem` -> entry/change projectors, hierarchy discovery driver.
 - `autodiscover.rs` - Exchange Autodiscover: `GetUserSettings`
-  (public-folder routing, content-mailbox SMTP) and the tested-but-
-  unwired `alternativeMailboxes` delegate parser, over `AccountNet`.
+  (public-folder routing, content-mailbox SMTP) and the
+  `alternativeMailboxes` delegate parser, wired into `open` via
+  `with_delegate_discovery()`, over `AccountNet`.
 
 `crates/graph/src/ews/`: `client.rs`
 (`EwsClient::execute(body, &EwsHeaders)`), `ops.rs` (`find_folder` /
@@ -318,12 +319,18 @@ quarantines just the foreign scope when the failure is
 primary scope (`owner == None`) stays terminal `NoPermission`. Wired at the
 `inventory_stream`/`changes_stream` per-scope fetch-failure boundary.
 
-Foreign-mailbox enumeration is config-supplied (`with_shared_mailbox`): Graph
-REST has no "list my delegated mailboxes" call. The Autodiscover
-`alternativeMailboxes` parser lands in `autodiscover.rs` (tested) but unwired -
-delegate enumeration into the foreign seeding is a named follow-up (`TODO.md`).
-The EWS twin `ews_shared_scope_error` applies the same `ScopeRevoked` ->
-`DisableScope` isolation to public-folder scopes.
+Foreign-mailbox enumeration is config-supplied (`with_shared_mailbox`) or,
+opt-in, Autodiscover-enumerated: Graph REST has no "list my delegated
+mailboxes" call, so `open` falls back to the EWS-era Autodiscover
+`alternativeMailboxes` response when `with_delegate_discovery()` is set
+(default off). `discover_shared_mailboxes` (`autodiscover.rs`) queries it for
+the primary user's SMTP; `merge_shared_mailboxes` combines the result with
+any `with_shared_mailbox` entries additively, empty-dropping and
+exact-string-deduping across the whole merged set (config first, discovered
+appended). Discovery is best-effort and non-fatal: malformed/truncated XML or
+a request failure degrades to the config-supplied mailboxes rather than
+failing `open`. The EWS twin `ews_shared_scope_error` applies the same
+`ScopeRevoked` -> `DisableScope` isolation to public-folder scopes.
 
 ## Public-folder discovery (Autodiscover)
 
@@ -531,11 +538,9 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
 - Discovery is mail-only (+ opt-in public folders); event/contact cursors
   are engine-constructed.
 - `scope_lifecycle_stream` is empty; folder creates/renames/deletes are
-  observed only at reopen. Live delegate enumeration (Autodiscover parser
-  landed, unwired) is a follow-up. Shared-mailbox routing is otherwise
-  complete: send-as (C-3), read paths and message mutations
-  (flag/move/destroy, drafts) all route to the owning mailbox via the
-  encoded message id.
+  observed only at reopen. Shared-mailbox routing is otherwise complete:
+  send-as (C-3), read paths and message mutations (flag/move/destroy,
+  drafts) all route to the owning mailbox via the encoded message id.
 - Public folders are poll-only (no push) and side-table-free: the deletion
   baseline rides in the cursor, capped at 10_000 items/folder (above:
   additions-only). `CalendarItem` and `Contact` public folders sync at

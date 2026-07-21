@@ -22,22 +22,21 @@ use super::graph_error::{GraphErrorContext, into_account_error, response_to_acco
 use crate::error::{GraphError, GraphResponseError};
 use crate::ews::push_general_ref;
 
-// The delegate (alternativeMailboxes) endpoint is the tested half of
-// the shared Autodiscover module; wiring delegate enumeration into A5a's
-// foreign-mailbox seeding is a named follow-up, so the entry point and
-// its parser land tested but unconsumed for now.
-#[allow(dead_code)]
 const AUTODISCOVER_URL: &str = "https://outlook.office365.com/autodiscover/autodiscover.xml";
 const AUTODISCOVER_SOAP_URL: &str = "https://outlook.office365.com/autodiscover/autodiscover.svc";
 
 /// A shared/delegate mailbox discovered via Exchange Autodiscover.
-/// Consumed once delegate auto-discovery wiring lands (named follow-up).
-#[allow(dead_code)]
+/// Routing keys on `smtp_address` alone; `display_name` and
+/// `mailbox_type` are parsed for wire fidelity (and asserted by the
+/// parser tests) but the seeding path deliberately does not filter on
+/// type, so they are unread in non-test builds.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedMailbox {
     pub(crate) smtp_address: String,
+    #[allow(dead_code)]
     pub(crate) display_name: Option<String>,
     /// E.g. "Delegate", "TeamMailbox", etc.
+    #[allow(dead_code)]
     pub(crate) mailbox_type: String,
 }
 
@@ -112,9 +111,16 @@ impl GraphAccount {
     }
 
     /// `alternativeMailboxes` Autodiscover XML -> delegate mailbox list.
-    /// Tested entry point; consumed once delegate auto-discovery wiring
-    /// into A5a's foreign seeding lands (named follow-up).
-    #[allow(dead_code)]
+    /// Consumed by delegate auto-discovery at `open` when the factory's
+    /// `with_delegate_discovery()` flag is set.
+    ///
+    /// Best-effort by design: `parse_alternative_mailboxes` treats
+    /// malformed or truncated XML as end-of-input rather than an error
+    /// (it is the shared quick-xml walking pattern used across this
+    /// module), so an HTTP-200 response with bad XML yields an empty or
+    /// partial mailbox list here, not an `Err`. That is non-fatal at the
+    /// call site: `open` degrades to the config-supplied mailboxes when
+    /// discovery comes back empty or fails outright.
     pub(crate) async fn discover_shared_mailboxes(
         &self,
         user_email: &str,
@@ -380,9 +386,34 @@ fn parse_user_settings_response(xml: &str) -> UserSettingsResponse {
     out
 }
 
+/// Merge config-supplied shared-mailbox routing keys with the
+/// Autodiscover-enumerated delegates into a single deduplicated list.
+/// Config entries come first and win ordering; every entry in the merged
+/// set (config first, discovered appended) is empty-dropped and deduped
+/// by exact string uniformly - a blank config entry seeds no client, and
+/// a delegate named both in config and by discovery (or discovered
+/// twice) is not seeded twice. Every discovered alternative mailbox is
+/// kept regardless of `mailbox_type` - the routing layer keys on the
+/// address alone.
+pub(crate) fn merge_shared_mailboxes(
+    config: &[String],
+    discovered: &[SharedMailbox],
+) -> Vec<String> {
+    let candidates = config.iter().cloned().chain(
+        discovered
+            .iter()
+            .map(|mailbox| mailbox.smtp_address.clone()),
+    );
+    let mut merged: Vec<String> = Vec::new();
+    for candidate in candidates {
+        if !candidate.is_empty() && !merged.iter().any(|existing| existing == &candidate) {
+            merged.push(candidate);
+        }
+    }
+    merged
+}
+
 /// Parse `AlternativeMailbox` elements from an Autodiscover XML response.
-/// Tested; consumed by the named delegate-enumeration follow-up.
-#[allow(dead_code)]
 fn parse_alternative_mailboxes(xml: &str) -> Vec<SharedMailbox> {
     let mut reader = Reader::from_str(xml);
     let mut mailboxes = Vec::new();
@@ -538,6 +569,90 @@ mod tests {
   </Response>
 </Autodiscover>"#;
         assert!(parse_alternative_mailboxes(xml).is_empty());
+    }
+
+    fn shared(smtp: &str, ty: &str) -> SharedMailbox {
+        SharedMailbox {
+            smtp_address: smtp.to_string(),
+            display_name: None,
+            mailbox_type: ty.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_appends_discovered_to_config() {
+        let config = vec!["configured@contoso.com".to_string()];
+        let discovered = vec![shared("sales@contoso.com", "Delegate")];
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(merged, vec!["configured@contoso.com", "sales@contoso.com"]);
+    }
+
+    #[test]
+    fn merge_dedups_overlap_keeping_config_order() {
+        let config = vec![
+            "shared@contoso.com".to_string(),
+            "eng@contoso.com".to_string(),
+        ];
+        // `shared@` is both config-supplied and discovered: it must not
+        // seed a second client. `sales@` is new and appends.
+        let discovered = vec![
+            shared("shared@contoso.com", "Delegate"),
+            shared("sales@contoso.com", "TeamMailbox"),
+        ];
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(
+            merged,
+            vec!["shared@contoso.com", "eng@contoso.com", "sales@contoso.com"]
+        );
+    }
+
+    #[test]
+    fn merge_ignores_empty_smtp_and_keeps_all_types() {
+        let config: Vec<String> = Vec::new();
+        // An empty smtp_address is dropped; a non-Delegate type is kept
+        // (no type filtering - the routing layer keys on the address).
+        let discovered = vec![
+            shared("", "Delegate"),
+            shared("team@contoso.com", "TeamMailbox"),
+        ];
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(merged, vec!["team@contoso.com"]);
+    }
+
+    #[test]
+    fn merge_drops_empty_config_entries() {
+        // A blank `with_shared_mailbox("")` entry must not seed a
+        // `/users/` client with an empty routing key.
+        let config = vec![
+            String::new(),
+            "configured@contoso.com".to_string(),
+            String::new(),
+        ];
+        let discovered: Vec<SharedMailbox> = Vec::new();
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(merged, vec!["configured@contoso.com"]);
+    }
+
+    #[test]
+    fn merge_dedups_repeated_config_entries() {
+        let config = vec![
+            "configured@contoso.com".to_string(),
+            "configured@contoso.com".to_string(),
+        ];
+        let discovered = vec![shared("sales@contoso.com", "Delegate")];
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(merged, vec!["configured@contoso.com", "sales@contoso.com"]);
+    }
+
+    #[test]
+    fn merge_dedups_repeated_discovered_entries() {
+        let config: Vec<String> = Vec::new();
+        let discovered = vec![
+            shared("dup@contoso.com", "Delegate"),
+            shared("dup@contoso.com", "Delegate"),
+        ];
+        let merged = merge_shared_mailboxes(&config, &discovered);
+        assert_eq!(merged, vec!["dup@contoso.com"]);
     }
 
     #[test]

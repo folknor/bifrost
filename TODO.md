@@ -149,12 +149,6 @@ re-auditors don't re-raise them.)
   `bifrost-sync`, and every account crate). Do not schedule A5b-1 until
   that lands. Nothing is broken today: the degraded additions-only mode is
   correct and covered by tests; this is a capability upgrade, not a fix.
-- **graph-A5b-2.** Wire delegate auto-discovery: the Autodiscover
-  `alternativeMailboxes` parser + `discover_shared_mailboxes` entry point
-  landed (tested) in `account/autodiscover.rs` but are unconsumed
-  (`#[allow(dead_code)]`). Wire delegate *enumeration* into A5a's
-  foreign-mailbox seeding (replacing config-supplied `with_shared_mailbox`)
-  and drop the allows. (A5b-scoped-out, named in the A5b spec.)
 - **graph-A5b-4.** The public-folder incremental poll uses
   `DateTimeReceived` as its change watermark (`advance_watermark` /
   `incremental_added_ids` in `account/public_folder.rs`). An in-place edit
