@@ -448,10 +448,22 @@ pub(crate) fn mailbox_owner_from_other_user_path(
 /// other/shared lists -> empty Vec (a plain personal-only server). A LIST
 /// under one prefix failing is non-fatal: log + skip that prefix, keep the
 /// others (a revoked prefix must not fail the whole open). When the server
-/// advertises ACL, each candidate folder is gated by MYRIGHTS: folders the
-/// user cannot read are dropped before registration (do not surface a
-/// scope you cannot SELECT). When ACL is not advertised, LIST visibility is
-/// taken to imply at least lookup, and a later SELECT surfaces any `NO`.
+/// advertises ACL, each candidate folder is probed with MYRIGHTS and the
+/// parsed set rides out on the entry. When ACL is not advertised, LIST
+/// visibility is taken to imply at least lookup, and a later SELECT
+/// surfaces any `NO`.
+///
+/// Every candidate under a non-personal prefix is RETURNED, including one
+/// whose rights do not grant read. Dropping the unreadable ones here was a
+/// silent demotion: RFC 2342 lets the personal `LIST "" "*"` echo the
+/// non-personal namespaces (and servers do), so a dropped candidate stayed
+/// in the registry as the bare personal entry that listing produced - no
+/// owner, no `Shared` namespace, no rights - and a consumer reading
+/// `containers_list` then treated a read-only share as a writable personal
+/// folder. The read decision is still honored, one layer down:
+/// `FolderEntry` marks such an entry UNSELECTABLE
+/// (`shared_folder_is_selectable`), so it surfaces as a correctly-typed,
+/// correctly-righted container without ever becoming a cursor scope.
 ///
 /// The parsed rights set is RETAINED on the returned entry (not just used
 /// as a gate) so `containers_list` can project it onto
@@ -528,20 +540,20 @@ pub(crate) async fn discover_shared_folders(
             });
             let mut rights = None;
             if acl && selectable {
-                // Pre-flight ACL gate: skip folders we cannot read. The
-                // rights gate is advisory; a per-folder MYRIGHTS failure is
-                // non-fatal (log + keep the folder; SELECT stays
+                // Pre-flight ACL probe. Advisory: it records what the
+                // server said, it does not decide membership of the shared
+                // set - a folder we cannot read is still a folder in this
+                // namespace, owned by this principal, and must reach the
+                // consumer with that identity rather than falling back to
+                // the personal listing's bare entry. A per-folder MYRIGHTS
+                // failure is non-fatal (log + keep the folder; SELECT stays
                 // authoritative).
                 match conn
                     .my_rights(info.name.as_str(), cfg.imap.command_timeout)
                     .await
                 {
                     Ok(wire) => {
-                        let parsed = MailboxRights::parse(&wire);
-                        if !parsed.can_read() {
-                            continue;
-                        }
-                        rights = Some(parsed);
+                        rights = Some(MailboxRights::parse(&wire));
                     }
                     Err(err) => {
                         tracing::debug!(

@@ -103,9 +103,8 @@ async fn partition_ews_ids(
     let mut ews = Vec::new();
     let mut rest = Vec::new();
     for id in ids {
-        match super::foreign::parse_message_id(id).public_folder() {
+        match super::pim::ews_read_folder(id) {
             Some(folder) => {
-                let folder = FolderId(folder.to_string());
                 if account.public_folder_routing(&folder).await.is_some() {
                     ews.push((id.clone(), folder));
                 } else {

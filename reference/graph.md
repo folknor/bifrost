@@ -544,6 +544,18 @@ Typed hydration is separate from `get_stream`: `message_hydrate` fetches one
 message at the requested projection into `Message`; `thread_hydrate` queries
 the conversation, sorted by date.
 
+`message_hydrate` makes the SAME transport decision the batch door makes
+(`pim::ews_read_folder`, the pure discriminator `partition_ews_ids` also uses):
+a public-folder id reads over EWS `GetItem` via `public_message_hydrate` +
+`message_from_ews_item`, everything else over Graph REST. Without that split
+the single-id door - the one a consumer reaches through the engine's hydration
+passthrough - stripped the id down to its native EWS `ItemId` and asked
+`/me/messages/{itemId}`, which 404s `ErrorItemNotFound` naming the bare item
+id. The EWS projection keeps the folder-qualified id, maps `BodyPreview` /
+HTML body onto `body_text` / `body_html`, tags the containing folder as the
+only container, and carries `Importance::Normal` and no `thread_id` (EWS's
+message shape reports neither).
+
 `move_thread` calls Graph move directly. `delete_thread` resolves Trash via
 `deletedItems` (Trash source destroys, else moves to Trash).
 `apply_label`/`remove_label` inherit the trait default (Graph provenance ->

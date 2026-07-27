@@ -5,8 +5,8 @@ use base64::Engine;
 use bifrost_types::{
     AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerContentClass,
     ContainerId, ContainerKind, ContainerNamespace, ContainerRights, DraftHandle, DraftPatch,
-    ErrorScope, FolderRole, HydrationProjection, Identity, IdentityId, Importance, LabelId,
-    MailboxId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
+    ErrorScope, FolderId, FolderRole, HydrationProjection, Identity, IdentityId, Importance,
+    LabelId, MailboxId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
     Provenance, SearchFilter, SearchRequest, SendAs, ThreadHydration, ThreadId, VacationConfig,
     Warning, WarningKind,
 };
@@ -995,9 +995,148 @@ pub(crate) async fn message_hydrate(
     message: ObjectId,
     projection: HydrationProjection,
 ) -> Result<Message, AccountError> {
+    // The single-id hydration door has to make the SAME transport decision
+    // the batch door (`get.rs::partition_ews_ids`) makes: a public-folder id
+    // wraps a raw EWS `ItemId`, and no Graph REST route can address one.
+    // Sending it down `/me/messages/{native}` 404s naming the bare item id,
+    // which is precisely what a consumer reaching hydration through the
+    // engine's passthrough saw.
+    if let Some(folder) = ews_read_folder(&message) {
+        return public_message_hydrate(&account, &message, &folder, projection).await;
+    }
     let value =
         fetch_message_value(&account, &message, hydrate_select(expand_blobs(projection))).await?;
     message_from_value(&value, projection)
+}
+
+/// The public folder a read of `id` must route through EWS `GetItem`, or
+/// `None` when the id reads over Graph REST (primary or shared-mailbox).
+///
+/// The transport decision lives in the id itself: `PUBLIC_SEP` is the
+/// discriminator, and the folder it carries is the `routing_map` key holding
+/// the item's `X-AnchorMailbox` / `X-PublicFolderMailbox` pair. Extracted so
+/// every door (batch hydrate, single hydrate, blob read) decides identically
+/// and the decision is unit-pinnable without a live server.
+pub(crate) fn ews_read_folder(id: &ObjectId) -> Option<FolderId> {
+    super::foreign::parse_message_id(id)
+        .public_folder()
+        .map(|folder| FolderId(folder.to_string()))
+}
+
+/// Hydrate one public-folder item over EWS `GetItem`, routed by its folder's
+/// `routing_map` headers - the single-id peer of `get.rs::fetch_ews_outcomes`.
+async fn public_message_hydrate(
+    account: &GraphAccount,
+    id: &ObjectId,
+    folder: &FolderId,
+    projection: HydrationProjection,
+) -> Result<Message, AccountError> {
+    let Some(routing) = account.public_folder_routing(folder).await else {
+        return Err(protocol_violation(
+            ProtocolErrorKind::MissingField,
+            AccountOperation::HydrateMessage,
+            Some(ErrorScope::Message { id: id.0.clone() }),
+            format!("public folder {} has no routing entry", folder.0),
+        ));
+    };
+    let Some(ews) = super::public_folder::ews_client(account) else {
+        return Err(super::graph_error::ews_error_to_account_error(
+            crate::ews::EwsError::Transport(bifrost_net::Error::Network {
+                message: "EWS account net not attached".to_string(),
+                transmission_state: bifrost_types::TransmissionState::Unsent,
+                source: None,
+            }),
+            GraphErrorContext::ews(AccountOperation::HydrateMessage)
+                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+        ));
+    };
+    let native = super::foreign::parse_message_id(id).native_id().to_string();
+    let item = ews
+        .get_item(&native, &routing.headers())
+        .await
+        .map_err(|error| {
+            super::graph_error::ews_error_to_account_error(
+                error,
+                GraphErrorContext::ews(AccountOperation::HydrateMessage)
+                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            )
+        })?;
+    Ok(message_from_ews_item(id.clone(), &item, folder, projection))
+}
+
+/// Project an EWS `GetItem` result into the user-facing `Message` shape.
+///
+/// EWS returns a parsed body, not MIME octets, so `body_html` carries the
+/// HTML part and `body_text` the `BodyPreview` text. Attachments ride out as
+/// EWS blob handles (`GetAttachment` fetches the bytes), and the containing
+/// public folder is the item's one membership. Pure over the already-fetched
+/// item so the projection is unit-pinnable without a live EWS server.
+fn message_from_ews_item(
+    id: ObjectId,
+    item: &crate::ews::EwsItem,
+    folder: &FolderId,
+    projection: HydrationProjection,
+) -> Message {
+    let (body_text, body_html) = match projection {
+        HydrationProjection::Headers => (None, None),
+        HydrationProjection::Preview(limit) => (
+            item.body_preview
+                .as_ref()
+                .map(|preview| preview.chars().take(limit).collect()),
+            None,
+        ),
+        _ => (item.body_preview.clone(), item.body_html.clone()),
+    };
+    let attachments = if expand_blobs(projection) {
+        item.attachments
+            .iter()
+            .map(|attachment| super::blob::blob_handle_from_ews_attachment(&id, attachment))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut flags = HashSet::new();
+    if item.is_read {
+        flags.insert("\\seen".to_string());
+    }
+    Message {
+        id,
+        // EWS `GetItem` on the message shape returns no conversation id,
+        // and a public item has no Graph conversation to join.
+        thread_id: None,
+        from: item
+            .sender_email
+            .iter()
+            .map(|address| Address {
+                name: item.sender_name.clone(),
+                address: address.clone(),
+            })
+            .collect(),
+        to: item.to_recipients.iter().map(ews_address).collect(),
+        cc: item.cc_recipients.iter().map(ews_address).collect(),
+        bcc: Vec::new(),
+        reply_to: Vec::new(),
+        subject: item.subject.clone(),
+        date: item.received_at.as_deref().and_then(parse_graph_datetime),
+        containers: vec![ContainerId(folder.0.clone())],
+        flags,
+        // EWS surfaces only the read bit on this shape; no importance field
+        // is requested, so every public item is Normal.
+        importance: Importance::Normal,
+        body_text,
+        body_html,
+        attachments,
+        size_bytes: None,
+        in_reply_to: None,
+        references: Vec::new(),
+    }
+}
+
+fn ews_address(recipient: &crate::ews::EwsRecipient) -> Address {
+    Address {
+        name: recipient.name.clone(),
+        address: recipient.email.clone(),
+    }
 }
 
 pub(crate) async fn move_thread(
@@ -2312,9 +2451,94 @@ mod tests {
 
     use super::*;
     use crate::account::PushMode;
-    use crate::account::foreign::{encode_foreign, encode_message_id};
+    use crate::account::foreign::{encode_foreign, encode_message_id, encode_public_item_id};
     use crate::client::GraphClient;
     use bifrost_types::{CursorScope, ObjectType};
+
+    // The single-id hydration door must reach the EWS arm for a public
+    // item. Before this, `message_hydrate` fell through to
+    // `/me/messages/{native}` and the server answered
+    // `ErrorItemNotFound` naming the BARE item id, even though the stored
+    // id was folder-qualified all along.
+    #[test]
+    fn public_item_id_selects_the_ews_read_arm() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let public = encode_public_item_id(&folder, "notice-1");
+        assert_eq!(ews_read_folder(&public), Some(folder));
+    }
+
+    #[test]
+    fn primary_and_foreign_ids_stay_on_the_rest_read_arm() {
+        assert_eq!(ews_read_folder(&ObjectId("notice-1".to_string())), None);
+        let foreign = encode_message_id(
+            &CursorScope::FolderType {
+                folder: encode_foreign("shared@contoso.com", "AAMkfolder"),
+                ty: ObjectType::Email,
+            },
+            "AAMkmsg",
+        );
+        assert_eq!(ews_read_folder(&foreign), None);
+    }
+
+    fn ews_item() -> crate::ews::EwsItem {
+        crate::ews::EwsItem {
+            item_id: "notice-1".to_string(),
+            change_key: Some("CK1".to_string()),
+            subject: Some("Notice".to_string()),
+            sender_email: Some("poster@contoso.com".to_string()),
+            sender_name: Some("Poster".to_string()),
+            received_at: Some("2026-01-02T03:04:05Z".to_string()),
+            body_preview: Some("preview text".to_string()),
+            body_html: Some("<p>preview text</p>".to_string()),
+            is_read: true,
+            item_class: "IPM.Note".to_string(),
+            to_recipients: vec![crate::ews::EwsRecipient {
+                email: "reader@contoso.com".to_string(),
+                name: Some("Reader".to_string()),
+            }],
+            cc_recipients: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    // The EWS projection keeps the folder-qualified id the consumer
+    // stored, so a hydrated public item still round-trips back through
+    // the EWS arm on the next read.
+    #[test]
+    fn ews_item_projects_to_message_keyed_by_the_qualified_id() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let id = encode_public_item_id(&folder, "notice-1");
+        let message = message_from_ews_item(
+            id.clone(),
+            &ews_item(),
+            &folder,
+            HydrationProjection::Full,
+        );
+        assert_eq!(message.id, id);
+        assert_eq!(ews_read_folder(&message.id), Some(folder.clone()));
+        assert_eq!(message.subject.as_deref(), Some("Notice"));
+        assert_eq!(message.from.len(), 1);
+        assert_eq!(message.from[0].address, "poster@contoso.com");
+        assert_eq!(message.to[0].address, "reader@contoso.com");
+        assert_eq!(message.body_html.as_deref(), Some("<p>preview text</p>"));
+        assert_eq!(message.body_text.as_deref(), Some("preview text"));
+        assert_eq!(message.containers, vec![ContainerId(folder.0)]);
+        assert!(message.flags.contains("\\seen"));
+        assert!(message.date.is_some());
+    }
+
+    #[test]
+    fn ews_headers_projection_drops_the_body() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let message = message_from_ews_item(
+            encode_public_item_id(&folder, "notice-1"),
+            &ews_item(),
+            &folder,
+            HydrationProjection::Headers,
+        );
+        assert!(message.body_text.is_none());
+        assert!(message.body_html.is_none());
+    }
 
     fn shared_account() -> GraphAccount {
         GraphAccount::new_for_tests_with_shared(

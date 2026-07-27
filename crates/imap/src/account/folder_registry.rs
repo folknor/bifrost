@@ -139,12 +139,13 @@ impl FolderEntry {
         shared_owner: Option<bifrost_types::MailboxId>,
         rights: Option<crate::types::MailboxRights>,
     ) -> Self {
-        let selectable = !info.attributes.iter().any(|attr| {
+        let listed_selectable = !info.attributes.iter().any(|attr| {
             matches!(
                 attr,
                 MailboxAttribute::NoSelect | MailboxAttribute::NonExistent
             )
         });
+        let selectable = shared_folder_is_selectable(listed_selectable, rights.as_ref());
         Self {
             name: info.name,
             selectable,
@@ -280,6 +281,32 @@ pub(crate) struct SharedFolderEntry {
 /// Pure so the precedence rule is unit-pinnable without a live server.
 pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> bool {
     !namespace_prefix.is_empty() && name.starts_with(namespace_prefix)
+}
+
+/// Whether a folder may be SELECTed, given LIST's own selectability
+/// (`\Noselect` / `\NonExistent`) and the MYRIGHTS set discovery captured.
+///
+/// This is where the RFC 4314 read decision lands. Shared-folder discovery
+/// used to enforce it by DROPPING an unreadable candidate from the shared
+/// set, which silently demoted it: the personal `LIST "" "*"` is free to
+/// echo the non-personal namespaces (RFC 2342), so the dropped path stayed
+/// registered as that listing's bare entry, with no owner, no `Shared`
+/// namespace, and no rights - a read-only share presenting as a writable
+/// personal folder. Keeping the entry and clearing `selectable` instead
+/// preserves the identity (owner, namespace, rights reach
+/// `containers_list`) while still keeping the folder out of
+/// `discover_cursor_scopes`, which filters on exactly this flag: no cursor
+/// scope is created for a mailbox we cannot SELECT.
+///
+/// `None` rights means unreported (personal folder, no ACL capability, or a
+/// MYRIGHTS failure that deferred to SELECT) and never gates.
+///
+/// Pure so the selectability decision is unit-pinnable without a server.
+pub(crate) fn shared_folder_is_selectable(
+    listed_selectable: bool,
+    rights: Option<&crate::types::MailboxRights>,
+) -> bool {
+    listed_selectable && rights.is_none_or(crate::types::MailboxRights::can_read)
 }
 
 #[derive(Default)]
@@ -655,6 +682,104 @@ mod tests {
             Some(crate::types::MailboxRights::parse("lr")),
             "the MYRIGHTS set must survive the personal-LIST overlap"
         );
+    }
+
+    // The exact downstream shape: ONE grantee shares TWO folders under ONE
+    // other-users prefix, one writable and one read-only, and the personal
+    // LIST echoes both (RFC 2342). Earlier tests fed disjoint lists, so the
+    // asymmetry never showed: discovery dropped the unreadable candidate,
+    // the personal echo stayed, and the read-only share arrived at the
+    // consumer as a writable PERSONAL folder. Both must carry owner,
+    // namespace and rights; only the rights may differ.
+    #[test]
+    fn writable_and_read_only_shares_under_one_prefix_both_keep_owner_and_rights() {
+        let writable = MailboxName::new("Shared/alice/Reports").expect("valid mailbox");
+        let read_only = MailboxName::new("Shared/alice/Read Only").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            vec![
+                MailboxInfo {
+                    name: writable.clone(),
+                    ..Default::default()
+                },
+                MailboxInfo {
+                    name: read_only.clone(),
+                    ..Default::default()
+                },
+            ],
+            vec![
+                shared_entry_under(&writable, Some("lrswipkxte"), "Shared/"),
+                shared_entry_under(&read_only, Some("lr"), "Shared/"),
+            ],
+        );
+
+        let alice = Some(bifrost_types::MailboxId("alice".to_owned()));
+        let w = registry.get(&writable).expect("writable entry");
+        let r = registry.get(&read_only).expect("read-only entry");
+        assert_eq!(w.shared_owner, alice);
+        assert_eq!(
+            r.shared_owner, alice,
+            "a read-only share must carry the same owner as its writable sibling"
+        );
+        assert_eq!(
+            w.rights,
+            Some(crate::types::MailboxRights::parse("lrswipkxte"))
+        );
+        assert_eq!(
+            r.rights,
+            Some(crate::types::MailboxRights::parse("lr")),
+            "the read-only rights set must reach the registry, not be discarded"
+        );
+        // Both are readable, so both stay selectable: rights are the ONLY
+        // difference between the two entries.
+        assert!(w.selectable);
+        assert!(r.selectable);
+    }
+
+    // A share the grantee cannot read keeps its shared identity (so it can
+    // never be mistaken for a personal folder) but is withheld from cursor
+    // scoping, which filters on `selectable`.
+    #[test]
+    fn unreadable_share_stays_shared_but_unselectable() {
+        let path = MailboxName::new("Shared/alice/No Read").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            vec![MailboxInfo {
+                name: path.clone(),
+                ..Default::default()
+            }],
+            vec![shared_entry_under(&path, Some("l"), "Shared/")],
+        );
+
+        let entry = registry.get(&path).expect("entry present");
+        assert_eq!(
+            entry.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned()))
+        );
+        assert_eq!(entry.rights, Some(crate::types::MailboxRights::parse("l")));
+        assert!(
+            !entry.selectable,
+            "an unreadable share must not become a cursor scope"
+        );
+    }
+
+    #[test]
+    fn selectability_gates_on_rights_only_when_rights_were_reported() {
+        // Unreported rights never gate (personal folder, or no ACL).
+        assert!(shared_folder_is_selectable(true, None));
+        // `\Noselect` still wins regardless of rights.
+        assert!(!shared_folder_is_selectable(
+            false,
+            Some(&crate::types::MailboxRights::parse("lrswipkxte"))
+        ));
+        // Read-only (`lr`) is selectable: `l`+`r` is the SELECT/FETCH pair.
+        assert!(shared_folder_is_selectable(
+            true,
+            Some(&crate::types::MailboxRights::parse("lr"))
+        ));
+        // Lookup without read is visible but not selectable.
+        assert!(!shared_folder_is_selectable(
+            true,
+            Some(&crate::types::MailboxRights::parse("l"))
+        ));
     }
 
     #[test]
