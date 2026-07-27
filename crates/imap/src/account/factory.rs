@@ -489,12 +489,16 @@ pub(crate) async fn discover_shared_folders(
             continue;
         }
         let shared_owner = mailbox_owner_for(&descriptor.prefix, descriptor.delimiter);
-        // LIST everything under this prefix. `LIST "<prefix>" "*"` enumerates
-        // the namespace's folders.
-        let listed = match conn
-            .list(&descriptor.prefix, "*", cfg.imap.command_timeout)
-            .await
-        {
+        // LIST everything under this prefix. The pattern - NOT the
+        // reference - carries the namespace root: `LIST "" "<prefix>*"`.
+        // RFC 3501 6.3.8 leaves reference/pattern concatenation
+        // implementation-defined, and servers that ignore the reference
+        // answer `LIST "<prefix>" "*"` with the PERSONAL namespace. That
+        // silently re-registers personal folders as shared candidates and
+        // yields zero real shared folders, so the interoperable form is
+        // the one that names the prefix inside the pattern.
+        let pattern = format!("{}*", descriptor.prefix);
+        let listed = match conn.list("", &pattern, cfg.imap.command_timeout).await {
             Ok(folders) => folders,
             Err(err) => {
                 tracing::debug!(
