@@ -96,6 +96,7 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             // Gmail's read-receipt model is read-only.
             mdn_sent_via_keyword: false,
         },
+        foreign_namespaces_advertised: false,
     }
 }
 

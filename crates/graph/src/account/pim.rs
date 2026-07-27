@@ -2508,12 +2508,8 @@ mod tests {
     fn ews_item_projects_to_message_keyed_by_the_qualified_id() {
         let folder = FolderId("AAMkPF=".to_string());
         let id = encode_public_item_id(&folder, "notice-1");
-        let message = message_from_ews_item(
-            id.clone(),
-            &ews_item(),
-            &folder,
-            HydrationProjection::Full,
-        );
+        let message =
+            message_from_ews_item(id.clone(), &ews_item(), &folder, HydrationProjection::Full);
         assert_eq!(message.id, id);
         assert_eq!(ews_read_folder(&message.id), Some(folder.clone()));
         assert_eq!(message.subject.as_deref(), Some("Notice"));

@@ -75,6 +75,7 @@ fn caps() -> AccountCapabilities {
         pim_methods: PimMethodSupport::default(),
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
+        foreign_namespaces_advertised: false,
     }
 }
 

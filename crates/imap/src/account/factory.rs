@@ -153,6 +153,8 @@ impl AccountFactory for ImapAccountFactory {
             // (A5c). A NAMESPACE-less or personal-only server yields an
             // empty list; a single revoked prefix is skipped, not fatal.
             let shared = discover_shared_folders(&conn, &cfg, &profile).await;
+            let foreign_namespaces_advertised = shared.foreign_namespaces_advertised;
+            let shared = shared.entries;
             // Fail-soft: a DAV open failure degrades to IMAP-only for
             // this cycle instead of failing the whole IMAP account.
             let mut dav_degraded = Vec::new();
@@ -170,6 +172,7 @@ impl AccountFactory for ImapAccountFactory {
                 contacts.as_ref().map(|c| c.capabilities()),
                 calendars.as_ref().map(|c| c.capabilities()),
                 submission.is_some(),
+                foreign_namespaces_advertised,
             );
             let registry = Arc::new(FolderRegistry::from_lists(folders, shared));
             let data_cap = cfg.pool_cap.saturating_sub(1).max(1);
@@ -442,10 +445,35 @@ pub(crate) fn mailbox_owner_from_other_user_path(
     }
 }
 
+/// Result of the open-time shared-folder discovery: the shared folders
+/// themselves plus whether the server advertised any foreign (other-user
+/// or shared) namespace root at all. The flag is deliberately independent
+/// of `entries` being empty: a grantless viewer on a sharing-capable
+/// server has zero entries today but a post-open ACL grant CAN surface
+/// folders later, which is exactly what a consumer-side rediscovery
+/// reattach exists to observe. On a personal-only server the flag is
+/// `false` and such a reattach can never surface anything.
+pub(crate) struct SharedDiscovery {
+    pub(crate) entries: Vec<super::folder_registry::SharedFolderEntry>,
+    pub(crate) foreign_namespaces_advertised: bool,
+}
+
+/// Pure decision: does a NAMESPACE response advertise any non-empty
+/// foreign (other-user or shared) namespace root? Split out of
+/// `discover_shared_folders` so the flag's semantics are pinned by unit
+/// tests rather than living inline in wire-driven code.
+pub(crate) fn namespaces_advertise_foreign(namespaces: &crate::types::NamespaceResponse) -> bool {
+    namespaces
+        .other
+        .iter()
+        .chain(namespaces.shared.iter())
+        .any(|descriptor| !descriptor.prefix.is_empty())
+}
+
 /// Issue NAMESPACE (when advertised / rev2) and LIST each non-empty
 /// `other` and `shared` namespace prefix. Returns the discovered shared
 /// folders tagged with their owning mailbox. NAMESPACE absent or empty
-/// other/shared lists -> empty Vec (a plain personal-only server). A LIST
+/// other/shared lists -> empty entry Vec (a plain personal-only server). A LIST
 /// under one prefix failing is non-fatal: log + skip that prefix, keep the
 /// others (a revoked prefix must not fail the whole open). When the server
 /// advertises ACL, each candidate folder is probed with MYRIGHTS and the
@@ -473,17 +501,24 @@ pub(crate) async fn discover_shared_folders(
     conn: &crate::ImapConnection,
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
-) -> Vec<super::folder_registry::SharedFolderEntry> {
+) -> SharedDiscovery {
     if !profile.supports(Capability::Namespace) && !profile.imap4rev2 {
-        return Vec::new();
+        return SharedDiscovery {
+            entries: Vec::new(),
+            foreign_namespaces_advertised: false,
+        };
     }
     let namespaces = match conn.namespace(cfg.imap.command_timeout).await {
         Ok(ns) => ns,
         Err(err) => {
             tracing::debug!(error = %err, "NAMESPACE failed; treating as personal-only");
-            return Vec::new();
+            return SharedDiscovery {
+                entries: Vec::new(),
+                foreign_namespaces_advertised: false,
+            };
         }
     };
+    let foreign_namespaces_advertised = namespaces_advertise_foreign(&namespaces);
     let acl = profile.supports(Capability::Acl);
     let mut out = Vec::new();
     // Other-user and shared namespaces are both non-personal, but their
@@ -572,7 +607,10 @@ pub(crate) async fn discover_shared_folders(
             });
         }
     }
-    out
+    SharedDiscovery {
+        entries: out,
+        foreign_namespaces_advertised,
+    }
 }
 
 pub(crate) async fn list_folders(
@@ -672,6 +710,49 @@ mod tests {
             mailbox_owner_from_other_user_path("Other/dave/INBOX", "Other", Some('/')),
             bifrost_types::MailboxId("dave".to_owned())
         );
+    }
+
+    #[test]
+    fn foreign_namespace_advertisement_requires_a_non_empty_foreign_prefix() {
+        use crate::types::{NamespaceDescriptor, NamespaceResponse};
+
+        let personal_only = NamespaceResponse {
+            personal: vec![NamespaceDescriptor {
+                prefix: String::new(),
+                delimiter: Some('/'),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!namespaces_advertise_foreign(&personal_only));
+
+        // An empty-prefix foreign descriptor is a degenerate advertisement
+        // (nothing distinct to LIST under) and must not count.
+        let empty_prefix_other = NamespaceResponse {
+            other: vec![NamespaceDescriptor::default()],
+            ..Default::default()
+        };
+        assert!(!namespaces_advertise_foreign(&empty_prefix_other));
+
+        let other_user = NamespaceResponse {
+            other: vec![NamespaceDescriptor {
+                prefix: "#user/".to_string(),
+                delimiter: Some('/'),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(namespaces_advertise_foreign(&other_user));
+
+        let shared_root = NamespaceResponse {
+            shared: vec![NamespaceDescriptor {
+                prefix: "#shared.".to_string(),
+                delimiter: Some('.'),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(namespaces_advertise_foreign(&shared_root));
     }
 
     #[test]

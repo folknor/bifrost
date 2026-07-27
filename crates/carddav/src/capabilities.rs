@@ -37,6 +37,7 @@ pub(crate) fn carddav_capabilities() -> AccountCapabilities {
         },
         filter_rule_shape: FilterRuleShape::None,
         conveniences: ConvenienceShape::default(),
+        foreign_namespaces_advertised: false,
     }
 }
 

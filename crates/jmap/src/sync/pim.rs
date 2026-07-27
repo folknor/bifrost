@@ -1201,7 +1201,10 @@ pub(crate) fn message_hydrate(
             super::hydrate::HydrationRoute::Foreign(account) => Some(account),
             super::hydrate::HydrationRoute::Primary => None,
         };
-        let mail = match owner.as_deref().and_then(|account| foreign_mail.get(account)) {
+        let mail = match owner
+            .as_deref()
+            .and_then(|account| foreign_mail.get(account))
+        {
             Some(handle) => handle.clone(),
             None => mail,
         };

@@ -15,6 +15,7 @@ pub(crate) fn build_capabilities(
     contacts: Option<&AccountCapabilities>,
     calendars: Option<&AccountCapabilities>,
     submission_configured: bool,
+    foreign_namespaces_advertised: bool,
 ) -> AccountCapabilities {
     // Copy only the contact / calendar field subsets from the
     // sub-accounts' real capability snapshots; an absent sub-account
@@ -137,6 +138,11 @@ pub(crate) fn build_capabilities(
             forwarded_via_extended_property: false,
             mdn_sent_via_keyword: true,
         },
+        // From the open-time NAMESPACE response: IMAP discovers shared /
+        // other-user folders only at open (no scope-lifecycle events), so
+        // the consumer needs to know whether a rediscovery reattach can
+        // ever surface anything on this server.
+        foreign_namespaces_advertised,
     }
 }
 
@@ -150,7 +156,7 @@ mod tests {
             vec![Capability::Idle, Capability::Condstore, Capability::Quota],
             Vec::new(),
         );
-        let caps = build_capabilities(&profile, &[], false, None, None, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false, false);
         assert_eq!(caps.cursor_freshness, CursorFreshness::Hybrid);
         assert_eq!(caps.blob_range, BlobRangeSupport::Yes);
         assert_eq!(caps.push, PushCapability::InProcess);
@@ -175,14 +181,14 @@ mod tests {
     #[test]
     fn capability_builder_leaves_mutation_concurrency_none_without_condstore() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], false, None, None, false);
+        let caps = build_capabilities(&profile, &[], false, None, None, false, false);
         assert_eq!(caps.mutation.concurrency, MutationConcurrency::None);
     }
 
     #[test]
     fn capability_builder_advertises_sieve_when_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let caps = build_capabilities(&profile, &[], true, None, None, false);
+        let caps = build_capabilities(&profile, &[], true, None, None, false, false);
         assert_eq!(caps.filter_rule_shape, FilterRuleShape::Scripts);
         assert!(caps.pim_methods.filters_list);
         assert!(caps.pim_methods.filter_create);
@@ -210,7 +216,7 @@ mod tests {
     fn capability_builder_advertises_contacts_when_carddav_configured() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
         let sub = contacts_snapshot();
-        let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false);
+        let caps = build_capabilities(&profile, &[], false, Some(&sub), None, false, false);
         assert!(caps.pim_methods.address_books_list);
         assert!(caps.pim_methods.contacts_list);
         assert!(caps.pim_methods.contact_get);
@@ -236,7 +242,7 @@ mod tests {
         calendars.pim_methods.event_get = true;
         calendars.pim_methods.event_rsvp = false; // unsupported by this provider
 
-        let caps = build_capabilities(&profile, &[], false, None, Some(&calendars), false);
+        let caps = build_capabilities(&profile, &[], false, None, Some(&calendars), false, false);
         assert!(caps.pim_methods.calendars_list);
         assert!(caps.pim_methods.event_get);
         assert!(
@@ -252,15 +258,24 @@ mod tests {
     fn capabilities_send_flag_tracks_submission() {
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
 
-        let without = build_capabilities(&profile, &[], false, None, None, false);
+        let without = build_capabilities(&profile, &[], false, None, None, false, false);
         assert!(!without.pim_methods.send_message);
         assert!(!without.pim_methods.draft_send);
 
-        let with = build_capabilities(&profile, &[], false, None, None, true);
+        let with = build_capabilities(&profile, &[], false, None, None, true, false);
         assert!(with.pim_methods.send_message);
         assert!(with.pim_methods.draft_send);
         // Submission does not turn on uploaded-attachment support (A6).
         assert!(!with.pim_methods.attachment_upload);
+    }
+
+    #[test]
+    fn foreign_namespace_flag_flows_through_verbatim() {
+        let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
+        let without = build_capabilities(&profile, &[], false, None, None, false, false);
+        assert!(!without.foreign_namespaces_advertised);
+        let with = build_capabilities(&profile, &[], false, None, None, false, true);
+        assert!(with.foreign_namespaces_advertised);
     }
 
     #[test]
@@ -270,7 +285,7 @@ mod tests {
         // `false` even when submission is configured; support is decided
         // at send time by the smtp boundary.
         let profile = ServerProfile::new(vec![Capability::Idle], Vec::new());
-        let with_submission = build_capabilities(&profile, &[], false, None, None, true);
+        let with_submission = build_capabilities(&profile, &[], false, None, None, true, false);
         assert!(!with_submission.pim_methods.scheduled_send);
     }
 }

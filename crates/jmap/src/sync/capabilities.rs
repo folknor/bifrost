@@ -187,6 +187,9 @@ pub(crate) fn build(
             forwarded_via_extended_property: false,
             mdn_sent_via_keyword: true,
         },
+        // JMAP foreign accounts arrive through the session resource, a
+        // per-request surface, not an open-time namespace discovery.
+        foreign_namespaces_advertised: false,
     };
 
     let limits = CoreLimits {

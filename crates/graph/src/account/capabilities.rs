@@ -103,6 +103,10 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             // read-only; mark_mdn_sent surfaces Unsupported(UpdateFlags).
             mdn_sent_via_keyword: false,
         },
+        // Graph's foreign surfaces (delegate mailboxes, public-folder
+        // pins) are configuration-driven, not open-time namespace
+        // discovery, so a consumer-side rediscovery reattach buys nothing.
+        foreign_namespaces_advertised: false,
     }
 }
 

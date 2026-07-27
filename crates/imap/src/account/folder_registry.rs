@@ -824,7 +824,10 @@ mod tests {
             },
         ]);
 
-        assert!(registry.get(&created).is_some(), "new personal folder lands");
+        assert!(
+            registry.get(&created).is_some(),
+            "new personal folder lands"
+        );
         let retained = registry.get(&shared).expect("shared entry retained");
         assert_eq!(
             retained.shared_owner,

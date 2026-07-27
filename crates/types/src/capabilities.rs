@@ -349,6 +349,18 @@ pub struct AccountCapabilities {
     /// convenience layer pick the right primitive without matching
     /// on `ProtocolKind`.
     pub conveniences: ConvenienceShape,
+    /// True iff the server advertises foreign (other-user / shared)
+    /// namespaces whose folder set is discovered ONLY at account open.
+    /// IMAP sets this from the open-time NAMESPACE response: the account
+    /// emits no scope-lifecycle events, so a share granted after open
+    /// becomes visible only when the consumer re-opens the account.
+    /// Consumers use this flag to decide whether such a rediscovery
+    /// reattach is ever worth its wire cost; on a personal-only server
+    /// (`false`) a grant can never surface and the reattach is pure
+    /// waste. `false` on every other provider: their foreign surfaces
+    /// (Graph delegates / public-folder pins, JMAP session accounts)
+    /// are configuration-driven, not open-time wire discovery.
+    pub foreign_namespaces_advertised: bool,
 }
 
 impl AccountCapabilities {
