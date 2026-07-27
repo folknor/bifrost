@@ -163,6 +163,7 @@ fn foreign_email_inventory(
                 // A5c-established owner-tag pattern).
                 if let Some(owner) = &owner {
                     qualify_foreign_memberships(&mut entry.memberships, owner);
+                    qualify_foreign_ids(&mut entry, owner);
                 }
                 items.push(entry);
             }
@@ -226,6 +227,22 @@ fn qualify_foreign_memberships(memberships: &mut Vec<MembershipScope>, owner: &T
         }
     }
     memberships.push(MembershipScope::Mailbox(owner.clone()));
+}
+
+/// Qualify a foreign inventory item's OBJECT ids with its owning account.
+///
+/// `Email/get` and blob download are accountId-scoped, but `get_stream` /
+/// `open_blob` receive only an id - no scope - so a bare native id would
+/// route hydration and blob reads through the PRIMARY account and fail (or
+/// silently resolve a same-id primary object). Encoding the owning
+/// accountId into both the object id and the whole-message `blobId` is what
+/// makes those reads self-routing, exactly as the folder codec makes the
+/// cursor scope self-routing on a cold resume.
+fn qualify_foreign_ids(entry: &mut InventoryEntry, owner: &TypesMailboxId) {
+    entry.id = ObjectId(super::foreign::encode_object(&owner.0, &entry.id.0));
+    if let Some(blob) = entry.blob_id.take() {
+        entry.blob_id = Some(BlobId(super::foreign::encode_object(&owner.0, &blob.0)));
+    }
 }
 
 fn email_inventory(
@@ -724,5 +741,37 @@ mod tests {
         assert!(memberships.contains(&MembershipScope::Mailbox(owner.clone())));
         // Two native memberships qualified + one owner tag.
         assert_eq!(memberships.len(), 3);
+    }
+
+    #[test]
+    fn foreign_object_and_blob_ids_are_qualified_with_owner_account() {
+        let owner = TypesMailboxId("acct-9".to_string());
+        let mut entry = InventoryEntry {
+            id: ObjectId("M1".to_string()),
+            memberships: Vec::new(),
+            size: Some(10),
+            blob_id: Some(BlobId("B1".to_string())),
+            fingerprint: Fingerprint {
+                server_version: ServerVersion::StateAt("s1".to_string()),
+                size: Some(10),
+                flags_hash: 0,
+            },
+            thread_id: None,
+            message_id: None,
+            references: Vec::new(),
+            in_reply_to: None,
+        };
+        qualify_foreign_ids(&mut entry, &owner);
+
+        // Both ids carry the owning account so hydration / blob reads route
+        // there instead of the primary account.
+        assert_eq!(
+            entry.id.0,
+            super::super::foreign::encode_object("acct-9", "M1")
+        );
+        assert_eq!(super::super::foreign::native_object(&entry.id.0), "M1");
+        let blob = entry.blob_id.expect("blob id present");
+        assert_eq!(blob.0, super::super::foreign::encode_object("acct-9", "B1"));
+        assert_eq!(super::super::foreign::native_object(&blob.0), "B1");
     }
 }

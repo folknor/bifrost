@@ -104,6 +104,13 @@ pub(crate) struct FolderEntry {
     /// folders. Drives `MembershipScope::Mailbox` tagging and
     /// `ErrorScope::Mailbox` scoping on revocation.
     pub(crate) shared_owner: Option<bifrost_types::MailboxId>,
+    /// The MYRIGHTS rights set observed for this folder at discovery, when
+    /// the server advertises ACL and answered. `None` means "not
+    /// reported" (no ACL capability, MYRIGHTS failed, or a personal folder
+    /// we never probed) - distinct from an explicit empty rights set.
+    /// Projected onto `Container::rights` by `containers_list`; the
+    /// authoritative per-operation gate is still the live `NO [ACL]`.
+    pub(crate) rights: Option<crate::types::MailboxRights>,
     cursor: RwLock<Option<FolderCursor>>,
     modseq_by_uid: RwLock<ModSeqCache>,
     last_seen: Mutex<Option<Instant>>,
@@ -124,6 +131,14 @@ impl FolderEntry {
         info: MailboxInfo,
         shared_owner: Option<bifrost_types::MailboxId>,
     ) -> Self {
+        Self::from_mailbox_with_owner_rights(info, shared_owner, None)
+    }
+
+    pub(crate) fn from_mailbox_with_owner_rights(
+        info: MailboxInfo,
+        shared_owner: Option<bifrost_types::MailboxId>,
+        rights: Option<crate::types::MailboxRights>,
+    ) -> Self {
         let selectable = !info.attributes.iter().any(|attr| {
             matches!(
                 attr,
@@ -136,6 +151,7 @@ impl FolderEntry {
             delimiter: info.delimiter,
             attributes: info.attributes,
             shared_owner,
+            rights,
             cursor: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
@@ -223,6 +239,25 @@ impl FolderEntry {
     }
 }
 
+/// One shared/other-user folder discovered under a non-personal
+/// namespace, carrying its owning mailbox identity (for membership tagging
+/// and scoped recovery) plus the MYRIGHTS rights set observed at
+/// discovery, when the server reported one.
+pub(crate) struct SharedFolderEntry {
+    pub(crate) info: MailboxInfo,
+    /// The owning mailbox. For an other-user namespace (root `#user/`),
+    /// this is the per-principal segment that follows the root in each
+    /// folder's own path - `#user/alice/INBOX` -> `MailboxId("alice")` -
+    /// so distinct users get distinct owners. For a shared namespace
+    /// (root `#shared.`), all folders share one owner, the root minus its
+    /// trailing delimiter -> `MailboxId("#shared")`.
+    pub(crate) owner: bifrost_types::MailboxId,
+    /// The parsed MYRIGHTS set, or `None` when the server did not report
+    /// one (no ACL capability, or MYRIGHTS failed and discovery deferred
+    /// to SELECT).
+    pub(crate) rights: Option<crate::types::MailboxRights>,
+}
+
 #[derive(Default)]
 pub(crate) struct FolderRegistry {
     by_name: RwLock<HashMap<String, Arc<FolderEntry>>>,
@@ -240,10 +275,7 @@ impl FolderRegistry {
     /// Personal entries carry `shared_owner: None`; each shared entry
     /// carries `Some(owner)` so membership tagging and scoped revocation
     /// can route on the owning mailbox.
-    pub(crate) fn from_lists(
-        personal: Vec<MailboxInfo>,
-        shared: Vec<(MailboxInfo, bifrost_types::MailboxId)>,
-    ) -> Self {
+    pub(crate) fn from_lists(personal: Vec<MailboxInfo>, shared: Vec<SharedFolderEntry>) -> Self {
         let registry = Self::default();
         registry.replace_all(personal);
         registry.ingest_shared(shared);
@@ -256,14 +288,18 @@ impl FolderRegistry {
     /// same folder name appears in both) must NOT flip the already-present
     /// personal entry to shared-tagged - the personal mapping wins, so the
     /// overlapping shared candidate is skipped rather than overwriting it.
-    pub(crate) fn ingest_shared(&self, shared: Vec<(MailboxInfo, bifrost_types::MailboxId)>) {
+    pub(crate) fn ingest_shared(&self, shared: Vec<SharedFolderEntry>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
-        for (info, owner) in shared {
-            let name = info.name.as_str().to_owned();
+        for shared in shared {
+            let name = shared.info.name.as_str().to_owned();
             if map.contains_key(&name) {
                 continue;
             }
-            let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, Some(owner)));
+            let entry = Arc::new(FolderEntry::from_mailbox_with_owner_rights(
+                shared.info,
+                Some(shared.owner),
+                shared.rights,
+            ));
             map.insert(name, entry);
         }
     }
@@ -294,11 +330,16 @@ impl FolderRegistry {
         // through the scoped `ScopeRevoked` quarantine. Source the owner
         // from the entry being superseded: the old name on a rename, the
         // same name on a recreate.
-        let inherited_owner = old_name
+        // The rights set rides along with the owner tag for the same
+        // reason: a LIST/IDLE `MailboxInfo` carries no MYRIGHTS, so
+        // rebuilding without it would silently drop a shared folder's
+        // read-only marking from `containers_list`.
+        let superseded = old_name
             .as_ref()
             .and_then(|old| map.get(old))
-            .or_else(|| map.get(&name))
-            .and_then(|entry| entry.shared_owner.clone());
+            .or_else(|| map.get(&name));
+        let inherited_owner = superseded.and_then(|entry| entry.shared_owner.clone());
+        let inherited_rights = superseded.and_then(|entry| entry.rights.clone());
         if let Some(old_name) = old_name {
             map.remove(&old_name);
         }
@@ -307,7 +348,11 @@ impl FolderRegistry {
             return;
         }
         if !map.contains_key(&name) || info.old_name.is_some() {
-            let entry = Arc::new(FolderEntry::from_mailbox_with_owner(info, inherited_owner));
+            let entry = Arc::new(FolderEntry::from_mailbox_with_owner_rights(
+                info,
+                inherited_owner,
+                inherited_rights,
+            ));
             map.insert(name, entry);
         }
     }
@@ -369,6 +414,19 @@ impl FolderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared-namespace discovery entry owned by `alice`, optionally
+    /// carrying a MYRIGHTS wire string.
+    fn shared_entry(name: &MailboxName, rights: Option<&str>) -> SharedFolderEntry {
+        SharedFolderEntry {
+            info: MailboxInfo {
+                name: name.clone(),
+                ..Default::default()
+            },
+            owner: bifrost_types::MailboxId("alice".to_owned()),
+            rights: rights.map(crate::types::MailboxRights::parse),
+        }
+    }
 
     #[test]
     fn compact_uid_set_roundtrips_and_diffs() {
@@ -477,20 +535,8 @@ mod tests {
                 ..Default::default()
             }],
             vec![
-                (
-                    MailboxInfo {
-                        name: overlap.clone(),
-                        ..Default::default()
-                    },
-                    bifrost_types::MailboxId("alice".to_owned()),
-                ),
-                (
-                    MailboxInfo {
-                        name: shared.clone(),
-                        ..Default::default()
-                    },
-                    bifrost_types::MailboxId("alice".to_owned()),
-                ),
+                shared_entry(&overlap, None),
+                shared_entry(&shared, Some("lr")),
             ],
         );
 
@@ -499,10 +545,16 @@ mod tests {
         let personal = registry.get(&overlap).expect("personal entry");
         assert!(personal.shared_owner.is_none());
         // The non-overlapping shared folder is still ingested.
-        let shared_entry = registry.get(&shared).expect("shared entry");
+        let ingested = registry.get(&shared).expect("shared entry");
         assert_eq!(
-            shared_entry.shared_owner,
+            ingested.shared_owner,
             Some(bifrost_types::MailboxId("alice".to_owned()))
+        );
+        // The discovery-time MYRIGHTS set is retained on the entry so
+        // `containers_list` can project it.
+        assert_eq!(
+            ingested.rights,
+            Some(crate::types::MailboxRights::parse("lr"))
         );
     }
 
@@ -529,16 +581,8 @@ mod tests {
     fn rename_preserves_shared_owner_tag() {
         let old = MailboxName::new("Shared/alice/Old").expect("valid mailbox");
         let new = MailboxName::new("Shared/alice/New").expect("valid mailbox");
-        let registry = FolderRegistry::from_lists(
-            Vec::new(),
-            vec![(
-                MailboxInfo {
-                    name: old.clone(),
-                    ..Default::default()
-                },
-                bifrost_types::MailboxId("alice".to_owned()),
-            )],
-        );
+        let registry =
+            FolderRegistry::from_lists(Vec::new(), vec![shared_entry(&old, Some("lrs"))]);
 
         registry.apply_mailbox_event(MailboxInfo {
             name: new.clone(),
@@ -552,21 +596,17 @@ mod tests {
             Some(bifrost_types::MailboxId("alice".to_owned())),
             "a renamed shared folder must keep its owner so a later SELECT denial quarantines",
         );
+        assert_eq!(
+            renamed.rights,
+            Some(crate::types::MailboxRights::parse("lrs")),
+            "a renamed shared folder must keep its MYRIGHTS projection",
+        );
     }
 
     #[test]
     fn recreate_preserves_shared_owner_tag() {
         let folder = MailboxName::new("Shared/alice/Proj").expect("valid mailbox");
-        let registry = FolderRegistry::from_lists(
-            Vec::new(),
-            vec![(
-                MailboxInfo {
-                    name: folder.clone(),
-                    ..Default::default()
-                },
-                bifrost_types::MailboxId("alice".to_owned()),
-            )],
-        );
+        let registry = FolderRegistry::from_lists(Vec::new(), vec![shared_entry(&folder, None)]);
 
         // Recreate at the same name (fresh UIDVALIDITY epoch): a same-name
         // event with old_name set, or a contains-key replace path.

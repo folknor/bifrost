@@ -9,7 +9,14 @@ use bifrost_types::DiagnosticText;
 pub(crate) use self::parse::*;
 pub(crate) use self::xml_helpers::*;
 
-const EWS_URL: &str = "https://outlook.office365.com/EWS/Exchange.asmx";
+/// The EWS SOAP endpoint under a given Outlook origin. Derived rather than
+/// hardcoded so the harness api-base override reaches EWS too (the
+/// production origin lives on `outlook.office365.com`, not on the Graph
+/// host, so redirecting the Graph base alone left EWS pointed at the real
+/// service).
+pub(crate) fn ews_url(outlook_base: &str) -> String {
+    format!("{}/EWS/Exchange.asmx", outlook_base.trim_end_matches('/'))
+}
 
 /// EWS request routing headers. Public-folder operations route by
 /// `X-AnchorMailbox` (the hierarchy or content mailbox SMTP address) and

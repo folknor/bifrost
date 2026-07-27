@@ -147,7 +147,8 @@ crates/jmap/src/sync/
   capabilities.rs  - AccountCapabilities builder, CoreLimits
   state.rs         - cursor envelope (V1 tag/length format)
   state_cache.rs   - per-accountId Email/Mailbox/Thread state maps
-  foreign.rs       - foreign-account mailbox codec (encode_foreign/parse_foreign/owner_tag)
+  foreign.rs       - foreign-account codec: mailbox (encode_foreign/parse_foreign/owner_tag)
+                     and object ids (encode_object/parse_object/native_object)
   discover.rs      - cursor_scopes / memberships / scope_lifecycle_stream
   inventory.rs     - per-scope inventory streaming
   changes.rs       - per-scope change stream dispatch
@@ -326,12 +327,41 @@ JMAP auto-discovers shared/delegate accounts from the session: at `open`, `forei
 
 The foreign accountId rides in the `Folder` scope's `FolderId` (`foreign.rs` codec, `\u{1f}` separator); `Type(_)` scopes cannot carry an account (`Type(Email)` is identical across accounts and would collide in the engine index), so the variant-free `Folder` shape is used. `mail_for_scope` / `account_id_for_scope` / `owner_of_scope` route a `Folder` scope to its `foreign_mail` handle, state-map key, and `MailboxId(accountId)` owner tag; primary scopes route to `self.mail` and `None`. `cursor_scopes` appends seeded foreign `Folder` scopes; `discover::memberships` appends one `Mailbox(accountId)` owner tag per foreign account, and `inventory_stream` stamps that tag onto every foreign-scope item so a foreign account's native mailbox ids cannot be conflated with the primary's in the membership index. The request layer is already per-account (`Account<Tr>::build` stamps the accountId), so routing is "hand `mail_for_scope` instead of `self.mail`", not a `core/request.rs` change.
 
-Out of A5a's read/sync slice (named follow-ups): foreign-account *mutations* (the `ifInState` cache is shaped for it via the per-accountId maps, but unwired) and foreign *mailbox lifecycle* (the `scope_lifecycle` worker polls only the primary; a foreign mailbox added after `open` appears at the next reopen).
+Foreign OBJECT ids are qualified with the same codec (`encode_object` /
+`parse_object` / `native_object`, same `\u{1f}` separator). The foreign
+inventory qualifies both `InventoryEntry::id` and its whole-message
+`blob_id`; the foreign changes leg qualifies its `ObjectChange` ids. This is
+what makes hydration and blob reads self-routing: `get_stream` and
+`open_blob` receive only an id - no scope - so a bare native id would run
+`Email/get` / `/download/{accountId}/{blobId}` against the PRIMARY account
+and either 404 or resolve an unrelated same-id primary object.
+`hydrate::route_for_id` buckets ids per routing target (one `Email/get` per
+account, since the call is accountId-scoped), strips to the native id on the
+wire, and re-qualifies on the way out so an outcome id is byte-identical to
+the id the caller handed in. `blob::foreign_split` does the same selection
+for `open_blob` and both legs of `open_raw_rfc822` (the `blobId` fetch AND
+the download). An id naming an account this session cannot reach falls back
+to the primary handle deliberately, so the miss surfaces as a real
+not-found rather than a fabricated local error.
+
+`containers_list` appends each foreign account's mailboxes with
+`namespace = Shared`, `owner = MailboxId(accountId)`,
+`native_id = encode_foreign(accountId, mailboxId)` (byte-identical to the
+seeded `CursorScope::Folder` string), `owner_local_id` = the bare mailbox id,
+and the parent re-encoded in the same namespace so a foreign child never
+points at a same-id primary mailbox. A per-account `Mailbox/get` failure
+degrades to a `Warning` plus the remaining containers. `containers_list` has
+no warning lane in the `Account` trait and this crate carries no logging
+dependency, so `fetch_foreign_containers` returns the structured `Warning`s
+and the caller drops them; the load-bearing half (one unreachable share does
+not blank the sidebar) is live regardless.
+
+Out of A5a's read/sync slice (named follow-ups): foreign-account *mutations* (the `ifInState` cache is shaped for it via the per-accountId maps, but unwired - a mutation primitive handed a foreign-qualified id today would pass the whole encoded string to the primary account) and foreign *mailbox lifecycle* (the `scope_lifecycle` worker polls only the primary; a foreign mailbox added after `open` appears at the next reopen).
 
 ### Known limitations
 
 - `Thread` and `Query` inventory are not implemented (fatal-unsupported); thread/query changes are supported.
-- Foreign bulk mutations and live foreign-mailbox lifecycle are not wired; `get_stream` hydration routes through the primary account. Foreign submission is supported, but scheduled foreign submission is not.
+- Foreign bulk mutations and live foreign-mailbox lifecycle are not wired. `get_stream` / `open_blob` / `open_raw_rfc822` DO route to the foreign account (via the qualified object-id codec); the mutation primitives do not. Foreign submission is supported, but scheduled foreign submission is not.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Push is WebSocket-subprotocol only (no HTTP/EventSource fallback).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook).
 - `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).

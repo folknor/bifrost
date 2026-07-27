@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bifrost_types::{
     AccountError, AccountFuture, AccountOperation, AccountStream, BlobCapabilities, BlobEncoding,
-    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerRights, FolderRole,
-    HydrationProjection, Importance, LabelId, Message, MutationTarget, ObjectId, Page, Provenance,
-    QuotaInfo, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
+    BlobHandle, BlobId, Container, ContainerId, ContainerKind, ContainerNamespace, ContainerRights,
+    FolderRole, HydrationProjection, Importance, LabelId, Message, MutationTarget, ObjectId, Page,
+    Provenance, QuotaInfo, SearchFilter, SearchRequest, ThreadHydration, ThreadId, VacationConfig,
+    Warning, WarningKind,
 };
 /// Convert a crate-internal error to `AccountError` with the correct
 /// `AccountOperation` for this call site. Every call site in this
@@ -658,10 +660,28 @@ pub(crate) fn search_messages(
     })
 }
 
+/// Every container the account exposes: the primary account's mailboxes
+/// plus each foreign (shared/delegate) account's, namespaced by owner.
+///
+/// A per-share enumeration failure degrades to a `Warning` plus the
+/// remaining containers. `containers_list` has no warning lane in the
+/// `Account` trait, and this crate deliberately carries no logging
+/// dependency, so the structured `Warning`s cannot be surfaced from here
+/// yet - they are built and returned by `fetch_foreign_containers` so
+/// wiring them into a warning-carrying containers surface is a call-site
+/// change rather than a rewrite. The load-bearing half of the degradation
+/// (the remaining containers still return) is live either way.
 pub(crate) fn containers_list(
     mail: MailAccount,
+    foreign_mail: Arc<HashMap<String, MailAccount>>,
 ) -> AccountFuture<Result<Vec<Container>, AccountError>> {
-    Box::pin(async move { fetch_containers(&mail, AccountOperation::ContainersList).await })
+    Box::pin(async move {
+        let mut containers = fetch_containers(&mail, AccountOperation::ContainersList).await?;
+        let (foreign, _warnings) =
+            fetch_foreign_containers(&foreign_mail, AccountOperation::ContainersList).await;
+        containers.extend(foreign);
+        Ok(containers)
+    })
 }
 
 pub(crate) fn container_create(
@@ -1443,8 +1463,41 @@ async fn fetch_containers(
     Ok(fetch_mailboxes(mail, op)
         .await?
         .into_iter()
-        .filter_map(container_from_mailbox)
+        .filter_map(|mailbox| container_from_mailbox(mailbox, None))
         .collect())
+}
+
+/// Enumerate every foreign (shared/delegate) account's mailboxes as
+/// `Shared`-namespace containers.
+///
+/// Each foreign account is independent, so a per-account `Mailbox/get`
+/// failure degrades to a `Warning` plus the remaining containers - matching
+/// the shape the discovery path already uses for a revoked share. One
+/// unreachable share must not blank the whole sidebar.
+async fn fetch_foreign_containers(
+    foreign_mail: &HashMap<String, MailAccount>,
+    op: AccountOperation,
+) -> (Vec<Container>, Vec<Warning>) {
+    let mut containers = Vec::new();
+    let mut warnings = Vec::new();
+    // Deterministic order so the projection is stable across calls.
+    let mut account_ids: Vec<&String> = foreign_mail.keys().collect();
+    account_ids.sort();
+    for account_id in account_ids {
+        let mail = &foreign_mail[account_id];
+        match fetch_mailboxes(mail, op).await {
+            Ok(mailboxes) => containers.extend(
+                mailboxes
+                    .into_iter()
+                    .filter_map(|mailbox| container_from_mailbox(mailbox, Some(account_id))),
+            ),
+            Err(_) => warnings.push(Warning::support_only(
+                WarningKind::OperatorAttentionNeeded,
+                format!("shared JMAP account {account_id} skipped: mailbox listing failed"),
+            )),
+        }
+    }
+    (containers, warnings)
 }
 
 async fn fetch_mailboxes(
@@ -1465,42 +1518,67 @@ async fn fetch_mailboxes(
         .into_list())
 }
 
-fn container_from_mailbox(mut mailbox: Mailbox) -> Option<Container> {
+/// Project one `Mailbox` onto a `Container`.
+///
+/// `owner_account` is `Some(accountId)` for a foreign (shared/delegate)
+/// account's mailbox. In that case the container's `native_id` is
+/// `encode_foreign(accountId, mailboxId)` - byte-identical to the
+/// `CursorScope::Folder` string the factory seeds for that mailbox, which is
+/// what lets the consumer join a container to its sync scope - while
+/// `owner_local_id` keeps the bare mailbox id for calls made against the
+/// owner's own account. The parent is re-encoded in the same namespace so a
+/// foreign child never points at a primary mailbox that happens to share
+/// the parent's id.
+fn container_from_mailbox(mut mailbox: Mailbox, owner_account: Option<&str>) -> Option<Container> {
     let id = mailbox.take_id();
     if id.as_str().is_empty() {
         return None;
     }
-    let native = id.into_string();
-    let parent = mailbox
-        .parent_id()
-        .map(|parent| ContainerId(parent.to_string()));
+    let local = id.into_string();
+    let native = match owner_account {
+        Some(account) => super::foreign::encode_foreign(account, &local).0,
+        None => local.clone(),
+    };
+    let parent = mailbox.parent_id().map(|parent| {
+        let parent = parent.to_string();
+        ContainerId(match owner_account {
+            Some(account) => super::foreign::encode_foreign(account, &parent).0,
+            None => parent,
+        })
+    });
     let role = map_role(mailbox.role());
-    let rights = mailbox.my_rights().map(rights_from_mailbox);
-    let is_subscribed = mailbox.is_subscribed();
-    Some(Container {
-        id: ContainerId(native.clone()),
-        kind: ContainerKind::Folder,
-        role,
-        provenance: Provenance {
-            provider: bifrost_types::ProtocolKind::Jmap,
-            kind: ContainerKind::Folder,
-            native: native.clone(),
-        },
-        native_id: native,
-        name: mailbox.name().unwrap_or("").to_string(),
-        parent,
-        // JMAP mailboxes carry no container color.
-        style: None,
+    Some(
+        Container::new(
+            ContainerId(native.clone()),
+            ContainerKind::Folder,
+            role,
+            Provenance {
+                provider: bifrost_types::ProtocolKind::Jmap,
+                kind: ContainerKind::Folder,
+                native,
+            },
+            mailbox.name().unwrap_or("").to_string(),
+            parent,
+        )
+        // JMAP mailboxes carry no container color, so `style` keeps its
+        // `Container::new` default.
+        //
         // A role-bearing mailbox is JMAP's native system notion; for
-        // folder-shaped JMAP that is exactly what `role` already
-        // captures, so there is no hidden split to surface.
-        system: role.is_some(),
+        // folder-shaped JMAP that is exactly what `role` already captures,
+        // so there is no hidden split to surface.
+        .with_system(role.is_some())
         // JMAP's `Mailbox.myRights` / `Mailbox.isSubscribed` carry the
-        // per-folder ACL and subscription state the shared-mailbox
-        // sidebar gates submit on; other providers leave these `None`.
-        rights,
-        is_subscribed,
-    })
+        // per-folder ACL and subscription state the shared-mailbox sidebar
+        // gates submit on.
+        .with_rights(mailbox.my_rights().map(rights_from_mailbox))
+        .with_subscription(mailbox.is_subscribed())
+        .with_namespace(match owner_account {
+            Some(_) => ContainerNamespace::Shared,
+            None => ContainerNamespace::Personal,
+        })
+        .with_owner(owner_account.map(|account| bifrost_types::MailboxId(account.to_string())))
+        .with_owner_local_id(owner_account.map(|_| local)),
+    )
 }
 
 /// Map the JMAP `Mailbox/myRights` object onto the unified
@@ -2374,6 +2452,102 @@ fn unix_to_system_time(timestamp: i64) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mailbox_json(id: &str, parent: Option<&str>, rights: serde_json::Value) -> Mailbox {
+        let mut value = serde_json::json!({
+            "id": id,
+            "name": "Reports",
+            "myRights": rights,
+            "isSubscribed": true,
+        });
+        if let Some(parent) = parent {
+            value["parentId"] = serde_json::Value::String(parent.to_string());
+        }
+        serde_json::from_value(value).expect("mailbox deserializes")
+    }
+
+    fn full_rights() -> serde_json::Value {
+        serde_json::json!({
+            "mayReadItems": true,
+            "mayAddItems": true,
+            "mayRemoveItems": true,
+            "maySetSeen": true,
+            "maySetKeywords": true,
+            "mayCreateChild": true,
+            "mayRename": true,
+            "mayDelete": true,
+            "maySubmit": true,
+        })
+    }
+
+    #[test]
+    fn foreign_mailbox_projects_as_shared_namespaced_container() {
+        let container = container_from_mailbox(
+            mailbox_json("mbx-12", Some("mbx-1"), full_rights()),
+            Some("acct-9"),
+        )
+        .expect("container");
+
+        assert_eq!(container.namespace, ContainerNamespace::Shared);
+        assert_eq!(
+            container.owner,
+            Some(bifrost_types::MailboxId("acct-9".to_string()))
+        );
+        // `native_id` is the per-account namespaced form (what the cursor
+        // scope keys on); `owner_local_id` is the bare mailbox id.
+        assert_eq!(
+            container.native_id,
+            super::super::foreign::encode_foreign("acct-9", "mbx-12").0
+        );
+        assert_eq!(container.owner_local_id.as_deref(), Some("mbx-12"));
+        // The parent is re-encoded in the same namespace, so a foreign child
+        // never points at a same-id primary mailbox.
+        assert_eq!(
+            container.parent,
+            Some(ContainerId(
+                super::super::foreign::encode_foreign("acct-9", "mbx-1").0
+            ))
+        );
+        // JMAP rights still project (they already did) and JMAP folders
+        // carry no content class.
+        assert_eq!(
+            container.rights.as_ref().and_then(|r| r.may_submit),
+            Some(true)
+        );
+        assert!(container.content_class.is_none());
+    }
+
+    /// The container's `native_id` must be byte-identical to the
+    /// `CursorScope::Folder` string the factory seeds for the same foreign
+    /// mailbox - that identity is the join key between a container and its
+    /// sync scope.
+    #[test]
+    fn foreign_container_native_id_matches_seeded_cursor_scope() {
+        let container =
+            container_from_mailbox(mailbox_json("mbx-12", None, full_rights()), Some("acct-9"))
+                .expect("container");
+        let scope = bifrost_types::CursorScope::Folder(super::super::foreign::encode_foreign(
+            "acct-9", "mbx-12",
+        ));
+        assert_eq!(
+            scope,
+            bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
+                container.native_id.clone()
+            )),
+        );
+    }
+
+    #[test]
+    fn primary_mailbox_stays_personal_and_unqualified() {
+        let container =
+            container_from_mailbox(mailbox_json("mbx-12", Some("mbx-1"), full_rights()), None)
+                .expect("container");
+        assert_eq!(container.namespace, ContainerNamespace::Personal);
+        assert!(container.owner.is_none());
+        assert!(container.owner_local_id.is_none());
+        assert_eq!(container.native_id, "mbx-12");
+        assert_eq!(container.parent, Some(ContainerId("mbx-1".to_string())));
+    }
 
     #[test]
     fn importance_high_sets_keyword_others_clear() {

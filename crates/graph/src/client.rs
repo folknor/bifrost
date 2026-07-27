@@ -15,6 +15,17 @@ use crate::error::{GraphError, GraphResponseError};
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 pub(crate) const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
 
+/// Production origin for the two non-Graph Microsoft surfaces this crate
+/// talks to: Exchange Autodiscover (`/autodiscover/autodiscover.xml`,
+/// `/autodiscover/autodiscover.svc`) and EWS (`/EWS/Exchange.asmx`). Both
+/// live on `outlook.office365.com`, NOT on the Graph host, so the Graph
+/// api-base override alone never redirected them.
+pub(crate) const OUTLOOK_BASE: &str = "https://outlook.office365.com";
+
+/// Production Graph host. Used only to decide whether an api-base is the
+/// real Graph endpoint or a harness redirect.
+const GRAPH_HOST: &str = "graph.microsoft.com";
+
 const CONCURRENCY_LIMIT: usize = 3;
 
 // pub: GraphAccountFactory consumers need a constructible Graph client handle.
@@ -28,6 +39,10 @@ struct ClientInner {
     account_net: RwLock<Option<AccountNet>>,
     api_base: String,
     api_beta_base: String,
+    /// Origin for the Autodiscover + EWS surfaces. Derived from `api_base`
+    /// (see [`derive_outlook_base`]) unless a consumer overrode it with
+    /// [`GraphClient::with_outlook_base`].
+    outlook_base: String,
     rate_limit_host: String,
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
@@ -80,12 +95,14 @@ impl GraphClient {
         let api_base = trim_base(api_base.into());
         let api_beta_base = trim_base(api_beta_base.into());
         let rate_limit_host = host_from_api_base(&api_base);
+        let outlook_base = derive_outlook_base(&api_base);
         Self {
             inner: Arc::new(ClientInner {
                 net: Some(Net::shared_default()),
                 account_net: RwLock::new(None),
                 api_base,
                 api_beta_base,
+                outlook_base,
                 rate_limit_host,
                 token_source,
                 mailbox_id: None,
@@ -101,13 +118,16 @@ impl GraphClient {
         api_beta_base: impl Into<String>,
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
+        let api_base = trim_base(api_base.into());
+        let outlook_base = derive_outlook_base(&api_base);
         Self {
             inner: Arc::new(ClientInner {
                 net: None,
                 account_net: RwLock::new(Some(net)),
-                api_base: trim_base(api_base.into()),
+                api_base,
                 api_beta_base: trim_base(api_beta_base.into()),
-                rate_limit_host: "graph.microsoft.com".to_string(),
+                outlook_base,
+                rate_limit_host: GRAPH_HOST.to_string(),
                 token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
@@ -170,6 +190,38 @@ impl GraphClient {
         &self.inner.api_base
     }
 
+    /// Origin for the Autodiscover + EWS surfaces.
+    pub(crate) fn outlook_base(&self) -> &str {
+        &self.inner.outlook_base
+    }
+
+    /// Override the Autodiscover / EWS origin independently of the Graph
+    /// api-base. Test seam mirroring `bifrost-google`'s
+    /// `with_people_api_base`: those two surfaces live on a different host
+    /// from Graph in production, so a harness that only redirects the Graph
+    /// base would still send Autodiscover and EWS traffic to
+    /// `outlook.office365.com`. Redirecting the Graph api-base to a
+    /// non-Graph host already derives this (so the common harness case needs
+    /// no extra call); this exists for a sovereign cloud, where the Graph and
+    /// Outlook hosts differ but neither is the public one.
+    // pub: harness / sovereign-cloud consumers redirect Autodiscover + EWS before registration.
+    #[must_use]
+    pub fn with_outlook_base(&self, outlook_base: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(ClientInner {
+                net: self.inner.net.clone(),
+                account_net: RwLock::new(self.account_net()),
+                api_base: self.inner.api_base.clone(),
+                api_beta_base: self.inner.api_beta_base.clone(),
+                outlook_base: trim_base(outlook_base.into()),
+                rate_limit_host: self.inner.rate_limit_host.clone(),
+                token_source: Arc::clone(&self.inner.token_source),
+                mailbox_id: self.inner.mailbox_id.clone(),
+                semaphore: Arc::clone(&self.inner.semaphore),
+            }),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn api_beta_base(&self) -> &str {
         &self.inner.api_beta_base
@@ -201,6 +253,7 @@ impl GraphClient {
                 account_net: RwLock::new(self.account_net()),
                 api_base: self.inner.api_base.clone(),
                 api_beta_base: self.inner.api_beta_base.clone(),
+                outlook_base: self.inner.outlook_base.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into()),
@@ -469,7 +522,33 @@ fn host_from_api_base(api_base: &str) -> String {
     reqwest::Url::parse(api_base)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| "graph.microsoft.com".to_string())
+        .unwrap_or_else(|| GRAPH_HOST.to_string())
+}
+
+/// Derive the Autodiscover / EWS origin from the Graph api-base.
+///
+/// A base on the production Graph host means production Microsoft, so
+/// Autodiscover and EWS keep their own production origin
+/// (`outlook.office365.com`) - they are a different host from Graph and
+/// must not be rewritten to it. Any OTHER host means the api-base was
+/// redirected (a harness mock, a sovereign cloud), and the same origin is
+/// the only sane target for the sibling surfaces: a harness that redirects
+/// Graph but leaves Autodiscover/EWS pointing at the real
+/// `outlook.office365.com` cannot exercise the public-folder or EWS-streaming
+/// legs at all. An unparseable base falls back to production rather than
+/// inventing an origin.
+fn derive_outlook_base(api_base: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(api_base) else {
+        return OUTLOOK_BASE.to_string();
+    };
+    if url.host_str() == Some(GRAPH_HOST) {
+        return OUTLOOK_BASE.to_string();
+    }
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+        (Some(host), None) => format!("{}://{host}", url.scheme()),
+        (None, _) => OUTLOOK_BASE.to_string(),
+    }
 }
 
 fn derive_beta_base(api_base: &str) -> Option<String> {
@@ -533,6 +612,53 @@ mod tests {
         assert_eq!(client.api_base(), "https://example.test/v1.0");
         assert_eq!(client.api_beta_base(), "https://example.test/beta");
         assert_eq!(client.access_token().await, "token");
+    }
+
+    #[test]
+    fn harness_api_base_redirects_autodiscover_and_ews() {
+        // A harness pointing the Graph api-base at its mock must get the
+        // Autodiscover + EWS surfaces redirected too: in production they
+        // live on `outlook.office365.com`, a different host from Graph, so
+        // an api-base-only override left them hitting the real service.
+        let harness = GraphClient::with_api_base("http://127.0.0.1:8181/v1.0", "token");
+        assert_eq!(harness.outlook_base(), "http://127.0.0.1:8181");
+        assert_eq!(
+            crate::ews::ews_url(harness.outlook_base()),
+            "http://127.0.0.1:8181/EWS/Exchange.asmx"
+        );
+        assert_eq!(
+            crate::account::autodiscover_soap_url(harness.outlook_base()),
+            "http://127.0.0.1:8181/autodiscover/autodiscover.svc"
+        );
+        assert_eq!(
+            crate::account::autodiscover_xml_url(harness.outlook_base()),
+            "http://127.0.0.1:8181/autodiscover/autodiscover.xml"
+        );
+
+        // The production Graph base keeps the production Outlook origin -
+        // Autodiscover/EWS are NOT on the Graph host.
+        let production = GraphClient::new("token");
+        assert_eq!(production.outlook_base(), OUTLOOK_BASE);
+        assert_eq!(
+            crate::ews::ews_url(production.outlook_base()),
+            "https://outlook.office365.com/EWS/Exchange.asmx"
+        );
+
+        // A shared-mailbox client inherits the override.
+        assert_eq!(
+            harness
+                .for_shared_mailbox("shared@contoso.com")
+                .outlook_base(),
+            "http://127.0.0.1:8181"
+        );
+
+        // An explicit override wins over the derivation.
+        assert_eq!(
+            production
+                .with_outlook_base("https://ews.test/")
+                .outlook_base(),
+            "https://ews.test"
+        );
     }
 
     #[test]

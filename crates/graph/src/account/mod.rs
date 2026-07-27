@@ -47,8 +47,16 @@ use tokio_util::sync::CancellationToken;
 // pub: consumers build a GraphClient before registering GraphAccountFactory with the engine.
 pub use crate::client::GraphClient;
 
+// Re-exported for the client-side api-base override test, which pins that a
+// redirected Graph base also redirects the Autodiscover endpoints.
+#[cfg(test)]
+pub(crate) use self::autodiscover::{autodiscover_soap_url, autodiscover_xml_url};
+
 use self::push::{EwsSubscriptionState, GraphSubscriptionGroup, PushEndpoint};
 use self::scopes::{CursorIndex, FolderTree};
+
+// pub: public-folder consumers name the folders they want synced.
+pub use self::public_folder::PublicFolderScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -90,10 +98,17 @@ pub(crate) struct GraphAccount {
     /// non-public folder on its existing (reject-on-delta) path.
     pub(crate) routing_map:
         Arc<RwLock<HashMap<bifrost_types::FolderId, cursor::PublicFolderRouting>>>,
-    /// Whether public-folder discovery is enabled (opt-in via
-    /// `with_public_folders`). Default off, so no existing Graph account
-    /// pays the Autodiscover round-trips.
-    pub(crate) public_folders_enabled: bool,
+    /// Projection metadata for every discovered public folder (display name,
+    /// EWS `FolderClass`, parent, effective rights), seeded in the same
+    /// discovery pass that fills `routing_map`. `containers_list` reads this
+    /// so it can render the full readable hierarchy - including folders that
+    /// are visible but not pinned for sync - without re-browsing EWS.
+    pub(crate) public_folder_meta:
+        Arc<RwLock<HashMap<bifrost_types::FolderId, public_folder::PublicFolderMeta>>>,
+    /// Which public folders this account syncs, or `None` when public-folder
+    /// discovery is off (the default, so no existing Graph account pays the
+    /// Autodiscover round-trips). Opt in via `with_public_folders`.
+    pub(crate) public_folders: Option<PublicFolderScope>,
     /// The account's primary SMTP, captured at open from the Graph
     /// profile. Seeds the `GetUserSettings` Autodiscover lookups.
     pub(crate) user_email: Option<String>,
@@ -105,7 +120,7 @@ impl GraphAccount {
         push_mode: PushMode,
         push_endpoint: Option<PushEndpoint>,
         shared_mailboxes: &[String],
-        public_folders_enabled: bool,
+        public_folders: Option<PublicFolderScope>,
         user_email: Option<String>,
     ) -> Self {
         let (push_tx, _) = broadcast::channel(256);
@@ -125,14 +140,15 @@ impl GraphAccount {
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(HashMap::new())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),
-            public_folders_enabled,
+            public_folder_meta: Arc::new(RwLock::new(HashMap::new())),
+            public_folders,
             user_email,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_tests(client: GraphClient, push_mode: PushMode) -> Self {
-        Self::new(client, push_mode, None, &[], false, None)
+        Self::new(client, push_mode, None, &[], None, None)
     }
 
     #[cfg(test)]
@@ -141,11 +157,11 @@ impl GraphAccount {
         push_mode: PushMode,
         shared_mailboxes: &[String],
     ) -> Self {
-        Self::new(client, push_mode, None, shared_mailboxes, false, None)
+        Self::new(client, push_mode, None, shared_mailboxes, None, None)
     }
 
     /// Seed a public-folder routing entry for tests. Mirrors what
-    /// spec-3's Autodiscover discovery does at runtime.
+    /// Autodiscover discovery does at runtime.
     #[cfg(test)]
     pub(crate) async fn seed_public_folder_for_tests(
         &self,
@@ -153,6 +169,22 @@ impl GraphAccount {
         routing: cursor::PublicFolderRouting,
     ) {
         self.routing_map.write().await.insert(folder, routing);
+    }
+
+    /// Seed a public folder's projection metadata for tests, alongside its
+    /// routing entry - the pair discovery installs together.
+    #[cfg(test)]
+    pub(crate) async fn seed_public_folder_meta_for_tests(
+        &self,
+        folder: bifrost_types::FolderId,
+        routing: cursor::PublicFolderRouting,
+        meta: public_folder::PublicFolderMeta,
+    ) {
+        self.routing_map
+            .write()
+            .await
+            .insert(folder.clone(), routing);
+        self.public_folder_meta.write().await.insert(folder, meta);
     }
 
     /// Select the `GraphClient` whose `/users/{mailbox}` prefix routes
@@ -216,7 +248,7 @@ pub struct GraphAccountFactory {
     push_mode: PushMode,
     push_endpoint: Option<PushEndpoint>,
     shared_mailboxes: Vec<String>,
-    public_folders: bool,
+    public_folders: Option<PublicFolderScope>,
     delegate_discovery: bool,
 }
 
@@ -228,20 +260,32 @@ impl GraphAccountFactory {
             push_mode: PushMode::GraphSubscriptions,
             push_endpoint: None,
             shared_mailboxes: Vec::new(),
-            public_folders: false,
+            public_folders: None,
             delegate_discovery: false,
         }
     }
 
-    /// Opt in to Exchange public-folder discovery and sync. Default off:
-    /// no existing Graph account pays the Autodiscover round-trips.
-    /// Discovered public folders surface as ordinary
-    /// `CursorScope::Folder` scopes synced by the no-delta-token poll
-    /// strategy. A per-folder Autodiscover/permission failure is skipped
-    /// with a scoped warning, not a discovery-wide failure.
+    /// Opt in to Exchange public-folder discovery, and say which folders may
+    /// SYNC. Default off entirely: no existing Graph account pays the
+    /// Autodiscover round-trips.
+    ///
+    /// Discovery always browses and projects the full readable hierarchy (so
+    /// `containers_list` shows every public folder the user can see), but only
+    /// the folders the `scope` allows become `CursorScope::Folder` scopes
+    /// synced by the no-delta-token poll strategy.
+    /// [`PublicFolderScope::hierarchy_only`] syncs nothing;
+    /// [`PublicFolderScope::pinned`] syncs exactly the listed folders. The
+    /// argument is REQUIRED rather than defaulted because an organization can
+    /// carry thousands of public folders holding millions of items - a
+    /// silently-permissive "sync everything discovered" default is the defect,
+    /// not the convenience.
+    ///
+    /// A per-folder Autodiscover/permission failure is skipped with a scoped
+    /// warning, not a discovery-wide failure.
     // pub: public-folder consumers opt in before building the factory.
-    pub fn with_public_folders(mut self) -> Self {
-        self.public_folders = true;
+    #[must_use]
+    pub fn with_public_folders(mut self, scope: PublicFolderScope) -> Self {
+        self.public_folders = Some(scope);
         self
     }
 
@@ -298,7 +342,7 @@ impl AccountFactory for GraphAccountFactory {
         let push_mode = self.push_mode;
         let push_endpoint = self.push_endpoint.clone();
         let shared_mailboxes = self.shared_mailboxes.clone();
-        let public_folders = self.public_folders;
+        let public_folders = self.public_folders.clone();
         let delegate_discovery = self.delegate_discovery;
         Box::pin(async move {
             client.attach_account(account_id);

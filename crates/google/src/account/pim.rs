@@ -778,28 +778,22 @@ fn gmail_date(time: SystemTime) -> String {
 }
 
 fn archive_container() -> Container {
-    Container {
-        id: ContainerId(ARCHIVE_ID.to_string()),
-        kind: ContainerKind::Label,
-        role: Some(FolderRole::Archive),
-        provenance: Provenance {
+    // Synthetic bifrost container (Gmail models archive as the absence of
+    // INBOX, not a real label), so it takes every `Container::new`
+    // default: no Gmail color, not a Gmail-native system label, no ACL /
+    // subscription / namespace metadata (Gmail is personal-only).
+    Container::new(
+        ContainerId(ARCHIVE_ID.to_string()),
+        ContainerKind::Label,
+        Some(FolderRole::Archive),
+        Provenance {
             provider: ProtocolKind::Gmail,
             kind: ContainerKind::Label,
             native: ARCHIVE_ID.to_string(),
         },
-        native_id: ARCHIVE_ID.to_string(),
-        name: "Archive".to_string(),
-        parent: None,
-        // Synthetic bifrost container (Gmail models archive as the
-        // absence of INBOX, not a real label), so it has no Gmail
-        // color and is not a Gmail-native system label.
-        style: None,
-        system: false,
-        // Gmail has no per-folder JMAP ACL or subscription model; only
-        // JMAP populates these.
-        rights: None,
-        is_subscribed: None,
-    }
+        "Archive".to_string(),
+        None,
+    )
 }
 
 fn container_from_label(label: &GmailLabel) -> Container {
@@ -811,30 +805,28 @@ fn container_from_label(label: &GmailLabel) -> Container {
         LABEL_SPAM => Some(FolderRole::Spam),
         _ => None,
     };
-    Container {
-        id: ContainerId(label.id.clone()),
-        kind: ContainerKind::Label,
+    // Gmail is personal-only and has no per-folder ACL / subscription
+    // model, so namespace / owner / rights / subscription all stay at
+    // their `Container::new` defaults.
+    Container::new(
+        ContainerId(label.id.clone()),
+        ContainerKind::Label,
         role,
-        provenance: Provenance {
+        Provenance {
             provider: ProtocolKind::Gmail,
             kind: ContainerKind::Label,
             native: label.id.clone(),
         },
-        native_id: label.id.clone(),
-        name: label.name.clone(),
-        parent: None,
-        style: style_from_label_color(label.color.as_ref()),
-        // Gmail tags far more labels as system (CATEGORY_*, IMPORTANT,
-        // CHAT, ...) than ever receive a `role`, so carry the native
-        // `type == "system"` bit through so the consumer can reproduce
-        // Gmail's system-label-as-folder split, which `role` alone
-        // (INBOX/SENT/DRAFT/TRASH/SPAM only) cannot.
-        system: label_is_system(label),
-        // Gmail has no per-folder JMAP ACL or subscription model; only
-        // JMAP populates these.
-        rights: None,
-        is_subscribed: None,
-    }
+        label.name.clone(),
+        None,
+    )
+    .with_style(style_from_label_color(label.color.as_ref()))
+    // Gmail tags far more labels as system (CATEGORY_*, IMPORTANT, CHAT,
+    // ...) than ever receive a `role`, so carry the native
+    // `type == "system"` bit through so the consumer can reproduce
+    // Gmail's system-label-as-folder split, which `role` alone
+    // (INBOX/SENT/DRAFT/TRASH/SPAM only) cannot.
+    .with_system(label_is_system(label))
 }
 
 /// Map a Gmail label `color` object into a `ContainerStyle`. Yields

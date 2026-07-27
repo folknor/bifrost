@@ -19,6 +19,14 @@ enum GraphBlobKind {
     File,
     Item,
     Reference,
+    /// An EWS `FileAttachment` on a public-folder item. Fetched via SOAP
+    /// `GetAttachment` (base64-inline), not via a Graph REST `$value` byte
+    /// stream - EWS has no such endpoint.
+    Ews,
+    /// An EWS `ItemAttachment`: an embedded Exchange item whose
+    /// `GetAttachment` payload is nested XML, not octets. Surfaced as a
+    /// non-byte-stream blob, like a Graph reference attachment.
+    EwsItem,
     Unknown,
 }
 
@@ -90,6 +98,122 @@ pub(crate) fn blob_handle_from_graph_attachment(
     })
 }
 
+/// Mint a blob handle for one EWS attachment descriptor on a public-folder
+/// item.
+///
+/// `message_id` is the folder-qualified public item id, so the locator
+/// carries the folder whose `routing_map` entry supplies the
+/// `X-AnchorMailbox` / `X-PublicFolderMailbox` pair `GetAttachment` needs.
+/// Range is never advertised: `GetAttachment` returns the whole attachment
+/// base64-inline in a SOAP body, so there is nothing to range over.
+pub(crate) fn blob_handle_from_ews_attachment(
+    message_id: &ObjectId,
+    attachment: &crate::ews::EwsAttachment,
+) -> BlobHandle {
+    let locator = GraphBlobLocator {
+        message_id: message_id.0.clone(),
+        attachment_id: attachment.attachment_id.clone(),
+        kind: if attachment.is_item {
+            GraphBlobKind::EwsItem
+        } else {
+            GraphBlobKind::Ews
+        },
+    };
+    let id = serde_json::to_string(&locator)
+        .unwrap_or_else(|_| format!("{}:{}", locator.message_id, locator.attachment_id));
+    BlobHandle {
+        id: BlobId(id),
+        size: attachment.size,
+        content_type: attachment.content_type.clone(),
+        digest: None,
+        capabilities: BlobCapabilities {
+            supports_range: false,
+            supports_parallel: false,
+            digest_available_pre_download: false,
+            encoding: BlobEncoding::Raw8Bit,
+        },
+    }
+}
+
+/// Fetch an EWS attachment's bytes through SOAP `GetAttachment`, routed by
+/// the enclosing public folder's `routing_map` headers.
+async fn fetch_ews_attachment(
+    account: &GraphAccount,
+    locator: &GraphBlobLocator,
+) -> Result<Bytes, EwsAttachmentError> {
+    let parsed = super::foreign::parse_message_id(&ObjectId(locator.message_id.clone()));
+    let Some(folder) = parsed.public_folder() else {
+        return Err(EwsAttachmentError::NotPublic);
+    };
+    let folder = bifrost_types::FolderId(folder.to_string());
+    let Some(routing) = account.public_folder_routing(&folder).await else {
+        return Err(EwsAttachmentError::NotPublic);
+    };
+    let Some(ews) = super::public_folder::ews_client(account) else {
+        return Err(EwsAttachmentError::NotAttached);
+    };
+    let content = ews
+        .get_attachment(&locator.attachment_id, &routing.headers())
+        .await
+        .map_err(|error| EwsAttachmentError::Ews(Box::new(error)))?;
+    Ok(Bytes::from(content.content))
+}
+
+enum EwsAttachmentError {
+    /// The locator does not name a public folder we route (a stale handle,
+    /// or discovery has not seeded the folder).
+    NotPublic,
+    NotAttached,
+    Ews(Box<crate::ews::EwsError>),
+}
+
+fn open_ews_blob_stream(
+    account: GraphAccount,
+    locator: GraphBlobLocator,
+) -> AccountStream<SyncEvent<Bytes>> {
+    Box::pin(async_stream::stream! {
+        match fetch_ews_attachment(&account, &locator).await {
+            Ok(bytes) => {
+                let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                yield SyncEvent::Batch(Batch {
+                    // GetAttachment returns the whole attachment in one
+                    // SOAP body, so this is always a single final page.
+                    items: vec![bytes],
+                    page_boundary: PageBoundary::Final,
+                    server_latency: std::time::Duration::default(),
+                    bytes_in,
+                    checkpoint: None::<Checkpoint>,
+                });
+            }
+            Err(EwsAttachmentError::NotPublic) => {
+                yield SyncEvent::Warning(warning_blob_not_byte_stream(
+                    &ObjectId(locator.message_id.clone()),
+                ));
+            }
+            Err(EwsAttachmentError::NotAttached) => {
+                let ctx = GraphErrorContext::ews(AccountOperation::OpenBlob)
+                    .with_scope(ErrorScope::Account);
+                yield SyncEvent::Terminated(super::graph_error::ews_error_to_account_error(
+                    crate::ews::EwsError::Transport(bifrost_net::Error::Network {
+                        message: "EWS account net not attached".to_string(),
+                        transmission_state: bifrost_types::TransmissionState::Unsent,
+                        source: None,
+                    }),
+                    ctx,
+                ));
+            }
+            Err(EwsAttachmentError::Ews(error)) => {
+                let ctx = GraphErrorContext::ews(AccountOperation::OpenBlob)
+                    .with_scope(ErrorScope::Message { id: locator.message_id.clone() });
+                yield SyncEvent::Terminated(super::graph_error::ews_error_to_account_error(
+                    *error, ctx,
+                ));
+            }
+        }
+        yield SyncEvent::Done(None);
+    })
+}
+
 fn open_blob_inner_stream(
     account: GraphAccount,
     handle: BlobHandle,
@@ -118,9 +242,25 @@ fn open_blob_inner_stream(
                 return;
             }
         };
-        if locator.kind == GraphBlobKind::Reference {
+        if locator.kind == GraphBlobKind::Reference || locator.kind == GraphBlobKind::EwsItem {
             yield SyncEvent::Warning(warning_blob_not_byte_stream(&ObjectId(locator.message_id)));
             yield SyncEvent::Done(None);
+            return;
+        }
+        // A public-folder attachment is an EWS SOAP read, not a Graph REST
+        // `$value` byte stream: Graph cannot address an EWS AttachmentId at
+        // all. Ranged reads are refused below (the handle never advertises
+        // range support), so only the whole-attachment path reaches here.
+        if locator.kind == GraphBlobKind::Ews {
+            if range.is_some() {
+                yield SyncEvent::Terminated(unsupported_range_error());
+                yield SyncEvent::Done(None);
+                return;
+            }
+            let mut stream = open_ews_blob_stream(account, locator);
+            while let Some(event) = stream.next().await {
+                yield event;
+            }
             return;
         }
         let op = if range.is_some() {
@@ -129,19 +269,7 @@ fn open_blob_inner_stream(
             AccountOperation::OpenBlob
         };
         if range.is_some() && !handle.capabilities.supports_range {
-            let account_error = AccountErrorBuilder::new(
-                AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
-                Cause::Request(RequestCause::Unsupported {
-                    operation: AccountOperation::OpenBlobRange,
-                }),
-            )
-            .operation(AccountOperation::OpenBlobRange)
-            .provider(Provider::Microsoft)
-            .protocol(Protocol::Graph)
-            .scope(ErrorScope::Account)
-            .try_build()
-            .expect("valid account error classification");
-            yield SyncEvent::Terminated(account_error);
+            yield SyncEvent::Terminated(unsupported_range_error());
             yield SyncEvent::Done(None);
             return;
         }
@@ -330,6 +458,24 @@ impl From<bifrost_net::Error> for BlobFetchError {
             other => Self::Failed(Box::new(crate::error::GraphError::Net(other))),
         }
     }
+}
+
+/// `Unsupported(OpenBlobRange)` for a handle that cannot be ranged (a Graph
+/// item/reference attachment, or any EWS attachment - `GetAttachment` has no
+/// byte-range form).
+fn unsupported_range_error() -> bifrost_types::AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(AccountOperation::OpenBlobRange),
+        Cause::Request(RequestCause::Unsupported {
+            operation: AccountOperation::OpenBlobRange,
+        }),
+    )
+    .operation(AccountOperation::OpenBlobRange)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(ErrorScope::Account)
+    .try_build()
+    .expect("valid account error classification")
 }
 
 fn decode_locator(handle: &BlobHandle) -> Result<GraphBlobLocator, String> {

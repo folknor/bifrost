@@ -329,7 +329,17 @@ impl Account for JmapAccount {
         ids: AccountStream<ObjectId>,
         projection: Projection,
     ) -> AccountStream<SyncEvent<ItemOutcome<HydratedObject>>> {
-        hydrate::stream(self.mail.clone(), self.core_limits, ids, projection)
+        // A foreign-qualified id must hydrate against its OWNING account
+        // (the same selection `mail_for_scope` makes on the changes path);
+        // `Email/get` is accountId-scoped, so routing it through the primary
+        // account cannot reach a shared mailbox's mail.
+        hydrate::stream(
+            self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
+            self.core_limits,
+            ids,
+            projection,
+        )
     }
 
     fn changes_stream(
@@ -389,7 +399,12 @@ impl Account for JmapAccount {
     }
 
     fn open_blob(&self, handle: BlobHandle) -> AccountStream<SyncEvent<bytes::Bytes>> {
-        blob::open(self.client.clone(), self.mail.id().clone(), handle)
+        blob::open(
+            self.client.clone(),
+            self.mail.id().clone(),
+            Arc::clone(&self.foreign_mail),
+            handle,
+        )
     }
 
     fn open_blob_range(
@@ -405,6 +420,7 @@ impl Account for JmapAccount {
             self.client.clone(),
             self.mail.id().clone(),
             self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
             message,
         )
     }
@@ -775,7 +791,7 @@ impl Account for JmapAccount {
     }
 
     fn containers_list(&self) -> AccountFuture<Result<Vec<Container>, AccountError>> {
-        pim::containers_list(self.mail.clone())
+        pim::containers_list(self.mail.clone(), Arc::clone(&self.foreign_mail))
     }
 
     fn container_create(

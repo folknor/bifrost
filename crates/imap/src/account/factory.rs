@@ -152,11 +152,7 @@ impl AccountFactory for ImapAccountFactory {
             // Surface shared/other-user folders via NAMESPACE + ACL gating
             // (A5c). A NAMESPACE-less or personal-only server yields an
             // empty list; a single revoked prefix is skipped, not fatal.
-            let shared = discover_shared_folders(&conn, &cfg, &profile)
-                .await
-                .into_iter()
-                .map(|sf| (sf.info, sf.owner))
-                .collect::<Vec<_>>();
+            let shared = discover_shared_folders(&conn, &cfg, &profile).await;
             // Fail-soft: a DAV open failure degrades to IMAP-only for
             // this cycle instead of failing the whole IMAP account.
             let mut dav_degraded = Vec::new();
@@ -388,20 +384,6 @@ fn server_id_disables_qresync(server_id: &[(String, Option<String>)]) -> bool {
     })
 }
 
-/// One shared/other-user folder discovered under a non-personal
-/// namespace, carrying its owning mailbox identity for membership tagging
-/// and scoped recovery.
-pub(crate) struct SharedFolder {
-    pub(crate) info: MailboxInfo,
-    /// The owning mailbox. For an other-user namespace (root `#user/`),
-    /// this is the per-principal segment that follows the root in each
-    /// folder's own path - `#user/alice/INBOX` -> `MailboxId("alice")` -
-    /// so distinct users get distinct owners. For a shared namespace
-    /// (root `#shared.`), all folders share one owner, the root minus its
-    /// trailing delimiter -> `MailboxId("#shared")`.
-    pub(crate) owner: bifrost_types::MailboxId,
-}
-
 /// Owner identity for the *shared* namespace: the namespace root minus its
 /// trailing delimiter. All folders under a shared root collapse to this one
 /// owner (there is no per-principal segment in a shared namespace). Pure and
@@ -470,11 +452,16 @@ pub(crate) fn mailbox_owner_from_other_user_path(
 /// user cannot read are dropped before registration (do not surface a
 /// scope you cannot SELECT). When ACL is not advertised, LIST visibility is
 /// taken to imply at least lookup, and a later SELECT surfaces any `NO`.
+///
+/// The parsed rights set is RETAINED on the returned entry (not just used
+/// as a gate) so `containers_list` can project it onto
+/// `Container::rights`: without it a read-only shared folder is
+/// indistinguishable from a writable one downstream.
 pub(crate) async fn discover_shared_folders(
     conn: &crate::ImapConnection,
     cfg: &ImapAccountConfig,
     profile: &ServerProfile,
-) -> Vec<SharedFolder> {
+) -> Vec<super::folder_registry::SharedFolderEntry> {
     if !profile.supports(Capability::Namespace) && !profile.imap4rev2 {
         return Vec::new();
     }
@@ -535,6 +522,7 @@ pub(crate) async fn discover_shared_folders(
                         | crate::types::MailboxAttribute::NonExistent
                 )
             });
+            let mut rights = None;
             if acl && selectable {
                 // Pre-flight ACL gate: skip folders we cannot read. The
                 // rights gate is advisory; a per-folder MYRIGHTS failure is
@@ -544,10 +532,12 @@ pub(crate) async fn discover_shared_folders(
                     .my_rights(info.name.as_str(), cfg.imap.command_timeout)
                     .await
                 {
-                    Ok(rights) => {
-                        if !MailboxRights::parse(&rights).can_read() {
+                    Ok(wire) => {
+                        let parsed = MailboxRights::parse(&wire);
+                        if !parsed.can_read() {
                             continue;
                         }
+                        rights = Some(parsed);
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -558,7 +548,11 @@ pub(crate) async fn discover_shared_folders(
                     }
                 }
             }
-            out.push(SharedFolder { info, owner });
+            out.push(super::folder_registry::SharedFolderEntry {
+                info,
+                owner,
+                rights,
+            });
         }
     }
     out

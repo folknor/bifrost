@@ -10,7 +10,57 @@
 //! protocol.
 
 use crate::cursor::ProtocolKind;
-use crate::ids::ObjectId;
+use crate::ids::{MailboxId, ObjectId};
+
+/// Which namespace a container lives in.
+///
+/// `Personal` is the account's own mailbox: every container a protocol
+/// enumerates for the authenticated principal itself. `Shared` is a
+/// delegate / shared / other-user mailbox (Graph `/users/{owner}`, a
+/// non-personal JMAP account, an IMAP other-user or shared namespace).
+/// `Public` is an Exchange public folder - organization-wide content
+/// owned by no principal at all.
+///
+/// The consumer branches on this to route a container into the right
+/// sidebar section and to decide which sync policy applies (a public
+/// folder is opt-in and allowlisted; a shared mailbox is not).
+/// Defaults to `Personal` so every existing construction site keeps its
+/// current meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ContainerNamespace {
+    /// The authenticated principal's own mailbox.
+    #[default]
+    Personal,
+    /// A delegate / shared / other-user mailbox, owned by another
+    /// principal. [`Container::owner`] names that principal.
+    Shared,
+    /// An Exchange public folder: organization-wide, no owning
+    /// principal.
+    Public,
+}
+
+/// What kind of items a container holds, when the protocol says so.
+///
+/// Exchange public folders are typed at the folder level (`IPF.Note`,
+/// `IPF.Appointment`, `IPF.Contact`, ...) and a mail client must not
+/// present a calendar public folder as a mail folder. Only the Graph
+/// public-folder projection populates this today, from the EWS
+/// `FolderClass` value; every other provider leaves
+/// [`Container::content_class`] `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ContainerContentClass {
+    /// Mail items (`IPF.Note`).
+    Mail,
+    /// Calendar items (`IPF.Appointment`).
+    Calendar,
+    /// Contacts (`IPF.Contact`).
+    Contacts,
+    /// A class the unified surface does not model (tasks, journals,
+    /// notes, an unrecognized `IPF.*` value).
+    Other,
+}
 
 /// Folder/label classification. Folder-shaped (IMAP, Graph) versus
 /// label-shaped (Gmail). JMAP mailboxes are folder-shaped on the
@@ -88,9 +138,12 @@ impl ContainerStyle {
 ///
 /// Every field is `Option<bool>`: `Some(b)` is the value the protocol
 /// reported, `None` means the protocol did not report that member.
-/// Only JMAP populates this (from `Mailbox.myRights`); folder-shaped
-/// protocols without a per-folder ACL model (IMAP, Graph) and
-/// label-shaped Gmail leave `Container::rights` `None` entirely.
+/// JMAP populates this from `Mailbox.myRights`, IMAP from RFC 4314
+/// MYRIGHTS on a shared folder, and Graph from EWS folder
+/// `EffectiveRights` on a public folder. Label-shaped Gmail has no
+/// per-folder ACL model and leaves `Container::rights` `None`, as does
+/// any folder the protocol never reported rights for (an unprobed
+/// personal IMAP folder, a Graph REST mail folder).
 ///
 /// Not `#[non_exhaustive]` because protocol Account impls construct
 /// `ContainerRights` directly when populating containers.
@@ -166,10 +219,14 @@ impl From<ContainerId> for ObjectId {
 /// `provenance.native` carries; surfaced separately for ergonomic
 /// access without descending into the provenance.
 ///
-/// Not `#[non_exhaustive]` because protocol Account impls construct
-/// `Container` values directly in `containers_list`. Future
-/// additions land as new fields with sensible defaults plus a
-/// builder helper rather than as breaking changes.
+/// Deliberately NOT `#[non_exhaustive]`: protocol Account impls and the
+/// downstream consumer both construct `Container` values directly, via
+/// `Container::new(..)` plus the `with_*` setters. That pairing is the
+/// stability contract - `Container::new`'s positional arity must stay
+/// fixed, and every future field lands as a defaulted field plus a new
+/// `with_*` setter. Adding a positional parameter to `new` would break
+/// every call site, including the consumer's, which is exactly what the
+/// builder discipline exists to prevent.
 #[derive(Debug, Clone)]
 pub struct Container {
     /// Engine-facing identifier.
@@ -202,10 +259,10 @@ pub struct Container {
     /// Folder-shaped protocols where `role` already fully determines
     /// folder-ness leave it `false`. Defaults to `false`.
     pub system: bool,
-    /// Per-folder access rights, when the protocol surfaces them. Only
-    /// JMAP populates this (from `Mailbox.myRights`); IMAP, Graph, and
-    /// Gmail have no per-folder ACL model on this surface and leave it
-    /// `None`. Drives shared-mailbox submit-gating in the consumer. See
+    /// Per-folder access rights, when the protocol surfaces them (JMAP
+    /// `Mailbox.myRights`, IMAP MYRIGHTS, Graph public-folder EWS
+    /// `EffectiveRights`). Drives shared-mailbox submit-gating and the
+    /// read-only-share distinction in the consumer. See
     /// [`ContainerRights`]. Defaults to `None`.
     pub rights: Option<ContainerRights>,
     /// Subscription state, when the protocol surfaces it. Only JMAP
@@ -213,6 +270,33 @@ pub struct Container {
     /// leave it `None`. `Some(true)`/`Some(false)` is the value the
     /// protocol reported. Defaults to `None`.
     pub is_subscribed: Option<bool>,
+    /// Which namespace this container lives in. Defaults to
+    /// [`ContainerNamespace::Personal`], so a provider that only
+    /// enumerates the principal's own mailbox never has to say anything.
+    /// See [`ContainerNamespace`].
+    pub namespace: ContainerNamespace,
+    /// The owning mailbox / principal for a `Shared` container: the
+    /// Graph `/users/{id}` routing key, the foreign JMAP `accountId`, or
+    /// the IMAP other-user / shared-namespace owner. `None` for
+    /// `Personal` and `Public` containers (a public folder has no owning
+    /// principal).
+    pub owner: Option<MailboxId>,
+    /// The container's native id inside the OWNER's own namespace, never
+    /// the foreign-encoded form `native_id` carries. Graph: the bare
+    /// mail-folder id. JMAP: the bare mailbox id. IMAP: the full mailbox
+    /// path (IMAP has no separate per-owner id space - the path already
+    /// is the native id). `None` when the container is not owned by
+    /// another principal.
+    ///
+    /// The pairing matters: `native_id` is the string the engine's cursor
+    /// scopes and membership index key on (and must be globally unique
+    /// across owners), while `owner_local_id` is what goes back onto the
+    /// wire in a request scoped to the owner's mailbox.
+    pub owner_local_id: Option<String>,
+    /// What kind of items the container holds, when the protocol types
+    /// its folders. Only populated for Graph public folders (from the EWS
+    /// `FolderClass`). See [`ContainerContentClass`].
+    pub content_class: Option<ContainerContentClass>,
 }
 
 impl Container {
@@ -243,6 +327,10 @@ impl Container {
             system: false,
             rights: None,
             is_subscribed: None,
+            namespace: ContainerNamespace::Personal,
+            owner: None,
+            owner_local_id: None,
+            content_class: None,
         }
     }
 
@@ -260,9 +348,7 @@ impl Container {
         self
     }
 
-    /// Set the per-folder access rights. Only the JMAP Account impl
-    /// layers this on (from `Mailbox.myRights`); other providers leave
-    /// it `None`.
+    /// Set the per-folder access rights.
     #[must_use]
     pub fn with_rights(mut self, rights: Option<ContainerRights>) -> Self {
         self.rights = rights;
@@ -275,6 +361,36 @@ impl Container {
     #[must_use]
     pub fn with_subscription(mut self, is_subscribed: Option<bool>) -> Self {
         self.is_subscribed = is_subscribed;
+        self
+    }
+
+    /// Set the namespace (personal / shared / public).
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: ContainerNamespace) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Set the owning mailbox / principal for a shared container.
+    #[must_use]
+    pub fn with_owner(mut self, owner: Option<MailboxId>) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    /// Set the container's native id inside the owner's own namespace.
+    /// Must be the bare (never foreign-encoded) form - see
+    /// [`Container::owner_local_id`].
+    #[must_use]
+    pub fn with_owner_local_id(mut self, owner_local_id: Option<String>) -> Self {
+        self.owner_local_id = owner_local_id;
+        self
+    }
+
+    /// Set the item class the container holds.
+    #[must_use]
+    pub fn with_content_class(mut self, content_class: Option<ContainerContentClass>) -> Self {
+        self.content_class = content_class;
         self
     }
 }
@@ -410,8 +526,42 @@ mod tests {
         assert!(!c.system);
         assert!(c.rights.is_none());
         assert!(c.is_subscribed.is_none());
+        // A container is personal-namespace, unowned, and untyped unless
+        // a provider says otherwise.
+        assert_eq!(c.namespace, ContainerNamespace::Personal);
+        assert_eq!(c.namespace, ContainerNamespace::default());
+        assert!(c.owner.is_none());
+        assert!(c.owner_local_id.is_none());
+        assert!(c.content_class.is_none());
         // native_id mirrors provenance.native.
         assert_eq!(c.native_id, "Label_42");
+    }
+
+    #[test]
+    fn container_builders_layer_namespace_owner_and_content_class() {
+        let c = Container::new(
+            ContainerId("shared\u{1f}AAMk".to_string()),
+            ContainerKind::Folder,
+            None,
+            Provenance {
+                provider: ProtocolKind::Graph,
+                kind: ContainerKind::Folder,
+                native: "shared\u{1f}AAMk".to_string(),
+            },
+            "Team Inbox".to_string(),
+            None,
+        )
+        .with_namespace(ContainerNamespace::Shared)
+        .with_owner(Some(MailboxId("shared@contoso.com".to_string())))
+        .with_owner_local_id(Some("AAMk".to_string()))
+        .with_content_class(Some(ContainerContentClass::Mail));
+        assert_eq!(c.namespace, ContainerNamespace::Shared);
+        assert_eq!(c.owner, Some(MailboxId("shared@contoso.com".to_string())));
+        // `owner_local_id` is the bare owner-namespace id, never the
+        // foreign-encoded `native_id`.
+        assert_eq!(c.owner_local_id.as_deref(), Some("AAMk"));
+        assert_ne!(c.owner_local_id.as_deref(), Some(c.native_id.as_str()));
+        assert_eq!(c.content_class, Some(ContainerContentClass::Mail));
     }
 
     #[test]

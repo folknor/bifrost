@@ -146,12 +146,18 @@ fn email_changes(
             };
 
             let new_state = response.new_state().to_string();
-            let changes = object_changes::<Email>(response.created(), ObjectChangeKind::Created)
+            // A foreign (shared/delegate) scope's change ids are qualified
+            // with the owning accountId, matching what the foreign
+            // inventory mints - otherwise hydrating a changed foreign email
+            // would route through the primary account.
+            let qualify = owner.as_ref().map(|owner| owner.0.clone());
+            let changes = object_changes::<Email>(response.created(), ObjectChangeKind::Created, qualify.as_deref())
                 .into_iter()
-                .chain(object_changes::<Email>(response.updated(), ObjectChangeKind::Updated))
+                .chain(object_changes::<Email>(response.updated(), ObjectChangeKind::Updated, qualify.as_deref()))
                 .chain(object_changes::<Email>(
                     response.destroyed(),
                     ObjectChangeKind::Destroyed,
+                    qualify.as_deref(),
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
@@ -205,15 +211,17 @@ fn mailbox_changes(
             };
 
             let new_state = response.new_state().to_string();
-            let changes = object_changes::<Mailbox>(response.created(), ObjectChangeKind::Created)
+            let changes = object_changes::<Mailbox>(response.created(), ObjectChangeKind::Created, None)
                 .into_iter()
                 .chain(object_changes::<Mailbox>(
                     response.updated(),
                     ObjectChangeKind::Updated,
+                    None,
                 ))
                 .chain(object_changes::<Mailbox>(
                     response.destroyed(),
                     ObjectChangeKind::Destroyed,
+                    None,
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
@@ -267,12 +275,13 @@ fn thread_changes(
             };
 
             let new_state = response.new_state().to_string();
-            let changes = object_changes::<Thread>(response.created(), ObjectChangeKind::Created)
+            let changes = object_changes::<Thread>(response.created(), ObjectChangeKind::Created, None)
                 .into_iter()
-                .chain(object_changes::<Thread>(response.updated(), ObjectChangeKind::Updated))
+                .chain(object_changes::<Thread>(response.updated(), ObjectChangeKind::Updated, None))
                 .chain(object_changes::<Thread>(
                     response.destroyed(),
                     ObjectChangeKind::Destroyed,
+                    None,
                 ))
                 .collect::<Vec<_>>();
             let checkpoint = checkpoint_for(scope.clone(), new_state.clone());
@@ -352,14 +361,27 @@ fn query_changes(
     })
 }
 
-fn object_changes<O: ChangesObject>(ids: &[O::Id], kind: ObjectChangeKind) -> Vec<Change>
+/// Project a changes id list onto `ObjectChange`s. `owner_account`
+/// (`Some(accountId)` only for a foreign/shared scope) qualifies each id
+/// into the owning account's namespace so downstream hydration and blob
+/// reads route to that account; a primary scope leaves ids bare.
+fn object_changes<O: ChangesObject>(
+    ids: &[O::Id],
+    kind: ObjectChangeKind,
+    owner_account: Option<&str>,
+) -> Vec<Change>
 where
     O::Id: ToString,
 {
     ids.iter()
         .map(|id| {
+            let native = id.to_string();
+            let id = match owner_account {
+                Some(account) => super::foreign::encode_object(account, &native),
+                None => native,
+            };
             Change::ObjectChange(ObjectChange {
-                id: ObjectId(id.to_string()),
+                id: ObjectId(id),
                 kind,
             })
         })

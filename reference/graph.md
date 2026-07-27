@@ -103,13 +103,28 @@ through it); helper modules and `GraphAccount` stay crate-private. `GraphClient`
 a shared `Arc<dyn TokenSource>` that `attach_account` hands to bifrost-net.
 
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
-`PushEndpoint`, a `shared_mailboxes: Vec<String>`, and a `public_folders` flag.
+`PushEndpoint`, a `shared_mailboxes: Vec<String>`, and
+`public_folders: Option<PublicFolderScope>`.
 `with_push_endpoint(url)` selects `GraphSubscriptions`; `with_ews_streaming()`
 selects `EwsStreaming` and clears the endpoint; default webhook-mode without an
 endpoint makes `push_subscribe` return `Error::MissingCoreCapability`.
 `with_shared_mailbox(id)` registers a delegate/shared mailbox by its
-`/users/{id}` routing key. `with_public_folders()` opts in to public-folder
-discovery/sync (default off).
+`/users/{id}` routing key. `with_public_folders(scope)` opts in to
+public-folder discovery (default off) and says which folders may SYNC:
+`PublicFolderScope::hierarchy_only()` projects the hierarchy and syncs
+nothing, `PublicFolderScope::pinned(ids)` syncs exactly those folders. The
+argument is required, not defaulted - an org can carry thousands of public
+folders holding millions of items, so "sync everything discovered" is a
+defect, not a convenience.
+
+`GraphClient` also derives an Autodiscover/EWS origin (`outlook_base`) from
+its Graph api-base: a base on `graph.microsoft.com` keeps the production
+`https://outlook.office365.com`, any other host (a harness mock, a sovereign
+cloud) becomes the origin for `/autodiscover/autodiscover.{xml,svc}` and
+`/EWS/Exchange.asmx` too. `with_outlook_base(base)` overrides it explicitly.
+Without this, redirecting the Graph api-base left Autodiscover and EWS
+pointed at the real service, so the public-folder and EWS-streaming legs
+could not be exercised against a mock at all.
 
 `AccountFactory::open(account_id)` attaches the `GraphClient` to `bifrost-net`
 under the engine `AccountId`, validates the token with a `users/me` profile
@@ -334,7 +349,7 @@ failing `open`. The EWS twin `ews_shared_scope_error` applies the same
 
 ## Public-folder discovery (Autodiscover)
 
-Opt-in via `with_public_folders()`. After the primary/shared mailboxes,
+Opt-in via `with_public_folders(scope)`. After the primary/shared mailboxes,
 `discover_cursor_scopes_inner` calls
 `public_folder::discover_public_folder_scopes`: resolve hierarchy routing via
 `GetUserSettings`, browse recursively from `find_folder("publicfoldersroot")`
@@ -342,11 +357,45 @@ with hierarchy headers (`child_folder_count > 0` re-enters the worklist; a
 `visited` dedup set plus a browse-step cap bound the walk), read-gate via
 `effective_rights.read`, and per folder resolve the content mailbox
 (`get_folder` PR_REPLICA_LIST GUID -> `construct_replica_smtp` ->
-`discover_content_mailbox`), seeding `routing_map` and emitting a
-`CursorScope::Folder`. Per-folder failures skip with a scoped `Warning`; a
-missing hierarchy skips the whole leg. Rights are advisory at discovery only
-(`EwsEffectiveRights`, `pub(crate)`, no shared rights type); the authoritative
-gate is the live `ErrorAccessDenied`.
+`discover_content_mailbox`). Per-folder failures skip with a scoped `Warning`;
+a missing hierarchy skips the whole leg.
+
+`seed_and_scope` then splits discovery from sync. It ALWAYS seeds two maps -
+`routing_map` (the content-mailbox routing the cursor payload carries) and
+`public_folder_meta` (display name, `FolderClass`, parent, effective rights,
+for the `containers_list` projection) - and emits a `CursorScope::Folder`
+only when the configured `PublicFolderScope` names the folder.
+`HierarchyOnly` emits none. Both maps are filled synchronously inside
+`SyncEngine::attach`'s discovery call, which is what makes them populated by
+the time `containers_list` runs; neither seeding may be deferred to a lazier
+point. Rights stay advisory at discovery (the authoritative gate is the live
+`ErrorAccessDenied`), but they are now also PROJECTED onto
+`Container::rights` so a read-only public folder is distinguishable
+downstream.
+
+## Public-folder hydration (EWS `GetItem` / `GetAttachment`)
+
+A public-folder item is a raw EWS `ItemId`; Graph REST has no route that can
+address it. `public_folder.rs` therefore mints folder-qualified object ids
+(`foreign::encode_public_item_id`, an RS-separated `"<folderId>\u{1e}<itemId>"`
+distinct from the US-separated shared-mailbox form) in both the inventory
+projection and the poll's `Added`/`Destroyed` emissions.
+
+`get_stream` splits each chunk with `partition_ews_ids`: an id whose folder is
+present in `routing_map` goes to `fetch_ews_outcomes` (one `GetItem` per item,
+because per-folder routing headers differ), everything else to the Graph
+`/$batch`. Both arms land in one `Batch`, so the consumer still sees exactly
+one outcome per pulled id. `hydrated_from_ews_item` projects into the SAME
+`HydratedObject` shape the REST arm returns: `Metadata` (the identical
+inventory-entry projection) for the body-bearing projections, `FlagsOnly` for
+`FlagsOnly`, plus one blob handle per attachment descriptor. Body-bearing
+projections degrade to `Metadata` for the same reason the REST arm does -
+`RawMime` means assembled RFC822, and `GetItem` returns a parsed HTML body.
+
+Attachment bytes route through `open_blob`: the blob locator carries the
+folder-qualified message id, so `GraphBlobKind::Ews` fetches via SOAP
+`GetAttachment` (base64-inline, hence no range support) and
+`GraphBlobKind::EwsItem` surfaces the `BlobNotByteStream` warning.
 
 ## Push: webhooks plus EWS streaming fallback
 
@@ -451,7 +500,25 @@ directory is an error, not an empty result).
 
 Container CRUD maps to mail folders only. `containers_list` returns
 native folder ids (`Provenance { Graph, Folder, native }`), refreshes the
-folder tree, and maps well-known folders; user folders stay role-less.
+folder tree, and maps well-known folders; user folders stay role-less. It then
+appends two namespaced legs:
+
+- Each `shared_clients` entry's folders, `namespace = Shared`,
+  `owner = MailboxId(mailbox)`, `native_id = encode_foreign(mailbox, folderId)`
+  (byte-identical to the `CursorScope::FolderType` string discovery emits, so
+  a container joins its sync scope by id), `owner_local_id` = the bare Graph
+  folder id. The primary role map is deliberately NOT applied here - a shared
+  mailbox's well-known folder ids are not the primary's. A per-mailbox listing
+  failure degrades to a `Warning` plus the remaining containers.
+- Each `routing_map` public folder, `namespace = Public`, no owner,
+  `content_class` from the EWS `FolderClass`, `rights` from the EWS
+  `EffectiveRights`. Purely local (reads the discovery-seeded maps, no EWS
+  round-trip) and includes folders that are visible but NOT pinned for sync -
+  the consumer has to see a folder before it can pin it.
+
+`containers_list` has no warning lane in the `Account` trait, so the
+degradation `Warning`s are logged rather than yielded.
+
 Create/rename/move/delete call `mailFolders`; root moves target
 `msgfolderroot`.
 

@@ -3,11 +3,12 @@ use std::time::SystemTime;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerId,
-    ContainerKind, DraftHandle, DraftPatch, ErrorScope, FolderRole, HydrationProjection, Identity,
-    IdentityId, Importance, LabelId, MailboxId, Message, MutationTarget, ObjectId, Page,
-    ProtocolErrorKind, ProtocolKind, Provenance, SearchFilter, SearchRequest, SendAs,
-    ThreadHydration, ThreadId, VacationConfig,
+    AccountError, AccountOperation, Address, AttachmentInline, Container, ContainerContentClass,
+    ContainerId, ContainerKind, ContainerNamespace, ContainerRights, DraftHandle, DraftPatch,
+    ErrorScope, FolderRole, HydrationProjection, Identity, IdentityId, Importance, LabelId,
+    MailboxId, Message, MutationTarget, ObjectId, Page, ProtocolErrorKind, ProtocolKind,
+    Provenance, SearchFilter, SearchRequest, SendAs, ThreadHydration, ThreadId, VacationConfig,
+    Warning, WarningKind,
 };
 use chrono::TimeZone;
 use serde::Deserialize;
@@ -645,10 +646,165 @@ pub(crate) async fn containers_list(account: GraphAccount) -> Result<Vec<Contain
             .map(|folder| (folder.id.clone(), folder.parent_folder_id.clone())),
     );
     let roles = well_known_folder_roles(&account).await;
-    Ok(folders
+    let mut containers: Vec<Container> = folders
         .into_iter()
-        .map(|folder| container_from_folder(folder, &roles))
-        .collect())
+        .map(|folder| container_from_folder(folder, &roles, None))
+        .collect();
+
+    // Shared (delegate) mailboxes, then public folders. Both are additive:
+    // a failure in either leg leaves the primary mailbox's containers intact.
+    let (shared, warnings) = shared_containers(&account).await;
+    containers.extend(shared);
+    // `containers_list` has no warning lane in the `Account` trait, so a
+    // per-mailbox degradation is logged here; the `Warning` values are built
+    // in the same shape the discovery path emits so the behavior stays
+    // testable.
+    for warning in &warnings {
+        tracing::warn!("[Graph] containers_list: {}", warning.message.as_str());
+    }
+    containers.extend(public_folder_containers(&account).await);
+    Ok(containers)
+}
+
+/// Enumerate each configured shared (delegate) mailbox's folders as
+/// `Shared`-namespace containers.
+///
+/// Each container's `native_id` is the foreign-encoded
+/// `encode_foreign(mailbox, folderId)` - byte-identical to the
+/// `CursorScope::FolderType` string `discover_cursor_scopes` emits for the
+/// same folder, which is what lets the consumer join a container to its sync
+/// scope - while `owner_local_id` keeps the bare Graph folder id for requests
+/// made against the owner's own mailbox.
+///
+/// A per-mailbox enumeration failure degrades to a `Warning` plus the
+/// remaining containers, matching the shape the discovery path already uses:
+/// one revoked share must not blank the whole sidebar.
+async fn shared_containers(account: &GraphAccount) -> (Vec<Container>, Vec<Warning>) {
+    let mut containers = Vec::new();
+    let mut warnings = Vec::new();
+    // Deterministic order so the projection is stable across calls.
+    let mut mailboxes: Vec<&String> = account.shared_clients.keys().collect();
+    mailboxes.sort();
+    for mailbox in mailboxes {
+        let client = &account.shared_clients[mailbox];
+        match client.list_mail_folders_recursive().await {
+            Ok(folders) => containers.extend(
+                folders
+                    .into_iter()
+                    // A shared mailbox's well-known folder ids are not the
+                    // primary's, so the primary role map must not be applied
+                    // here; role falls back to the well-known-name match.
+                    .map(|folder| container_from_folder(folder, &HashMap::new(), Some(mailbox))),
+            ),
+            Err(_) => warnings.push(Warning::support_only(
+                WarningKind::OperatorAttentionNeeded,
+                format!("shared mailbox {mailbox} skipped: folder listing failed"),
+            )),
+        }
+    }
+    (containers, warnings)
+}
+
+/// Project every discovered public folder as a `Public`-namespace container.
+///
+/// Reads the `routing_map` / `public_folder_meta` pair that
+/// `discover_public_folder_scopes` seeds, so this is purely local - no EWS
+/// round-trip. `SyncEngine::attach` drives scope discovery synchronously
+/// before any `containers_list` call, which is what makes the maps populated
+/// by the time this runs.
+///
+/// The full readable hierarchy projects here, including folders that are NOT
+/// pinned for sync: the consumer has to see a folder before it can decide to
+/// pin it.
+async fn public_folder_containers(account: &GraphAccount) -> Vec<Container> {
+    // Snapshot the routing keys and release that guard before taking the
+    // metadata one: the two maps are never held simultaneously.
+    let mut native_ids: Vec<String> = {
+        let routing = account.routing_map.read().await;
+        routing.keys().map(|folder| folder.0.clone()).collect()
+    };
+    // Deterministic order so the projection is stable across calls.
+    native_ids.sort();
+    let meta = account.public_folder_meta.read().await;
+    native_ids
+        .into_iter()
+        .map(|native| {
+            let meta = meta.get(&bifrost_types::FolderId(native.clone()));
+            let name = meta
+                .map(|meta| meta.display_name.clone())
+                .unwrap_or_else(|| native.clone());
+            Container::new(
+                ContainerId(native.clone()),
+                ContainerKind::Folder,
+                // A public folder plays no ratatoskr mailbox role: it is not
+                // anyone's Inbox / Sent / Trash.
+                None,
+                Provenance {
+                    provider: ProtocolKind::Graph,
+                    kind: ContainerKind::Folder,
+                    native: native.clone(),
+                },
+                name,
+                meta.and_then(|meta| meta.parent.clone())
+                    .map(|parent| ContainerId(parent.0)),
+            )
+            .with_namespace(ContainerNamespace::Public)
+            // A public folder is owned by the organization, not by a
+            // principal, so there is no owner mailbox to name and no
+            // owner-local id space to translate into.
+            .with_content_class(
+                meta.and_then(|meta| content_class_from_folder_class(meta.folder_class.as_deref())),
+            )
+            .with_rights(meta.map(|meta| rights_from_effective_rights(&meta.effective_rights)))
+        })
+        .collect()
+}
+
+/// Map an EWS `FolderClass` onto the unified [`ContainerContentClass`].
+///
+/// A public folder is typed at the folder level and a mail client must not
+/// present an `IPF.Appointment` folder as a mail folder. `None` when the
+/// server reported no class at all (distinct from
+/// `Some(ContainerContentClass::Other)`, which is "typed, but as something
+/// this surface does not model").
+fn content_class_from_folder_class(folder_class: Option<&str>) -> Option<ContainerContentClass> {
+    let class = folder_class?;
+    // The wire form is `IPF.Note`, `IPF.Note.Something`, `IPF.Appointment`,
+    // ...; match on the leading segment so a subtype does not fall to Other.
+    let normalized = class.trim().to_ascii_lowercase();
+    Some(if normalized.starts_with("ipf.note") {
+        ContainerContentClass::Mail
+    } else if normalized.starts_with("ipf.appointment") {
+        ContainerContentClass::Calendar
+    } else if normalized.starts_with("ipf.contact") {
+        ContainerContentClass::Contacts
+    } else {
+        ContainerContentClass::Other
+    })
+}
+
+/// Project EWS folder `EffectiveRights` onto the unified
+/// [`ContainerRights`].
+///
+/// Every member the EWS shape speaks to is `Some(_)`: the server answered,
+/// so an absent right is a definite "no". `may_submit` stays `None` - EWS
+/// folder rights say nothing about submission (a public folder has no
+/// submission address), and reporting `Some(false)` would claim knowledge the
+/// wire never provided.
+fn rights_from_effective_rights(rights: &crate::ews::EwsEffectiveRights) -> ContainerRights {
+    ContainerRights {
+        may_read_items: Some(rights.read),
+        may_add_items: Some(rights.create_contents),
+        may_remove_items: Some(rights.delete),
+        // EWS has no per-flag right; `Modify` is the whole item-mutation
+        // gate, so both keyword members map to it.
+        may_set_seen: Some(rights.modify),
+        may_set_keywords: Some(rights.modify),
+        may_create_child: Some(rights.create_hierarchy),
+        may_rename: Some(rights.modify),
+        may_delete: Some(rights.delete),
+        may_submit: None,
+    }
 }
 
 pub(crate) async fn container_create(
@@ -2005,39 +2161,57 @@ const WELL_KNOWN_FOLDERS: &[(&str, FolderRole)] = &[
     ("archive", FolderRole::Archive),
 ];
 
+/// Project one Graph mail folder onto a `Container`.
+///
+/// `owner` is `Some(mailbox)` for a shared (delegate) mailbox's folder,
+/// which namespaces the ids: `native_id` becomes the foreign-encoded form
+/// (byte-identical to the `CursorScope::FolderType` string discovery emits
+/// for the same folder) while `owner_local_id` keeps the bare Graph folder
+/// id. The parent is encoded in the same namespace, so a shared child never
+/// points at a same-id primary folder.
 fn container_from_folder(
     folder: GraphMailFolder,
     roles: &HashMap<String, FolderRole>,
+    owner: Option<&str>,
 ) -> Container {
     let role = roles
         .get(&folder.id)
         .copied()
         .or_else(|| role_from_well_known_name(&folder.id));
-    let id = ContainerId(folder.id.clone());
-    Container {
-        id: id.clone(),
-        kind: ContainerKind::Folder,
+    let native = match owner {
+        Some(mailbox) => super::foreign::encode_foreign(mailbox, &folder.id).0,
+        None => folder.id.clone(),
+    };
+    let parent = folder.parent_folder_id.map(|parent| {
+        ContainerId(match owner {
+            Some(mailbox) => super::foreign::encode_foreign(mailbox, &parent).0,
+            None => parent,
+        })
+    });
+    Container::new(
+        ContainerId(native.clone()),
+        ContainerKind::Folder,
         role,
-        provenance: Provenance {
+        Provenance {
             provider: ProtocolKind::Graph,
             kind: ContainerKind::Folder,
-            native: folder.id.clone(),
+            native: native.clone(),
         },
-        native_id: folder.id,
-        name: folder.display_name.unwrap_or_else(|| id.0.clone()),
-        parent: folder.parent_folder_id.map(ContainerId),
-        // Graph mail folders carry no container color (categories are
-        // message flags, not containers).
-        style: None,
-        // Graph is folder-shaped: well-known folders already map into
-        // `role`, so `role` fully determines folder-ness and there is
-        // no Gmail-style hidden split for `system` to surface.
-        system: false,
-        // Graph has no per-folder JMAP ACL or subscription model on
-        // this surface; only JMAP populates these.
-        rights: None,
-        is_subscribed: None,
-    }
+        folder.display_name.unwrap_or_else(|| native.clone()),
+        parent,
+    )
+    // Graph mail folders carry no container color (categories are message
+    // flags, not containers), and Graph is folder-shaped (well-known folders
+    // already map into `role`), so `style` and `system` keep their
+    // `Container::new` defaults. Graph REST exposes no per-folder ACL or
+    // subscription state on mail folders either; the EWS `EffectiveRights`
+    // that DO exist are a public-folder-only surface.
+    .with_namespace(match owner {
+        Some(_) => ContainerNamespace::Shared,
+        None => ContainerNamespace::Personal,
+    })
+    .with_owner(owner.map(|mailbox| MailboxId(mailbox.to_string())))
+    .with_owner_local_id(owner.map(|_| folder.id))
 }
 
 fn role_from_well_known_name(name: &str) -> Option<FolderRole> {
@@ -2148,6 +2322,197 @@ mod tests {
             PushMode::GraphSubscriptions,
             &["shared@contoso.com".to_string()],
         )
+    }
+
+    fn mail_folder(id: &str, parent: Option<&str>) -> GraphMailFolder {
+        serde_json::from_value(json!({
+            "id": id,
+            "displayName": "Reports",
+            "parentFolderId": parent,
+        }))
+        .expect("mail folder deserializes")
+    }
+
+    #[test]
+    fn shared_mailbox_folder_projects_as_shared_namespaced_container() {
+        let container = container_from_folder(
+            mail_folder("AAMkChild", Some("AAMkParent")),
+            &HashMap::new(),
+            Some("shared@contoso.com"),
+        );
+        assert_eq!(container.namespace, ContainerNamespace::Shared);
+        assert_eq!(
+            container.owner,
+            Some(MailboxId("shared@contoso.com".to_string()))
+        );
+        // `native_id` is the foreign-encoded form; `owner_local_id` is the
+        // bare Graph folder id, never the encoded one.
+        assert_eq!(
+            container.native_id,
+            encode_foreign("shared@contoso.com", "AAMkChild").0
+        );
+        assert_eq!(container.owner_local_id.as_deref(), Some("AAMkChild"));
+        assert_ne!(
+            container.owner_local_id.as_deref(),
+            Some(container.native_id.as_str())
+        );
+        // The parent is encoded in the same namespace.
+        assert_eq!(
+            container.parent,
+            Some(ContainerId(
+                encode_foreign("shared@contoso.com", "AAMkParent").0
+            ))
+        );
+        // Graph REST mail folders expose no ACL; only public folders do.
+        assert!(container.rights.is_none());
+        assert!(container.content_class.is_none());
+
+        // A primary folder stays personal and unqualified.
+        let primary = container_from_folder(
+            mail_folder("AAMkChild", Some("AAMkParent")),
+            &HashMap::new(),
+            None,
+        );
+        assert_eq!(primary.namespace, ContainerNamespace::Personal);
+        assert!(primary.owner.is_none());
+        assert!(primary.owner_local_id.is_none());
+        assert_eq!(primary.native_id, "AAMkChild");
+    }
+
+    /// A shared container's `native_id` must be byte-identical to the
+    /// `CursorScope::FolderType` string `discover_cursor_scopes` emits for
+    /// the same folder - that identity is the join key between a container
+    /// and its sync scope.
+    #[test]
+    fn shared_container_native_id_matches_discovered_cursor_scope() {
+        let container = container_from_folder(
+            mail_folder("AAMkChild", None),
+            &HashMap::new(),
+            Some("shared@contoso.com"),
+        );
+        // The exact expression `discover_cursor_scopes_inner` uses for a
+        // shared mailbox's folder.
+        let scope = CursorScope::FolderType {
+            folder: encode_foreign("shared@contoso.com", "AAMkChild"),
+            ty: ObjectType::Email,
+        };
+        assert_eq!(
+            scope,
+            CursorScope::FolderType {
+                folder: bifrost_types::FolderId(container.native_id.clone()),
+                ty: ObjectType::Email,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn public_folders_project_with_content_class_and_rights() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let routing = crate::account::cursor::PublicFolderRouting {
+            anchor_mailbox: "content@contoso.com".to_string(),
+            public_folder_mailbox: Some("pf@contoso.com".to_string()),
+        };
+        account
+            .seed_public_folder_meta_for_tests(
+                bifrost_types::FolderId("AAMkPF=".to_string()),
+                routing.clone(),
+                crate::account::public_folder::PublicFolderMeta {
+                    display_name: "Company Announcements".to_string(),
+                    folder_class: Some("IPF.Note".to_string()),
+                    parent: None,
+                    effective_rights: crate::ews::EwsEffectiveRights {
+                        create_associated: false,
+                        create_contents: false,
+                        create_hierarchy: false,
+                        delete: false,
+                        modify: false,
+                        read: true,
+                    },
+                },
+            )
+            .await;
+        account
+            .seed_public_folder_meta_for_tests(
+                bifrost_types::FolderId("AAMkCal=".to_string()),
+                routing,
+                crate::account::public_folder::PublicFolderMeta {
+                    display_name: "Team Calendar".to_string(),
+                    folder_class: Some("IPF.Appointment".to_string()),
+                    parent: Some(bifrost_types::FolderId("AAMkPF=".to_string())),
+                    effective_rights: crate::ews::EwsEffectiveRights {
+                        create_associated: true,
+                        create_contents: true,
+                        create_hierarchy: true,
+                        delete: true,
+                        modify: true,
+                        read: true,
+                    },
+                },
+            )
+            .await;
+
+        let containers = public_folder_containers(&account).await;
+        assert_eq!(containers.len(), 2);
+        let calendar = containers
+            .iter()
+            .find(|c| c.native_id == "AAMkCal=")
+            .expect("calendar public folder");
+        assert_eq!(calendar.namespace, ContainerNamespace::Public);
+        // A public folder has no owning principal.
+        assert!(calendar.owner.is_none());
+        assert!(calendar.owner_local_id.is_none());
+        assert_eq!(calendar.name, "Team Calendar");
+        assert_eq!(calendar.parent, Some(ContainerId("AAMkPF=".to_string())));
+        assert_eq!(
+            calendar.content_class,
+            Some(ContainerContentClass::Calendar)
+        );
+
+        // A read-only public folder is distinguishable from a writable one.
+        let mail = containers
+            .iter()
+            .find(|c| c.native_id == "AAMkPF=")
+            .expect("mail public folder");
+        assert_eq!(mail.content_class, Some(ContainerContentClass::Mail));
+        let read_only = mail.rights.as_ref().expect("rights projected");
+        assert_eq!(read_only.may_read_items, Some(true));
+        assert_eq!(read_only.may_add_items, Some(false));
+        assert_eq!(read_only.may_remove_items, Some(false));
+        assert_eq!(read_only.may_set_keywords, Some(false));
+        // EWS folder rights say nothing about submission.
+        assert_eq!(read_only.may_submit, None);
+        let writable = calendar.rights.as_ref().expect("rights projected");
+        assert_eq!(writable.may_add_items, Some(true));
+        assert_eq!(writable.may_create_child, Some(true));
+        assert_eq!(writable.may_delete, Some(true));
+    }
+
+    #[test]
+    fn folder_class_maps_onto_content_class() {
+        assert_eq!(
+            content_class_from_folder_class(Some("IPF.Note")),
+            Some(ContainerContentClass::Mail)
+        );
+        // A subtype must not fall through to Other.
+        assert_eq!(
+            content_class_from_folder_class(Some("IPF.Note.Microsoft.Oof.Log")),
+            Some(ContainerContentClass::Mail)
+        );
+        assert_eq!(
+            content_class_from_folder_class(Some("IPF.Appointment")),
+            Some(ContainerContentClass::Calendar)
+        );
+        assert_eq!(
+            content_class_from_folder_class(Some("IPF.Contact")),
+            Some(ContainerContentClass::Contacts)
+        );
+        assert_eq!(
+            content_class_from_folder_class(Some("IPF.Task")),
+            Some(ContainerContentClass::Other)
+        );
+        // Unreported is distinct from "typed as something we don't model".
+        assert_eq!(content_class_from_folder_class(None), None);
     }
 
     fn foreign_message_id(mailbox: &str, folder: &str, native: &str) -> ObjectId {

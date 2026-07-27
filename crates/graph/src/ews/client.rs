@@ -1,13 +1,16 @@
 use super::{
-    EWS_URL, EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_response_error,
-    check_soap_fault,
+    EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_response_error, check_soap_fault,
+    ews_url,
 };
 
 impl EwsClient {
-    pub(crate) fn new(net: bifrost_net::AccountNet) -> Self {
+    /// Build a client whose SOAP endpoint sits under `outlook_base` (the
+    /// client's Autodiscover/EWS origin, which honors the harness api-base
+    /// override).
+    pub(crate) fn new(net: bifrost_net::AccountNet, outlook_base: &str) -> Self {
         Self {
             net,
-            ews_url: EWS_URL.to_string(),
+            ews_url: ews_url(outlook_base),
         }
     }
 

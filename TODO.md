@@ -363,6 +363,45 @@ provider capability ratatoskr may eventually wire, currently rejected with
   decide whether IMAP honors `send_as` by translating it to a `from` override or
   whether it stays a deliberate `Unsupported`. Today: deliberate `Unsupported`.
 
+## Namespaced-container follow-ups
+
+Surfaced while landing the namespaced-container surface (shared-mailbox and
+public-folder containers, EWS public-folder hydration, allowlisted public-folder
+scopes). Each was deliberately out of that brick's scope; none blocks the
+container projection itself.
+
+- **nc-1 (types/all)** `Account::containers_list` has no warning lane. Its
+  signature is `Result<Vec<Container>, AccountError>`, so the per-mailbox
+  enumeration degradations the shared and foreign projections implement can
+  build a structured `Warning` but cannot yield it - graph logs it, jmap drops
+  it (that crate carries no logging dependency by design). The contract wants
+  "degrade to a warning plus the remaining containers", which is only half
+  expressible today. Widen to `(Vec<Container>, Vec<Warning>)` or route the
+  warnings onto a `SyncEvent` stream.
+- **nc-2 (graph)** `get_item_body` is message-shaped: it requests
+  `message:ToRecipients` and friends, so a mixed-class public folder hydrates
+  its mail correctly and then fails per item on `Contact` / `CalendarItem` with
+  `ErrorInvalidPropertyRequest`. The class is not knowable at request time from
+  a bare item id; thread `EwsItem.item_class` through from the inventory pass
+  and make the requested property shape conditional. Consumers that drop
+  non-mail scopes before hydration do not hit this.
+- **nc-3 (graph)** EWS `GetItem` fans out one request per item because the
+  per-folder routing headers differ. Items sharing a public folder could batch
+  into a single `<m:ItemIds>` list; worth doing once a pinned folder is large.
+- **nc-4 (graph)** `well_known_folder_roles` is only correct for the primary
+  mailbox, so shared-mailbox containers fall back to display-name matching and
+  their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
+  round-trips per shared mailbox; decide whether the roles are worth it.
+- **nc-5 (jmap/graph)** The mutation primitives were never taught the
+  foreign-qualified id form. Hydration and blob access now route to the owning
+  account, but a consumer handing a foreign-encoded id to `set_keyword` /
+  `bulk_move` / the other mutation entry points still misroutes to the primary
+  account. Required before a consumer can mutate shared-mailbox mail.
+- **nc-6 (jmap)** Hydration flushes its trailing per-target buffers in
+  `HashMap` iteration order, so batch ordering across routing targets is
+  nondeterministic. Per-item outcomes are unaffected; only the grouping order
+  varies.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

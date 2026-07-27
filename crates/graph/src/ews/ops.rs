@@ -10,10 +10,12 @@
 //! unit-pinnable without a live request.
 
 use super::xml_helpers::{is_distinguished_folder_id, xml_escape};
-use super::{EwsClient, EwsError, EwsFolder, EwsHeaders, EwsItem, FindItemsResult};
 use super::{
-    parse_find_folder_response, parse_find_items_response, parse_get_folder_response,
-    parse_get_item_response,
+    EwsAttachmentContent, EwsClient, EwsError, EwsFolder, EwsHeaders, EwsItem, FindItemsResult,
+};
+use super::{
+    parse_find_folder_response, parse_find_items_response, parse_get_attachment_response,
+    parse_get_folder_response, parse_get_item_response,
 };
 
 impl EwsClient {
@@ -58,20 +60,23 @@ impl EwsClient {
         parse_find_items_response(&xml)
     }
 
-    /// Fetch the full body + recipients of a single item. Part of the
-    /// read-ops foundation; the poll/inventory paths sync via
-    /// `find_items` (IdOnly), so `get_item` is unwired - consumed by
-    /// per-item hydration once that path lands.
+    /// Fetch the full body, headers, recipients, and attachment metadata of
+    /// a single item. This is the public-folder hydration read: a public
+    /// folder's items are raw EWS `ItemId`s that Graph REST
+    /// (`/me/messages/{id}`) cannot address at all, so the hydration path
+    /// dispatches here for a `Folder` scope present in the routing map.
+    /// `headers` carries the folder's `X-AnchorMailbox` /
+    /// `X-PublicFolderMailbox` routing pair.
     ///
     /// The request body is message-shaped (`get_item_body` asks for
     /// `message:ToRecipients`/`CcRecipients`), so it is only class-safe for
     /// `<t:Message>`: a real Contact/CalendarItem GetItem would return
-    /// `ErrorInvalidPropertyRequest`. Making the shape class-conditional is
-    /// deferred with the hydration wiring - `get_item` takes only an id, so
-    /// the class is not even known here yet. The parser tolerates all three
-    /// classes (see `parse_get_item_response`); that tolerance is not a
-    /// claim of operational non-mail GetItem support.
-    #[allow(dead_code)]
+    /// `ErrorInvalidPropertyRequest`. Making the shape class-conditional
+    /// needs the class at request time, which a bare id does not carry; a
+    /// mixed-class public folder therefore hydrates its mail items and fails
+    /// per-item on the others. The parser tolerates all three classes (see
+    /// `parse_get_item_response`); that tolerance is not a claim of
+    /// operational non-mail GetItem support.
     pub(crate) async fn get_item(
         &self,
         item_id: &str,
@@ -80,6 +85,21 @@ impl EwsClient {
         let body = get_item_body(item_id);
         let xml = self.execute(&body, headers).await?;
         parse_get_item_response(&xml)
+    }
+
+    /// Fetch one attachment's bytes. EWS has no byte-stream attachment
+    /// endpoint (unlike Graph REST's `/attachments/{id}/$value`), so the
+    /// content arrives base64-inline in the SOAP body and the parser decodes
+    /// it. `headers` carries the same public-folder routing pair as the
+    /// enclosing `GetItem`.
+    pub(crate) async fn get_attachment(
+        &self,
+        attachment_id: &str,
+        headers: &EwsHeaders,
+    ) -> Result<EwsAttachmentContent, EwsError> {
+        let body = get_attachment_body(attachment_id);
+        let xml = self.execute(&body, headers).await?;
+        parse_get_attachment_response(&xml)
     }
 }
 
@@ -173,10 +193,7 @@ fn find_items_body(folder_id: &str, since: Option<&str>, offset: u32, max_entrie
 }
 
 // Message-shaped: requests `message:ToRecipients`/`CcRecipients`, so this
-// body is only class-safe for `<t:Message>`. Non-mail GetItem is unwired
-// (sync runs through FindItem IdOnly); a class-conditional shape lands with
-// the per-item hydration path. See the `get_item` doc comment.
-#[allow(dead_code)]
+// body is only class-safe for `<t:Message>`. See the `get_item` doc comment.
 fn get_item_body(item_id: &str) -> String {
     let escaped_id = xml_escape(item_id);
     format!(
@@ -195,6 +212,20 @@ fn get_item_body(item_id: &str) -> String {
     <t:ItemId Id="{escaped_id}"/>
   </m:ItemIds>
 </m:GetItem>"#
+    )
+}
+
+fn get_attachment_body(attachment_id: &str) -> String {
+    let escaped_id = xml_escape(attachment_id);
+    format!(
+        r#"<m:GetAttachment>
+  <m:AttachmentShape>
+    <t:IncludeMimeContent>false</t:IncludeMimeContent>
+  </m:AttachmentShape>
+  <m:AttachmentIds>
+    <t:AttachmentId Id="{escaped_id}"/>
+  </m:AttachmentIds>
+</m:GetAttachment>"#
     )
 }
 
@@ -226,6 +257,24 @@ mod tests {
         let opaque = find_folder_body("AAMkAGFk=");
         assert!(opaque.contains(r#"<t:FolderId Id="AAMkAGFk="/>"#));
         assert!(!opaque.contains("DistinguishedFolderId"));
+    }
+
+    #[test]
+    fn get_item_body_requests_body_recipients_and_attachments() {
+        let body = get_item_body("AAMkItem=");
+        assert!(body.contains(r#"<t:ItemId Id="AAMkItem="/>"#));
+        assert!(body.contains(r#"FieldURI="item:Body""#));
+        assert!(body.contains(r#"FieldURI="item:Attachments""#));
+        assert!(body.contains(r#"FieldURI="message:ToRecipients""#));
+        assert!(body.contains(r#"FieldURI="message:CcRecipients""#));
+        assert!(body.contains("<t:BodyType>HTML</t:BodyType>"));
+    }
+
+    #[test]
+    fn get_attachment_body_names_the_attachment() {
+        let body = get_attachment_body("AAMkAtt=");
+        assert!(body.contains("<m:GetAttachment>"));
+        assert!(body.contains(r#"<t:AttachmentId Id="AAMkAtt="/>"#));
     }
 
     #[test]

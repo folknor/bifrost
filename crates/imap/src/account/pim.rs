@@ -6,7 +6,8 @@ use bifrost_types::compose::{
     Address, AttachmentHandle, DraftHandle, DraftPatch, IdentityId, SendRequest,
 };
 use bifrost_types::container::{
-    Container, ContainerId, ContainerKind, FolderRole, MutationTarget, Provenance,
+    Container, ContainerId, ContainerKind, ContainerNamespace, ContainerRights, FolderRole,
+    MutationTarget, Provenance,
 };
 use bifrost_types::hydration::{HydrationProjection, Importance, Message, ThreadHydration};
 use bifrost_types::ids::{ObjectId, ThreadId};
@@ -20,8 +21,8 @@ use bifrost_types::{
 use chrono::{DateTime, Datelike, Utc};
 
 use crate::types::{
-    FetchAttr, Flag, MailboxAttribute, MailboxName, SearchCriteria, StatusItem, StoreOperation,
-    ThreadNode,
+    AclRight, FetchAttr, Flag, MailboxAttribute, MailboxName, MailboxRights, SearchCriteria,
+    StatusItem, StoreOperation, ThreadNode,
 };
 
 use super::{
@@ -1607,33 +1608,87 @@ fn containers_snapshot(account: &ImapAccount) -> Vec<Container> {
         .entries()
         .into_iter()
         .map(|entry| {
-            let native = entry.name.as_str().to_owned();
-            Container {
-                id: ContainerId(native.clone()),
-                kind: ContainerKind::Folder,
-                role: folder_role(&entry.attributes, &native),
-                provenance: Provenance {
-                    provider: ProtocolKind::Imap,
-                    kind: ContainerKind::Folder,
-                    native: native.clone(),
-                },
-                native_id: native.clone(),
-                name: leaf_name(account, &entry.name),
-                parent: parent_id(entry.delimiter, &native),
-                // IMAP mailboxes carry no container color.
-                style: None,
-                // IMAP is folder-shaped: special-use folders already
-                // map into `role`, so `role` fully determines
-                // folder-ness and there is no Gmail-style hidden split
-                // for `system` to surface.
-                system: false,
-                // IMAP has no per-folder JMAP ACL or subscription model
-                // on this surface; only JMAP populates these.
-                rights: None,
-                is_subscribed: None,
-            }
+            let display_name = leaf_name(account, &entry.name);
+            container_from_folder_entry(&entry, display_name)
         })
         .collect()
+}
+
+/// Project one registry entry onto a `Container`. Pure over the entry plus
+/// the already-resolved display name (the only piece that needs the
+/// account, for INBOX aliasing), so the namespace / owner / rights
+/// projection is unit-pinnable without a live connection.
+///
+/// A shared/other-user folder is namespaced by its owning mailbox. IMAP has
+/// no separate per-owner id space - the full mailbox path IS the native id
+/// in every namespace - so `owner_local_id` is that same path, and
+/// `native_id` (which the cursor scope keys on) needs no re-encoding. That
+/// keeps `native_id` byte-identical to the `CursorScope::Folder` string
+/// `discover_cursor_scopes` emits for the same folder.
+fn container_from_folder_entry(
+    entry: &super::folder_registry::FolderEntry,
+    display_name: String,
+) -> Container {
+    let native = entry.name.as_str().to_owned();
+    let namespace = if entry.shared_owner.is_some() {
+        ContainerNamespace::Shared
+    } else {
+        ContainerNamespace::Personal
+    };
+    Container::new(
+        ContainerId(native.clone()),
+        ContainerKind::Folder,
+        folder_role(&entry.attributes, &native),
+        Provenance {
+            provider: ProtocolKind::Imap,
+            kind: ContainerKind::Folder,
+            native: native.clone(),
+        },
+        display_name,
+        parent_id(entry.delimiter, &native),
+    )
+    // IMAP mailboxes carry no container color, and IMAP is folder-shaped
+    // (special-use maps into `role`), so `style` and `system` keep their
+    // `Container::new` defaults.
+    .with_namespace(namespace)
+    .with_owner(entry.shared_owner.clone())
+    .with_owner_local_id(entry.shared_owner.as_ref().map(|_| native.clone()))
+    // RFC 4314 MYRIGHTS, captured at shared-folder discovery. `None` for a
+    // personal folder or a server without ACL.
+    .with_rights(entry.rights.as_ref().map(rights_from_myrights))
+}
+
+/// Project an RFC 4314 MYRIGHTS set onto the unified [`ContainerRights`].
+///
+/// Every member is `Some(_)`: once the server answered MYRIGHTS, the
+/// absence of a letter is a definite "no", not "unreported" (the
+/// unreported case is `FolderEntry::rights == None`, which never reaches
+/// here). The mapping follows RFC 4314 Section 4:
+///
+/// - `l`+`r` -> read (`l` is the visibility gate, `r` the access gate)
+/// - `i` -> add items (APPEND / COPY into)
+/// - `t` -> remove items (set `\Deleted`)
+/// - `s` -> persist `\Seen`
+/// - `w` -> set other flags/keywords
+/// - `k` (or the pre-4314 `c`) -> create a child mailbox
+/// - `x` (or the pre-4314 `d`) -> rename / delete the mailbox itself
+/// - `p` -> post to the mailbox's submission address
+fn rights_from_myrights(rights: &MailboxRights) -> ContainerRights {
+    let mailbox_admin =
+        rights.contains(AclRight::DeleteMailbox) || rights.contains(AclRight::DeleteLegacy);
+    ContainerRights {
+        may_read_items: Some(rights.can_read()),
+        may_add_items: Some(rights.contains(AclRight::Insert)),
+        may_remove_items: Some(rights.contains(AclRight::DeleteMessages)),
+        may_set_seen: Some(rights.contains(AclRight::Seen)),
+        may_set_keywords: Some(rights.contains(AclRight::Write)),
+        may_create_child: Some(
+            rights.contains(AclRight::CreateMailbox) || rights.contains(AclRight::CreateLegacy),
+        ),
+        may_rename: Some(mailbox_admin),
+        may_delete: Some(mailbox_admin),
+        may_submit: Some(rights.contains(AclRight::Post)),
+    }
 }
 
 fn folder_role(attributes: &[MailboxAttribute], name: &str) -> Option<FolderRole> {
@@ -1920,6 +1975,118 @@ fn pim_malformed(detail: impl Into<String>) -> AccountError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::super::folder_registry::{FolderRegistry, SharedFolderEntry};
+    use crate::types::MailboxInfo;
+
+    fn registry_with_shared(rights: Option<&str>) -> FolderRegistry {
+        let personal = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            delimiter: Some('/'),
+            ..Default::default()
+        };
+        let shared = MailboxInfo {
+            name: MailboxName::new("Shared/alice/Reports").expect("valid mailbox"),
+            delimiter: Some('/'),
+            ..Default::default()
+        };
+        FolderRegistry::from_lists(
+            vec![personal],
+            vec![SharedFolderEntry {
+                info: shared,
+                owner: bifrost_types::MailboxId("alice".to_owned()),
+                rights: rights.map(MailboxRights::parse),
+            }],
+        )
+    }
+
+    #[test]
+    fn container_projection_namespaces_shared_folder_and_leaves_personal_alone() {
+        let registry = registry_with_shared(Some("lr"));
+
+        let shared = registry
+            .get(&MailboxName::new("Shared/alice/Reports").expect("valid mailbox"))
+            .expect("shared entry");
+        let container = container_from_folder_entry(&shared, "Reports".to_owned());
+        assert_eq!(container.namespace, ContainerNamespace::Shared);
+        assert_eq!(
+            container.owner,
+            Some(bifrost_types::MailboxId("alice".to_owned()))
+        );
+        // IMAP's owner-local id is the full path: it is already the native
+        // id in the owner's namespace, and it matches the cursor-scope
+        // string byte for byte.
+        assert_eq!(
+            container.owner_local_id.as_deref(),
+            Some("Shared/alice/Reports")
+        );
+        assert_eq!(container.native_id, "Shared/alice/Reports");
+        // No provider types IMAP folders, so `content_class` stays None.
+        assert!(container.content_class.is_none());
+
+        let personal = registry
+            .get(&MailboxName::new("INBOX").expect("valid mailbox"))
+            .expect("personal entry");
+        let container = container_from_folder_entry(&personal, "INBOX".to_owned());
+        assert_eq!(container.namespace, ContainerNamespace::Personal);
+        assert!(container.owner.is_none());
+        assert!(container.owner_local_id.is_none());
+        // A personal folder was never MYRIGHTS-probed, so rights are
+        // unreported rather than "no rights".
+        assert!(container.rights.is_none());
+    }
+
+    /// The container's `native_id` must be byte-identical to the
+    /// `CursorScope::Folder` string discovery emits for the same folder -
+    /// that identity is what lets the consumer join a container to its
+    /// sync scope.
+    #[test]
+    fn container_native_id_matches_discovered_cursor_scope() {
+        let registry = registry_with_shared(Some("lr"));
+        for entry in registry.entries() {
+            let scope = super::super::folder_scope(&entry.name);
+            let container = container_from_folder_entry(&entry, "n/a".to_owned());
+            assert_eq!(
+                scope,
+                bifrost_types::CursorScope::Folder(bifrost_types::FolderId(
+                    container.native_id.clone()
+                )),
+                "container native_id must equal the emitted cursor scope string",
+            );
+        }
+    }
+
+    #[test]
+    fn myrights_projection_distinguishes_read_only_from_writable() {
+        // Read-only share: lookup + read only.
+        let read_only = rights_from_myrights(&MailboxRights::parse("lr"));
+        assert_eq!(read_only.may_read_items, Some(true));
+        assert_eq!(read_only.may_add_items, Some(false));
+        assert_eq!(read_only.may_remove_items, Some(false));
+        assert_eq!(read_only.may_set_seen, Some(false));
+        assert_eq!(read_only.may_set_keywords, Some(false));
+        assert_eq!(read_only.may_create_child, Some(false));
+        assert_eq!(read_only.may_rename, Some(false));
+        assert_eq!(read_only.may_delete, Some(false));
+        assert_eq!(read_only.may_submit, Some(false));
+
+        // Full share.
+        let full = rights_from_myrights(&MailboxRights::parse("lrswipkxtea"));
+        assert_eq!(full.may_read_items, Some(true));
+        assert_eq!(full.may_add_items, Some(true));
+        assert_eq!(full.may_remove_items, Some(true));
+        assert_eq!(full.may_set_seen, Some(true));
+        assert_eq!(full.may_set_keywords, Some(true));
+        assert_eq!(full.may_create_child, Some(true));
+        assert_eq!(full.may_rename, Some(true));
+        assert_eq!(full.may_delete, Some(true));
+        assert_eq!(full.may_submit, Some(true));
+
+        // The pre-4314 virtual rights map onto the same members.
+        let legacy = rights_from_myrights(&MailboxRights::parse("lrcd"));
+        assert_eq!(legacy.may_create_child, Some(true));
+        assert_eq!(legacy.may_delete, Some(true));
+    }
 
     #[test]
     fn importance_high_sets_keyword_others_clear() {

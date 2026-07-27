@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -12,14 +14,40 @@ use crate::email::{EmailGet, EmailId, Property};
 
 type MailAccount = crate::account::Account<crate::transport_reqwest::ReqwestTransport>;
 
+/// Resolve the JMAP `accountId` a foreign-qualified id belongs to.
+///
+/// Blob download is accountId-scoped (`/download/{accountId}/{blobId}`), so
+/// a foreign (shared/delegate) blob must be requested under its OWNING
+/// account - the primary account's download URL would 404 on a blob it does
+/// not own. `Some((accountId, native))` when the id was qualified by the
+/// foreign inventory projection AND that account is still reachable;
+/// `None` for a primary id (or an id naming an account that vanished, which
+/// falls back to the primary account so the miss surfaces as a real 404
+/// rather than a fabricated local error). Pure so the selection is
+/// unit-pinnable without a live session.
+pub(crate) fn foreign_split<F>(id: &str, is_registered: F) -> Option<(&str, &str)>
+where
+    F: Fn(&str) -> bool,
+{
+    super::foreign::parse_object(id).filter(|(account, _)| is_registered(account))
+}
+
 pub(crate) fn open(
     client: Client,
     account_id: AccountId,
+    foreign_accounts: Arc<HashMap<String, MailAccount>>,
     handle: BlobHandle,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
         let started = Instant::now();
-        let mut blob = BlobRef::new(account_id, BlobId::new(handle.id.0));
+        // A foreign-qualified blob id names its owning account; download
+        // under that account, with the native blobId on the wire.
+        let (account_id, native_blob) =
+            match foreign_split(&handle.id.0, |account| foreign_accounts.contains_key(account)) {
+                Some((account, native)) => (AccountId::new(account), native.to_string()),
+                None => (account_id, handle.id.0.clone()),
+            };
+        let mut blob = BlobRef::new(account_id, BlobId::new(native_blob));
         if let Some(content_type) = handle.content_type {
             blob = blob.with_content_type(content_type);
         }
@@ -56,14 +84,31 @@ pub(crate) fn open_raw_rfc822(
     client: Client,
     account_id: AccountId,
     mail: MailAccount,
+    foreign_accounts: Arc<HashMap<String, MailAccount>>,
     message: ObjectId,
 ) -> AccountStream<SyncEvent<bytes::Bytes>> {
     Box::pin(async_stream::stream! {
         let started = Instant::now();
+        // A foreign-qualified message id routes BOTH legs (the `Email/get`
+        // for the whole-message blobId and the blob download) to the owning
+        // account. Routing only one of them would fetch a blobId from one
+        // account and download it from another.
+        let (account_id, mail, native_message) =
+            match foreign_split(&message.0, |account| foreign_accounts.contains_key(account)) {
+                Some((account, native)) => (
+                    AccountId::new(account),
+                    foreign_accounts
+                        .get(account)
+                        .cloned()
+                        .expect("foreign_split only returns a registered account"),
+                    native.to_string(),
+                ),
+                None => (account_id, mail, message.0.clone()),
+            };
         let response = match mail
             .call(
                 EmailGet::new()
-                    .ids([EmailId::new(message.0.clone())])
+                    .ids([EmailId::new(native_message)])
                     .properties([Property::BlobId]),
             )
             .await
@@ -168,4 +213,32 @@ pub(crate) fn open_range(
             "JMAP ranged blob download needs a Range-capable transport hook",
         );
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::foreign_split;
+
+    #[test]
+    fn foreign_blob_id_selects_the_owning_account() {
+        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
+        let is_registered = |account: &str| registered.contains(account);
+
+        let foreign = super::super::foreign::encode_object("acct-9", "B1");
+        // The download runs under the FOREIGN accountId with the native
+        // blobId on the wire.
+        assert_eq!(
+            foreign_split(&foreign, is_registered),
+            Some(("acct-9", "B1"))
+        );
+
+        // A bare (primary) id keeps the primary account.
+        assert_eq!(foreign_split("B1", is_registered), None);
+        // An id naming an unreachable account falls back to primary, so the
+        // miss surfaces as a real download 404.
+        let gone = super::super::foreign::encode_object("acct-gone", "B1");
+        assert_eq!(foreign_split(&gone, is_registered), None);
+    }
 }

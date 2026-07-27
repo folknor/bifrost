@@ -106,8 +106,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bifrost_types::{
     AccountOperation, AccountStream, Change, ChangeCursor, Checkpoint, CursorScope, ErrorScope,
     Fingerprint, FolderId, InventoryEntry, MailboxId, MembershipScope, ObjectChange,
-    ObjectChangeKind, ObjectId, PageBoundary, ScopeChange, ScopeChangeKind, ServerVersion,
-    SyncEvent, Warning, WarningKind,
+    ObjectChangeKind, PageBoundary, ScopeChange, ScopeChangeKind, ServerVersion, SyncEvent,
+    Warning, WarningKind,
 };
 
 use super::GraphAccount;
@@ -131,6 +131,71 @@ const PUBLIC_FOLDER_PAGE_SIZE: u32 = 100;
 /// forever (or saturates the offset at `u32::MAX`), which would
 /// otherwise spin the page loop indefinitely.
 const PUBLIC_FOLDER_PAGE_CAP: usize = 1_000;
+
+/// Which public folders this account actually SYNCS.
+///
+/// An organization can carry thousands of public folders holding millions
+/// of items, so "discovered" and "synced" must be separate decisions:
+/// discovery always browses and seeds the full readable hierarchy (that is
+/// what makes the folders visible in `containers_list`), but only the
+/// folders named here get a `CursorScope::Folder` and therefore a cursor,
+/// an inventory pass, and a poll.
+///
+/// `#[non_exhaustive]`, so construct through [`PublicFolderScope::hierarchy_only`]
+/// / [`PublicFolderScope::pinned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PublicFolderScope {
+    /// Browse and project the hierarchy, sync nothing. The consumer sees
+    /// every readable public folder and can pin one later.
+    HierarchyOnly,
+    /// Sync exactly these folders (by native EWS folder id). A folder not
+    /// in the list is still discovered and projected, but never synced.
+    Pinned(Vec<bifrost_types::FolderId>),
+}
+
+impl PublicFolderScope {
+    /// Project the hierarchy without syncing any folder's items.
+    // pub: the default-safe public-folder opt-in.
+    #[must_use]
+    pub fn hierarchy_only() -> Self {
+        Self::HierarchyOnly
+    }
+
+    /// Sync only the named folders.
+    // pub: consumers pin the public folders they want synced.
+    #[must_use]
+    pub fn pinned(folders: impl IntoIterator<Item = bifrost_types::FolderId>) -> Self {
+        Self::Pinned(folders.into_iter().collect())
+    }
+
+    /// Whether this folder may emit a cursor scope (i.e. be synced).
+    fn syncs(&self, folder: &FolderId) -> bool {
+        match self {
+            Self::HierarchyOnly => false,
+            Self::Pinned(pinned) => pinned.contains(folder),
+        }
+    }
+}
+
+/// Projection metadata for a discovered public folder, seeded alongside the
+/// routing map so `containers_list` can render the hierarchy without
+/// re-browsing EWS.
+///
+/// Deliberately separate from `PublicFolderRouting`: routing is serialized
+/// into the opaque cursor payload, so adding display fields to it would tick
+/// the cursor schema for data the sync loop never reads.
+#[derive(Debug, Clone)]
+pub(crate) struct PublicFolderMeta {
+    pub(crate) display_name: String,
+    /// The EWS `FolderClass` (`IPF.Note`, `IPF.Appointment`, ...), when the
+    /// server reported one.
+    pub(crate) folder_class: Option<String>,
+    /// The parent folder in the public hierarchy, or `None` directly under
+    /// the public-folders root.
+    pub(crate) parent: Option<FolderId>,
+    pub(crate) effective_rights: crate::ews::EwsEffectiveRights,
+}
 
 /// Defensive cap on the number of `FindFolder` browse calls during
 /// hierarchy discovery. A public-folder hierarchy is a tree, so this
@@ -426,13 +491,18 @@ fn apply_cap(candidate: Vec<String>, was_degraded: bool) -> (Vec<String>, bool, 
 /// Project an `EwsItem` to an inventory entry, owner-tagged with both
 /// the public folder and its content mailbox (the A5a owner-tag
 /// pattern, so the consumer maps the scope to its public owner).
+///
+/// The id is folder-qualified (`encode_public_item_id`): a raw EWS `ItemId`
+/// carries no hint of where it lives, so an unqualified id would reach
+/// `get_stream` / `open_blob` with nothing to route on and fall through to
+/// the Graph REST arm, which cannot address an EWS item at all.
 pub(crate) fn item_to_inventory_entry(
     item: &EwsItem,
     folder: &FolderId,
     content_mailbox: &str,
 ) -> InventoryEntry {
     InventoryEntry {
-        id: ObjectId(item.item_id.clone()),
+        id: super::foreign::encode_public_item_id(folder, &item.item_id),
         memberships: vec![
             MembershipScope::Folder(folder.clone()),
             MembershipScope::Mailbox(MailboxId(content_mailbox.to_string())),
@@ -489,18 +559,23 @@ fn unhandled_classes_warning(folder_id: &str, unhandled: &[String]) -> Option<Wa
 /// inventory pass assigns - the `Folder` scope and the content-mailbox
 /// owner tag (the A5a pattern the engine's covering rule cannot
 /// synthesize).
+///
+/// The emitted id is folder-qualified, identical to what the inventory
+/// projection mints for the same item, so a changed item hydrates through
+/// the EWS arm exactly like a backfilled one.
 fn emit_item_added(changes: &mut Vec<Change>, item_id: &str, folder: &FolderId, owner: &MailboxId) {
+    let id = super::foreign::encode_public_item_id(folder, item_id);
     changes.push(Change::ObjectChange(ObjectChange {
-        id: ObjectId(item_id.to_string()),
+        id: id.clone(),
         kind: ObjectChangeKind::Updated,
     }));
     changes.push(Change::ScopeChange(ScopeChange {
-        id: ObjectId(item_id.to_string()),
+        id: id.clone(),
         membership: MembershipScope::Folder(folder.clone()),
         kind: ScopeChangeKind::Added,
     }));
     changes.push(Change::ScopeChange(ScopeChange {
-        id: ObjectId(item_id.to_string()),
+        id,
         membership: MembershipScope::Mailbox(owner.clone()),
         kind: ScopeChangeKind::Added,
     }));
@@ -513,8 +588,11 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-fn ews_client(account: &GraphAccount) -> Option<EwsClient> {
-    account.client.account_net().map(EwsClient::new)
+pub(crate) fn ews_client(account: &GraphAccount) -> Option<EwsClient> {
+    account
+        .client
+        .account_net()
+        .map(|net| EwsClient::new(net, account.client.outlook_base()))
 }
 
 /// The result of walking a folder's `FindItem` pages.
@@ -611,18 +689,31 @@ fn incomplete_walk_error(folder_id: &str) -> EwsError {
 
 // ── Discovery ───────────────────────────────────────────────
 
-/// Browse the public-folder hierarchy and emit a `CursorScope::Folder`
-/// per readable leaf-and-branch folder, seeding `routing_map` with each
-/// folder's content-mailbox routing. Opt-in (`with_public_folders`); a
-/// per-folder Autodiscover/permission failure is skipped with a scoped
-/// warning, never a discovery-wide failure (A5a per-mailbox robustness).
+/// Browse the public-folder hierarchy, seeding `routing_map` (content-mailbox
+/// routing) and `public_folder_meta` (display name, folder class, parent,
+/// effective rights) for every readable folder, and emit a
+/// `CursorScope::Folder` ONLY for the folders the configured
+/// [`PublicFolderScope`] allows.
 ///
-/// Returns the discovered scopes plus any warnings. On a routing-
-/// resolution failure (no public-folder hierarchy at all) the whole
-/// public-folder leg is skipped with a single warning - the primary and
-/// shared mailboxes still discover.
+/// The browse/seed half is deliberately unconditional: `containers_list`
+/// projects the full readable hierarchy off these two maps, so a consumer can
+/// see (and later pin) a folder it is not yet syncing. The scope half is
+/// allowlisted, because an organization can carry thousands of public folders
+/// holding millions of items and syncing all of them uninvited is exactly the
+/// defect a silently-permissive default produces.
+///
+/// Both maps are filled here, synchronously under `SyncEngine::attach`'s
+/// discovery call, which is what makes them populated by the time
+/// `containers_list` runs. Do not defer either seeding to a lazier point.
+///
+/// Opt-in (`with_public_folders`); a per-folder Autodiscover/permission
+/// failure is skipped with a scoped warning, never a discovery-wide failure
+/// (A5a per-mailbox robustness). On a routing-resolution failure (no
+/// public-folder hierarchy at all) the whole public-folder leg is skipped with
+/// a single warning - the primary and shared mailboxes still discover.
 pub(crate) async fn discover_public_folder_scopes(
     account: &GraphAccount,
+    scope_policy: &PublicFolderScope,
 ) -> (Vec<CursorScope>, Vec<Warning>) {
     let mut scopes = Vec::new();
     let mut warnings = Vec::new();
@@ -678,6 +769,10 @@ pub(crate) async fn discover_public_folder_scopes(
         if !visited.insert(parent_id.clone()) {
             continue;
         }
+        // The root is a distinguished id, not a real folder, so a child of
+        // it has no projectable parent container.
+        let parent_container =
+            (parent_id != "publicfoldersroot").then(|| FolderId(parent_id.clone()));
         steps += 1;
         if steps > PUBLIC_FOLDER_BROWSE_STEP_CAP {
             warnings.push(Warning::support_only(
@@ -717,13 +812,17 @@ pub(crate) async fn discover_public_folder_scopes(
             match resolve_content_routing(account, &ews, &folder, &hierarchy_headers, &domain).await
             {
                 Ok(content_routing) => {
-                    let folder_id = FolderId(folder.folder_id.clone());
-                    account
-                        .routing_map
-                        .write()
-                        .await
-                        .insert(folder_id.clone(), content_routing);
-                    scopes.push(CursorScope::Folder(folder_id));
+                    if let Some(scope) = seed_and_scope(
+                        account,
+                        scope_policy,
+                        &folder,
+                        parent_container.clone(),
+                        content_routing,
+                    )
+                    .await
+                    {
+                        scopes.push(scope);
+                    }
                 }
                 Err(()) => {
                     warnings.push(Warning::support_only(
@@ -739,6 +838,39 @@ pub(crate) async fn discover_public_folder_scopes(
     }
 
     (scopes, warnings)
+}
+
+/// Seed one discovered public folder into BOTH discovery maps and decide
+/// whether it becomes a cursor scope.
+///
+/// The seeding is unconditional (that is what makes the folder visible in
+/// `containers_list`); only the scope is allowlisted. Split out of the browse
+/// loop so the seed-vs-sync split is unit-pinnable without a live EWS server.
+async fn seed_and_scope(
+    account: &GraphAccount,
+    scope_policy: &PublicFolderScope,
+    folder: &EwsFolder,
+    parent: Option<FolderId>,
+    routing: PublicFolderRouting,
+) -> Option<CursorScope> {
+    let folder_id = FolderId(folder.folder_id.clone());
+    account
+        .routing_map
+        .write()
+        .await
+        .insert(folder_id.clone(), routing);
+    account.public_folder_meta.write().await.insert(
+        folder_id.clone(),
+        PublicFolderMeta {
+            display_name: folder.display_name.clone(),
+            folder_class: folder.folder_class.clone(),
+            parent,
+            effective_rights: folder.effective_rights.clone(),
+        },
+    );
+    scope_policy
+        .syncs(&folder_id)
+        .then_some(CursorScope::Folder(folder_id))
 }
 
 /// Resolve a single public folder's content-mailbox routing: fetch its
@@ -1024,8 +1156,10 @@ fn reduce_public_folder_poll(
         // deletion diff and emits no Destroyed.
         if !pf.degraded {
             for gone in deleted_ids(&pf.live_ids, &scan_set) {
+                // Same folder-qualified id form the additions use, so the
+                // consumer's destroy matches the id it stored.
                 changes.push(Change::ObjectChange(ObjectChange {
-                    id: ObjectId(gone),
+                    id: super::foreign::encode_public_item_id(&folder, &gone),
                     kind: ObjectChangeKind::Destroyed,
                 }));
             }
@@ -1247,7 +1381,16 @@ mod tests {
             item_class: "IPM.Note".to_string(),
             to_recipients: Vec::new(),
             cc_recipients: Vec::new(),
+            attachments: Vec::new(),
         }
+    }
+
+    /// The folder-qualified `ObjectId` the emission path mints for a native
+    /// EWS item id in the test folder. Emissions carry the folder so the
+    /// hydration path can route the item onto EWS `GetItem`; the cursor's
+    /// own `live_ids` / `boundary_ids` stay native.
+    fn emitted_id(native: &str) -> bifrost_types::ObjectId {
+        super::super::foreign::encode_public_item_id(&FolderId("AAMkPF=".to_string()), native)
     }
 
     fn cursor(
@@ -1514,11 +1657,11 @@ mod tests {
                 assert!(changes.iter().any(|c| matches!(
                     c,
                     Change::ObjectChange(o)
-                        if o.id == ObjectId("fresh".to_string())
+                        if o.id == emitted_id("fresh")
                             && matches!(o.kind, ObjectChangeKind::Updated)
                 )));
                 assert!(!changes.iter().any(|c| matches!(
-                    c, Change::ObjectChange(o) if o.id == ObjectId("known".to_string())
+                    c, Change::ObjectChange(o) if o.id == emitted_id("known")
                 )));
                 assert!(cursor.live_ids.contains(&"fresh".to_string()));
                 *cursor
@@ -1573,7 +1716,7 @@ mod tests {
             .iter()
             .filter(|c| match c {
                 Change::ObjectChange(o) => {
-                    o.id == ObjectId(id.to_string())
+                    o.id == emitted_id(id)
                         && matches!(o.kind, ObjectChangeKind::Destroyed) == destroyed
                 }
                 _ => false,
@@ -1999,6 +2142,62 @@ mod tests {
         }
     }
 
+    /// `HierarchyOnly` emits zero cursor scopes and a one-element `Pinned`
+    /// list emits exactly one - but BOTH seed the routing map (and the
+    /// projection metadata) for every discovered folder, so
+    /// `containers_list` shows the whole readable hierarchy either way. An
+    /// organization can carry thousands of public folders; discovering one
+    /// must never imply syncing it.
+    #[tokio::test]
+    async fn scope_policy_gates_cursor_scopes_but_never_the_routing_map() {
+        use super::super::{GraphAccount, PushMode};
+        use crate::client::GraphClient;
+
+        let routing = PublicFolderRouting {
+            anchor_mailbox: "content@contoso.com".to_string(),
+            public_folder_mailbox: Some("pf@contoso.com".to_string()),
+        };
+        let discovered = [folder("AAMkPF1=", true), folder("AAMkPF2=", true)];
+
+        for (policy, expected_scopes) in [
+            (PublicFolderScope::hierarchy_only(), Vec::new()),
+            (
+                PublicFolderScope::pinned([FolderId("AAMkPF2=".to_string())]),
+                vec![CursorScope::Folder(FolderId("AAMkPF2=".to_string()))],
+            ),
+        ] {
+            let account =
+                GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+            let mut scopes = Vec::new();
+            for entry in &discovered {
+                if let Some(scope) =
+                    seed_and_scope(&account, &policy, entry, None, routing.clone()).await
+                {
+                    scopes.push(scope);
+                }
+            }
+            assert_eq!(scopes, expected_scopes, "policy {policy:?}");
+            // Both folders are routable and projectable under either policy.
+            assert_eq!(
+                account.routing_map.read().await.len(),
+                2,
+                "policy {policy:?}"
+            );
+            assert_eq!(
+                account.public_folder_meta.read().await.len(),
+                2,
+                "policy {policy:?}"
+            );
+            assert!(
+                account
+                    .public_folder_routing(&FolderId("AAMkPF1=".to_string()))
+                    .await
+                    .is_some(),
+                "an unpinned folder is still routable so it can project",
+            );
+        }
+    }
+
     #[test]
     fn discovery_skips_unreadable_public_folder() {
         let folders = vec![folder("readable", true), folder("denied", false)];
@@ -2015,7 +2214,12 @@ mod tests {
             &folder,
             "content@contoso.com",
         );
-        assert_eq!(entry.id, ObjectId("x".to_string()));
+        // The entry id is folder-qualified so hydration can route the item
+        // onto EWS `GetItem` (Graph REST cannot address an EWS ItemId).
+        assert_eq!(entry.id, emitted_id("x"));
+        let parsed = super::super::foreign::parse_message_id(&entry.id);
+        assert_eq!(parsed.public_folder(), Some("AAMkPF="));
+        assert_eq!(parsed.native_id(), "x");
         assert!(
             entry
                 .memberships

@@ -116,7 +116,7 @@ mod tests {
     use bifrost_types::{CursorScope, FolderId, MailboxId, ObjectType, SyncEvent};
     use futures::StreamExt;
 
-    use super::super::folder_registry::FolderRegistry;
+    use super::super::folder_registry::{FolderRegistry, SharedFolderEntry};
     use super::super::folder_scope;
     use super::super::test_support::{StubAccount, stub_arc};
     use super::{fan_in_discovery, memberships_for_entry};
@@ -138,10 +138,11 @@ mod tests {
     fn discover_memberships_tags_shared_folder_with_mailbox() {
         let registry = FolderRegistry::from_lists(
             vec![mailbox_info("INBOX")],
-            vec![(
-                mailbox_info("Shared/alice/INBOX"),
-                MailboxId("alice".to_string()),
-            )],
+            vec![SharedFolderEntry {
+                info: mailbox_info("Shared/alice/INBOX"),
+                owner: MailboxId("alice".to_string()),
+                rights: None,
+            }],
         );
 
         let mut personal = None;
@@ -175,10 +176,11 @@ mod tests {
     async fn discover_cursor_scopes_includes_shared_folder_scope() {
         let registry = FolderRegistry::from_lists(
             vec![mailbox_info("INBOX")],
-            vec![(
-                mailbox_info("Shared/alice/INBOX"),
-                MailboxId("alice".to_string()),
-            )],
+            vec![SharedFolderEntry {
+                info: mailbox_info("Shared/alice/INBOX"),
+                owner: MailboxId("alice".to_string()),
+                rights: None,
+            }],
         );
         let folder_scopes: Vec<CursorScope> = registry
             .entries()

@@ -86,12 +86,162 @@ pub(crate) fn get_stream(
     })
 }
 
-/// Project a Graph `/$batch` response into `ItemOutcome` envelopes.
-/// Per-item 2xx hydrate; per-item 4xx/5xx emit `ItemOutcome::Failed`
-/// with a structured `AccountError` (Protocol::Graph, AttemptCause
-/// Acknowledged, classified `RecoveryClass`). Locally-invalid items
-/// (no body where one is required) also emit `Failed` rather than
-/// poisoning the rest of the batch.
+/// Split a hydration chunk into the ids that must be read over EWS
+/// `GetItem` and the ids that go through the Graph REST `$batch`.
+///
+/// A public-folder item is a raw EWS `ItemId` carried inside a
+/// folder-qualified `ObjectId`; Graph REST has no route that can address it
+/// (`/me/messages/{ItemId}` 404s), so before this split every public-folder
+/// item hydrated as `Failed`. Membership in the routing map is the
+/// discriminator - a folder-qualified id whose folder was never discovered
+/// falls back to the REST arm, which reports the real miss rather than a
+/// fabricated local error.
+async fn partition_ews_ids(
+    account: &GraphAccount,
+    ids: &[ObjectId],
+) -> (Vec<(ObjectId, FolderId)>, Vec<ObjectId>) {
+    let mut ews = Vec::new();
+    let mut rest = Vec::new();
+    for id in ids {
+        match super::foreign::parse_message_id(id).public_folder() {
+            Some(folder) => {
+                let folder = FolderId(folder.to_string());
+                if account.public_folder_routing(&folder).await.is_some() {
+                    ews.push((id.clone(), folder));
+                } else {
+                    rest.push(id.clone());
+                }
+            }
+            None => rest.push(id.clone()),
+        }
+    }
+    (ews, rest)
+}
+
+/// Hydrate the public-folder ids of a chunk through EWS `GetItem`, one
+/// request per item (EWS `GetItem` takes an id list, but each id can sit in
+/// a different public folder with a different routing header pair, so the
+/// per-folder routing is what forces the fan-out).
+async fn fetch_ews_outcomes(
+    account: &GraphAccount,
+    ids: &[(ObjectId, FolderId)],
+    projection: Projection,
+) -> Vec<ItemOutcome<HydratedObject>> {
+    let mut outcomes = Vec::new();
+    for (id, folder) in ids {
+        let batch_id = BatchItemId(id.0.clone());
+        let Some(routing) = account.public_folder_routing(folder).await else {
+            // Raced with a routing-map eviction; report it per item rather
+            // than poisoning the rest of the chunk.
+            outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                batch_id,
+                super::graph_error::protocol_violation(
+                    bifrost_types::ProtocolErrorKind::MissingField,
+                    AccountOperation::Hydrate,
+                    Some(ErrorScope::Message { id: id.0.clone() }),
+                    format!("public folder {} has no routing entry", folder.0),
+                ),
+            )));
+            continue;
+        };
+        let Some(ews) = super::public_folder::ews_client(account) else {
+            outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                batch_id,
+                super::graph_error::ews_error_to_account_error(
+                    crate::ews::EwsError::Transport(bifrost_net::Error::Network {
+                        message: "EWS account net not attached".to_string(),
+                        transmission_state: bifrost_types::TransmissionState::Unsent,
+                        source: None,
+                    }),
+                    GraphErrorContext::ews(AccountOperation::Hydrate)
+                        .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                ),
+            )));
+            continue;
+        };
+        let native = super::foreign::parse_message_id(id).native_id().to_string();
+        match ews.get_item(&native, &routing.headers()).await {
+            Ok(item) => outcomes.push(ItemOutcome::Succeeded(BatchSuccess::new(
+                batch_id,
+                hydrated_from_ews_item(
+                    id.clone(),
+                    &item,
+                    folder,
+                    &routing.anchor_mailbox,
+                    projection,
+                ),
+            ))),
+            Err(error) => outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                batch_id,
+                super::graph_error::ews_error_to_account_error(
+                    error,
+                    GraphErrorContext::ews(AccountOperation::Hydrate)
+                        .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                ),
+            ))),
+        }
+    }
+    outcomes
+}
+
+/// Project an EWS `GetItem` result into the SAME `HydratedObject` shape the
+/// Graph REST arm returns.
+///
+/// `Metadata` reuses the public-folder inventory projection, so a hydrated
+/// item is byte-identical to its inventory entry (same id, same memberships,
+/// same change-key fingerprint). The body-bearing projections degrade to
+/// `Metadata` for the same reason the REST arm does: `HydratedObjectKind` can
+/// only carry assembled RFC822 in `RawMime`, and an EWS `GetItem` returns a
+/// parsed HTML body, not MIME octets - minting it as `RawMime` would violate
+/// that contract. Attachment DESCRIPTORS still ride out as blob handles, so
+/// the consumer can pull the bytes through `open_blob`.
+///
+/// Pure over the already-fetched item, so the projection is unit-pinnable
+/// without a live EWS server.
+pub(crate) fn hydrated_from_ews_item(
+    id: ObjectId,
+    item: &crate::ews::EwsItem,
+    folder: &FolderId,
+    content_mailbox: &str,
+    projection: Projection,
+) -> HydratedObject {
+    let kind = match projection {
+        Projection::FlagsOnly => HydratedObjectKind::FlagsOnly(ews_flags(item)),
+        _ => HydratedObjectKind::Metadata(super::public_folder::item_to_inventory_entry(
+            item,
+            folder,
+            content_mailbox,
+        )),
+    };
+    let blobs = item
+        .attachments
+        .iter()
+        .map(|attachment| super::blob::blob_handle_from_ews_attachment(&id, attachment))
+        .collect();
+    HydratedObject { id, kind, blobs }
+}
+
+/// The canonical flag set an EWS item carries. EWS surfaces only the
+/// read/unread bit on this shape (no categories, no flag status), so
+/// `\seen` is the whole vocabulary.
+fn ews_flags(item: &crate::ews::EwsItem) -> HashSet<String> {
+    let mut flags = HashSet::new();
+    if item.is_read {
+        flags.insert("\\seen".to_string());
+    }
+    flags
+}
+
+/// Project a hydration chunk into `ItemOutcome` envelopes.
+///
+/// Public-folder ids are served by EWS `GetItem`, everything else by the
+/// Graph `/$batch`; both arms land in ONE `Batch` so the consumer still sees
+/// exactly one outcome per pulled id. Per-item 2xx hydrate; per-item 4xx/5xx
+/// (or an EWS SOAP fault) emit `ItemOutcome::Failed` with a structured
+/// `AccountError` (Protocol::Graph / Protocol::Ews, AttemptCause
+/// Acknowledged, classified `RecoveryClass`). Locally-invalid items (no body
+/// where one is required) also emit `Failed` rather than poisoning the rest
+/// of the batch.
 async fn fetch_batch(
     account: &GraphAccount,
     ids: &[ObjectId],
@@ -100,6 +250,22 @@ async fn fetch_batch(
 ) -> Result<Vec<SyncEvent<ItemOutcome<HydratedObject>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
+    }
+    // Public-folder ids read over EWS; everything else over Graph REST.
+    let (ews_ids, ids) = partition_ews_ids(account, ids).await;
+    let mut ews_outcomes = fetch_ews_outcomes(account, &ews_ids, projection).await;
+    if ids.is_empty() {
+        return Ok(vec![SyncEvent::Batch(Batch {
+            items: ews_outcomes,
+            page_boundary: if is_final {
+                PageBoundary::Final
+            } else {
+                PageBoundary::Page
+            },
+            server_latency: std::time::Duration::default(),
+            bytes_in: 0,
+            checkpoint: None::<Checkpoint>,
+        })]);
     }
     let select = select_for_projection(projection);
     let requests = ids
@@ -121,7 +287,10 @@ async fn fetch_batch(
         .collect();
     let request = BatchRequest { requests };
     let response: BatchResponse = account.client.post_batch(&request).await?;
-    let mut outcomes: Vec<ItemOutcome<HydratedObject>> = Vec::new();
+    // The EWS-hydrated items ride in the same batch as the REST ones: the
+    // consumer sees one outcome per pulled id regardless of which arm served
+    // it.
+    let mut outcomes: Vec<ItemOutcome<HydratedObject>> = std::mem::take(&mut ews_outcomes);
     let mut etags = Vec::new();
 
     for item in response.responses {
@@ -352,6 +521,142 @@ mod tests {
             hydrate_url_for_id(&account, &primary_id, "id"),
             "/me/messages/AAMkmsg?$select=id"
         );
+    }
+
+    fn ews_item() -> crate::ews::EwsItem {
+        crate::ews::EwsItem {
+            item_id: "AAMkItem=".to_string(),
+            change_key: Some("CK1".to_string()),
+            subject: Some("Company Policy".to_string()),
+            sender_email: Some("hr@contoso.com".to_string()),
+            sender_name: Some("HR".to_string()),
+            received_at: Some("2026-03-01T10:30:00Z".to_string()),
+            body_preview: None,
+            body_html: Some("<p>Read this</p>".to_string()),
+            is_read: true,
+            item_class: "IPM.Note".to_string(),
+            to_recipients: Vec::new(),
+            cc_recipients: Vec::new(),
+            attachments: vec![
+                crate::ews::EwsAttachment {
+                    attachment_id: "AAMkAtt1=".to_string(),
+                    name: Some("policy.pdf".to_string()),
+                    content_type: Some("application/pdf".to_string()),
+                    size: Some(2048),
+                    is_inline: false,
+                    is_item: false,
+                },
+                crate::ews::EwsAttachment {
+                    attachment_id: "AAMkAtt2=".to_string(),
+                    name: Some("Forwarded".to_string()),
+                    content_type: None,
+                    size: None,
+                    is_inline: false,
+                    is_item: true,
+                },
+            ],
+        }
+    }
+
+    /// The EWS arm projects into the SAME `HydratedObject` shape the Graph
+    /// REST arm does: `Metadata` for the body-bearing projections (never
+    /// `RawMime`, which must be assembled RFC822), `FlagsOnly` for
+    /// `FlagsOnly`, and one blob handle per attachment descriptor.
+    #[test]
+    fn ews_get_item_projects_into_the_graph_hydrated_shape() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let id = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
+        let item = ews_item();
+
+        for projection in [Projection::Metadata, Projection::Headers, Projection::Full] {
+            let hydrated = hydrated_from_ews_item(
+                id.clone(),
+                &item,
+                &folder,
+                "content@contoso.com",
+                projection,
+            );
+            // The hydrated id is the folder-qualified id the caller asked
+            // for, identical to the inventory entry's.
+            assert_eq!(hydrated.id, id);
+            match &hydrated.kind {
+                HydratedObjectKind::Metadata(entry) => {
+                    assert_eq!(entry.id, id);
+                    assert!(
+                        entry
+                            .memberships
+                            .contains(&MembershipScope::Folder(folder.clone()))
+                    );
+                    assert!(entry.memberships.contains(&MembershipScope::Mailbox(
+                        bifrost_types::MailboxId("content@contoso.com".to_string())
+                    )));
+                }
+                other => panic!("expected Metadata for {projection:?}, got {other:?}"),
+            }
+            // Attachment metadata rides out as blob handles; the bytes come
+            // through `open_blob` (EWS GetAttachment).
+            assert_eq!(hydrated.blobs.len(), 2);
+            // EWS has no byte-range attachment form.
+            assert!(
+                hydrated
+                    .blobs
+                    .iter()
+                    .all(|b| !b.capabilities.supports_range)
+            );
+            assert_eq!(hydrated.blobs[0].size, Some(2048));
+            assert_eq!(
+                hydrated.blobs[0].content_type.as_deref(),
+                Some("application/pdf")
+            );
+        }
+
+        let flags = hydrated_from_ews_item(
+            id.clone(),
+            &item,
+            &folder,
+            "content@contoso.com",
+            Projection::FlagsOnly,
+        );
+        match flags.kind {
+            HydratedObjectKind::FlagsOnly(flags) => {
+                assert!(flags.contains("\\seen"));
+                assert_eq!(flags.len(), 1);
+            }
+            other => panic!("expected FlagsOnly, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_folder_ids_partition_onto_the_ews_arm() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let folder = FolderId("AAMkPF=".to_string());
+        account
+            .seed_public_folder_for_tests(
+                folder.clone(),
+                crate::account::cursor::PublicFolderRouting {
+                    anchor_mailbox: "content@contoso.com".to_string(),
+                    public_folder_mailbox: Some("pf@contoso.com".to_string()),
+                },
+            )
+            .await;
+
+        let public = super::super::foreign::encode_public_item_id(&folder, "AAMkItem=");
+        let primary = ObjectId("AAMkmsg".to_string());
+        // A folder-qualified id whose folder was never discovered has no
+        // routing, so it stays on the REST arm rather than being dropped.
+        let unknown = super::super::foreign::encode_public_item_id(
+            &FolderId("AAMkOther=".to_string()),
+            "AAMkItem=",
+        );
+
+        let (ews, rest) = partition_ews_ids(
+            &account,
+            &[public.clone(), primary.clone(), unknown.clone()],
+        )
+        .await;
+        assert_eq!(ews, vec![(public, folder)]);
+        assert_eq!(rest, vec![primary, unknown]);
     }
 
     /// A3: Graph hydration body projections no longer mint a JSON

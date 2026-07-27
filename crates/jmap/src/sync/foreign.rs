@@ -60,6 +60,34 @@ pub(crate) fn owner_tag(account_id: &str) -> MembershipScope {
     MembershipScope::Mailbox(MailboxId(account_id.to_string()))
 }
 
+/// Encode a foreign account's native object id (an `Email` id, a `blobId`)
+/// into the same `accountId\u{1f}native` namespace the folder codec uses.
+///
+/// This is what makes hydration and blob reads route to the FOREIGN
+/// account. `Email/get` and blob download are both accountId-scoped calls,
+/// but `get_stream` / `open_blob` receive only an id - no scope - so
+/// without the owning account riding inside the id string they would run
+/// against the primary account and either 404 or, worse, resolve a primary
+/// object that happens to share the id. The mint sites are the foreign
+/// inventory / changes projections; the request sites decode and select the
+/// foreign handle. A primary id is never encoded, so one logical object has
+/// exactly one wire form.
+pub(crate) fn encode_object(account_id: &str, native: &str) -> String {
+    format!("{account_id}{FOREIGN_SEP}{native}")
+}
+
+/// A parsed object id: `Some((accountId, native))` for a foreign-account
+/// object, `None` for a primary-account object (a bare native id).
+pub(crate) fn parse_object(id: &str) -> Option<(&str, &str)> {
+    id.split_once(FOREIGN_SEP)
+}
+
+/// The native (owner-namespace) form of an object id, whether or not it was
+/// foreign-encoded.
+pub(crate) fn native_object(id: &str) -> &str {
+    parse_object(id).map_or(id, |(_, native)| native)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +111,28 @@ mod tests {
             owner_tag("acct-99"),
             MembershipScope::Mailbox(MailboxId("acct-99".to_string()))
         );
+    }
+
+    #[test]
+    fn object_id_round_trips_and_leaves_primary_bare() {
+        let encoded = encode_object("acct-9", "M1234");
+        assert_eq!(encoded, format!("acct-9{FOREIGN_SEP}M1234"));
+        assert_eq!(parse_object(&encoded), Some(("acct-9", "M1234")));
+        assert_eq!(native_object(&encoded), "M1234");
+
+        // A primary id has no separator: it parses as primary and its
+        // native form is itself.
+        assert_eq!(parse_object("M1234"), None);
+        assert_eq!(native_object("M1234"), "M1234");
+    }
+
+    #[test]
+    fn object_id_encoding_is_byte_stable() {
+        // Re-encoding a decoded native id under the same account yields the
+        // identical bytes: one wire form per logical object.
+        let once = encode_object("acct-9", "M1234");
+        let twice = encode_object("acct-9", native_object(&once));
+        assert_eq!(once, twice);
     }
 
     #[test]

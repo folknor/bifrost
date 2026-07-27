@@ -19,6 +19,16 @@ use bifrost_types::{CursorScope, FolderId, MailboxId, MembershipScope, ObjectId}
 /// SMTP address, or a user id, so it is unambiguous as a delimiter.
 const FOREIGN_SEP: char = '\u{1f}';
 
+/// Reserved separator for a PUBLIC-folder item id: `"<folderId>\u{1e}<itemId>"`.
+/// A distinct delimiter from `FOREIGN_SEP` because the two namespaces mean
+/// different things - a foreign id carries a `/users/{mailbox}` routing key
+/// and reads over Graph REST, a public id carries the EWS folder whose
+/// `routing_map` entry supplies the `X-AnchorMailbox` /
+/// `X-PublicFolderMailbox` pair and reads over EWS `GetItem`. `\u{1e}` (RS,
+/// record separator) cannot appear in an EWS folder or item id, so the two
+/// forms are mutually unambiguous.
+const PUBLIC_SEP: char = '\u{1e}';
+
 /// A foreign-mailbox folder: the routing mailbox plus the native Graph
 /// folder id within it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,27 +109,60 @@ pub(crate) fn owner_tag(mailbox: &str) -> MembershipScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedMessageId {
     Primary(String),
-    Foreign { mailbox: String, message: String },
+    Foreign {
+        mailbox: String,
+        message: String,
+    },
+    /// An Exchange public-folder item. Carries the EWS folder id, because
+    /// that is the `routing_map` key holding the item's
+    /// `X-AnchorMailbox` / `X-PublicFolderMailbox` routing pair - a public
+    /// folder has no owning mailbox of its own to route by. Read over EWS
+    /// `GetItem` / `GetAttachment`, never Graph REST (`/me/messages/{id}`
+    /// does not know a raw EWS `ItemId`).
+    Public {
+        folder: String,
+        item: String,
+    },
 }
 
 impl ParsedMessageId {
     /// The native Graph message id, regardless of variant - the value that
-    /// goes into a `/messages/{id}` REST path.
+    /// goes into a `/messages/{id}` REST path or an EWS `<t:ItemId>`.
     pub(crate) fn native_id(&self) -> &str {
         match self {
             Self::Primary(id) => id,
             Self::Foreign { message, .. } => message,
+            Self::Public { item, .. } => item,
         }
     }
 
     /// The owning mailbox routing key when this id belongs to a shared
-    /// mailbox; `None` for a primary-mailbox item.
+    /// mailbox; `None` for a primary-mailbox or public-folder item.
     pub(crate) fn owner(&self) -> Option<&str> {
         match self {
-            Self::Primary(_) => None,
+            Self::Primary(_) | Self::Public { .. } => None,
             Self::Foreign { mailbox, .. } => Some(mailbox),
         }
     }
+
+    /// The public folder this item lives in, when it is a public-folder
+    /// item. `Some(_)` is exactly the discriminator that routes a read onto
+    /// the EWS arm instead of the Graph REST arm.
+    pub(crate) fn public_folder(&self) -> Option<&str> {
+        match self {
+            Self::Public { folder, .. } => Some(folder),
+            _ => None,
+        }
+    }
+}
+
+/// Encode a `(public folder, native EWS item id)` pair into the `ObjectId`
+/// the public-folder inventory / poll projections emit. The folder rides
+/// along so hydration and attachment reads can look its routing headers up
+/// in `routing_map` - without it a public-folder item would hydrate through
+/// Graph REST, which cannot address a raw EWS `ItemId` at all.
+pub(crate) fn encode_public_item_id(folder: &FolderId, item: &str) -> ObjectId {
+    ObjectId(format!("{}{PUBLIC_SEP}{item}", folder.0))
 }
 
 /// Encode a `(scope, native message id)` pair into the `ObjectId` carried
@@ -138,9 +181,17 @@ pub(crate) fn encode_message_id(scope: &CursorScope, native: &str) -> ObjectId {
     }
 }
 
-/// Parse an `ObjectId` back into a `ParsedMessageId`. Splits on the first
-/// `FOREIGN_SEP`; an id with no separator is a primary-mailbox item.
+/// Parse an `ObjectId` back into a `ParsedMessageId`. The public-folder form
+/// is checked first (its `PUBLIC_SEP` is the more specific marker), then the
+/// foreign-mailbox form; an id with neither separator is a primary-mailbox
+/// item. Both splits take the FIRST separator only.
 pub(crate) fn parse_message_id(id: &ObjectId) -> ParsedMessageId {
+    if let Some((folder, item)) = id.0.split_once(PUBLIC_SEP) {
+        return ParsedMessageId::Public {
+            folder: folder.to_string(),
+            item: item.to_string(),
+        };
+    }
     match id.0.split_once(FOREIGN_SEP) {
         Some((mailbox, message)) => ParsedMessageId::Foreign {
             mailbox: mailbox.to_string(),
@@ -236,6 +287,39 @@ mod tests {
         let once = encode_message_id(&scope, "AAMkmessage");
         let twice = encode_message_id(&scope, parse_message_id(&once).native_id());
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn public_item_id_round_trips_and_is_distinct_from_foreign() {
+        let folder = FolderId("AAMkPF=".to_string());
+        let id = encode_public_item_id(&folder, "AAMkItem=");
+        assert_eq!(id.0, format!("AAMkPF={PUBLIC_SEP}AAMkItem="));
+
+        let parsed = parse_message_id(&id);
+        assert_eq!(parsed.native_id(), "AAMkItem=");
+        assert_eq!(parsed.public_folder(), Some("AAMkPF="));
+        // A public item has no owning mailbox: its routing comes from the
+        // folder's `routing_map` entry, not from a `/users/{mailbox}` key.
+        assert_eq!(parsed.owner(), None);
+
+        // A foreign-mailbox id is NOT mistaken for a public one, and vice
+        // versa.
+        let foreign = encode_message_id(
+            &CursorScope::FolderType {
+                folder: encode_foreign("shared@contoso.com", "AAMkfolder"),
+                ty: bifrost_types::ObjectType::Email,
+            },
+            "AAMkmessage",
+        );
+        assert_eq!(parse_message_id(&foreign).public_folder(), None);
+        assert_eq!(
+            parse_message_id(&foreign).owner(),
+            Some("shared@contoso.com")
+        );
+
+        // Re-encoding a decoded public id is byte-stable.
+        let twice = encode_public_item_id(&folder, parse_message_id(&id).native_id());
+        assert_eq!(id, twice);
     }
 
     #[test]

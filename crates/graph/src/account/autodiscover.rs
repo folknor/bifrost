@@ -22,8 +22,27 @@ use super::graph_error::{GraphErrorContext, into_account_error, response_to_acco
 use crate::error::{GraphError, GraphResponseError};
 use crate::ews::push_general_ref;
 
-const AUTODISCOVER_URL: &str = "https://outlook.office365.com/autodiscover/autodiscover.xml";
-const AUTODISCOVER_SOAP_URL: &str = "https://outlook.office365.com/autodiscover/autodiscover.svc";
+/// The POX (`autodiscover.xml`) Autodiscover endpoint under a given Outlook
+/// origin. Derived rather than hardcoded so the harness api-base override
+/// reaches Autodiscover too: production Autodiscover lives on
+/// `outlook.office365.com`, not on the Graph host, so redirecting only the
+/// Graph base left delegate/public-folder discovery hitting the real
+/// service.
+pub(crate) fn autodiscover_xml_url(outlook_base: &str) -> String {
+    format!(
+        "{}/autodiscover/autodiscover.xml",
+        outlook_base.trim_end_matches('/')
+    )
+}
+
+/// The SOAP (`autodiscover.svc` / `GetUserSettings`) Autodiscover endpoint
+/// under a given Outlook origin. See [`autodiscover_xml_url`].
+pub(crate) fn autodiscover_soap_url(outlook_base: &str) -> String {
+    format!(
+        "{}/autodiscover/autodiscover.svc",
+        outlook_base.trim_end_matches('/')
+    )
+}
 
 /// A shared/delegate mailbox discovered via Exchange Autodiscover.
 /// Routing keys on `smtp_address` alone; `display_name` and
@@ -135,9 +154,8 @@ impl GraphAccount {
   </Request>
 </Autodiscover>"#
         );
-        let xml = self
-            .autodiscover_post(AUTODISCOVER_URL, "text/xml", None, body)
-            .await?;
+        let url = autodiscover_xml_url(self.client.outlook_base());
+        let xml = self.autodiscover_post(&url, "text/xml", None, body).await?;
         Ok(parse_alternative_mailboxes(&xml))
     }
 
@@ -151,7 +169,7 @@ impl GraphAccount {
         // on-prem tenants and ride in-body, not as an HTTP 3xx. Follow a
         // bounded chain; the cap guards against a redirect loop.
         const MAX_REDIRECTS: usize = 5;
-        let mut url = AUTODISCOVER_SOAP_URL.to_string();
+        let mut url = autodiscover_soap_url(self.client.outlook_base());
         let mut email = email.to_string();
 
         for _ in 0..=MAX_REDIRECTS {

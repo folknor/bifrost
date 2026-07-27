@@ -161,9 +161,11 @@ async fn discover_cursor_scopes_inner(
     // synced by the no-delta-token poll strategy. Per-folder failures
     // skip with a scoped warning - the primary/shared mailboxes already
     // discovered above are unaffected.
-    if account.public_folders_enabled {
+    // Discovery seeds the whole readable hierarchy either way; only the
+    // allowlisted folders come back as scopes.
+    if let Some(policy) = account.public_folders.as_ref() {
         let (pf_scopes, pf_warnings) =
-            super::public_folder::discover_public_folder_scopes(account).await;
+            super::public_folder::discover_public_folder_scopes(account, policy).await;
         scopes.extend(pf_scopes);
         warnings.extend(pf_warnings);
     }

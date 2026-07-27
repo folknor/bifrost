@@ -62,12 +62,40 @@ pub(crate) struct EwsItem {
     pub(crate) item_class: String,
     pub(crate) to_recipients: Vec<EwsRecipient>,
     pub(crate) cc_recipients: Vec<EwsRecipient>,
+    /// Attachment METADATA only (`GetItem` returns descriptors, never
+    /// bytes). The bytes come from a separate `GetAttachment` call.
+    pub(crate) attachments: Vec<EwsAttachment>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EwsRecipient {
     pub(crate) email: String,
     pub(crate) name: Option<String>,
+}
+
+/// One attachment descriptor from a `GetItem` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EwsAttachment {
+    pub(crate) attachment_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) size: Option<u64>,
+    pub(crate) is_inline: bool,
+    /// `true` for `<t:ItemAttachment>`: an embedded Exchange item, not a
+    /// byte stream. `GetAttachment` returns it as XML, so it is surfaced as
+    /// a non-byte-stream blob handle rather than a downloadable one.
+    pub(crate) is_item: bool,
+}
+
+/// The bytes of one attachment, from a `GetAttachment` response.
+#[derive(Debug, Clone)]
+pub(crate) struct EwsAttachmentContent {
+    pub(crate) attachment_id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) content_type: Option<String>,
+    /// Decoded `<t:Content>` octets. Empty for an `ItemAttachment` (whose
+    /// payload is a nested XML item, not base64 content).
+    pub(crate) content: Vec<u8>,
 }
 
 pub(crate) struct FindItemsResult {
@@ -521,6 +549,9 @@ pub(crate) fn parse_find_items_response(xml: &str) -> Result<FindItemsResult, Ew
                             item_class: default_item_class(&item_class),
                             to_recipients: Vec::new(),
                             cc_recipients: Vec::new(),
+                            // FindItem is IdOnly + a few scalars; the
+                            // attachment descriptors come from GetItem.
+                            attachments: Vec::new(),
                         });
                     }
                     in_item = false;
@@ -573,9 +604,23 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
     let mut item_class = String::new();
     let mut to_recipients: Vec<EwsRecipient> = Vec::new();
     let mut cc_recipients: Vec<EwsRecipient> = Vec::new();
+    let mut attachments: Vec<EwsAttachment> = Vec::new();
 
     let mut recip_email = String::new();
     let mut recip_name: Option<String> = None;
+
+    // `<t:Attachments>` is a sub-tree with its own `Name` / `ContentType` /
+    // (for an ItemAttachment) nested `Subject`, `Body`, and `ItemId`
+    // elements. Everything inside it belongs to the attachment, never to
+    // the enclosing item, so field capture is suppressed while
+    // `in_attachments` is set.
+    let mut in_attachments = false;
+    let mut current_attachment: Option<EwsAttachment> = None;
+    // Depth of the open attachment element. Descriptor fields are captured
+    // only from its DIRECT children: an ItemAttachment embeds a whole item,
+    // whose organizer/recipient `Mailbox` carries its own `<t:Name>` that
+    // would otherwise overwrite the attachment's file name.
+    let mut attachment_depth: i32 = 0;
 
     loop {
         match reader.read_event() {
@@ -588,7 +633,21 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     in_item = true;
                     item_depth = depth;
                 }
-                if in_item {
+                if in_item && local == "Attachments" {
+                    in_attachments = true;
+                }
+                if in_attachments && is_attachment_tag(local) && current_attachment.is_none() {
+                    attachment_depth = depth;
+                    current_attachment = Some(EwsAttachment {
+                        attachment_id: String::new(),
+                        name: None,
+                        content_type: None,
+                        size: None,
+                        is_inline: false,
+                        is_item: local == "ItemAttachment",
+                    });
+                }
+                if in_item && !in_attachments {
                     match local {
                         "From" => in_from = true,
                         "ToRecipients" => in_to = true,
@@ -605,8 +664,15 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 current_tag = local.to_string();
                 buf.clear();
 
-                // Direct-child `ItemId` only (Start form: one level below).
-                if in_item && local == "ItemId" && depth == item_depth + 1 {
+                if let Some(attachment) = current_attachment.as_mut()
+                    && local == "AttachmentId"
+                    && depth == attachment_depth + 1
+                {
+                    attachment.attachment_id = extract_attribute(e, "Id");
+                }
+                // Direct-child `ItemId` only (Start form: one level below),
+                // and never one nested inside an attachment.
+                if in_item && !in_attachments && local == "ItemId" && depth == item_depth + 1 {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -614,9 +680,17 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
             Ok(Event::Empty(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 let local = strip_ns(&name);
+                // An Empty `AttachmentId` is a child of the currently-open
+                // element, so it counts when that element IS the attachment.
+                if let Some(attachment) = current_attachment.as_mut()
+                    && local == "AttachmentId"
+                    && depth == attachment_depth
+                {
+                    attachment.attachment_id = extract_attribute(e, "Id");
+                }
                 // Direct-child `ItemId` only (Empty form: child of the
                 // currently-open element at `depth`).
-                if in_item && local == "ItemId" && depth == item_depth {
+                if in_item && !in_attachments && local == "ItemId" && depth == item_depth {
                     item_id = extract_attribute(e, "Id");
                     change_key = Some(extract_attribute(e, "ChangeKey")).filter(|s| !s.is_empty());
                 }
@@ -628,7 +702,30 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 let local = strip_ns(&name);
                 let trimmed = buf.trim();
 
-                if in_mailbox {
+                if current_attachment.is_some() {
+                    if let Some(attachment) = current_attachment.as_mut()
+                        && depth == attachment_depth + 1
+                    {
+                        match current_tag.as_str() {
+                            "Name" => attachment.name = Some(trimmed.to_string()),
+                            "ContentType" => attachment.content_type = Some(trimmed.to_string()),
+                            "Size" => attachment.size = trimmed.parse().ok(),
+                            "IsInline" => attachment.is_inline = trimmed == "true",
+                            _ => {}
+                        }
+                    }
+                    if is_attachment_tag(local)
+                        && depth == attachment_depth
+                        // Drop a descriptor with no id: it cannot be fetched,
+                        // so surfacing it as a blob handle would mint a handle
+                        // that can only ever fail.
+                        && let Some(done) = current_attachment
+                            .take()
+                            .filter(|a| !a.attachment_id.is_empty())
+                    {
+                        attachments.push(done);
+                    }
+                } else if in_mailbox {
                     match current_tag.as_str() {
                         "EmailAddress" => recip_email = trimmed.to_string(),
                         "Name" => recip_name = Some(trimmed.to_string()),
@@ -651,7 +748,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                             }
                         }
                     }
-                } else if in_item {
+                } else if in_item && !in_attachments {
                     match current_tag.as_str() {
                         "Subject" => subject = Some(trimmed.to_string()),
                         "DateTimeReceived" => received_at = Some(trimmed.to_string()),
@@ -666,6 +763,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                     "From" => in_from = false,
                     "ToRecipients" => in_to = false,
                     "CcRecipients" => in_cc = false,
+                    "Attachments" => in_attachments = false,
                     _ => {}
                 }
 
@@ -676,7 +774,7 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
                 // as a sibling AFTER the item element closes from bleeding
                 // into the already-captured item's accumulators (without the
                 // close, `in_item` stays true to EOF).
-                if is_item_tag(local) && in_item && depth == item_depth {
+                if is_item_tag(local) && in_item && !in_attachments && depth == item_depth {
                     in_item = false;
                 }
 
@@ -707,10 +805,101 @@ pub(crate) fn parse_get_item_response(xml: &str) -> Result<EwsItem, EwsError> {
         item_class: default_item_class(&item_class),
         to_recipients,
         cc_recipients,
+        attachments,
+    })
+}
+
+/// Parse a `GetAttachment` response into the attachment's decoded bytes.
+///
+/// `<t:Content>` is base64 in the SOAP body (EWS has no byte-stream
+/// attachment endpoint - unlike Graph REST's `/attachments/{id}/$value` -
+/// so the whole attachment arrives inline and is decoded here). An
+/// `ItemAttachment` carries a nested XML item instead of `<t:Content>`; it
+/// parses to empty content rather than an error, and the caller surfaces it
+/// as a non-byte-stream blob.
+pub(crate) fn parse_get_attachment_response(xml: &str) -> Result<EwsAttachmentContent, EwsError> {
+    let mut reader = Reader::from_str(xml);
+
+    let mut attachment_id = String::new();
+    let mut name: Option<String> = None;
+    let mut content_type: Option<String> = None;
+    let mut content: Vec<u8> = Vec::new();
+
+    let mut current_tag = String::new();
+    let mut buf = String::new();
+    // Anything below a nested item inside an ItemAttachment belongs to that
+    // item, not to the attachment descriptor.
+    let mut in_nested_item = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let local = strip_ns(&name_bytes);
+                if is_item_tag(local) {
+                    in_nested_item = true;
+                }
+                if local == "AttachmentId" {
+                    attachment_id = extract_attribute(e, "Id");
+                }
+                current_tag = local.to_string();
+                buf.clear();
+            }
+            Ok(Event::Empty(ref e)) => {
+                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if strip_ns(&name_bytes) == "AttachmentId" {
+                    attachment_id = extract_attribute(e, "Id");
+                }
+            }
+            Ok(Event::Text(ref e)) => push_text(e, &mut buf),
+            Ok(Event::GeneralRef(ref e)) => push_general_ref(e, &mut buf),
+            Ok(Event::End(ref e)) => {
+                let name_bytes = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let local = strip_ns(&name_bytes);
+                let trimmed = buf.trim();
+                if !in_nested_item {
+                    match current_tag.as_str() {
+                        "Name" => name = Some(trimmed.to_string()),
+                        "ContentType" => content_type = Some(trimmed.to_string()),
+                        "Content" if !trimmed.is_empty() => {
+                            content = BASE64.decode(trimmed).map_err(|e| {
+                                malformed(format!("GetAttachment content is not base64: {e}"))
+                            })?;
+                        }
+                        _ => {}
+                    }
+                }
+                if is_item_tag(local) {
+                    in_nested_item = false;
+                }
+                buf.clear();
+                current_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(malformed(format!("GetAttachment parse failed: {e}"))),
+            _ => {}
+        }
+    }
+
+    if attachment_id.is_empty() {
+        return Err(malformed("No attachment found in GetAttachment response"));
+    }
+
+    Ok(EwsAttachmentContent {
+        attachment_id,
+        name,
+        content_type,
+        content,
     })
 }
 
 // ── Shared helpers ──────────────────────────────────────────
+
+/// Attachment container elements a `GetItem` / `GetAttachment` response can
+/// carry (EWS `AttachmentType` subtypes).
+fn is_attachment_tag(local: &str) -> bool {
+    matches!(local, "FileAttachment" | "ItemAttachment")
+}
 
 /// Whether an `ExtendedFieldURI` PropertyTag names PR_REPLICA_LIST
 /// (`0x6698`). EWS emits the hex form; accept either case and the bare
@@ -1285,6 +1474,134 @@ mod tests {
         assert_eq!(item.item_class, "IPM.Contact");
         assert!(item.to_recipients.is_empty());
         assert!(item.cc_recipients.is_empty());
+    }
+
+    #[test]
+    fn parse_get_item_response_collects_body_recipients_and_attachments() {
+        // The public-folder hydration read: a Message with body, To/Cc
+        // recipients, and two attachment descriptors. The nested
+        // ItemAttachment's own Subject / ItemId must NOT overwrite the
+        // enclosing item's, and the id-less descriptor is dropped (it could
+        // only ever fail to fetch).
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                       xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Items>
+            <t:Message>
+              <t:ItemId Id="AAMkItem=" ChangeKey="CK1"/>
+              <t:Subject>Company Policy</t:Subject>
+              <t:DateTimeReceived>2026-03-01T10:30:00Z</t:DateTimeReceived>
+              <t:Body BodyType="HTML">&lt;p&gt;Read this&lt;/p&gt;</t:Body>
+              <t:IsRead>true</t:IsRead>
+              <t:ItemClass>IPM.Note</t:ItemClass>
+              <t:From>
+                <t:Mailbox>
+                  <t:Name>HR</t:Name>
+                  <t:EmailAddress>hr@contoso.com</t:EmailAddress>
+                </t:Mailbox>
+              </t:From>
+              <t:ToRecipients>
+                <t:Mailbox>
+                  <t:Name>All Staff</t:Name>
+                  <t:EmailAddress>staff@contoso.com</t:EmailAddress>
+                </t:Mailbox>
+              </t:ToRecipients>
+              <t:CcRecipients>
+                <t:Mailbox>
+                  <t:EmailAddress>legal@contoso.com</t:EmailAddress>
+                </t:Mailbox>
+              </t:CcRecipients>
+              <t:Attachments>
+                <t:FileAttachment>
+                  <t:AttachmentId Id="AAMkAtt1="/>
+                  <t:Name>policy.pdf</t:Name>
+                  <t:ContentType>application/pdf</t:ContentType>
+                  <t:Size>2048</t:Size>
+                  <t:IsInline>false</t:IsInline>
+                </t:FileAttachment>
+                <t:ItemAttachment>
+                  <t:AttachmentId Id="AAMkAtt2="/>
+                  <t:Name>Forwarded Note</t:Name>
+                  <t:Message>
+                    <t:ItemId Id="NESTED=" ChangeKey="NCK"/>
+                    <t:Subject>Nested Subject</t:Subject>
+                  </t:Message>
+                </t:ItemAttachment>
+                <t:FileAttachment>
+                  <t:Name>no-id.bin</t:Name>
+                </t:FileAttachment>
+              </t:Attachments>
+            </t:Message>
+          </m:Items>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let item = parse_get_item_response(xml).expect("parse should succeed");
+        // Identity and body survive the attachment sub-tree.
+        assert_eq!(item.item_id, "AAMkItem=");
+        assert_eq!(item.change_key.as_deref(), Some("CK1"));
+        assert_eq!(item.subject.as_deref(), Some("Company Policy"));
+        assert_eq!(item.body_html.as_deref(), Some("<p>Read this</p>"));
+        assert!(item.is_read);
+        assert_eq!(item.sender_email.as_deref(), Some("hr@contoso.com"));
+        assert_eq!(item.to_recipients.len(), 1);
+        assert_eq!(item.to_recipients[0].email, "staff@contoso.com");
+        assert_eq!(item.cc_recipients.len(), 1);
+        assert_eq!(item.cc_recipients[0].email, "legal@contoso.com");
+
+        // Two id-bearing descriptors; the id-less one is dropped.
+        assert_eq!(item.attachments.len(), 2);
+        assert_eq!(
+            item.attachments[0],
+            EwsAttachment {
+                attachment_id: "AAMkAtt1=".to_string(),
+                name: Some("policy.pdf".to_string()),
+                content_type: Some("application/pdf".to_string()),
+                size: Some(2048),
+                is_inline: false,
+                is_item: false,
+            }
+        );
+        assert_eq!(item.attachments[1].attachment_id, "AAMkAtt2=");
+        assert!(item.attachments[1].is_item);
+    }
+
+    #[test]
+    fn parse_get_attachment_response_decodes_content() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetAttachmentResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                             xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetAttachmentResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+          <m:Attachments>
+            <t:FileAttachment>
+              <t:AttachmentId Id="AAMkAtt1="/>
+              <t:Name>hello.txt</t:Name>
+              <t:ContentType>text/plain</t:ContentType>
+              <t:Content>aGVsbG8=</t:Content>
+            </t:FileAttachment>
+          </m:Attachments>
+        </m:GetAttachmentResponseMessage>
+      </m:ResponseMessages>
+    </m:GetAttachmentResponse>
+  </s:Body>
+</s:Envelope>"#;
+        let attachment = parse_get_attachment_response(xml).expect("parse should succeed");
+        assert_eq!(attachment.attachment_id, "AAMkAtt1=");
+        assert_eq!(attachment.name.as_deref(), Some("hello.txt"));
+        assert_eq!(attachment.content_type.as_deref(), Some("text/plain"));
+        // EWS ships attachment bytes base64-inline, not as a byte stream.
+        assert_eq!(attachment.content, b"hello");
     }
 
     #[test]
