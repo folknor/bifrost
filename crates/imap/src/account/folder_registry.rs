@@ -256,6 +256,30 @@ pub(crate) struct SharedFolderEntry {
     /// one (no ACL capability, or MYRIGHTS failed and discovery deferred
     /// to SELECT).
     pub(crate) rights: Option<crate::types::MailboxRights>,
+    /// The NAMESPACE prefix this folder was enumerated under (`#user/`,
+    /// `Shared/`, ...). Carried so `ingest_shared` can tell a folder that
+    /// genuinely lives in a non-personal namespace from a candidate a
+    /// misbehaving server echoed out of the personal namespace.
+    pub(crate) namespace_prefix: String,
+}
+
+/// Whether a shared-namespace candidate outranks an identically-named entry
+/// the personal LIST already produced.
+///
+/// True exactly when the candidate's path actually lies under the non-empty
+/// NAMESPACE prefix it was enumerated with. That prefix is the server's own
+/// declaration that the path is not personal, so the overlap is the personal
+/// LIST over-reporting (RFC 2342 leaves `LIST "" "*"` free to include
+/// non-personal namespaces, and several servers do), not a shared probe
+/// leaking personal folders.
+///
+/// False for an empty prefix or a path outside it, which is the case a
+/// reference/pattern-ignoring server produces: those candidates must not
+/// demote a genuine personal folder.
+///
+/// Pure so the precedence rule is unit-pinnable without a live server.
+pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> bool {
+    !namespace_prefix.is_empty() && name.starts_with(namespace_prefix)
 }
 
 #[derive(Default)]
@@ -283,16 +307,29 @@ impl FolderRegistry {
     }
 
     /// Install shared/other-user folders, each tagged with its owning
-    /// mailbox. Additive: existing personal entries are left in place. A
-    /// shared/other-user namespace that overlaps the personal LIST (the
-    /// same folder name appears in both) must NOT flip the already-present
-    /// personal entry to shared-tagged - the personal mapping wins, so the
-    /// overlapping shared candidate is skipped rather than overwriting it.
+    /// mailbox and MYRIGHTS set.
+    ///
+    /// The overlap rule is `shared_overrides_personal`: a candidate whose
+    /// path lies under its own non-personal NAMESPACE prefix wins over an
+    /// entry the personal `LIST "" "*"` already produced, because many
+    /// servers (Dovecot among them) answer the unqualified personal LIST
+    /// with the shared and other-user namespaces too. Skipping those
+    /// overlaps - the prior rule - left the folder registered as a bare
+    /// personal entry: no owner tag, no `Shared` namespace, and no rights,
+    /// which is how a read-only shared folder became indistinguishable from
+    /// a writable one downstream.
+    ///
+    /// A candidate NOT under its prefix is still skipped. That is the
+    /// defense against a server that ignores the LIST reference/pattern
+    /// split and answers a namespace LIST with personal folders: those
+    /// must never demote a real personal INBOX to shared.
     pub(crate) fn ingest_shared(&self, shared: Vec<SharedFolderEntry>) {
         let mut map = self.by_name.write().expect("folder registry lock poisoned");
         for shared in shared {
             let name = shared.info.name.as_str().to_owned();
-            if map.contains_key(&name) {
+            if map.contains_key(&name)
+                && !shared_overrides_personal(&name, &shared.namespace_prefix)
+            {
                 continue;
             }
             let entry = Arc::new(FolderEntry::from_mailbox_with_owner_rights(
@@ -301,6 +338,28 @@ impl FolderRegistry {
                 shared.rights,
             ));
             map.insert(name, entry);
+        }
+    }
+
+    /// Replace the PERSONAL folder set, preserving the shared/other-user
+    /// entries discovered under NAMESPACE at open.
+    ///
+    /// A mid-session re-LIST (`refresh_folders` after a create / rename /
+    /// move / delete) only enumerates the personal root, so clearing the
+    /// whole map would drop every shared folder along with its owner tag and
+    /// MYRIGHTS - blanking the shared half of `containers_list` until the
+    /// next account reopen. A personal candidate that collides with a
+    /// retained shared entry does not overwrite it (the shared tagging is
+    /// the more specific fact).
+    pub(crate) fn replace_personal(&self, folders: Vec<MailboxInfo>) {
+        let mut map = self.by_name.write().expect("folder registry lock poisoned");
+        map.retain(|_, entry| entry.shared_owner.is_some());
+        for info in folders {
+            let name = info.name.as_str().to_owned();
+            if map.contains_key(&name) {
+                continue;
+            }
+            map.insert(name, Arc::new(FolderEntry::from_mailbox(info)));
         }
     }
 
@@ -416,8 +475,16 @@ mod tests {
     use super::*;
 
     /// A shared-namespace discovery entry owned by `alice`, optionally
-    /// carrying a MYRIGHTS wire string.
+    /// carrying a MYRIGHTS wire string. Enumerated under `#user/`.
     fn shared_entry(name: &MailboxName, rights: Option<&str>) -> SharedFolderEntry {
+        shared_entry_under(name, rights, "#user/")
+    }
+
+    fn shared_entry_under(
+        name: &MailboxName,
+        rights: Option<&str>,
+        namespace_prefix: &str,
+    ) -> SharedFolderEntry {
         SharedFolderEntry {
             info: MailboxInfo {
                 name: name.clone(),
@@ -425,6 +492,7 @@ mod tests {
             },
             owner: bifrost_types::MailboxId("alice".to_owned()),
             rights: rights.map(crate::types::MailboxRights::parse),
+            namespace_prefix: namespace_prefix.to_owned(),
         }
     }
 
@@ -555,6 +623,92 @@ mod tests {
         assert_eq!(
             ingested.rights,
             Some(crate::types::MailboxRights::parse("lr"))
+        );
+    }
+
+    // RFC 2342 leaves `LIST "" "*"` free to include the non-personal
+    // namespaces, and several servers do. When the SAME path comes back from
+    // both the personal LIST and its own namespace LIST, the namespace
+    // enumeration is authoritative: skipping the overlap left the folder
+    // registered bare (no owner, no rights), which is exactly how a
+    // read-only shared folder became indistinguishable from a writable one.
+    #[test]
+    fn shared_candidate_under_its_prefix_upgrades_an_overlapping_personal_entry() {
+        let path = MailboxName::new("Shared/alice/Reports").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            // The personal LIST already returned the shared path.
+            vec![MailboxInfo {
+                name: path.clone(),
+                ..Default::default()
+            }],
+            vec![shared_entry_under(&path, Some("lr"), "Shared/")],
+        );
+
+        let entry = registry.get(&path).expect("entry present");
+        assert_eq!(
+            entry.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned())),
+            "a path under a declared shared namespace must carry its owner"
+        );
+        assert_eq!(
+            entry.rights,
+            Some(crate::types::MailboxRights::parse("lr")),
+            "the MYRIGHTS set must survive the personal-LIST overlap"
+        );
+    }
+
+    #[test]
+    fn shared_precedence_needs_the_path_to_be_under_the_prefix() {
+        // The overlap case a namespace LIST genuinely outranks.
+        assert!(shared_overrides_personal("Shared/alice/INBOX", "Shared/"));
+        // A server that ignores the LIST reference/pattern split answers a
+        // namespace probe with personal folders; those must never demote a
+        // real personal INBOX.
+        assert!(!shared_overrides_personal("INBOX", "Shared/"));
+        // An empty prefix carries no claim at all.
+        assert!(!shared_overrides_personal("INBOX", ""));
+        // Textual prefix match is what the server itself declared, so a
+        // sibling root that merely shares a leading substring still counts
+        // only when the declared prefix matches.
+        assert!(!shared_overrides_personal("SharedOther/x", "#user/"));
+    }
+
+    // A mid-session personal re-LIST (after a create / rename / move /
+    // delete) must not take the shared entries down with it.
+    #[test]
+    fn replace_personal_retains_shared_entries_with_owner_and_rights() {
+        let personal = MailboxName::new("INBOX").expect("valid mailbox");
+        let shared = MailboxName::new("Shared/alice/Reports").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            vec![MailboxInfo {
+                name: personal.clone(),
+                ..Default::default()
+            }],
+            vec![shared_entry_under(&shared, Some("lrswipkxte"), "Shared/")],
+        );
+
+        let created = MailboxName::new("Projects").expect("valid mailbox");
+        registry.replace_personal(vec![
+            MailboxInfo {
+                name: personal.clone(),
+                ..Default::default()
+            },
+            MailboxInfo {
+                name: created.clone(),
+                ..Default::default()
+            },
+        ]);
+
+        assert!(registry.get(&created).is_some(), "new personal folder lands");
+        let retained = registry.get(&shared).expect("shared entry retained");
+        assert_eq!(
+            retained.shared_owner,
+            Some(bifrost_types::MailboxId("alice".to_owned()))
+        );
+        assert_eq!(
+            retained.rights,
+            Some(crate::types::MailboxRights::parse("lrswipkxte")),
+            "a personal re-LIST must not blank shared rights"
         );
     }
 

@@ -1152,14 +1152,64 @@ pub(crate) fn thread_hydrate(
     })
 }
 
+/// Re-qualify a foreign account's `Message` ids with their owning account.
+///
+/// `email_to_message` reads the bare native ids off the wire, but every id a
+/// consumer hands back to this crate (`open_blob`, `get_stream`, a container
+/// join against `containers_list`) has to be self-routing. Without this the
+/// hydrated message's own id, its container ids, and its attachment blob ids
+/// all come back in the PRIMARY namespace, so the follow-up blob download
+/// 404s against the primary account and the container ids join nothing.
+///
+/// Pure over the three id slices so the qualification is unit-pinnable
+/// without constructing a whole `Message`.
+fn qualify_foreign_message_ids(
+    id: &mut ObjectId,
+    containers: &mut [ContainerId],
+    attachments: &mut [BlobHandle],
+    account: &str,
+) {
+    id.0 = super::foreign::encode_object(account, &id.0);
+    for container in containers {
+        // A container id is a MAILBOX id, so it carries the same namespace
+        // `containers_list` mints for a foreign mailbox - not the object
+        // namespace - and the two must not be confused.
+        *container = ContainerId(super::foreign::encode_foreign(account, &container.0).0);
+    }
+    for attachment in attachments {
+        attachment.id = BlobId(super::foreign::encode_object(account, &attachment.id.0));
+    }
+}
+
 pub(crate) fn message_hydrate(
     mail: MailAccount,
+    foreign_mail: Arc<HashMap<String, MailAccount>>,
     message: ObjectId,
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
+        // `Email/get` is accountId-scoped. A foreign-qualified id therefore
+        // has to run against its OWNING account's handle: on the primary
+        // handle it either 404s (reporting the encoded id verbatim, which is
+        // how this surfaced downstream) or resolves an unrelated primary
+        // object that happens to share the native id. `get_stream` already
+        // routed per id; this one-id door did not, and it is the door the
+        // engine's `message_hydrate` passthrough funnels into.
+        let owner = match super::hydrate::route_for_id(&message, |account| {
+            foreign_mail.contains_key(account)
+        }) {
+            super::hydrate::HydrationRoute::Foreign(account) => Some(account),
+            super::hydrate::HydrationRoute::Primary => None,
+        };
+        let mail = match owner.as_deref().and_then(|account| foreign_mail.get(account)) {
+            Some(handle) => handle.clone(),
+            None => mail,
+        };
+        // The wire call takes the NATIVE id: the owning account is expressed
+        // by the handle, not by the id string.
+        let native = super::foreign::native_object(&message.0).to_string();
         let mut get = EmailGet::new()
-            .ids([EmailId::new(message.0.clone())])
+            .ids([EmailId::new(native)])
             .properties(message_properties(projection));
         if matches!(
             projection,
@@ -1189,7 +1239,16 @@ pub(crate) fn message_hydrate(
                 ),
             )
         })?;
-        Ok(email_to_message(email, projection))
+        let mut hydrated = email_to_message(email, projection);
+        if let Some(account) = owner.as_deref() {
+            qualify_foreign_message_ids(
+                &mut hydrated.id,
+                &mut hydrated.containers,
+                &mut hydrated.attachments,
+                account,
+            );
+        }
+        Ok(hydrated)
     })
 }
 
@@ -2464,6 +2523,52 @@ mod tests {
             value["parentId"] = serde_json::Value::String(parent.to_string());
         }
         serde_json::from_value(value).expect("mailbox deserializes")
+    }
+
+    // A foreign-account hydration must come back in the SAME id namespace
+    // the foreign inventory minted, or the consumer's follow-up blob read
+    // and container join both address the primary account.
+    #[test]
+    fn foreign_hydration_requalifies_message_container_and_blob_ids() {
+        let mut id = ObjectId("M1".to_string());
+        let mut containers = vec![ContainerId("inbox".to_string())];
+        let mut attachments = vec![BlobHandle {
+            id: BlobId("B1".to_string()),
+            size: None,
+            content_type: None,
+            digest: None,
+            capabilities: BlobCapabilities {
+                supports_range: false,
+                supports_parallel: false,
+                digest_available_pre_download: false,
+                encoding: BlobEncoding::Raw8Bit,
+            },
+        }];
+
+        qualify_foreign_message_ids(&mut id, &mut containers, &mut attachments, "acct-9");
+
+        // Object ids (message, blob) ride the OBJECT namespace, which
+        // `open_blob` / `get_stream` decode.
+        assert_eq!(id.0, super::super::foreign::encode_object("acct-9", "M1"));
+        assert_eq!(
+            attachments[0].id.0,
+            super::super::foreign::encode_object("acct-9", "B1")
+        );
+        // A container id is a mailbox id, so it rides the FOLDER namespace
+        // `containers_list` and the cursor scopes key on - byte-identical, or
+        // the join fails.
+        assert_eq!(
+            containers[0].0,
+            super::super::foreign::encode_foreign("acct-9", "inbox").0
+        );
+    }
+
+    // A primary (bare) id is left alone: one logical object, one wire form.
+    #[test]
+    fn primary_hydration_ids_are_not_qualified() {
+        let route = super::super::hydrate::route_for_id(&ObjectId("M1".to_string()), |_| true);
+        assert_eq!(route, super::super::hydrate::HydrationRoute::Primary);
+        assert_eq!(super::super::foreign::native_object("M1"), "M1");
     }
 
     fn full_rights() -> serde_json::Value {

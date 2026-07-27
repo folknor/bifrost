@@ -1024,7 +1024,12 @@ impl Account for JmapAccount {
         message: ObjectId,
         projection: HydrationProjection,
     ) -> AccountFuture<Result<Message, AccountError>> {
-        pim::message_hydrate(self.mail.clone(), message, projection)
+        pim::message_hydrate(
+            self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
+            message,
+            projection,
+        )
     }
 
     fn move_thread(

@@ -18,7 +18,7 @@ use bifrost_types::{
     Checkpoint, CursorEstablishment, CursorScope, DiagnosticText, EngineDirective, ErrorScope,
     InvalidationSink, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
     MutationSuccess, PageBoundary, PauseReason, Priority, ReconcileAction, ReconcileAdvice,
-    RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
+    RecoveryClass, RetryAdvice, SubscriptionHandle, SyncEvent, WatchEvent,
 };
 use dashmap::DashMap;
 use futures::stream::StreamExt;
@@ -157,6 +157,29 @@ enum InitialScope {
     DeferredInventory(CursorScope),
 }
 
+/// Whether an `establish_initial_cursor` failure is contained to the scope
+/// that produced it, rather than a reason to fail the whole account attach.
+///
+/// The signal is the account layer's own derived `RecoveryClass`: a protocol
+/// crate that classifies a failure as `DisableScope(_)` has already said the
+/// scope is independently quarantinable (a revoked shared mailbox, an
+/// unreadable public folder). The running path honors that through
+/// `disable_scope`; this is the same rule applied at attach, where the loop
+/// previously propagated every error and let one dead share take the primary
+/// mailbox down with it.
+///
+/// Deliberately narrow: anything else (auth loss, transport failure, a
+/// schema-incompatible cursor) still fails the attach, because those are not
+/// scope-local facts.
+///
+/// Pure so the containment rule is unit-pinnable without an engine.
+fn scope_local_establish_failure(error: &AccountError) -> bool {
+    matches!(
+        error.recovery(),
+        RecoveryClass::Engine(EngineDirective::DisableScope(_))
+    )
+}
+
 impl SyncEngine {
     #[must_use]
     pub fn builder() -> SyncEngineBuilder {
@@ -244,12 +267,37 @@ impl SyncEngine {
         let scopes = self.discover_scopes(opened.as_ref()).await?;
         let mut deferred_inventory_scopes = Vec::new();
         for scope in scopes.clone() {
-            match self
-                .establish_one(&account_id, opened.as_ref(), scope, Arc::clone(&cursors))
-                .await?
-            {
-                InitialScope::Ready => {}
-                InitialScope::DeferredInventory(scope) => deferred_inventory_scopes.push(scope),
+            let established = self
+                .establish_one(
+                    &account_id,
+                    opened.as_ref(),
+                    scope.clone(),
+                    Arc::clone(&cursors),
+                )
+                .await;
+            match established {
+                Ok(InitialScope::Ready) => {}
+                Ok(InitialScope::DeferredInventory(scope)) => {
+                    deferred_inventory_scopes.push(scope);
+                }
+                // A scope-local failure must stay scope-local. The running
+                // path already quarantines one revoked shared/public scope
+                // without touching its siblings (`disable_scope`); attach did
+                // not, so a single unreachable shared mailbox or public folder
+                // failed the whole account and the consumer got no sync at
+                // all - primary mail included. Drop the scope and continue;
+                // the next reopen re-runs discovery and picks it back up if
+                // access returned.
+                Err(Error::Account(error)) if scope_local_establish_failure(&error) => {
+                    tracing::warn!(
+                        target: "bifrost.sync.attach",
+                        account = ?account_id,
+                        scope = ?scope,
+                        error = %error,
+                        "scope-local establishment failure; skipping scope, account continues"
+                    );
+                }
+                Err(other) => return Err(other),
             }
         }
 
@@ -3700,6 +3748,45 @@ mod tests {
         use super::jittered;
         use std::time::Duration;
         assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// Attach must contain a scope-local establishment failure instead of
+    /// failing the whole account. One revoked shared mailbox or unreadable
+    /// public folder previously took the primary mailbox down with it,
+    /// because the establish loop propagated every error with `?`.
+    #[test]
+    fn scope_revoked_establishment_failure_is_contained_to_its_scope() {
+        use super::scope_local_establish_failure;
+        use bifrost_types::{
+            AccessCause, AccessErrorKind, AccountErrorBuilder, AccountErrorKind, AccountOperation,
+            Cause, ErrorScope, Protocol, StateCause, SyncStateErrorKind,
+        };
+
+        let revoked = AccountErrorBuilder::new(
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+            Cause::State(StateCause::ScopeRevoked),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::EstablishCursor)
+        .scope(ErrorScope::Cursor(CursorScope::Folder(FolderId(
+            "Shared/alice/INBOX".into(),
+        ))))
+        .try_build()
+        .expect("valid account error classification");
+        assert!(scope_local_establish_failure(&revoked));
+
+        // An account-wide fact still fails the attach: containment is
+        // deliberately narrow, keyed on the protocol crate's own
+        // `DisableScope` classification and nothing else.
+        let denied = AccountErrorBuilder::new(
+            AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied),
+            Cause::Access(AccessCause::PermissionDenied { resource: None }),
+        )
+        .protocol(Protocol::Imap)
+        .operation(AccountOperation::EstablishCursor)
+        .try_build()
+        .expect("valid account error classification");
+        assert!(!scope_local_establish_failure(&denied));
     }
 
     #[test]

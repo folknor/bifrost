@@ -80,6 +80,16 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    - `Ready(cursor)`: persist, start `changes_stream` immediately.
    - `EstablishViaInventory`: defer to backfill; the inventory
      pass's terminal `Done` carries the cursor.
+   - Error whose derived `RecoveryClass` is
+     `Engine(DisableScope(_))` (`scope_local_establish_failure`,
+     pure): SKIP the scope, log, keep attaching. The protocol crate
+     has already classified the failure as independently
+     quarantinable (a revoked shared mailbox, an unreadable public
+     folder), and the running path honors that via `disable_scope`;
+     this is the same rule at attach. Previously every establish
+     error propagated, so one dead share failed the whole account
+     and the consumer got no sync at all, primary mail included.
+     Any other error still fails the attach.
 5. `discover_memberships()` -> populate `CursorRegistry`
    membership index for push-hint routing. `scope_covers_membership`
    in `engine.rs` is the engine-policy mapping (account-wide

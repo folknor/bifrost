@@ -357,8 +357,22 @@ with hierarchy headers (`child_folder_count > 0` re-enters the worklist; a
 `visited` dedup set plus a browse-step cap bound the walk), read-gate via
 `effective_rights.read`, and per folder resolve the content mailbox
 (`get_folder` PR_REPLICA_LIST GUID -> `construct_replica_smtp` ->
-`discover_content_mailbox`). Per-folder failures skip with a scoped `Warning`;
-a missing hierarchy skips the whole leg.
+`discover_content_mailbox`).
+
+Neither Autodiscover leg may drop a folder. Both degrade instead, because
+both depend on optional Exchange machinery that a tenant (or a harness) may
+simply not serve, and dropping meant an EMPTY `routing_map`: zero public
+containers, zero pinned scopes, and nothing but a support-only warning:
+
+- No `PublicFolderInformation`: `hierarchy_routing_fallback` anchors the
+  browse on the account's own mailbox (a real identity - the anchor becomes
+  the owner `MailboxId` on every emitted item, so it must never be empty).
+- No content-mailbox routing for a folder: `content_routing_or_hierarchy`
+  seeds it with the hierarchy routing the browse already succeeded with.
+
+Both helpers are pure and unit-pinned. A `find_folder` failure at the root is
+still fatal to the leg (there is no hierarchy at all); a sub-folder browse
+failure still skips that subtree.
 
 `seed_and_scope` then splits discovery from sync. It ALWAYS seeds two maps -
 `routing_map` (the content-mailbox routing the cursor payload carries) and

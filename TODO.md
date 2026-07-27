@@ -401,6 +401,25 @@ container projection itself.
   `HashMap` iteration order, so batch ordering across routing targets is
   nondeterministic. Per-item outcomes are unaffected; only the grouping order
   varies.
+- **nc-7 (jmap)** Foreign inventory does not qualify `InventoryEntry::thread_id`,
+  so a foreign account's thread ids reach the consumer bare. Two consequences:
+  a foreign thread id collides in the consumer's index with a primary thread
+  that happens to share the id, and `thread_hydrate` (which is therefore left
+  unrouted on purpose - there is no encoded form to route) runs `Thread/get`
+  against the primary account for a foreign thread. Qualifying thread ids is a
+  contract change on an id the consumer groups by, not a wiring fix, so it
+  wants a decision rather than a patch. `id` and `blob_id` ARE qualified.
+- **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
+  primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
+  through the same `container_from_mailbox`, so a share whose `Mailbox/get`
+  omits `myRights` silently projects as unreported rather than as a
+  degradation. No warning lane exists to say which (see nc-1).
+- **nc-9 (graph)** `GraphClient::with_account_net` hardcodes
+  `rate_limit_host = GRAPH_HOST` instead of deriving it from the supplied
+  api-base, unlike every other constructor. A consumer injecting its own
+  `AccountNet` against a redirected base therefore meters under the production
+  Graph host bucket. Cosmetic today (the injected net owns its own limits) but
+  it is an inconsistency waiting to mislead.
 
 ## Notes
 

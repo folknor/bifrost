@@ -344,6 +344,22 @@ the download). An id naming an account this session cannot reach falls back
 to the primary handle deliberately, so the miss surfaces as a real
 not-found rather than a fabricated local error.
 
+`pim::message_hydrate` (the one-id door, and the one
+`SyncEngine::message_hydrate` funnels into) routes on the SAME
+`hydrate::route_for_id` decision. It previously did not, so a foreign-encoded
+id reached the primary `Email/get` verbatim and came back as a `NotFound`
+naming the encoded string. On the way out, `qualify_foreign_message_ids`
+re-qualifies the hydrated `Message`: `id` and each attachment `BlobId` in the
+OBJECT namespace (`encode_object`, what `open_blob` decodes), each
+`ContainerId` in the FOLDER namespace (`encode_foreign`, what
+`containers_list` and the cursor scopes key on). The two namespaces are not
+interchangeable and the projection must not confuse them.
+
+`thread_hydrate` is NOT routed, deliberately: foreign inventory never
+qualifies `InventoryEntry::thread_id`, so there is no foreign-encoded thread
+id in circulation to route. See the `nc-7` TODO - qualifying thread ids is a
+contract change, not a wiring fix.
+
 `containers_list` appends each foreign account's mailboxes with
 `namespace = Shared`, `owner = MailboxId(accountId)`,
 `native_id = encode_foreign(accountId, mailboxId)` (byte-identical to the

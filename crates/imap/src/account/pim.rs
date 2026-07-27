@@ -1800,7 +1800,11 @@ async fn refresh_folders(account: &ImapAccount, op: AccountOperation) -> Result<
     let folders = factory::list_folders(&conn, &account.config, &profile)
         .await
         .map_err(err)?;
-    account.folders.replace_all(folders);
+    // Personal-root re-LIST only. `replace_all` would clear the shared /
+    // other-user entries NAMESPACE discovery installed at open, taking their
+    // owner tags and MYRIGHTS with them, so every container mutation would
+    // blank the shared half of `containers_list` until the next reopen.
+    account.folders.replace_personal(folders);
     Ok(())
 }
 
@@ -1996,6 +2000,7 @@ mod tests {
                 info: shared,
                 owner: bifrost_types::MailboxId("alice".to_owned()),
                 rights: rights.map(MailboxRights::parse),
+                namespace_prefix: "Shared/".to_owned(),
             }],
         )
     }
@@ -2034,6 +2039,42 @@ mod tests {
         // A personal folder was never MYRIGHTS-probed, so rights are
         // unreported rather than "no rights".
         assert!(container.rights.is_none());
+    }
+
+    // The rights projection has to survive the case where the personal
+    // `LIST "" "*"` ALSO returned the shared path (RFC 2342 permits it and
+    // several servers do it). Before the precedence fix the overlapping entry
+    // stayed personal, so `Container::rights` came back `None` for a folder
+    // whose MYRIGHTS had been parsed and then discarded.
+    #[test]
+    fn shared_container_keeps_its_rights_when_the_personal_list_overlaps() {
+        let path = MailboxName::new("Shared/alice/Reports").expect("valid mailbox");
+        let registry = FolderRegistry::from_lists(
+            vec![MailboxInfo {
+                name: path.clone(),
+                delimiter: Some('/'),
+                ..Default::default()
+            }],
+            vec![SharedFolderEntry {
+                info: MailboxInfo {
+                    name: path.clone(),
+                    delimiter: Some('/'),
+                    ..Default::default()
+                },
+                owner: bifrost_types::MailboxId("alice".to_owned()),
+                rights: Some(MailboxRights::parse("lr")),
+                namespace_prefix: "Shared/".to_owned(),
+            }],
+        );
+
+        let entry = registry.get(&path).expect("entry present");
+        let container = container_from_folder_entry(&entry, "Reports".to_owned());
+        assert_eq!(container.namespace, ContainerNamespace::Shared);
+        let rights = container.rights.expect("MYRIGHTS reaches the container");
+        // `lr` is a read-only share: readable, but no insert / delete / flag.
+        assert_eq!(rights.may_read_items, Some(true));
+        assert_eq!(rights.may_add_items, Some(false));
+        assert_eq!(rights.may_remove_items, Some(false));
     }
 
     /// The container's `native_id` must be byte-identical to the

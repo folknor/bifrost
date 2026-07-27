@@ -525,6 +525,39 @@ pub(crate) fn item_to_inventory_entry(
     }
 }
 
+/// The hierarchy routing to browse with when Autodiscover did not answer
+/// `PublicFolderInformation`.
+///
+/// Anchoring on the caller's own mailbox is what Exchange does when no
+/// hierarchy hint is published, and it keeps `anchor_mailbox` a real,
+/// non-empty identity - the value that later becomes the owner
+/// `MailboxId` on every item this leg emits. An empty anchor would tag
+/// every public item with `Mailbox("")`.
+///
+/// Pure so the degradation decision is unit-pinnable without Autodiscover.
+pub(crate) fn hierarchy_routing_fallback(user_email: &str) -> PublicFolderRouting {
+    PublicFolderRouting {
+        anchor_mailbox: user_email.to_string(),
+        // No `InternalRpcClientServer` hint: send no `X-PublicFolderMailbox`
+        // rather than inventing a server name.
+        public_folder_mailbox: None,
+    }
+}
+
+/// The routing a discovered public folder is seeded with: its own
+/// content-mailbox routing when Autodiscover resolved one, else the
+/// hierarchy routing the browse already succeeded with.
+///
+/// Split out (and pure) because it is the decision that separates "this
+/// folder is projected but routes suboptimally" from the prior behavior,
+/// "this folder does not exist as far as the consumer is concerned".
+pub(crate) fn content_routing_or_hierarchy(
+    content: Option<PublicFolderRouting>,
+    hierarchy: &PublicFolderRouting,
+) -> PublicFolderRouting {
+    content.unwrap_or_else(|| hierarchy.clone())
+}
+
 /// Read-gate a discovered folder list: keep only folders the caller can
 /// read. Advisory at discovery (don't emit an unreadable scope); the
 /// authoritative per-operation gate is the live `ErrorAccessDenied`.
@@ -736,14 +769,23 @@ pub(crate) async fn discover_public_folder_scopes(
         return (scopes, warnings);
     };
 
+    // A missing Autodiscover hierarchy hint is a DEGRADATION, not a reason to
+    // abandon the leg. `PublicFolderInformation` only names a preferred
+    // hierarchy mailbox; the caller's own mailbox is a valid `X-AnchorMailbox`
+    // for `publicfoldersroot`, and a deployment (or a harness) that does not
+    // answer `GetUserSettings` still serves the hierarchy. Returning here
+    // meant a single unanswered Autodiscover setting produced zero public
+    // containers with nothing but a support-only warning to show for it.
     let routing = match account.discover_public_folder_routing(&user_email).await {
         Ok(routing) => routing,
         Err(_) => {
             warnings.push(Warning::support_only(
                 WarningKind::OperatorAttentionNeeded,
-                "public-folder discovery skipped: hierarchy routing unavailable".to_string(),
+                "public-folder hierarchy routing unavailable; browsing anchored on the \
+                 account mailbox"
+                    .to_string(),
             ));
-            return (scopes, warnings);
+            hierarchy_routing_fallback(&user_email)
         }
     };
 
@@ -809,30 +851,39 @@ pub(crate) async fn discover_public_folder_scopes(
             if folder.child_folder_count > 0 {
                 to_visit.push(folder.folder_id.clone());
             }
-            match resolve_content_routing(account, &ews, &folder, &hierarchy_headers, &domain).await
-            {
-                Ok(content_routing) => {
-                    if let Some(scope) = seed_and_scope(
-                        account,
-                        scope_policy,
-                        &folder,
-                        parent_container.clone(),
-                        content_routing,
-                    )
+            // Seeding is UNCONDITIONAL (that is the documented contract:
+            // `containers_list` projects the full readable hierarchy off these
+            // maps). Content-mailbox routing is a per-folder optimization -
+            // it needs `PR_REPLICA_LIST` plus one Autodiscover round-trip per
+            // replica GUID - so gating the seed on it, as this previously did,
+            // silently produced an EMPTY routing map (and therefore zero public
+            // containers and zero pinned scopes) on any deployment that does
+            // not serve that chain. Fall back to the hierarchy routing, which
+            // is the routing the browse itself just succeeded with.
+            let content_routing =
+                resolve_content_routing(account, &ews, &folder, &hierarchy_headers, &domain)
                     .await
-                    {
-                        scopes.push(scope);
-                    }
-                }
-                Err(()) => {
-                    warnings.push(Warning::support_only(
-                        WarningKind::OperatorAttentionNeeded,
-                        format!(
-                            "public folder {} skipped: content-mailbox routing unresolved",
-                            folder.display_name
-                        ),
-                    ));
-                }
+                    .ok();
+            if content_routing.is_none() {
+                warnings.push(Warning::support_only(
+                    WarningKind::OperatorAttentionNeeded,
+                    format!(
+                        "public folder {} content-mailbox routing unresolved; \
+                         routing content ops on the hierarchy mailbox",
+                        folder.display_name
+                    ),
+                ));
+            }
+            if let Some(scope) = seed_and_scope(
+                account,
+                scope_policy,
+                &folder,
+                parent_container.clone(),
+                content_routing_or_hierarchy(content_routing, &routing),
+            )
+            .await
+            {
+                scopes.push(scope);
             }
         }
     }
@@ -1366,6 +1417,52 @@ pub(crate) fn public_folder_changes_stream(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // Discovery must project a folder it browsed successfully even when the
+    // per-folder content-mailbox chain (PR_REPLICA_LIST -> Autodiscover) does
+    // not resolve. The prior behavior dropped such a folder entirely, so a
+    // deployment without that chain saw an empty routing map, zero public
+    // containers, and zero pinned scopes.
+    #[test]
+    fn unresolved_content_routing_falls_back_to_the_hierarchy_routing() {
+        let hierarchy = PublicFolderRouting {
+            anchor_mailbox: "hierarchy@contoso.com".to_string(),
+            public_folder_mailbox: Some("server01.contoso.com".to_string()),
+        };
+        let fallback = content_routing_or_hierarchy(None, &hierarchy);
+        assert_eq!(fallback.anchor_mailbox, "hierarchy@contoso.com");
+        assert_eq!(
+            fallback.public_folder_mailbox.as_deref(),
+            Some("server01.contoso.com")
+        );
+        // Resolved content routing still wins - the fallback never overrides
+        // a real answer.
+        let content = PublicFolderRouting {
+            anchor_mailbox: "content@contoso.com".to_string(),
+            public_folder_mailbox: Some("content@contoso.com".to_string()),
+        };
+        assert_eq!(
+            content_routing_or_hierarchy(Some(content), &hierarchy).anchor_mailbox,
+            "content@contoso.com"
+        );
+    }
+
+    // An unanswered `PublicFolderInformation` degrades the anchor to the
+    // account's own mailbox rather than abandoning the whole leg. The anchor
+    // must stay a real identity: it becomes the owner `MailboxId` on every
+    // item this leg emits.
+    #[test]
+    fn missing_hierarchy_hint_anchors_on_the_account_mailbox() {
+        let routing = hierarchy_routing_fallback("user@contoso.com");
+        assert_eq!(routing.anchor_mailbox, "user@contoso.com");
+        assert!(routing.public_folder_mailbox.is_none());
+        assert!(!routing.anchor_mailbox.is_empty());
+        // The headers it materializes carry the anchor and omit the
+        // public-folder mailbox rather than sending an invented server.
+        let pairs = routing.headers().pairs();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "X-AnchorMailbox");
+    }
 
     fn item(id: &str, received: Option<&str>, is_read: bool) -> EwsItem {
         EwsItem {

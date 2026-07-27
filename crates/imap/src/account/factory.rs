@@ -556,6 +556,7 @@ pub(crate) async fn discover_shared_folders(
                 info,
                 owner,
                 rights,
+                namespace_prefix: descriptor.prefix.clone(),
             });
         }
     }

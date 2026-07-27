@@ -142,6 +142,7 @@ mod tests {
                 info: mailbox_info("Shared/alice/INBOX"),
                 owner: MailboxId("alice".to_string()),
                 rights: None,
+                namespace_prefix: "Shared/".to_string(),
             }],
         );
 
@@ -180,6 +181,7 @@ mod tests {
                 info: mailbox_info("Shared/alice/INBOX"),
                 owner: MailboxId("alice".to_string()),
                 rights: None,
+                namespace_prefix: "Shared/".to_string(),
             }],
         );
         let folder_scopes: Vec<CursorScope> = registry
