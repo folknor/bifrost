@@ -287,12 +287,50 @@ pub trait Account: Send + Sync {
     /// Bulk move. Targets are moved into `destination`.
     ///
     /// Same streaming invariants as `bulk_set_flags`.
+    ///
+    /// Destination-only. On a label-model provider that is not enough
+    /// to express "and leave the label it came from" - see
+    /// [`bulk_move_from`](Self::bulk_move_from), which is the surface
+    /// to reach for when the consumer knows the source.
     fn bulk_move(
         &self,
         targets: AccountStream<ObjectId>,
         destination: MembershipScope,
         key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>>;
+
+    /// Bulk move out of a known `source` container.
+    ///
+    /// Same contract and streaming invariants as
+    /// [`bulk_move`](Self::bulk_move), plus: on completion the targets
+    /// are no longer members of `source`. `None` is exactly
+    /// `bulk_move`.
+    ///
+    /// The point is request count, not semantics. On the folder-model
+    /// providers a move already vacates the source as part of the move
+    /// itself (IMAP `MOVE`, Graph `POST /messages/{id}/move`, JMAP
+    /// replacing `mailboxIds`), so the default impl below - forward to
+    /// `bulk_move`, ignore `source` - already satisfies the contract
+    /// for them. On the label-model provider it does not: Gmail's
+    /// `batchModify` has to be told to remove the source label, and
+    /// without this surface a consumer has to compose `bulk_move` plus
+    /// one `remove_from_container` PER ID, which is O(n) requests
+    /// against precisely the provider whose bulk endpoint could express
+    /// add-and-remove in a single call. Gmail therefore overrides.
+    ///
+    /// Deliberately not capability-gated: every impl satisfies the
+    /// post-condition, so a consumer never has to branch on which
+    /// provider it is talking to.
+    fn bulk_move_from(
+        &self,
+        targets: AccountStream<ObjectId>,
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        let _ = source;
+        self.bulk_move(targets, destination, key)
+    }
 
     /// Bulk destroy.
     ///

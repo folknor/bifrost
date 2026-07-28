@@ -12,6 +12,62 @@ const LABEL_STARRED: &str = "STARRED";
 const LABEL_DRAFT: &str = "DRAFT";
 const LABEL_IMPORTANT: &str = "IMPORTANT";
 
+/// Gmail's mutually exclusive display containers.
+///
+/// Gmail shows a message in whichever of these it carries, whatever
+/// else is also attached: a spam message filed into a user label is
+/// still rendered under Spam. So a relocation has to strip every one
+/// of them the message is *not* moving into; adding the destination
+/// alone is a no-op from the user's point of view.
+pub(crate) const LABEL_INBOX: &str = "INBOX";
+pub(crate) const LABEL_SPAM: &str = "SPAM";
+pub(crate) const LABEL_TRASH: &str = "TRASH";
+const EXCLUSIVE_CONTAINERS: [&str; 3] = [LABEL_INBOX, LABEL_SPAM, LABEL_TRASH];
+
+/// Synthetic bifrost container id for Gmail archive.
+///
+/// Gmail models archive as the *absence* of every exclusive container
+/// rather than as a label, so `containers_list` synthesises this id
+/// purely to give the role table an `Archive` entry. It is not a real
+/// Gmail label id and must never reach `addLabelIds` - Gmail rejects
+/// the modify if it does.
+pub(crate) const ARCHIVE_ID: &str = "archive";
+
+pub(crate) fn is_archive_id(id: &str) -> bool {
+    id.eq_ignore_ascii_case(ARCHIVE_ID)
+}
+
+/// The single Gmail relocation rule, shared by the bulk driver and the
+/// single-object builders so a consumer cannot get different wire
+/// semantics depending on which entry point it reached.
+///
+/// "Move into `destination`" lowers to: add `destination` (unless it is
+/// the synthetic archive, which has no label to add), and remove every
+/// exclusive display container that is not the destination itself.
+///
+/// - `INBOX` -> add INBOX, drop SPAM + TRASH (un-spam / un-trash).
+/// - `archive` -> add nothing, drop INBOX + SPAM + TRASH.
+/// - a user label -> add it, drop INBOX + SPAM + TRASH, so filing a
+///   spammed or trashed message actually takes it out of Spam / Trash.
+/// - `SPAM` / `TRASH` -> add it, drop the other two.
+pub(crate) fn move_placement_patch(destination: &str) -> LabelPatch {
+    let add_label_ids = if is_archive_id(destination) {
+        Vec::new()
+    } else {
+        vec![destination.to_string()]
+    };
+    let remove_label_ids = EXCLUSIVE_CONTAINERS
+        .iter()
+        .filter(|container| !destination.eq_ignore_ascii_case(container))
+        .map(|container| (*container).to_string())
+        .collect();
+    LabelPatch {
+        add_label_ids,
+        remove_label_ids,
+        unsupported_flags: Vec::new(),
+    }
+}
+
 const FLAG_SEEN: &str = "\\Seen";
 const FLAG_FLAGGED: &str = "\\Flagged";
 const FLAG_DRAFT: &str = "\\Draft";
@@ -292,6 +348,69 @@ mod tests {
                 LABEL_STARRED.to_string(),
                 LABEL_UNREAD.to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn move_to_inbox_drops_the_other_exclusive_containers() {
+        let patch = move_placement_patch(LABEL_INBOX);
+        assert_eq!(patch.add_label_ids, vec![LABEL_INBOX.to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()]
+        );
+    }
+
+    #[test]
+    fn move_to_user_label_drops_spam_and_trash_too() {
+        let patch = move_placement_patch("Label_42");
+        assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string()
+            ],
+            "filing a spammed or trashed message must take it out of Spam / Trash"
+        );
+    }
+
+    #[test]
+    fn move_to_archive_adds_no_label() {
+        let patch = move_placement_patch(ARCHIVE_ID);
+        assert!(
+            patch.add_label_ids.is_empty(),
+            "`archive` is synthetic and is not a Gmail label id"
+        );
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn move_to_spam_keeps_spam_and_drops_the_rest() {
+        let patch = move_placement_patch(LABEL_SPAM);
+        assert_eq!(patch.add_label_ids, vec![LABEL_SPAM.to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![LABEL_INBOX.to_string(), LABEL_TRASH.to_string()]
+        );
+    }
+
+    #[test]
+    fn exclusive_container_match_is_case_insensitive() {
+        let patch = move_placement_patch("inbox");
+        assert_eq!(patch.add_label_ids, vec!["inbox".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()],
+            "a lowercased INBOX must not ask Gmail to remove the container it is moving into"
         );
     }
 

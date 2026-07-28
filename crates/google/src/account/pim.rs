@@ -23,15 +23,12 @@ use crate::types::{
 use super::blobs;
 use super::error;
 use super::flags;
+use super::flags::{ARCHIVE_ID, LABEL_INBOX, LABEL_SPAM, LABEL_TRASH, is_archive_id};
 use super::scopes::{ScopeCache, labels_for_flags, refresh_scope_snapshot};
 
-const LABEL_INBOX: &str = "INBOX";
 const LABEL_SENT: &str = "SENT";
 const LABEL_DRAFT: &str = "DRAFT";
-const LABEL_TRASH: &str = "TRASH";
-const LABEL_SPAM: &str = "SPAM";
 const LABEL_UNREAD: &str = "UNREAD";
-const ARCHIVE_ID: &str = "archive";
 const MAX_GMAIL_PAGE_SIZE: u32 = 500;
 
 pub(crate) fn add_to_container(
@@ -571,30 +568,19 @@ pub(crate) fn move_thread(
     source: Option<ContainerId>,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let target_target = MutationTarget::Thread(thread.clone());
-        let (add, remove) = add_container_patch(&target);
+        // One `threads.modify`: the add and every removal (the exclusive
+        // display containers plus the caller's source label) ride the
+        // same request, so there is no window where the thread sits in
+        // both containers.
+        let (add, remove) = move_container_patch(&target, source.as_ref());
         modify_target(
             &client,
-            target_target,
+            MutationTarget::Thread(thread),
             add,
             remove,
             bifrost_types::AccountOperation::BulkMove,
         )
-        .await?;
-        if let Some(source) = source
-            && source != target
-        {
-            let (add, remove) = remove_container_patch(&source);
-            modify_target(
-                &client,
-                MutationTarget::Thread(thread),
-                add,
-                remove,
-                bifrost_types::AccountOperation::RemoveFromContainer,
-            )
-            .await?;
-        }
-        Ok(())
+        .await
     })
 }
 
@@ -617,7 +603,7 @@ pub(crate) fn delete_thread(
                 )
             });
         }
-        let (add, remove) = add_container_patch(&ContainerId(LABEL_TRASH.to_string()));
+        let (add, remove) = move_container_patch(&ContainerId(LABEL_TRASH.to_string()), None);
         modify_target(
             &client,
             MutationTarget::Thread(thread),
@@ -659,10 +645,40 @@ async fn modify_target(
 
 fn add_container_patch(container: &ContainerId) -> (Vec<String>, Vec<String>) {
     if is_archive_id(&container.0) {
-        (Vec::new(), vec![LABEL_INBOX.to_string()])
-    } else {
-        (vec![container.0.clone()], Vec::new())
+        // Archive is not a label - it is the absence of every exclusive
+        // display container - so "add to archive" is only expressible
+        // as a relocation.
+        return move_container_patch(container, None);
     }
+    (vec![container.0.clone()], Vec::new())
+}
+
+/// Single-object relocation, sharing
+/// [`flags::move_placement_patch`] with the bulk `batchModify` driver
+/// so a consumer gets the same wire semantics whichever entry point it
+/// reached: the exclusive display containers the message is leaving are
+/// stripped, and the synthetic `archive` id never reaches
+/// `addLabelIds`.
+///
+/// `source` adds the user label being filed out of, in the SAME modify
+/// call - the destination alone cannot imply it.
+fn move_container_patch(
+    target: &ContainerId,
+    source: Option<&ContainerId>,
+) -> (Vec<String>, Vec<String>) {
+    let mut patch = flags::move_placement_patch(&target.0);
+    if let Some(source) = source {
+        let redundant = is_archive_id(&source.0)
+            || source.0.eq_ignore_ascii_case(&target.0)
+            || patch
+                .remove_label_ids
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&source.0));
+        if !redundant {
+            patch.remove_label_ids.push(source.0.clone());
+        }
+    }
+    (patch.add_label_ids, patch.remove_label_ids)
 }
 
 fn remove_container_patch(container: &ContainerId) -> (Vec<String>, Vec<String>) {
@@ -1272,10 +1288,6 @@ fn system_time_from_millis(value: &str) -> Option<SystemTime> {
         .map(|millis| UNIX_EPOCH + Duration::from_millis(millis))
 }
 
-fn is_archive_id(id: &str) -> bool {
-    id.eq_ignore_ascii_case(ARCHIVE_ID)
-}
-
 fn non_negative_i64(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
@@ -1442,10 +1454,73 @@ mod tests {
     }
 
     #[test]
-    fn read_state_uses_unread_label_inverse() {
+    fn adding_archive_is_a_relocation_not_a_label() {
         let (add, remove) = add_container_patch(&ContainerId(ARCHIVE_ID.to_string()));
         assert!(add.is_empty());
-        assert_eq!(remove, vec![LABEL_INBOX.to_string()]);
+        assert_eq!(
+            remove,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_a_user_label_does_not_relocate() {
+        let (add, remove) = add_container_patch(&ContainerId("Label_42".to_string()));
+        assert_eq!(add, vec!["Label_42".to_string()]);
+        assert!(
+            remove.is_empty(),
+            "add_to_container is additive; only a move strips the inbox"
+        );
+    }
+
+    #[test]
+    fn single_object_move_matches_the_bulk_rule() {
+        let (add, remove) = move_container_patch(&ContainerId("Label_42".to_string()), None);
+        assert_eq!(add, vec!["Label_42".to_string()]);
+        assert_eq!(
+            remove,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string()
+            ],
+            "the single-object and bulk builders must not disagree"
+        );
+    }
+
+    #[test]
+    fn single_object_move_folds_the_source_into_one_request() {
+        let (_, remove) = move_container_patch(
+            &ContainerId("Label_42".to_string()),
+            Some(&ContainerId("Label_7".to_string())),
+        );
+        assert_eq!(
+            remove,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string(),
+                "Label_7".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn single_object_move_to_archive_adds_no_label() {
+        let (add, remove) = move_container_patch(&ContainerId(ARCHIVE_ID.to_string()), None);
+        assert!(add.is_empty());
+        assert_eq!(
+            remove,
+            vec![
+                LABEL_INBOX.to_string(),
+                LABEL_SPAM.to_string(),
+                LABEL_TRASH.to_string()
+            ]
+        );
     }
 
     #[test]

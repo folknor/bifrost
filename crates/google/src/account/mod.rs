@@ -351,6 +351,28 @@ impl Account for GoogleAccount {
             Arc::clone(&self.scope_cache),
             targets,
             destination,
+            None,
+            key,
+        )
+    }
+
+    // Account: Gmail is the reason `bulk_move_from` exists. `batchModify`
+    // carries `addLabelIds` and `removeLabelIds` in one request, so the
+    // source detach costs nothing extra here - whereas without it a
+    // consumer has to issue one `remove_from_container` per message.
+    fn bulk_move_from(
+        &self,
+        targets: AccountStream<ObjectId>,
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+        key: IdempotencyKey,
+    ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+        mutation::bulk_move(
+            Arc::clone(&self.client),
+            Arc::clone(&self.scope_cache),
+            targets,
+            destination,
+            source,
             key,
         )
     }

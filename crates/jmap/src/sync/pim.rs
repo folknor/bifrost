@@ -267,7 +267,8 @@ pub(crate) fn send_message(
             Some(role_mailbox(&mail, FolderRole::Sent, AccountOperation::Send).await?)
         };
 
-        let mut create = build_email_create_from_send(&mail, request, draft_mailbox).await?;
+        let mut create =
+            build_email_create_from_send(&mail, request, draft_mailbox.clone()).await?;
         if let Some((_, Some(sender))) = identity.as_ref() {
             create.sender([address_to_jmap(sender.clone())]);
         }
@@ -307,10 +308,10 @@ pub(crate) fn send_message(
             }
         }
 
-        if let Some(sent) = sent_mailbox {
+        if let Some(sent) = sent_mailbox.as_ref() {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
-                .submitted_to_sent(sent);
+                .submitted_to_sent(sent, Some(&draft_mailbox));
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
         }
@@ -399,7 +400,7 @@ pub(crate) fn send_raw_message(
         let mut import_req = crate::email::import::EmailImportRequest::new();
         let import_create_id = {
             let entry = import_req.email(blob.blob_id);
-            entry.mailbox_ids([draft_mailbox]);
+            entry.mailbox_ids([draft_mailbox.clone()]);
             entry.keywords([DRAFT_KEYWORD]);
             entry.create_id()
         };
@@ -408,10 +409,10 @@ pub(crate) fn send_raw_message(
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
             .undo_status(UndoStatus::Final);
-        if let Some(sent) = sent_mailbox {
+        if let Some(sent) = sent_mailbox.as_ref() {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
-                .submitted_to_sent(sent);
+                .submitted_to_sent(sent, Some(&draft_mailbox));
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
         }
@@ -577,8 +578,19 @@ pub(crate) fn draft_send(
 ) -> AccountFuture<Result<ObjectId, AccountError>> {
     Box::pin(async move {
         let draft_id = EmailId::new(draft.0.clone());
-        let sent_mailbox =
-            role_mailbox(&mail, FolderRole::Sent, AccountOperation::DraftSend).await?;
+        // Sent and Drafts in one `Mailbox/get`: the submission patch
+        // needs the Drafts id to un-file the draft by path rather than
+        // by replacing `mailboxIds` wholesale.
+        let mut roles = role_mailboxes(
+            &mail,
+            &[FolderRole::Sent, FolderRole::Drafts],
+            AccountOperation::DraftSend,
+        )
+        .await?;
+        let sent_mailbox = roles
+            .remove(&FolderRole::Sent)
+            .ok_or_else(|| missing_role_mailbox(AccountOperation::DraftSend))?;
+        let draft_mailbox = roles.remove(&FolderRole::Drafts);
         let mut submission_set = EmailSubmissionSet::new();
         submission_set
             .create_with_id(SUBMISSION_CREATE_ID)
@@ -586,7 +598,7 @@ pub(crate) fn draft_send(
             .undo_status(UndoStatus::Final);
         submission_set
             .on_success_update_email(SUBMISSION_CREATE_ID)
-            .submitted_to_sent(sent_mailbox);
+            .submitted_to_sent(&sent_mailbox, draft_mailbox.as_ref());
         let mut response = mail
             .call(submission_set)
             .await
@@ -1511,21 +1523,41 @@ async fn role_mailbox(
     role: FolderRole,
     op: AccountOperation,
 ) -> Result<MailboxId, AccountError> {
-    fetch_mailboxes(mail, op)
+    role_mailboxes(mail, &[role], op)
         .await?
-        .into_iter()
-        .find(|mailbox| map_role(mailbox.role()) == Some(role))
-        .and_then(|mut mailbox| {
-            let id = mailbox.take_id();
-            if id.as_str().is_empty() {
-                None
-            } else {
-                Some(id)
-            }
-        })
-        .ok_or_else(|| {
-            super::error::unsupported_error(op, None, "JMAP required mailbox role not found")
-        })
+        .remove(&role)
+        .ok_or_else(|| missing_role_mailbox(op))
+}
+
+/// Resolve several role mailboxes from ONE `Mailbox/get`. Roles the
+/// account does not expose are simply absent from the map, so the
+/// caller decides which of them are required. Batching matters because
+/// the submission paths need Drafts and Sent together and
+/// `fetch_mailboxes` is an uncached round trip.
+async fn role_mailboxes(
+    mail: &MailAccount,
+    roles: &[FolderRole],
+    op: AccountOperation,
+) -> Result<HashMap<FolderRole, MailboxId>, AccountError> {
+    let mut found = HashMap::new();
+    for mut mailbox in fetch_mailboxes(mail, op).await? {
+        let Some(role) = map_role(mailbox.role()) else {
+            continue;
+        };
+        if !roles.contains(&role) {
+            continue;
+        }
+        let id = mailbox.take_id();
+        if id.as_str().is_empty() {
+            continue;
+        }
+        found.entry(role).or_insert(id);
+    }
+    Ok(found)
+}
+
+fn missing_role_mailbox(op: AccountOperation) -> AccountError {
+    super::error::unsupported_error(op, None, "JMAP required mailbox role not found")
 }
 
 async fn fetch_containers(

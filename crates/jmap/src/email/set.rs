@@ -262,17 +262,35 @@ impl EmailPatch {
     /// been submitted: relocate it to the Sent mailbox and stop it
     /// being a draft.
     ///
-    /// Rewriting `mailboxIds` alone is not enough. RFC 8621 s4.1.1
-    /// makes `$draft` the authoritative "this is a draft" signal -
-    /// membership of the Drafts mailbox is a consequence, not the
-    /// cause - so a submitted message that keeps the keyword is listed
-    /// under BOTH Drafts and Sent by any client that filters on it.
-    /// The two edits touch different top-level properties
-    /// (`mailboxIds` wholesale, `keywords/$draft` by patch path), which
-    /// RFC 8620 s5.3 permits; only mixing a property with a path into
-    /// that same property is forbidden.
-    pub(crate) fn submitted_to_sent(&mut self, sent: impl Into<MailboxId>) -> &mut Self {
-        self.mailbox_ids([sent]);
+    /// Every edit is a dotted-path patch, matching RFC 8621 s7.5's own
+    /// submission example (`mailboxIds/{draftsId}: null`,
+    /// `mailboxIds/{sentId}: true`, `keywords/$draft: null`). Assigning
+    /// `mailboxIds` as a whole value instead would be a *replacement*,
+    /// silently dropping any unrelated mailbox the submitted message
+    /// also belongs to - a user-filed label on a JMAP server that
+    /// models labels as mailboxes, or a shared-folder membership.
+    ///
+    /// Clearing `$draft` is not optional either: RFC 8621 s4.1.1 makes
+    /// the keyword the authoritative "this is a draft" signal (mailbox
+    /// membership is a consequence, not the cause), so a submitted
+    /// message that keeps the keyword is listed under BOTH Drafts and
+    /// Sent by any client that filters on it.
+    ///
+    /// `drafts` is `None` when the caller could not resolve a Drafts
+    /// mailbox; the message then stays wherever it was and merely gains
+    /// Sent, which is the safe degradation (a stale Drafts membership
+    /// is recoverable; a dropped one is not).
+    pub(crate) fn submitted_to_sent(
+        &mut self,
+        sent: &MailboxId,
+        drafts: Option<&MailboxId>,
+    ) -> &mut Self {
+        if let Some(drafts) = drafts
+            && drafts != sent
+        {
+            self.mailbox_id(drafts, false);
+        }
+        self.mailbox_id(sent, true);
         self.keyword(super::DRAFT_KEYWORD, false)
     }
 }
@@ -434,15 +452,18 @@ mod tests {
     #[test]
     fn submitted_to_sent_moves_and_clears_the_draft_keyword() {
         let mut patch = EmailPatch::default();
-        patch.submitted_to_sent(MailboxId::new("sent-1"));
+        patch.submitted_to_sent(&MailboxId::new("sent-1"), Some(&MailboxId::new("drafts-1")));
         let json = serde_json::to_value(&patch).expect("serializable patch");
 
         assert_eq!(
-            json.get("mailboxIds")
-                .and_then(|v| v.get("sent-1"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true),
+            json.get("mailboxIds/sent-1"),
+            Some(&serde_json::Value::Bool(true)),
             "the sent message must land in the Sent mailbox"
+        );
+        assert_eq!(
+            json.get("mailboxIds/drafts-1"),
+            Some(&serde_json::Value::Null),
+            "the draft must leave Drafts"
         );
         assert_eq!(
             json.get("keywords/$draft"),
@@ -450,8 +471,46 @@ mod tests {
             "a submitted message that keeps $draft shows under Drafts AND Sent"
         );
         // RFC 8620 s5.3: a property and a patch path into that same
-        // property must not both appear. `keywords` wholesale must stay
-        // absent now that `keywords/$draft` is present.
+        // property must not both appear. Neither `keywords` nor
+        // `mailboxIds` wholesale may show up alongside their paths.
         assert!(json.get("keywords").is_none());
+        assert!(json.get("mailboxIds").is_none());
+    }
+
+    #[test]
+    fn submitted_to_sent_does_not_replace_unrelated_memberships() {
+        // Replacing `mailboxIds` as a whole value would drop every
+        // membership the caller did not name. Only the two paths the
+        // submission actually owns may appear.
+        let mut patch = EmailPatch::default();
+        patch.submitted_to_sent(&MailboxId::new("sent-1"), Some(&MailboxId::new("drafts-1")));
+        let paths = patch.patch.as_ref().expect("patch paths");
+        assert_eq!(paths.len(), 3);
+        assert!(patch.mailbox_ids.is_none());
+    }
+
+    #[test]
+    fn submitted_to_sent_without_a_drafts_mailbox_only_adds_sent() {
+        let mut patch = EmailPatch::default();
+        patch.submitted_to_sent(&MailboxId::new("sent-1"), None);
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+        assert_eq!(
+            json.get("mailboxIds/sent-1"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    }
+
+    #[test]
+    fn submitted_to_sent_never_adds_and_removes_the_same_mailbox() {
+        // A server whose Drafts and Sent are the same mailbox must not
+        // get `true` and `null` for one path in one patch.
+        let mut patch = EmailPatch::default();
+        patch.submitted_to_sent(&MailboxId::new("one"), Some(&MailboxId::new("one")));
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+        assert_eq!(
+            json.get("mailboxIds/one"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 }

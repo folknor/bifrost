@@ -29,7 +29,8 @@ use super::error::{
     GmailErrorContext, applied_outcomes, is_batch_delete_scope_failure,
     merge_delete_fallback_error, mutation_error, skipped_outcomes,
 };
-use super::flags::{LabelPatch, translate_flag_op};
+use super::flags;
+use super::flags::{LABEL_TRASH, LabelPatch, translate_flag_op};
 use super::scopes::{ScopeCache, labels_for_flags};
 
 pub(crate) fn bulk_set_flags(
@@ -47,9 +48,19 @@ pub(crate) fn bulk_move(
     cache: ScopeCache,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
+    source: Option<MembershipScope>,
     key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(client, cache, targets, MutationKind::Move(destination), key)
+    mutation_stream(
+        client,
+        cache,
+        targets,
+        MutationKind::Move {
+            destination,
+            source,
+        },
+        key,
+    )
 }
 
 pub(crate) fn bulk_destroy(
@@ -94,8 +105,11 @@ fn mutation_stream(
                     let labels = labels_for_flags(&state.client, &state.cache).await;
                     state.patch = Some(translate_flag_op(op, &labels));
                 }
-                MutationKind::Move(destination) => {
-                    state.patch = Some(move_patch(destination));
+                MutationKind::Move {
+                    destination,
+                    source,
+                } => {
+                    state.patch = Some(move_patch(destination, source.as_ref()));
                 }
                 MutationKind::Destroy => {}
             }
@@ -118,7 +132,7 @@ fn mutation_stream(
         let started = Instant::now();
         let event = match &state.kind {
             MutationKind::Destroy => apply_destroy(&state.client, &ids, &state.key).await,
-            MutationKind::SetFlags(_) | MutationKind::Move(_) => {
+            MutationKind::SetFlags(_) | MutationKind::Move { .. } => {
                 let patch = state.patch.clone().unwrap_or_default();
                 apply_label_patch(&state.client, &ids, patch, &state.key, operation).await
             }
@@ -146,7 +160,10 @@ fn mutation_stream(
 
 enum MutationKind {
     SetFlags(FlagOp),
-    Move(MembershipScope),
+    Move {
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+    },
     Destroy,
 }
 
@@ -154,7 +171,7 @@ impl MutationKind {
     fn operation(&self) -> AccountOperation {
         match self {
             Self::SetFlags(_) => AccountOperation::UpdateFlags,
-            Self::Move(_) => AccountOperation::BulkMove,
+            Self::Move { .. } => AccountOperation::BulkMove,
             Self::Destroy => AccountOperation::BulkDestroy,
         }
     }
@@ -222,11 +239,10 @@ async fn apply_destroy(
                 error,
                 GmailErrorContext::mutation(AccountOperation::BulkDestroy),
             );
-            let fallback = LabelPatch {
-                add_label_ids: vec![LABEL_TRASH.to_string()],
-                remove_label_ids: vec![LABEL_INBOX.to_string()],
-                unsupported_flags: Vec::new(),
-            };
+            // The fallback is a move into TRASH, so it goes through the
+            // same relocation rule as every other move rather than
+            // hand-rolling a patch that would leave SPAM attached.
+            let fallback = flags::move_placement_patch(LABEL_TRASH);
             match apply_label_patch(client, ids, fallback, key, AccountOperation::BulkDestroy).await
             {
                 MutationApply::Batch(outcomes) => MutationApply::Batch(outcomes),
@@ -250,47 +266,59 @@ fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess
     SyncEvent::Terminated(error)
 }
 
-/// Gmail's mutually exclusive system containers. A message carrying
-/// `SPAM` or `TRASH` is displayed in that container regardless of any
-/// other label it also carries, so a move INTO the inbox has to strip
-/// them; merely adding `INBOX` leaves the message where it was.
-const LABEL_INBOX: &str = "INBOX";
-const LABEL_SPAM: &str = "SPAM";
-const LABEL_TRASH: &str = "TRASH";
-
-/// Translate a bulk move destination into a Gmail label patch.
+/// Translate a bulk move destination (and optional source) into a
+/// Gmail label patch.
 ///
-/// Gmail has no "move" verb; a move is an add plus the removal of the
-/// container the message is leaving. The bulk API carries no source
-/// container (unlike the single-thread path, which is handed one and
-/// removes it explicitly), so the patch has to be derived from the
-/// destination alone:
+/// Gmail has no "move" verb; a move is an add plus the removal of every
+/// container the message is leaving. The exclusive-container half of
+/// that is destination-derived and lives in
+/// [`flags::move_placement_patch`], shared with the single-object
+/// builders in `pim.rs` so both entry points agree on the wire shape.
 ///
-/// - Destination `INBOX` is an un-archive / un-spam / un-trash. `SPAM`
-///   and `TRASH` outrank `INBOX` in Gmail's display rules, so both are
-///   removed; leaving `SPAM` on is what made a bulk un-spam campaign a
-///   no-op from the user's point of view.
-/// - Any other destination is a file-away: drop `INBOX` so the message
-///   leaves the inbox, and let the destination label define where it
-///   lands.
-fn move_patch(destination: &MembershipScope) -> LabelPatch {
-    match destination {
-        MembershipScope::Label(LabelId(label_id)) => {
-            let remove_label_ids = if label_id.eq_ignore_ascii_case(LABEL_INBOX) {
-                vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()]
-            } else {
-                vec![LABEL_INBOX.to_string()]
-            };
-            LabelPatch {
-                add_label_ids: vec![label_id.clone()],
-                remove_label_ids,
-                unsupported_flags: Vec::new(),
-            }
-        }
-        _ => LabelPatch {
+/// `source` covers the part the destination cannot imply: a *user*
+/// label the message is being filed out of. Folding it into the same
+/// `batchModify` is what lets a consumer drop the O(n) "bulk_move plus
+/// a per-id `remove_from_container`" composition - Gmail's
+/// `batchModify` expresses add-and-remove in one request.
+fn move_patch(destination: &MembershipScope, source: Option<&MembershipScope>) -> LabelPatch {
+    let Some(LabelId(destination_id)) = as_label(destination) else {
+        return LabelPatch {
             unsupported_flags: vec!["gmail move destination must be a label".to_string()],
             ..LabelPatch::default()
-        },
+        };
+    };
+    let mut patch = flags::move_placement_patch(destination_id);
+    match source {
+        None => {}
+        Some(scope) => {
+            let Some(LabelId(source_id)) = as_label(scope) else {
+                return LabelPatch {
+                    unsupported_flags: vec!["gmail move source must be a label".to_string()],
+                    ..LabelPatch::default()
+                };
+            };
+            // Removing the synthetic `archive` id is a no-op (there is
+            // no such Gmail label), and a source equal to the
+            // destination would ask Gmail to add and remove the same
+            // label in one request.
+            let redundant = flags::is_archive_id(source_id)
+                || source_id.eq_ignore_ascii_case(destination_id)
+                || patch
+                    .remove_label_ids
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(source_id));
+            if !redundant {
+                patch.remove_label_ids.push(source_id.clone());
+            }
+        }
+    }
+    patch
+}
+
+fn as_label(scope: &MembershipScope) -> Option<&LabelId> {
+    match scope {
+        MembershipScope::Label(label) => Some(label),
+        _ => None,
     }
 }
 
@@ -350,7 +378,7 @@ mod tests {
 
     #[test]
     fn move_to_inbox_clears_spam_and_trash() {
-        let patch = move_patch(&label("INBOX"));
+        let patch = move_patch(&label("INBOX"), None);
         assert_eq!(patch.add_label_ids, vec!["INBOX".to_string()]);
         assert_eq!(
             patch.remove_label_ids,
@@ -362,7 +390,7 @@ mod tests {
 
     #[test]
     fn move_to_inbox_is_case_insensitive() {
-        let patch = move_patch(&label("inbox"));
+        let patch = move_patch(&label("inbox"), None);
         assert_eq!(
             patch.remove_label_ids,
             vec!["SPAM".to_string(), "TRASH".to_string()]
@@ -370,15 +398,89 @@ mod tests {
     }
 
     #[test]
-    fn move_to_user_label_leaves_the_inbox() {
-        let patch = move_patch(&label("Label_42"));
+    fn move_to_user_label_clears_every_exclusive_container() {
+        let patch = move_patch(&label("Label_42"), None);
         assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
-        assert_eq!(patch.remove_label_ids, vec!["INBOX".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()],
+            "filing a spammed message into a label must take it out of Spam"
+        );
+    }
+
+    #[test]
+    fn bulk_move_to_archive_adds_no_label() {
+        let patch = move_patch(&label("archive"), None);
+        assert!(
+            patch.add_label_ids.is_empty(),
+            "`archive` is synthetic; asking Gmail to apply it is a 400"
+        );
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()]
+        );
+        assert!(patch.unsupported_flags.is_empty());
+    }
+
+    #[test]
+    fn source_label_rides_the_same_batch_modify() {
+        let patch = move_patch(&label("Label_42"), Some(&label("Label_7")));
+        assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![
+                "INBOX".to_string(),
+                "SPAM".to_string(),
+                "TRASH".to_string(),
+                "Label_7".to_string()
+            ],
+            "the source detach must not cost a second request"
+        );
+    }
+
+    #[test]
+    fn source_already_implied_by_the_destination_is_not_repeated() {
+        let patch = move_patch(&label("Label_42"), Some(&label("inbox")));
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()]
+        );
+    }
+
+    #[test]
+    fn synthetic_archive_source_is_dropped() {
+        let patch = move_patch(&label("Label_42"), Some(&label("archive")));
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["INBOX".to_string(), "SPAM".to_string(), "TRASH".to_string()],
+            "`archive` is not a removable Gmail label"
+        );
+    }
+
+    #[test]
+    fn source_equal_to_destination_is_dropped() {
+        let patch = move_patch(&label("Label_42"), Some(&label("Label_42")));
+        assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
+        assert!(
+            !patch.remove_label_ids.contains(&"Label_42".to_string()),
+            "one request must not both add and remove the same label"
+        );
     }
 
     #[test]
     fn non_label_destination_is_unsupported() {
-        let patch = move_patch(&MembershipScope::Folder(FolderId("INBOX".into())));
+        let patch = move_patch(&MembershipScope::Folder(FolderId("INBOX".into())), None);
+        assert!(patch.add_label_ids.is_empty());
+        assert!(patch.remove_label_ids.is_empty());
+        assert_eq!(patch.unsupported_flags.len(), 1);
+    }
+
+    #[test]
+    fn non_label_source_is_unsupported() {
+        let patch = move_patch(
+            &label("Label_42"),
+            Some(&MembershipScope::Folder(FolderId("INBOX".into()))),
+        );
         assert!(patch.add_label_ids.is_empty());
         assert!(patch.remove_label_ids.is_empty());
         assert_eq!(patch.unsupported_flags.len(), 1);

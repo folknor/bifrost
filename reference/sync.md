@@ -438,6 +438,18 @@ is the engine-side entry that records the handle on success.
 `ItemOutcome::Uncertain` always queues for read-back so a
 non-idempotent transport drop never replays blindly.
 
+`SyncEngine::bulk_move` and `SyncEngine::bulk_move_from` share
+`run_bulk_pipeline` with `bulk_destroy`; the move arm submits through
+`Account::bulk_move_from(targets, destination, source, key)` and
+`bulk_move` is exactly `source: None`. `source` exists for request
+count, not semantics: the folder-model providers vacate the source as
+part of the move itself, so the trait's default impl forwards to
+`bulk_move` and drops it, while Gmail folds it into the same
+`batchModify` and thereby removes the O(n) `remove_from_container`
+workaround. The read-back guard is unchanged either way - it
+reconciles membership of `destination`, the property that says the
+move landed, and does not separately re-verify absence from `source`.
+
 `IdempotencyKey` is `{ run_id, sequence, protocol_salt }`. `run_id`
 is consumer-minted and consumer-persisted across process restarts
 so retries from a previous process correlate.

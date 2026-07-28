@@ -1158,7 +1158,7 @@ impl SyncEngine {
     ///
     /// Shares the idempotency / retry / recovery loop with
     /// [`Self::bulk_set_flags`] (see [`Self::run_bulk_pipeline`]); the
-    /// only differences are the wire op (`Account::bulk_move`) and the
+    /// only differences are the wire op (`Account::bulk_move_from`) and the
     /// read-back guard, which reconciles against container membership
     /// rather than a flag set. Like `bulk_set_flags`, this is the
     /// volume path where the read-back guard and idempotency key matter,
@@ -1171,10 +1171,38 @@ impl SyncEngine {
         vendor: &crate::mutation::IdempotencyVendor,
         protocol: bifrost_types::ProtocolKind,
     ) -> Result<crate::mutation::MutationCounters, Error> {
+        self.bulk_move_from(account_id, targets, destination, None, vendor, protocol)
+            .await
+    }
+
+    /// [`Self::bulk_move`] with the source container the targets are
+    /// leaving.
+    ///
+    /// Identical pipeline; the source rides through to
+    /// [`bifrost_types::Account::bulk_move_from`], which is what lets a
+    /// Gmail campaign express the detach in the same `batchModify` as
+    /// the attach instead of one `remove_from_container` per message.
+    /// `None` is exactly [`Self::bulk_move`].
+    ///
+    /// The read-back guard is unchanged: it reconciles membership of
+    /// `destination`, which is the property that says the move landed.
+    /// It does not separately re-verify absence from `source`.
+    pub async fn bulk_move_from(
+        &self,
+        account_id: &AccountId,
+        targets: Vec<bifrost_types::ObjectId>,
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+        vendor: &crate::mutation::IdempotencyVendor,
+        protocol: bifrost_types::ProtocolKind,
+    ) -> Result<crate::mutation::MutationCounters, Error> {
         self.run_bulk_pipeline(
             account_id,
             targets,
-            BulkPipelineOp::Move(destination),
+            BulkPipelineOp::Move {
+                destination,
+                source,
+            },
             vendor,
             protocol,
         )
@@ -1260,9 +1288,15 @@ impl SyncEngine {
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = match &op {
-                BulkPipelineOp::Move(destination) => {
-                    account.bulk_move(target_stream, destination.clone(), key.clone())
-                }
+                BulkPipelineOp::Move {
+                    destination,
+                    source,
+                } => account.bulk_move_from(
+                    target_stream,
+                    destination.clone(),
+                    source.clone(),
+                    key.clone(),
+                ),
                 BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
             };
             retry_ids.clear();
@@ -1395,7 +1429,7 @@ impl SyncEngine {
         if !readback_ids.is_empty() {
             let account = slot.current.load_full();
             let outcome = match &op {
-                BulkPipelineOp::Move(destination) => {
+                BulkPipelineOp::Move { destination, .. } => {
                     crate::mutation::run_move_readback_guard(
                         account.as_ref().as_ref(),
                         readback_ids,
@@ -3652,8 +3686,12 @@ impl Drop for SyncEngine {
 /// the idempotency / retry / recovery loop is identical to
 /// `bulk_set_flags`.
 enum BulkPipelineOp {
-    /// Route every target into `destination` via `Account::bulk_move`.
-    Move(MembershipScope),
+    /// Route every target into `destination` (and, when the consumer
+    /// knows it, out of `source`) via `Account::bulk_move_from`.
+    Move {
+        destination: MembershipScope,
+        source: Option<MembershipScope>,
+    },
     /// Destroy every target via `Account::bulk_destroy`.
     Destroy,
 }

@@ -207,13 +207,26 @@ impl Account for FlagsAccount {
         Box::pin(stream::empty())
     }
 
+    /// Echoes the destination it was handed back as a single
+    /// `Succeeded` item id, so a caller can prove which arguments
+    /// reached the wire method.
     fn bulk_move(
         &self,
         _targets: AccountStream<ObjectId>,
-        _destination: MembershipScope,
+        destination: MembershipScope,
         _key: IdempotencyKey,
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-        Box::pin(stream::empty())
+        let item = ItemOutcome::Succeeded(bifrost_types::BatchSuccess::new(
+            bifrost_types::BatchItemId(format!("{destination:?}")),
+            MutationSuccess::Applied,
+        ));
+        Box::pin(stream::iter([SyncEvent::Batch(Batch {
+            items: vec![item],
+            page_boundary: PageBoundary::Page,
+            server_latency: std::time::Duration::ZERO,
+            bytes_in: 0,
+            checkpoint: None,
+        })]))
     }
 
     fn bulk_destroy(
@@ -703,6 +716,51 @@ async fn readback_guard_with_no_ids_is_no_op() {
         .expect("guard ok");
     assert_eq!(outcome.skipped, 0);
     assert_eq!(outcome.still_failed, 0);
+}
+
+/// The `bulk_move_from` default impl must forward to `bulk_move` with
+/// the destination intact. An Account that only implements the
+/// relocating form (IMAP / Graph / JMAP) already vacates the source as
+/// part of the move, so dropping `source` here is the correct default,
+/// but the destination must survive.
+#[tokio::test]
+async fn bulk_move_from_defaults_to_bulk_move() {
+    let acc = FlagsAccount {
+        caps: caps(),
+        flag_table: std::collections::HashMap::new(),
+    };
+    let destination = MembershipScope::Label(bifrost_types::LabelId("Label_42".into()));
+    let source = MembershipScope::Label(bifrost_types::LabelId("Label_7".into()));
+    let events: Vec<_> = acc
+        .bulk_move_from(
+            Box::pin(stream::empty()),
+            destination.clone(),
+            Some(source),
+            key(),
+        )
+        .collect()
+        .await;
+    let ids = events
+        .into_iter()
+        .filter_map(|event| match event {
+            SyncEvent::Batch(batch) => Some(batch.items),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            ItemOutcome::Succeeded(success) => Some(success.item.0),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![format!("{destination:?}")]);
+}
+
+fn key() -> IdempotencyKey {
+    IdempotencyKey {
+        run_id: bifrost_types::RunId("test-run".into()),
+        sequence: 0,
+        protocol_salt: bifrost_types::ProtocolSalt::Gmail("test-salt".into()),
+    }
 }
 
 /// Cross-check: a guard run against an arc'd Account behaves the same.

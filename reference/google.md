@@ -185,9 +185,35 @@ Mail mutation primitives use Gmail label modification:
 - `set_is_read` flips Gmail's `UNREAD` label with inverted polarity.
 - `set_keyword`, `set_category`, `set_extended_property`, and
   `set_importance` are `Unsupported` (see the capability list above).
-- The Archive container is synthetic: adding to Archive removes
-  `INBOX`; removing from Archive is a no-op (archive is the absence
-  of the Inbox label, not a native label).
+- The Archive container is synthetic: adding to Archive is lowered as
+  a relocation (see below), never as a label to apply; removing from
+  Archive is a no-op (archive is the absence of a display container,
+  not a native label).
+- `move_thread` is ONE `threads.modify`: the add and every removal
+  (the exclusive display containers plus the caller's `source` label)
+  ride the same request, so there is no window where the thread sits
+  in both containers.
+
+One relocation rule, shared by `flags::move_placement_patch` between
+the bulk `batchModify` driver and the single-object builders in
+`pim.rs`, so a consumer cannot get different wire semantics depending
+on which entry point it reached. `INBOX` / `SPAM` / `TRASH` are Gmail's
+mutually exclusive display containers: Gmail renders a message under
+whichever of them it carries, whatever else is also attached. "Move
+into `destination`" therefore lowers to *add `destination`, remove
+every exclusive container that is not `destination`*:
+
+- `INBOX` -> add INBOX, drop SPAM + TRASH (un-spam / un-trash).
+- a user label -> add it, drop INBOX + SPAM + TRASH, so filing a
+  spammed or trashed message actually takes it out of Spam / Trash.
+- `archive` -> add nothing (it is not a Gmail label id, and Gmail
+  rejects a modify that tries to apply it), drop all three.
+- `SPAM` / `TRASH` -> add it, drop the other two.
+
+An optional `source` is the one part the destination cannot imply - a
+user label being filed out of - and it joins the same
+`removeLabelIds`. It is skipped when it is the synthetic `archive`,
+equal to the destination, or already implied.
 
 Composition renders MIME through the shared `bifrost-types::mime`
 serializer (`render_rfc5322`, shared with IMAP send) and sends the
@@ -455,15 +481,21 @@ watch lifecycle.
 
 ## Mutation pipeline
 
-`bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a
-single `mutation_stream` driver:
+`bulk_set_flags`, `bulk_move`, `bulk_move_from`, and `bulk_destroy`
+share a single `mutation_stream` driver:
 
 - Drain up to 1000 ids per round (the Gmail `batchModify` /
   `batchDelete` cap).
 - Translate the operation once per stream: `SetFlags` runs
   through `translate_flag_op` against the cached label list;
-  `Move` builds an add/remove `LabelPatch` from the destination
-  label; `Destroy` carries no translation.
+  `Move` builds an add/remove `LabelPatch` via `move_patch` from the
+  destination and the optional source (see the relocation rule above);
+  `Destroy` carries no translation.
+- Gmail is the reason `Account::bulk_move_from` exists: `batchModify`
+  carries `addLabelIds` and `removeLabelIds` in one request, so the
+  source detach is free here, where the destination-only `bulk_move`
+  forces a consumer into one `remove_from_container` PER ID. `bulk_move`
+  is `bulk_move_from` with `source: None`.
 - Post the batch:
   - `SetFlags` / `Move` -> `users.messages.batchModify`.
   - `Destroy` -> `users.messages.batchDelete`. On 403 it falls
