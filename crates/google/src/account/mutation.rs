@@ -223,8 +223,8 @@ async fn apply_destroy(
                 GmailErrorContext::mutation(AccountOperation::BulkDestroy),
             );
             let fallback = LabelPatch {
-                add_label_ids: vec!["TRASH".to_string()],
-                remove_label_ids: vec!["INBOX".to_string()],
+                add_label_ids: vec![LABEL_TRASH.to_string()],
+                remove_label_ids: vec![LABEL_INBOX.to_string()],
                 unsupported_flags: Vec::new(),
             };
             match apply_label_patch(client, ids, fallback, key, AccountOperation::BulkDestroy).await
@@ -250,17 +250,43 @@ fn terminate_event(error: AccountError) -> SyncEvent<ItemOutcome<MutationSuccess
     SyncEvent::Terminated(error)
 }
 
+/// Gmail's mutually exclusive system containers. A message carrying
+/// `SPAM` or `TRASH` is displayed in that container regardless of any
+/// other label it also carries, so a move INTO the inbox has to strip
+/// them; merely adding `INBOX` leaves the message where it was.
+const LABEL_INBOX: &str = "INBOX";
+const LABEL_SPAM: &str = "SPAM";
+const LABEL_TRASH: &str = "TRASH";
+
+/// Translate a bulk move destination into a Gmail label patch.
+///
+/// Gmail has no "move" verb; a move is an add plus the removal of the
+/// container the message is leaving. The bulk API carries no source
+/// container (unlike the single-thread path, which is handed one and
+/// removes it explicitly), so the patch has to be derived from the
+/// destination alone:
+///
+/// - Destination `INBOX` is an un-archive / un-spam / un-trash. `SPAM`
+///   and `TRASH` outrank `INBOX` in Gmail's display rules, so both are
+///   removed; leaving `SPAM` on is what made a bulk un-spam campaign a
+///   no-op from the user's point of view.
+/// - Any other destination is a file-away: drop `INBOX` so the message
+///   leaves the inbox, and let the destination label define where it
+///   lands.
 fn move_patch(destination: &MembershipScope) -> LabelPatch {
     match destination {
-        MembershipScope::Label(LabelId(label_id)) => LabelPatch {
-            add_label_ids: vec![label_id.clone()],
-            remove_label_ids: if label_id.eq_ignore_ascii_case("INBOX") {
-                Vec::new()
+        MembershipScope::Label(LabelId(label_id)) => {
+            let remove_label_ids = if label_id.eq_ignore_ascii_case(LABEL_INBOX) {
+                vec![LABEL_SPAM.to_string(), LABEL_TRASH.to_string()]
             } else {
-                vec!["INBOX".to_string()]
-            },
-            unsupported_flags: Vec::new(),
-        },
+                vec![LABEL_INBOX.to_string()]
+            };
+            LabelPatch {
+                add_label_ids: vec![label_id.clone()],
+                remove_label_ids,
+                unsupported_flags: Vec::new(),
+            }
+        }
         _ => LabelPatch {
             unsupported_flags: vec!["gmail move destination must be a label".to_string()],
             ..LabelPatch::default()
@@ -311,4 +337,50 @@ async fn post_empty_json<B: Serialize>(
         headers,
         response.body,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_types::FolderId;
+
+    fn label(id: &str) -> MembershipScope {
+        MembershipScope::Label(LabelId(id.to_string()))
+    }
+
+    #[test]
+    fn move_to_inbox_clears_spam_and_trash() {
+        let patch = move_patch(&label("INBOX"));
+        assert_eq!(patch.add_label_ids, vec!["INBOX".to_string()]);
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["SPAM".to_string(), "TRASH".to_string()],
+            "bulk un-spam must strip SPAM, not merely add INBOX"
+        );
+        assert!(patch.unsupported_flags.is_empty());
+    }
+
+    #[test]
+    fn move_to_inbox_is_case_insensitive() {
+        let patch = move_patch(&label("inbox"));
+        assert_eq!(
+            patch.remove_label_ids,
+            vec!["SPAM".to_string(), "TRASH".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_to_user_label_leaves_the_inbox() {
+        let patch = move_patch(&label("Label_42"));
+        assert_eq!(patch.add_label_ids, vec!["Label_42".to_string()]);
+        assert_eq!(patch.remove_label_ids, vec!["INBOX".to_string()]);
+    }
+
+    #[test]
+    fn non_label_destination_is_unsupported() {
+        let patch = move_patch(&MembershipScope::Folder(FolderId("INBOX".into())));
+        assert!(patch.add_label_ids.is_empty());
+        assert!(patch.remove_label_ids.is_empty());
+        assert_eq!(patch.unsupported_flags.len(), 1);
+    }
 }

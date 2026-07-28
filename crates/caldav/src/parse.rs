@@ -35,6 +35,101 @@ pub(crate) struct CalDavFetchedEvent {
     pub(crate) data: String,
 }
 
+/// One resource inside a 207 that yielded no usable `calendar-data`,
+/// with the status the server gave it (when it gave one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CalDavFailedResource {
+    pub(crate) href: String,
+    pub(crate) status: Option<u16>,
+}
+
+impl CalDavFailedResource {
+    /// True when the status means "this particular resource is not
+    /// there" - the benign, genuinely per-resource case that
+    /// `Page::failed_ids` exists to carry. Anything else (auth,
+    /// permission, server error, or no status at all) can just as
+    /// easily be a condition affecting the whole request.
+    pub(crate) fn is_missing_resource(&self) -> bool {
+        matches!(self.status, Some(404 | 410))
+    }
+}
+
+/// Outcome of a `calendar-multiget` / `calendar-query` REPORT: the
+/// resources that came back with usable `calendar-data` (`events`) plus
+/// the ones that did not (`failed`).
+///
+/// A 207 Multi-Status is per-resource by construction, so a single bad
+/// propstat inside it is a per-resource failure and nothing more.
+/// Failing the whole parse on one of them turned a one-event problem
+/// into a dead pull. But the converse is equally wrong: RFC 4918 s13
+/// says a 207 body may describe success, partial success, OR complete
+/// failure, so a body in which every resource failed must not be
+/// handed back as an empty success. See `classify`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CalDavMultigetReport {
+    pub(crate) events: Vec<CalDavFetchedEvent>,
+    pub(crate) failed: Vec<CalDavFailedResource>,
+}
+
+/// What a parsed 207 body actually represents, per RFC 4918 s13.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MultigetOutcome {
+    /// Nothing failed, or enough succeeded that the failures are
+    /// per-resource news the caller should report but not fail on.
+    Usable,
+    /// Every resource in the body failed and at least one of them
+    /// failed for a reason that is not "this resource is missing".
+    /// Reporting this as an empty success lets a consumer record the
+    /// collection as fully walked and drop the resources permanently.
+    CompleteFailure { status: Option<u16> },
+}
+
+impl CalDavMultigetReport {
+    /// Fold another chunk's report into this one. Multiget is chunked
+    /// and text search runs one REPORT per property, so both lanes have
+    /// to accumulate across calls.
+    pub(crate) fn extend(&mut self, other: CalDavMultigetReport) {
+        self.events.extend(other.events);
+        self.failed.extend(other.failed);
+    }
+
+    pub(crate) fn failed_hrefs(&self) -> Vec<String> {
+        self.failed
+            .iter()
+            .map(|failure| failure.href.clone())
+            .collect()
+    }
+
+    /// Classify the body rather than merely parsing it.
+    ///
+    /// An empty body is `Usable`: a query that matched nothing is a
+    /// legitimate empty result, not a failure. A body with at least one
+    /// usable resource is `Usable` too - the failures are real, and the
+    /// caller still reports them, but the request as a whole worked.
+    ///
+    /// A body where EVERY resource failed is only benign if every
+    /// failure was a missing resource (404/410), which is what happens
+    /// when hrefs are deleted between the listing and the multiget.
+    /// If any of them was an auth, permission, or server condition,
+    /// the body is a complete failure and the caller must surface it as
+    /// an error instead of an empty page.
+    pub(crate) fn classify(&self) -> MultigetOutcome {
+        if !self.events.is_empty() || self.failed.is_empty() {
+            return MultigetOutcome::Usable;
+        }
+        let systemic = self
+            .failed
+            .iter()
+            .find(|failure| !failure.is_missing_resource());
+        match systemic {
+            Some(failure) => MultigetOutcome::CompleteFailure {
+                status: failure.status,
+            },
+            None => MultigetOutcome::Usable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CalDavSyncReport {
     pub(crate) sync_token: Option<String>,
@@ -216,9 +311,18 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
     Ok(listing)
 }
 
-pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CalDavFetchedEvent>, String> {
+/// Parse a `calendar-multiget` / `calendar-query` 207 response.
+///
+/// `Err` is reserved for a malformed document - the whole payload is
+/// unusable and there is nothing per-resource to salvage. A well-formed
+/// 207 whose individual responses carry non-2xx propstats (or 2xx with
+/// no `calendar-data`) is NOT an error: those hrefs land in
+/// `failed_hrefs` and every sibling that did come back is returned, so
+/// the caller can report the casualties through `Page::failed_ids`
+/// while the rest of the pull succeeds.
+pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, String> {
     let mut reader = Reader::from_str(xml);
-    let mut results = Vec::new();
+    let mut report = CalDavMultigetReport::default();
     let mut current = ResponseParts::default();
     let mut stack = Vec::new();
     let mut text = String::new();
@@ -230,6 +334,9 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CalDavFetchedEvent>
                 if name == "response" {
                     current = ResponseParts::default();
                     current.in_response = true;
+                }
+                if current.in_response && name == "propstat" {
+                    current.begin_propstat();
                 }
                 if current.in_response && name == "collection" {
                     current.is_collection = true;
@@ -252,24 +359,44 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CalDavFetchedEvent>
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
                 if current.in_response {
+                    // Properties are collected PROPSTAT-scoped and only
+                    // promoted by `commit_propstat` if that propstat's
+                    // own status was 2xx. Writing the response-level
+                    // fields here instead made the result depend on
+                    // propstat order: data from a failed block could be
+                    // adopted, and a trailing non-2xx block could
+                    // discard data a successful one supplied.
                     match (parent, name.as_str()) {
                         (Some("response"), "href") => current.href = trimmed(&text),
-                        (Some("prop"), "getetag") => current.etag = normalize_etag(&text),
-                        (Some("prop"), "calendar-data") => current.calendar_data = trimmed(&text),
-                        (Some("propstat"), "status") => current.status = trimmed(&text),
+                        (Some("prop"), "getetag") => {
+                            current.propstat_etag = normalize_etag(&text);
+                        }
+                        (Some("prop"), "calendar-data") => {
+                            current.propstat_calendar_data = trimmed(&text);
+                        }
+                        (Some("propstat"), "status") => {
+                            current.propstat_status = trimmed(&text);
+                            current.propstat_success =
+                                status_code(&text).map(|code| matches!(code, 200..=299));
+                        }
+                        (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
                     }
                 }
+                if name == "propstat" {
+                    current.commit_propstat();
+                }
                 if name == "response" {
                     current.in_response = false;
-                    if let Some(status) = current.error_status() {
-                        return Err(format!(
-                            "multiget response for {} returned {status}",
-                            current.href.as_deref().unwrap_or("<unknown>")
-                        ));
-                    }
                     if let Some(event) = current.as_fetched_event() {
-                        results.push(event);
+                        report.events.push(event);
+                    } else if let Some(failed) = current.as_failed_multiget_resource() {
+                        // Nothing usable came back for this one
+                        // resource. That says nothing about its
+                        // siblings, so the rest of the page survives;
+                        // the carried status lets the caller tell a
+                        // vanished resource apart from a refusal.
+                        report.failed.push(failed);
                     }
                 }
                 stack.pop();
@@ -281,7 +408,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CalDavFetchedEvent>
         }
     }
 
-    Ok(results)
+    Ok(report)
 }
 
 pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport, String> {
@@ -443,6 +570,18 @@ struct ResponseParts {
     sync_token: Option<String>,
     propstat_sync_token: Option<String>,
     propstat_status: Option<String>,
+    /// Propstat-scoped `calendar-data` / `getetag`, promoted to the
+    /// response level by `commit_propstat` only when that propstat's
+    /// own status was 2xx. Multiget uses these instead of writing the
+    /// response-level fields directly, so a value can never be adopted
+    /// from a propstat the server refused, and a later unrelated
+    /// non-2xx propstat can never retract a value an earlier 2xx one
+    /// legitimately supplied.
+    propstat_calendar_data: Option<String>,
+    propstat_etag: Option<String>,
+    /// Status codes of every non-2xx propstat in this response, in
+    /// document order. Drives failure classification.
+    failed_statuses: Vec<u16>,
 }
 
 impl ResponseParts {
@@ -456,6 +595,8 @@ impl ResponseParts {
         self.propstat_color = None;
         self.propstat_sync_token = None;
         self.propstat_status = None;
+        self.propstat_calendar_data = None;
+        self.propstat_etag = None;
     }
 
     fn mark_calendar(&mut self) {
@@ -485,6 +626,9 @@ impl ResponseParts {
     fn commit_propstat(&mut self) {
         if self.propstat_success == Some(false) {
             self.saw_failed_propstat = true;
+            if let Some(code) = self.propstat_status.as_deref().and_then(status_code) {
+                self.failed_statuses.push(code);
+            }
         }
         if self.propstat_success.unwrap_or(true) {
             self.has_success_propstat = true;
@@ -500,6 +644,12 @@ impl ResponseParts {
             if self.propstat_sync_token.is_some() {
                 self.sync_token = self.propstat_sync_token.take();
             }
+            if self.propstat_calendar_data.is_some() {
+                self.calendar_data = self.propstat_calendar_data.take();
+            }
+            if self.propstat_etag.is_some() {
+                self.etag = self.propstat_etag.take();
+            }
         }
         self.in_propstat = false;
         self.propstat_success = None;
@@ -510,6 +660,8 @@ impl ResponseParts {
         self.propstat_color = None;
         self.propstat_sync_token = None;
         self.propstat_status = None;
+        self.propstat_calendar_data = None;
+        self.propstat_etag = None;
     }
 
     fn as_calendar_collection(&self) -> Option<CalendarCollection> {
@@ -567,10 +719,23 @@ impl ResponseParts {
         })
     }
 
-    fn error_status(&self) -> Option<&str> {
-        let status = self.status.as_deref()?;
-        let code = status_code(status)?;
-        (!matches!(code, 200..=299)).then_some(status)
+    /// A multiget response that yielded no usable `calendar-data`,
+    /// with the most informative status available: the first non-2xx
+    /// propstat status, else a response-level status. A collection
+    /// response (some servers echo the collection itself alongside the
+    /// requested resources) is not a failed resource and is dropped
+    /// rather than reported.
+    fn as_failed_multiget_resource(&self) -> Option<CalDavFailedResource> {
+        if self.is_collection {
+            return None;
+        }
+        let href = self.href.clone()?;
+        let status = self
+            .failed_statuses
+            .first()
+            .copied()
+            .or_else(|| self.status.as_deref().and_then(status_code));
+        Some(CalDavFailedResource { href, status })
     }
 
     fn as_sync_entry(&self) -> Option<CalDavSyncEntry> {
@@ -821,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn multiget_report_rejects_embedded_failures() {
+    fn multiget_report_reports_embedded_failures_per_resource() {
         let xml = r#"
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:response>
@@ -833,9 +998,86 @@ mod tests {
   </D:response>
 </D:multistatus>"#;
 
-        let error = parse_multiget_report(xml).expect_err("embedded 404 should fail");
-        assert!(error.contains("404"));
-        assert!(error.contains("/cal/missing.ics"));
+        let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
+        assert!(report.events.is_empty());
+        assert_eq!(report.failed_hrefs(), vec!["/cal/missing.ics".to_string()]);
+        assert_eq!(report.failed[0].status, Some(404));
+        // Every resource failed, but the only failure was a vanished
+        // resource, so the body is still usable.
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
+    }
+
+    #[test]
+    fn one_bad_propstat_does_not_abort_the_rest_of_the_multiget() {
+        // The whole point of a 207: per-resource outcomes. A refused
+        // resource must not cost the caller its siblings.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/missing.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data/></D:prop>
+      <D:status>HTTP/1.1 403 Forbidden</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/cal/good.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"g1"</D:getetag>
+        <C:calendar-data>BEGIN:VCALENDAR
+END:VCALENDAR</C:calendar-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
+        assert_eq!(report.events.len(), 1);
+        assert_eq!(report.events[0].uri, "/cal/good.ics");
+        assert_eq!(report.failed_hrefs(), vec!["/cal/missing.ics".to_string()]);
+        // Partial success: the 403 is reported, not fatal.
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
+    }
+
+    #[test]
+    fn multiget_report_treats_a_2xx_without_calendar_data_as_failed() {
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/empty.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getetag>"e1"</D:getetag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
+        assert!(report.events.is_empty());
+        assert_eq!(report.failed_hrefs(), vec!["/cal/empty.ics".to_string()]);
+    }
+
+    #[test]
+    fn multiget_report_ignores_an_echoed_collection_response() {
+        // Some servers echo the collection alongside the requested
+        // resources. That is not a failed event resource.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("a 207 is not a parse failure");
+        assert!(report.events.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
     #[test]
@@ -855,9 +1097,128 @@ END:VCALENDAR</C:calendar-data>
   </D:response>
 </D:multistatus>"#;
 
-        let events = parse_multiget_report(xml).expect("embedded 200 should pass");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].etag.as_deref(), Some("abc"));
+        let report = parse_multiget_report(xml).expect("embedded 200 should pass");
+        assert_eq!(report.events.len(), 1);
+        assert_eq!(report.events[0].etag.as_deref(), Some("abc"));
+        assert!(report.failed.is_empty());
+    }
+
+    /// A response split across two propstat blocks - the RFC 4918
+    /// shape where found and not-found properties are reported
+    /// separately - in both orders. Equivalent input must give an
+    /// equivalent answer.
+    fn two_propstat_multiget(data_first: bool) -> String {
+        let ok_block = "    <D:propstat>\n\
+      <D:prop>\n\
+        <D:getetag>\"ok\"</D:getetag>\n\
+        <C:calendar-data>BEGIN:VCALENDAR\nEND:VCALENDAR</C:calendar-data>\n\
+      </D:prop>\n\
+      <D:status>HTTP/1.1 200 OK</D:status>\n\
+    </D:propstat>\n";
+        let missing_block = "    <D:propstat>\n\
+      <D:prop><D:displayname/></D:prop>\n\
+      <D:status>HTTP/1.1 404 Not Found</D:status>\n\
+    </D:propstat>\n";
+        let blocks = if data_first {
+            format!("{ok_block}{missing_block}")
+        } else {
+            format!("{missing_block}{ok_block}")
+        };
+        format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
+  <D:response>\n\
+    <D:href>/cal/split.ics</D:href>\n\
+{blocks}  </D:response>\n\
+</D:multistatus>"
+        )
+    }
+
+    #[test]
+    fn multiget_is_not_order_dependent_across_propstats() {
+        // A trailing 404 propstat for an unrelated property must not
+        // retract calendar-data a 200 propstat legitimately supplied,
+        // and the answer must not depend on which block came first.
+        for data_first in [true, false] {
+            let xml = two_propstat_multiget(data_first);
+            let report = parse_multiget_report(&xml).expect("valid 207");
+            assert_eq!(
+                report.events.len(),
+                1,
+                "data_first={data_first}: usable calendar-data was dropped"
+            );
+            assert_eq!(report.events[0].uri, "/cal/split.ics");
+            assert_eq!(report.events[0].etag.as_deref(), Some("ok"));
+            assert!(report.failed.is_empty());
+        }
+    }
+
+    #[test]
+    fn calendar_data_from_a_failed_propstat_is_never_adopted() {
+        // The mirror image: data sitting inside a non-2xx propstat is
+        // not usable, even when a later propstat succeeds.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/refused.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data>BEGIN:VCALENDAR
+END:VCALENDAR</C:calendar-data></D:prop>
+      <D:status>HTTP/1.1 403 Forbidden</D:status>
+    </D:propstat>
+    <D:propstat>
+      <D:prop><D:getetag>"x"</D:getetag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(
+            report.events.is_empty(),
+            "calendar-data from a 403 propstat must not be served as an event"
+        );
+        assert_eq!(report.failed_hrefs(), vec!["/cal/refused.ics".to_string()]);
+        assert_eq!(report.failed[0].status, Some(403));
+    }
+
+    #[test]
+    fn a_wholly_refused_body_is_a_complete_failure_not_an_empty_success() {
+        // RFC 4918 s13: a 207 can describe complete failure. Handing
+        // this back as an empty page lets a consumer mark the
+        // collection walked and drop both resources for good.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/one.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data/></D:prop>
+      <D:status>HTTP/1.1 401 Unauthorized</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/cal/two.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data/></D:prop>
+      <D:status>HTTP/1.1 401 Unauthorized</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert_eq!(
+            report.classify(),
+            MultigetOutcome::CompleteFailure { status: Some(401) }
+        );
+    }
+
+    #[test]
+    fn an_empty_body_is_usable_not_a_failure() {
+        // A query that matched nothing is a legitimate empty result.
+        let xml = r#"<D:multistatus xmlns:D="DAV:"></D:multistatus>"#;
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.events.is_empty());
+        assert!(report.failed.is_empty());
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
     }
 
     #[test]

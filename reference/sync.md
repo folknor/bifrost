@@ -289,10 +289,56 @@ consumer-acked `put_backfill` lands, so waiters wake on a durable,
 consumer-acknowledged boundary - identical to the change-cursor path.
 
 `LiveSupersedes` is the ring-evicting `(VecDeque + HashSet)` set
-the multiplexer feeds with live `Created` ids so cold-start
-hydration does not double-emit objects the live stream already
-showed. Default cap `LIVE_SUPERSEDES_DEFAULT_CAP = 100_000`;
-overflow drops the oldest insertion.
+`BackfillRunner::run_partition` filters each inventory page through,
+via `filter_supersedes`. Default cap
+`LIVE_SUPERSEDES_DEFAULT_CAP = 100_000`; overflow drops the oldest
+insertion.
+
+**Nothing populates it, and that is deliberate.** No production
+path calls `add`, so the filter is a no-op and every inventory
+entry is forwarded. Cold-start can therefore re-emit a `Created`
+for an object the live stream already announced. That duplicate is
+accepted: consumers must already tolerate a repeated `Created`,
+because a crash mid-plan re-walks every partition and re-emits
+consumer-acked pages.
+
+Populating it from `drive_changes_stream` looks obvious and is
+wrong, for two independent reasons:
+
+- **Broadcasting is not receiving.** The per-account channel is a
+  `tokio::broadcast`. The slot's sentinel receiver makes `send`
+  report success with no consumer attached, a subscriber that
+  attaches later starts at the ring's tail, and a lagging
+  subscriber has values overwritten out from under it - this crate
+  has no `Lagged` handling and never replays. Recording on `send`
+  records ids the consumer will never see, and suppressing the
+  inventory copy of one of those loses that object for the session,
+  since the in-memory cursor has already advanced.
+- **Selection and publication are separate operations.** The runner
+  decides to keep an entry and broadcasts it later; the live feed
+  records and broadcasts separately. These are distinct spawned
+  tasks on a multi-threaded runtime, so they run genuinely in
+  parallel - the absence of an await between the runner's `take` and
+  its `send` does not close the window. A mutex makes each `add` and
+  `take` atomic but does nothing for the compound take-then-publish,
+  which is what the guarantee needs.
+
+The only sound record trigger the engine has is the consumer ack:
+`ack_checkpoint` is what this crate already treats as proof of
+receipt, precisely because broadcast delivery is not. A correct
+design buffers ids as pending keyed by their batch's checkpoint and
+promotes them only on ack, with a policy for batches carrying no
+checkpoint and a bound on the pending buffer. It would also need
+take-and-publish to be one indivisible decision on both sides, and
+a test-only seam to prove it - the window has no scheduling point,
+so no mock server can stage the interleaving black-box.
+
+`take` is O(1): it removes from the membership set only and leaves
+a tombstone slot in the eviction ring, so a future sound producer
+does not make cold-start quadratic. A tombstone cannot cause a
+wrong suppression - suppression reads the membership set, which
+only `add` writes - and eviction reclaims tombstone slots as they
+reach the front, so membership reconverges on `cap` with no scan.
 
 `BackfillCheckpointWriter` (in `backfill/checkpoint.rs`) is a
 thin wrapper over `CheckpointStore::put_backfill`. The runner no

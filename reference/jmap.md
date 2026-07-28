@@ -325,6 +325,23 @@ response-shape mismatches). Both take the caller's `AccountOperation`.
 
 JMAP auto-discovers shared/delegate accounts from the session: at `open`, `foreign_mail_account_ids` selects session accounts with `isPersonal: false` advertising `urn:ietf:params:jmap:mail`, excluding the primary; each becomes a scoped `Account::new(client, accountId)` handle in `foreign_mail`. `seed_foreign_account` runs the primary's three probes (`Email`/`Mailbox`/`Thread` state) plus a `Mailbox/get` enumeration, inserting per-accountId `state_cache` entries and seeding one `CursorScope::Folder(encode_foreign(accountId, mailboxId))` per mailbox into `seed_states`. A successfully seeded foreign account that also advertises Submission is included in `foreign_submission`; only that same routing set enables `pim_methods.send_as`, so an account skipped by probing never produces an advertised but unreachable send path. A failed probe is skipped (others still open); cost is O(foreign accounts) round-trips at open.
 
+Owner-email resolution for those accounts is a two-level RFC 9670 gate
+(`owner_email_plans`): no session `urn:ietf:params:jmap:principals`
+capability means no plans at all, and per account the
+`...:principals:owner` capability supplies the principal id.
+`Principal/get` is authoritative; the account name is only ever a
+fallback, and a narrow one. `account_name_as_address` PARSES the name
+rather than sniffing it for an `@`, accepting only a bare addr-spec with
+a dotted domain - display-name forms like `Support <support@example.com>`
+are rejected outright rather than having an address guessed out of them,
+because a wrong owner is worse than no owner. `fetch_principal_email`
+returns a three-way `PrincipalEmail` so a lookup that never completed is
+distinguishable from one that completed with no address:
+`owner_email_from_lookup` permits the name fallback only on `Absent`.
+On `Unavailable` the owner email is left unset, so a transport blip or an
+unimplemented `Principal/get` cannot overwrite real ownership with a
+label.
+
 The foreign accountId rides in the `Folder` scope's `FolderId` (`foreign.rs` codec, `\u{1f}` separator); `Type(_)` scopes cannot carry an account (`Type(Email)` is identical across accounts and would collide in the engine index), so the variant-free `Folder` shape is used. `mail_for_scope` / `account_id_for_scope` / `owner_of_scope` route a `Folder` scope to its `foreign_mail` handle, state-map key, and `MailboxId(accountId)` owner tag; primary scopes route to `self.mail` and `None`. `cursor_scopes` appends seeded foreign `Folder` scopes; `discover::memberships` appends one `Mailbox(accountId)` owner tag per foreign account, and `inventory_stream` stamps that tag onto every foreign-scope item so a foreign account's native mailbox ids cannot be conflated with the primary's in the membership index. The request layer is already per-account (`Account<Tr>::build` stamps the accountId), so routing is "hand `mail_for_scope` instead of `self.mail`", not a `core/request.rs` change.
 
 Foreign OBJECT ids are qualified with the same codec (`encode_object` /

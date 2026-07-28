@@ -26,6 +26,11 @@ mod marker {
 /// Strongly-typed Email ID.
 pub(crate) type EmailId = crate::core::id::Id<marker::Email>;
 
+/// RFC 8621 s4.1.1 IMAP-derived keyword marking a message as a draft.
+/// A JMAP server derives "this is a draft" from the keyword, not from
+/// mailbox membership, so it has to be cleared when a draft is sent.
+pub(crate) const DRAFT_KEYWORD: &str = "$draft";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(crate) struct Email {
     #[serde(rename = "id")]

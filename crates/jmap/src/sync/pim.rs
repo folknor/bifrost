@@ -43,8 +43,8 @@ use super::state_cache::{self, StateMap};
 use crate::core::SetCreate;
 use crate::core::query;
 use crate::email::{
-    BodyProperty, Email, EmailAddress as JmapEmailAddress, EmailBodyPart, EmailBodyValue, EmailGet,
-    EmailId, EmailPatch, EmailSet, Property as EmailProperty,
+    BodyProperty, DRAFT_KEYWORD, Email, EmailAddress as JmapEmailAddress, EmailBodyPart,
+    EmailBodyValue, EmailGet, EmailId, EmailPatch, EmailSet, Property as EmailProperty,
 };
 use crate::email_submission::{Address as SubmissionAddress, EmailSubmissionSet, UndoStatus};
 use crate::identity::{IdentityGet, IdentityId as JmapIdentityId, IdentitySet};
@@ -60,7 +60,6 @@ type MailAccount = crate::account::Account<ReqwestTransport>;
 
 const SEEN_KEYWORD: &str = "$seen";
 const IMPORTANT_KEYWORD: &str = "$important";
-const DRAFT_KEYWORD: &str = "$draft";
 const SUBMISSION_CREATE_ID: &str = "submit0";
 const ATTACHMENT_HANDLE_PREFIX: &str = "jmap:";
 
@@ -311,7 +310,7 @@ pub(crate) fn send_message(
         if let Some(sent) = sent_mailbox {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
-                .mailbox_ids([sent]);
+                .submitted_to_sent(sent);
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
         }
@@ -412,7 +411,7 @@ pub(crate) fn send_raw_message(
         if let Some(sent) = sent_mailbox {
             submission_set
                 .on_success_update_email(SUBMISSION_CREATE_ID)
-                .mailbox_ids([sent]);
+                .submitted_to_sent(sent);
         } else {
             submission_set = submission_set.on_success_destroy_email(SUBMISSION_CREATE_ID);
         }
@@ -587,7 +586,7 @@ pub(crate) fn draft_send(
             .undo_status(UndoStatus::Final);
         submission_set
             .on_success_update_email(SUBMISSION_CREATE_ID)
-            .mailbox_ids([sent_mailbox]);
+            .submitted_to_sent(sent_mailbox);
         let mut response = mail
             .call(submission_set)
             .await
@@ -1553,8 +1552,13 @@ enum OwnerEmailPlan {
     /// error path.
     Skip,
     /// The account advertises `urn:ietf:params:jmap:principals:owner`
-    /// with a principal id: resolve via `Principal/get`.
-    FromPrincipal(String),
+    /// with a principal id: resolve via `Principal/get`, and if that
+    /// yields nothing, degrade to `name_fallback` when the session name
+    /// is itself an address.
+    FromPrincipal {
+        principal_id: String,
+        name_fallback: Option<String>,
+    },
     /// No owner principal, but the account's session NAME is an address:
     /// use it directly. Only reachable when the SESSION advertises the
     /// principals capability - the caller gates on that first.
@@ -1565,18 +1569,56 @@ enum OwnerEmailPlan {
 /// account-level owner principal id (if advertised) and the account's
 /// session name.
 ///
-/// The name fallback deliberately requires the principal id to be ABSENT:
-/// a present-but-unresolvable principal is an error path and must land on
-/// `Skip` (fail-soft), never on the name heuristic - that ordering is the
-/// legacy contract this projection preserves.
+/// A principal id is always preferred: `Principal/get` is authoritative
+/// and the session name is only a label. A principal the server answers
+/// for and does not know is the case the fallback exists for, but the
+/// fallback applies ONLY when the lookup actually completed - see
+/// `PrincipalEmail`. A lookup that failed teaches nothing, and guessing
+/// over it would overwrite real ownership with metadata.
 fn owner_email_plan(owner_principal_id: Option<&str>, account_name: &str) -> OwnerEmailPlan {
+    let name_email = account_name_as_address(account_name);
     if let Some(principal_id) = owner_principal_id {
-        return OwnerEmailPlan::FromPrincipal(principal_id.to_string());
+        return OwnerEmailPlan::FromPrincipal {
+            principal_id: principal_id.to_string(),
+            name_fallback: name_email,
+        };
     }
-    if account_name.contains('@') {
-        return OwnerEmailPlan::FromName(account_name.to_string());
+    match name_email {
+        Some(email) => OwnerEmailPlan::FromName(email),
+        None => OwnerEmailPlan::Skip,
     }
-    OwnerEmailPlan::Skip
+}
+
+/// Interpret an `Account.name` as an owner address by PARSING it, not
+/// by sniffing for an `@`.
+///
+/// RFC 8620 defines `Account.name` as a user-facing label ("e.g. the
+/// email address"); an address is one possible shape, not a contract.
+/// A containment test accepted anything with an `@` anywhere in it and
+/// stored the whole string, so `Support <support@example.com>` became
+/// an owner "address" verbatim.
+///
+/// Only a bare addr-spec is accepted. Pulling the address out of a
+/// `Name <addr>` form is deliberately NOT done: that guesses which
+/// address inside a free-form label identifies the owner, and a wrong
+/// owner is worse than no owner. Requiring a dotted domain rejects
+/// local-only labels that could never route.
+fn account_name_as_address(name: &str) -> Option<String> {
+    let candidate = name.trim();
+    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if candidate.contains(['<', '>', ',', ';', '"', '\\']) {
+        return None;
+    }
+    let (local, domain) = candidate.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 /// Plan owner-email resolution for every foreign account in the session.
@@ -1641,11 +1683,14 @@ async fn resolve_owner_emails(
             OwnerEmailPlan::FromName(email) => {
                 resolved.insert(account_id, email);
             }
-            OwnerEmailPlan::FromPrincipal(principal_id) => {
-                if let Some(email) =
+            OwnerEmailPlan::FromPrincipal {
+                principal_id,
+                name_fallback,
+            } => {
+                let outcome =
                     fetch_principal_email(mail, principals_account_id.as_deref(), &principal_id)
-                        .await
-                {
+                        .await;
+                if let Some(email) = owner_email_from_lookup(outcome, name_fallback) {
                     resolved.insert(account_id, email);
                 }
             }
@@ -1654,17 +1699,58 @@ async fn resolve_owner_emails(
     resolved
 }
 
+/// Outcome of one owner-principal lookup.
+///
+/// The distinction that matters is between "the server answered and
+/// there is no email" and "we never got an answer". Collapsing both to
+/// `None` meant a transport blip or an unimplemented `Principal/get`
+/// was indistinguishable from genuine absence, and the name fallback
+/// fired on all of them - so a transient failure could overwrite real
+/// ownership with a guess derived from a display label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrincipalEmail {
+    /// Authoritative address from `Principal/get`.
+    Resolved(String),
+    /// The call succeeded and yielded no address: either the principal
+    /// is not one the server knows, or it carries no email property.
+    /// There is nothing better to be had, so a parsed account name may
+    /// stand in.
+    Absent,
+    /// The call did not complete. This is not evidence of anything;
+    /// never fall back on it, or a blip rewrites ownership.
+    Unavailable,
+}
+
+/// Combine a principal lookup with the plan's parsed name fallback.
+///
+/// The whole point of classifying the lookup: only a COMPLETED one
+/// licenses the fallback. `Absent` means the server answered and there
+/// is no address, so the account name is the best remaining evidence.
+/// `Unavailable` means we never got an answer, and substituting a guess
+/// there would overwrite authoritative ownership with metadata on every
+/// transient failure.
+fn owner_email_from_lookup(
+    outcome: PrincipalEmail,
+    name_fallback: Option<String>,
+) -> Option<String> {
+    match outcome {
+        PrincipalEmail::Resolved(email) => Some(email),
+        PrincipalEmail::Absent => name_fallback,
+        PrincipalEmail::Unavailable => None,
+    }
+}
+
 /// `Principal/get` for one owner principal, against the session's
 /// principals account when it names one (falling back to the mail
 /// account's id, matching the legacy default-account behavior).
 ///
-/// Fail-soft by signature: transport errors, method errors, an empty
-/// result, and a principal without an email all collapse to `None`.
+/// Still fail-soft - no error escapes - but the failure is now
+/// classified rather than flattened.
 async fn fetch_principal_email(
     mail: &MailAccount,
     principals_account_id: Option<&str>,
     principal_id: &str,
-) -> Option<String> {
+) -> PrincipalEmail {
     let account = match principals_account_id {
         Some(id) => crate::account::Account::new(mail.client().clone(), id),
         None => mail.clone(),
@@ -1680,8 +1766,11 @@ async fn fetch_principal_email(
             .into_list()
             .into_iter()
             .next()
-            .and_then(|principal| principal.email().map(String::from)),
-        Err(_) => None,
+            .and_then(|principal| principal.email().map(String::from))
+            .map_or(PrincipalEmail::Absent, PrincipalEmail::Resolved),
+        // Transport failure, method error, unimplemented method: we
+        // learned nothing about who owns this account.
+        Err(_) => PrincipalEmail::Unavailable,
     }
 }
 
@@ -2834,12 +2923,14 @@ mod tests {
 
     #[test]
     fn owner_email_plan_prefers_principal_over_name() {
-        // A present principal id always routes through `Principal/get`,
-        // even when the account name looks like an address: the name
-        // fallback is only for accounts that advertise no owner principal.
+        // A present principal id always routes through `Principal/get`
+        // first, even when the account name looks like an address.
         assert_eq!(
             owner_email_plan(Some("p-1"), "shared@example.test"),
-            OwnerEmailPlan::FromPrincipal("p-1".to_string())
+            OwnerEmailPlan::FromPrincipal {
+                principal_id: "p-1".to_string(),
+                name_fallback: Some("shared@example.test".to_string()),
+            }
         );
         assert_eq!(
             owner_email_plan(None, "shared@example.test"),
@@ -2848,6 +2939,121 @@ mod tests {
         assert_eq!(
             owner_email_plan(None, "Shared Mailbox"),
             OwnerEmailPlan::Skip
+        );
+    }
+
+    #[test]
+    fn unresolvable_principal_degrades_to_the_name_instead_of_blanking() {
+        // A principal the server answers for and does not know leaves
+        // nothing authoritative, so the plan carries the parsed session
+        // name to degrade to. (Only `PrincipalEmail::Absent` actually
+        // consumes it; a failed lookup does not.)
+        let plan = owner_email_plan(Some("p-unreadable"), "shared@example.test");
+        let OwnerEmailPlan::FromPrincipal { name_fallback, .. } = plan else {
+            panic!("a present principal id must plan a principal lookup");
+        };
+        assert_eq!(name_fallback.as_deref(), Some("shared@example.test"));
+    }
+
+    #[test]
+    fn account_name_must_parse_as_an_address_not_merely_contain_an_at() {
+        // RFC 8620 Account.name is a user-facing label. Sniffing for
+        // '@' stored display-name forms wholesale as owner addresses.
+        assert_eq!(
+            account_name_as_address("shared@example.test").as_deref(),
+            Some("shared@example.test")
+        );
+        assert_eq!(
+            account_name_as_address("  shared@example.test  ").as_deref(),
+            Some("shared@example.test"),
+            "surrounding whitespace is trimmed, not a rejection"
+        );
+
+        for rejected in [
+            "Support <support@example.com>",
+            "Shared Mailbox",
+            "Ada Lovelace ada@example.test",
+            "@example.test",
+            "ada@",
+            "ada@@example.test",
+            "ada@localhost",
+            "ada@.example.test",
+            "ada@example.",
+            "\"quoted\"@example.test",
+            "a@b.test, c@d.test",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                account_name_as_address(rejected),
+                None,
+                "{rejected:?} must not be treated as an owner address"
+            );
+        }
+    }
+
+    #[test]
+    fn a_display_name_account_never_becomes_a_fallback() {
+        // The plan for an account whose name is a display string must
+        // carry no fallback at all, so a completed-but-empty lookup
+        // resolves to nothing rather than to a label.
+        assert_eq!(
+            owner_email_plan(Some("p-1"), "Support <support@example.com>"),
+            OwnerEmailPlan::FromPrincipal {
+                principal_id: "p-1".to_string(),
+                name_fallback: None,
+            }
+        );
+        assert_eq!(
+            owner_email_plan(None, "Support <support@example.com>"),
+            OwnerEmailPlan::Skip
+        );
+    }
+
+    #[test]
+    fn only_a_completed_lookup_permits_the_name_fallback() {
+        // The rule the resolver applies, stated directly: `Absent`
+        // (the server answered, no address) may degrade to the parsed
+        // name; `Unavailable` (no answer) must not, or a transient
+        // failure overwrites real ownership with a guess.
+        let fallback = || Some("shared@example.test".to_string());
+        assert_eq!(
+            owner_email_from_lookup(
+                PrincipalEmail::Resolved("owner@example.test".into()),
+                fallback()
+            )
+            .as_deref(),
+            Some("owner@example.test"),
+            "an authoritative answer always wins over the name"
+        );
+        assert_eq!(
+            owner_email_from_lookup(PrincipalEmail::Absent, fallback()).as_deref(),
+            Some("shared@example.test"),
+            "a completed lookup with no address may degrade to the name"
+        );
+        assert_eq!(
+            owner_email_from_lookup(PrincipalEmail::Unavailable, fallback()),
+            None,
+            "a failed lookup must not be papered over with the account name"
+        );
+        assert_eq!(
+            owner_email_from_lookup(PrincipalEmail::Absent, None),
+            None,
+            "and with no parseable name there is nothing to degrade to"
+        );
+    }
+
+    #[test]
+    fn unresolvable_principal_without_an_address_name_has_nothing_to_fall_back_to() {
+        // A non-address name is not an email and must never be guessed
+        // into one; the fallback stays empty and the account resolves to
+        // no owner email at all.
+        assert_eq!(
+            owner_email_plan(Some("p-unreadable"), "Shared Mailbox"),
+            OwnerEmailPlan::FromPrincipal {
+                principal_id: "p-unreadable".to_string(),
+                name_fallback: None,
+            }
         );
     }
 
@@ -2932,7 +3138,12 @@ mod tests {
             vec![
                 (
                     "acct-owner".to_string(),
-                    OwnerEmailPlan::FromPrincipal("p-owner".to_string())
+                    // "Shared Mailbox" is not address-shaped, so this
+                    // account has no name to degrade to.
+                    OwnerEmailPlan::FromPrincipal {
+                        principal_id: "p-owner".to_string(),
+                        name_fallback: None,
+                    }
                 ),
                 (
                     "acct-name".to_string(),

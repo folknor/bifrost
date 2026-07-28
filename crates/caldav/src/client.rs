@@ -11,8 +11,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 
 use crate::parse::{
-    CalDavEventEntry, CalDavFetchedEvent, CalDavSyncReport, CalendarCollection,
-    extract_href_property, parse_calendar_collections, parse_multiget_report,
+    CalDavFetchedEvent, CalDavMultigetReport, CalDavSyncReport, CalendarCollection,
+    MultigetOutcome, extract_href_property, parse_calendar_collections, parse_multiget_report,
     parse_propfind_events, parse_sync_collection_report,
 };
 use crate::{CalDavConfig, CalDavCredentials};
@@ -170,25 +170,6 @@ impl CalDavClient {
             .map_err(|error| parse_error(operation, format!("calendar list: {error}")))
     }
 
-    pub(crate) async fn list_events(
-        &self,
-        calendar_url: &str,
-    ) -> Result<Vec<CalDavEventEntry>, AccountError> {
-        self.list_events_for_operation(calendar_url, AccountOperation::EventsInRange)
-            .await
-    }
-
-    pub(crate) async fn list_events_for_operation(
-        &self,
-        calendar_url: &str,
-        operation: AccountOperation,
-    ) -> Result<Vec<CalDavEventEntry>, AccountError> {
-        Ok(self
-            .list_events_listing(calendar_url, operation)
-            .await?
-            .entries)
-    }
-
     /// Depth-1 event PROPFIND returning both the committed entries and
     /// the hrefs the server reported *failed* within the 207, so the
     /// snapshot diff can preserve transiently-failed resources rather
@@ -209,22 +190,23 @@ impl CalDavClient {
         calendar_url: &str,
         start: Option<&str>,
         end: Option<&str>,
-    ) -> Result<Vec<CalDavFetchedEvent>, AccountError> {
+    ) -> Result<CalDavMultigetReport, AccountError> {
         let body = calendar_query_body(start, end);
         let response = self
             .report_raw(calendar_url, &body, AccountOperation::EventsInRange)
             .await?;
-        parse_multiget_report(&response).map_err(|error| {
+        let parsed = parse_multiget_report(&response).map_err(|error| {
             parse_error(AccountOperation::EventsInRange, format!("query: {error}"))
-        })
+        })?;
+        multiget_failure(&parsed, AccountOperation::EventsInRange).map_or(Ok(parsed), Err)
     }
 
     pub(crate) async fn query_events_text(
         &self,
         calendar_url: &str,
         query: &str,
-    ) -> Result<Vec<CalDavFetchedEvent>, AccountError> {
-        let mut all_results = Vec::new();
+    ) -> Result<CalDavMultigetReport, AccountError> {
+        let mut all_results = CalDavMultigetReport::default();
         for property in ["SUMMARY", "DESCRIPTION", "LOCATION", "ATTENDEE"] {
             let body = calendar_text_query_body(property, query);
             let response = self
@@ -233,6 +215,9 @@ impl CalDavClient {
             let parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::EventSearch, format!("query: {error}"))
             })?;
+            if let Some(error) = multiget_failure(&parsed, AccountOperation::EventSearch) {
+                return Err(error);
+            }
             all_results.extend(parsed);
         }
         Ok(all_results)
@@ -243,8 +228,8 @@ impl CalDavClient {
         calendar_url: &str,
         uris: &[String],
         operation: AccountOperation,
-    ) -> Result<Vec<CalDavFetchedEvent>, AccountError> {
-        let mut all_results = Vec::new();
+    ) -> Result<CalDavMultigetReport, AccountError> {
+        let mut all_results = CalDavMultigetReport::default();
         for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
             let mut href_elements = String::new();
             for uri in chunk {
@@ -265,6 +250,9 @@ impl CalDavClient {
             let response = self.report_raw(calendar_url, &body, operation).await?;
             let parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
+            if let Some(error) = multiget_failure(&parsed, operation) {
+                return Err(error);
+            }
             all_results.extend(parsed);
         }
         Ok(all_results)
@@ -642,6 +630,38 @@ fn should_fallback_discovery(error: &AccountError) -> bool {
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Calendar)
     )
+}
+
+/// Turn a wholly-failed 207 body into a real error.
+///
+/// RFC 4918 s13: a Multi-Status body can describe success, partial
+/// success, or complete failure. The transport already returned 207, so
+/// only the body says which. Handing a complete failure back as an
+/// empty page lets a consumer record the collection as fully walked and
+/// drop every resource in it permanently; routing it through
+/// `status_error` instead gives the embedded status its normal
+/// classification, so an all-401 body reauthorizes and an all-503 body
+/// retries rather than silently truncating the calendar.
+fn multiget_failure(
+    report: &crate::parse::CalDavMultigetReport,
+    operation: AccountOperation,
+) -> Option<AccountError> {
+    match report.classify() {
+        MultigetOutcome::Usable => None,
+        MultigetOutcome::CompleteFailure { status } => {
+            let code = status
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Some(status_error(
+                operation,
+                code,
+                format!(
+                    "multi-status body reported failure for all {} resources",
+                    report.failed.len()
+                ),
+            ))
+        }
+    }
 }
 
 pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {

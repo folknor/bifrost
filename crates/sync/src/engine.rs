@@ -510,6 +510,11 @@ impl SyncEngine {
         // scopes and runs one `BackfillRunner::run_partition` per
         // scope under a default policy. Items + checkpoints flow onto
         // the same per-account broadcast.
+        // The de-dup set the partition runner filters against. Nothing
+        // populates it - see the `LiveSupersedes` type docs for why
+        // broadcasting a live change is not evidence the consumer got
+        // it, and therefore not a sound basis for suppressing that
+        // object's inventory copy.
         let live_supersedes = Arc::new(LiveSupersedes::new());
         let backfill_registry_handle = Arc::clone(&self.backfill_registry);
         let bf_account = Arc::clone(&current);

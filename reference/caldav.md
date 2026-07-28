@@ -96,9 +96,34 @@ Supported calendar primitives:
   recurrence-aware: a recurring master whose own interval sits outside the
   window is retained when its RRULE can still yield an in-window occurrence
   (dropped only when it starts after the window, or an RRULE `UNTIL` ends it
-  before the window). Per-resource parse failures are not swallowed - the
-  failed `.ics` hrefs surface on `Page::failed_ids` so a consumer can tell a
-  transient failure apart from a real remote deletion.
+  before the window). Per-resource failures are not swallowed - the failed
+  hrefs surface on `Page::failed_ids` so a consumer can tell a transient
+  failure apart from a real remote deletion. Two kinds land there and they
+  are equivalent to the consumer: a resource the server refused inside the
+  207 (non-2xx propstat, or 2xx with no `calendar-data`), and one that
+  fetched 200 but would not tokenize. `parse_multiget_report` returns
+  `CalDavMultigetReport { events, failed }` and reserves `Err` for a
+  malformed document, so a single bad propstat can no longer abort the
+  whole pull. `event_search` reports the same way, deduped across its four
+  per-property REPORTs.
+
+  Properties are collected propstat-scoped and promoted to the response
+  only by `commit_propstat`, and only from a 2xx propstat. That is what
+  makes a multi-propstat response order-independent: `calendar-data`
+  inside a refused block is never adopted, and a trailing non-2xx block
+  for an unrelated property never retracts data a successful block
+  supplied.
+
+  The body is classified, not merely parsed. Per RFC 4918 s13 a 207 may
+  describe success, partial success, or complete failure, so
+  `CalDavMultigetReport::classify` returns `CompleteFailure` when every
+  resource failed and at least one failed for a reason other than
+  404/410 (a resource deleted between listing and multiget is the benign
+  per-resource case). `multiget_failure` routes that through
+  `status_error`, so an all-401 body reauthorizes and an all-503 body
+  retries instead of returning an empty page that a consumer would
+  record as a completed walk - which would drop those resources
+  permanently.
 - `event_get` - direct `GET` of the event resource.
 - `event_create` - creates a VEVENT resource with a UUID-backed
   `.ics` path using `PUT`, including STATUS from shared lifecycle status,
@@ -131,7 +156,14 @@ Supported calendar primitives:
   each normalized to a `mailto:` URI when bare - and then applies the same
   raw-preserving replacement path to the local resource. Accounts without
   an identifiable attendee, organizer, or schedule outbox return
-  `Unsupported`.
+  `Unsupported`. The advertised `pim_methods.event_rsvp` flag is
+  discovery-derived, not assumed: `scheduling_available` requires BOTH a
+  `CALDAV:schedule-outbox-URL` on the current-user-principal AND a
+  calendar-user-address for this user (from
+  `CALDAV:calendar-user-address-set`, or configured explicitly). A plain
+  RFC 4791 store that advertises neither reports `event_rsvp = false`, so
+  a consumer's capability gate rejects the call up front instead of the
+  iTIP POST failing on the wire.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, then keep local filtering as a

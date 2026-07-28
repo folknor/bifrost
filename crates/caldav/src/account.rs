@@ -7,7 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use futures::{StreamExt, stream};
 
-use crate::capabilities::caldav_capabilities;
+use crate::capabilities::{caldav_capabilities, scheduling_available};
 use crate::client::{CalDavClient, PutCondition, event_scope, unsupported_error};
 use crate::ical::{
     create_to_ical, event_from_ical, events_from_ical, new_uid, patch_to_ical, rsvp_patch,
@@ -40,6 +40,13 @@ impl CalDavAccount {
             None => client.discover_calendar_user_email().await.ok().flatten(),
         };
         let schedule_outbox_url = client.discover_schedule_outbox_url().await.ok().flatten();
+        // `event_rsvp` is discovery-derived, not assumed: the RSVP path
+        // below hard-requires both of these and returns `unsupported`
+        // without them, so advertising the method on a scheduling-less
+        // RFC 4791 store would only move the failure from the
+        // capability gate to the wire.
+        let event_rsvp =
+            scheduling_available(rsvp_email.as_deref(), schedule_outbox_url.as_deref());
         let calendar_home = client.discover_calendar_home().await?;
         let collections = client.list_calendars(&calendar_home).await?;
         let default_calendar_url = collections
@@ -48,7 +55,7 @@ impl CalDavAccount {
             .unwrap_or_else(|| client.resolve_url(&calendar_home));
         Ok(Self {
             client: Arc::new(client),
-            capabilities: caldav_capabilities(),
+            capabilities: caldav_capabilities(event_rsvp),
             calendar_home,
             default_calendar_url,
             rsvp_email,
@@ -709,11 +716,14 @@ impl Account for CalDavAccount {
                 .query_events_in_range(&calendar_url, range_start.as_deref(), range_end.as_deref())
                 .await?;
             let mut events = Vec::new();
-            // Per-resource parse failures are surfaced (not swallowed) so a
+            // Per-resource failures are surfaced (not swallowed) so a
             // consumer can tell a transient failure apart from a real remote
-            // deletion.
-            let mut failed = Vec::new();
-            for event in fetched {
+            // deletion. Two kinds land here and they are the same thing to
+            // the consumer: a resource the server refused inside the 207
+            // (non-2xx propstat), and one that came back 200 but would not
+            // tokenize. Neither aborts the rest of the pull.
+            let mut failed = fetched.failed_hrefs();
+            for event in fetched.events {
                 match events_from_ical(
                     event.uri.clone(),
                     CalendarId(calendar_url.clone()),
@@ -883,21 +893,43 @@ impl Account for CalDavAccount {
                 Self::calendar_url(&client, &default_calendar_url, request.calendar_id);
             let needle = request.query.to_lowercase();
             let fetched = if needle.is_empty() {
-                let entries = client.list_events(&calendar_url).await?;
-                let uris = entries
+                // The match-all path lists first, then multigets. Both
+                // legs can lose individual resources inside their 207,
+                // so both feed `failed_ids` - dropping the listing's
+                // casualties would report a match-all search as
+                // complete when it was not.
+                let listing = client
+                    .list_events_listing(&calendar_url, AccountOperation::EventSearch)
+                    .await?;
+                let uris = listing
+                    .entries
                     .iter()
                     .map(|entry| entry.uri.clone())
                     .collect::<Vec<_>>();
-                client
+                let mut fetched = client
                     .fetch_events(&calendar_url, &uris, AccountOperation::EventSearch)
-                    .await?
+                    .await?;
+                fetched.failed.extend(
+                    listing
+                        .failed_hrefs
+                        .into_iter()
+                        .map(|href| crate::parse::CalDavFailedResource { href, status: None }),
+                );
+                fetched
             } else {
                 client
                     .query_events_text(&calendar_url, &request.query)
                     .await?
             };
             let mut seen = HashSet::new();
+            // Search dedups across the four per-property REPORTs, so the
+            // failed hrefs need the same treatment before they become
+            // `failed_ids`.
+            let mut failed = fetched.failed_hrefs();
+            failed.sort_unstable();
+            failed.dedup();
             let mut events = fetched
+                .events
                 .into_iter()
                 .filter(|event| seen.insert(event.uri.clone()))
                 .flat_map(|event| {
@@ -917,7 +949,12 @@ impl Account for CalDavAccount {
             if let Some(limit) = request.limit.and_then(|limit| usize::try_from(limit).ok()) {
                 events.truncate(limit);
             }
-            Ok(Page::single(events))
+            Ok(Page {
+                items: events,
+                next_cursor: None,
+                estimated_total: None,
+                failed_ids: failed,
+            })
         })
     }
 
@@ -1464,7 +1501,7 @@ mod tests {
     async fn caldav_host_attachment_unsupported() {
         // CalDAV has no cloud-drive hosting; the flag is false (Default) and
         // the leg returns `Unsupported(HostAttachment)`.
-        assert!(!caldav_capabilities().pim_methods.host_attachment);
+        assert!(!caldav_capabilities(true).pim_methods.host_attachment);
 
         let err = unsupported_future::<HostedAttachment>(AccountOperation::HostAttachment)
             .await
@@ -1479,7 +1516,7 @@ mod tests {
     async fn caldav_open_raw_rfc822_unsupported() {
         // CalDAV advertises no raw RFC822 read; the flag is false and the
         // stream's first item terminates `Unsupported(OpenRawRfc822)`.
-        assert!(!caldav_capabilities().pim_methods.open_raw_rfc822);
+        assert!(!caldav_capabilities(true).pim_methods.open_raw_rfc822);
 
         let mut stream = unsupported_stream::<Bytes>(AccountOperation::OpenRawRfc822);
         let first = stream.next().await.expect("first event");

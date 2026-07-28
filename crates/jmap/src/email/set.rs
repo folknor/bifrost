@@ -257,6 +257,24 @@ impl EmailPatch {
             .insert(property.into(), serde_json::Value::Null);
         self
     }
+
+    /// The `onSuccessUpdateEmail` patch for a message that has just
+    /// been submitted: relocate it to the Sent mailbox and stop it
+    /// being a draft.
+    ///
+    /// Rewriting `mailboxIds` alone is not enough. RFC 8621 s4.1.1
+    /// makes `$draft` the authoritative "this is a draft" signal -
+    /// membership of the Drafts mailbox is a consequence, not the
+    /// cause - so a submitted message that keeps the keyword is listed
+    /// under BOTH Drafts and Sent by any client that filters on it.
+    /// The two edits touch different top-level properties
+    /// (`mailboxIds` wholesale, `keywords/$draft` by patch path), which
+    /// RFC 8620 s5.3 permits; only mixing a property with a path into
+    /// that same property is forbidden.
+    pub(crate) fn submitted_to_sent(&mut self, sent: impl Into<MailboxId>) -> &mut Self {
+        self.mailbox_ids([sent]);
+        self.keyword(super::DRAFT_KEYWORD, false)
+    }
 }
 
 impl EmailBodyPart {
@@ -406,5 +424,34 @@ impl Default for EmailAddressGroup {
 impl EmailHeader {
     pub(crate) fn new(name: String, value: String) -> EmailHeader {
         EmailHeader { name, value }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submitted_to_sent_moves_and_clears_the_draft_keyword() {
+        let mut patch = EmailPatch::default();
+        patch.submitted_to_sent(MailboxId::new("sent-1"));
+        let json = serde_json::to_value(&patch).expect("serializable patch");
+
+        assert_eq!(
+            json.get("mailboxIds")
+                .and_then(|v| v.get("sent-1"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the sent message must land in the Sent mailbox"
+        );
+        assert_eq!(
+            json.get("keywords/$draft"),
+            Some(&serde_json::Value::Null),
+            "a submitted message that keeps $draft shows under Drafts AND Sent"
+        );
+        // RFC 8620 s5.3: a property and a patch path into that same
+        // property must not both appear. `keywords` wholesale must stay
+        // absent now that `keywords/$draft` is present.
+        assert!(json.get("keywords").is_none());
     }
 }
