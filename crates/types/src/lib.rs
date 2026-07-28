@@ -37,7 +37,9 @@ pub mod search;
 pub mod settings;
 
 // Account trait + factory + erased return aliases.
-pub use account::{Account, AccountFactory, AccountFuture, AccountStream};
+pub use account::{
+    Account, AccountFactory, AccountFuture, AccountStream, CategoryDefinition, MessageReactionState,
+};
 
 // Blob types.
 pub use blob::{BlobCapabilities, BlobEncoding, BlobHandle, ByteRange, Digest, DigestAlgorithm};

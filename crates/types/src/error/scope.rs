@@ -111,6 +111,8 @@ fn object_type_name(ty: ObjectType) -> &'static str {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub enum AccountOperation {
+    CategoryDefinitionsList,
+    MessageReactionsRead,
     Discover,
     EstablishCursor,
     DiscoverCursorScopes,

@@ -677,8 +677,19 @@ pub(crate) fn containers_list(
 ) -> AccountFuture<Result<Vec<Container>, AccountError>> {
     Box::pin(async move {
         let mut containers = fetch_containers(&mail, AccountOperation::ContainersList).await?;
-        let (foreign, _warnings) =
-            fetch_foreign_containers(&foreign_mail, AccountOperation::ContainersList).await;
+        // Owner emails are resolved once per foreign account per call
+        // (never per container) and are best-effort metadata: any
+        // resolution failure yields `None` for that account and MUST NOT
+        // propagate out of `containers_list` - the consumer treats a
+        // container-listing error as an attach failure, and a missing
+        // cosmetic email must never cause an account outage.
+        let owner_emails = resolve_owner_emails(&mail, &foreign_mail).await;
+        let (foreign, _warnings) = fetch_foreign_containers(
+            &foreign_mail,
+            &owner_emails,
+            AccountOperation::ContainersList,
+        )
+        .await;
         containers.extend(foreign);
         Ok(containers)
     })
@@ -1525,8 +1536,153 @@ async fn fetch_containers(
     Ok(fetch_mailboxes(mail, op)
         .await?
         .into_iter()
-        .filter_map(|mailbox| container_from_mailbox(mailbox, None))
+        .filter_map(|mailbox| container_from_mailbox(mailbox, None, None))
         .collect())
+}
+
+/// The JMAP principals capabilities (RFC 9670) gating owner-email
+/// resolution.
+const PRINCIPALS_CAPABILITY: &str = "urn:ietf:params:jmap:principals";
+const PRINCIPALS_OWNER_CAPABILITY: &str = "urn:ietf:params:jmap:principals:owner";
+
+/// How one foreign account's owner email resolves. Pure decision core of
+/// `resolve_owner_emails`, split out so the gate is unit-pinnable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerEmailPlan {
+    /// No email for this account. Also the fail-soft landing for every
+    /// error path.
+    Skip,
+    /// The account advertises `urn:ietf:params:jmap:principals:owner`
+    /// with a principal id: resolve via `Principal/get`.
+    FromPrincipal(String),
+    /// No owner principal, but the account's session NAME is an address:
+    /// use it directly. Only reachable when the SESSION advertises the
+    /// principals capability - the caller gates on that first.
+    FromName(String),
+}
+
+/// Decide how a foreign account's owner email resolves, given the
+/// account-level owner principal id (if advertised) and the account's
+/// session name.
+///
+/// The name fallback deliberately requires the principal id to be ABSENT:
+/// a present-but-unresolvable principal is an error path and must land on
+/// `Skip` (fail-soft), never on the name heuristic - that ordering is the
+/// legacy contract this projection preserves.
+fn owner_email_plan(owner_principal_id: Option<&str>, account_name: &str) -> OwnerEmailPlan {
+    if let Some(principal_id) = owner_principal_id {
+        return OwnerEmailPlan::FromPrincipal(principal_id.to_string());
+    }
+    if account_name.contains('@') {
+        return OwnerEmailPlan::FromName(account_name.to_string());
+    }
+    OwnerEmailPlan::Skip
+}
+
+/// Plan owner-email resolution for every foreign account in the session.
+///
+/// Level ONE of the two-level gate lives here: a session that does not
+/// advertise `urn:ietf:params:jmap:principals` yields no plans at all -
+/// not even the name fallback. Resolving from the account name on a
+/// session with no principals capability would populate owner emails
+/// where the legacy behavior left them NULL.
+fn owner_email_plans(
+    session: &crate::core::session::Session,
+    foreign_account_ids: &[&String],
+) -> Vec<(String, OwnerEmailPlan)> {
+    if !session.has_capability(PRINCIPALS_CAPABILITY) {
+        return Vec::new();
+    }
+    foreign_account_ids
+        .iter()
+        .filter_map(|account_id| {
+            let account = session.account(account_id)?;
+            // Level TWO: the individual account's owner capability.
+            let owner_principal_id =
+                account
+                    .capability(PRINCIPALS_OWNER_CAPABILITY)
+                    .and_then(|capability| match capability {
+                        crate::core::session::Capabilities::PrincipalsOwner(owner) => {
+                            owner.principal_id().map(|id| id.as_str().to_string())
+                        }
+                        _ => None,
+                    });
+            Some((
+                (*account_id).clone(),
+                owner_email_plan(owner_principal_id.as_deref(), account.name()),
+            ))
+        })
+        .collect()
+}
+
+/// Resolve owner emails for the foreign accounts, once per account.
+/// Returns only the resolved entries; every failure lands as an absent
+/// key (fail-soft, mandatory - see `containers_list`).
+async fn resolve_owner_emails(
+    mail: &MailAccount,
+    foreign_mail: &HashMap<String, MailAccount>,
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    if foreign_mail.is_empty() {
+        return resolved;
+    }
+    let session = mail.client().session();
+    // Deterministic order so the resolution (and its logging, if any is
+    // ever added) is stable across calls.
+    let mut foreign_ids: Vec<&String> = foreign_mail.keys().collect();
+    foreign_ids.sort();
+    let principals_account_id = session
+        .principals_capabilities()
+        .and_then(|capabilities| capabilities.account_id_for_principal())
+        .map(|id| id.as_str().to_string());
+    for (account_id, plan) in owner_email_plans(&session, &foreign_ids) {
+        match plan {
+            OwnerEmailPlan::Skip => {}
+            OwnerEmailPlan::FromName(email) => {
+                resolved.insert(account_id, email);
+            }
+            OwnerEmailPlan::FromPrincipal(principal_id) => {
+                if let Some(email) =
+                    fetch_principal_email(mail, principals_account_id.as_deref(), &principal_id)
+                        .await
+                {
+                    resolved.insert(account_id, email);
+                }
+            }
+        }
+    }
+    resolved
+}
+
+/// `Principal/get` for one owner principal, against the session's
+/// principals account when it names one (falling back to the mail
+/// account's id, matching the legacy default-account behavior).
+///
+/// Fail-soft by signature: transport errors, method errors, an empty
+/// result, and a principal without an email all collapse to `None`.
+async fn fetch_principal_email(
+    mail: &MailAccount,
+    principals_account_id: Option<&str>,
+    principal_id: &str,
+) -> Option<String> {
+    let account = match principals_account_id {
+        Some(id) => crate::account::Account::new(mail.client().clone(), id),
+        None => mail.clone(),
+    };
+    let get = crate::principal::PrincipalGet::new()
+        .ids([crate::principal::PrincipalId::new(principal_id)])
+        .properties([
+            crate::principal::Property::Email,
+            crate::principal::Property::Name,
+        ]);
+    match account.call(get).await {
+        Ok(response) => response
+            .into_list()
+            .into_iter()
+            .next()
+            .and_then(|principal| principal.email().map(String::from)),
+        Err(_) => None,
+    }
 }
 
 /// Enumerate every foreign (shared/delegate) account's mailboxes as
@@ -1538,6 +1694,7 @@ async fn fetch_containers(
 /// unreachable share must not blank the whole sidebar.
 async fn fetch_foreign_containers(
     foreign_mail: &HashMap<String, MailAccount>,
+    owner_emails: &HashMap<String, String>,
     op: AccountOperation,
 ) -> (Vec<Container>, Vec<Warning>) {
     let mut containers = Vec::new();
@@ -1547,12 +1704,11 @@ async fn fetch_foreign_containers(
     account_ids.sort();
     for account_id in account_ids {
         let mail = &foreign_mail[account_id];
+        let owner_email = owner_emails.get(account_id).map(String::as_str);
         match fetch_mailboxes(mail, op).await {
-            Ok(mailboxes) => containers.extend(
-                mailboxes
-                    .into_iter()
-                    .filter_map(|mailbox| container_from_mailbox(mailbox, Some(account_id))),
-            ),
+            Ok(mailboxes) => containers.extend(mailboxes.into_iter().filter_map(|mailbox| {
+                container_from_mailbox(mailbox, Some(account_id), owner_email)
+            })),
             Err(_) => warnings.push(Warning::support_only(
                 WarningKind::OperatorAttentionNeeded,
                 format!("shared JMAP account {account_id} skipped: mailbox listing failed"),
@@ -1591,7 +1747,11 @@ async fn fetch_mailboxes(
 /// owner's own account. The parent is re-encoded in the same namespace so a
 /// foreign child never points at a primary mailbox that happens to share
 /// the parent's id.
-fn container_from_mailbox(mut mailbox: Mailbox, owner_account: Option<&str>) -> Option<Container> {
+fn container_from_mailbox(
+    mut mailbox: Mailbox,
+    owner_account: Option<&str>,
+    owner_email: Option<&str>,
+) -> Option<Container> {
     let id = mailbox.take_id();
     if id.as_str().is_empty() {
         return None;
@@ -1639,6 +1799,10 @@ fn container_from_mailbox(mut mailbox: Mailbox, owner_account: Option<&str>) -> 
             None => ContainerNamespace::Personal,
         })
         .with_owner(owner_account.map(|account| bifrost_types::MailboxId(account.to_string())))
+        // Best-effort metadata resolved once per foreign account by
+        // `resolve_owner_emails`; `None` for a personal mailbox and for
+        // every unresolvable owner (fail-soft).
+        .with_owner_email(owner_email.map(str::to_string))
         .with_owner_local_id(owner_account.map(|_| local)),
     )
 }
@@ -2593,10 +2757,12 @@ mod tests {
         let container = container_from_mailbox(
             mailbox_json("mbx-12", Some("mbx-1"), full_rights()),
             Some("acct-9"),
+            Some("owner@example.test"),
         )
         .expect("container");
 
         assert_eq!(container.namespace, ContainerNamespace::Shared);
+        assert_eq!(container.owner_email.as_deref(), Some("owner@example.test"));
         assert_eq!(
             container.owner,
             Some(bifrost_types::MailboxId("acct-9".to_string()))
@@ -2631,9 +2797,12 @@ mod tests {
     /// sync scope.
     #[test]
     fn foreign_container_native_id_matches_seeded_cursor_scope() {
-        let container =
-            container_from_mailbox(mailbox_json("mbx-12", None, full_rights()), Some("acct-9"))
-                .expect("container");
+        let container = container_from_mailbox(
+            mailbox_json("mbx-12", None, full_rights()),
+            Some("acct-9"),
+            None,
+        )
+        .expect("container");
         let scope = bifrost_types::CursorScope::Folder(super::super::foreign::encode_foreign(
             "acct-9", "mbx-12",
         ));
@@ -2647,14 +2816,133 @@ mod tests {
 
     #[test]
     fn primary_mailbox_stays_personal_and_unqualified() {
-        let container =
-            container_from_mailbox(mailbox_json("mbx-12", Some("mbx-1"), full_rights()), None)
-                .expect("container");
+        let container = container_from_mailbox(
+            mailbox_json("mbx-12", Some("mbx-1"), full_rights()),
+            None,
+            None,
+        )
+        .expect("container");
         assert_eq!(container.namespace, ContainerNamespace::Personal);
         assert!(container.owner.is_none());
+        assert!(container.owner_email.is_none());
         assert!(container.owner_local_id.is_none());
         assert_eq!(container.native_id, "mbx-12");
         assert_eq!(container.parent, Some(ContainerId("mbx-1".to_string())));
+    }
+
+    // -- owner-email resolution (the two-level RFC 9670 gate) ------------
+
+    #[test]
+    fn owner_email_plan_prefers_principal_over_name() {
+        // A present principal id always routes through `Principal/get`,
+        // even when the account name looks like an address: the name
+        // fallback is only for accounts that advertise no owner principal.
+        assert_eq!(
+            owner_email_plan(Some("p-1"), "shared@example.test"),
+            OwnerEmailPlan::FromPrincipal("p-1".to_string())
+        );
+        assert_eq!(
+            owner_email_plan(None, "shared@example.test"),
+            OwnerEmailPlan::FromName("shared@example.test".to_string())
+        );
+        assert_eq!(
+            owner_email_plan(None, "Shared Mailbox"),
+            OwnerEmailPlan::Skip
+        );
+    }
+
+    fn gate_session(with_principals_capability: bool) -> crate::core::session::Session {
+        let mut capabilities = serde_json::json!({
+            "urn:ietf:params:jmap:core": {
+                "maxSizeUpload": 50000000,
+                "maxConcurrentUpload": 4,
+                "maxSizeRequest": 10000000,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 16,
+                "maxObjectsInGet": 500,
+                "maxObjectsInSet": 500,
+                "collationAlgorithms": []
+            },
+        });
+        if with_principals_capability {
+            capabilities["urn:ietf:params:jmap:principals"] = serde_json::json!({});
+        }
+        serde_json::from_value(serde_json::json!({
+            "capabilities": capabilities,
+            "accounts": {
+                "acct-owner": {
+                    "name": "Shared Mailbox",
+                    "isPersonal": false,
+                    "isReadOnly": false,
+                    "accountCapabilities": {
+                        "urn:ietf:params:jmap:principals:owner": {
+                            "accountIdForPrincipal": "acct-principals",
+                            "principalId": "p-owner"
+                        }
+                    }
+                },
+                "acct-name": {
+                    "name": "shared@example.test",
+                    "isPersonal": false,
+                    "isReadOnly": false,
+                    "accountCapabilities": {}
+                },
+                "acct-plain": {
+                    "name": "Shared Mailbox",
+                    "isPersonal": false,
+                    "isReadOnly": false,
+                    "accountCapabilities": {}
+                }
+            },
+            "primaryAccounts": {},
+            "username": "user@example.test",
+            "apiUrl": "https://example.test/jmap/",
+            "downloadUrl": "https://example.test/jmap/download/{accountId}/{blobId}/{name}",
+            "uploadUrl": "https://example.test/jmap/upload/{accountId}/",
+            "eventSourceUrl": "https://example.test/jmap/es/",
+            "state": "s1"
+        }))
+        .expect("gate session deserializes")
+    }
+
+    #[test]
+    fn session_without_principals_capability_plans_nothing() {
+        // Level ONE of the gate: no session principals capability means no
+        // resolution at all - INCLUDING the name fallback. Resolving from
+        // the account name here would populate emails where the legacy
+        // behavior left them NULL.
+        let session = gate_session(false);
+        let acct_owner = "acct-owner".to_string();
+        let acct_name = "acct-name".to_string();
+        let ids = vec![&acct_owner, &acct_name];
+        assert!(owner_email_plans(&session, &ids).is_empty());
+    }
+
+    #[test]
+    fn session_with_principals_capability_plans_per_account() {
+        let session = gate_session(true);
+        let acct_owner = "acct-owner".to_string();
+        let acct_name = "acct-name".to_string();
+        let acct_plain = "acct-plain".to_string();
+        let acct_unknown = "acct-unknown".to_string();
+        let ids = vec![&acct_owner, &acct_name, &acct_plain, &acct_unknown];
+        let plans = owner_email_plans(&session, &ids);
+        assert_eq!(
+            plans,
+            vec![
+                (
+                    "acct-owner".to_string(),
+                    OwnerEmailPlan::FromPrincipal("p-owner".to_string())
+                ),
+                (
+                    "acct-name".to_string(),
+                    OwnerEmailPlan::FromName("shared@example.test".to_string())
+                ),
+                ("acct-plain".to_string(), OwnerEmailPlan::Skip),
+                // `acct-unknown` is absent from the session and yields no
+                // plan at all (fail-soft: absent, never an error).
+            ]
+        );
     }
 
     #[test]

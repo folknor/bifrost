@@ -1832,6 +1832,29 @@ impl SyncEngine {
         Ok(self.live_account(account_id)?.containers_list().await?)
     }
 
+    /// Forwards to the account's provider category-definition surface.
+    pub async fn category_definitions_list(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Vec<bifrost_types::CategoryDefinition>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .category_definitions_list()
+            .await?)
+    }
+
+    /// Forwards to the account's provider reaction-read surface.
+    pub async fn message_reactions(
+        &self,
+        account_id: &AccountId,
+        ids: &[bifrost_types::ObjectId],
+    ) -> Result<bifrost_types::BatchOutcome<bifrost_types::MessageReactionState>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .message_reactions(ids)
+            .await?)
+    }
+
     /// Create a new container of `kind` named `name` under `parent`.
     /// Forwards to [`Account::container_create`]; returns the
     /// engine-facing id. `style` carries an optional initial color

@@ -149,6 +149,10 @@ pub enum QuotaSignal {
 /// the trait surface stays additive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PimMethodSupport {
+    /// Read Outlook master category definitions.
+    pub category_definitions: bool,
+    /// Read Exchange-native message reaction properties.
+    pub message_reactions: bool,
     // Mail mutation primitives.
     pub add_to_container: bool,
     pub remove_from_container: bool,

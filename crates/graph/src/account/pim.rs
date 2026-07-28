@@ -1303,7 +1303,7 @@ async fn fetch_paged_values(
 /// `/singleValueExtendedProperties/...` clear). The `$batch` envelope is
 /// always posted on the primary client; routing rides entirely in the
 /// per-item URL prefix, mirroring the read paths in `get.rs`.
-fn message_batch_url(account: &GraphAccount, id: &ObjectId, suffix: &str) -> String {
+pub(crate) fn message_batch_url(account: &GraphAccount, id: &ObjectId, suffix: &str) -> String {
     let parsed = super::foreign::parse_message_id(id);
     let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
     let enc_id = bifrost_net::url::encode_component(parsed.native_id());
@@ -2350,6 +2350,14 @@ fn container_from_folder(
         None => ContainerNamespace::Personal,
     })
     .with_owner(owner.map(|mailbox| MailboxId(mailbox.to_string())))
+    // The `/users/{id}` routing key doubles as the owner email exactly when
+    // it is addressable (a UPN/SMTP address the account already holds);
+    // an object-id-shaped key carries no email and projects `None`.
+    .with_owner_email(
+        owner
+            .filter(|mailbox| mailbox.contains('@'))
+            .map(str::to_string),
+    )
     .with_owner_local_id(owner.map(|_| folder.id))
 }
 
@@ -2586,6 +2594,17 @@ mod tests {
         // Graph REST mail folders expose no ACL; only public folders do.
         assert!(container.rights.is_none());
         assert!(container.content_class.is_none());
+        // An addressable routing key IS the owner email.
+        assert_eq!(container.owner_email.as_deref(), Some("shared@contoso.com"));
+
+        // An object-id-shaped routing key carries no email.
+        let opaque = container_from_folder(
+            mail_folder("AAMkChild", Some("AAMkParent")),
+            &HashMap::new(),
+            Some("48d31887-5fad-4d73-a9f5-3c356e68a038"),
+        );
+        assert_eq!(opaque.namespace, ContainerNamespace::Shared);
+        assert!(opaque.owner_email.is_none());
 
         // A primary folder stays personal and unqualified.
         let primary = container_from_folder(
@@ -2596,6 +2615,7 @@ mod tests {
         assert_eq!(primary.namespace, ContainerNamespace::Personal);
         assert!(primary.owner.is_none());
         assert!(primary.owner_local_id.is_none());
+        assert!(primary.owner_email.is_none());
         assert_eq!(primary.native_id, "AAMkChild");
     }
 

@@ -1,0 +1,418 @@
+//! Exchange-native message reaction read surface.
+//!
+//! Reads the two `singleValueExtendedProperties` the Outlook clients write
+//! for reactions (`OwnerReactionType`, `ReactionsCount`) via `$batch` GETs,
+//! chunked to Graph's batch limit of 20 and merged into ONE
+//! [`BatchOutcome`] whose `finalize` accounts for every submitted id.
+//!
+//! The three-lane mapping is the whole point of the surface:
+//!
+//! - a batch item with a 2xx status goes to `succeeded`, carrying a
+//!   [`MessageReactionState`] whose fields are `None` when the property is
+//!   absent - that is a real "no reaction" answer the consumer may act on
+//!   (its classifier deletes the cached owner row on it);
+//! - a non-2xx item goes to `failed`;
+//! - a chunk that never returned, or an item the `$batch` envelope did not
+//!   answer, goes to `uncertain`.
+//!
+//! A `failed` or `uncertain` item MUST NOT be reported as an empty state:
+//! collapsing the lanes would let a transient Graph error wipe the
+//! consumer's cached reactions.
+
+use std::collections::HashSet;
+
+use bifrost_types::{
+    AccountError, AccountOperation, BatchItemId, BatchOutcome, BatchOutcomeBuilder, ErrorScope,
+    MessageReactionState, ObjectId, ProtocolErrorKind,
+};
+use reqwest::StatusCode;
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::GraphAccount;
+use super::graph_error::{
+    GraphErrorContext, into_account_error, protocol_violation, response_to_account_error_pub,
+};
+use super::pim::message_batch_url;
+use crate::error::GraphResponseError;
+use crate::types::{BatchRequest, BatchRequestItem, BatchResponseItem};
+
+/// The MAPI named-property GUID Outlook stores reactions under. Identical
+/// to what Outlook Web writes; the ids below are the fully-qualified
+/// `singleValueExtendedProperties` ids Graph filters on.
+const REACTIONS_GUID: &str = "{41F28F13-83F4-4114-A584-EEDB5A6B0BFF}";
+
+/// Graph's `$batch` request limit.
+const BATCH_LIMIT: usize = 20;
+
+#[derive(Debug, Deserialize)]
+struct SingleValueExtendedProperty {
+    id: String,
+    value: String,
+}
+
+fn owner_reaction_property_id() -> String {
+    format!("String {REACTIONS_GUID} Name OwnerReactionType")
+}
+
+fn reactions_count_property_id() -> String {
+    format!("Integer {REACTIONS_GUID} Name ReactionsCount")
+}
+
+/// Read reaction state for `ids`, chunked internally to the `$batch`
+/// limit and merged into one finalized [`BatchOutcome`].
+pub(crate) async fn message_reactions(
+    account: GraphAccount,
+    ids: &[ObjectId],
+) -> Result<BatchOutcome<MessageReactionState>, AccountError> {
+    let operation = AccountOperation::MessageReactionsRead;
+    // Dedupe while preserving order: `finalize` treats a repeated id as a
+    // duplicate-lane invariant violation, and a caller asking twice about
+    // one message is asking one question.
+    let mut seen = HashSet::new();
+    let unique: Vec<ObjectId> = ids
+        .iter()
+        .filter(|id| seen.insert(id.0.clone()))
+        .cloned()
+        .collect();
+    let expected: Vec<BatchItemId> = unique.iter().map(|id| BatchItemId(id.0.clone())).collect();
+
+    let owner_id = owner_reaction_property_id();
+    let count_id = reactions_count_property_id();
+    let filter = format!("$filter=id eq '{owner_id}' or id eq '{count_id}'");
+
+    let mut builder = BatchOutcomeBuilder::new();
+    for chunk in unique.chunks(BATCH_LIMIT) {
+        let requests: Vec<BatchRequestItem> = chunk
+            .iter()
+            .enumerate()
+            .map(|(index, id)| BatchRequestItem {
+                id: index.to_string(),
+                method: "GET".to_string(),
+                url: message_batch_url(
+                    &account,
+                    id,
+                    &format!("/singleValueExtendedProperties?{filter}"),
+                ),
+                body: None,
+                headers: None,
+            })
+            .collect();
+        match account.client.post_batch(&BatchRequest { requests }).await {
+            Ok(response) => classify_chunk(chunk, response.responses, operation, &mut builder),
+            Err(e) => {
+                // The whole chunk never returned: every item's fate is
+                // unknown. Uncertain, never an empty succeeded state.
+                let ctx = GraphErrorContext::graph(operation);
+                let error = into_account_error(e, ctx);
+                for id in chunk {
+                    builder.push_uncertain(BatchItemId(id.0.clone()), error.clone());
+                }
+            }
+        }
+    }
+
+    builder.finalize(&expected).map_err(|e| {
+        protocol_violation(
+            ProtocolErrorKind::ContractViolation,
+            operation,
+            None,
+            format!("Graph reaction read broke batch accounting: {e}"),
+        )
+    })
+}
+
+/// Project one chunk's `$batch` responses into the outcome lanes.
+///
+/// Split out of the transport loop so the lane rules are unit-pinnable:
+/// 2xx -> succeeded (parsed state), non-2xx -> failed (classified error),
+/// unanswered id -> uncertain.
+fn classify_chunk(
+    chunk: &[ObjectId],
+    responses: Vec<BatchResponseItem>,
+    operation: AccountOperation,
+    builder: &mut BatchOutcomeBuilder<MessageReactionState>,
+) {
+    let mut answered: HashSet<usize> = HashSet::new();
+    for item in responses {
+        let Some(index) = item.id.parse::<usize>().ok().filter(|i| *i < chunk.len()) else {
+            // An id we never submitted; nothing to account it against.
+            continue;
+        };
+        if !answered.insert(index) {
+            // Graph answered the same request twice; the first answer won.
+            continue;
+        }
+        let message_id = &chunk[index];
+        if (200..300).contains(&item.status) {
+            builder.push_succeeded(
+                BatchItemId(message_id.0.clone()),
+                reaction_state(message_id, item.body.as_ref()),
+            );
+        } else {
+            let headers = header_map(item.headers);
+            let body = item
+                .body
+                .as_ref()
+                .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
+                .unwrap_or_default();
+            let response = GraphResponseError::from_response(
+                StatusCode::from_u16(item.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                headers,
+                body,
+            );
+            let ctx = GraphErrorContext::graph(operation).with_scope(ErrorScope::Message {
+                id: message_id.0.clone(),
+            });
+            builder.push_failed(
+                BatchItemId(message_id.0.clone()),
+                response_to_account_error_pub(response, &ctx),
+            );
+        }
+    }
+    // Any submitted id the envelope did not answer was acknowledged as a
+    // batch but never individually resolved - uncertain by definition.
+    for (index, message_id) in chunk.iter().enumerate() {
+        if !answered.contains(&index) {
+            builder.push_uncertain(
+                BatchItemId(message_id.0.clone()),
+                protocol_violation(
+                    ProtocolErrorKind::ContractViolation,
+                    operation,
+                    Some(ErrorScope::Message {
+                        id: message_id.0.clone(),
+                    }),
+                    format!(
+                        "Graph $batch returned no response for reaction read {index} \
+                         (item fate unknown)"
+                    ),
+                ),
+            );
+        }
+    }
+}
+
+/// Extract the reaction state from a 2xx `singleValueExtendedProperties`
+/// body. Absent properties are real `None` answers; an empty-string
+/// `OwnerReactionType` means "reaction removed" and maps to `None` too,
+/// mirroring the legacy consumer's trim-and-check.
+fn reaction_state(message_id: &ObjectId, body: Option<&Value>) -> MessageReactionState {
+    let owner_id = owner_reaction_property_id();
+    let count_id = reactions_count_property_id();
+    let mut owner_reaction = None;
+    let mut reactions_count = None;
+    if let Some(values) = body
+        .and_then(|body| body.get("value"))
+        .and_then(Value::as_array)
+    {
+        for value in values {
+            let Ok(prop) = serde_json::from_value::<SingleValueExtendedProperty>(value.clone())
+            else {
+                continue;
+            };
+            if prop.id.eq_ignore_ascii_case(&owner_id) {
+                let trimmed = prop.value.trim();
+                if !trimmed.is_empty() {
+                    owner_reaction = Some(trimmed.to_string());
+                }
+            } else if prop.id.eq_ignore_ascii_case(&count_id) {
+                reactions_count = prop.value.trim().parse::<i64>().ok();
+            }
+        }
+    }
+    MessageReactionState {
+        id: message_id.clone(),
+        owner_reaction,
+        reactions_count,
+    }
+}
+
+fn header_map(
+    headers: Option<std::collections::HashMap<String, String>>,
+) -> reqwest::header::HeaderMap {
+    let mut map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers.unwrap_or_default() {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            map.insert(name, value);
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_types::BatchItemOutcome;
+
+    fn oid(value: &str) -> ObjectId {
+        ObjectId(value.to_string())
+    }
+
+    fn props_body(entries: &[(&str, &str)]) -> Value {
+        serde_json::json!({
+            "value": entries
+                .iter()
+                .map(|(id, value)| serde_json::json!({ "id": id, "value": value }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn reaction_state_reads_owner_and_count() {
+        let body = props_body(&[
+            (owner_reaction_property_id().as_str(), "heart"),
+            (reactions_count_property_id().as_str(), "3"),
+        ]);
+        let state = reaction_state(&oid("m1"), Some(&body));
+        assert_eq!(state.owner_reaction.as_deref(), Some("heart"));
+        assert_eq!(state.reactions_count, Some(3));
+    }
+
+    #[test]
+    fn empty_owner_value_is_a_real_none_answer() {
+        let body = props_body(&[(owner_reaction_property_id().as_str(), "  ")]);
+        let state = reaction_state(&oid("m1"), Some(&body));
+        assert_eq!(state.owner_reaction, None);
+        assert_eq!(state.reactions_count, None);
+    }
+
+    #[test]
+    fn absent_properties_and_absent_body_are_none() {
+        assert_eq!(reaction_state(&oid("m1"), None).owner_reaction, None);
+        let empty = props_body(&[]);
+        let state = reaction_state(&oid("m1"), Some(&empty));
+        assert_eq!(state.owner_reaction, None);
+        assert_eq!(state.reactions_count, None);
+    }
+
+    #[test]
+    fn property_id_match_is_case_insensitive() {
+        let body = props_body(&[(owner_reaction_property_id().to_uppercase().as_str(), "like")]);
+        let state = reaction_state(&oid("m1"), Some(&body));
+        assert_eq!(state.owner_reaction.as_deref(), Some("like"));
+    }
+
+    fn response_item(id: &str, status: u16, body: Option<Value>) -> BatchResponseItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "status": status,
+            "body": body,
+        }))
+        .expect("batch response item deserializes")
+    }
+
+    #[test]
+    fn classify_chunk_routes_items_into_the_three_lanes() {
+        let chunk = [oid("ok"), oid("gone"), oid("unanswered")];
+        let mut builder = BatchOutcomeBuilder::new();
+        classify_chunk(
+            &chunk,
+            vec![
+                response_item(
+                    "0",
+                    200,
+                    Some(props_body(&[(
+                        owner_reaction_property_id().as_str(),
+                        "heart",
+                    )])),
+                ),
+                response_item("1", 404, None),
+            ],
+            AccountOperation::MessageReactionsRead,
+            &mut builder,
+        );
+        let outcome = builder
+            .finalize(&[
+                BatchItemId("ok".to_string()),
+                BatchItemId("gone".to_string()),
+                BatchItemId("unanswered".to_string()),
+            ])
+            .expect("every id lands in exactly one lane");
+
+        assert_eq!(outcome.succeeded().len(), 1);
+        assert_eq!(outcome.succeeded()[0].item.0, "ok");
+        assert_eq!(
+            outcome.succeeded()[0].output.owner_reaction.as_deref(),
+            Some("heart")
+        );
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, "gone");
+        assert_eq!(outcome.uncertain().len(), 1);
+        assert_eq!(outcome.uncertain()[0].item.0, "unanswered");
+    }
+
+    #[test]
+    fn failed_item_never_carries_an_empty_state() {
+        // The lane split is the contract: a 404 must land in `failed`,
+        // not surface as a succeeded item with `None` fields (which the
+        // consumer would read as "reaction removed" and delete on).
+        let chunk = [oid("m1")];
+        let mut builder = BatchOutcomeBuilder::new();
+        classify_chunk(
+            &chunk,
+            vec![response_item("0", 503, None)],
+            AccountOperation::MessageReactionsRead,
+            &mut builder,
+        );
+        let outcome = builder
+            .finalize(&[BatchItemId("m1".to_string())])
+            .expect("finalize");
+        assert!(outcome.succeeded().is_empty());
+        assert_eq!(outcome.failed().len(), 1);
+    }
+
+    #[test]
+    fn duplicate_and_unknown_response_ids_do_not_double_account() {
+        let chunk = [oid("m1")];
+        let mut builder = BatchOutcomeBuilder::new();
+        classify_chunk(
+            &chunk,
+            vec![
+                response_item("0", 200, Some(props_body(&[]))),
+                // Graph answering twice, and answering an id never sent:
+                // both must be ignored rather than double-pushed.
+                response_item("0", 500, None),
+                response_item("7", 200, None),
+            ],
+            AccountOperation::MessageReactionsRead,
+            &mut builder,
+        );
+        let outcome = builder
+            .finalize(&[BatchItemId("m1".to_string())])
+            .expect("finalize");
+        assert_eq!(outcome.succeeded().len(), 1);
+        assert!(outcome.failed().is_empty());
+        assert!(outcome.uncertain().is_empty());
+    }
+
+    #[test]
+    fn submission_order_is_preserved_across_lanes() {
+        let chunk = [oid("a"), oid("b")];
+        let mut builder = BatchOutcomeBuilder::new();
+        classify_chunk(
+            &chunk,
+            vec![
+                response_item("1", 200, Some(props_body(&[]))),
+                response_item("0", 429, None),
+            ],
+            AccountOperation::MessageReactionsRead,
+            &mut builder,
+        );
+        let outcome = builder
+            .finalize(&[BatchItemId("a".to_string()), BatchItemId("b".to_string())])
+            .expect("finalize");
+        let ids: Vec<&str> = outcome
+            .iter()
+            .map(|item| match item {
+                BatchItemOutcome::Succeeded(s) => s.item.0.as_str(),
+                BatchItemOutcome::Failed(f) => f.item.0.as_str(),
+                BatchItemOutcome::Uncertain(u) => u.item.0.as_str(),
+            })
+            .collect();
+        // Push order: responses arrive b-first, then a's failure.
+        assert_eq!(ids, ["b", "a"]);
+    }
+}

@@ -118,6 +118,8 @@ pub(crate) fn build(
         historyid_expires_after: None,
         delta_token_expires_after: None,
         pim_methods: PimMethodSupport {
+            category_definitions: false,
+            message_reactions: false,
             add_to_container: true,
             remove_from_container: true,
             set_keyword: true,

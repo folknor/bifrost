@@ -293,6 +293,9 @@ pub struct Container {
     /// across owners), while `owner_local_id` is what goes back onto the
     /// wire in a request scoped to the owner's mailbox.
     pub owner_local_id: Option<String>,
+    /// Best-effort owner email for a shared container. This is metadata only:
+    /// a failure to resolve it must never make container discovery fail.
+    pub owner_email: Option<String>,
     /// What kind of items the container holds, when the protocol types
     /// its folders. Only populated for Graph public folders (from the EWS
     /// `FolderClass`). See [`ContainerContentClass`].
@@ -330,6 +333,7 @@ impl Container {
             namespace: ContainerNamespace::Personal,
             owner: None,
             owner_local_id: None,
+            owner_email: None,
             content_class: None,
         }
     }
@@ -384,6 +388,13 @@ impl Container {
     #[must_use]
     pub fn with_owner_local_id(mut self, owner_local_id: Option<String>) -> Self {
         self.owner_local_id = owner_local_id;
+        self
+    }
+
+    /// Set the best-effort email address of the owning shared mailbox.
+    #[must_use]
+    pub fn with_owner_email(mut self, owner_email: Option<String>) -> Self {
+        self.owner_email = owner_email;
         self
     }
 

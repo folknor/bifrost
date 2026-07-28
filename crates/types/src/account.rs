@@ -61,6 +61,21 @@ use crate::page::Page;
 use crate::search::SearchRequest;
 use crate::settings::{Identity, IdentityPatch, QuotaInfo, VacationConfig};
 
+/// A provider category definition. Color is the protocol token, not a UI color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryDefinition {
+    pub name: String,
+    pub color: Option<String>,
+}
+
+/// Exchange-native reaction state for one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageReactionState {
+    pub id: ObjectId,
+    pub owner_reaction: Option<String>,
+    pub reactions_count: Option<i64>,
+}
+
 /// Erased streaming return type for `Account` methods.
 ///
 /// Each Account method that streams returns a boxed `Stream`. The
@@ -84,6 +99,21 @@ pub trait Account: Send + Sync {
     /// `RecoveryClass::CapabilityChanged`, never through a live
     /// channel here.
     fn capabilities(&self) -> &AccountCapabilities;
+
+    /// List provider category definitions when the protocol supports them.
+    fn category_definitions_list(
+        &self,
+    ) -> AccountFuture<Result<Vec<CategoryDefinition>, AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::CategoryDefinitionsList)) })
+    }
+
+    /// Read reaction state. Providers preserving per-item failures override this.
+    fn message_reactions(
+        &self,
+        _ids: &[ObjectId],
+    ) -> AccountFuture<Result<crate::BatchOutcome<MessageReactionState>, AccountError>> {
+        Box::pin(async { Err(unsupported_error(AccountOperation::MessageReactionsRead)) })
+    }
 
     /// Apply the engine's current priority hint to this account.
     ///

@@ -2,6 +2,7 @@ mod autodiscover;
 mod blob;
 mod calendar;
 mod capabilities;
+mod categories;
 mod changes;
 mod cloud;
 mod contacts;
@@ -19,6 +20,7 @@ mod pim;
 mod public_folder;
 mod push;
 mod push_stream;
+mod reactions;
 mod scopes;
 
 use std::collections::HashMap;
@@ -784,6 +786,24 @@ impl Account for GraphAccount {
     ) -> AccountFuture<Result<Vec<bifrost_types::Container>, AccountError>> {
         let account = self.clone();
         Box::pin(async move { pim::containers_list(account).await })
+    }
+
+    fn category_definitions_list(
+        &self,
+    ) -> AccountFuture<Result<Vec<bifrost_types::CategoryDefinition>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { categories::category_definitions_list(account).await })
+    }
+
+    fn message_reactions(
+        &self,
+        ids: &[bifrost_types::ObjectId],
+    ) -> AccountFuture<
+        Result<bifrost_types::BatchOutcome<bifrost_types::MessageReactionState>, AccountError>,
+    > {
+        let account = self.clone();
+        let ids = ids.to_vec();
+        Box::pin(async move { reactions::message_reactions(account, &ids).await })
     }
 
     fn container_create(
