@@ -243,6 +243,22 @@ pub struct PimMethodSupport {
     /// CalDAV, CardDAV). Replaces ratatoskr's consumer-side `match provider`
     /// in `handlers/gal.rs` (closes the A8 provider-identity leak A-2).
     pub directory_search: bool,
+    /// Mail-enabled directory-group listing (`directory_groups_list`):
+    /// the org-directory groups the authenticated mailbox belongs to
+    /// (Microsoft Graph `/me/memberOf` filtered to mail-enabled). `true`
+    /// only on Graph; `false` -> `Unsupported(DirectoryGroupsList)`.
+    /// Support is protocol-level: a tenant that has not granted
+    /// directory-group read consent still fails at call time with a
+    /// `NoPermission` error - consent is per-tenant runtime state a
+    /// static flag cannot know.
+    pub directory_groups_list: bool,
+    /// Transitive directory-group member expansion
+    /// (`directory_group_expand`): resolve a `DirectoryGroupId` to its
+    /// user members, nested groups flattened provider-side (Microsoft
+    /// Graph `/groups/{id}/transitiveMembers`). `true` only on Graph;
+    /// `false` -> `Unsupported(DirectoryGroupExpand)`. Same per-tenant
+    /// consent caveat as `directory_groups_list`.
+    pub directory_group_expand: bool,
     // Calendar primitives and conveniences.
     pub calendars_list: bool,
     pub events_in_range: bool,

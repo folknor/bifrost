@@ -12,6 +12,7 @@ mod filters;
 mod foreign;
 mod get;
 mod graph_error;
+mod groups;
 mod inventory;
 mod mutate;
 mod pim;
@@ -30,13 +31,14 @@ use bifrost_types::{
     AddressBook, AddressBookId, BlobHandle, ByteRange, Calendar, CalendarEvent, Change,
     ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
-    DirectoryCard, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
-    EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
-    MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, RsvpStatus,
-    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
-    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
-    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Importance,
+    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget,
+    ObjectId, Page, Priority, Projection, RsvpStatus, ScopeLifecycleEvent, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
+    WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -950,6 +952,23 @@ impl Account for GraphAccount {
         Box::pin(
             async move { contacts::directory_search(account, query, limit, page_cursor).await },
         )
+    }
+
+    fn directory_groups_list(
+        &self,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { groups::directory_groups_list(account, page_cursor).await })
+    }
+
+    fn directory_group_expand(
+        &self,
+        group: DirectoryGroupId,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        let account = self.clone();
+        Box::pin(async move { groups::directory_group_expand(account, group, page_cursor).await })
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

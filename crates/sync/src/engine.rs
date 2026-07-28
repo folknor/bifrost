@@ -2107,6 +2107,39 @@ impl SyncEngine {
             .await?)
     }
 
+    /// List the mail-enabled organization-directory groups the account's
+    /// mailbox belongs to. Forwards 1:1 to
+    /// [`Account::directory_groups_list`]; gated by
+    /// `capabilities().pim_methods.directory_groups_list` at the protocol
+    /// layer.
+    pub async fn directory_groups_list(
+        &self,
+        account_id: &AccountId,
+        page_cursor: Option<Vec<u8>>,
+    ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroup>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .directory_groups_list(page_cursor)
+            .await?)
+    }
+
+    /// Expand one directory group to its user members (transitive,
+    /// provider-side). Forwards 1:1 to
+    /// [`Account::directory_group_expand`]; gated by
+    /// `capabilities().pim_methods.directory_group_expand` at the
+    /// protocol layer.
+    pub async fn directory_group_expand(
+        &self,
+        account_id: &AccountId,
+        group: bifrost_types::DirectoryGroupId,
+        page_cursor: Option<Vec<u8>>,
+    ) -> Result<bifrost_types::Page<bifrost_types::DirectoryGroupMember>, Error> {
+        Ok(self
+            .live_account(account_id)?
+            .directory_group_expand(group, page_cursor)
+            .await?)
+    }
+
     /// List an account's server-side filter rules or scripts. Forwards
     /// 1:1 to [`Account::filters_list`]; the supported model is
     /// advertised through `capabilities().filter_rule_shape` and

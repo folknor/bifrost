@@ -315,7 +315,7 @@ fn directory_user_to_card(user: GraphDirectoryUser) -> Option<DirectoryCard> {
     })
 }
 
-async fn get_page<T: serde::de::DeserializeOwned>(
+pub(crate) async fn get_page<T: serde::de::DeserializeOwned>(
     account: &GraphAccount,
     url: &str,
     operation: AccountOperation,

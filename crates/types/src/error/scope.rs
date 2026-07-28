@@ -173,6 +173,8 @@ pub enum AccountOperation {
     ContactSearch,
     ContactAutocomplete,
     DirectorySearch,
+    DirectoryGroupsList,
+    DirectoryGroupExpand,
     CalendarsList,
     EventsInRange,
     EventGet,
@@ -336,6 +338,8 @@ mod tests {
             AccountOperation::Search,
             AccountOperation::ContactGet,
             AccountOperation::QuotaGet,
+            AccountOperation::DirectoryGroupsList,
+            AccountOperation::DirectoryGroupExpand,
         ] {
             assert!(op.is_idempotent(), "{op:?} must stay idempotent");
         }

@@ -16,15 +16,16 @@ use bifrost_types::{
     Change, ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, Container, ContainerId, ContainerKind, ConvenienceShape, CostClass,
     CursorDescriptor, CursorEstablishment, CursorFreshness, CursorScope, DirectoryCard,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterRuleShape, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEntry, ItemOutcome, MembershipScope, Message, MutationCapabilities,
-    MutationConcurrency, MutationReplaySafety, MutationSuccess, MutationTarget, ObjectId, Page,
-    PageBoundary, PimMethodSupport, Priority, Projection, PushCapability, QuotaInfo, QuotaSignal,
-    RateLimitClass, RequestCause, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
+    EventId, EventPatch, EventRange, EventSearchRequest, FilterRuleShape, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationCapabilities, MutationConcurrency, MutationReplaySafety, MutationSuccess,
+    MutationTarget, ObjectId, Page, PageBoundary, PimMethodSupport, Priority, Projection,
+    PushCapability, QuotaInfo, QuotaSignal, RateLimitClass, RequestCause, RsvpStatus,
+    ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate,
+    ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent, SyncStrategy,
+    ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::stream;
@@ -567,6 +568,21 @@ impl Account for StubAccount {
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         Box::pin(async { Err(unsupported(AccountOperation::DirectorySearch)) })
+    }
+
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupsList)) })
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        Box::pin(async { Err(unsupported(AccountOperation::DirectoryGroupExpand)) })
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

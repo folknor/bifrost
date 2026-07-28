@@ -512,6 +512,21 @@ server-filters exact-email queries. Rows without `mail` are dropped;
 `User.ReadBasic.All` / `User.Read.All` 403s -> `NoPermission` (an unauthorized
 directory is an error, not an empty result).
 
+Directory groups (`account/groups.rs`, Graph-only in the workspace):
+`directory_groups_list` walks `{prefix}/memberOf/microsoft.graph.group`
+filtered to `mailEnabled eq true`, classifying rows into
+`DirectoryGroupKind` (`Unified` in `groupTypes` -> `Unified`, else
+`securityEnabled` -> `MailEnabledSecurity`, else `DistributionList`);
+mail-disabled groups are dropped. `directory_group_expand` walks
+`/groups/{id}/transitiveMembers/microsoft.graph.user` (nested groups
+flattened and cycle-checked server-side), projecting
+`DirectoryGroupMember { email, display_name }` with `mail` preferred over
+`userPrincipalName`, lowercased, memberless-of-both rows dropped. Both
+page via `@odata.nextLink` bytes like `directory_search` and need
+`GroupMember.Read.All`-class consent - a harder grant than the mail
+scopes; an ungranted tenant 403s -> `NoPermission` at call time (the
+capability flags state protocol support, not tenant consent).
+
 Container CRUD maps to mail folders only. `containers_list` returns
 native folder ids (`Provenance { Graph, Folder, native }`), refreshes the
 folder tree, and maps well-known folders; user folders stay role-less. It then

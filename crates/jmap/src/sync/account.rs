@@ -7,15 +7,15 @@ use bifrost_types::{
     AddressBook, AddressBookId, AttachmentHandle, BlobHandle, ByteRange, Calendar, CalendarEvent,
     ChangeCursor, CloudUploadMeta, ContactCard, ContactCreate, ContactId, ContactPatch,
     ContactSearchRequest, Container, ContainerId, ContainerKind, CostClass, CursorDescriptor,
-    CursorEstablishment, CursorScope, DirectoryCard, DraftHandle, DraftPatch, ErrorScope,
-    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation,
-    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
-    IdentityPatch, Importance, InventoryEntry, InventoryPartition, InventoryPartitioning,
-    ItemOutcome, Label, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, Page,
-    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs,
-    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
-    SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    CursorEstablishment, CursorScope, DirectoryCard, DirectoryGroup, DirectoryGroupId,
+    DirectoryGroupMember, DraftHandle, DraftPatch, ErrorScope, EventCreate, EventId, EventPatch,
+    EventRange, EventSearchRequest, FilterValidation, HostedAttachment, HydratedObject,
+    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
+    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, Label, MembershipScope,
+    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
+    RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendAs, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -955,6 +955,31 @@ impl Account for JmapAccount {
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         let err = super::error::unsupported_error(
             AccountOperation::DirectorySearch,
+            None,
+            "JMAP has no organization-directory concept",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::DirectoryGroupsList,
+            None,
+            "JMAP has no organization-directory concept",
+        );
+        Box::pin(async move { Err(err) })
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        let err = super::error::unsupported_error(
+            AccountOperation::DirectoryGroupExpand,
             None,
             "JMAP has no organization-directory concept",
         );

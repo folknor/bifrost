@@ -76,6 +76,12 @@ pub(crate) fn gmail_capabilities() -> AccountCapabilities {
             contact_search: true,
             contact_autocomplete: true,
             directory_search: true,
+            // Google People has no directory-group surface (the Workspace
+            // Directory API is a separate consent/product scope, and People
+            // "contact groups" are the user's personal labels, not
+            // org-directory groups).
+            directory_groups_list: false,
+            directory_group_expand: false,
             calendars_list: true,
             events_in_range: true,
             event_get: true,

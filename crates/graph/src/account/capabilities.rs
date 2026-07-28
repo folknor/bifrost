@@ -82,6 +82,8 @@ pub(crate) fn build_capabilities(push_mode: PushMode) -> AccountCapabilities {
             contact_search: true,
             contact_autocomplete: true,
             directory_search: true,
+            directory_groups_list: true,
+            directory_group_expand: true,
             calendars_list: true,
             events_in_range: true,
             event_get: true,
@@ -196,6 +198,8 @@ mod tests {
         assert!(caps.pim_methods.contact_search);
         assert!(caps.pim_methods.contact_autocomplete);
         assert!(caps.pim_methods.directory_search);
+        assert!(caps.pim_methods.directory_groups_list);
+        assert!(caps.pim_methods.directory_group_expand);
         assert!(caps.pim_methods.calendars_list);
         assert!(caps.pim_methods.events_in_range);
         assert!(caps.pim_methods.event_get);

@@ -460,7 +460,8 @@ Alongside the read-only hydration cluster, the engine forwards sibling
 method, inventing no new semantics: object-level mutation conveniences,
 compose / draft, container read + CRUD, the **contact** cluster
 (`address_books_list`, `contacts_list`, `contact_get`, `contact_create`,
-`contact_update`, `contact_delete`, `directory_search`), the
+`contact_update`, `contact_delete`, `directory_search`,
+`directory_groups_list`, `directory_group_expand`), the
 **server-filter** cluster (`filters_list`, `filter_create`,
 `filter_update`, `filter_delete`, `filter_validate`) - whose supported
 model a consumer reads off `capabilities().filter_rule_shape` and

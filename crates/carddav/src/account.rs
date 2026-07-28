@@ -8,15 +8,15 @@ use bifrost_types::{
     CalendarEvent, Change, ChangeCursor, Checkpoint, CloudUploadMeta, ContactCard, ContactCorpus,
     ContactCreate, ContactId, ContactPatch, ContactProvenance, ContactSearchRequest, Container,
     ContainerId, ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope,
-    DirectoryCard, DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange,
-    EventSearchRequest, FilterValidation, FlagOp, HostedAttachment, HydratedObject,
-    HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance,
-    InventoryEntry, InventoryPartition, InventoryPartitioning, ItemOutcome, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectChange, ObjectChangeKind, ObjectId, ObjectType,
-    OpaqueChangeState, Page, PageBoundary, Priority, ProtocolKind, QuotaInfo, RsvpStatus,
-    SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, ServerVersion, SubscriptionHandle, SyncEvent, SyncStrategy, ThreadHydration,
-    ThreadId, VacationConfig, WatchEvent,
+    DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch,
+    EventCreate, EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, InventoryPartition, InventoryPartitioning,
+    ItemOutcome, MembershipScope, Message, MutationSuccess, MutationTarget, ObjectChange,
+    ObjectChangeKind, ObjectId, ObjectType, OpaqueChangeState, Page, PageBoundary, Priority,
+    ProtocolKind, QuotaInfo, RsvpStatus, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, ServerVersion, SubscriptionHandle,
+    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -950,6 +950,21 @@ impl Account for CardDavAccount {
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         unsupported_future(AccountOperation::DirectorySearch)
+    }
+
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupsList)
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupExpand)
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

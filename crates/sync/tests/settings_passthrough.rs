@@ -608,6 +608,29 @@ impl Account for SettingsAccount {
         })
     }
 
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroup>, AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::DirectoryGroupsList,
+            ))
+        })
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: bifrost_types::DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<bifrost_types::DirectoryGroupMember>, AccountError>> {
+        Box::pin(async {
+            Err(unsupported(
+                bifrost_types::AccountOperation::DirectoryGroupExpand,
+            ))
+        })
+    }
+
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
         Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::CalendarsList)) })
     }

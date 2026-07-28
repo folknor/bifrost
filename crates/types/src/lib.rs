@@ -95,6 +95,8 @@ pub use contact::{
 
 // Organization-directory (GAL) result type.
 pub use directory::DirectoryCard;
+// Organization-directory group types.
+pub use directory::{DirectoryGroup, DirectoryGroupId, DirectoryGroupKind, DirectoryGroupMember};
 
 // Cursor + scope types.
 pub use cursor::{

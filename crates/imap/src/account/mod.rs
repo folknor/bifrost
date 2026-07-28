@@ -12,13 +12,13 @@ use bifrost_types::{
     BlobHandle, ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta,
     ContactCard, ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container,
     ContainerId, ContainerKind, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterValidation, HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey,
-    Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope,
-    Message, MutationSuccess, MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo,
-    RsvpStatus, SearchRequest, SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId,
-    ServerFilterPatch, SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig,
-    WatchEvent,
+    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
+    EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, HostedAttachment,
+    HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId, IdentityPatch,
+    Importance, InventoryEntry, ItemOutcome, MembershipScope, Message, MutationSuccess,
+    MutationTarget, ObjectId, Page, Priority, Projection, QuotaInfo, RsvpStatus, SearchRequest,
+    SendRequest, ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch,
+    SubscriptionHandle, SyncEvent, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bifrost_types::{AddressBook, AddressBookId};
 use futures::stream::Stream;
@@ -731,6 +731,21 @@ impl Account for ImapAccount {
         _page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         unsupported_future(AccountOperation::DirectorySearch)
+    }
+
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupsList)
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupExpand)
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

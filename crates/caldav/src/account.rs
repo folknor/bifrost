@@ -656,6 +656,21 @@ impl Account for CalDavAccount {
         unsupported_future(AccountOperation::DirectorySearch)
     }
 
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupsList)
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        unsupported_future(AccountOperation::DirectoryGroupExpand)
+    }
+
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {
         let client = Arc::clone(&self.client);
         let home = self.calendar_home.clone();

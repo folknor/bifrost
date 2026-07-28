@@ -24,13 +24,14 @@ use bifrost_types::{
     ByteRange, Calendar, CalendarEvent, Change, ChangeCursor, CloudUploadMeta, ContactCard,
     ContactCreate, ContactId, ContactPatch, ContactSearchRequest, Container, ContainerId,
     ContainerKind, CostClass, CursorDescriptor, CursorEstablishment, CursorScope, DirectoryCard,
-    DraftHandle, DraftPatch, EventCreate, EventId, EventPatch, EventRange, EventSearchRequest,
-    FilterValidation, FlagOp, HostedAttachment, HydratedObject, HydrationProjection,
-    IdempotencyKey, Identity, IdentityId, IdentityPatch, Importance, InventoryEntry, ItemOutcome,
-    MembershipScope, Message, MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page,
-    Priority, Projection, QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest,
-    ServerFilter, ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle,
-    SyncEvent, SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
+    DirectoryGroup, DirectoryGroupId, DirectoryGroupMember, DraftHandle, DraftPatch, EventCreate,
+    EventId, EventPatch, EventRange, EventSearchRequest, FilterValidation, FlagOp,
+    HostedAttachment, HydratedObject, HydrationProjection, IdempotencyKey, Identity, IdentityId,
+    IdentityPatch, Importance, InventoryEntry, ItemOutcome, MembershipScope, Message,
+    MutationSuccess, MutationTarget, ObjectId, OpaqueChangeState, Page, Priority, Projection,
+    QuotaInfo, RsvpStatus, ScopeLifecycleEvent, SearchRequest, SendRequest, ServerFilter,
+    ServerFilterCreate, ServerFilterId, ServerFilterPatch, SubscriptionHandle, SyncEvent,
+    SyncStrategy, ThreadHydration, ThreadId, VacationConfig, WatchEvent,
 };
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -692,6 +693,31 @@ impl Account for GoogleAccount {
         page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>> {
         contacts::directory_search(Arc::clone(&self.client), query, limit, page_cursor)
+    }
+
+    fn directory_groups_list(
+        &self,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::DirectoryGroupsList),
+                error::GmailErrorContext::base(AccountOperation::DirectoryGroupsList),
+            ))
+        })
+    }
+
+    fn directory_group_expand(
+        &self,
+        _group: DirectoryGroupId,
+        _page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>> {
+        Box::pin(async {
+            Err(error::into_account_error(
+                crate::error::Error::unsupported(AccountOperation::DirectoryGroupExpand),
+                error::GmailErrorContext::base(AccountOperation::DirectoryGroupExpand),
+            ))
+        })
     }
 
     fn calendars_list(&self) -> AccountFuture<Result<Vec<Calendar>, AccountError>> {

@@ -36,3 +36,75 @@ pub struct DirectoryCard {
     /// Which protocol family produced this row.
     pub provider: ProtocolKind,
 }
+
+/// Provider-native identity of one directory group.
+///
+/// Unlike `DirectoryCard`, a directory group carries real identity: the
+/// consumer names a group in order to expand its membership
+/// (`Account::directory_group_expand`), so the id must round-trip. The
+/// inner string is the provider's native group id (Microsoft Graph
+/// `group.id`), opaque to consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DirectoryGroupId(pub String);
+
+/// Classification of a mail-enabled directory group.
+///
+/// The vocabulary is provider-neutral; today only Microsoft Graph
+/// produces these rows (`Unified` in `groupTypes` -> `Unified`, else
+/// `securityEnabled` -> `MailEnabledSecurity`, else `DistributionList`).
+/// Mail-disabled groups are dropped at the provider boundary and never
+/// surface here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DirectoryGroupKind {
+    /// A modern collaboration group (Microsoft 365 "Unified" group).
+    Unified,
+    /// A classic distribution list.
+    DistributionList,
+    /// A mail-enabled security group.
+    MailEnabledSecurity,
+}
+
+/// One mail-enabled directory group the authenticated mailbox belongs to.
+///
+/// Surfaced by `Account::directory_groups_list`. Distinct from the
+/// personal contact-group labels Google People flattens into
+/// `AddressBook`s, and unrelated to the `ObjectType::ContactGroup`
+/// cursor variant - this is the org-directory corpus, read-only, like
+/// `DirectoryCard`.
+///
+/// Not `#[non_exhaustive]`: like `DirectoryCard`, protocol Account impls
+/// construct these values directly outside this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryGroup {
+    /// Provider-native group identity; feed to
+    /// `Account::directory_group_expand`.
+    pub id: DirectoryGroupId,
+    pub display_name: String,
+    /// The group's own SMTP address, when it has one.
+    pub email: Option<String>,
+    pub kind: DirectoryGroupKind,
+    /// Which protocol family produced this row.
+    pub provider: ProtocolKind,
+}
+
+/// One resolved member of a directory group.
+///
+/// Produced by `Account::directory_group_expand`, which expands
+/// membership transitively and provider-side down to users - nested
+/// groups never appear as members, so a member needs no identity for
+/// follow-up expansion and none is carried. Deliberately minimal: the
+/// expansion endpoints project only name and address, so this does NOT
+/// reuse `DirectoryCard` (whose corpus fields - phones, company,
+/// department - would always be empty here).
+///
+/// Not `#[non_exhaustive]`: constructed directly by protocol crates,
+/// same as `DirectoryCard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryGroupMember {
+    /// Primary email address, lowercased. Always present (members
+    /// without a resolvable address are dropped at the provider
+    /// boundary, matching the legacy ratatoskr behavior).
+    pub email: String,
+    pub display_name: Option<String>,
+}

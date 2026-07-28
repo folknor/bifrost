@@ -42,7 +42,7 @@ use crate::cursor::{
     ChangeCursor, CursorDescriptor, CursorEstablishment, CursorScope, MembershipScope,
     ScopeLifecycleEvent,
 };
-use crate::directory::DirectoryCard;
+use crate::directory::{DirectoryCard, DirectoryGroup, DirectoryGroupId, DirectoryGroupMember};
 use crate::error::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, ItemOutcome,
     MutationSuccess, RequestCause,
@@ -648,6 +648,37 @@ pub trait Account: Send + Sync {
         limit: Option<u32>,
         page_cursor: Option<Vec<u8>>,
     ) -> AccountFuture<Result<Page<DirectoryCard>, AccountError>>;
+
+    /// List the mail-enabled organization-directory groups the
+    /// authenticated mailbox belongs to (Microsoft 365 groups,
+    /// distribution lists, mail-enabled security groups). Read-only, like
+    /// `directory_search`; mail-disabled groups are dropped at the
+    /// provider boundary. `page_cursor` resumes from a prior
+    /// `Page::next_cursor`.
+    ///
+    /// Gated by `capabilities().pim_methods.directory_groups_list`.
+    /// Accounts without a directory-group surface leave the flag `false`
+    /// and return `Unsupported(DirectoryGroupsList)`. A supporting
+    /// protocol on a tenant without directory-group read consent fails
+    /// with a `NoPermission` error at call time.
+    fn directory_groups_list(
+        &self,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroup>, AccountError>>;
+
+    /// Expand one directory group to its user members. Expansion is
+    /// transitive and provider-side: nested groups are flattened to
+    /// their users and never appear as members. Members without a
+    /// resolvable email address are dropped. `page_cursor` resumes from
+    /// a prior `Page::next_cursor`.
+    ///
+    /// Gated by `capabilities().pim_methods.directory_group_expand`,
+    /// with the same consent caveat as `directory_groups_list`.
+    fn directory_group_expand(
+        &self,
+        group: DirectoryGroupId,
+        page_cursor: Option<Vec<u8>>,
+    ) -> AccountFuture<Result<Page<DirectoryGroupMember>, AccountError>>;
 
     // ------------------------------------------------------------
     // Calendar primitives (S4-W1)

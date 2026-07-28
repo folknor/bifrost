@@ -115,6 +115,8 @@ pub(crate) fn build_capabilities(
             contact_search: contact_pim.is_some_and(|p| p.contact_search),
             contact_autocomplete: contact_pim.is_some_and(|p| p.contact_autocomplete),
             directory_search: false,
+            directory_groups_list: false,
+            directory_group_expand: false,
             calendars_list: calendar_pim.is_some_and(|p| p.calendars_list),
             events_in_range: calendar_pim.is_some_and(|p| p.events_in_range),
             event_get: calendar_pim.is_some_and(|p| p.event_get),
