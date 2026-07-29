@@ -8,9 +8,16 @@ that doc already marks resolved or deliberately-kept are not re-reported.
 Tests landed in this pass (behavior pinned as it exists today):
 
 - `crates/sync/tests/envelope_hardening.rs` - byte-level decoder rejection
-  matrix (reserved bytes, unknown kind/scope/objtype/protocol tags, invalid
-  UTF-8, every strict prefix of both envelope kinds, oversized length
-  prefixes, trailing-garbage tolerance, multibyte folder ids).
+  matrix (reserved bytes, unknown kind/scope/objtype/protocol tags, the
+  reserved `0xFF` tag mapping to `SchemaIncompatible` rather than a plain
+  decode error, invalid UTF-8, every strict prefix of both envelope kinds,
+  oversized length prefixes, trailing-garbage tolerance, multibyte folder
+  ids).
+- `crates/sync/tests/attach_schema_recovery.rs` - attach against a store
+  that reports a row as `SchemaIncompatible`: the attach survives, the
+  unreadable row is deleted, the scope is re-established from the live
+  account, and a sibling scope is untouched. Pins the half of the
+  schema-clear contract that has no reopen listener to route to.
 - `crates/sync/tests/registry_hints.rs` - `CursorRegistry` membership index
   (dedupe, shared-membership pruning on delete, put-replaces), the
   `scopes_for_hint` routing table, and `membership_to_cursor_scope`.
@@ -22,16 +29,10 @@ Tests landed in this pass (behavior pinned as it exists today):
   (stale checkpoints never satisfy a later `pause`/`checkpoint_now`; each
   request needs its own post-request record), boundary compose rules
   (`checkpoint_now` restores Run / restores a pre-existing Pause; `pause`
-  stays paused), snapshot accessors, and the no-receiver signal-loss
-  footgun (B14). Two tests document behavior I believe is defective and
-  say so in their comments rather than endorsing it:
-  `pause_with_no_checkpoint_traffic_parks` (the B5 hang) and the two
-  `*_silently_lost_*` tests (B14). First-cut versions of four tests in
-  this file failed validation because the harness dropped its watch
-  receivers, making every `Boundary::set` / `Control::priority` /
-  `Control::bandwidth_cap` a silent no-op - which is itself B14; the
-  harness now holds keepalive receivers exactly as the engine's
-  `AccountSlot` / worker topology does.
+  stays paused), concurrent-pause preservation, snapshot accessors, and
+  canonical watch values after every receiver is dropped. The remaining
+  test that documents behavior believed defective is
+  `pause_with_no_checkpoint_traffic_parks` (the B5 hang).
 - `crates/sync/tests/lane_budget.rs` - `LaneQueue` DropOldest shedding +
   shed counter + capacity floor; `ConcurrencyBudget` permit arithmetic,
   clamping, and `validate` rejection of zero fields. The
@@ -47,78 +48,6 @@ Tests landed in this pass (behavior pinned as it exists today):
   defaults, and `inventory_partition_stream`'s Full-vs-rejected contract.
 
 ## Bugs
-
-### B1. Bulk campaigns silently drop unprocessed ids on a retryable stream termination
-
-`crates/sync/src/engine.rs`, `bulk_set_flags` (~line 1020) and
-`run_bulk_pipeline` (~line 1322) - the two copies share the defect.
-
-Path to failure: submit `bulk_set_flags` with 100 targets. The protocol
-stream yields per-item outcomes for 30 of them, then ends with
-`SyncEvent::Terminated(err)` whose plan is `RecoveryPlan::Retry` (rate
-limit, transport blip - the most common mid-stream failure). The Retry arm
-stores the advice and `break`s. The resubmission set is then computed as
-the intersection of `remaining` and `retry_ids`, and `retry_ids` contains only ids whose *per-item*
-outcome was a retryable `Failed`. The 70 ids the stream never reached are:
-
-- not resubmitted (not in `retry_ids`),
-- not read-back (only the Reconcile and Engine arms sweep `remaining`),
-- not counted (`counters_from_outcomes` iterates the `outcomes` map, which
-  has no entry for them).
-
-The campaign returns `Ok(counters)` whose lane totals sum to 30, and the 70
-unapplied mutations vanish without any signal. Contrast with the Reconcile
-arm directly above, which sweeps every unresolved id in `remaining` into
-`readback_ids` + `PendingReadback`, and the Engine arm, which sweeps them
-into `BlockedByEngine`.
-
-Proposed fix: in the Retry termination arm (both copies), extend
-`retry_ids` with every id in `remaining` that has no resolved outcome
-(`Applied | Skipped | FailedTerminal`), mirroring the Reconcile sweep, so
-the next attempt resubmits them; on budget exhaustion they then flow into
-the read-back guard like any other pending id.
-
-### B2. Destroy read-back guard classifies ANY fetch failure as "destroy landed"
-
-`crates/sync/src/mutation/readback.rs`, `run_destroy_readback_guard`
-(~line 200).
-
-The guard's own doc says a destroy is reclassified as `Skipped` only "on an
-explicit not-found signal", but the code counts every
-`ItemOutcome::Failed(_)` from the read-back fetch as skipped -
-`failure.error` is never inspected. Path to failure: a bulk destroy leaves
-one id `Uncertain` (transport drop). The read-back `get_stream` for that id
-fails with `Server(RateLimited)` or `Authorization(PermissionDenied)` - a
-per-item failure that has nothing to do with existence. The guard counts it
-`skipped`, the engine folds `skipped` into the campaign counters as "the
-destroy landed on the earlier attempt", and the consumer deletes the row
-locally. The message still exists on the server; local and remote state
-have now diverged in the direction the guard exists to prevent.
-
-Proposed fix: match on `failure.error.kind()` - only
-`AccountErrorKind::NotFound(_)` maps to `skipped`; every other kind joins
-the `uncertain` lane (original outcome stands, id stays pending).
-
-### B3. `checkpoint_now` clobbers a concurrent pause when it restores the boundary
-
-`crates/sync/src/control.rs`, `Control::checkpoint_now` (~line 176).
-
-`checkpoint_now` snapshots the boundary, sets `CheckpointNow`, awaits a
-post-request checkpoint (unboundedly long: it waits on a consumer ack), and
-then unconditionally writes the snapshot back. Path to failure: consumer
-calls `checkpoint_now()` while running (`previous = Run`). During the wait,
-the engine exhausts a reopen budget and calls `engine_pause` -
-`AccountControl::Pause(RetryBudgetExhausted)` is broadcast and the boundary
-flips to `Pause`; workers park. The awaited ack then lands, and
-`checkpoint_now` restores `Run` - silently undoing the engine pause. The
-consumer has been told the account is paused (control broadcast) but the
-workers are running again; the pause reason is never cleared, and the next
-failure re-pauses, producing a flapping account. The same shape clobbers a
-concurrent consumer `pause()`.
-
-Proposed fix: restore only if the boundary still reads `CheckpointNow`
-(compare-and-set through the watch sender via `send_if_modified`), so any
-interleaved `Pause`/`Stop`/`Run` written during the wait wins.
 
 ### B4. Account reopen: no re-discovery, dead lifecycle stream, leaked old handle
 
@@ -188,51 +117,6 @@ no-checkpoint-yet marker) once all workers for the account are parked.
 Alternatively document loudly that `pause()` resolves only after the next
 consumer-acked batch and provide a non-waiting `pause_hint()`.
 
-### B6. Cursor-envelope encode of unknown enum variants produces bytes that brick the next attach
-
-`crates/sync/src/cursor/envelope.rs`, `encode_obj_type` /
-`encode_protocol` (~lines 285-340), plus `establish_one` in `engine.rs`.
-
-Both encoders map any future `#[non_exhaustive]` variant to `0xFF`, so
-`encode_envelope` SUCCEEDS for a cursor the codec cannot represent; the
-failure is deferred to decode ("fails loudly rather than silently
-aliasing"). But look at where that decode error lands: a consumer store
-persists the envelope bytes, and on the next attach its
-`get_change_cursor` decode fails with `Error::Other(...)` - not
-`Error::SchemaIncompatible`, so `establish_one`'s translator arm does not
-fire, and the error propagates out of `attach_inner` as a hard attach
-failure. Result: the moment any protocol crate mints a cursor with a new
-`ObjectType`/`ProtocolKind` variant before the codec learns it, accounts
-write a poisoned durable cursor on day 1 and refuse to attach on day 2,
-with no automatic recovery path (the schema-clear loop never runs).
-
-Proposed fix: fail at encode time (return `Result` or panic like
-`encode_scope` already does for unknown scope variants - inconsistently,
-the scope arm panics while the objtype/protocol arms emit 0xFF); or map
-the decode error for reserved tags onto the `SchemaIncompatible` recovery
-path so the engine self-heals by re-establishing.
-
-Related nit in the same file: `pack_envelope`/`write_bytes` use
-`u32::try_from(len).unwrap_or(u32::MAX)`, which for a >4 GiB payload writes
-a wrong length prefix and corrupt envelope instead of failing. Unreachable
-in practice, but it is the only silent-corruption path in the codec.
-
-### B7. `BudgetGate::acquire` holds the global permit while parked on the account pool
-
-`crates/sync/src/scheduler/budget.rs` (~line 165).
-
-The module doc says "per-account first ... global second"; the code
-acquires the GLOBAL semaphore first and then awaits the per-account
-semaphore while holding it. Path to failure (once the gate is wired in, as
-`scheduler/mod.rs` says is planned): one account with `per_account = 8`
-receives 72 submissions; 8 run, and up to 56 more waiters each hold one of
-the 64 global permits while parked on the account semaphore. Global is
-exhausted, so every OTHER account's `acquire` blocks even though those
-accounts are idle - the exact cross-account starvation the two-layer
-design exists to prevent. Latent today (nothing calls `acquire` on a
-production path), but it will be load-bearing the day the follow-up pass
-lands. Fix: swap the order (inner first, then global), matching the doc.
-
 ### B8. Per-item `Engine(_)` mutation failures never reach the reopen listener
 
 `crates/sync/src/engine.rs`, `classify_item_outcome` (~line 3790).
@@ -249,20 +133,6 @@ Either forward the directive from `classify_item_outcome` (it would need
 the reopen sender threaded in) or fix the two docs to say stream-level
 only. Today's protocol crates likely terminate the stream alongside, which
 is why this has not bitten; it is a contract hole, not an observed failure.
-
-### B9. `BackfillRegistry` is engine-wide but keyed by `CursorScope` only
-
-`crates/sync/src/backfill/mod.rs` + the single shared
-`SyncEngine.backfill_registry`.
-
-Two attached accounts with the same scope shape - two Gmail accounts
-(`CursorScope::Account`) or two JMAP accounts (`Type(Email)`) - write to
-the same registry row. Account A finishing marks `Completed`; account B
-starting flips it `Running`; the public `backfill_registry()` accessor and
-any observability built on `snapshot()` report a merged fiction. No
-control-flow decision reads the registry today (skip decisions read the
-account-keyed `CheckpointStore`), so this corrupts observability only.
-Fix: key by `(AccountId, CursorScope)` or move the registry onto the slot.
 
 ### B10. Push overflow coalescing demotes `Terminated` / `Warning` to a plain wakeup
 
@@ -335,47 +205,6 @@ WebSocket, background workers) is orphaned until its own internals notice.
 Cheap fix: on every early-error path after `open`, call
 `opened.close().await` best-effort before returning.
 
-### B14. Control and boundary signals are silently lost once every watch receiver is gone
-
-`crates/sync/src/cancel/boundary.rs::Boundary::set`,
-`crates/sync/src/control.rs` (`Control::priority`,
-`Control::bandwidth_cap`), `crates/sync/src/engine.rs::engine_pause`.
-
-`tokio::sync::watch::Sender::send` refuses to update the value when zero
-receivers exist, and every one of these call sites discards the error
-(`let _ = ...send(...)`), so the signal is dropped AND the watch value is
-left stale - `snapshot()` / `priority_snapshot()` keep reporting the old
-state. `Boundary::set`'s comment claims a failed send "is the shutdown
-path and not an engine bug", but the receiver population is an accident
-of worker lifetimes, not an invariant:
-
-- Boundary receivers are the `BoundaryView` clones held by the
-  multiplexer, the reconciler, and per-scope polls. The `AccountSlot`
-  holds `boundary_tx` (a sender) and NO view, so nothing keeps the
-  channel receivable by construction. If the reconciler and multiplexer
-  ever exit early (worker panic reaches the same state), a later
-  `engine_pause` - the retry-budget-exhausted path - broadcasts
-  `AccountControl::Pause` to the consumer while the boundary silently
-  stays `Run`.
-- Priority / bandwidth-cap receivers are the control-applier task's
-  views plus the slot's `priority_rx` / `bandwidth_cap_rx` keepalives.
-  Those two slot fields carry `#[allow(dead_code)]` as if vestigial, but
-  they are load-bearing: without them, a control-applier exit would make
-  every subsequent `Control::priority` call a silent no-op whose
-  `priority_snapshot()` still reports the pre-call value.
-
-Found the hard way: the first-cut `control_boundary.rs` harness dropped
-its receivers and four tests failed against values that had silently not
-been written. Pinned as current behavior (explicitly not endorsed) by
-`boundary_set_is_silently_lost_once_every_view_is_dropped` and
-`priority_and_cap_updates_are_silently_lost_without_receivers`.
-
-Proposed fix: use `watch::Sender::send_replace` (updates the value
-regardless of receiver count) at all four call sites - the snapshot
-accessors then stay truthful and any receiver that appears later sees the
-latest state - and/or hold a keepalive `BoundaryView` on the
-`AccountSlot` alongside the existing priority/cap keepalives.
-
 ## Doc-vs-code contradictions (beyond those folded into bugs above)
 
 - **D1.** `reference/sync.md` push section: "`Reconciler::warning_event`
@@ -403,12 +232,6 @@ latest state - and/or hold a keepalive `BoundaryView` on the
   per its inline comment), so workers parked on the token exit without
   waiting for a boundary. The method doc and inline comment disagree;
   the inline one matches the code.
-- **D6.** `cursor/store.rs` trait doc: "All four methods are async" - the
-  trait has five methods.
-- **D7.** `backfill/mod.rs` says `BackfillRegistry` tracks "the latest
-  checkpoint per scope so resumption picks up inside the partition" - it
-  stores only a three-state enum; resume state lives in the
-  `CheckpointStore`.
 - **D8.** `reference/sync.md`'s hydration section reads as though
   `InventoryEntry` (fingerprint, threading headers, memberships) reaches
   the consumer on the broadcast stream. It does not, anywhere: both
@@ -462,14 +285,9 @@ latest state - and/or hold a keepalive `BoundaryView` on the
   (`types.rs`) - capabilities, backfill/push/mutation handles, cursors,
   checkpoints, priority channels, throttles. Some are genuinely
   future-wiring (throttles is tracked as sync-F2), but the volume
-  suggests the slot shape and the actual wiring have drifted. Two of
-  them - `priority_rx` and `bandwidth_cap_rx` - are NOT dead at all:
-  they are watch-channel keepalives without which `Control::priority` /
-  `bandwidth_cap` become silent no-ops the moment the control-applier
-  task exits (see B14). The `allow(dead_code)` on those two actively
-  invites their removal; a comment naming their keepalive role (or a
-  `_`-prefixed rename) would protect them. Note also there is no
-  boundary-view equivalent on the slot, which is half of B14.
+  suggests the slot shape and the actual wiring have drifted. The
+  `priority_rx` and `bandwidth_cap_rx` fields are receiver keepalives,
+  but canonical snapshots no longer depend on them.
 - **O6. Thread-convenience defaults reuse bulk operation tags** -
   `move_thread` reports `Unsupported(BulkMove)` and `delete_thread`
   `Unsupported(BulkDestroy)` (`types/src/account.rs`); there is no
@@ -491,12 +309,6 @@ latest state - and/or hold a keepalive `BoundaryView` on the
   account-wide push failures to a random folder. `CursorScope::Account`
   as the deliberate account-wide marker (as `broadcast_warning` uses)
   would be honest.
-- **O9. `checkpoint_now` while already `CheckpointNow`** snapshots
-  `CheckpointNow` as `previous` and restores it, leaving the boundary
-  latched at `CheckpointNow` until someone sends `Run`. Only reachable
-  with two concurrent `checkpoint_now` calls (the first restores, the
-  second then restores its stale snapshot); same family as B3 and fixed
-  by the same compare-and-set.
 - **O10. `run_backfill_orchestrator` snapshots `cursors.all_scopes()`
   once**, after the subscriber wait. Deferred-inventory scopes that
   establish later (the fusion worker runs concurrently) are absent from
@@ -510,34 +322,29 @@ latest state - and/or hold a keepalive `BoundaryView` on the
   type-level witness, but under the new hermeticity policy an in-memory
   duplex transcript could now drive one real attach end-to-end for at
   least one protocol; noted as an opportunity, not a defect.
+- **O12. Oversized cursor-envelope fields corrupt their length prefix.**
+  `pack_envelope` / `write_bytes` use
+  `u32::try_from(len).unwrap_or(u32::MAX)`, which for a payload larger
+  than 4 GiB writes a false length prefix instead of failing. This is
+  unreachable in practice but remains the codec's one silent-corruption
+  path.
 
 ## What I did not get to
 
 - **Engine-level integration tests with a full stub account** (attach ->
   broadcast -> ack -> checkpoint persistence; the backfill
   consumer-ack-completion loop; the disable-scope quarantine driven
-  through a real `ReopenRequest`). The building blocks exist
-  (settings/filter passthrough tests attach full stubs), but each such
-  test is a ~700-line stub plus careful subscriber sequencing, and I
-  prioritized pinning the pure logic that had zero coverage. The
-  highest-value next test is a regression for B1: a stub whose
-  `bulk_set_flags` emits outcomes for a strict subset of pulled ids and
-  then terminates retryable, asserting every submitted id is accounted
-  for in the returned counters - it fails today by construction.
-- **A reproduction test for B3/B5** beyond the pin I landed - proving the
-  clobber requires racing `engine_pause` against `checkpoint_now`, which
-  wants either a seam in `SyncControl` or the full engine harness above.
+  through a real `ReopenRequest`). `attach_schema_recovery.rs` now covers
+  the establish-loop half of this with a full stub plus a custom
+  `CheckpointStore`, but the ack / broadcast / backfill-completion
+  sequencing is still unpinned: each such test is a ~700-line stub plus
+  careful subscriber sequencing, and pure logic with zero coverage came
+  first. The five stub accounts across the suite are now near-identical
+  boilerplate; a shared `tests/common` module would pay for itself before
+  the sixth.
+- **A full-engine reproduction test for B5** beyond the control-level
+  pin, which wants either a quiescence seam in `SyncControl` or the full
+  engine harness above.
 - **Verifying B12's blast radius inside the JMAP crate** (what
   `establish_initial_cursor(Folder(...))` actually does there) - outside
   my file scope; flagged for whoever owns `crates/jmap`.
-- **Run validation of the reworked `control_boundary.rs`** - the
-  orchestrator's first pass confirmed all six files compile clippy-clean
-  and five pass; four `control_boundary.rs` tests failed because the
-  first-cut harness dropped its watch receivers (the B14 silent-loss
-  behavior applied to the tests themselves). The file was rewritten with
-  keepalive receivers on a `ControlHarness`, plus two new tests pinning
-  the no-receiver loss explicitly; the rework is reasoned from source
-  but not yet re-run from this seat. The timeout-based park-proof tests
-  remain written without `start_paused` (workspace tokio lacks the
-  `test-util` feature) and cannot flake toward false failure since the
-  awaited futures are unresolvable by construction.

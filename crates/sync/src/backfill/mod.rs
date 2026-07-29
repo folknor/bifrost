@@ -15,7 +15,7 @@ pub mod runner;
 
 use std::sync::Arc;
 
-use bifrost_types::CursorScope;
+use bifrost_types::{AccountId, CursorScope};
 use tokio_util::sync::CancellationToken;
 
 pub use checkpoint::BackfillCheckpointWriter;
@@ -29,16 +29,14 @@ pub struct BackfillHandle {
     pub live_supersedes: Arc<LiveSupersedes>,
 }
 
-/// Backfill registry: tracks which scopes are mid-backfill, which have
-/// completed, and the latest checkpoint per scope so resumption picks
-/// up inside the partition that contains the checkpoint's progress
-/// marker.
+/// Backfill registry: tracks which account scopes are pending, running,
+/// or complete. Durable resume state lives in the checkpoint store.
 #[derive(Debug, Default)]
 pub struct BackfillRegistry {
-    inner: dashmap::DashMap<CursorScope, BackfillState>,
+    inner: dashmap::DashMap<(AccountId, CursorScope), BackfillState>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BackfillState {
     Pending,
@@ -52,12 +50,50 @@ impl BackfillRegistry {
         Self::default()
     }
 
-    pub fn mark(&self, scope: CursorScope, state: BackfillState) {
-        self.inner.insert(scope, state);
+    pub fn mark(&self, account: AccountId, scope: CursorScope, state: BackfillState) {
+        self.inner.insert((account, scope), state);
     }
 
     #[must_use]
-    pub fn snapshot(&self, scope: &CursorScope) -> Option<BackfillState> {
-        self.inner.get(scope).map(|r| *r.value())
+    pub fn snapshot(&self, account: &AccountId, scope: &CursorScope) -> Option<BackfillState> {
+        self.inner
+            .get(&(account.clone(), scope.clone()))
+            .map(|r| *r.value())
+    }
+
+    pub fn forget_account(&self, account: &AccountId) {
+        self.inner.retain(|(candidate, _), _| candidate != account);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_isolates_identical_scopes_by_account() {
+        let registry = BackfillRegistry::new();
+        let first = AccountId("first".into());
+        let second = AccountId("second".into());
+        let scope = CursorScope::Account;
+
+        registry.mark(first.clone(), scope.clone(), BackfillState::Completed);
+        registry.mark(second.clone(), scope.clone(), BackfillState::Running);
+
+        assert_eq!(
+            registry.snapshot(&first, &scope),
+            Some(BackfillState::Completed)
+        );
+        assert_eq!(
+            registry.snapshot(&second, &scope),
+            Some(BackfillState::Running)
+        );
+
+        registry.forget_account(&first);
+        assert_eq!(registry.snapshot(&first, &scope), None);
+        assert_eq!(
+            registry.snapshot(&second, &scope),
+            Some(BackfillState::Running)
+        );
     }
 }

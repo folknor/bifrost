@@ -86,7 +86,7 @@ fn unknown_object_type_tag_is_rejected() {
     // Type scope repr is [tag, obj_type] at offsets 13, 14.
     bytes[14] = 0xFF;
     let err = decode_envelope(&bytes).expect_err("unknown object type");
-    assert!(format!("{err}").contains("unknown object type tag"));
+    assert!(format!("{err}").contains("schema is incompatible"));
 }
 
 #[test]
@@ -98,6 +98,14 @@ fn unknown_protocol_tag_is_rejected() {
     bytes[18] = 0xEE;
     let err = decode_envelope(&bytes).expect_err("unknown protocol tag");
     assert!(format!("{err}").contains("unknown protocol tag"));
+}
+
+#[test]
+fn reserved_future_protocol_tag_is_schema_incompatible() {
+    let mut bytes = change_envelope(CursorScope::Account);
+    bytes[18] = 0xFF;
+    let err = decode_envelope(&bytes).expect_err("future protocol tag");
+    assert!(format!("{err}").contains("schema is incompatible"));
 }
 
 #[test]

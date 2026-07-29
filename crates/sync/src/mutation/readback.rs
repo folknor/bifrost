@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 
 use bifrost_types::{
-    Account, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome, MembershipScope, ObjectId,
-    Projection, SyncEvent,
+    Account, AccountErrorKind, FlagOp, HydratedObject, HydratedObjectKind, ItemOutcome,
+    MembershipScope, ObjectId, Projection, SyncEvent,
 };
 use futures::stream::{self, StreamExt};
 
@@ -173,9 +173,10 @@ pub async fn run_move_readback_guard(
 ///
 /// - the fetch `Succeeded` -> the object is still hydratable, so the
 ///   destroy did NOT land; the `Failed` outcome stands (`still_failed`).
-/// - the fetch `Failed` -> the server no longer returns the id, i.e. it
-///   was destroyed (possibly on the pre-retry attempt); downgrade to
-///   `Skipped`.
+/// - the fetch `Failed(NotFound)` -> the server no longer returns the
+///   id, so the destroy landed; downgrade to `Skipped`.
+/// - any other fetch `Failed` -> the read-back itself failed; classify
+///   it as uncertain so the original mutation outcome stands.
 /// - the fetch was `Uncertain` -> `uncertain`; the original `Failed`
 ///   stands.
 ///
@@ -198,8 +199,12 @@ pub async fn run_destroy_readback_guard(
                         ItemOutcome::Succeeded(_) => {
                             outcome.still_failed = outcome.still_failed.saturating_add(1);
                         }
-                        ItemOutcome::Failed(_) => {
-                            outcome.skipped = outcome.skipped.saturating_add(1);
+                        ItemOutcome::Failed(failure) => {
+                            if destroy_readback_saw_absence(&failure.error) {
+                                outcome.skipped = outcome.skipped.saturating_add(1);
+                            } else {
+                                outcome.uncertain = outcome.uncertain.saturating_add(1);
+                            }
                         }
                         ItemOutcome::Uncertain(_) => {
                             outcome.uncertain = outcome.uncertain.saturating_add(1);
@@ -218,6 +223,10 @@ pub async fn run_destroy_readback_guard(
     Ok(outcome)
 }
 
+fn destroy_readback_saw_absence(error: &bifrost_types::AccountError) -> bool {
+    matches!(error.kind(), AccountErrorKind::NotFound(_))
+}
+
 fn membership_contains(hydrated: &HydratedObject, destination: &MembershipScope) -> bool {
     let HydratedObjectKind::Metadata(entry) = &hydrated.kind else {
         // Wrong projection - cannot reconcile. Be safe: treat as not
@@ -230,6 +239,9 @@ fn membership_contains(hydrated: &HydratedObject, destination: &MembershipScope)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bifrost_types::{
+        AccountErrorBuilder, AccountErrorKind, Cause, ResourceKind, ServerCause, ServerErrorKind,
+    };
     use std::collections::HashSet;
 
     fn set(items: &[&str]) -> HashSet<String> {
@@ -279,5 +291,27 @@ mod tests {
             remove: set(&["\\Seen"]),
         };
         assert!(!matches_target_set(&obs, &op2));
+    }
+
+    #[test]
+    fn destroy_readback_only_accepts_not_found_as_absence() {
+        let not_found = AccountErrorBuilder::new(
+            AccountErrorKind::NotFound(ResourceKind::Message),
+            Cause::Request(bifrost_types::RequestCause::NotFound {
+                what: ResourceKind::Message,
+                id: None,
+            }),
+        )
+        .try_build()
+        .expect("valid not-found classification");
+        assert!(destroy_readback_saw_absence(&not_found));
+
+        let rate_limited = AccountErrorBuilder::new(
+            AccountErrorKind::Server(ServerErrorKind::RateLimited),
+            Cause::Server(ServerCause::RateLimited { retry_hint: None }),
+        )
+        .try_build()
+        .expect("valid rate-limit classification");
+        assert!(!destroy_readback_saw_absence(&rate_limited));
     }
 }

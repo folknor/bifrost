@@ -244,22 +244,24 @@ page instead would let a server whose query cap sits below `chunk`
 truncate cold-start hydration after one page.
 
 Resume: the `BackfillRegistry` (`BackfillState::Pending/Running/Completed`)
-is in-memory only and is wiped when the slot is torn down, so it cannot
-carry completion across an attach -> detach -> re-attach cycle. The sole
-durable record is the consumer-acked `BackfillCheckpoint` in the
-`CheckpointStore`. On completion the orchestrator broadcasts a durable
-completion marker - a synthetic empty `Batch` whose `BackfillCheckpoint`
-sits on the `completion_partition` sentinel key (`partitioner::
-completion_partition`, distinct from every `page:F:T` / `uid:F:T` /
-`time:F:T` key). It rides the same consumer-ack path as the page batches
-(`emit_backfill_complete` -> broadcast -> consumer persist+ack -> ack
-writer `put_backfill`), and because it is ordered behind every page it
-only lands durably after the consumer has persisted all of them - a crash
-before completion re-walks rather than recording a false "done". Its
-`items_done` is stamped at `total_walked + 1` (the honest total rides in
-`items_estimated`) so it strictly wins `get_backfill`'s "latest by
-`items_done`" query regardless of how a store breaks ties, and on
-re-attach the marker is the checkpoint returned.
+is an engine-wide observability index keyed by `(AccountId, CursorScope)`.
+Account rows are removed on detach, so the registry cannot merge
+identically-shaped scopes from different accounts or carry completion
+across an attach -> detach -> re-attach cycle. The sole durable record is
+the consumer-acked `BackfillCheckpoint` in the `CheckpointStore`. On
+completion the orchestrator broadcasts a durable completion marker - a
+synthetic empty `Batch` whose `BackfillCheckpoint` sits on the
+`completion_partition` sentinel key (`partitioner::completion_partition`,
+distinct from every `page:F:T` / `uid:F:T` / `time:F:T` key). It rides
+the same consumer-ack path as the page batches (`emit_backfill_complete`
+-> broadcast -> consumer persist+ack -> ack writer `put_backfill`), and
+because it is ordered behind every page it only lands durably after the
+consumer has persisted all of them - a crash before completion re-walks
+rather than recording a false "done". Its `items_done` is stamped at
+`total_walked + 1` (the honest total rides in `items_estimated`) so it
+strictly wins `get_backfill`'s "latest by items_done" query regardless of
+how a store breaks ties, and on re-attach the marker is the checkpoint
+returned.
 
 This skip-on-complete signal is uniform across plan kinds; the difference
 is whether positional resume is also possible:
@@ -406,6 +408,16 @@ is the engine-side entry that records the handle on success.
 2. Collect `ItemOutcome::Failed` ids whose `AccountError::recovery()`
    is `RecoveryClass::Retry(advice)` or
    `RecoveryClass::Reconcile(_)`.
+   If the stream itself terminates with `Retry`, ids the stream never
+   resolved join the retry set too - a stream can end before it emits
+   an outcome for every submitted target, and without that sweep those
+   ids are neither resubmitted, read back, nor counted. The sweep is
+   deliberately narrower than the `Reconcile` / `Engine` termination
+   arms: it claims only unseen ids and ids already queued for retry.
+   An id sitting in the read-back lane belongs to the guard (that lane
+   exists so a write whose first attempt may have landed is verified
+   rather than replayed), and an engine-blocked id is waiting on a
+   directive.
 3. Sleep for the effective delay from `advice.retry_hint`
    (`RetryHint::min_delay(now)` or `RetryHint::not_before(now)` per
    the caller's scheduler shape) and resubmit with the **same**
@@ -414,7 +426,11 @@ is the engine-side entry that records the handle on success.
    Repeat up to `EngineConfig::mutation_max_retries`.
 4. Run `run_readback_guard` once at the end against unresolved
    failures: `get_stream(Projection::FlagsOnly)` re-fetches and
-   reconciles applied / skipped / failed_terminal.
+   reconciles applied / skipped / failed_terminal. The read-back set
+   is derived from the per-id outcome map when the retry loop exits
+   (every id still `PendingRetry` or `PendingReadback`), not
+   accumulated during it, so an id parked in the read-back lane cannot
+   be dropped by a later attempt that resubmits its siblings.
 
 `MutationCounters` buckets `ItemOutcome::Failed` outcomes via
 `crate::recovery::plan_recovery`:
@@ -549,7 +565,9 @@ default 64).
 shed counter and emit a `warn!`.
 
 `BudgetGate` exposes two semaphores per account (sync + mutation)
-plus global caps. Lazy-creation uses
+plus global caps. Acquisition takes the per-account permit first and
+the global permit second, so a waiter parked on a busy account cannot
+consume global capacity needed by another account. Lazy-creation uses
 `DashMap::entry().or_insert_with(...)` to close the original
 data race.
 
@@ -585,6 +603,25 @@ once per second and calls `control.observe_bandwidth(bps)`.
 
 `Control` itself (the trait re-exported from `bifrost-types`) is
 dyn-safe; `SyncControl` is the engine's concrete implementation.
+Boundary, priority, bandwidth-cap, and checkpoint watch senders use
+`send_replace`, so their canonical snapshots update even when no
+receiver is alive.
+
+Boundary writes from `SyncControl` are compare-and-set, not blind
+writes:
+
+- `checkpoint_now` installs `CheckpointNow` and reads the request it
+  displaced in one atomic step (`Boundary::request_checkpoint`), then
+  restores that value only if the boundary still reads `CheckpointNow`
+  (`Boundary::restore_if_current`). An interleaved pause, stop, or
+  resume wins in both halves - neither the install nor the restore can
+  clobber it.
+- `Stop` is terminal for consumer-driven writes
+  (`Boundary::set_unless_stopped`, used by `pause` / `resume`, and
+  refused outright by `request_checkpoint`). A pause written over a
+  detach's `Stop` parks the workers instead of letting them drain,
+  and `detach` then waits out its whole timeout. `Boundary::set` is
+  still the unconditional primitive the engine's own teardown uses.
 
 ## Cursor envelope
 
@@ -596,6 +633,25 @@ dyn-safe; `SyncControl` is the engine's concrete implementation.
 - `Error::Other("cursor envelope: version N exceeds engine
   version M")` if `envelope_version > ENGINE_VERSION`.
 - Otherwise decoded `Checkpoint::Change` / `Checkpoint::Backfill`.
+
+Encoding an `ObjectType` or `ProtocolKind` variant the codec does not
+know panics, the same rule `encode_scope` already applied to unknown
+`CursorScope` variants. Writing a placeholder tag instead would
+persist a durable row nothing can decode, and the account would then
+re-establish, re-encode the same unreadable value, and re-poison the
+row on every attach. Decoding the reserved tag `0xFF` (written by an
+engine revision that did exactly that) yields
+`Error::SchemaIncompatible` so those rows still heal.
+
+An unreadable row is healed where it is found. `run_establish` - the
+running-account path - returns a typed `AccountError` whose derived
+`RecoveryClass` is `Engine(SchemaIncompatible)`, and the reopen
+listener runs the account-wide schema-clear loop. `establish_one` -
+the attach path - deletes the row and re-establishes that one scope
+inline, because the reopen listener is spawned later in `attach_inner`
+and does not exist yet: propagating the error there would fail the
+attach with nothing left running to clear the row, so every later
+attach would fail identically.
 
 (These are engine `Error` enum variants, not `RecoveryClass`
 variants.)
@@ -624,7 +680,14 @@ pub trait CheckpointStore: Send + Sync {
 take a borrowed `&CursorScope`. `delete_change_cursor` is required
 because `RecoveryClass::Engine(EngineDirective::RestartScope)` must
 drop the durable cursor so the next establish re-runs via inventory;
-a no-op delete would silently preserve the stale cursor.
+a no-op delete would silently preserve the stale cursor. It is also
+what attach calls to clear an undecodable envelope, so a store that
+no-ops here strands the account on a row it cannot read.
+
+A store that decodes durable bytes must surface a schema it cannot
+read as `Error::SchemaIncompatible` from `get_change_cursor`; that is
+the signal both establish paths key on. Any other error is treated as
+a store failure and propagates.
 
 `InMemoryCheckpointStore` is the test backend (HashMap-backed). No
 sled / sqlite default; storage is consumer-owned.
@@ -638,7 +701,9 @@ Applies to all four protocols today (every protocol declares
 `MutationReplaySafety::None`; the engine reads back after retry to
 disambiguate ambiguous transport failures). The guard re-fetches
 affected ids via `Account::get_stream(ids, Projection::FlagsOnly)`
-and reconciles against the intended mutation.
+and reconciles against the intended mutation. Destroy read-back treats
+only an explicit `AccountErrorKind::NotFound` as proof that the object
+is absent; any other per-item fetch failure remains uncertain.
 
 ## Error / Terminated / Warning
 
@@ -746,7 +811,7 @@ crates/sync/src/
     fusion.rs             // InventoryFusion::run_with_broadcast
     idle.rs poll.rs       // helper drivers (AdaptiveCadence)
   backfill/
-    mod.rs                // BackfillHandle, BackfillRegistry,
+    mod.rs                // BackfillHandle, account-keyed BackfillRegistry,
                           // BackfillPolicy / Strategy
     runner.rs             // BackfillRunner::run_partition,
                           // LiveSupersedes (ring-evicting, default

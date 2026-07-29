@@ -24,7 +24,7 @@ use crate::error::Error;
 
 /// Persistence contract.
 ///
-/// All four methods are async because real persistence backends are
+/// All five methods are async because real persistence backends are
 /// IO-bound. The in-memory impl returns ready futures.
 pub trait CheckpointStore: Send + Sync {
     /// Persist or replace the change cursor for `(account, scope)`.

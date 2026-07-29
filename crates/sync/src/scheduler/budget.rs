@@ -167,10 +167,6 @@ impl BudgetGate {
         account: &AccountId,
         kind: WorkKind,
     ) -> Result<BudgetPermit, Error> {
-        let outer = Arc::clone(&self.inner.global)
-            .acquire_owned()
-            .await
-            .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?;
         let inner_sem = match kind {
             WorkKind::Sync => self.sync_semaphore(account),
             WorkKind::Mutation => self.mutation_semaphore(account),
@@ -179,6 +175,10 @@ impl BudgetGate {
             .acquire_owned()
             .await
             .map_err(|e| Error::Other(format!("account semaphore closed: {e}")))?;
+        let outer = Arc::clone(&self.inner.global)
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::Other(format!("global semaphore closed: {e}")))?;
         Ok(BudgetPermit {
             _outer: outer,
             _inner: inner,
@@ -218,5 +218,63 @@ pub struct BudgetPermit {
 impl std::fmt::Debug for BudgetPermit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BudgetPermit").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn account_waiter_does_not_hold_a_global_permit() {
+        let budget = ConcurrencyBudget {
+            per_account: 2,
+            global: 2,
+            mutation_share_num: 1,
+            mutation_share_den: 2,
+        };
+        let gate = BudgetGate::new(budget);
+        let account_a = AccountId("a".into());
+        let account_b = AccountId("b".into());
+        gate.register(account_a.clone());
+        gate.register(account_b.clone());
+
+        let held = gate
+            .acquire(&account_a, WorkKind::Sync)
+            .await
+            .expect("first account permit");
+        let waiting_gate = gate.clone();
+        let waiting_account = account_a.clone();
+        let waiter =
+            tokio::spawn(
+                async move { waiting_gate.acquire(&waiting_account, WorkKind::Sync).await },
+            );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Without this the permit assertion below passes vacuously if
+        // the waiter never got scheduled: it has to be parked on the
+        // account semaphore for "does it hold a global permit" to mean
+        // anything.
+        assert!(
+            !waiter.is_finished(),
+            "waiter must be parked on the exhausted account semaphore"
+        );
+        assert_eq!(
+            gate.inner.global.available_permits(),
+            1,
+            "an account-local waiter must not consume the spare global permit"
+        );
+        let other = gate
+            .acquire(&account_b, WorkKind::Sync)
+            .await
+            .expect("other account uses spare global permit");
+
+        drop(other);
+        drop(held);
+        waiter
+            .await
+            .expect("waiter task completes")
+            .expect("waiter acquires after release");
     }
 }

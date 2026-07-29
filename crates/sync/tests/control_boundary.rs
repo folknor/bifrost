@@ -6,14 +6,9 @@
 //! was the stale-snapshot bug the generation counter exists to
 //! prevent). Nothing in the suite previously pinned this.
 //!
-//! Harness note: `tokio::sync::watch::Sender::send` refuses to update
-//! the value once every receiver has been dropped, and `Boundary::set`
-//! / `Control::priority` / `Control::bandwidth_cap` all ignore that
-//! error. The engine keeps receivers alive (worker-held
-//! `BoundaryView`s, the slot's `priority_rx` / `bandwidth_cap_rx`), so
-//! the harness must too - `ControlHarness` holds them for the test's
-//! lifetime. The no-receiver behavior itself is pinned at the bottom
-//! of this file as a documented footgun.
+//! The harness keeps watch receivers alive to mirror the engine worker
+//! topology, while the final tests verify that canonical snapshots
+//! remain correct even after every receiver is dropped.
 //!
 //! All tests are in-process and deterministic. The two park-proof
 //! tests wrap a genuinely-unresolvable future in a short real timeout
@@ -46,10 +41,12 @@ fn sample_checkpoint(state: &[u8]) -> Checkpoint {
 struct ControlHarness {
     control: SyncControl,
     boundary: Boundary,
-    // Keepalive receivers. Without them every `set` / `priority` /
-    // `bandwidth_cap` is a silent no-op (watch sends fail with zero
-    // receivers), which is exactly the engine's AccountSlot / worker
-    // topology these fields stand in for.
+    // Receivers held for the test's lifetime, mirroring the engine's
+    // AccountSlot / worker topology. They are no longer load-bearing
+    // for the canonical value (the senders use `send_replace`), but
+    // keeping them means these tests exercise the same wakeup paths
+    // the engine does; the receiver-less behavior is pinned separately
+    // at the bottom of this file.
     _boundary_view: BoundaryView,
     _priority_rx: watch::Receiver<Priority>,
     _cap_rx: watch::Receiver<Option<u64>>,
@@ -133,10 +130,6 @@ async fn checkpoint_now_returns_a_checkpoint_recorded_after_the_request() {
 async fn checkpoint_now_restores_a_pre_existing_pause() {
     // A checkpoint request made while paused flushes one boundary and
     // remains paused (the documented compose rule on BoundaryRequest).
-    // NOTE: the restore is an unconditional write-back of the
-    // snapshot, which is also the B3 clobber race in
-    // this test only exercises the
-    // uncontended compose case that is correct today.
     let h = make_control();
     h.boundary.set(BoundaryRequest::Pause);
     let recorder = h.control.clone();
@@ -149,6 +142,49 @@ async fn checkpoint_now_restores_a_pre_existing_pause() {
         h.boundary.snapshot(),
         BoundaryRequest::Pause,
         "checkpoint_now while paused must stay paused afterwards"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_now_does_not_clobber_a_concurrent_pause() {
+    let h = make_control();
+    let recorder = h.control.clone();
+    let boundary = h.boundary.clone();
+    let (result, ()) = tokio::join!(h.control.checkpoint_now(), async move {
+        tokio::task::yield_now().await;
+        boundary.set(BoundaryRequest::Pause);
+        recorder.record_checkpoint(sample_checkpoint(b"cp")).await;
+    });
+    assert!(result.is_ok());
+    assert_eq!(
+        h.boundary.snapshot(),
+        BoundaryRequest::Pause,
+        "the concurrent pause must win over checkpoint restoration"
+    );
+}
+
+#[tokio::test]
+async fn control_calls_never_resurrect_a_stopping_account() {
+    // `detach` writes `Stop` and then waits for workers to drain. A
+    // consumer racing that teardown with a pause / resume / checkpoint
+    // must not un-stop them: a `Pause` written over `Stop` parks the
+    // workers instead, and detach then burns its whole timeout.
+    let h = make_control();
+    h.boundary.set(BoundaryRequest::Stop);
+
+    h.control.resume();
+    assert_eq!(h.boundary.snapshot(), BoundaryRequest::Stop);
+
+    let recorder = h.control.clone();
+    let (result, ()) = tokio::join!(h.control.checkpoint_now(), async move {
+        tokio::task::yield_now().await;
+        recorder.record_checkpoint(sample_checkpoint(b"cp")).await;
+    });
+    assert!(result.is_ok(), "the final flush still satisfies the waiter");
+    assert_eq!(
+        h.boundary.snapshot(),
+        BoundaryRequest::Stop,
+        "checkpoint_now must not displace a stop request"
     );
 }
 
@@ -207,30 +243,20 @@ async fn two_sequential_checkpoint_requests_each_need_their_own_record() {
     assert_eq!(cursor.server_state.bytes, b"two".to_vec());
 }
 
-// ---------- no-receiver signal loss (documented footgun) ----------
-//
-// These pin behavior believed to be a defect, not an endorsement: see
-//. `watch::Sender::send` refuses to
-// update the value once every receiver is dropped, and Boundary /
-// SyncControl ignore the send error, so the signal is silently lost.
-// In production the engine is shielded only by worker-held
-// BoundaryViews and the slot's priority_rx / bandwidth_cap_rx
-// keepalives; there is no boundary keepalive on the slot itself.
-
 #[tokio::test]
-async fn boundary_set_is_silently_lost_once_every_view_is_dropped() {
+async fn boundary_snapshot_updates_after_every_view_is_dropped() {
     let (boundary, view) = Boundary::new();
     drop(view);
     boundary.set(BoundaryRequest::Pause);
     assert_eq!(
         boundary.snapshot(),
-        BoundaryRequest::Run,
-        "with zero receivers the set is a silent no-op (current behavior; B14)"
+        BoundaryRequest::Pause,
+        "the sender retains the canonical boundary value"
     );
 }
 
 #[tokio::test]
-async fn priority_and_cap_updates_are_silently_lost_without_receivers() {
+async fn priority_and_cap_snapshots_update_without_receivers() {
     let (boundary, _view) = Boundary::new();
     let (priority_tx, priority_rx) = watch::channel(Priority::Normal);
     let (cap_tx, cap_rx) = watch::channel(Some(1_000_u64));
@@ -241,14 +267,14 @@ async fn priority_and_cap_updates_are_silently_lost_without_receivers() {
     control.priority(Priority::Foreground);
     assert_eq!(
         control.priority_snapshot(),
-        Priority::Normal,
-        "priority update silently dropped with zero receivers (current behavior; B14)"
+        Priority::Foreground,
+        "priority snapshot must retain the latest requested value"
     );
 
     control.bandwidth_cap(None);
     assert_eq!(
         control.bandwidth_cap_snapshot(),
-        Some(1_000),
-        "bandwidth-cap update silently dropped with zero receivers (current behavior; B14)"
+        None,
+        "bandwidth-cap snapshot must retain the latest requested value"
     );
 }

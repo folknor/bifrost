@@ -7,7 +7,7 @@
 //! read-only hydration passthrough (`get_stream`, `message_hydrate`,
 //! `open_blob`, `open_raw_rfc822`, ...), `invalidation_sink`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -756,7 +756,7 @@ impl SyncEngine {
         // to flush their final checkpoint to the ack writer.
         self.ack_senders.remove(account_id);
         // Ask running workers to checkpoint cleanly, then stop.
-        let _ = slot.boundary_tx.send(BoundaryRequest::Stop);
+        slot.boundary_tx.send_replace(BoundaryRequest::Stop);
         // Trip shutdown before awaiting workers. Some account-level
         // workers park on the shutdown token rather than the boundary
         // watch, so waiting first would always run to detach_timeout.
@@ -793,6 +793,7 @@ impl SyncEngine {
         }
         self.sink.unregister(account_id);
         self.scheduler.budget().forget(account_id);
+        self.backfill_registry.forget_account(account_id);
         if let Some(meter) = &self.bandwidth_meter {
             meter.forget_account(account_id);
         }
@@ -868,7 +869,8 @@ impl SyncEngine {
             .accounts
             .get(account_id)
             .ok_or_else(|| Error::AccountNotAttached(account_id.clone()))?;
-        let _ = slot.boundary_tx.send(crate::cancel::BoundaryRequest::Run);
+        slot.boundary_tx
+            .send_replace(crate::cancel::BoundaryRequest::Run);
         let _ = slot.account_control_tx.send(AccountControl::Resume);
         Ok(())
     }
@@ -967,7 +969,6 @@ impl SyncEngine {
 
         let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
         let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
-        let mut readback_ids: Vec<bifrost_types::ObjectId> = Vec::new();
         let mut dedupe_count: u64 = 0;
         let mut remaining: Vec<bifrost_types::ObjectId> = targets;
         let mut attempt: u32 = 0;
@@ -988,8 +989,11 @@ impl SyncEngine {
             let target_stream: AccountStream<bifrost_types::ObjectId> =
                 Box::pin(futures::stream::iter(remaining.clone()));
             let mut stream = account.bulk_set_flags(target_stream, op.clone(), key.clone());
+            // Only the retry queue is per-attempt. Read-back membership
+            // is derived from `outcomes` after the campaign ends, so an
+            // id parked in the read-back lane survives an attempt that
+            // resubmits its siblings.
             retry_ids.clear();
-            readback_ids.clear();
             let mut stream_termination_advice: Option<RetryAdvice> = None;
 
             while let Some(event) = stream.next().await {
@@ -1000,7 +1004,6 @@ impl SyncEngine {
                                 item,
                                 &mut outcomes,
                                 &mut retry_ids,
-                                &mut readback_ids,
                                 &mut dedupe_count,
                             );
                         }
@@ -1019,6 +1022,7 @@ impl SyncEngine {
                         let original = err.clone();
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
+                                queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
@@ -1040,9 +1044,9 @@ impl SyncEngine {
                                                 | MutationBucket::FailedTerminal
                                         )
                                     ) {
-                                        readback_ids.push(id.clone());
-                                        // Mark the item as PendingReadback so
-                                        // `counters_from_outcomes` counts it
+                                        // PendingReadback both queues the id
+                                        // for the guard and makes
+                                        // `counters_from_outcomes` count it
                                         // alongside other read-back-queued
                                         // items. Without this insert the
                                         // counter rebalance would underflow
@@ -1113,7 +1117,7 @@ impl SyncEngine {
             }
 
             attempt = attempt.saturating_add(1);
-            let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
+            let retry_set: HashSet<_> = retry_ids.iter().cloned().collect();
             let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
                 .iter()
                 .filter(|id| retry_set.contains(*id))
@@ -1124,11 +1128,10 @@ impl SyncEngine {
                 std::mem::swap(&mut remaining, &mut next_remaining);
                 continue;
             }
-            // No more attempts. Anything still in `retry_ids` becomes
-            // a pending read-back candidate so the guard can decide
-            // applied vs failed_terminal.
+            // No more attempts. Anything still in `retry_ids` stays
+            // pending so the read-back guard can decide applied vs
+            // failed_terminal.
             for id in &retry_set {
-                readback_ids.push(id.clone());
                 outcomes.insert(id.clone(), MutationBucket::PendingRetry);
             }
             break;
@@ -1138,6 +1141,7 @@ impl SyncEngine {
         for _ in 0..dedupe_count {
             totals.record_dedupe_by_client_id();
         }
+        let readback_ids = unresolved_readback_ids(&outcomes);
         if !readback_ids.is_empty() {
             let account = slot.current.load_full();
             let outcome =
@@ -1267,7 +1271,6 @@ impl SyncEngine {
 
         let mut outcomes: HashMap<bifrost_types::ObjectId, MutationBucket> = HashMap::new();
         let mut retry_ids: Vec<bifrost_types::ObjectId> = Vec::new();
-        let mut readback_ids: Vec<bifrost_types::ObjectId> = Vec::new();
         let mut dedupe_count: u64 = 0;
         let mut remaining: Vec<bifrost_types::ObjectId> = targets;
         let mut attempt: u32 = 0;
@@ -1299,8 +1302,11 @@ impl SyncEngine {
                 ),
                 BulkPipelineOp::Destroy => account.bulk_destroy(target_stream, key.clone()),
             };
+            // Only the retry queue is per-attempt. Read-back membership
+            // is derived from `outcomes` after the campaign ends, so an
+            // id parked in the read-back lane survives an attempt that
+            // resubmits its siblings.
             retry_ids.clear();
-            readback_ids.clear();
             let mut stream_termination_advice: Option<RetryAdvice> = None;
 
             while let Some(event) = stream.next().await {
@@ -1311,7 +1317,6 @@ impl SyncEngine {
                                 item,
                                 &mut outcomes,
                                 &mut retry_ids,
-                                &mut readback_ids,
                                 &mut dedupe_count,
                             );
                         }
@@ -1320,6 +1325,7 @@ impl SyncEngine {
                         let original = err.clone();
                         match plan_recovery(err) {
                             RecoveryPlan::Retry(advice) => {
+                                queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
                                 stream_termination_advice = Some(advice);
                                 break;
                             }
@@ -1341,7 +1347,6 @@ impl SyncEngine {
                                                 | MutationBucket::FailedTerminal
                                         )
                                     ) {
-                                        readback_ids.push(id.clone());
                                         outcomes
                                             .insert(id.clone(), MutationBucket::PendingReadback);
                                     }
@@ -1404,7 +1409,7 @@ impl SyncEngine {
             }
 
             attempt = attempt.saturating_add(1);
-            let retry_set: std::collections::HashSet<_> = retry_ids.iter().cloned().collect();
+            let retry_set: HashSet<_> = retry_ids.iter().cloned().collect();
             let mut next_remaining: Vec<bifrost_types::ObjectId> = remaining
                 .iter()
                 .filter(|id| retry_set.contains(*id))
@@ -1416,7 +1421,6 @@ impl SyncEngine {
                 continue;
             }
             for id in &retry_set {
-                readback_ids.push(id.clone());
                 outcomes.insert(id.clone(), MutationBucket::PendingRetry);
             }
             break;
@@ -1426,6 +1430,7 @@ impl SyncEngine {
         for _ in 0..dedupe_count {
             totals.record_dedupe_by_client_id();
         }
+        let readback_ids = unresolved_readback_ids(&outcomes);
         if !readback_ids.is_empty() {
             let account = slot.current.load_full();
             let outcome = match &op {
@@ -2374,11 +2379,21 @@ impl SyncEngine {
         scope: CursorScope,
         cursors: Arc<CursorRegistry>,
     ) -> Result<InitialScope, Error> {
-        // Check the store first - resume path. Schema-incompatible
-        // envelopes route through the recovery translator so the
-        // engine reports a typed `AccountError` whose derived
-        // `RecoveryClass` is `Engine(SchemaIncompatible)`. The reopen
-        // listener then performs the schema-clear loop. (sync-D10)
+        // Check the store first - resume path.
+        //
+        // A schema-incompatible envelope is healed HERE rather than
+        // handed to the recovery translator. The running-account path
+        // (`run_establish`) can return a typed `AccountError` because a
+        // reopen listener is alive to receive
+        // `Engine(SchemaIncompatible)` and run the schema-clear loop;
+        // at attach that listener does not exist yet - it is spawned
+        // further down `attach_inner`. Returning an error here instead
+        // would fail the whole attach with nothing left running to
+        // clear the undecodable row, so the account would refuse to
+        // attach on every subsequent start with no recovery path.
+        // Dropping the row and re-establishing this scope is exactly
+        // what `handle_schema_incompatible` would have done, scoped to
+        // the one cursor that cannot be read. (sync-D10)
         match self.checkpoints.get_change_cursor(account_id, &scope).await {
             Ok(Some(existing)) => {
                 cursors.put(existing);
@@ -2386,9 +2401,28 @@ impl SyncEngine {
             }
             Ok(None) => {}
             Err(Error::SchemaIncompatible) => {
-                return Err(Error::Account(crate::recovery::cursor_decode_failure(
-                    bifrost_types::AccountOperation::EstablishCursor,
-                )));
+                tracing::warn!(
+                    target: "bifrost.sync.attach",
+                    account = ?account_id,
+                    scope = ?scope,
+                    "schema-incompatible cursor envelope; clearing the row and re-establishing the scope"
+                );
+                if let Err(err) = self
+                    .checkpoints
+                    .delete_change_cursor(account_id, &scope)
+                    .await
+                {
+                    // Non-fatal: re-establishment overwrites the row on
+                    // success anyway. Log and keep going rather than
+                    // failing the attach on a store hiccup.
+                    tracing::warn!(
+                        target: "bifrost.sync.attach",
+                        account = ?account_id,
+                        scope = ?scope,
+                        error = %err,
+                        "delete_change_cursor failed while clearing an unreadable envelope"
+                    );
+                }
             }
             Err(other) => return Err(other),
         }
@@ -2568,7 +2602,11 @@ async fn run_backfill_orchestrator(
                 match store.get_backfill(&account_id, &scope).await {
                     Ok(opt) => {
                         if backfill_complete_recorded(opt.as_ref()) {
-                            registry.mark(scope.clone(), BackfillState::Completed);
+                            registry.mark(
+                                account_id.clone(),
+                                scope.clone(),
+                                BackfillState::Completed,
+                            );
                             continue;
                         }
                     }
@@ -2581,7 +2619,7 @@ async fn run_backfill_orchestrator(
                         );
                     }
                 }
-                registry.mark(scope.clone(), BackfillState::Running);
+                registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
                 let mut completed = true;
                 let mut total_seen = 0_u64;
                 for partition in partitions {
@@ -2617,6 +2655,7 @@ async fn run_backfill_orchestrator(
                     emit_backfill_complete(changes_tx.as_ref(), &scope, total_seen);
                 }
                 registry.mark(
+                    account_id.clone(),
                     scope.clone(),
                     if completed {
                         BackfillState::Completed
@@ -2634,7 +2673,11 @@ async fn run_backfill_orchestrator(
                 match store.get_backfill(&account_id, &scope).await {
                     Ok(opt) => match open_pages_resume(opt.as_ref()) {
                         OpenPagesResume::Skip => {
-                            registry.mark(scope.clone(), BackfillState::Completed);
+                            registry.mark(
+                                account_id.clone(),
+                                scope.clone(),
+                                BackfillState::Completed,
+                            );
                             continue;
                         }
                         OpenPagesResume::ResumeFrom(position) => from = position,
@@ -2651,7 +2694,7 @@ async fn run_backfill_orchestrator(
                         );
                     }
                 }
-                registry.mark(scope.clone(), BackfillState::Running);
+                registry.mark(account_id.clone(), scope.clone(), BackfillState::Running);
                 let mut completed = true;
                 let mut total_seen = 0_u64;
                 loop {
@@ -2714,6 +2757,7 @@ async fn run_backfill_orchestrator(
                     emit_backfill_complete(changes_tx.as_ref(), &scope, total_seen);
                 }
                 registry.mark(
+                    account_id.clone(),
                     scope.clone(),
                     if completed {
                         BackfillState::Completed
@@ -3554,7 +3598,8 @@ fn engine_pause(ctx: &RecoveryContext<'_>, reason: PauseReason) {
     // driven work for the account until a consumer calls
     // `SyncEngine::resume_account` (or sends `Resume` through
     // `Control::resume`).
-    let _ = ctx.boundary_tx.send(crate::cancel::BoundaryRequest::Pause);
+    ctx.boundary_tx
+        .send_replace(crate::cancel::BoundaryRequest::Pause);
 }
 
 fn jittered(base: Duration) -> Duration {
@@ -3620,6 +3665,11 @@ async fn run_establish(
             return Ok(());
         }
         Ok(None) => {}
+        // Unlike `establish_one`, this path runs with a live reopen
+        // listener, so an undecodable envelope is reported as a typed
+        // error whose derived `RecoveryClass` is
+        // `Engine(SchemaIncompatible)` and the listener runs the
+        // account-wide schema-clear loop.
         Err(Error::SchemaIncompatible) => {
             return Err(Error::Account(crate::recovery::cursor_decode_failure(
                 bifrost_types::AccountOperation::EstablishCursor,
@@ -3709,8 +3759,70 @@ enum MutationBucket {
     BlockedByEngine,
 }
 
+/// Add every retry-eligible target to the retry queue after a
+/// retryable stream termination.
+///
+/// A stream may terminate before it emits an item outcome for every
+/// submitted target. Those unseen ids are still part of the campaign
+/// and must be retried alongside explicit per-item retry failures;
+/// without this sweep they are neither resubmitted, read back, nor
+/// counted, and the campaign reports success for work that never
+/// happened.
+///
+/// Deliberately narrower than the `Reconcile` / `Engine` termination
+/// sweeps, which claim every id that is not already resolved. An id
+/// sitting in `PendingReadback` is owned by the read-back guard -
+/// that lane exists precisely so a write whose first attempt may have
+/// landed is verified rather than replayed - and a `BlockedByEngine`
+/// id is waiting on an engine directive. Neither is ours to resubmit,
+/// so only ids the stream never resolved (`None`) or explicitly asked
+/// us to retry (`PendingRetry`) are queued.
+fn queue_unresolved_for_retry(
+    remaining: &[bifrost_types::ObjectId],
+    outcomes: &HashMap<bifrost_types::ObjectId, MutationBucket>,
+    retry_ids: &mut Vec<bifrost_types::ObjectId>,
+) {
+    // Set-based dedupe: `remaining` and `retry_ids` both scale with the
+    // campaign, so a linear scan per candidate is quadratic on the
+    // exact path (a large bulk that trips a rate limit) where it hurts.
+    let mut queued: HashSet<bifrost_types::ObjectId> = retry_ids.iter().cloned().collect();
+    for id in remaining {
+        let eligible = matches!(outcomes.get(id), None | Some(MutationBucket::PendingRetry));
+        if eligible && queued.insert(id.clone()) {
+            retry_ids.push(id.clone());
+        }
+    }
+}
+
+/// Every id whose campaign outcome is still unresolved once the retry
+/// loop ends, in no particular order.
+///
+/// The read-back queue is derived from `outcomes` rather than
+/// accumulated during the loop: the map is the single source of truth
+/// for per-id state, it already survives across attempts, and deriving
+/// it means an id parked in the read-back lane cannot be lost when a
+/// later attempt resubmits its siblings.
+fn unresolved_readback_ids(
+    outcomes: &HashMap<bifrost_types::ObjectId, MutationBucket>,
+) -> Vec<bifrost_types::ObjectId> {
+    let mut ids = Vec::new();
+    for (id, bucket) in outcomes {
+        if matches!(
+            bucket,
+            MutationBucket::PendingRetry | MutationBucket::PendingReadback
+        ) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
 /// Classify one `ItemOutcome<MutationSuccess>` and update the
-/// per-id outcome map, retry queue, and read-back queue.
+/// per-id outcome map and retry queue.
+///
+/// Read-back membership is not a separate queue: `PendingReadback`
+/// (and any `PendingRetry` still unresolved when the loop ends) IS the
+/// read-back lane, collected by `unresolved_readback_ids`.
 ///
 /// Dispatch rules:
 /// - `Succeeded(Applied)` -> `Applied`.
@@ -3728,7 +3840,6 @@ fn classify_item_outcome(
     item: ItemOutcome<MutationSuccess>,
     outcomes: &mut HashMap<bifrost_types::ObjectId, MutationBucket>,
     retry_ids: &mut Vec<bifrost_types::ObjectId>,
-    readback_ids: &mut Vec<bifrost_types::ObjectId>,
     dedupe_count: &mut u64,
 ) {
     use crate::recovery::{RecoveryPlan, plan_recovery};
@@ -3747,7 +3858,6 @@ fn classify_item_outcome(
             match plan_recovery(failure.error) {
                 RecoveryPlan::Retry(advice) => match advice.disposition {
                     bifrost_types::RetryDisposition::AfterStateRefresh => {
-                        readback_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingReadback);
                     }
                     bifrost_types::RetryDisposition::SameRequest
@@ -3759,33 +3869,23 @@ fn classify_item_outcome(
                     // default to read-back (the safe path) and require
                     // explicit handling here when added.
                     _ => {
-                        readback_ids.push(id.clone());
                         outcomes.insert(id, MutationBucket::PendingReadback);
                     }
                 },
                 RecoveryPlan::Reconcile(advice) => {
-                    let mut wants_check = false;
                     for action in &advice.guidance.actions {
-                        match action {
-                            ReconcileAction::CheckTarget => wants_check = true,
-                            ReconcileAction::DedupeByClientId => {
-                                *dedupe_count = dedupe_count.saturating_add(1);
-                            }
-                            _ => {}
+                        if matches!(action, ReconcileAction::DedupeByClientId) {
+                            *dedupe_count = dedupe_count.saturating_add(1);
                         }
                     }
-                    if wants_check {
-                        readback_ids.push(id.clone());
-                        outcomes.insert(id, MutationBucket::PendingReadback);
-                    } else {
-                        // No `CheckTarget` requested; the consumer
-                        // must dedupe before retrying, so we cannot
-                        // automatically resolve the item. Leave it as
-                        // pending-readback so the per-id state is
-                        // surfaced through the counters.
-                        readback_ids.push(id.clone());
-                        outcomes.insert(id, MutationBucket::PendingReadback);
-                    }
+                    // Both reconcile shapes land in the same lane.
+                    // `CheckTarget` asks for exactly what the read-back
+                    // guard performs; without it the consumer must
+                    // dedupe before any retry, so the engine cannot
+                    // resolve the item automatically either. Either way
+                    // pending-readback is the honest state and surfaces
+                    // the id through the counters.
+                    outcomes.insert(id, MutationBucket::PendingReadback);
                 }
                 RecoveryPlan::Engine(_) => {
                     outcomes.insert(id, MutationBucket::BlockedByEngine);
@@ -3797,7 +3897,6 @@ fn classify_item_outcome(
         }
         ItemOutcome::Uncertain(uncertain) => {
             let id = bifrost_types::ObjectId(uncertain.item.0);
-            readback_ids.push(id.clone());
             outcomes.insert(id, MutationBucket::PendingReadback);
         }
     }
@@ -3823,7 +3922,10 @@ fn counters_from_outcomes(
 
 #[cfg(test)]
 mod tests {
-    use super::scope_covers_membership;
+    use super::{
+        MutationBucket, queue_unresolved_for_retry, scope_covers_membership,
+        unresolved_readback_ids,
+    };
     use bifrost_types::{CursorScope, FolderId, MembershipScope, ObjectType};
 
     #[test]
@@ -3847,6 +3949,84 @@ mod tests {
         use super::jittered;
         use std::time::Duration;
         assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn retryable_stream_termination_requeues_every_unresolved_target() {
+        let applied = bifrost_types::ObjectId("applied".into());
+        let explicit_retry = bifrost_types::ObjectId("explicit-retry".into());
+        let unseen = bifrost_types::ObjectId("unseen".into());
+        let remaining = vec![applied.clone(), explicit_retry.clone(), unseen.clone()];
+        let outcomes = std::collections::HashMap::from([
+            (applied, MutationBucket::Applied),
+            (explicit_retry.clone(), MutationBucket::PendingRetry),
+        ]);
+        let mut retry_ids = vec![explicit_retry.clone()];
+
+        queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
+
+        assert_eq!(retry_ids, vec![explicit_retry, unseen]);
+    }
+
+    /// The retry sweep must not raid the other two lanes. An id the
+    /// protocol reported `Uncertain` (or a reconcile that wants its
+    /// target checked) belongs to the read-back guard - resubmitting it
+    /// is exactly the blind replay that lane exists to prevent - and an
+    /// engine-blocked id is waiting on a directive.
+    #[test]
+    fn retry_sweep_leaves_readback_and_engine_blocked_ids_alone() {
+        let uncertain = bifrost_types::ObjectId("uncertain".into());
+        let blocked = bifrost_types::ObjectId("blocked".into());
+        let unseen = bifrost_types::ObjectId("unseen".into());
+        let remaining = vec![uncertain.clone(), blocked.clone(), unseen.clone()];
+        let outcomes = std::collections::HashMap::from([
+            (uncertain, MutationBucket::PendingReadback),
+            (blocked, MutationBucket::BlockedByEngine),
+        ]);
+        let mut retry_ids = Vec::new();
+
+        queue_unresolved_for_retry(&remaining, &outcomes, &mut retry_ids);
+
+        assert_eq!(retry_ids, vec![unseen]);
+    }
+
+    /// Both pending lanes reach the guard, and nothing else does.
+    #[test]
+    fn readback_queue_is_every_still_pending_id() {
+        let outcomes = std::collections::HashMap::from([
+            (
+                bifrost_types::ObjectId("applied".into()),
+                MutationBucket::Applied,
+            ),
+            (
+                bifrost_types::ObjectId("skipped".into()),
+                MutationBucket::Skipped,
+            ),
+            (
+                bifrost_types::ObjectId("failed".into()),
+                MutationBucket::FailedTerminal,
+            ),
+            (
+                bifrost_types::ObjectId("blocked".into()),
+                MutationBucket::BlockedByEngine,
+            ),
+            (
+                bifrost_types::ObjectId("retry".into()),
+                MutationBucket::PendingRetry,
+            ),
+            (
+                bifrost_types::ObjectId("readback".into()),
+                MutationBucket::PendingReadback,
+            ),
+        ]);
+
+        let mut ids: Vec<String> = unresolved_readback_ids(&outcomes)
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+        ids.sort();
+
+        assert_eq!(ids, vec!["readback".to_string(), "retry".to_string()]);
     }
 
     /// Attach must contain a scope-local establishment failure instead of

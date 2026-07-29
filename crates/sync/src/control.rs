@@ -92,9 +92,7 @@ impl SyncControl {
             generation,
             checkpoint: Some(checkpoint),
         };
-        // `send` errors only if every receiver has dropped; the
-        // sender side holds the canonical value so that is fine.
-        let _ = self.inner.checkpoint_tx.send(snapshot);
+        self.inner.checkpoint_tx.send_replace(snapshot);
     }
 
     /// Engine-side hook: bandwidth meter feeds observed throughput.
@@ -168,7 +166,9 @@ impl Control for SyncControl {
             // `record_checkpoint` calls that race with us land in the
             // new generation, not the old one.
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            self.inner.boundary.set(BoundaryRequest::Pause);
+            self.inner
+                .boundary
+                .set_unless_stopped(BoundaryRequest::Pause);
             self.wait_for_checkpoint_at_or_after(gen_id).await
         })
     }
@@ -180,27 +180,31 @@ impl Control for SyncControl {
     > {
         Box::pin(async move {
             let gen_id = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            let previous = self.inner.boundary.snapshot();
-            self.inner.boundary.set(BoundaryRequest::CheckpointNow);
+            // Read-and-install is one atomic step, so a `Pause` landing
+            // between the two is never displaced by this request.
+            let previous = self.inner.boundary.request_checkpoint();
             let cp = self.wait_for_checkpoint_at_or_after(gen_id).await?;
-            // Restore the caller's prior state. A checkpoint request
-            // made while paused should flush one boundary and remain
-            // paused; a request made while running resumes running.
-            self.inner.boundary.set(previous);
+            // Restore only if no concurrent control or engine action
+            // changed the boundary while this request was waiting.
+            if let Some(previous) = previous {
+                self.inner
+                    .boundary
+                    .restore_if_current(BoundaryRequest::CheckpointNow, previous);
+            }
             Ok(cp)
         })
     }
 
     fn resume(&self) {
-        self.inner.boundary.set(BoundaryRequest::Run);
+        self.inner.boundary.set_unless_stopped(BoundaryRequest::Run);
     }
 
     fn priority(&self, p: Priority) {
-        let _ = self.inner.priority.send(p);
+        self.inner.priority.send_replace(p);
     }
 
     fn bandwidth_cap(&self, bps: Option<u64>) {
-        let _ = self.inner.bandwidth_cap.send(bps);
+        self.inner.bandwidth_cap.send_replace(bps);
     }
 
     fn bandwidth_observed(&self) -> u64 {

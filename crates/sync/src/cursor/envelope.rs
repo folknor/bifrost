@@ -36,6 +36,14 @@ pub const MIN_MIGRATABLE: u32 = 1;
 
 const MAGIC: u8 = 0xB5;
 
+/// Enum tag this codec will never write. Earlier revisions encoded
+/// unknown `ObjectType` / `ProtocolKind` variants as this value, which
+/// persisted rows nothing could decode; encoding now panics instead
+/// (see `encode_obj_type`). Decoding still maps the tag to
+/// `Error::SchemaIncompatible` so rows written by such a revision heal
+/// through the schema-clear path rather than stranding the account.
+const TAG_RESERVED: u8 = 0xFF;
+
 /// Envelope kind tag. The migration dispatcher uses this to pick the
 /// right fixup chain when `MIN_MIGRATABLE < ENGINE_VERSION` eventually.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,15 +300,19 @@ fn encode_obj_type(ty: ObjectType) -> u8 {
         ObjectType::EmailSubmission => OBJTYPE_EMAIL_SUBMISSION,
         ObjectType::CalendarEvent => OBJTYPE_CALENDAR_EVENT,
         ObjectType::ContactGroup => OBJTYPE_CONTACT_GROUP,
-        // `ObjectType` is `#[non_exhaustive]`; reserve 0xFF for any
-        // future variant the envelope codec does not yet know about so
-        // decoding fails loudly rather than silently aliasing onto an
-        // existing tag.
-        _ => 0xFF,
+        // `ObjectType` is `#[non_exhaustive]`; panic rather than
+        // writing the reserved tag, which would persist a durable row
+        // this engine can never decode. Same rule as `encode_scope`:
+        // the codec must learn a variant before a cursor carrying it
+        // can be stored.
+        _ => panic!("cursor envelope: unknown object type variant"),
     }
 }
 
 fn decode_obj_type(tag: u8) -> Result<ObjectType, Error> {
+    if tag == TAG_RESERVED {
+        return Err(Error::SchemaIncompatible);
+    }
     match tag {
         OBJTYPE_EMAIL => Ok(ObjectType::Email),
         OBJTYPE_MAILBOX => Ok(ObjectType::Mailbox),
@@ -333,13 +345,16 @@ fn encode_protocol(p: ProtocolKind) -> u8 {
         ProtocolKind::CardDav => PROTOCOL_CARDDAV,
         ProtocolKind::CalDav => PROTOCOL_CALDAV,
         ProtocolKind::Graph => PROTOCOL_GRAPH,
-        // `ProtocolKind` is `#[non_exhaustive]`; future variants
-        // surface as the reserved 0xFF tag so decoding fails loudly.
-        _ => 0xFF,
+        // `ProtocolKind` is `#[non_exhaustive]`; see `encode_obj_type`
+        // for why an unknown variant is a panic and not a reserved tag.
+        _ => panic!("cursor envelope: unknown protocol variant"),
     }
 }
 
 fn decode_protocol(tag: u8) -> Result<ProtocolKind, Error> {
+    if tag == TAG_RESERVED {
+        return Err(Error::SchemaIncompatible);
+    }
     match tag {
         PROTOCOL_JMAP => Ok(ProtocolKind::Jmap),
         PROTOCOL_IMAP => Ok(ProtocolKind::Imap),
