@@ -23,7 +23,7 @@ use super::capabilities;
 use super::discover;
 use super::foreign;
 use super::mutation;
-use super::push::{ReconnectPolicy, WsState};
+use super::push::{PushRouting, ReconnectPolicy, WsState};
 use super::state;
 
 type MailAccount = JmapMailAccount<ReqwestTransport>;
@@ -278,11 +278,17 @@ impl AccountFactory for JmapAccountFactory {
             let (caps, limits) = capabilities::build(&session, support)?;
 
             let shutdown = CancellationToken::new();
+            // Snapshot of who this session syncs: push notifications are
+            // keyed by accountId (RFC 8620 s7.1) and the reader routes a
+            // foreign account's Email changes onto its seeded `Folder`
+            // scopes instead of the primary type scope.
+            let push_routing = Arc::new(PushRouting::new(primary_id.clone(), seed_states.keys()));
             let ws = WsState::spawn(
                 client.clone(),
                 caps.push_in_process(),
                 shutdown.clone(),
                 config.reconnect_policy,
+                push_routing,
             );
 
             let account = JmapAccount::new(

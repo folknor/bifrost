@@ -25,14 +25,69 @@ pub(crate) fn set_flags(
     op: FlagOp,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
-    mutation_stream(
-        mail,
-        limits,
-        email_states,
-        account_id,
-        targets,
-        MutationKind::Flags(op),
-    )
+    match &op {
+        FlagOp::Add(flags) | FlagOp::Remove(flags) if flags.is_empty() => {
+            skipped_flag_stream(targets, limits)
+        }
+        FlagOp::Patch { add, remove } if add.is_empty() && remove.is_empty() => {
+            skipped_flag_stream(targets, limits)
+        }
+        FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) | FlagOp::Patch { .. } => {
+            mutation_stream(
+                mail,
+                limits,
+                email_states,
+                account_id,
+                targets,
+                MutationKind::Flags(op),
+            )
+        }
+        _ => Box::pin(async_stream::stream! {
+            yield super::error::terminated_unsupported(
+                AccountOperation::UpdateFlags,
+                None,
+                "JMAP does not support this FlagOp variant",
+            );
+        }),
+    }
+}
+
+/// An empty additive/subtractive flag operation is an intentional local
+/// no-op. Preserve one outcome per target, but never send `{}` patches that a
+/// server would acknowledge as if a mutation had been applied.
+fn skipped_flag_stream(
+    mut targets: AccountStream<ObjectId>,
+    limits: CoreLimits,
+) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
+    Box::pin(async_stream::stream! {
+        let batch_size = limits.max_objects_in_set.clamp(1, 500);
+        let mut items = Vec::with_capacity(batch_size);
+        while let Some(id) = targets.next().await {
+            items.push(ItemOutcome::Succeeded(BatchSuccess::new(
+                BatchItemId(id.0),
+                MutationSuccess::Skipped,
+            )));
+            if items.len() >= batch_size {
+                yield SyncEvent::Batch(Batch {
+                    items: std::mem::take(&mut items),
+                    page_boundary: PageBoundary::Page,
+                    server_latency: std::time::Duration::ZERO,
+                    bytes_in: 0,
+                    checkpoint: None,
+                });
+            }
+        }
+        if !items.is_empty() {
+            yield SyncEvent::Batch(Batch {
+                items,
+                page_boundary: PageBoundary::Page,
+                server_latency: std::time::Duration::ZERO,
+                bytes_in: 0,
+                checkpoint: None,
+            });
+        }
+        yield SyncEvent::Done(None);
+    })
 }
 
 pub(crate) fn move_to(
@@ -472,31 +527,33 @@ mod tests {
         );
     }
 
-    // BUG, documented rather than endorsed. An empty flag set produces an
-    // EMPTY patch object. `Email/set` accepts `{"m1": {}}` as a valid
-    // no-op update and answers with `updated: {"m1": null}`, so
-    // `apply_batch` reports `MutationSuccess::Applied` for every id in the
-    // batch while nothing changed. The same shape is reachable through
-    // `FlagOp::Add(empty)`, `Remove(empty)`, `Patch{empty, empty}`, and
-    // through any future `FlagOp` variant, which `apply_flags` swallows in
-    // its `_ => {}` arm.
-    //
-    // Fix: reject an operation that produces no patch at the boundary
-    // (`Request(Malformed)`), or short-circuit it to a successful no-op
-    // without a round trip - either is honest; reporting `Applied` for an
-    // unrecognized operation is not.
-    #[test]
-    fn an_empty_flag_op_sends_an_empty_patch_that_reads_back_as_success() {
-        let body = set_body(
-            &MutationKind::Flags(FlagOp::Add(std::collections::HashSet::new())),
-            &["m1"],
-            "s1",
+    #[tokio::test]
+    async fn an_empty_flag_op_short_circuits_to_skipped_outcomes() {
+        let targets: AccountStream<ObjectId> = Box::pin(futures::stream::iter([
+            ObjectId("m1".into()),
+            ObjectId("m2".into()),
+        ]));
+        let mut stream = skipped_flag_stream(
+            targets,
+            CoreLimits {
+                max_objects_in_get: 1,
+                max_objects_in_set: 1,
+            },
         );
-        assert_eq!(
-            body["update"]["m1"],
-            serde_json::json!({}),
-            "an empty add is an empty patch, which the server accepts as a no-op update"
-        );
+
+        for expected in ["m1", "m2"] {
+            match stream.next().await {
+                Some(SyncEvent::Batch(batch)) => match &batch.items[..] {
+                    [ItemOutcome::Succeeded(success)] => {
+                        assert_eq!(success.item.0, expected);
+                        assert_eq!(success.output, MutationSuccess::Skipped);
+                    }
+                    other => panic!("expected one skipped outcome, got {other:?}"),
+                },
+                other => panic!("expected skipped batch, got {other:?}"),
+            }
+        }
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
     }
 
     #[test]

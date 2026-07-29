@@ -1,7 +1,8 @@
 # bifrost-jmap `core/` + `sync/` sweep
 
-Scope: `crates/jmap/src/core/**` and `crates/jmap/src/sync/**` only. Edits
-confined to those trees; everything outside is reported, not touched.
+Scope: implementation fixes are confined to `crates/jmap/src/core/**` and
+`crates/jmap/src/sync/**`; supporting plans and references track their current
+state.
 
 Read first: `reference/jmap.md`, `reference/error-model.md`,
 `plans/bug-hunt-2026-06-17.md`, `plans/jmap/*`. Nothing below re-reports a
@@ -104,185 +105,6 @@ so `Field::Null` is expressible and distinct from `Field::Omitted`. Until then
 `container_move(_, None)` should not report success; but the honest fix is the
 field type, not a guard at the call site.
 
-### B3 - Foreign inventory (and full primary inventory) truncate on the first short page
-
-**Where:** `sync/inventory.rs::foreign_email_inventory` (90-211) and
-`sync/inventory.rs::email_inventory` (248-360).
-
-**Mechanism.** Both loops do:
-
-```
-let ids = query_response.ids().to_vec();      // from Email/query
-...
-let items = <hydrated from Email/get>;
-let batch_len = items.len();                  // HYDRATED count
-if batch_len < limit { yield Done; break }
-position += batch_len;
-```
-
-`batch_len` counts objects `Email/get` returned, not ids `Email/query`
-returned. It is smaller than `limit` in two routine cases:
-
-1. The server caps its query page below `maxObjectsInGet`. This is not
-   hypothetical - `email_inventory_page` (362-515) exists precisely because of
-   it and says so in its own comment: *"a server whose query page cap is below
-   the requested window width (saehrimnir caps queries below its get cap)
-   returns fewer ids than asked for, and the orchestrator reads a short window
-   as end-of-inventory and silently drops every later page."*
-2. An id vanished between the query and the get (it lands in `notFound`, which
-   both loops discard). `email_inventory_page` also names this: *"advance by
-   the number of ids consumed from the query - not by the count of hydrated
-   objects, which can be smaller when an id vanished between query and get."*
-
-So the fix landed in the *partitioned* path and not in the two *unpartitioned*
-paths that share the identical shape.
-
-**Path to failure.** A shared mailbox with 5000 messages, `maxObjectsInGet =
-256`, server query page cap 100. `foreign_email_inventory` asks for 256, gets
-100 ids, hydrates 100, sees `100 < 256`, yields `SyncEvent::Done(None)`. The
-engine records a complete inventory. 4900 messages in that shared folder are
-never enumerated, and nothing reports an error. `inventory_partitioning`
-returns `Full` for every non-`Type(Email)` scope, so **every** foreign
-(shared/delegate) scope takes this path unconditionally - the truncation is
-guaranteed on such a server, not merely possible.
-
-The same holds for `email_inventory` whenever the engine chooses
-`InventoryPartition::Full` for the primary Email scope. A single deleted
-message racing the backfill is enough to end it early.
-
-**Proposed fix.** Port the `email_inventory_page` logic into both loops:
-advance `position` by `ids.len()`, and terminate only on an *empty query page*,
-never on a short hydration batch. Optionally surface the `Email/get`
-`notFound` ids so a vanished message is a per-item signal rather than silence.
-
-### B4 - WebSocket push discards the `accountId`, so shared-account pushes invalidate the primary scope
-
-**Where:** `sync/push.rs::emit_push` (291-322).
-
-**Mechanism.** RFC 8620 s7.1 shapes `StateChange.changed` as
-`{accountId: {DataType: newState}}`. `emit_push` iterates
-`changed.values()` and never looks at the key. Every `Email` state change,
-whoever it belongs to, becomes
-`HintPayload::SpecificCursorScope(CursorScope::Type(ObjectType::Email))` -
-the *primary* account's scope.
-
-**Path to failure.** A delegate drops a message into a shared mailbox
-`acct-foreign`. The server pushes
-`{"changed": {"acct-foreign": {"Email": "s2"}}}`. The engine is told the
-primary `Type(Email)` scope is invalid, repolls the primary account's
-`Email/changes` (which returns nothing new), and never repolls the
-`Folder(acct-foreign, *)` scopes. The shared mailbox stays stale until the
-next account reopen - which is exactly the failure push exists to prevent.
-The primary scope also eats a spurious poll for a change that did not happen
-in it.
-
-**Proposed fix.** Thread the accountId through `emit_push`. When it names a
-registered foreign account, emit one `SpecificCursorScope` hint per seeded
-`Folder(accountId, *)` scope (or a single `SpecificMembership(Mailbox(accountId))`
-hint if the engine's covering rule accepts the owner tag); when it names the
-primary account, keep today's behavior. `emit_push` currently takes only
-`(PushObject, &Sender)`, so it needs the foreign registry - the reader loop
-already holds a `Client` and could hold an `Arc<HashMap<String, _>>` alongside
-`enabled`.
-
-Pinned by `a_foreign_account_state_change_is_announced_as_a_primary_scope_change`
-in `sync/push.rs` (documents current behavior, explicitly labelled a bug).
-
-### B5 - A foreign `Folder` scope cannot be push-subscribed at all
-
-**Where:** `sync/push.rs::data_type_for_scope` (149-156), consumed by
-`push::subscribe` (106-117).
-
-**Mechanism.** `data_type_for_scope` returns `Some(_)` only for
-`Type(Email|Mailbox|Thread)`. `CursorScope::Folder(_)` falls into `_ => None`.
-`subscribe` filter-maps the caller's scopes and then hard-errors when the
-resulting set is empty.
-
-**Path to failure.** An engine that subscribes per scope calls
-`push_subscribe(&[Folder(acct-9 + inbox)])`. It gets back
-`Unsupported("JMAP push subscribe requires at least one supported scope")`,
-so the consumer records "push unavailable" for that scope. A mixed call
-(`[Type(Email), Folder(...)]`) succeeds but silently drops the foreign half,
-which then never appears in the `enabled` union either.
-
-This compounds B4: even if `emit_push` were fixed to route by account, nothing
-would be subscribed for the foreign scopes to begin with. JMAP WebSocket push
-is subscribed *per DataType* and delivered for every visible account, so
-`Folder(_)` should simply map to `DataType::Email`.
-
-**Proposed fix.** `CursorScope::Folder(_) => Some(DataType::Email)` in
-`data_type_for_scope`. `scope_for_data_type` stays as-is (it is the reverse
-map used for hints, and B4's fix supersedes it).
-
-Pinned by `a_foreign_folder_scope_maps_to_no_push_data_type`.
-
-### B6 - `scope_lifecycle` advances the mailbox state before hydrating names, so a transient failure loses folder events permanently
-
-**Where:** `sync/discover.rs::scope_lifecycle` (138-183).
-
-**Mechanism.** Order of operations inside the `Ok(response)` arm:
-
-```
-let created  = response.created().to_vec();
-let updated  = response.updated().to_vec();
-state_cache::set(&mailbox_states, &account_id, response.new_state());  // line 143
-if (...) && let Ok(fetched) = fetch_mailboxes(&mail, created.chain(updated)).await  // 147
-```
-
-The since-state is committed *before* the follow-up `Mailbox/get`, and the
-`if let Ok` swallows every failure of that get.
-
-**Path to failure.** The user creates a folder "Receipts" on their phone.
-`Mailbox/changes` reports `created: ["mb-9"]` and `newState: "s2"`.
-`state_cache::set` writes `s2`. The follow-up `Mailbox/get` for `mb-9` hits a
-503 (or a connection reset, or a rate limit). `if let Ok(...)` skips the whole
-block, no `ScopeLifecycle::Created` is emitted, and the next poll asks for
-changes *since s2* - which no longer includes `mb-9`. The folder is invisible
-to the consumer until the account is reopened. The event is not delayed; it is
-gone.
-
-Note the poll interval is 300s, so "until reopen" can be a very long time.
-
-**Proposed fix.** Move `state_cache::set` after the successful fetch, and
-classify the `fetch_mailboxes` error through `into_account_error` instead of
-discarding it: `continue` without advancing on a retry class, and emit
-`ScopeLifecycleEvent::Terminated` on a terminal class. Destroyed ids come
-straight off the changes response and can be emitted before the fetch.
-
-### B7 - `scope_lifecycle` reports a rename on every mailbox update
-
-**Where:** `sync/discover.rs::scope_lifecycle` (165-181).
-
-**Mechanism.**
-
-```
-let old_name = replace_mailbox_name(&mailbox_names, id.clone(), name).await;
-if old_name.is_some() {
-    yield ScopeLifecycle::Renamed { old: scope.clone(), new: scope };
-}
-```
-
-`replace_mailbox_name` is `HashMap::insert`, which returns the *previous
-value* - `Some(_)` for any mailbox already in the map, whether or not the name
-changed. The new name is never compared to the old one.
-
-**Path to failure.** A message arrives in the Inbox. `Mailbox/changes` reports
-`updated: ["mb-inbox"]` (RFC 8621 s2.4 lets the server report a mailbox
-updated when only its counts changed - and `ChangesResponse::updated_properties`
-exists in `mailbox/mod.rs` precisely to describe that case, though this code
-never reads it). The follow-up get returns name "Inbox". `insert` returns
-`Some("Inbox")`. A `ScopeLifecycle::Renamed { old: Mailbox(mb-inbox), new:
-Mailbox(mb-inbox) }` is emitted. Every incoming message produces a spurious
-folder-rename event, and `old == new` so the event carries no information even
-when the rename is real.
-
-**Proposed fix.** Emit only when `old_name.as_deref() != Some(name.as_str())`.
-Additionally consider gating the whole created/updated fetch on
-`response.updated_properties()` containing something other than the count
-properties (`Property::is_count` already exists for this and is currently
-unused by the lifecycle worker) - that removes the `Mailbox/get` round trip
-entirely for the count-only case.
-
 ### B8 - `Response::get` matches on the call id only; the method name is never checked
 
 **Where:** `core/response.rs::get` (31-49); the handle field it ignores is
@@ -343,6 +165,20 @@ filtering the changes call"* - but `email_changes` emits only
 mechanism the comment names does not exist, so nothing tells the engine which
 of the 12 folders the message actually landed in.
 
+**Interaction with push routing (added after the routing fix landed).**
+`push.rs::emit_state_change` now routes a foreign `StateChange` onto one exact
+`SpecificCursorScope` hint per seeded `Folder(accountId, *)` scope, because
+that is the only correct answer while the cursor topology is per-mailbox: JMAP
+state is per-(accountId, type), so all M of that account's cursors really did
+move, and hinting fewer would leave cursors stale. The consequence is that a
+single foreign push now drives M change-stream passes for an M-mailbox share -
+the fanout is *correct*, but it pays B9's pre-existing O(mailboxes) wire cost
+once per notification rather than once per poll interval, so B9's cost is now
+push-rate-driven. Whoever takes B9 should weigh the two together: option (a)
+below collapses the topology to one `Folder` scope per foreign account, which
+collapses the push fanout to a single hint at the same time. Option (b) keeps
+the fanout as-is. This is an argument for (a), not a new bug.
+
 **Proposed fix.** Two options, both larger than a patch:
 (a) seed one `Folder` scope per foreign *account* rather than per mailbox, and
     derive per-mailbox membership from the hydrated `mailboxIds`; or
@@ -351,63 +187,6 @@ of the 12 folders the message actually landed in.
     becomes true and the engine can attribute the change.
 Either way the comment must stop describing behavior the code does not have.
 This is a design call, not a mechanical fix.
-
-### B10 - An empty or unrecognized `FlagOp` sends an empty patch and is reported as applied
-
-**Where:** `sync/mutation.rs::apply_flags` (312-337), consumed by `send_set`
-(284-310) and `apply_batch` (140-232).
-
-**Mechanism.** `apply_flags` writes into an `EmailPatch` obtained from
-`set.update(id)`. `FlagOp::Add(empty_set)` writes nothing; the `_ => {}` arm
-(there for `FlagOp`'s `#[non_exhaustive]`) writes nothing either. The patch
-serializes to `{}`. `Email/set` accepts `{"update": {"m1": {}}}` as a valid
-no-op and answers `updated: {"m1": null}`. `apply_batch` reads that through
-`response.updated(&email_id)` and emits
-`ItemOutcome::Succeeded(MutationSuccess::Applied)` for every id.
-
-**Path to failure.** A future `FlagOp` variant (the type is
-`#[non_exhaustive]` precisely to allow one) reaches this Account impl. Every
-target is reported `Applied`, the engine's read-back guard sees flags it never
-asked to change, and the mutation is silently dropped. The same shape is
-reachable today via `FlagOp::Add(HashSet::new())`, `Remove(empty)`, and
-`Patch { add: empty, remove: empty }`.
-
-**Proposed fix.** Have `apply_flags` return whether it produced any patch
-entry; an operation that produced none is either a boundary rejection
-(`Request(Malformed)` for an unknown variant) or a short-circuited local
-success (for a genuinely empty set) - both are honest, and `Applied` for an
-unhandled operation is not.
-
-Pinned by `an_empty_flag_op_sends_an_empty_patch_that_reads_back_as_success`
-in `sync/mutation.rs` (documents current behavior, explicitly labelled a bug).
-
-### B11 - The push reader task does not race the shutdown token against its blocking reads
-
-**Where:** `sync/push.rs::reader_loop` (204-281).
-
-**Mechanism.** `shutdown.is_cancelled()` is polled at the top of the reconnect
-loop and after each received message, but the two places the task actually
-parks are not raced against it:
-
-- `futures::StreamExt::next(&mut ws).await` (224) - blocks until the server
-  sends something or the socket errors.
-- `tokio::time::sleep(backoff).await` (278) - up to `policy.max` (60s by
-  default).
-
-**Path to failure.** `JmapAccount::close()` cancels the token and awaits
-`disable_push_ws()`. If the socket is already gone (the common case - the
-account is closing because the connection dropped), the reader is sitting in
-`sleep(60s)` and keeps the `Client`, its `AccountNet` handle, and the
-broadcast sender alive for up to a minute past close. On a reopen loop that
-churns accounts, reader tasks accumulate. `reference/jmap.md` states
-*"`close()` cancels the shutdown token (terminating the WebSocket reader and
-in-flight streams)"* - the reader is not terminated, only asked.
-
-**Proposed fix.** Wrap both awaits in `tokio::select!` against
-`shutdown.cancelled()`, matching the pattern `push::stream` already uses
-(62-87). Low risk, both sites are cancel-safe.
-
----
 
 ## 2. Gaps and smells
 
@@ -595,11 +374,9 @@ factory's variant). `Client<T>` and `Account<Tr>` are both generic over
 `HttpTransport`, and `Client::with_transport` is `pub(crate)` - the seam
 exists and the sync layer opts out of it.
 
-Consequence for this sweep: B2 (silent no-op move), B3 (inventory
-truncation), B6 (lost lifecycle events), B9 (duplicate change fan-out), and
-B10's read-back half are all *behavioral* bugs in async streams that a stub
-transport would pin in a dozen lines each, and none of them can be tested
-today. I could only pin their pure sub-parts.
+Consequence for the remaining stream bugs, notably B2 and B9: their async
+behavior cannot be pinned with an in-process transport stub without a
+mechanical genericization across the sync tree.
 
 Making the alias a generic parameter (`fn stream<Tr: HttpTransport>(mail:
 Account<Tr>, ...)`) is mechanical but touches every file in the tree, so it
@@ -607,183 +384,14 @@ is a decision rather than a drive-by. It is the single highest-leverage change
 available for this crate's testability, and the `core/tests.rs` stub I landed
 is the working proof that the transport seam holds.
 
-### O3 - `inventory.rs` re-collects ids it already owns
-
-`let ids = query_response.ids().to_vec();` then `.ids(ids.clone())` in both
-`email_inventory` (281-288) and `foreign_email_inventory` (129-136). The clone
-is only needed because `batch_len`/`consumed` is read afterwards; taking
-`ids.len()` first removes both the `to_vec` and the `clone` on the hot
-backfill path. Small, but it is per page of every backfill.
-
----
+Partially worked around in `push.rs` only: the reader now drives the client
+through a two-method `PushTransport` trait, which is what lets its shutdown
+and timeout behavior be pinned hermetically. That is a local seam for one
+file, not a substitute for genericizing the tree.
 
 ## 4. Doc contradictions found
 
-1. `reference/jmap.md:46` - *"`CallHandle<M>` validates call_id and method
-   name"*. It validates the call id only. See B8.
-2. `reference/jmap.md:171` - *"`close()` cancels the shutdown token
-   (terminating the WebSocket reader ...)"*. The reader is not terminated
-   promptly; it parks on an unraced read or sleep. See B11.
-3. `sync/changes.rs:94-99` - the comment claims foreign per-mailbox
-   membership *"rides on the change items' scope changes"*. No `ScopeChange`
-   is ever emitted on that path. See B9.
-4. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts
-   are not open-time discovery. They are. See G1.
-5. `reference/jmap.md:217` - the short-page discipline is described as a
-   property of the Email inventory generally; it holds only in
-   `email_inventory_page`. See B3.
-6. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported
-   without noting that discovery never offers the scope. See G2.
-
-I did not edit `reference/jmap.md`: it is outside my scope, and per the
-project rule the doc update should ride with whichever fix commit lands.
-
----
-
-## 5. Tests landed
-
-All deterministic and in-process. No listener, no port, no daemon, no clock
-dependence.
-
-**`crates/jmap/src/core/tests.rs`** - new `mod envelope`, built on a stub
-`HttpTransport` (`StubTransport`) that records the exact JSON body the client
-would have POSTed and replays a FIFO of canned replies. This is the
-request/response envelope's first test coverage.
-
-- `request_serializes_using_method_calls_and_injected_account_id` - the RFC
-  8620 3-tuple encoding, `using` seeded with core, `createdIds` omitted when
-  unset, and `accountId` injected by `Request::call` rather than by the method
-  constructor.
-- `using_accumulates_each_capability_exactly_once` - a Mail-capability method
-  between two Core ones appends `urn:ietf:params:jmap:mail` once; call ids are
-  positional and monotonic. (Needed a second test method on a different
-  capability - `TestMailGet` - since every pre-existing test method rides
-  Core, which `Request::new` already seeds.)
-- `account_scoped_and_explicitly_overridden_account_ids_reach_the_wire` -
-  `Account::build` stamps the capability's primary account; an explicit
-  `Request::account_id` beats the client default.
-- `send_methods_batches_in_order_and_returns_typed_responses` - one batch is
-  one round trip, tuple order matches call order.
-- `responses_returned_out_of_order_still_match_their_handles` - extraction is
-  by call id, not by position (RFC 8620 permits any response order).
-- `result_references_serialize_as_hash_prefixed_arguments` - `#ids` shape and
-  the mutual exclusion with literal `ids`.
-- `a_diverging_session_state_marks_the_cached_session_stale` - both
-  directions of the `session_updated` flag.
-- `a_transport_failure_surfaces_as_error_transport` and
-  `an_unparseable_response_body_is_a_response_decode_error` - the
-  transport-vs-decode error split is not laundered.
-- `response_get_matches_the_call_id_only_and_ignores_the_method_name` -
-  **documents B8, does not endorse it.**
-
-**`crates/jmap/src/sync/push.rs`** - new test module (the file had none).
-
-- `a_primary_email_state_change_invalidates_the_email_cursor_scope`,
-  `a_data_type_with_no_cursor_scope_degrades_to_an_unknown_hint`,
-  `a_grouped_push_fans_out_to_one_event_per_entry` - `emit_push` projection.
-- `a_foreign_account_state_change_is_announced_as_a_primary_scope_change` -
-  **documents B4, does not endorse it.**
-- `a_foreign_folder_scope_maps_to_no_push_data_type` - **documents B5, does
-  not endorse it.**
-- `data_type_and_scope_mappings_are_inverse_for_the_supported_types`,
-  `the_enabled_data_type_union_spans_every_live_subscription`.
-- `the_push_stream_ends_when_the_shutdown_token_is_cancelled` and
-  `a_lagged_broadcast_slot_coalesces_into_an_unknown_invalidation` - the
-  subscriber's two contract points, driven through a real `broadcast` channel
-  and a real `CancellationToken`.
-
-**`crates/jmap/src/sync/changes.rs`** - new test module (the file had none).
-
-- `primary_change_ids_stay_bare`, `foreign_change_ids_carry_their_owning_account`,
-  `an_empty_change_list_yields_no_changes` - the foreign id-qualification on
-  the changes leg, which is what makes a changed shared message hydrate
-  against its owning account.
-- `every_supported_scope_can_build_its_checkpoint_cursor` - `checkpoint_for`
-  unwraps, so every scope reachable from a change loop (including the
-  codec-encoded foreign `Folder` shape) must encode and decode again.
-
-**`crates/jmap/src/sync/mutation.rs`** - added to the existing module.
-
-- `every_batch_is_gated_by_if_in_state` - the `MutationConcurrency::StateBased`
-  claim in `capabilities.rs` is actually on the wire.
-- `flag_add_and_remove_use_dotted_keyword_paths` - RFC 8620 s5.3 removal is an
-  explicit `null` key, not `false` and not an omission.
-- `flag_set_replaces_the_whole_keyword_map`,
-  `a_flag_patch_applies_removals_after_additions`,
-  `a_multi_id_batch_carries_one_update_entry_per_id`,
-  `a_move_assigns_the_destination_as_the_only_mailbox`.
-- `an_empty_flag_op_sends_an_empty_patch_that_reads_back_as_success` -
-  **documents B10, does not endorse it.**
-
-**`crates/jmap/src/sync/state.rs`** - added to the existing module.
-
-- `rejects_a_cursor_whose_payload_scope_disagrees_with_its_envelope` and
-  `a_folder_scope_naming_a_different_mailbox_is_also_rejected` - the
-  `decode_cursor` scope-equality guard, which had no coverage.
-- `an_unsupported_scope_cannot_be_encoded_at_all` - a `FolderId` with no
-  foreign separator has no account to route to and must not mint a cursor.
-
-**`crates/jmap/src/sync/hydrate.rs`** - added to the existing module.
-
-- `each_projection_requests_the_properties_it_actually_reads` - dropping
-  `Keywords` from `FlagsOnly` would hydrate every message with an empty flag
-  set instead of failing; `Metadata` must request exactly
-  `inventory_properties()` or hydrated and inventory fingerprints diverge.
-- `a_foreign_route_and_a_primary_route_never_share_a_batch_buffer` - the
-  `HydrationRoute` keys `stream`'s per-request buffers, so they must not
-  compare equal.
-
-**Deliberately not duplicated.** `crates/jmap/src/tests.rs` (another agent's
-file) already pins the `MailboxPatch::default()` / `parent_id(None)` wire
-shapes, including a verbatim replay of the `container_rename` construction.
-Adding the same assertions under `sync/` would be redundant, so B1 and B2 are
-reported here with their sync-side consequences and left pinned there.
-
----
-
-## 6. Not done, and why
-
-- **No test for B2, B3, B6, B7, B9, B11.** Every one of them lives inside an
-  `async_stream` that takes a concrete
-  `Account<ReqwestTransport>`. There is no seam to inject a stub through
-  without changing the nine `type MailAccount = ...` aliases in `sync/`,
-  which is a structural change, not a test. See O2 - unblocking this is the
-  highest-value follow-up in the crate. I pinned the pure sub-parts I could
-  reach (`emit_push`, `object_changes`, `apply_flags`, `properties_for_projection`,
-  `checkpoint_for`, the cursor guards) and left the stream bodies uncovered.
-
-- **`sync/error.rs` (68 KB) not audited.** It has the largest existing test
-  module in the tree and `reference/error-model.md` plus
-  `plans/bug-hunt-2026-06-17.md` both indicate it was worked over recently. I
-  read its call sites from the streams rather than the mapping table itself.
-  A dedicated pass on the `(AccountErrorKind, Cause) -> RecoveryClass`
-  routing against `error-model.md` is still owed.
-
-- **`sync/calendar_ops.rs` (69 KB) and `sync/contacts.rs` (35 KB) not
-  audited.** In scope by directory, but they are PIM surfaces layered on the
-  same primitives rather than the request/cursor/change machinery the task
-  named, and both already carry test modules. Reading them properly needs the
-  JSCalendar / JSContact mappings in `reference/jmap.md` s"PIM primitives"
-  cross-checked against the RFCs, which is its own sweep.
-
-- **`sync/pim.rs` (121 KB) audited selectively.** I read the container CRUD,
-  identity, role resolution, foreign owner-email gate, and hydration
-  qualification. The send / draft / scheduled-send / search / filters legs I
-  read only far enough to confirm the `role_mailboxes` dependency chain for
-  B1. The send path in particular (result-referenced `Email/set` +
-  `EmailSubmission/set` + `onSuccessUpdateEmail`) deserves its own read.
-
-- **`sync/filters.rs` and `sync/foreign.rs` not re-audited.** `foreign.rs` is
-  small, pure, and already well covered. `filters.rs` is a thin Sieve mapping
-  with an existing test module and no cross-cutting invariants.
-
-- **`core/query.rs`, `core/copy.rs`, `core/parse.rs`, `core/changes.rs`,
-  `core/query_changes.rs` read but not deeply audited.** No defect surfaced on
-  the read; the request-envelope work took the budget. `core/session.rs`
-  I read in full (it is load-bearing for the test fixtures) and found nothing
-  beyond G5, which lives in `client.rs`.
-
-- **Nothing outside `core/` and `sync/` was edited.** The B1/B2 fixes both
-  belong in `mailbox/mod.rs` and `identity/mod.rs`; B8's fix is one line in
-  `core/response.rs` and is in scope, but it is a fix, not a test, so it is
-  reported rather than applied per the task's split.
+1. `reference/jmap.md:46` - *`CallHandle<M>` validates call_id and method name*. It validates the call id only. See B8.
+2. `sync/changes.rs:94-99` - the comment claims foreign per-mailbox membership *"rides on the change items' scope changes"*. No `ScopeChange` is ever emitted on that path. See B9.
+3. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
+4. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.

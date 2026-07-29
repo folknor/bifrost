@@ -131,9 +131,13 @@ fn foreign_email_inventory(
                 yield SyncEvent::Done(None);
                 break;
             }
+            // Position is in the query result space, not the hydrated
+            // result space. A server may cap Email/query below this request's
+            // limit, and an id can disappear between query and get.
+            let consumed = ids.len();
 
             let get_response = mail
-                .call(EmailGet::new().ids(ids.clone()).properties(inventory_properties()))
+                .call(EmailGet::new().ids(ids).properties(inventory_properties()))
                 .await;
 
             let get_response = match get_response {
@@ -179,12 +183,7 @@ fn foreign_email_inventory(
                 });
             }
 
-            if batch_len < limit {
-                yield SyncEvent::Done(None);
-                break;
-            }
-
-            let advance = match i32::try_from(batch_len) {
+            let advance = match i32::try_from(consumed) {
                 Ok(value) => value,
                 Err(_) => {
                     yield super::error::terminated_contract_violation(
@@ -283,9 +282,12 @@ fn email_inventory(
                 yield SyncEvent::Done(None);
                 break;
             }
+            // See the corresponding foreign-inventory loop: only an empty
+            // query page means end-of-inventory.
+            let consumed = ids.len();
 
             let get_response = mail
-                .call(EmailGet::new().ids(ids.clone()).properties(inventory_properties()))
+                .call(EmailGet::new().ids(ids).properties(inventory_properties()))
                 .await;
 
             let get_response = match get_response {
@@ -319,12 +321,7 @@ fn email_inventory(
                 });
             }
 
-            if batch_len < limit {
-                yield SyncEvent::Done(None);
-                break;
-            }
-
-            let advance = match i32::try_from(batch_len) {
+            let advance = match i32::try_from(consumed) {
                 Ok(value) => value,
                 Err(_) => {
                     // Pagination shape mismatch: the server returned a

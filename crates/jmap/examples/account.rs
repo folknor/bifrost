@@ -21,6 +21,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .reconnect_policy(ReconnectPolicy {
             initial: Duration::from_secs(1),
             max: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(20),
         })
         .build(),
     );

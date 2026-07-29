@@ -140,47 +140,68 @@ pub(crate) fn scope_lifecycle(
                     let created = response.created().to_vec();
                     let updated = response.updated().to_vec();
                     let destroyed = response.destroyed().to_vec();
-                    state_cache::set(&mailbox_states, &account_id, response.new_state().to_string())
-                        .await;
+                    let new_state = response.new_state().to_string();
 
-                    if (!created.is_empty() || !updated.is_empty())
-                        && let Ok(fetched) =
-                            fetch_mailboxes(&mail, created.iter().chain(&updated)).await
-                    {
-                            for mailbox in fetched {
-                                let id = mailbox.id().map(ToString::to_string);
-                                let name = mailbox.name().unwrap_or("").to_string();
-                                let Some(id) = id else {
-                                    continue;
-                                };
-
-                                if created
-                                    .iter()
-                                    .any(|created_id| created_id.as_str() == id.as_str())
+                    let fetched = if !created.is_empty() || !updated.is_empty() {
+                        match fetch_mailboxes(&mail, created.iter().chain(&updated)).await {
+                            Ok(fetched) => fetched,
+                            Err(err) => {
+                                let acct = super::error::into_account_error(
+                                    err,
+                                    super::error::JmapErrorContext::new(
+                                        bifrost_types::AccountOperation::ScopeLifecycle,
+                                    ),
+                                );
+                                if acct.recovery().is_terminal()
+                                    || acct.recovery().requires_engine_action()
                                 {
-                                    update_mailbox_name(&mailbox_names, id.clone(), name).await;
-                                    yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(MembershipScope::Mailbox(
-                                        bifrost_types::MailboxId(id),
-                                    )));
-                                } else {
-                                    let old_name = replace_mailbox_name(
-                                        &mailbox_names,
-                                        id.clone(),
-                                        name,
-                                    )
-                                    .await;
-                                    if old_name.is_some() {
-                                        let scope = MembershipScope::Mailbox(
-                                            bifrost_types::MailboxId(id),
-                                        );
-                                        yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
-                                            old: scope.clone(),
-                                            new: scope,
-                                        });
-                                    }
+                                    yield ScopeLifecycleEvent::Terminated(acct);
+                                    break;
                                 }
+                                // Do not advance the changes state: retrying
+                                // this response is the only way to preserve
+                                // the created/renamed lifecycle event.
+                                tokio::time::sleep(Duration::from_secs(300)).await;
+                                continue;
                             }
                         }
+                    } else {
+                        Vec::new()
+                    };
+
+                    for mailbox in fetched {
+                        let id = mailbox.id().map(ToString::to_string);
+                        let name = mailbox.name().unwrap_or("").to_string();
+                        let Some(id) = id else {
+                            continue;
+                        };
+
+                        if created
+                            .iter()
+                            .any(|created_id| created_id.as_str() == id.as_str())
+                        {
+                            update_mailbox_name(&mailbox_names, id.clone(), name).await;
+                            yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Created(MembershipScope::Mailbox(
+                                bifrost_types::MailboxId(id),
+                            )));
+                        } else {
+                            let old_name = replace_mailbox_name(
+                                &mailbox_names,
+                                id.clone(),
+                                name.clone(),
+                            )
+                            .await;
+                            if old_name.as_deref() != Some(name.as_str()) {
+                                let scope = MembershipScope::Mailbox(
+                                    bifrost_types::MailboxId(id),
+                                );
+                                yield ScopeLifecycleEvent::Lifecycle(ScopeLifecycle::Renamed {
+                                    old: scope.clone(),
+                                    new: scope,
+                                });
+                            }
+                        }
+                    }
 
                     for destroyed_id in destroyed {
                         let id = destroyed_id.into_string();
@@ -189,6 +210,10 @@ pub(crate) fn scope_lifecycle(
                             bifrost_types::MailboxId(id),
                         )));
                     }
+
+                    // Commit only after every follow-up needed to describe
+                    // this changes response has completed successfully.
+                    state_cache::set(&mailbox_states, &account_id, new_state).await;
 
                     if !response.has_more_changes() {
                         tokio::time::sleep(Duration::from_secs(300)).await;
