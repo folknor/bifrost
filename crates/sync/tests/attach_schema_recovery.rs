@@ -12,7 +12,9 @@
 //! These tests pin the attach path healing the row itself: delete the
 //! scope's cursor, re-establish from the live account, keep going.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bifrost_sync::{CheckpointStore, Error, InMemoryCheckpointStore, SyncEngine};
@@ -98,6 +100,7 @@ struct PoisonedStore {
     poisoned: Mutex<Vec<CursorScope>>,
     /// Scopes the engine asked to delete, in call order.
     deleted: Mutex<Vec<CursorScope>>,
+    fail_reads: bool,
 }
 
 impl PoisonedStore {
@@ -110,6 +113,13 @@ impl PoisonedStore {
 
     fn deleted(&self) -> Vec<CursorScope> {
         self.deleted.lock().expect("deleted lock").clone()
+    }
+
+    fn with_read_failure() -> Self {
+        Self {
+            fail_reads: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -128,6 +138,13 @@ impl CheckpointStore for PoisonedStore {
         scope: &'a CursorScope,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ChangeCursor>, Error>> + Send + 'a>>
     {
+        if self.fail_reads {
+            return Box::pin(async {
+                Err(Error::CheckpointStore(
+                    "forced attach-time read failure".into(),
+                ))
+            });
+        }
         let still_poisoned = self
             .poisoned
             .lock()
@@ -181,15 +198,38 @@ impl CheckpointStore for PoisonedStore {
 
 /// Account that discovers a fixed scope list and establishes a cursor
 /// for each, recording which scopes it was asked to establish.
+type SubscriptionCalls = Arc<Mutex<Vec<(usize, Vec<CursorScope>)>>>;
+
 struct HealAccount {
     caps: AccountCapabilities,
     scopes: Vec<CursorScope>,
     established: Arc<Mutex<Vec<CursorScope>>>,
+    closed: Arc<AtomicUsize>,
+    generation: usize,
+    closed_generations: Arc<Mutex<Vec<usize>>>,
+    subscribed: SubscriptionCalls,
+    unsubscribed: Arc<Mutex<Vec<(usize, SubscriptionHandle)>>>,
+    lifecycle_calls: Arc<Mutex<Vec<usize>>>,
 }
 
 struct HealFactory {
     scopes: Vec<CursorScope>,
     established: Arc<Mutex<Vec<CursorScope>>>,
+    closed: Arc<AtomicUsize>,
+}
+
+impl HealFactory {
+    fn new(
+        scopes: Vec<CursorScope>,
+        established: Arc<Mutex<Vec<CursorScope>>>,
+        closed: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            scopes,
+            established,
+            closed,
+        }
+    }
 }
 
 impl AccountFactory for HealFactory {
@@ -199,11 +239,70 @@ impl AccountFactory for HealFactory {
     ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
         let scopes = self.scopes.clone();
         let established = Arc::clone(&self.established);
+        let closed = Arc::clone(&self.closed);
         Box::pin(async move {
             let account: Arc<dyn Account> = Arc::new(HealAccount {
                 caps: caps(),
                 scopes,
                 established,
+                closed,
+                generation: 0,
+                closed_generations: Arc::new(Mutex::new(Vec::new())),
+                subscribed: Arc::new(Mutex::new(Vec::new())),
+                unsubscribed: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
+            });
+            Ok(account)
+        })
+    }
+}
+
+struct RotatingFactory {
+    scopes: Mutex<VecDeque<Vec<CursorScope>>>,
+    established: Arc<Mutex<Vec<CursorScope>>>,
+    closed: Arc<AtomicUsize>,
+    closed_generations: Arc<Mutex<Vec<usize>>>,
+    subscribed: SubscriptionCalls,
+    unsubscribed: Arc<Mutex<Vec<(usize, SubscriptionHandle)>>>,
+    lifecycle_calls: Arc<Mutex<Vec<usize>>>,
+    opens: AtomicUsize,
+}
+
+impl AccountFactory for RotatingFactory {
+    fn open(
+        &self,
+        _account_id: AccountId,
+    ) -> AccountFuture<Result<Arc<dyn Account>, AccountError>> {
+        let scopes = self
+            .scopes
+            .lock()
+            .expect("scopes lock")
+            .pop_front()
+            .expect("one scope set per expected open");
+        let generation = self.opens.fetch_add(1, Ordering::SeqCst);
+        let established = Arc::clone(&self.established);
+        let closed = Arc::clone(&self.closed);
+        let closed_generations = Arc::clone(&self.closed_generations);
+        let subscribed = Arc::clone(&self.subscribed);
+        let unsubscribed = Arc::clone(&self.unsubscribed);
+        let lifecycle_calls = Arc::clone(&self.lifecycle_calls);
+        Box::pin(async move {
+            let mut account_caps = caps();
+            account_caps.push = if generation == 0 {
+                PushCapability::None
+            } else {
+                PushCapability::InProcess
+            };
+            let account: Arc<dyn Account> = Arc::new(HealAccount {
+                caps: account_caps,
+                scopes,
+                established,
+                closed,
+                generation,
+                closed_generations,
+                subscribed,
+                unsubscribed,
+                lifecycle_calls,
             });
             Ok(account)
         })
@@ -242,6 +341,10 @@ impl Account for HealAccount {
     }
 
     fn scope_lifecycle_stream(&self) -> AccountStream<ScopeLifecycleEvent> {
+        self.lifecycle_calls
+            .lock()
+            .expect("lifecycle calls lock")
+            .push(self.generation);
         Box::pin(stream::empty())
     }
 
@@ -279,20 +382,25 @@ impl Account for HealAccount {
 
     fn push_subscribe(
         &self,
-        _scopes: &[CursorScope],
+        scopes: &[CursorScope],
     ) -> AccountFuture<Result<SubscriptionHandle, AccountError>> {
-        Box::pin(async { Err(unsupported(bifrost_types::AccountOperation::PushSubscribe)) })
+        self.subscribed
+            .lock()
+            .expect("subscribed lock")
+            .push((self.generation, scopes.to_vec()));
+        let handle = SubscriptionHandle(format!("generation-{}", self.generation));
+        Box::pin(async move { Ok(handle) })
     }
 
     fn push_unsubscribe(
         &self,
-        _handle: SubscriptionHandle,
+        handle: SubscriptionHandle,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async {
-            Err(unsupported(
-                bifrost_types::AccountOperation::PushUnsubscribe,
-            ))
-        })
+        self.unsubscribed
+            .lock()
+            .expect("unsubscribed lock")
+            .push((self.generation, handle));
+        Box::pin(async { Ok(()) })
     }
 
     fn push_stream(&self) -> AccountStream<WatchEvent> {
@@ -342,6 +450,11 @@ impl Account for HealAccount {
     }
 
     fn close(&self) -> AccountFuture<Result<(), AccountError>> {
+        self.closed.fetch_add(1, Ordering::SeqCst);
+        self.closed_generations
+            .lock()
+            .expect("closed generations lock")
+            .push(self.generation);
         Box::pin(async { Ok(()) })
     }
 
@@ -750,15 +863,17 @@ async fn attach_heals_an_undecodable_cursor_instead_of_failing() {
     let scope = CursorScope::Account;
     let store = Arc::new(PoisonedStore::with_poisoned(vec![scope.clone()]));
     let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
 
     let engine = SyncEngine::builder()
         .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
         .build()
         .expect("default engine config is valid");
-    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory {
-        scopes: vec![scope.clone()],
-        established: Arc::clone(&established),
-    });
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![scope.clone()],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+    ));
 
     engine
         .attach(account_id.clone(), factory)
@@ -786,6 +901,7 @@ async fn attach_heals_an_undecodable_cursor_instead_of_failing() {
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -795,15 +911,17 @@ async fn one_undecodable_scope_does_not_disturb_its_siblings() {
     let healthy = CursorScope::Type(bifrost_types::ObjectType::Mailbox);
     let store = Arc::new(PoisonedStore::with_poisoned(vec![poisoned.clone()]));
     let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
 
     let engine = SyncEngine::builder()
         .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
         .build()
         .expect("default engine config is valid");
-    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory {
-        scopes: vec![poisoned.clone(), healthy.clone()],
-        established: Arc::clone(&established),
-    });
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![poisoned.clone(), healthy.clone()],
+        Arc::clone(&established),
+        Arc::clone(&closed),
+    ));
 
     engine
         .attach(account_id.clone(), factory)
@@ -823,4 +941,141 @@ async fn one_undecodable_scope_does_not_disturb_its_siblings() {
     );
 
     engine.detach(&account_id).await.expect("detach succeeds");
+    assert_eq!(closed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_attach_closes_the_opened_account() {
+    let account_id = AccountId("attach-failure-close".to_owned());
+    let store = Arc::new(PoisonedStore::with_read_failure());
+    let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory: Arc<dyn AccountFactory> = Arc::new(HealFactory::new(
+        vec![CursorScope::Account],
+        established,
+        Arc::clone(&closed),
+    ));
+
+    let result = engine.attach(account_id.clone(), factory).await;
+    assert!(matches!(result, Err(Error::CheckpointStore(_))));
+    assert_eq!(
+        closed.load(Ordering::SeqCst),
+        1,
+        "every post-open attach failure must close the live handle"
+    );
+    assert!(
+        !engine.attached_account_ids().contains(&account_id),
+        "failed attach must not leave a slot behind"
+    );
+}
+
+#[tokio::test]
+async fn reopen_refreshes_topology_subscriptions_and_lifecycle_handle() {
+    let account_id = AccountId("full-reattach".to_owned());
+    let old_scope = CursorScope::Account;
+    let new_scope = CursorScope::Type(bifrost_types::ObjectType::Email);
+    let established = Arc::new(Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
+    let closed_generations = Arc::new(Mutex::new(Vec::new()));
+    let subscribed = Arc::new(Mutex::new(Vec::new()));
+    let unsubscribed = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle_calls = Arc::new(Mutex::new(Vec::new()));
+    let factory = Arc::new(RotatingFactory {
+        scopes: Mutex::new(VecDeque::from([
+            vec![old_scope.clone()],
+            vec![new_scope.clone()],
+        ])),
+        established: Arc::clone(&established),
+        closed: Arc::clone(&closed),
+        closed_generations: Arc::clone(&closed_generations),
+        subscribed: Arc::clone(&subscribed),
+        unsubscribed: Arc::clone(&unsubscribed),
+        lifecycle_calls: Arc::clone(&lifecycle_calls),
+        opens: AtomicUsize::new(0),
+    });
+    let store = Arc::new(InMemoryCheckpointStore::new());
+    let engine = SyncEngine::builder()
+        .checkpoints(Arc::clone(&store) as Arc<dyn CheckpointStore>)
+        .build()
+        .expect("default engine config is valid");
+    let factory_trait: Arc<dyn AccountFactory> = Arc::clone(&factory) as Arc<dyn AccountFactory>;
+
+    engine
+        .attach(account_id.clone(), factory_trait)
+        .await
+        .expect("initial attach");
+    engine
+        .subscribe_push(&account_id, std::slice::from_ref(&old_scope))
+        .await
+        .expect("initial push subscription");
+    engine.reopen(&account_id).await.expect("full reattach");
+
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        engine
+            .account_capabilities(&account_id)
+            .expect("capabilities")
+            .push,
+        PushCapability::InProcess,
+        "capability snapshot must come from the replacement handle"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &old_scope)
+            .await
+            .expect("old cursor lookup")
+            .is_none(),
+        "vanished scopes must be removed durably"
+    );
+    assert!(
+        store
+            .get_change_cursor(&account_id, &new_scope)
+            .await
+            .expect("new cursor lookup")
+            .is_some(),
+        "newly discovered scopes must be established"
+    );
+    assert_eq!(
+        *subscribed.lock().expect("subscribed lock"),
+        vec![(0, vec![old_scope.clone()]), (1, vec![new_scope.clone()]),],
+        "replacement handle must recreate every registered subscription"
+    );
+    assert_eq!(
+        *unsubscribed.lock().expect("unsubscribed lock"),
+        vec![(0, SubscriptionHandle("generation-0".into()))],
+        "old subscription must be removed through the old handle"
+    );
+    assert_eq!(
+        *closed_generations.lock().expect("closed generations lock"),
+        vec![0],
+        "successful reopen closes exactly the old handle"
+    );
+
+    for _ in 0..1000 {
+        if lifecycle_calls
+            .lock()
+            .expect("lifecycle calls lock")
+            .contains(&1)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        lifecycle_calls
+            .lock()
+            .expect("lifecycle calls lock")
+            .contains(&1),
+        "lifecycle task must resubscribe to the replacement handle"
+    );
+
+    engine.detach(&account_id).await.expect("detach");
+    assert_eq!(
+        *closed_generations.lock().expect("closed generations lock"),
+        vec![0, 1]
+    );
 }

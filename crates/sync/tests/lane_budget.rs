@@ -79,7 +79,8 @@ fn mutation_permits_round_up_and_never_drop_below_one() {
     assert_eq!(budget.mutation_permits(), 2);
     assert_eq!(budget.sync_permits(), 3);
 
-    // Tiny account pool: at least one mutation permit survives.
+    // Tiny account pool still computes the split, but validation
+    // rejects it because no sync permit remains.
     let budget = ConcurrencyBudget {
         per_account: 1,
         global: 64,
@@ -87,10 +88,8 @@ fn mutation_permits_round_up_and_never_drop_below_one() {
         mutation_share_den: 100,
     };
     assert_eq!(budget.mutation_permits(), 1);
-    // NOTE: this leaves sync_permits() == 0; BudgetGate::register
-    // papers over it with .max(1), which quietly grants per_account+1
-    // effective permits.
     assert_eq!(budget.sync_permits(), 0);
+    assert!(budget.validate().is_err());
 }
 
 #[test]
@@ -104,6 +103,7 @@ fn mutation_share_numerator_clamps_to_denominator() {
     };
     assert_eq!(budget.mutation_permits(), 8);
     assert_eq!(budget.sync_permits(), 0);
+    assert!(budget.validate().is_err());
 }
 
 #[test]
@@ -112,6 +112,10 @@ fn validate_rejects_every_zero_field() {
     let cases = [
         ConcurrencyBudget {
             per_account: 0,
+            ..base
+        },
+        ConcurrencyBudget {
+            per_account: 1,
             ..base
         },
         ConcurrencyBudget { global: 0, ..base },

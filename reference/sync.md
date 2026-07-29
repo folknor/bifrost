@@ -96,11 +96,17 @@ engine.shutdown().await?; // explicit cleanup; preferred over Drop
    cursors cover every membership; folder-typed cursors cover the
    matching folder; query cursors cover the matching query).
 6. Spawn workers: ack writer, control applier, push reconciler,
-   push forwarder (if `PushCapability != None`), multiplexer,
+   push forwarder, multiplexer,
    backfill orchestrator, deferred-inventory worker (if any),
    reopen listener, bandwidth feed (if a meter is wired). Store
-   all `WorkerTask`s.
+   all `WorkerTask`s. The push forwarder parks while
+   `PushCapability::None` and wakes on the reopen-generation signal,
+   so a capability change does not require spawning a new task.
 7. Return `SyncControl`.
+
+Any error after `factory.open` and before slot installation closes the
+opened account best-effort before returning, so failed discovery or
+establishment cannot strand protocol workers or connections.
 
 `detach` sends `Stop` on the boundary channel, cancels the
 shutdown token, calls `Account::close()`, awaits all workers
@@ -113,14 +119,16 @@ for each (logging but not failing on per-account errors), then
 cancels the engine-root token. Strongly preferred over relying
 on `Drop`, which can only fire a best-effort sync cancel.
 
-`reopen` (driven by `EngineDirective::RestartAccount`) calls
-`factory.open(account_id)` again and
-`slot.current.store(Arc::new(next))` after reapplying the priority
-and bandwidth-cap snapshots. Spawned tasks pick up the new handle
-on their next `load_full()`. Capability shifts no longer have a
-dedicated directive variant; the convergence rewrite collapsed
-them onto `RestartAccount` because account reopen already re-runs
-`discover_cursor_scopes` / `discover_memberships` / `push_subscribe`.
+`reopen` (driven by `EngineDirective::RestartAccount`) is a staged
+reattach. It opens a replacement, reapplies priority and bandwidth,
+rediscovers cursor scopes and memberships into a temporary registry,
+establishes newly-appeared scopes, removes vanished cursors, recreates
+registered push subscriptions, refreshes the capability snapshot, and
+then swaps the handle and registry topology. A generation watch wakes
+the push and lifecycle readers even when their old streams never end.
+The old subscriptions are removed through the old handle and
+`Account::close()` is called best-effort. Any failure before the swap
+closes the replacement and leaves the running handle installed.
 
 ## Stream contract: broadcast + consumer ack
 
@@ -141,8 +149,9 @@ ack-driven:
    mpsc kept in `engine.ack_senders`) receives an `AckRequest`,
    writes to `CheckpointStore`, then fires
    `SyncControl::record_checkpoint` to wake `pause` /
-   `checkpoint_now` waiters. The waiter contract is "the
-   returned checkpoint has been persisted."
+   `checkpoint_now` waiters. A returned `Some(checkpoint)` is
+   durable; `None` means the account is safely idle without any
+   durable checkpoint yet.
 
 On restart the engine reads the last-acked cursor from the store
 and re-runs `changes_stream` from there; items the consumer
@@ -160,19 +169,18 @@ successful `Done`.
 
 `Multiplexer::run` drives:
 
-- **In-process push** (IMAP IDLE, JMAP WebSocket, EWS streaming)
-  on the most-active cursor scope.
-- **Adaptive polling** for everything else: per-scope
+- **Adaptive polling** per scope:
   `AdaptiveCadence` starts at `MultiplexerConfig::poll_initial`
   (default 60s), halves on observed change down to `poll_min`
   (default 30s), doubles after **five** consecutive no-change
   ticks up to `poll_max` (default 30 minutes). The pure helper is
   `Multiplexer::updated_cadence(cur, seen_change, min, max)`.
 - **Scope lifecycle** events from `Account::scope_lifecycle_stream`.
-  `Created` and `Renamed` translate to a
-  `ReopenRequest::Recovery { recovery: RestartScope }` via
-  `lifecycle_reopen` so the engine drives the fresh cursor
-  establishment through the same recovery path; `Deleted`
+  `Created` and `Renamed` consult the registered cursor shapes.
+  Account-wide and type-wide models already cover the new membership
+  and create no cursor. Per-folder and query models translate the
+  membership into matching `RestartScope` requests so the engine
+  establishes only shapes the protocol already advertises. `Deleted`
   cancels the per-scope token and drops the cursor.
   Not every protocol feeds this stream: IMAP deliberately emits
   no lifecycle events (the stream stays open and yields nothing
@@ -182,7 +190,10 @@ successful `Done`.
   `ScopeLifecycle` events, so a folder that appears after attach is
   invisible to the engine until the next account reopen. True
   NOTIFY-MAILBOXES / LIST-diff lifecycle detection for IMAP is a
-  deferred feature, not a bug.
+  deferred feature, not a bug. The lifecycle reader reloads the
+  replacement account whenever the reopen-generation watch changes;
+  a naturally-ended stream reconnects with bounded exponential
+  backoff.
 - **Reopen requests** on a `mpsc::Sender<ReopenRequest>` channel:
   `RestartScope` deletes the in-memory and durable cursor before
   re-establishing; `RestartAccount` routes up to the engine's reopen
@@ -358,17 +369,19 @@ the reconciler reads; `detach` calls `unregister`. The drop
 counter is exposed as `bifrost_sync_push_dropped_total`.
 
 Implements `bifrost_types::InvalidationSink::push`:
-`try_send` first; on `Full`, increment the drop counter and
-spawn a short task that does `tokio::time::timeout(100ms,
-send().await)` of a synthesized `coalesced_event` carrying
-`HintPayload::Unknown` so the reconciler still performs a full
-reconcile rather than swallow the wakeup. `Closed` (account
-detached mid-push) is silently ignored.
+`try_send` first; on `Full`, increment the drop counter. Invalidations
+and connection-health transitions are coalesced into one
+`HintPayload::Unknown` send with a 100ms bound. `Terminated` and
+`Warning` are lossless control information: the captured engine
+runtime waits for queue space and sends the original event without
+demoting its classification. Capturing the runtime during `register`
+also lets receiver threads outside Tokio use the sink. `Closed`
+(account detached mid-push) is silently ignored.
 
 The in-process push forwarder spawned in `attach` runs the same
-coalesce-on-full path against its per-account `tx` so an
-`Account::push_stream` burst that outpaces the reconciler is
-collapsed to an `Unknown` reconcile request rather than dropped.
+overflow policy against its per-account `tx`: redundant invalidations
+collapse to an `Unknown` reconcile request, while warnings and
+terminations retain their original classification.
 
 `push::reconciler` receives `WatchEvent::Invalidated { hint }`,
 calls `scopes_for_hint(&cursors, &hint.payload)` (which consults
@@ -378,12 +391,13 @@ the membership index populated at attach), then drives
 `crate::recovery::plan_recovery` and forwards
 `RecoveryPlan::Engine(directive)` to the slot's reopen channel
 carrying the original account error; `Retry(advice)` sleeps for the
-duration derived from `advice.retry_hint`. On
-`Disconnected` / `Reconnected`, `Reconciler::warning_event`
-synthesizes a `MultiplexerEvent` carrying
-`SyncEvent::Warning { kind: WarningKind::Other("push:disconnected"
-| "push:reconnected"), ... }` and `Reconnected` additionally
-triggers a full `HintPayload::Unknown` reconcile.
+duration derived from `advice.retry_hint`.
+
+`Disconnected` emits an account-scoped
+`WarningKind::Other` with message "push transport disconnected".
+`Reconnected` emits no warning and triggers a full
+`HintPayload::Unknown` reconcile whose synthetic source is
+`PushSource::Coalesced`.
 
 `WatchEvent::Terminated(AccountError)` (push streams that classify
 their own exit) flows through the same `plan_recovery` dispatch:
@@ -394,8 +408,10 @@ warning while the in-process forwarder reconnects on its next
 iteration.
 
 `SubscriptionRegistry` (per-engine `DashMap<AccountId,
-Vec<SubscriptionHandle>>`) stashes handles returned by
-`Account::push_subscribe` so the consumer can later call
+Vec<RegisteredSubscription>>`) stashes each returned handle together
+with its requested cursor scopes. That scope snapshot lets account
+reopen recreate subscriptions against the replacement topology.
+The consumer can later call
 `SyncEngine::unsubscribe_push(account)` to walk the handles back
 through `Account::push_unsubscribe`. `SyncEngine::subscribe_push`
 is the engine-side entry that records the handle on success.
@@ -484,11 +500,16 @@ per-account `WatchEvent` mpsc capacity lives on
 
 ## Hydration passthrough
 
-The change and inventory streams the engine broadcasts are
-projection-only. A `Change` carries `{ id, kind }`; an `InventoryEntry`
-carries a fingerprint and threading headers, never message content. A
-consumer that turns those signals into real rows (message bodies,
-attachment bytes, parsed threads) must fetch full content out-of-band.
+The engine broadcast is id-only. A live `Change` already carries
+`{ id, kind }`; both `InventoryFusion` and `BackfillRunner` deliberately
+down-convert each `InventoryEntry` to
+`Change::ObjectChange { id, Created }`. Fingerprints, threading headers,
+and inventory memberships do not reach consumers through
+`MultiplexerEvent`. A consumer that turns those signals into real rows
+must call `get_stream`, normally with `Projection::Metadata` first and
+then a fuller projection as needed. This repeats metadata the protocol
+may already have fetched during cold start, but keeps one event
+vocabulary and is the explicit v1 design.
 The `Account` handle that can do so lives behind `slot.current`
 (`ArcSwap<Arc<dyn Account>>`) and is otherwise private, so `SyncEngine`
 exposes a read-only passthrough cluster as the consumer's single door
@@ -559,17 +580,20 @@ consecutive higher-lane pulls (`SchedulerConfig::starvation_floor`,
 default 64).
 
 `LaneQueue` is bounded (default 1024 items, configurable via
-`EngineConfig::lane_capacity`). On overflow, sheds according to
-`LaneShedPolicy`: `DropOldest` (default, evicts the head) or
-`DropNewest` (rejects the incoming submission). Both increment a
-shed counter and emit a `warn!`.
+`EngineConfig::lane_capacity`). Production construction always uses
+`LaneShedPolicy::DropOldest`, which evicts the head, increments a shed
+counter, and emits a `warn!`. `DropNewest` remains an internal policy
+variant for direct queue construction and tests; `EngineConfig` does
+not expose a selector.
 
 `BudgetGate` exposes two semaphores per account (sync + mutation)
 plus global caps. Acquisition takes the per-account permit first and
 the global permit second, so a waiter parked on a busy account cannot
 consume global capacity needed by another account. Lazy-creation uses
 `DashMap::entry().or_insert_with(...)` to close the original
-data race.
+data race. `ConcurrencyBudget::validate` requires `per_account >= 2`
+and a mutation share that leaves at least one real sync permit; the
+gate no longer masks a zero split by granting an extra permit.
 
 **Status (v1):** the scheduler and budget gate are intentionally
 NOT WIRED into the engine's production work paths. Multiplexer,
@@ -584,14 +608,45 @@ until then. See `scheduler/mod.rs` module docs.
 
 `SyncControl` carries the priority hint, bandwidth-observed
 counter, pause/resume token, and the boundary channel.
-`record_checkpoint` wakes `pause().await` and
-`checkpoint_now().await` waiters parked on
-`boundary_recipient.notified()`. It is fired by the ack writer after
-`put_change_cursor` / `put_backfill` succeeds for an `AckRequest`
-(`engine.rs`). Both the change-cursor and backfill paths are
-consumer-ack-deferred, so every recorded boundary is one the consumer
-has durably acknowledged; the backfill runner no longer writes or
-records checkpoints itself.
+`pause().await` and `checkpoint_now().await` return
+`Result<Option<Checkpoint>, AccountError>`. The value is the latest
+durable checkpoint, or `None` when an idle account has never produced
+one. `SyncControl` tracks active stream operations plus every broadcast
+checkpoint awaiting a consumer ack. A boundary waiter resolves only
+when activity reaches zero and that pending set is empty. This gives an
+idle account a completion source without claiming safety while a batch
+is still in flight.
+
+Every producer registers its checkpoint with `expect_checkpoint`
+BEFORE broadcasting the batch and retracts it with
+`retire_checkpoint` when the send reached only the slot's sentinel
+receiver. Registering after the send would let a consumer that acks
+in that window strand an entry no ack can match.
+
+An entry leaves the pending set three ways, and every broadcast hits
+one of them:
+
+- `record_checkpoint`, fired by the ack writer after
+  `put_change_cursor` / `put_backfill` succeeds for an `AckRequest`.
+  Removes the entry by exact identity and refreshes the durable
+  snapshot. Both change-cursor and backfill paths are
+  consumer-ack-deferred.
+- `retire_checkpoint`, fired when the ack was processed but produced
+  nothing durable (store write failed) or when no real subscriber
+  received the batch. The entry stops gating waiters - it is no
+  longer in flight - but the durable snapshot is NOT advanced, and
+  the consumer learns of a failed write from `ack_checkpoint`'s own
+  `Result`. Leaving it pending instead would wedge every later
+  `pause` / `checkpoint_now` on the account for the process lifetime.
+- Supersession: a newer broadcast on the same lane + scope replaces
+  the older one. Broadcasts within a lane+scope come from a single
+  sequential task, so acking the newest proves the earlier ones are
+  durable too. This bounds the set by the account's scope count
+  instead of by how many batches a consumer left unacked, and lets a
+  consumer that acks coarsely (persist N batches, ack the last
+  checkpoint) still reach a boundary. `record_checkpoint` removes by
+  exact identity rather than by key, so acking an OLD checkpoint
+  never retires a newer outstanding one.
 
 The mutation pipeline records counters, not checkpoints; it does
 not call `record_checkpoint`.
@@ -643,6 +698,10 @@ row on every attach. Decoding the reserved tag `0xFF` (written by an
 engine revision that did exactly that) yields
 `Error::SchemaIncompatible` so those rows still heal.
 
+Every encoded length is checked against `u32::MAX`. An impossible
+larger in-memory field panics at the encoding boundary instead of
+writing a false truncated prefix and silently corrupting the envelope.
+
 An unreadable row is healed where it is found. `run_establish` - the
 running-account path - returns a typed `AccountError` whose derived
 `RecoveryClass` is `Engine(SchemaIncompatible)`, and the reopen
@@ -691,6 +750,14 @@ a store failure and propagates.
 
 `InMemoryCheckpointStore` is the test backend (HashMap-backed). No
 sled / sqlite default; storage is consumer-owned.
+
+`get_backfill` selects the greatest `items_done`. Equal-progress rows
+use the greatest parsed page upper bound, then lexicographically
+greatest opaque partition bytes, so equal-sized page windows resume
+deterministically from the furthest one. Page checkpoint
+`items_done` counts entries observed before `LiveSupersedes` filtering;
+filtering therefore cannot make a full inventory window look short and
+falsely signal exhaustion.
 
 `Partition` is `Hash + Eq` (additive change to `bifrost-types`)
 because the in-memory store keys on it.
@@ -744,6 +811,13 @@ that enforces "the engine has nothing left to try"; both the terminal arms
 than writing to any built-in queue or dashboard. Any operator-notification
 queue is the consumer's to build off the broadcast
 `SyncEvent::Terminated`.
+
+The reopen listener never sleeps for a bare `RecoveryPlan::Retry`.
+The originating poll, push, or mutation path owns an actionable retry;
+the listener only records shared throttle deadlines and stays
+available for engine directives. Sleeping there would serialize
+restart and schema recovery behind a delay after which no operation was
+actually retried.
 
 Reopens use exponential backoff with ±20% jitter (1s initial, 5min
 cap) and a three-attempt budget. After three failures the engine
@@ -809,9 +883,9 @@ crates/sync/src/
     changes.rs            // drive_changes_stream + ChangesEvent +
                           // AckRequest (broadcast-then-consumer-ack)
     fusion.rs             // InventoryFusion::run_with_broadcast
-    idle.rs poll.rs       // helper drivers (AdaptiveCadence)
+    poll.rs               // adaptive cadence helper
   backfill/
-    mod.rs                // BackfillHandle, account-keyed BackfillRegistry,
+    mod.rs                // account-keyed BackfillRegistry,
                           // BackfillPolicy / Strategy
     runner.rs             // BackfillRunner::run_partition,
                           // LiveSupersedes (ring-evicting, default
@@ -825,7 +899,7 @@ crates/sync/src/
                           // warning_event on Disconnected/Reconnected
     subscription.rs       // SubscriptionRegistry (per-engine DashMap)
   mutation/
-    mod.rs                // MutationHandle, MutationCounters,
+    mod.rs                // MutationCounters,
                           // fanout::partition_by_account
     idempotency.rs        // IdempotencyKey vending
     readback.rs           // Projection::FlagsOnly read-back guard

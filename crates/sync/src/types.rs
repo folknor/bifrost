@@ -5,21 +5,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use bifrost_types::{Account, AccountCapabilities, AccountControl, AccountFactory, Priority};
+use bifrost_types::{Account, AccountCapabilities, AccountControl, AccountFactory};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::multiplexer::ReopenRequest;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::backfill::BackfillHandle;
 use crate::cancel::BoundaryRequest;
 use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
 use crate::cursor::store::DynCheckpointStore;
 use crate::multiplexer::MultiplexerHandle;
-use crate::mutation::MutationHandle;
-use crate::push::PushHandle;
 use crate::scheduler::budget::ConcurrencyBudget;
 
 /// Top-level engine configuration. Cloned into every `AccountSlot`.
@@ -162,31 +159,19 @@ impl Default for MutationConfig {
 /// backfill, mutation) at their next iteration without re-spawning.
 /// Workers load with `current.load_full()`.
 pub(crate) struct AccountSlot {
-    #[allow(dead_code)]
     pub factory: Arc<dyn AccountFactory>,
     pub current: Arc<ArcSwap<Arc<dyn Account>>>,
-    #[allow(dead_code)]
-    pub capabilities: AccountCapabilities,
+    /// Monotonic signal bumped after a successful handle swap. Long-
+    /// lived push and lifecycle streams select on it so they drop the
+    /// old stream even when that stream never terminates itself.
+    pub account_generation_tx: watch::Sender<u64>,
+    pub reopen_lock: Arc<tokio::sync::Mutex<()>>,
+    pub capabilities: Arc<std::sync::RwLock<AccountCapabilities>>,
     pub multiplexer: MultiplexerHandle,
-    #[allow(dead_code)]
-    pub backfill: BackfillHandle,
-    #[allow(dead_code)]
-    pub push: PushHandle,
-    #[allow(dead_code)]
-    pub mutation: MutationHandle,
-    #[allow(dead_code)]
     pub cursors: Arc<CursorRegistry>,
-    #[allow(dead_code)]
     pub checkpoints: Arc<DynCheckpointStore>,
-    #[allow(dead_code)]
-    pub priority_tx: watch::Sender<Priority>,
-    #[allow(dead_code)]
-    pub priority_rx: watch::Receiver<Priority>,
-    #[allow(dead_code)]
-    pub bandwidth_cap_rx: watch::Receiver<Option<u64>>,
     pub boundary_tx: watch::Sender<BoundaryRequest>,
     pub shutdown: CancellationToken,
-    #[allow(dead_code)]
     pub control: SyncControl,
     /// Sentinel receiver keeps `changes_tx` alive across periods with
     /// no subscribers so new subscribers don't get a closed-channel
@@ -197,10 +182,6 @@ pub(crate) struct AccountSlot {
     /// aborts each worker on timeout so tasks do not leak past the
     /// configured deadline.
     pub workers: Mutex<Vec<WorkerTask>>,
-    /// Optional bandwidth meter wired through `bifrost-net` so
-    /// `Control::bandwidth_observed` returns a real reading.
-    #[allow(dead_code)]
-    pub bandwidth_meter: Option<Arc<bifrost_net::BandwidthMeter>>,
     /// Per-account control stream. Engine publishes
     /// `AccountControl::Pause(reason)` when the engine has automatically
     /// paused the account (operator-override directive, retry budget
@@ -223,7 +204,6 @@ pub(crate) struct AccountSlot {
     /// to pause work that maps to a busy key. Tracked as `sync-F2`
     /// in the decisions doc; recorded today, not yet read by the
     /// poll/push paths.
-    #[allow(dead_code)]
     pub throttles: Arc<std::sync::Mutex<crate::recovery::ThrottleBucket>>,
 }
 

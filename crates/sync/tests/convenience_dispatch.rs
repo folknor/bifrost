@@ -893,13 +893,13 @@ async fn multi_call_conveniences_default_to_unsupported() {
         .move_thread(ThreadId("t-1".into()), ContainerId("c".into()), None)
         .await
         .expect_err("move_thread default");
-    assert_unsupported(&err, AccountOperation::BulkMove);
+    assert_unsupported(&err, AccountOperation::MoveThread);
 
     let err = account
         .delete_thread(ThreadId("t-1".into()), None)
         .await
         .expect_err("delete_thread default");
-    assert_unsupported(&err, AccountOperation::BulkDestroy);
+    assert_unsupported(&err, AccountOperation::DeleteThread);
 
     let err = account
         .send_raw_message(Bytes::from_static(b"MIME-Version: 1.0\r\n"), None)

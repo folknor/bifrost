@@ -116,10 +116,12 @@ fn pack_envelope(version: u32, kind: EnvelopeKind, scope: &[u8], payload: &[u8])
     out.push(kind.tag());
     // Lengths are u32 little-endian; envelopes are always shorter
     // than 4 GB and a varint would buy nothing here.
-    let scope_len = u32::try_from(scope.len()).unwrap_or(u32::MAX);
+    let scope_len =
+        u32::try_from(scope.len()).expect("cursor envelope: scope exceeds u32 length limit");
     out.extend_from_slice(&scope_len.to_le_bytes());
     out.extend_from_slice(scope);
-    let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let payload_len =
+        u32::try_from(payload.len()).expect("cursor envelope: payload exceeds u32 length limit");
     out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(payload);
     out
@@ -520,7 +522,7 @@ fn write_string(out: &mut Vec<u8>, s: &str) {
 }
 
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let len = u32::try_from(bytes.len()).expect("cursor envelope: field exceeds u32 length limit");
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
 }

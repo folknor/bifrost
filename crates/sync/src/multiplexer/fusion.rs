@@ -11,8 +11,8 @@
 //! checkpoint.
 //!
 //! Inventory data: every `Batch` is forwarded to the per-account
-//! broadcast as a `ScopeChange::Added` membership signal before the
-//! cursor is persisted, so cold-start inventory (Graph all scopes,
+//! broadcast as an `ObjectChange::Created` signal before the cursor
+//! is persisted, so cold-start inventory (Graph all scopes,
 //! IMAP-Basic / CONDSTORE-only folders) does not vanish.
 
 use std::sync::Arc;
@@ -24,8 +24,8 @@ use bifrost_types::{
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
 
+use crate::control::SyncControl;
 use crate::cursor::CursorRegistry;
-use crate::cursor::store::DynCheckpointStore;
 use crate::error::Error;
 
 use super::MultiplexerEvent;
@@ -48,7 +48,7 @@ pub enum FusionOutcome {
 pub struct InventoryFusion {
     pub account_id: bifrost_types::AccountId,
     pub cursors: Arc<CursorRegistry>,
-    pub store: Arc<DynCheckpointStore>,
+    pub control: Option<SyncControl>,
 }
 
 impl InventoryFusion {
@@ -78,6 +78,10 @@ impl InventoryFusion {
         scope: CursorScope,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
     ) -> Result<FusionOutcome, Error> {
+        let _activity = match &self.control {
+            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
+            None => None,
+        };
         let mut stream = account.inventory_stream(scope.clone());
         while let Some(event) = stream.next().await {
             match event {
@@ -86,9 +90,20 @@ impl InventoryFusion {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Done(Some(cp.clone()))),
-                            checkpoint: Some(cp),
+                            checkpoint: Some(cp.clone()),
                         };
-                        let _ = tx.send(me);
+                        // Register before publishing so a fast consumer
+                        // ack cannot land before the entry exists and
+                        // leave it outstanding forever.
+                        if let Some(control) = &self.control {
+                            control.expect_checkpoint(cp.clone());
+                        }
+                        let delivered = tx.send(me).unwrap_or(0);
+                        if delivered <= 1
+                            && let Some(control) = &self.control
+                        {
+                            control.retire_checkpoint(&cp);
+                        }
                     }
                     return self.finalize(scope, checkpoint).await;
                 }
@@ -176,26 +191,4 @@ impl InventoryFusion {
         self.cursors.put(cursor);
         Ok(FusionOutcome::Established)
     }
-
-    /// Convenience: count entries observed in an inventory stream.
-    /// Used by tests to assert backfill partition math.
-    #[allow(dead_code)]
-    pub async fn count_entries(
-        &self,
-        account: &dyn Account,
-        scope: CursorScope,
-    ) -> Result<u64, Error> {
-        let mut stream = account.inventory_stream(scope);
-        let mut total: u64 = 0;
-        while let Some(event) = stream.next().await {
-            if let SyncEvent::Batch(b) = event {
-                total = total.saturating_add(count(&b.items));
-            }
-        }
-        Ok(total)
-    }
-}
-
-fn count(items: &[InventoryEntry]) -> u64 {
-    u64::try_from(items.len()).unwrap_or(u64::MAX)
 }

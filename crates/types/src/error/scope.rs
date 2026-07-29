@@ -132,6 +132,8 @@ pub enum AccountOperation {
     UpdateFlags,
     BulkMove,
     BulkDestroy,
+    MoveThread,
+    DeleteThread,
     AddToContainer,
     RemoveFromContainer,
     SetKeyword,
@@ -219,6 +221,8 @@ impl AccountOperation {
                 | Self::Send
                 | Self::BulkMove
                 | Self::BulkDestroy
+                | Self::MoveThread
+                | Self::DeleteThread
                 | Self::AddToContainer
                 | Self::RemoveFromContainer
                 | Self::AttachmentUpload
@@ -305,6 +309,8 @@ mod tests {
             AccountOperation::DraftDiscard,
             AccountOperation::CancelScheduledSend,
             AccountOperation::BulkMove,
+            AccountOperation::MoveThread,
+            AccountOperation::DeleteThread,
         ] {
             assert!(!op.is_idempotent(), "{op:?} must be non-idempotent");
         }

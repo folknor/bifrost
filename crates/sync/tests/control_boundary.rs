@@ -1,22 +1,15 @@
 //! `SyncControl` generation-gating and boundary-compose tests.
 //!
-//! The pause / checkpoint_now waiter contract is "the returned
-//! checkpoint has been persisted AFTER the request was made": a
-//! checkpoint recorded before the request must never satisfy it (that
-//! was the stale-snapshot bug the generation counter exists to
-//! prevent). Nothing in the suite previously pinned this.
+//! The pause / checkpoint_now waiter contract is "the account is at a
+//! safe boundary and the returned value is the latest durable
+//! checkpoint, if one exists." Idle accounts resolve immediately,
+//! including accounts that have never emitted a checkpoint.
 //!
 //! The harness keeps watch receivers alive to mirror the engine worker
 //! topology, while the final tests verify that canonical snapshots
 //! remain correct even after every receiver is dropped.
 //!
-//! All tests are in-process and deterministic. The two park-proof
-//! tests wrap a genuinely-unresolvable future in a short real timeout
-//! (the future can never complete because no `record_checkpoint` ever
-//! fires, so the timeout can only elapse - there is no race to lose).
-//! `tokio::join!` sequences the record-after-request interleavings.
-
-use std::time::Duration;
+//! All tests are in-process and deterministic.
 
 use bifrost_sync::{Boundary, BoundaryRequest, BoundaryView, SyncControl};
 use bifrost_types::{
@@ -72,52 +65,42 @@ fn make_control() -> ControlHarness {
 }
 
 #[tokio::test]
-async fn checkpoint_recorded_before_the_request_does_not_satisfy_it() {
+async fn idle_checkpoint_request_returns_the_latest_durable_checkpoint() {
     let h = make_control();
     // A checkpoint lands (consumer acked some earlier batch) ...
     h.control
         .record_checkpoint(sample_checkpoint(b"stale"))
         .await;
-    // ... then the consumer asks for a fresh boundary. The stale
-    // snapshot must NOT be returned; with no new record arriving the
-    // call parks (proven by the timeout elapsing).
-    let result = tokio::time::timeout(Duration::from_millis(100), h.control.checkpoint_now()).await;
-    assert!(
-        result.is_err(),
-        "checkpoint_now must wait for a post-request checkpoint, not return the stale one"
-    );
+    // ... then the consumer asks for a safe boundary while nothing is
+    // active. The already-durable checkpoint is the honest snapshot.
+    let checkpoint = h
+        .control
+        .checkpoint_now()
+        .await
+        .expect("idle checkpoint request");
+    assert_eq!(checkpoint, Some(sample_checkpoint(b"stale")));
 }
 
 #[tokio::test]
-async fn pause_with_no_checkpoint_traffic_parks() {
-    // Documents the liveness property as it exists today: on an idle
-    // account (no batches -> no consumer acks -> no record_checkpoint)
-    // `pause` does not resolve.
-    // this pin is a description of current behavior, not an
-    // endorsement.
+async fn pause_with_no_checkpoint_traffic_returns_none() {
     let h = make_control();
-    let result = tokio::time::timeout(Duration::from_millis(100), h.control.pause()).await;
-    assert!(
-        result.is_err(),
-        "pause() parks until a checkpoint is recorded"
-    );
-    // The boundary flip itself happened immediately, so workers do
-    // park even while the waiter is still pending.
+    let result = h.control.pause().await.expect("idle pause");
+    assert_eq!(result, None);
     assert_eq!(h.boundary.snapshot(), BoundaryRequest::Pause);
 }
 
 #[tokio::test]
-async fn checkpoint_now_returns_a_checkpoint_recorded_after_the_request() {
+async fn checkpoint_now_returns_a_previously_recorded_checkpoint() {
     let h = make_control();
-    let recorder = h.control.clone();
-    let (result, ()) = tokio::join!(h.control.checkpoint_now(), async move {
-        // Let checkpoint_now bump its generation and park first.
-        tokio::task::yield_now().await;
-        recorder
-            .record_checkpoint(sample_checkpoint(b"fresh"))
-            .await;
-    });
-    let checkpoint = result.expect("checkpoint_now resolves on a fresh record");
+    h.control
+        .record_checkpoint(sample_checkpoint(b"fresh"))
+        .await;
+    let checkpoint = h
+        .control
+        .checkpoint_now()
+        .await
+        .expect("checkpoint request")
+        .expect("latest checkpoint");
     let Checkpoint::Change(cursor) = checkpoint else {
         panic!("expected the Change checkpoint back");
     };
@@ -220,27 +203,16 @@ async fn priority_and_bandwidth_snapshots_reflect_control_calls() {
 }
 
 #[tokio::test]
-async fn two_sequential_checkpoint_requests_each_need_their_own_record() {
-    // Generation gating is per-request: the record that satisfied the
-    // first request does not satisfy a second request made after it.
+async fn sequential_idle_checkpoint_requests_share_the_latest_snapshot() {
     let h = make_control();
-
-    let recorder = h.control.clone();
-    let (first, ()) = tokio::join!(h.control.checkpoint_now(), async move {
-        tokio::task::yield_now().await;
-        recorder.record_checkpoint(sample_checkpoint(b"one")).await;
-    });
-    assert!(first.is_ok());
-
-    let recorder = h.control.clone();
-    let (second, ()) = tokio::join!(h.control.checkpoint_now(), async move {
-        tokio::task::yield_now().await;
-        recorder.record_checkpoint(sample_checkpoint(b"two")).await;
-    });
-    let Checkpoint::Change(cursor) = second.expect("second request resolves") else {
+    h.control.record_checkpoint(sample_checkpoint(b"one")).await;
+    let first = h.control.checkpoint_now().await.expect("first request");
+    let second = h.control.checkpoint_now().await.expect("second request");
+    assert_eq!(first, second);
+    let Some(Checkpoint::Change(cursor)) = second else {
         panic!("expected Change checkpoint");
     };
-    assert_eq!(cursor.server_state.bytes, b"two".to_vec());
+    assert_eq!(cursor.server_state.bytes, b"one".to_vec());
 }
 
 #[tokio::test]

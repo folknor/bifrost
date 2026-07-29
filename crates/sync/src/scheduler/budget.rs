@@ -49,9 +49,9 @@ impl Default for ConcurrencyBudget {
 }
 
 impl ConcurrencyBudget {
-    /// Reject obviously-degenerate configurations: a zero
-    /// `per_account` would mean no account can run any work, and a
-    /// zero `mutation_share_num` previously silently rewrote to 1.
+    /// Reject degenerate configurations: each account must retain at
+    /// least one sync permit and one mutation permit, and no zero
+    /// field is silently rewritten.
     /// Construct the budget through this validated accessor so the
     /// failure surface is a typed `Error` rather than a silent
     /// rewrite.
@@ -60,9 +60,9 @@ impl ConcurrencyBudget {
     /// invalid input; the engine surfaces this to the consumer at
     /// build time.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.per_account == 0 {
+        if self.per_account < 2 {
             return Err(Error::Other(
-                "ConcurrencyBudget: per_account must be > 0".into(),
+                "ConcurrencyBudget: per_account must be >= 2".into(),
             ));
         }
         if self.global == 0 {
@@ -76,6 +76,11 @@ impl ConcurrencyBudget {
         if self.mutation_share_den == 0 {
             return Err(Error::Other(
                 "ConcurrencyBudget: mutation_share_den must be > 0".into(),
+            ));
+        }
+        if self.mutation_permits() >= self.per_account {
+            return Err(Error::Other(
+                "ConcurrencyBudget: mutation share must leave at least one sync permit".into(),
             ));
         }
         Ok(())
@@ -130,11 +135,10 @@ struct BudgetInner {
 impl BudgetGate {
     #[must_use]
     pub fn new(budget: ConcurrencyBudget) -> Self {
-        let global_permits = budget.global.max(1);
         Self {
             inner: Arc::new(BudgetInner {
                 budget,
-                global: Arc::new(Semaphore::new(global_permits)),
+                global: Arc::new(Semaphore::new(budget.global)),
                 account_sync: DashMap::new(),
                 account_mutation: DashMap::new(),
             }),
@@ -145,8 +149,8 @@ impl BudgetGate {
     /// `acquire` call doesn't race with later config changes. Called
     /// from `SyncEngine::attach`.
     pub fn register(&self, account: AccountId) {
-        let sync = Arc::new(Semaphore::new(self.inner.budget.sync_permits().max(1)));
-        let mutation = Arc::new(Semaphore::new(self.inner.budget.mutation_permits().max(1)));
+        let sync = Arc::new(Semaphore::new(self.inner.budget.sync_permits()));
+        let mutation = Arc::new(Semaphore::new(self.inner.budget.mutation_permits()));
         self.inner.account_sync.insert(account.clone(), sync);
         self.inner.account_mutation.insert(account, mutation);
     }
@@ -191,7 +195,7 @@ impl BudgetGate {
         // unregistered account would each allocate a fresh
         // `Semaphore`, with the loser then gating against an orphan
         // that has no permits drained by the winner's holders.
-        let permits = self.inner.budget.sync_permits().max(1);
+        let permits = self.inner.budget.sync_permits();
         self.inner
             .account_sync
             .entry(account.clone())
@@ -200,7 +204,7 @@ impl BudgetGate {
     }
 
     fn mutation_semaphore(&self, account: &AccountId) -> Arc<Semaphore> {
-        let permits = self.inner.budget.mutation_permits().max(1);
+        let permits = self.inner.budget.mutation_permits();
         self.inner
             .account_mutation
             .entry(account.clone())

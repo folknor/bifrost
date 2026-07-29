@@ -89,7 +89,7 @@ impl Reconciler {
                 // Treat reconnect as a full reconcile across every
                 // registered cursor scope.
                 let hint = InvalidationHint {
-                    source: bifrost_types::PushSource::JmapStateChange,
+                    source: bifrost_types::PushSource::Coalesced,
                     payload: HintPayload::Unknown,
                 };
                 if let Err(err) = self.reconcile(&hint).await {
@@ -125,28 +125,16 @@ impl Reconciler {
                             bifrost_types::WarningKind::Other,
                             "push stream terminated with retryable recovery",
                         );
-                        let scope = self
-                            .cursors
-                            .all_scopes()
-                            .into_iter()
-                            .next()
-                            .unwrap_or(CursorScope::Account);
                         let me = MultiplexerEvent {
-                            scope,
+                            scope: CursorScope::Account,
                             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
                             checkpoint: None,
                         };
                         let _ = self.changes_tx.send(me);
                     }
                     RecoveryPlan::Terminal(fatal) => {
-                        let scope = self
-                            .cursors
-                            .all_scopes()
-                            .into_iter()
-                            .next()
-                            .unwrap_or(CursorScope::Account);
                         let me = MultiplexerEvent {
-                            scope,
+                            scope: CursorScope::Account,
                             event: Arc::new(bifrost_types::SyncEvent::Terminated(
                                 fatal.into_inner(),
                             )),
@@ -228,17 +216,9 @@ impl Reconciler {
     }
 
     fn warning_event(&self, message: &str, kind: bifrost_types::WarningKind) -> MultiplexerEvent {
-        // We need an arbitrary CursorScope for the event; pick the
-        // first registered one or fall back to Account.
-        let scope = self
-            .cursors
-            .all_scopes()
-            .into_iter()
-            .next()
-            .unwrap_or(CursorScope::Account);
         let warning = Warning::user_safe(kind, message);
         MultiplexerEvent {
-            scope,
+            scope: CursorScope::Account,
             event: Arc::new(bifrost_types::SyncEvent::Warning(warning)),
             checkpoint: None,
         }

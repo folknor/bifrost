@@ -4,10 +4,9 @@
 //! engine test rides on, and its `get_backfill` "latest by
 //! `items_done`" selection is load-bearing for backfill resume
 //! (`open_pages_resume` / `backfill_complete_recorded` in engine.rs).
-//! Nothing previously pinned it. Ties between equal `items_done`
-//! rows are deliberately NOT pinned - the trait leaves tie-breaking
-//! to the store, and resume tolerates either winner (worst case is a
-//! re-walk, which is idempotent).
+//! Equal-progress ties are pinned as well: the furthest page upper
+//! bound wins, making resume deterministic and preventing a needless
+//! re-walk from an earlier equal-sized window.
 
 use bifrost_sync::{CheckpointStore, InMemoryCheckpointStore};
 use bifrost_types::{
@@ -176,6 +175,29 @@ async fn get_backfill_returns_the_strictly_largest_items_done() {
         .expect("present");
     assert_eq!(got.partition, Partition(b"page:500:1000".to_vec()));
     assert_eq!(got.progress.items_done, 501);
+}
+
+#[tokio::test]
+async fn get_backfill_tie_selects_the_furthest_page_window() {
+    let store = InMemoryCheckpointStore::new();
+    let scope = CursorScope::Type(ObjectType::Email);
+    for partition in [
+        b"page:1000:1500".as_slice(),
+        b"page:0:500".as_slice(),
+        b"page:500:1000".as_slice(),
+    ] {
+        store
+            .put_backfill(&account("a"), backfill(&scope, partition, 500))
+            .await
+            .expect("put");
+    }
+
+    let got = store
+        .get_backfill(&account("a"), &scope)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.partition, Partition(b"page:1000:1500".to_vec()));
 }
 
 #[tokio::test]

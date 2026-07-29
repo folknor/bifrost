@@ -19,7 +19,7 @@ use crate::mutation::Fingerprint;
 /// Carried inside `Batch` at advance boundaries; never travels as its
 /// own event. Resuming from a checkpoint whose covering batch was not
 /// durably written is unsafe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Checkpoint {
     Change(ChangeCursor),
@@ -29,7 +29,7 @@ pub enum Checkpoint {
 /// Backfill checkpoint. Partition-aware, finite. The engine's
 /// backfill scheduler partitions newest-first so foreground mail is
 /// hydrated before deep history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackfillCheckpoint {
     pub scope: CursorScope,
     pub partition: Partition,
@@ -94,7 +94,7 @@ pub enum InventoryPartitioning {
 }
 
 /// Progress within a single backfill partition.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackfillProgress {
     pub items_done: u64,
     pub items_estimated: Option<u64>,
@@ -303,20 +303,22 @@ pub trait InvalidationSink: Send + Sync + 'static {
 /// engine-driven stream.
 ///
 /// `pause` and `checkpoint_now` are async because they must wait for
-/// "stream is at a safe boundary, here is the checkpoint, you can
-/// now drop." `resume`, `priority`, `bandwidth_cap`, and
+/// "stream is at a safe boundary, here is the latest checkpoint if
+/// one exists, you can now drop." An idle account that has never
+/// produced a checkpoint returns `None`. `resume`, `priority`,
+/// `bandwidth_cap`, and
 /// `bandwidth_observed` stay synchronous (fire-and-forget signals or
 /// pure reads).
 pub trait Control: Send + Sync {
     fn pause(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
     >;
     fn checkpoint_now(
         &self,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Checkpoint, AccountError>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Option<Checkpoint>, AccountError>> + Send + '_>,
     >;
     fn resume(&self);
     fn priority(&self, p: Priority);

@@ -4,11 +4,11 @@
 //! suite did not previously pin: `scopes_for_hint` (hint -> affected
 //! cursor scopes) and the registry's membership index maintenance
 //! (`link_membership` dedupe, `delete` pruning). Also pins
-//! `membership_to_cursor_scope`, the lifecycle-event mapping the
+//! `membership_to_cursor_scopes`, the lifecycle-event mapping the
 //! multiplexer uses to synthesize `RestartScope` recoveries.
 
 use bifrost_sync::CursorRegistry;
-use bifrost_sync::multiplexer::membership_to_cursor_scope;
+use bifrost_sync::multiplexer::membership_to_cursor_scopes;
 use bifrost_sync::push::scopes_for_hint;
 use bifrost_types::{
     ChangeCursor, CursorScope, FolderId, HintPayload, LabelId, MailboxId, MembershipScope,
@@ -133,31 +133,51 @@ fn put_replaces_the_cursor_for_an_existing_scope() {
 }
 
 #[test]
-fn membership_to_cursor_scope_mapping() {
+fn membership_to_cursor_scope_mapping_respects_registered_shapes() {
+    let folder_registry = CursorRegistry::new();
+    folder_registry.put(cursor(&CursorScope::Folder(FolderId("existing".into()))));
     // Folder membership -> per-folder cursor scope.
     assert_eq!(
-        membership_to_cursor_scope(&MembershipScope::Folder(FolderId("F".into()))),
-        Some(CursorScope::Folder(FolderId("F".into())))
+        membership_to_cursor_scopes(
+            &folder_registry,
+            &MembershipScope::Folder(FolderId("F".into()))
+        ),
+        vec![CursorScope::Folder(FolderId("F".into()))]
     );
-    // Mailbox membership -> folder cursor scope sharing the id string.
-    // NOTE: this is the engine's heuristic for lifecycle events; on a
-    // type-cursor protocol (JMAP) the synthesized Folder scope has no
-    // registered cursor, so the recovery path is asked to establish a
-    // scope the protocol may not serve. Pinned as-is; see
-    // for the discussion.
     assert_eq!(
-        membership_to_cursor_scope(&MembershipScope::Mailbox(MailboxId("mb-1".into()))),
-        Some(CursorScope::Folder(FolderId("mb-1".into())))
+        membership_to_cursor_scopes(
+            &folder_registry,
+            &MembershipScope::Mailbox(MailboxId("mb-1".into()))
+        ),
+        vec![CursorScope::Folder(FolderId("mb-1".into()))]
     );
+
+    let query_registry = CursorRegistry::new();
+    query_registry.put(cursor(&CursorScope::Query(QueryId("existing".into()))));
     // Query membership -> query cursor scope.
     assert_eq!(
-        membership_to_cursor_scope(&MembershipScope::Query(QueryId("q".into()))),
-        Some(CursorScope::Query(QueryId("q".into())))
+        membership_to_cursor_scopes(
+            &query_registry,
+            &MembershipScope::Query(QueryId("q".into()))
+        ),
+        vec![CursorScope::Query(QueryId("q".into()))]
     );
-    // Gmail labels live under the account-wide cursor; no per-label
-    // cursor scope exists.
+
+    let type_registry = CursorRegistry::new();
+    type_registry.put(cursor(&CursorScope::Type(ObjectType::Email)));
     assert_eq!(
-        membership_to_cursor_scope(&MembershipScope::Label(LabelId("STARRED".into()))),
-        None
+        membership_to_cursor_scopes(
+            &type_registry,
+            &MembershipScope::Mailbox(MailboxId("mb-1".into()))
+        ),
+        Vec::<CursorScope>::new(),
+        "type-wide cursors already cover new mailboxes"
+    );
+    assert_eq!(
+        membership_to_cursor_scopes(
+            &type_registry,
+            &MembershipScope::Label(LabelId("STARRED".into()))
+        ),
+        Vec::<CursorScope>::new()
     );
 }

@@ -16,6 +16,7 @@ pub mod reconciler;
 pub mod subscription;
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_types::{
@@ -23,18 +24,10 @@ use bifrost_types::{
 };
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 pub use reconciler::{Reconciler, scopes_for_hint};
+pub(crate) use subscription::RegisteredSubscription;
 pub use subscription::SubscriptionRegistry;
-
-/// Engine-side handle stashed in the per-account slot for the push
-/// reconciler task.
-#[derive(Debug)]
-pub struct PushHandle {
-    pub cancel: CancellationToken,
-    pub sender: mpsc::Sender<WatchEvent>,
-}
 
 /// Engine-side `InvalidationSink` implementation.
 ///
@@ -45,6 +38,7 @@ pub struct PushHandle {
 pub struct InvalidationSinkInner {
     senders: DashMap<AccountId, mpsc::Sender<WatchEvent>>,
     drop_counter: AtomicU64,
+    runtime: OnceLock<tokio::runtime::Handle>,
 }
 
 impl InvalidationSinkInner {
@@ -53,10 +47,14 @@ impl InvalidationSinkInner {
         Self {
             senders: DashMap::new(),
             drop_counter: AtomicU64::new(0),
+            runtime: OnceLock::new(),
         }
     }
 
     pub fn register(&self, account: AccountId, sender: mpsc::Sender<WatchEvent>) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = self.runtime.set(handle);
+        }
         self.senders.insert(account, sender);
     }
 
@@ -67,20 +65,6 @@ impl InvalidationSinkInner {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.drop_counter.load(Ordering::Relaxed)
-    }
-
-    /// Engine-internal helper: enumerate scopes affected by a hint
-    /// using the cursor registry's membership index. Mirrors
-    /// `scopes_for_hint` but exposed here so out-of-process callers
-    /// can compute the same answer for observability without the
-    /// reconciler in scope.
-    #[allow(dead_code)]
-    pub(crate) fn affected_scopes(
-        &self,
-        registry: &crate::cursor::CursorRegistry,
-        hint: &HintPayload,
-    ) -> Vec<bifrost_types::CursorScope> {
-        scopes_for_hint(registry, hint)
     }
 }
 
@@ -95,23 +79,31 @@ impl InvalidationSink for InvalidationSinkInner {
         let Some(tx) = self.senders.get(&account) else {
             return;
         };
-        match tx.try_send(event.clone()) {
+        match tx.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(rejected)) => {
-                // Channel full: try to land a coalesced
-                // `HintPayload::Unknown` so the reconciler still
-                // performs a full reconcile. We spawn a short-lived
-                // sender task that uses `send().await` with a tight
-                // deadline so a transiently-full channel doesn't
-                // drop the wakeup entirely. Increment the drop counter
-                // for observability either way.
-                let unknown = coalesced_event(rejected);
                 let sender = tx.clone();
                 self.drop_counter.fetch_add(1, Ordering::Relaxed);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if let Some(handle) = self.runtime.get() {
+                    let lossless = requires_lossless_delivery(&rejected);
+                    let delivery = if lossless {
+                        rejected
+                    } else {
+                        coalesced_event(rejected)
+                    };
                     handle.spawn(async move {
-                        let deadline = tokio::time::Duration::from_millis(100);
-                        let _ = tokio::time::timeout(deadline, sender.send(unknown)).await;
+                        if lossless {
+                            // Terminal classifications and warnings
+                            // are control information, not redundant
+                            // invalidation hints. Preserve the exact
+                            // event and wait for queue space.
+                            let _ = sender.send(delivery).await;
+                        } else {
+                            // Invalidations and health transitions can
+                            // collapse to one bounded full reconcile.
+                            let deadline = tokio::time::Duration::from_millis(100);
+                            let _ = tokio::time::timeout(deadline, sender.send(delivery)).await;
+                        }
                     });
                 }
             }
@@ -120,6 +112,11 @@ impl InvalidationSink for InvalidationSinkInner {
             }
         }
     }
+}
+
+#[must_use]
+pub(crate) fn requires_lossless_delivery(event: &WatchEvent) -> bool {
+    matches!(event, WatchEvent::Terminated(_) | WatchEvent::Warning(_))
 }
 
 pub(crate) fn coalesced_event(event: WatchEvent) -> WatchEvent {
@@ -140,4 +137,89 @@ pub(crate) fn coalesced_event(event: WatchEvent) -> WatchEvent {
 #[must_use]
 pub fn shared_sink() -> Arc<InvalidationSinkInner> {
     Arc::new(InvalidationSinkInner::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bifrost_types::{AccountOperation, CursorScope, Warning, WarningKind};
+
+    fn invalidated() -> WatchEvent {
+        WatchEvent::Invalidated {
+            hint: InvalidationHint {
+                source: PushSource::ImapNotify,
+                payload: HintPayload::Unknown,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn full_sink_preserves_warning_from_a_non_runtime_thread() {
+        let sink = Arc::new(InvalidationSinkInner::new());
+        let account = AccountId("warning".into());
+        let (tx, mut rx) = mpsc::channel(1);
+        sink.register(account.clone(), tx);
+        sink.senders
+            .get(&account)
+            .expect("registered")
+            .try_send(invalidated())
+            .expect("fill queue");
+
+        let outside = Arc::clone(&sink);
+        std::thread::spawn(move || {
+            outside.push(
+                account,
+                WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "preserve me")),
+            );
+        })
+        .join()
+        .expect("push thread");
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
+        let delivered = rx.recv().await;
+        assert!(matches!(delivered, Some(WatchEvent::Warning(_))));
+    }
+
+    #[tokio::test]
+    async fn full_sink_preserves_terminated_classification() {
+        let sink = Arc::new(InvalidationSinkInner::new());
+        let account = AccountId("terminated".into());
+        let (tx, mut rx) = mpsc::channel(1);
+        sink.register(account.clone(), tx);
+        sink.senders
+            .get(&account)
+            .expect("registered")
+            .try_send(invalidated())
+            .expect("fill queue");
+        let error = crate::recovery::restart_scope_error(
+            CursorScope::Account,
+            AccountOperation::SyncChanges,
+        );
+
+        sink.push(account, WatchEvent::Terminated(error));
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(WatchEvent::Invalidated { .. })
+        ));
+        let delivered = rx.recv().await;
+        assert!(matches!(delivered, Some(WatchEvent::Terminated(_))));
+    }
+
+    #[test]
+    fn only_control_information_requires_lossless_delivery() {
+        let warning = WatchEvent::Warning(Warning::user_safe(WarningKind::Other, "warning"));
+        let terminated = WatchEvent::Terminated(crate::recovery::restart_scope_error(
+            CursorScope::Account,
+            AccountOperation::SyncChanges,
+        ));
+        assert!(requires_lossless_delivery(&warning));
+        assert!(requires_lossless_delivery(&terminated));
+        assert!(!requires_lossless_delivery(&invalidated()));
+        assert!(!requires_lossless_delivery(&WatchEvent::Disconnected));
+        assert!(!requires_lossless_delivery(&WatchEvent::Reconnected));
+    }
 }

@@ -50,8 +50,10 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
 
     /// Read the latest backfill checkpoint for `(account, scope)`.
-    /// Returns the one with the most recent `items_done` if the store
-    /// has more than one partition's worth of state.
+    /// Returns the one with the greatest `items_done` if the store has
+    /// more than one partition's worth of state. Ties must be stable:
+    /// a page partition with the greatest parsed upper bound wins,
+    /// followed by lexicographically-greatest opaque partition bytes.
     ///
     /// The default `InMemoryCheckpointStore` implementation scans
     /// every backfill entry per call (O(n) on total partitions per
@@ -169,7 +171,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 if aid == &account && s == &scope {
                     let beats_current = match &latest {
                         None => true,
-                        Some(existing) => ck.progress.items_done > existing.progress.items_done,
+                        Some(existing) => backfill_checkpoint_is_later(ck, existing),
                     };
                     if beats_current {
                         latest = Some(ck.clone());
@@ -192,5 +194,31 @@ impl CheckpointStore for InMemoryCheckpointStore {
             guard.change.remove(&(account, scope));
             Ok(())
         })
+    }
+}
+
+fn backfill_checkpoint_is_later(
+    candidate: &BackfillCheckpoint,
+    current: &BackfillCheckpoint,
+) -> bool {
+    match candidate
+        .progress
+        .items_done
+        .cmp(&current.progress.items_done)
+    {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            let candidate_page =
+                crate::backfill::partitioner::parse_page_partition(&candidate.partition);
+            let current_page =
+                crate::backfill::partitioner::parse_page_partition(&current.partition);
+            match (candidate_page, current_page) {
+                (Some((_, candidate_to)), Some((_, current_to))) if candidate_to != current_to => {
+                    candidate_to > current_to
+                }
+                _ => candidate.partition.0 > current.partition.0,
+            }
+        }
     }
 }

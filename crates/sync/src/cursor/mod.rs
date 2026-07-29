@@ -94,4 +94,19 @@ impl CursorRegistry {
         let guard = self.cursors.read().expect("poisoned");
         guard.keys().cloned().collect()
     }
+
+    /// Atomically replace both cursor and membership topology from a
+    /// fully-discovered staging registry. Account reopen builds the
+    /// replacement off to the side so workers never observe a
+    /// half-refreshed membership index.
+    pub fn replace_from(&self, replacement: &Self) {
+        let cursors = replacement.cursors.read().expect("poisoned").clone();
+        let memberships = replacement
+            .membership_index
+            .read()
+            .expect("poisoned")
+            .clone();
+        *self.cursors.write().expect("poisoned") = cursors;
+        *self.membership_index.write().expect("poisoned") = memberships;
+    }
 }

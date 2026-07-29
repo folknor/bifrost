@@ -14,19 +14,10 @@
 pub mod idempotency;
 pub mod readback;
 
-use tokio_util::sync::CancellationToken;
-
 pub use idempotency::{IdempotencyVendor, MutationCampaignId};
 pub use readback::{
     ReadbackOutcome, run_destroy_readback_guard, run_move_readback_guard, run_readback_guard,
 };
-
-/// Engine-side handle stashed in the per-account slot for the mutation
-/// pipeline.
-#[derive(Debug)]
-pub struct MutationHandle {
-    pub cancel: CancellationToken,
-}
 
 /// Aggregate counters for a mutation campaign.
 ///

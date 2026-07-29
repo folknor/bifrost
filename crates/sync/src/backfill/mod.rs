@@ -2,8 +2,8 @@
 //!
 //! Backfill is the cold-start hydration pass. The partitioner plans
 //! newest-first partitions (so a user sees recent mail before deep
-//! history), the runner drives each partition, and the checkpointer
-//! persists at every partition boundary.
+//! history), and the runner emits a consumer-ack-deferred checkpoint
+//! at every partition boundary.
 //!
 //! `BackfillPolicy` is configurable per account; the default is
 //! `TimeWindowed` with exponentially-widening windows per
@@ -13,21 +13,11 @@ pub mod checkpoint;
 pub mod partitioner;
 pub mod runner;
 
-use std::sync::Arc;
-
 use bifrost_types::{AccountId, CursorScope};
-use tokio_util::sync::CancellationToken;
 
 pub use checkpoint::BackfillCheckpointWriter;
 pub use partitioner::{BackfillPolicy, BackfillStrategy, PartitionPlan, default_time_boundaries};
 pub use runner::{BackfillPartitionOutcome, BackfillRunner, LiveSupersedes};
-
-/// Engine-side handle stashed in the per-account slot.
-#[derive(Debug)]
-pub struct BackfillHandle {
-    pub cancel: CancellationToken,
-    pub live_supersedes: Arc<LiveSupersedes>,
-}
 
 /// Backfill registry: tracks which account scopes are pending, running,
 /// or complete. Durable resume state lives in the checkpoint store.

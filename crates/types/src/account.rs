@@ -854,7 +854,7 @@ pub trait Account: Send + Sync {
         _target: ContainerId,
         _source: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::BulkMove)) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::MoveThread)) })
     }
 
     /// Apply a label to `target`. Dispatches by `label.provenance`
@@ -1023,7 +1023,7 @@ pub trait Account: Send + Sync {
         _thread: ThreadId,
         _current: Option<ContainerId>,
     ) -> AccountFuture<Result<(), AccountError>> {
-        Box::pin(async { Err(unsupported_error(AccountOperation::BulkDestroy)) })
+        Box::pin(async { Err(unsupported_error(AccountOperation::DeleteThread)) })
     }
 
     /// Graceful local-handle teardown. IMAP `LOGOUT` + pool drain,

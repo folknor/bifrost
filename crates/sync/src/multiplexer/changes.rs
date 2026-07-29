@@ -86,9 +86,16 @@ pub async fn drive_changes_stream(
     _account_id: AccountId,
     changes_tx: broadcast::Sender<MultiplexerEvent>,
     boundary: BoundaryView,
-    _control: Option<SyncControl>,
+    control: Option<SyncControl>,
     _ack_tx: Option<mpsc::Sender<AckRequest>>,
 ) -> Result<ChangesEvent, Error> {
+    let _activity = match &control {
+        Some(control) => match control.begin_activity() {
+            Some(activity) => Some(activity),
+            None => return Ok(ChangesEvent::Paused),
+        },
+        None => None,
+    };
     let mut stream = account.changes_stream(cursor);
     while let Some(event) = stream.next().await {
         match boundary.peek() {
@@ -115,7 +122,25 @@ pub async fn drive_changes_stream(
         // `(items, checkpoint)` atomically in their own store, then
         // call `SyncEngine::ack_checkpoint` to durably advance the
         // engine's cursor.
-        let _ = changes_tx.send(me.clone());
+        // Register the outstanding checkpoint BEFORE publishing it.
+        // A consumer that receives, persists and acks between the send
+        // and the registration would otherwise leave behind an entry
+        // no ack can ever match, permanently wedging boundary waiters.
+        let expected = match (&control, &checkpoint) {
+            (Some(control), Some(checkpoint)) => {
+                control.expect_checkpoint(checkpoint.clone());
+                Some(checkpoint.clone())
+            }
+            _ => None,
+        };
+        let delivered = changes_tx.send(me.clone()).unwrap_or(0);
+        if delivered <= 1
+            && let (Some(control), Some(expected)) = (&control, &expected)
+        {
+            // Only the slot's sentinel receiver saw this batch, so no
+            // consumer ack is coming for it.
+            control.retire_checkpoint(expected);
+        }
         if let Some(Checkpoint::Change(c)) = &checkpoint {
             // Advance the in-memory registry so the next poll
             // iteration starts from the freshly-yielded cursor. The

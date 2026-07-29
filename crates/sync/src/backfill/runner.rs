@@ -37,6 +37,7 @@ use bifrost_types::{
 use futures::stream::StreamExt;
 use tokio::sync::broadcast;
 
+use crate::control::SyncControl;
 use crate::error::Error;
 use crate::multiplexer::MultiplexerEvent;
 
@@ -230,8 +231,10 @@ impl BackfillRunner {
     /// `Change::ObjectChange::Created` (skipping ids in
     /// `LiveSupersedes`), each page carrying a `BackfillCheckpoint`.
     /// Does NOT write to `CheckpointStore`: durable advance is
-    /// consumer-ack-driven (see module docs). Returns the total count of
-    /// entries kept after the supersedes filter.
+    /// consumer-ack-driven (see module docs). Checkpoint progress counts
+    /// entries observed before filtering because it describes the
+    /// inventory position, while the returned outcome reports both the
+    /// observed and forwarded totals.
     pub async fn run_partition(
         account: &dyn Account,
         scope: CursorScope,
@@ -239,7 +242,12 @@ impl BackfillRunner {
         live: &LiveSupersedes,
         changes_tx: Option<broadcast::Sender<MultiplexerEvent>>,
         envelope_version: u32,
+        control: Option<&SyncControl>,
     ) -> Result<BackfillPartitionOutcome, Error> {
+        let _activity = match control {
+            Some(control) => Some(control.begin_activity().ok_or(Error::Paused)?),
+            None => None,
+        };
         let partition_key = partition_key(&partition);
         let mut stream = account.inventory_partition_stream(scope.clone(), partition);
         let mut seen_total: u64 = 0;
@@ -263,7 +271,7 @@ impl BackfillRunner {
                             partition: partition_key.clone(),
                             progress_marker: None,
                             progress: BackfillProgress {
-                                items_done: kept_total,
+                                items_done: seen_total,
                                 items_estimated: None,
                             },
                             envelope_version,
@@ -287,9 +295,21 @@ impl BackfillRunner {
                         let me = MultiplexerEvent {
                             scope: scope.clone(),
                             event: Arc::new(SyncEvent::Batch(synthetic)),
-                            checkpoint: Some(Checkpoint::Backfill(bf)),
+                            checkpoint: Some(Checkpoint::Backfill(bf.clone())),
                         };
-                        let _ = tx.send(me);
+                        // Register before publishing so a fast consumer
+                        // ack cannot land before the entry exists and
+                        // leave it outstanding forever.
+                        let expected = Checkpoint::Backfill(bf);
+                        if let Some(control) = control {
+                            control.expect_checkpoint(expected.clone());
+                        }
+                        let delivered = tx.send(me).unwrap_or(0);
+                        if delivered <= 1
+                            && let Some(control) = control
+                        {
+                            control.retire_checkpoint(&expected);
+                        }
                     }
                 }
                 SyncEvent::Done(_) => break,
