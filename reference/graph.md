@@ -98,6 +98,40 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
 - `error.rs` - blob-not-byte-stream warning helper. Classification
   helpers live in `graph_error.rs`.
 
+`GraphClient` owns the REST test seam. Every REST helper - raw MIME import
+included - funnels through one private `execute_wire`, which adapts the
+production `bifrost_net::Response` into a Graph-local wire response; test
+builds enqueue scripted status, headers, and bodies there and inspect the
+recorded method, URL, conditional/prefer headers, content type, and JSON or
+raw body. This keeps Graph account tests hermetic without exposing or
+changing bifrost-net's private dispatch seam. The production path is
+unchanged: it still goes through `AccountNet` for bearer auth, retry, rate
+limits, and metering. JSON bodies are serialized by the funnel rather than by
+`RequestBuilder::json` (identical bytes and content type, plus the same
+`EncodeBody` failure) so the funnel is non-generic and the one non-JSON body
+can share it; `post_mime` previously built its own request on `AccountNet` and
+was the one wire path the seam could not see.
+
+Two rules make the seam an equivalence rather than an approximation:
+
+- A scripted status takes the shape `bifrost-net` would have produced.
+  Its retry loop returns `Ok(Response)` for 2xx and a passed-through 3xx
+  ONLY: a terminal 4xx becomes `Error::Status`, a 401 surviving the forced
+  refresh `Error::AuthLost`, and the retryable set (429 plus 5xx) becomes
+  `Error::RateLimited` / `Error::RetryBudgetExhausted` once the budget is
+  gone. The retry set is read off `RetryPolicy::default()` - the policy
+  `attach_account` installs - not restated. Backoff, attempt count, and the
+  concurrency permit are not simulated; they change how long production
+  takes to reach an outcome, not which outcome it reaches.
+- An ARMED script that runs out panics at the offending request. Falling
+  through to `AccountNet` would let an unexpected request reach the network
+  and would leave it out of the recorded list, so a test asserting "exactly
+  N requests" could not detect the N+1th. Mirrors the EWS double.
+
+Still outside the funnel, and so still unseamed: blob byte streams
+(`download_stream`), the OneDrive resumable chunk PUT (pre-authed, no bearer),
+and the Autodiscover POST. EWS has its own `EwsExecute` seam.
+
 Calendar/contact primitives live in `calendar.rs` and `contacts.rs`. Graph
 calendar `color` is a provider token (not projected); reads request `Prefer:
 outlook.timezone="UTC"`. Recurrence maps common daily/weekly/monthly/yearly
@@ -900,7 +934,38 @@ for `fileAttachment` (item/reference false); no pre-download digest.
 ## Error translation
 
 `graph_error::into_account_error(error, ctx)` converts the crate-internal
-`GraphError` into an `AccountError` via `try_build`. `GraphErrorContext
+`GraphError` into an `AccountError` via `try_build`.
+
+The `GraphError::Net` arm re-decodes Graph's error envelope before
+delegating. `bifrost-net` never hands a 4xx or 5xx back as a response - its
+retry loop converts one into `Status` / `RateLimited` /
+`RetryBudgetExhausted`, body preserved - so classifying those through
+`bifrost_net::into_account_error` alone reads the HTTP status and throws the
+typed `error.code` away. The whole `GraphSignal` table below then applied to
+`$batch` subresponses and to nothing else: a live 400 `InvalidDeltaToken`,
+the documented delta-expiry signal, classified `Request(Malformed)` ->
+terminal `ClientBug` instead of `SyncState(CursorInvalid)` ->
+`RestartScope`, and a 403 `AdminConsentRequired` classified
+`PermissionDenied` instead of `NeedsAdminConsent`. `net_to_account_error`
+refines when the body is Graph's - an envelope decoded, or there was no body
+at all and the status table is the whole answer (a bare 412 is
+`ConcurrencyConflict` here and an opaque server error in bifrost-net's
+table). A NON-EMPTY body that is not an envelope stays on bifrost-net's
+mapping on purpose: Graph did not write it, so reading it as
+`Protocol(ContractViolation)` would turn an edge device's HTML 403 on the
+Autodiscover leg into a terminal provider fault. `AuthLost` is never
+refined - it means a 401 survived a forced refresh, stronger evidence than
+the envelope, and Graph's own 401 arm derives the same recovery class.
+
+The same transport fact governs control flow, not just classification:
+`webhooks::subscription_is_gone` reads the status through
+`GraphError::response_status`, which sees both the `Response` shape (`$batch`
+subresponse, EWS HTTP failure, OneDrive chunk PUT) and the response evidence
+a `bifrost_net::Error` preserved. Matching only `GraphError::Response` made it
+permanently false on the live path, so `delete_subscription` failed on an
+already-vanished row and the renewal worker never took its recreate branch.
+
+`GraphErrorContext
 { protocol, operation, scope, idempotency_override }` threads the operation so
 `recovery::derive` computes `RecoveryClass` (no private recovery table).
 `idempotency_override` is `None` everywhere except the one call site that

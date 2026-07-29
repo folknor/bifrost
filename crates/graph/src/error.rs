@@ -101,6 +101,41 @@ struct InnerErrorBody {
     date: Option<String>,
 }
 
+impl GraphError {
+    /// The HTTP status the SERVER answered with, wherever that evidence
+    /// survives.
+    ///
+    /// A non-success status reaches this crate two ways and control flow
+    /// must not care which. `Response` carries one directly (a `$batch`
+    /// subresponse, an EWS HTTP failure, the OneDrive chunk PUT). Every
+    /// ordinary REST call instead gets a `bifrost_net::Error`, because the
+    /// transport converts 4xx/5xx into `Status` / `RateLimited` /
+    /// `RetryBudgetExhausted` / `AuthLost` before returning - matching only
+    /// the `Response` shape here meant a 404 from `DELETE /subscriptions`
+    /// was never recognized as "already gone" on the live path.
+    #[must_use]
+    pub(crate) fn response_status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Response(response) => Some(response.status),
+            Self::Net(bifrost_net::Error::Status { code, .. }) => Some(*code),
+            Self::Net(bifrost_net::Error::RateLimited { final_response, .. }) => {
+                Some(final_response.status)
+            }
+            Self::Net(
+                bifrost_net::Error::RetryBudgetExhausted {
+                    final_response: Some(final_response),
+                    ..
+                }
+                | bifrost_net::Error::AuthLost {
+                    final_response: Some(final_response),
+                    ..
+                },
+            ) => Some(final_response.status),
+            Self::Configuration { .. } | Self::Net(_) | Self::Json { .. } => None,
+        }
+    }
+}
+
 impl GraphResponseError {
     /// Parse a Graph error response from its raw status/headers/body.
     /// Best-effort decode: if the body is not a recognizable Graph

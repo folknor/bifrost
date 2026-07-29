@@ -298,6 +298,7 @@ fn header_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{GraphClient, ScriptedRestResponse};
     use bifrost_types::BatchItemOutcome;
 
     fn oid(value: &str) -> ObjectId {
@@ -431,6 +432,39 @@ mod tests {
                 .failed()
                 .iter()
                 .any(|failure| failure.item.0 == public.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_reaction_batch_posts_its_surviving_graph_id() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({
+                "responses": [{"id":"0", "status":200, "body":{"value":[]}}]
+            }),
+        )]);
+        let account =
+            GraphAccount::new_for_tests(client.clone(), super::super::PushMode::GraphSubscriptions);
+        let graph = oid("graph-message");
+        let public = public_id("pf", "item");
+        let outcome = message_reactions(account, &[public.clone(), graph.clone()])
+            .await
+            .expect("per-item outcome");
+        assert_eq!(outcome.succeeded().len(), 1);
+        assert_eq!(outcome.succeeded()[0].item.0, graph.0);
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, public.0);
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.ends_with("/$batch"));
+        assert_eq!(
+            requests[0]
+                .body
+                .as_ref()
+                .and_then(|body| body["requests"].as_array())
+                .map(Vec::len),
+            Some(1)
         );
     }
 

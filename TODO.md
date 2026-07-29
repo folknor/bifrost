@@ -491,6 +491,25 @@ blocking; each is a real defect or a real decision, not a cleanup.
   unchanged - Graph-local `GraphTransport` (now with a working precedent one
   module over) or promote net's `Dispatch`.
 
+  UPDATE 2: the REST half is now solved Graph-locally too, with the
+  `#[cfg(test)]` response queue rather than a trait. Every REST helper -
+  including the one raw-MIME body that used to build its own request -
+  funnels through one `GraphClient::execute_wire`, which adapts the
+  production response into a Graph-local wire shape; every path named above
+  is now pinned end to end. Two things had to be true for that to be worth
+  anything, and both cost a round to get right: a scripted status has to
+  take the shape bifrost-net's retry loop would have produced (it returns
+  `Ok(Response)` for 2xx and a passed-through 3xx ONLY), and an exhausted
+  script has to fail loudly instead of falling through to the network.
+  Getting the first right surfaced a live defect the seam had been hiding
+  in plain sight: because a 4xx never arrives as a response, Graph's typed
+  `error.code` classification and its `subscription_is_gone` predicate were
+  both dead on the live path. That is the argument for promoting net's
+  `Dispatch` instead: an in-crate double has to re-derive the transport's
+  status contract, and every crate that builds one re-derives it
+  separately. This item stays open on the net side; the Graph consumer no
+  longer blocks on it.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

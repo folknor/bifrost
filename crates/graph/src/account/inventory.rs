@@ -75,8 +75,12 @@ pub(crate) fn inventory_stream(
             };
             let mut entries = Vec::new();
             let mut etags = Vec::new();
+            let mut removed_etag_ids = Vec::new();
             for value in page.value {
                 if is_removed(&value) {
+                    if let Some(id) = value.get("id").and_then(Value::as_str) {
+                        removed_etag_ids.push(super::foreign::encode_message_id(&scope, id).0);
+                    }
                     continue;
                 }
                 if let Some(mut entry) = inventory_entry_from_value(&scope, &value) {
@@ -92,10 +96,13 @@ pub(crate) fn inventory_stream(
                 }
             }
 
-            if !etags.is_empty() {
+            if !etags.is_empty() || !removed_etag_ids.is_empty() {
                 let mut cache = account.etag_index.write().await;
                 for (id, etag) in etags {
                     cache.insert(id, etag);
+                }
+                for id in removed_etag_ids {
+                    cache.remove(&id);
                 }
             }
 
@@ -391,6 +398,7 @@ mod tests {
 
     use super::super::PushMode;
     use super::*;
+    use crate::client::ScriptedRestResponse;
 
     fn test_account() -> GraphAccount {
         GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
@@ -487,6 +495,78 @@ mod tests {
         }
         assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inventory_walks_the_absolute_next_link_and_rejects_a_page_without_either_link() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id": "one", "changeKey": "ck-one"}],
+                    "@odata.nextLink": "https://graph.example/next?page=2"
+                }),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({
+                    "value": [{"id": "two", "changeKey": "ck-two"}]
+                }),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let mut stream = inventory_stream(account, scope);
+        assert!(matches!(stream.next().await, Some(SyncEvent::Batch(_))));
+        let SyncEvent::Terminated(error) = stream.next().await.expect("neither-link failure")
+        else {
+            panic!("expected termination")
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::ContractViolation
+            )
+        ));
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .url
+                .contains("/me/mailFolders/inbox/messages/delta?")
+        );
+        assert_eq!(requests[1].url, "https://graph.example/next?page=2");
+    }
+
+    #[tokio::test]
+    async fn inventory_tombstone_evicts_its_cached_etag() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "value": [{"id":"gone", "@removed":{"reason":"deleted"}}],
+                "@odata.deltaLink":"https://graph.example/delta"
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client, PushMode::GraphSubscriptions);
+        account
+            .etag_index
+            .write()
+            .await
+            .insert("gone".to_string(), "old".to_string());
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let mut stream = inventory_stream(account.clone(), scope);
+        let _ = stream.next().await;
+        let _ = stream.next().await;
+        assert_eq!(account.etag_index.write().await.get("gone"), None);
     }
 
     #[test]

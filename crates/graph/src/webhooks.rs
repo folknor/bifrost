@@ -87,8 +87,19 @@ pub(crate) async fn renew_subscription(
     Ok(new_expiry)
 }
 
+/// Did the server answer "this subscription no longer exists"?
+///
+/// Reads the status through `GraphError::response_status`, which sees both
+/// shapes a Graph failure arrives in. Matching only `GraphError::Response`
+/// here made this predicate permanently false on the live path - a REST
+/// 404/410 is a `bifrost_net::Error::Status`, never a response - so
+/// `delete_subscription` failed on an already-vanished row and the renewal
+/// worker never took its recreate branch.
 pub(crate) fn subscription_is_gone(error: &GraphError) -> bool {
-    matches!(error, GraphError::Response(response) if response.status == reqwest::StatusCode::NOT_FOUND || response.status == reqwest::StatusCode::GONE)
+    matches!(
+        error.response_status(),
+        Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE)
+    )
 }
 
 pub(crate) async fn delete_subscription(
@@ -370,6 +381,25 @@ mod tests {
                 transmission_state: bifrost_types::TransmissionState::Unsent,
                 source: None,
             }
+        )));
+
+        // The shape a REST 404/410 actually arrives in: bifrost-net turns a
+        // terminal 4xx into `Error::Status` before this crate sees it, so a
+        // predicate that reads only `GraphError::Response` is dead on the
+        // live path however well it is unit-pinned against that variant.
+        let net_gone = |status| {
+            GraphError::Net(bifrost_net::Error::Status {
+                code: status,
+                body: bytes::Bytes::new(),
+                headers: reqwest::header::HeaderMap::new(),
+            })
+        };
+        assert!(subscription_is_gone(&net_gone(
+            reqwest::StatusCode::NOT_FOUND
+        )));
+        assert!(subscription_is_gone(&net_gone(reqwest::StatusCode::GONE)));
+        assert!(!subscription_is_gone(&net_gone(
+            reqwest::StatusCode::FORBIDDEN
         )));
     }
 

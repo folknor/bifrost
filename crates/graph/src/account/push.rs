@@ -948,7 +948,7 @@ fn new_handle() -> Result<SubscriptionHandle, AccountError> {
 mod tests {
     use bifrost_types::FolderId;
 
-    use crate::client::GraphClient;
+    use crate::client::{GraphClient, ScriptedRestResponse};
 
     use super::*;
 
@@ -1065,6 +1065,168 @@ mod tests {
             err.kind(),
             AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
         ));
+    }
+
+    #[tokio::test]
+    async fn webhook_creation_rolls_back_each_already_created_subscription() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::CREATED,
+                serde_json::json!({"id":"first","expirationDateTime":"2099-01-01T00:00:00Z"}),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"error":{"code":"ErrorInternalServerError","message":"no"}}),
+            ),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let mut account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        account.push_endpoint = Some(PushEndpoint {
+            webhook_url: "https://example.test/hook".to_string(),
+            client_state: Some("secret".to_string()),
+        });
+        let scopes = vec![
+            CursorScope::FolderType {
+                folder: FolderId("inbox".to_string()),
+                ty: ObjectType::Email,
+            },
+            CursorScope::FolderType {
+                folder: FolderId("contacts".to_string()),
+                ty: ObjectType::Contact,
+            },
+        ];
+        assert!(subscribe_graph(account.clone(), scopes).await.is_err());
+        assert!(account.graph_subscriptions.read().await.is_empty());
+        let requests = client.take_rest_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "POST", "DELETE"]
+        );
+        assert!(requests[2].url.ends_with("/subscriptions/first"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_graph_deletes_every_server_row() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![
+                state("one", "/me/messages"),
+                state("two", "/me/events"),
+            ]),
+        );
+        unsubscribe_graph(account.clone(), handle)
+            .await
+            .expect("delete loop succeeds");
+        assert!(account.graph_subscriptions.read().await.is_empty());
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].url.ends_with("/subscriptions/one"));
+        assert!(requests[1].url.ends_with("/subscriptions/two"));
+    }
+
+    /// A subscription Graph has already dropped must not fail teardown.
+    /// `subscription_is_gone` used to read only `GraphError::Response`,
+    /// which a REST call never produces - the transport converts a 404 into
+    /// `bifrost_net::Error::Status` first - so on the live path the 404
+    /// tolerance never applied, the DELETE loop aborted on the vanished row,
+    /// and the handle stayed registered with its remaining siblings
+    /// undeleted.
+    #[tokio::test]
+    async fn unsubscribe_tolerates_a_subscription_the_server_already_dropped() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::NOT_FOUND,
+                serde_json::json!({"error":{"code":"ResourceNotFound","message":"gone"}}),
+            ),
+            ScriptedRestResponse::empty(reqwest::StatusCode::NO_CONTENT),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let handle = SubscriptionHandle("h".to_string());
+        account.graph_subscriptions.write().await.insert(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![
+                state("vanished", "/me/messages"),
+                state("live", "/me/events"),
+            ]),
+        );
+
+        unsubscribe_graph(account.clone(), handle)
+            .await
+            .expect("a row the server already dropped is not a teardown failure");
+        assert!(account.graph_subscriptions.read().await.is_empty());
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].url.ends_with("/subscriptions/live"));
+    }
+
+    #[tokio::test]
+    async fn exchange_id_translation_posts_each_wire_chunk_and_accumulates_answers() {
+        let client = GraphClient::new("token");
+        let pending: Vec<_> = (0..=TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
+            .map(|index| {
+                (
+                    CursorScope::FolderType {
+                        folder: FolderId(format!("f{index}")),
+                        ty: ObjectType::Email,
+                    },
+                    format!("f{index}"),
+                )
+            })
+            .collect();
+        let answer = |start: usize, end: usize| serde_json::json!({"value": (start..end).map(|index| serde_json::json!({"sourceId":format!("f{index}"),"targetId":format!("e{index}")})).collect::<Vec<_>>()});
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                answer(0, TRANSLATE_EXCHANGE_IDS_MAX_INPUTS),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                answer(
+                    TRANSLATE_EXCHANGE_IDS_MAX_INPUTS,
+                    TRANSLATE_EXCHANGE_IDS_MAX_INPUTS + 1,
+                ),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::EwsStreaming);
+        let translated = translate_ews_scopes(&account, pending)
+            .await
+            .expect("wire fan-out translates all folders");
+        assert_eq!(translated.len(), TRANSLATE_EXCHANGE_IDS_MAX_INPUTS + 1);
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.ends_with("/me/translateExchangeIds"))
+        );
+        assert_eq!(
+            requests[0]
+                .body
+                .as_ref()
+                .and_then(|body| body["inputIds"].as_array())
+                .map(Vec::len),
+            Some(TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
+        );
+        assert_eq!(
+            requests[1]
+                .body
+                .as_ref()
+                .and_then(|body| body["inputIds"].as_array())
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

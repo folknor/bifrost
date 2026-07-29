@@ -2521,7 +2521,7 @@ mod tests {
     use super::*;
     use crate::account::PushMode;
     use crate::account::foreign::{encode_foreign, encode_message_id, encode_public_item_id};
-    use crate::client::GraphClient;
+    use crate::client::{GraphClient, ScriptedRestResponse};
     use bifrost_types::{AccountErrorKind, CursorScope, ObjectType, RequestErrorKind};
 
     // The single-id hydration door must reach the EWS arm for a public
@@ -2547,6 +2547,97 @@ mod tests {
             "AAMkmsg",
         );
         assert_eq!(ews_read_folder(&foreign), None);
+    }
+
+    /// Graph's raw-MIME import is the one call whose body is not JSON, so
+    /// it used to build its own request straight on `AccountNet` and sat
+    /// outside the seam entirely. It now shares the single wire funnel:
+    /// the base64 octets go out verbatim under `text/plain`, and the draft
+    /// the import returns is what gets sent.
+    #[tokio::test]
+    async fn raw_mime_import_posts_the_base64_octets_as_text_plain() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::CREATED,
+                json!({"id": "draft-1", "changeKey": "ck"}),
+            ),
+            ScriptedRestResponse::empty(reqwest::StatusCode::ACCEPTED),
+        ]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let raw = bytes::Bytes::from_static(b"Subject: hi\r\n\r\nbody");
+
+        let sent = send_raw_message(account, raw.clone(), None)
+            .await
+            .expect("MIME import returns the draft id");
+        assert_eq!(sent.0, "draft-1");
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].content_type, "text/plain");
+        assert_eq!(requests[0].body, None);
+        assert_eq!(
+            requests[0].raw_body.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&raw)
+                    .as_bytes()
+            )
+        );
+        assert!(requests[0].url.ends_with("/me/messages"));
+        assert!(requests[1].url.ends_with("/me/messages/draft-1/send"));
+        assert_eq!(requests[1].content_type, "application/json");
+    }
+
+    #[tokio::test]
+    async fn write_batch_drains_past_a_failure_to_evict_a_later_destroy_etag() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "responses": [
+                    {"id":"0", "status":400, "body":{"error":{"code":"BadRequest"}}},
+                    {"id":"1", "status":204}
+                ]
+            }),
+        )]);
+        let account = GraphAccount::new_for_tests(client.clone(), PushMode::GraphSubscriptions);
+        let failed = ObjectId("failed".to_string());
+        let destroyed = ObjectId("destroyed".to_string());
+        account
+            .etag_index
+            .write()
+            .await
+            .insert(destroyed.0.clone(), "stale".to_string());
+        let requests = vec![
+            BatchRequestItem {
+                id: "0".to_string(),
+                method: "PATCH".to_string(),
+                url: "/me/messages/failed".to_string(),
+                body: None,
+                headers: None,
+            },
+            BatchRequestItem {
+                id: "1".to_string(),
+                method: "DELETE".to_string(),
+                url: "/me/messages/destroyed".to_string(),
+                body: None,
+                headers: None,
+            },
+        ];
+        assert!(
+            submit_write_batch_with_targets(
+                &account,
+                requests,
+                &[failed, destroyed.clone()],
+                true,
+                AccountOperation::BulkDestroy
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(account.etag_index.write().await.get(&destroyed.0), None);
+        assert_eq!(client.take_rest_requests().len(), 1);
     }
 
     fn ews_item() -> crate::ews::EwsItem {
@@ -2822,6 +2913,47 @@ mod tests {
             ty: ObjectType::Email,
         };
         encode_message_id(&scope, native)
+    }
+
+    /// A shared-mailbox client is derived inside `GraphAccount::new`, so a
+    /// test never holds it. It shares the primary's script - the way it
+    /// already shares the semaphore and the `AccountNet` a request actually
+    /// goes down - or every foreign-mailbox request would sit outside both
+    /// the script and the recorded list.
+    #[tokio::test]
+    async fn a_foreign_message_write_rides_the_primary_clients_script() {
+        let client = GraphClient::new("token");
+        client.script_rest([
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"id": "AAMkmsg", "changeKey": "ck"}),
+            ),
+            ScriptedRestResponse::json(
+                reqwest::StatusCode::OK,
+                json!({"responses": [{"id": "0", "status": 200}]}),
+            ),
+        ]);
+        let account = GraphAccount::new_for_tests_with_shared(
+            client.clone(),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+
+        set_is_read(account, MutationTarget::Message(id), true)
+            .await
+            .expect("foreign write routes to the owning mailbox");
+
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .url
+                .contains("/users/shared%40contoso.com/messages/AAMkmsg"),
+            "{}",
+            requests[0].url
+        );
+        assert!(requests[1].url.ends_with("/$batch"));
     }
 
     #[test]

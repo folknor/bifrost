@@ -1,8 +1,9 @@
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
 use bifrost_net::{
-    AccountId, AccountNet, AccountSpec, Net, RateLimit, Response, RetryPolicy, StaticTokenSource,
-    TokenSource,
+    AccountId, AccountNet, AccountSpec, Net, RateLimit, RetryPolicy, StaticTokenSource, TokenSource,
 };
 use bifrost_types::TransmissionState;
 use bytes::Bytes;
@@ -45,6 +46,207 @@ struct ClientInner {
     token_source: Arc<dyn TokenSource>,
     mailbox_id: Option<String>,
     semaphore: Arc<Semaphore>,
+    /// Shared with every client derived from this one
+    /// (`for_shared_mailbox`, `with_outlook_base`), the way the semaphore
+    /// and the `AccountNet` already are: in production those derivatives
+    /// issue their requests down the same transport, so a seam they did not
+    /// share would leave every foreign-mailbox path unscriptable and
+    /// silently outside the recorded request list.
+    #[cfg(test)]
+    scripted: Arc<std::sync::Mutex<ScriptedRest>>,
+}
+
+/// Graph-owned response shape at the one REST funnel.  Keeping this small
+/// adapter local lets tests script Graph responses without reaching into
+/// bifrost-net's private dispatch seam.
+struct RestResponse {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+}
+
+impl From<bifrost_net::Response> for RestResponse {
+    fn from(response: bifrost_net::Response) -> Self {
+        Self {
+            status: response.status(),
+            headers: response.headers,
+            body: response.body,
+        }
+    }
+}
+
+/// Request body plus the content type it travels under, at the one wire
+/// funnel. JSON callers serialize up front instead of handing
+/// `RequestBuilder::json` a `Serialize` value, which keeps the funnel
+/// non-generic so the raw-MIME caller (`post_mime`) can share it - and
+/// therefore share the test seam - rather than opening a second,
+/// unscriptable path to `AccountNet`.
+struct WireBody {
+    content_type: &'static str,
+    bytes: Bytes,
+}
+
+/// Content type every JSON call sends, and the one a bodiless call still
+/// sends (unchanged from before the funnel merge).
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// Graph's import-from-MIME content type: the body is the base64 of the
+/// RFC 5322 octets, not JSON.
+const MIME_CONTENT_TYPE: &str = "text/plain";
+
+impl WireBody {
+    fn json<B: Serialize + ?Sized>(body: &B) -> Result<Self, GraphError> {
+        // Mirrors `RequestBuilder::json`'s failure shape so a body whose
+        // `Serialize` impl fails still surfaces as `EncodeBody`.
+        let bytes = serde_json::to_vec(body).map_err(|error| {
+            GraphError::Net(bifrost_net::Error::EncodeBody {
+                message: format!("serde_json::to_vec failed: {error}"),
+                source: Some(Box::new(error)),
+            })
+        })?;
+        Ok(Self {
+            content_type: JSON_CONTENT_TYPE,
+            bytes: Bytes::from(bytes),
+        })
+    }
+
+    fn mime(bytes: Bytes) -> Self {
+        Self {
+            content_type: MIME_CONTENT_TYPE,
+            bytes,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct RestRequest {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) if_match: Option<String>,
+    pub(crate) prefer: Option<String>,
+    pub(crate) content_type: String,
+    /// The JSON body as sent, when the call sent one. `None` for a
+    /// bodiless call and for the raw-MIME call, whose bytes land in
+    /// `raw_body` instead.
+    pub(crate) body: Option<serde_json::Value>,
+    /// The verbatim bytes of a non-JSON body (Graph's base64 MIME import).
+    pub(crate) raw_body: Option<Bytes>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptedRestResponse {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+}
+
+#[cfg(test)]
+impl ScriptedRestResponse {
+    pub(crate) fn json(status: reqwest::StatusCode, body: serde_json::Value) -> Self {
+        Self {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::from(serde_json::to_vec(&body).expect("JSON response serializes")),
+        }
+    }
+
+    pub(crate) fn empty(status: reqwest::StatusCode) -> Self {
+        Self {
+            status,
+            headers: reqwest::header::HeaderMap::new(),
+            body: Bytes::new(),
+        }
+    }
+
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.insert(
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("valid test header"),
+            reqwest::header::HeaderValue::from_str(value).expect("valid test header value"),
+        );
+        self
+    }
+
+    /// Reproduce what `bifrost-net` actually hands back for this status.
+    ///
+    /// The retry loop NEVER returns `Ok(Response)` for a 4xx or 5xx: a 4xx
+    /// outside the retry set becomes `Error::Status`, a 401 that survives a
+    /// forced token refresh becomes `Error::AuthLost`, and the retryable set
+    /// (429 plus the 5xx family) becomes `Error::RateLimited` /
+    /// `Error::RetryBudgetExhausted` once the budget is gone. Only 2xx and a
+    /// passed-through 3xx arrive as a response. A seam that handed a scripted
+    /// 500 back as a successful response would put every test built on it on
+    /// a code path production cannot reach, and the divergence would show up
+    /// as tests passing rather than as a failure.
+    ///
+    /// The retry set is read off `RetryPolicy::default()` - the policy
+    /// `attach_account` installs - rather than restated here, so a change to
+    /// the policy cannot leave the seam behind. Backoff, the attempt count,
+    /// and the client's own concurrency permit are deliberately not
+    /// simulated: they change how long production takes to reach an outcome,
+    /// not which outcome it reaches. A 3xx passes through as a response
+    /// because that is what the transport does with one it cannot follow.
+    fn into_net_outcome(self) -> Result<RestResponse, GraphError> {
+        use reqwest::StatusCode;
+
+        let Self {
+            status,
+            headers,
+            body,
+        } = self;
+        if status.is_success() || status.is_redirection() {
+            return Ok(RestResponse {
+                status,
+                headers,
+                body,
+            });
+        }
+
+        let policy = RetryPolicy::default();
+        let retry_after = bifrost_net::parse_retry_after(headers.get(reqwest::header::RETRY_AFTER))
+            .map(|hint| hint.min(policy.honor_retry_after_cap));
+        let final_response = bifrost_net::FinalResponse {
+            status,
+            headers: headers.clone(),
+            body: bifrost_net::error::cap_status_body(body.clone()),
+        };
+
+        let error = if status == StatusCode::UNAUTHORIZED {
+            bifrost_net::Error::AuthLost {
+                transmission_state: Some(TransmissionState::Acknowledged),
+                final_response: Some(final_response),
+            }
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            bifrost_net::Error::RateLimited {
+                retry_after,
+                final_response,
+            }
+        } else if status.is_server_error() || policy.statuses.contains(&status) {
+            bifrost_net::Error::RetryBudgetExhausted {
+                final_response: Some(final_response),
+                retry_after_history: retry_after.into_iter().collect(),
+            }
+        } else {
+            bifrost_net::Error::Status {
+                code: status,
+                body: bifrost_net::error::cap_status_body(body),
+                headers,
+            }
+        };
+        Err(GraphError::Net(error))
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScriptedRest {
+    /// Set by the first `script_rest` call and never cleared. While it is
+    /// set the client is a closed system: an unscripted request is a test
+    /// bug, not a reason to reach for the network.
+    armed: bool,
+    responses: VecDeque<ScriptedRestResponse>,
+    requests: Vec<RestRequest>,
 }
 
 impl GraphClient {
@@ -79,6 +281,8 @@ impl GraphClient {
                 token_source: source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+                #[cfg(test)]
+                scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
             }),
         }
     }
@@ -101,6 +305,8 @@ impl GraphClient {
                 token_source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
+                #[cfg(test)]
+                scripted: Arc::new(std::sync::Mutex::new(ScriptedRest::default())),
             }),
         }
     }
@@ -201,6 +407,8 @@ impl GraphClient {
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: self.inner.mailbox_id.clone(),
                 semaphore: Arc::clone(&self.inner.semaphore),
+                #[cfg(test)]
+                scripted: Arc::clone(&self.inner.scripted),
             }),
         }
     }
@@ -235,6 +443,8 @@ impl GraphClient {
                 token_source: Arc::clone(&self.inner.token_source),
                 mailbox_id: Some(mailbox_id.into()),
                 semaphore: Arc::clone(&self.inner.semaphore),
+                #[cfg(test)]
+                scripted: Arc::clone(&self.inner.scripted),
             }),
         }
     }
@@ -319,27 +529,9 @@ impl GraphClient {
         base64_mime: Bytes,
     ) -> Result<T, GraphError> {
         let url = self.api_url(path);
-        let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
-            GraphError::Net(bifrost_net::Error::Network {
-                message: "Graph request semaphore closed".to_string(),
-                transmission_state: TransmissionState::Unsent,
-                source: None,
-            })
-        })?;
-        let account_net = self.account_net().ok_or_else(|| {
-            GraphError::Net(bifrost_net::Error::Network {
-                message: "Graph client is not attached to an account".to_string(),
-                transmission_state: TransmissionState::Unsent,
-                source: None,
-            })
-        })?;
-        let response = account_net
-            .post(&url)
-            .header("Content-Type", "text/plain")
-            .body(base64_mime)
-            .send()
-            .await
-            .map_err(GraphError::Net)?;
+        let response = self
+            .execute_wire(&url, "POST", None, None, Some(WireBody::mime(base64_mime)))
+            .await?;
         parse_json_response(response)
     }
 
@@ -424,7 +616,7 @@ impl GraphClient {
         url: &str,
         method: &str,
         body: Option<&B>,
-    ) -> Result<Response, GraphError> {
+    ) -> Result<RestResponse, GraphError> {
         self.execute_request(url, method, None, None, body).await
     }
 
@@ -434,7 +626,7 @@ impl GraphClient {
         method: &str,
         etag: &str,
         body: Option<&B>,
-    ) -> Result<Response, GraphError> {
+    ) -> Result<RestResponse, GraphError> {
         self.execute_request(url, method, Some(etag), None, body)
             .await
     }
@@ -446,7 +638,29 @@ impl GraphClient {
         if_match: Option<&str>,
         prefer: Option<&str>,
         body: Option<&B>,
-    ) -> Result<Response, GraphError> {
+    ) -> Result<RestResponse, GraphError> {
+        let body = match body {
+            Some(body) => Some(WireBody::json(body)?),
+            None => None,
+        };
+        self.execute_wire(url, method, if_match, prefer, body).await
+    }
+
+    /// The one place a Graph REST request leaves this crate. Every helper
+    /// above funnels through here, raw MIME included, so the scripted seam
+    /// covers the whole surface and no path can quietly bypass it.
+    async fn execute_wire(
+        &self,
+        url: &str,
+        method: &str,
+        if_match: Option<&str>,
+        prefer: Option<&str>,
+        body: Option<WireBody>,
+    ) -> Result<RestResponse, GraphError> {
+        #[cfg(test)]
+        if let Some(outcome) = self.scripted_wire(method, url, if_match, prefer, body.as_ref()) {
+            return outcome;
+        }
         let _permit = self.inner.semaphore.acquire().await.map_err(|_| {
             GraphError::Net(bifrost_net::Error::Network {
                 message: "Graph request semaphore closed".to_string(),
@@ -475,7 +689,11 @@ impl GraphClient {
             }
         };
 
-        builder = builder.header("Content-Type", "application/json");
+        builder = builder.header(
+            "Content-Type",
+            body.as_ref()
+                .map_or(JSON_CONTENT_TYPE, |body| body.content_type),
+        );
         if let Some(etag) = if_match {
             builder = builder.header("If-Match", etag);
         }
@@ -483,11 +701,77 @@ impl GraphClient {
             builder = builder.header("Prefer", prefer);
         }
 
-        if let Some(b) = body {
-            builder = builder.json(b);
+        if let Some(body) = body {
+            builder = builder.body(body.bytes);
         }
 
-        builder.send().await.map_err(GraphError::Net)
+        builder
+            .send()
+            .await
+            .map(RestResponse::from)
+            .map_err(GraphError::Net)
+    }
+
+    /// Answer a request from the installed script, or `None` when this
+    /// client was never scripted (production, and the many unit tests that
+    /// never issue a request at all).
+    ///
+    /// An ARMED client that runs out of responses panics rather than
+    /// falling through to `AccountNet`: falling through would let an
+    /// unexpected extra request reach the network, which breaks
+    /// hermeticity outright, and would leave it out of the recorded
+    /// requests, so a test asserting "exactly N requests" could not detect
+    /// the N+1th. Mirrors the EWS double's exhaustion panic.
+    #[cfg(test)]
+    fn scripted_wire(
+        &self,
+        method: &str,
+        url: &str,
+        if_match: Option<&str>,
+        prefer: Option<&str>,
+        body: Option<&WireBody>,
+    ) -> Option<Result<RestResponse, GraphError>> {
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        if !scripted.armed {
+            return None;
+        }
+        let Some(response) = scripted.responses.pop_front() else {
+            panic!("Graph REST script exhausted by request: {method} {url}");
+        };
+        let is_json = body.is_none_or(|body| body.content_type == JSON_CONTENT_TYPE);
+        scripted.requests.push(RestRequest {
+            method: method.to_string(),
+            url: url.to_string(),
+            if_match: if_match.map(str::to_string),
+            prefer: prefer.map(str::to_string),
+            content_type: body
+                .map_or(JSON_CONTENT_TYPE, |body| body.content_type)
+                .to_string(),
+            body: body.filter(|_| is_json).map(|body| {
+                serde_json::from_slice(body.bytes.as_ref()).expect("Graph JSON body round-trips")
+            }),
+            raw_body: body.filter(|_| !is_json).map(|body| body.bytes.clone()),
+        });
+        Some(response.into_net_outcome())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn script_rest(&self, responses: impl IntoIterator<Item = ScriptedRestResponse>) {
+        let mut scripted = self.inner.scripted.lock().expect("REST script lock");
+        scripted.armed = true;
+        scripted.responses.extend(responses);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_rest_requests(&self) -> Vec<RestRequest> {
+        std::mem::take(
+            &mut self
+                .inner
+                .scripted
+                .lock()
+                .expect("REST script lock")
+                .requests,
+        )
     }
 }
 
@@ -542,9 +826,16 @@ fn build_url(base: &str, path: &str) -> String {
 /// constructs a `GraphResponseError` from the raw response so the
 /// account boundary receives structured evidence, not a formatted
 /// string.
-fn parse_json_response<T: DeserializeOwned>(response: Response) -> Result<T, GraphError> {
-    let status = response.status();
-    let Response { headers, body, .. } = response;
+///
+/// The reachable non-success statuses here are the 3xx `bifrost-net`
+/// passes through (304 on a conditional read, and a redirect no one can
+/// follow); 4xx and 5xx never arrive as a response at all, because the
+/// transport converts them into `bifrost_net::Error` first. Those are
+/// re-decoded against Graph's error envelope at the account boundary
+/// (`graph_error::into_account_error`), not here.
+fn parse_json_response<T: DeserializeOwned>(response: RestResponse) -> Result<T, GraphError> {
+    let status = response.status;
+    let RestResponse { headers, body, .. } = response;
     if !status.is_success() {
         let err = GraphResponseError::from_response(status, headers, body);
         return Err(GraphError::Response(err));
@@ -558,8 +849,8 @@ fn parse_json_response<T: DeserializeOwned>(response: Response) -> Result<T, Gra
 
 /// Check a Graph response for success status. On failure, constructs
 /// a `GraphResponseError` from the raw response.
-fn check_response_status(response: Response) -> Result<(), GraphError> {
-    let status = response.status();
+fn check_response_status(response: RestResponse) -> Result<(), GraphError> {
+    let status = response.status;
     if status.is_success() {
         return Ok(());
     }
@@ -766,5 +1057,108 @@ mod tests {
             0,
             "three attaches must leave exactly one live registration to detach"
         );
+    }
+
+    #[tokio::test]
+    async fn scripted_rest_records_the_graph_owned_request_and_returns_its_response() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({"displayName":"Ada"}),
+        )]);
+
+        let profile = client.get_profile().await.expect("scripted profile");
+        assert_eq!(profile.display_name.as_deref(), Some("Ada"));
+        let requests = client.take_rest_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert!(
+            requests[0]
+                .url
+                .ends_with("/me?$select=displayName,mail,userPrincipalName")
+        );
+        assert_eq!(requests[0].if_match, None);
+        assert_eq!(requests[0].prefer, None);
+        assert_eq!(requests[0].body, None);
+
+        let response = ScriptedRestResponse::empty(reqwest::StatusCode::TOO_MANY_REQUESTS)
+            .with_header("Retry-After", "5");
+        assert_eq!(response.headers["retry-after"], "5");
+    }
+
+    /// The seam is only worth building if it answers the way the transport
+    /// answers. `bifrost-net` returns `Ok(Response)` for 2xx and a
+    /// passed-through 3xx ONLY; every other status leaves its retry loop as
+    /// a typed `Error`. A seam that returned a scripted 500 as a response
+    /// would send every test built on it down a branch production cannot
+    /// reach, and nothing would fail to say so.
+    #[test]
+    fn a_scripted_status_takes_the_shape_bifrost_net_would_have_produced() {
+        use reqwest::StatusCode;
+
+        assert!(
+            ScriptedRestResponse::empty(StatusCode::OK)
+                .into_net_outcome()
+                .is_ok()
+        );
+        // A 304 on a conditional read is passed through as a response.
+        assert!(
+            ScriptedRestResponse::empty(StatusCode::NOT_MODIFIED)
+                .into_net_outcome()
+                .is_ok()
+        );
+
+        match ScriptedRestResponse::empty(StatusCode::NOT_FOUND).into_net_outcome() {
+            Err(GraphError::Net(bifrost_net::Error::Status { code, .. })) => {
+                assert_eq!(code, StatusCode::NOT_FOUND);
+            }
+            _ => panic!("a terminal 4xx is Error::Status"),
+        }
+
+        match ScriptedRestResponse::empty(StatusCode::TOO_MANY_REQUESTS)
+            .with_header("Retry-After", "5")
+            .into_net_outcome()
+        {
+            Err(GraphError::Net(bifrost_net::Error::RateLimited {
+                retry_after,
+                final_response,
+            })) => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(5)));
+                assert_eq!(final_response.status, StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("429 past the budget is Error::RateLimited"),
+        }
+
+        match ScriptedRestResponse::empty(StatusCode::INTERNAL_SERVER_ERROR).into_net_outcome() {
+            Err(GraphError::Net(bifrost_net::Error::RetryBudgetExhausted {
+                final_response: Some(final_response),
+                ..
+            })) => assert_eq!(final_response.status, StatusCode::INTERNAL_SERVER_ERROR),
+            _ => panic!("5xx past the budget is Error::RetryBudgetExhausted"),
+        }
+
+        match ScriptedRestResponse::empty(StatusCode::UNAUTHORIZED).into_net_outcome() {
+            Err(GraphError::Net(bifrost_net::Error::AuthLost {
+                transmission_state,
+                final_response: Some(_),
+            })) => assert_eq!(transmission_state, Some(TransmissionState::Acknowledged)),
+            _ => panic!("a 401 surviving the forced refresh is Error::AuthLost"),
+        }
+    }
+
+    /// An armed script that runs out must fail the test at the request that
+    /// exceeded it. Falling through to `AccountNet` would put a real socket
+    /// behind an unexpected request and leave it out of the recorded list,
+    /// so a test asserting "exactly N requests" could not see the N+1th.
+    #[tokio::test]
+    #[should_panic(expected = "Graph REST script exhausted")]
+    async fn an_exhausted_script_fails_loudly_instead_of_reaching_the_network() {
+        let client = GraphClient::new("token");
+        client.script_rest([ScriptedRestResponse::json(
+            reqwest::StatusCode::OK,
+            serde_json::json!({}),
+        )]);
+        let _ = client.get_profile().await;
+        let _ = client.get_profile().await;
     }
 }

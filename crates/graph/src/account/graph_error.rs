@@ -118,11 +118,72 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
             ),
             &ctx,
         ),
-        GraphError::Net(net) => {
-            apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), &ctx)
-        }
+        GraphError::Net(net) => net_to_account_error(net, &ctx),
         GraphError::Response(response) => response_to_account_error(response, &ctx),
         GraphError::Json { message, body } => json_parse_to_account_error(&message, body, &ctx),
+    }
+}
+
+/// Classify a transport-layer failure, re-decoding Graph's own error
+/// envelope first when the failure carries one.
+///
+/// `bifrost-net` never hands a 4xx or 5xx back as a response: the retry
+/// loop converts it into `Status`, `RateLimited`, or
+/// `RetryBudgetExhausted` with the body preserved. Delegating those
+/// straight to `bifrost_net::into_account_error` classifies them on the
+/// HTTP status alone and throws Graph's typed `error.code` away, so the
+/// whole `GraphSignal` table below applied only to `$batch` subresponses
+/// and never to an ordinary REST call: a 400 `InvalidDeltaToken` - the
+/// documented delta-expiry signal - landed on `Request(Malformed)` ->
+/// `ClientBug` instead of `SyncState(CursorInvalid)` -> `RestartScope`,
+/// and a 403 `AdminConsentRequired` on `PermissionDenied` instead of
+/// `NeedsAdminConsent`.
+///
+/// Refinement needs the body to be Graph's: either an envelope decoded, or
+/// there was no body at all and the status table is the whole answer (a
+/// bare 412 is `ConcurrencyConflict` here and a bare `Server(Error)` in
+/// bifrost-net, and a bare 400 on a cursor scope is the forward-compat
+/// delta-expiry restart). A NON-EMPTY body that is not an envelope is left
+/// on bifrost-net's mapping on purpose: Graph did not write it, so reading
+/// it as `Protocol(ContractViolation)` would turn an edge device's HTML 403
+/// on the Autodiscover leg into a terminal provider fault.
+///
+/// `AuthLost` is deliberately not refined either: it means a 401 survived a
+/// forced token refresh, which is strictly stronger evidence than the
+/// envelope, and Graph's own 401 arm derives the same recovery class.
+#[must_use]
+fn net_to_account_error(net: bifrost_net::Error, ctx: &GraphErrorContext) -> AccountError {
+    if let Some((status, headers, body)) = graph_envelope_evidence(&net) {
+        let response = GraphResponseError::from_response(status, headers, body);
+        if response.signal.is_some() || response.body.is_empty() {
+            return response_to_account_error(response, ctx);
+        }
+    }
+    apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), ctx)
+}
+
+/// Status, headers, and body of the response a `bifrost_net::Error`
+/// preserved, for the variants whose body may carry a Graph error
+/// envelope.
+fn graph_envelope_evidence(
+    net: &bifrost_net::Error,
+) -> Option<(StatusCode, HeaderMap, bytes::Bytes)> {
+    match net {
+        bifrost_net::Error::Status {
+            code,
+            body,
+            headers,
+        } => Some((*code, headers.clone(), body.clone())),
+        bifrost_net::Error::RateLimited { final_response, .. }
+        | bifrost_net::Error::RetryBudgetExhausted {
+            final_response: Some(final_response),
+            ..
+        } => Some((
+            final_response.status,
+            final_response.headers.clone(),
+            final_response.body.clone(),
+        )),
+        _ => None,
     }
 }
 
@@ -1764,6 +1825,101 @@ mod tests {
         assert!(
             body_text.contains("(truncated)"),
             "missing truncation marker"
+        );
+    }
+
+    /// The whole `GraphSignal` table is reachable only if a REST failure
+    /// carrying an envelope gets re-decoded here. `bifrost-net` converts
+    /// every 4xx/5xx into an `Error` before this crate sees it, so without
+    /// the re-decode the table applied to `$batch` subresponses alone and a
+    /// live delta-token expiry classified `Request(Malformed)` -> terminal
+    /// `ClientBug` instead of restarting the scope.
+    #[test]
+    fn a_transport_status_carrying_a_graph_envelope_classifies_on_its_signal() {
+        let error = into_account_error(
+            GraphError::Net(bifrost_net::Error::Status {
+                code: StatusCode::BAD_REQUEST,
+                body: body(r#"{"error":{"code":"InvalidDeltaToken","message":"expired"}}"#),
+                headers: HeaderMap::new(),
+            }),
+            graph_ctx(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(CursorScope::Account)),
+        );
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+            ),
+            "{:?}",
+            error.kind()
+        );
+        assert!(matches!(
+            error.recovery(),
+            RecoveryClass::Engine(EngineDirective::RestartScope(_))
+        ));
+
+        // Same for a status the retry loop escalated: the envelope rides
+        // along in the preserved final response.
+        let consent = into_account_error(
+            GraphError::Net(bifrost_net::Error::RetryBudgetExhausted {
+                final_response: Some(bifrost_net::FinalResponse {
+                    status: StatusCode::FORBIDDEN,
+                    headers: HeaderMap::new(),
+                    body: body(r#"{"error":{"code":"AdminConsentRequired"}}"#),
+                }),
+                retry_after_history: Vec::new(),
+            }),
+            graph_ctx(AccountOperation::SyncInventory),
+        );
+        assert!(matches!(
+            consent.kind(),
+            AccountErrorKind::Authorization(AccessErrorKind::AdminConsentRequired)
+        ));
+
+        // A bodyless failure has no envelope to read, but the status table
+        // is then the whole answer and Graph's is the richer one: a bare
+        // 412 on a conditioned write is a concurrency conflict the engine
+        // resolves with a state refresh, not the opaque server error
+        // bifrost-net's table produces.
+        let conflict = into_account_error(
+            GraphError::Net(bifrost_net::Error::Status {
+                code: StatusCode::PRECONDITION_FAILED,
+                body: Bytes::new(),
+                headers: HeaderMap::new(),
+            }),
+            graph_ctx(AccountOperation::UpdateFlags),
+        );
+        assert!(
+            matches!(conflict.kind(), AccountErrorKind::ConcurrencyConflict),
+            "{:?}",
+            conflict.kind()
+        );
+    }
+
+    /// No envelope, no refinement. The status is then all the evidence
+    /// there is, and bifrost-net's mapping additionally carries the
+    /// transport's own (retry history, transmission state) that a rebuilt
+    /// response error would drop. It also keeps the non-JSON legs honest:
+    /// an edge device answering the Autodiscover POST with an HTML 403 is
+    /// a permission failure, not the `Protocol(ContractViolation)` the
+    /// Graph-envelope classifier reads a non-envelope body as.
+    #[test]
+    fn a_transport_status_without_a_graph_envelope_keeps_the_net_classification() {
+        let error = into_account_error(
+            GraphError::Net(bifrost_net::Error::Status {
+                code: StatusCode::FORBIDDEN,
+                body: body("<html><body>Forbidden</body></html>"),
+                headers: HeaderMap::new(),
+            }),
+            graph_ctx(AccountOperation::Discover),
+        );
+        assert!(
+            matches!(
+                error.kind(),
+                AccountErrorKind::Authorization(AccessErrorKind::PermissionDenied)
+            ),
+            "{:?}",
+            error.kind()
         );
     }
 
