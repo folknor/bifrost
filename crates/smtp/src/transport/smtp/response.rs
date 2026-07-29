@@ -11,7 +11,7 @@ use nom::{
     IResult, Parser,
     branch::alt,
     bytes::streaming::{tag, take_until},
-    combinator::{complete, map},
+    combinator::{complete, map, peek, value},
     multi::many0,
     sequence::preceded,
 };
@@ -210,7 +210,7 @@ impl Response {
 
     /// Tests code equality
     pub fn has_code(&self, code: u16) -> bool {
-        self.code.to_string() == code.to_string()
+        u16::from(self.code) == code
     }
 
     /// Returns only the first word of the message if possible
@@ -354,8 +354,14 @@ pub(crate) fn parse_response(i: &str) -> IResult<&str, Response> {
         tag("\r\n"),
     ))
     .parse(i)?;
-    let (i, (last_code, last_line)) =
-        (parse_code, preceded(tag(" "), take_until("\r\n"))).parse(i)?;
+    let (i, (last_code, last_line)) = (
+        parse_code,
+        alt((
+            preceded(tag(" "), take_until("\r\n")),
+            value("", peek(complete(tag("\r\n")))),
+        )),
+    )
+        .parse(i)?;
     let (i, _) = complete(tag("\r\n")).parse(i)?;
 
     // Check that all codes are equal.
@@ -678,13 +684,9 @@ mod test {
     }
 
     #[test]
-    fn parse_response_rejects_reply_without_a_space_separator() {
-        // DOCUMENTS A BUG: RFC 5321 4.2 spells the
-        // final reply line as `Reply-code [ SP textstring ] CRLF`, so a bare
-        // `250\r\n` is a legal reply. The parser requires the space and turns
-        // it into a parse error, which aborts the connection.
-        assert!("250\r\n".parse::<Response>().is_err());
-        assert!("250-first\r\n250\r\n".parse::<Response>().is_err());
+    fn parse_response_accepts_reply_without_a_space_separator() {
+        assert!("250\r\n".parse::<Response>().is_ok());
+        assert!("250-first\r\n250\r\n".parse::<Response>().is_ok());
     }
 
     #[test]

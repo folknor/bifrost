@@ -15,7 +15,7 @@ use crate::transport::smtp::{error, transport::SmtpClient};
 pub(crate) struct Pool {
     config: PoolConfig,
     connections: Mutex<Option<Vec<ParkedConnection>>>,
-    thread_terminator: mpsc::SyncSender<()>,
+    thread_terminator: Option<mpsc::SyncSender<()>>,
     client: SmtpClient,
 }
 
@@ -31,16 +31,21 @@ pub(crate) struct PooledConnection {
 
 impl Pool {
     pub(crate) fn new(config: PoolConfig, client: SmtpClient) -> Arc<Self> {
-        let (thread_tx, thread_rx) = mpsc::sync_channel(1);
+        let (thread_terminator, thread_rx) = if config.min_idle > 0 {
+            let (thread_tx, thread_rx) = mpsc::sync_channel(1);
+            (Some(thread_tx), Some(thread_rx))
+        } else {
+            (None, None)
+        };
 
         let pool = Arc::new(Self {
             config,
             connections: Mutex::new(Some(Vec::new())),
-            thread_terminator: thread_tx,
+            thread_terminator,
             client,
         });
 
-        {
+        if let Some(thread_rx) = thread_rx {
             let pool_ = Arc::clone(&pool);
 
             let min_idle = pool_.config.min_idle;
@@ -146,7 +151,9 @@ impl Pool {
             }
         }
 
-        _ = self.thread_terminator.try_send(());
+        if let Some(thread_terminator) = &self.thread_terminator {
+            _ = thread_terminator.try_send(());
+        }
     }
 
     pub(crate) fn connection(self: &Arc<Self>) -> Result<PooledConnection, Error> {
@@ -165,6 +172,13 @@ impl Pool {
 
             match conn {
                 Some(conn) => {
+                    if conn.idle_duration() > self.config.idle_timeout {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("dropping an expired connection");
+
+                        conn.unpark().abort();
+                        continue;
+                    }
                     let mut conn = conn.unpark();
 
                     if !conn.test_connected() {

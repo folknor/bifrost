@@ -482,19 +482,11 @@ mod test {
     }
 
     #[test]
-    fn ehlo_and_lhlo_do_not_validate_the_client_id() {
-        // DOCUMENTS A BUG: `ClientId::Domain` is
-        // written into the greeting verbatim. VRFY and EXPN run their argument
-        // through `validate_single_line_argument`; EHLO and LHLO do not, so a
-        // caller-supplied `hello_name` carrying CRLF emits a second command
-        // line before any reply is read.
+    fn ehlo_and_lhlo_client_ids_are_validated_before_the_driver_writes_them() {
         let id = ClientId::Domain("host\r\nRSET".to_owned());
 
-        assert_eq!(
-            format!("{}", Ehlo::new(id.clone())),
-            "EHLO host\r\nRSET\r\n"
-        );
-        assert_eq!(format!("{}", Lhlo::new(id)), "LHLO host\r\nRSET\r\n");
+        assert!(id.validate().is_err());
+        assert!(ClientId::domain("mail.example.org").is_ok());
     }
 
     #[test]

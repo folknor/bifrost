@@ -88,7 +88,7 @@ impl ClientCodec {
                 (b'\r', _) => {
                     self.status = CodecStatus::StartingNewLine;
                 }
-                (b'\n', CodecStatus::StartingNewLine) => {
+                (b'\n', _) => {
                     self.status = CodecStatus::StartOfNewLine;
                 }
                 (_, CodecStatus::StartingNewLine) => {
@@ -105,6 +105,19 @@ impl ClientCodec {
             }
         }
     }
+}
+
+/// Return the RFC 1870 message size for a DATA transfer.
+///
+/// Every DATA writer terminates with `\r\n.\r\n` unconditionally, so the data
+/// section the server receives is always the caller's bytes plus that leading
+/// `CRLF` - a caller-supplied final `CRLF` gains a trailing empty line rather
+/// than being reused as the terminator's line break. Declaring `len` for those
+/// messages under-reports by two octets, so count the CRLF either way.
+/// Transparency dots and the terminator line itself stay excluded, as RFC 1870
+/// requires.
+pub(crate) fn smtp_data_size(message: &[u8]) -> usize {
+    message.len() + 2
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -151,7 +164,7 @@ mod test {
         codec.encode(b"test.\r\n", &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "..\r\ntest\r\ntest\r\n\r\n..\r\n\r\ntestte\r\n..\r\nsttesttest.test\n.test\ntesttesttest\r\n..test\r\ntest.\r\n"
+            "..\r\ntest\r\ntest\r\n\r\n..\r\n\r\ntestte\r\n..\r\nsttesttest.test\n..test\ntesttesttest\r\n..test\r\ntest.\r\n"
         );
     }
 
@@ -190,13 +203,7 @@ mod test {
     }
 
     #[test]
-    fn codec_does_not_treat_a_bare_lf_as_a_line_break() {
-        // DOCUMENTS A BUG: transparency tracking is
-        // CRLF-only. A body with bare-LF line endings - which
-        // `MessageBuilder::body` produces for `Vec<u8>` input, since only
-        // `String` bodies get CRLF normalization - can carry an unstuffed
-        // lone-dot line. A relay that accepts a bare LF as a line terminator
-        // ends DATA there and parses the rest of the body as SMTP commands.
+    fn codec_treats_a_bare_lf_as_a_line_break() {
         let mut buf = Vec::new();
         let mut codec = ClientCodec::new();
 
@@ -204,8 +211,18 @@ mod test {
 
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "body\n.\nMAIL FROM:<attacker@example.com>\r\n"
+            "body\n..\nMAIL FROM:<attacker@example.com>\r\n"
         );
+    }
+
+    #[test]
+    fn data_size_counts_the_crlf_the_terminator_always_writes() {
+        // `write_body` emits `\r\n.\r\n` whether or not the caller ended the
+        // message with a CRLF, so the data section is always two octets longer
+        // than the caller's buffer. Transparency dots are still excluded.
+        assert_eq!(smtp_data_size(b"line\r\n"), 8);
+        assert_eq!(smtp_data_size(b"line"), 6);
+        assert_eq!(smtp_data_size(b".quoted\r\n"), 11);
     }
 
     #[test]

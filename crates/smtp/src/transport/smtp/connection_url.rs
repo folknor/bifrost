@@ -106,7 +106,7 @@ pub(crate) fn from_connection_url<B: TransportBuilder>(connection_url: &str) -> 
     // use the path segment of the URL as name in the name in the HELO / EHLO command
     if connection_url.path().len() > 1 {
         let name = connection_url.path().trim_matches('/').to_owned();
-        builder = builder.hello_name(ClientId::Domain(name));
+        builder = builder.hello_name(ClientId::domain(name)?);
     }
 
     if let Some(password) = connection_url.password() {

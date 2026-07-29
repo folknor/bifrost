@@ -3,7 +3,7 @@ use std::path::Path;
 use std::{
     collections::HashMap,
     fmt::Display,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, ToSocketAddrs},
     time::Duration,
 };
@@ -14,7 +14,7 @@ use bifrost_sasl::ScramChannelBinding;
 use super::escape_crlf;
 use super::{
     ClientCodec, ConnectionState, MAX_RESPONSE_BYTES, MAX_RESPONSE_LINE_BYTES, NetworkStream,
-    TlsParameters,
+    TlsParameters, smtp_data_size,
 };
 use crate::{
     address::{Address, Envelope},
@@ -25,7 +25,7 @@ use crate::{
             decode_scram_payload, first_attemptable, oauth_mechanism, password_mechanism_order,
             scram_hash,
         },
-        batch::{SendProgress, SmtpBatchRecipient},
+        batch::{RecipientProgress, SendProgress, SmtpBatchRecipient},
         commands::{Auth, Bdat, Data, Ehlo, Expn, Lhlo, Mail, Noop, Rcpt, Rset, Starttls, Vrfy},
         error,
         error::{Error, SmtpCommandPhase, SmtpTransmissionState},
@@ -454,6 +454,16 @@ impl SmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let mut progress = SendProgress::new(Protocol::Smtp, recipients);
+        let rcpt_options_all = self
+            .rcpt_options_for_batch(&progress.recipients, options)
+            .map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
 
         let mail_options = self
             .mail_options_for_batch(from.as_ref(), email, options, false)
@@ -466,7 +476,13 @@ impl SmtpConnection {
             })?;
 
         if self.server_info().supports_pipelining() {
-            return self.send_smtp_batch_pipelined(from, email, mail_options, options, progress);
+            return self.send_smtp_batch_pipelined(
+                from,
+                email,
+                mail_options,
+                rcpt_options_all,
+                progress,
+            );
         }
 
         // Non-pipelined path. Split the wire event the same way the pipelined
@@ -502,8 +518,11 @@ impl SmtpConnection {
             .iter()
             .map(|r| r.address.clone())
             .collect();
-        for (i, addr) in recipient_addresses.into_iter().enumerate() {
-            let rcpt_options = self.rcpt_options_single(&addr, options).unwrap_or_default();
+        for (i, (addr, rcpt_options)) in recipient_addresses
+            .into_iter()
+            .zip(rcpt_options_all)
+            .enumerate()
+        {
             match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
                 Ok(resp) if resp.is_positive() => progress.record_rcpt_accepted(i),
                 Ok(resp) => progress.record_rcpt_rejected(i, resp),
@@ -603,19 +622,11 @@ impl SmtpConnection {
         from: Option<Address>,
         email: &[u8],
         mail_options: Vec<MailParameter>,
-        options: &SendOptions,
+        rcpt_options_all: Vec<Vec<RcptParameter>>,
         mut progress: SendProgress,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         // Build and write the pipelined command batch (MAIL FROM + all RCPTs + DATA).
         let mut commands = Mail::new(from, mail_options).to_string();
-        let rcpt_options_all: Vec<Vec<RcptParameter>> = progress
-            .recipients
-            .iter()
-            .map(|r| {
-                self.rcpt_options_single(&r.address, options)
-                    .unwrap_or_default()
-            })
-            .collect();
         for (rec, rcpt_opts) in progress.recipients.iter().zip(&rcpt_options_all) {
             commands.push_str(&Rcpt::new(rec.address.clone(), rcpt_opts.clone()).to_string());
         }
@@ -764,6 +775,16 @@ impl SmtpConnection {
         options: &SendOptions,
     ) -> Result<SendProgress, (Error, SendProgress)> {
         let mut progress = SendProgress::new(Protocol::Lmtp, recipients);
+        let rcpt_options_all = self
+            .rcpt_options_for_batch(&progress.recipients, options)
+            .map_err(|error| {
+                (
+                    error
+                        .with_attempt(SmtpTransmissionState::Unsent)
+                        .with_phase(SmtpCommandPhase::RcptTo),
+                    progress.clone(),
+                )
+            })?;
 
         let mail_options = self
             .mail_options_for_batch(from.as_ref(), email, options, false)
@@ -806,8 +827,11 @@ impl SmtpConnection {
             .map(|r| r.address.clone())
             .collect();
         let mut accepted_count = 0usize;
-        for (i, addr) in recipient_addresses.into_iter().enumerate() {
-            let rcpt_options = self.rcpt_options_single(&addr, options).unwrap_or_default();
+        for (i, (addr, rcpt_options)) in recipient_addresses
+            .into_iter()
+            .zip(rcpt_options_all)
+            .enumerate()
+        {
             match self.command_accepting_status(Rcpt::new(addr, rcpt_options)) {
                 Ok(resp) if resp.is_positive() => {
                     progress.record_rcpt_accepted(i);
@@ -938,6 +962,27 @@ impl SmtpConnection {
         Ok(parameters)
     }
 
+    fn rcpt_options_for_batch(
+        &self,
+        recipients: &[RecipientProgress],
+        options: &SendOptions,
+    ) -> Result<Vec<Vec<RcptParameter>>, Error> {
+        for (recipient, _) in options.recipient_parameters() {
+            if !recipients.iter().any(|batch_recipient| {
+                addresses_match_for_recipient_options(recipient, &batch_recipient.address)
+            }) {
+                return Err(error::invalid_input(
+                    "recipient-specific RCPT parameters do not match a batch recipient",
+                ));
+            }
+        }
+
+        recipients
+            .iter()
+            .map(|recipient| self.rcpt_options_single(&recipient.address, options))
+            .collect()
+    }
+
     /// Like `mail_options` but takes an explicit sender address instead of an `Envelope`.
     fn mail_options_for_batch(
         &self,
@@ -947,6 +992,11 @@ impl SmtpConnection {
         allow_binary_mime: bool,
     ) -> Result<Vec<MailParameter>, Error> {
         let mut mail_options = vec![];
+        let message_size = if allow_binary_mime {
+            email.len()
+        } else {
+            smtp_data_size(email)
+        };
 
         let has_smtputf8 = options
             .mail_parameters()
@@ -985,19 +1035,19 @@ impl SmtpConnection {
             if self
                 .server_info()
                 .size_limit()
-                .is_some_and(|limit| email.len() > limit)
+                .is_some_and(|limit| message_size > limit)
             {
                 return Err(error::invalid_input(
                     "Message is larger than the server-advertised SIZE limit",
                 ));
             }
-            mail_options.push(MailParameter::Size(email.len()));
+            mail_options.push(MailParameter::Size(message_size));
         }
 
         for parameter in options.mail_parameters() {
             self.validate_mail_parameter(
                 parameter,
-                email.len(),
+                message_size,
                 email.is_ascii(),
                 allow_binary_mime,
             )?;
@@ -1016,6 +1066,11 @@ impl SmtpConnection {
     ) -> Result<Vec<MailParameter>, Error> {
         // Mail
         let mut mail_options = vec![];
+        let message_size = if allow_binary_mime {
+            email.len()
+        } else {
+            smtp_data_size(email)
+        };
 
         // Internationalization handling
         //
@@ -1061,19 +1116,19 @@ impl SmtpConnection {
             if self
                 .server_info()
                 .size_limit()
-                .is_some_and(|limit| email.len() > limit)
+                .is_some_and(|limit| message_size > limit)
             {
                 return Err(error::invalid_input(
                     "Message is larger than the server-advertised SIZE limit",
                 ));
             }
-            mail_options.push(MailParameter::Size(email.len()));
+            mail_options.push(MailParameter::Size(message_size));
         }
 
         for parameter in options.mail_parameters() {
             self.validate_mail_parameter(
                 parameter,
-                email.len(),
+                message_size,
                 email.is_ascii(),
                 allow_binary_mime,
             )?;
@@ -1190,7 +1245,7 @@ impl SmtpConnection {
             }
             MailParameter::FutureRelease(value) => {
                 if !self.server_info().supports_future_release() {
-                    return Err(error::invalid_input(
+                    return Err(error::feature_unsupported(
                         "FUTURERELEASE requires server FUTURERELEASE support",
                     ));
                 }
@@ -1201,7 +1256,7 @@ impl SmtpConnection {
                             .future_release_max_interval()
                             .is_some_and(|limit| *seconds > limit) =>
                     {
-                        return Err(error::invalid_input(
+                        return Err(error::parameter_over_limit(
                             "HOLDFOR exceeds the server-advertised FUTURERELEASE limit",
                         ));
                     }
@@ -1296,6 +1351,7 @@ impl SmtpConnection {
 
     /// Send EHLO or LHLO and update server info
     fn hello(&mut self, hello_name: &ClientId) -> Result<(), Error> {
+        hello_name.validate()?;
         let response = match self.protocol {
             Protocol::Lmtp => try_smtp!(self.command(Lhlo::new(hello_name.clone())), self),
             _ => try_smtp!(self.command(Ehlo::new(hello_name.clone())), self),
@@ -1688,7 +1744,7 @@ impl SmtpConnection {
         self.stream.get_mut().set_state(ConnectionState::Ok);
 
         #[cfg(feature = "tracing")]
-        tracing::debug!("Wrote: {}", escape_crlf(&String::from_utf8_lossy(string)));
+        tracing::debug!("Wrote {} bytes", string.len());
         Ok(())
     }
 
@@ -1706,19 +1762,30 @@ impl SmtpConnection {
         self.stream.get_mut().set_state(ConnectionState::Broken);
 
         let mut buffer = String::with_capacity(100);
-        let mut pre = 0;
 
-        while self.stream.read_line(&mut buffer).map_err(error::network)? > 0 {
-            if buffer.len() - pre > MAX_RESPONSE_LINE_BYTES {
+        loop {
+            let mut line = Vec::with_capacity(100);
+            let bytes_read = {
+                let mut limited = (&mut self.stream).take((MAX_RESPONSE_LINE_BYTES + 1) as u64);
+                limited
+                    .read_until(b'\n', &mut line)
+                    .map_err(error::network)?
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            if line.len() > MAX_RESPONSE_LINE_BYTES {
                 return Err(error::parse("SMTP response line too long"));
             }
-            if buffer.len() > MAX_RESPONSE_BYTES {
+            if buffer.len() + line.len() > MAX_RESPONSE_BYTES {
                 return Err(error::parse("SMTP response too large"));
             }
-            pre = buffer.len();
+            let line = std::str::from_utf8(&line)
+                .map_err(|_| error::parse("SMTP response is not valid UTF-8"))?;
+            buffer.push_str(line);
 
             #[cfg(feature = "tracing")]
-            tracing::debug!("<< {}", escape_crlf(&buffer));
+            tracing::debug!("<< {}", escape_crlf(line));
             match parse_response(&buffer) {
                 Ok((_remaining, response)) => {
                     self.stream.get_mut().set_state(ConnectionState::Ok);
@@ -1885,7 +1952,7 @@ mod test {
                 .unwrap();
 
             let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=22 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
+                "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n",
                 "RCPT TO:<first@example.com> NOTIFY=FAILURE,DELAY ORCPT=rfc822;alias+3Dfirst@example.com\r\n",
                 "RCPT TO:<second@example.com> NOTIFY=FAILURE,DELAY\r\n",
                 "DATA\r\n",
@@ -1945,7 +2012,7 @@ mod test {
         assert!(commands[0].starts_with("EHLO "));
         assert_eq!(
             commands[1],
-            "MAIL FROM:<sender@example.com> SIZE=22 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n"
+            "MAIL FROM:<sender@example.com> SIZE=24 HOLDFOR=60 BY=300;R MT-PRIORITY=-1 RET=HDRS ENVID=env+3D1\r\n"
         );
         assert_eq!(
             commands[2],
@@ -1983,7 +2050,7 @@ mod test {
                 .unwrap();
 
             let expected_batch = concat!(
-                "MAIL FROM:<sender@example.com> SIZE=22\r\n",
+                "MAIL FROM:<sender@example.com> SIZE=24\r\n",
                 "RCPT TO:<recipient@example.com>\r\n",
                 "DATA\r\n",
             );
@@ -2025,7 +2092,7 @@ mod test {
 
         let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert!(commands[0].starts_with("EHLO "));
-        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=22\r\n");
+        assert_eq!(commands[1], "MAIL FROM:<sender@example.com> SIZE=24\r\n");
         assert_eq!(commands[2], "RCPT TO:<recipient@example.com>\r\n");
         assert_eq!(commands[3], "DATA\r\n");
         assert_eq!(commands[4], "RSET\r\n");
@@ -2103,7 +2170,7 @@ mod test {
         let commands = commands_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(
             commands[1],
-            "MAIL FROM:<sender@example.com> SIZE=23 SMTPUTF8 BODY=8BITMIME\r\n"
+            "MAIL FROM:<sender@example.com> SIZE=25 SMTPUTF8 BODY=8BITMIME\r\n"
         );
         handle.join().unwrap();
     }

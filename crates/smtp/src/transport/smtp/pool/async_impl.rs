@@ -45,7 +45,7 @@ impl<E: SmtpExecutor> Pool<E> {
             handle: OnceLock::new(),
         });
 
-        {
+        if pool.config.min_idle > 0 {
             let pool_ = Arc::clone(&pool);
 
             let min_idle = pool_.config.min_idle;
@@ -169,6 +169,13 @@ impl<E: SmtpExecutor> Pool<E> {
 
             match conn {
                 Some(conn) => {
+                    if conn.idle_duration() > self.config.idle_timeout {
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("dropping an expired connection");
+
+                        conn.unpark().abort().await;
+                        continue;
+                    }
                     let mut conn = conn.unpark();
 
                     if !conn.test_connected().await {

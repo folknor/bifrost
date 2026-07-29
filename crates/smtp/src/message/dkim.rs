@@ -223,7 +223,21 @@ fn dkim_header_format(
     let header_name =
         dkim_canonicalize_header_tag("DKIM-Signature", config.canonicalization.header);
     let header_name = HeaderName::new_from_ascii(header_name.into()).unwrap();
-    headers.insert_raw(HeaderValue::new(header_name, format!("v=1; a={signing_algorithm}-sha256; d={domain}; s={selector}; c={canon}; q=dns/txt; t={timestamp}; h={headers_list}; bh={body_hash}; b={signature}",domain=config.domain, selector=config.selector,canon=config.canonicalization,timestamp=timestamp,headers_list=headers_list,body_hash=body_hash,signature=signature,signing_algorithm=config.private_key.get_signing_algorithm())));
+    let prefix = format!(
+        "v=1; a={signing_algorithm}-sha256; d={domain}; s={selector}; c={canon}; q=dns/txt; t={timestamp}; h={headers_list}; bh={body_hash};",
+        domain = config.domain,
+        selector = config.selector,
+        canon = config.canonicalization,
+        signing_algorithm = config.private_key.get_signing_algorithm(),
+    );
+    let encoded_prefix = HeaderValue::new(header_name.clone(), prefix.clone())
+        .get_encoded()
+        .to_owned();
+    headers.insert_raw(HeaderValue::dangerous_new_pre_encoded(
+        header_name,
+        format!("{prefix} b={signature}"),
+        format!("{encoded_prefix}\r\n b={signature}"),
+    ));
     headers
 }
 
@@ -238,7 +252,14 @@ fn dkim_canonicalize_body(
             while body.ends_with(b"\r\n\r\n") {
                 body = &body[..body.len() - 2];
             }
-            Cow::Borrowed(body)
+            if body.ends_with(b"\r\n") {
+                Cow::Borrowed(body)
+            } else {
+                let mut out = Vec::with_capacity(body.len() + 2);
+                out.extend_from_slice(body);
+                out.extend_from_slice(b"\r\n");
+                Cow::Owned(out)
+            }
         }
         DkimCanonicalizationType::Relaxed => {
             let mut out = Vec::with_capacity(body.len());
@@ -253,8 +274,11 @@ fn dkim_canonicalize_body(
                 body = &body[1..];
             }
             // Remove empty lines at end
-            while out.ends_with(b"\r\n\r\n") {
+            while out.ends_with(b"\r\n") {
                 out.truncate(out.len() - 2);
+            }
+            if !out.is_empty() {
+                out.extend_from_slice(b"\r\n");
             }
             Cow::Owned(out)
         }
@@ -262,58 +286,58 @@ fn dkim_canonicalize_body(
 }
 
 fn dkim_canonicalize_headers_relaxed(headers: &str) -> String {
-    let mut r = String::with_capacity(headers.len());
+    let input = headers.as_bytes();
+    let mut out = Vec::with_capacity(input.len());
+    let mut offset = 0;
 
-    fn skip_whitespace(h: &str) -> &str {
-        match h.as_bytes().first() {
-            Some(b' ' | b'\t') => skip_whitespace(&h[1..]),
-            _ => h,
+    while offset < input.len() {
+        let Some(relative_colon) = input[offset..].iter().position(|byte| *byte == b':') else {
+            out.extend_from_slice(&input[offset..]);
+            break;
+        };
+        let colon = offset + relative_colon;
+        let mut name_end = colon;
+        while name_end > offset && matches!(input[name_end - 1], b' ' | b'\t') {
+            name_end -= 1;
+        }
+        out.extend(input[offset..name_end].iter().map(u8::to_ascii_lowercase));
+        out.push(b':');
+
+        offset = colon + 1;
+        let value_start = out.len();
+        let mut pending_space = false;
+        loop {
+            match input.get(offset..) {
+                Some([b'\r', b'\n', b' ' | b'\t', ..]) => {
+                    pending_space = out.len() > value_start;
+                    offset += 2;
+                    while matches!(input.get(offset), Some(b' ' | b'\t')) {
+                        offset += 1;
+                    }
+                }
+                Some([b'\r', b'\n', ..]) => {
+                    offset += 2;
+                    out.extend_from_slice(b"\r\n");
+                    break;
+                }
+                Some([b' ' | b'\t', ..]) => {
+                    pending_space = out.len() > value_start;
+                    offset += 1;
+                }
+                Some([byte, ..]) => {
+                    if pending_space {
+                        out.push(b' ');
+                        pending_space = false;
+                    }
+                    out.push(*byte);
+                    offset += 1;
+                }
+                Some([]) | None => break,
+            }
         }
     }
 
-    fn name(h: &str, out: &mut String) {
-        if let Some(name_end) = h.bytes().position(|c| c == b':') {
-            let (name, rest) = h.split_at(name_end + 1);
-            *out += name;
-            // Space after header colon is stripped.
-            value(skip_whitespace(rest), out);
-        } else {
-            // This should never happen.
-            *out += h;
-        }
-    }
-
-    fn value(h: &str, out: &mut String) {
-        match h.as_bytes() {
-            // Continuation lines.
-            [b'\r', b'\n', b' ' | b'\t', ..] => {
-                out.push(' ');
-                value(skip_whitespace(&h[2..]), out);
-            }
-            // End of header.
-            [b'\r', b'\n', ..] => {
-                *out += "\r\n";
-                name(&h[2..], out);
-            }
-            // Sequential whitespace.
-            [b' ' | b'\t', b' ' | b'\t' | b'\r', ..] => value(&h[1..], out),
-            // All whitespace becomes spaces.
-            [b'\t', ..] => {
-                out.push(' ');
-                value(&h[1..], out);
-            }
-            [_, ..] => {
-                let mut chars = h.chars();
-                out.push(chars.next().unwrap());
-                value(chars.as_str(), out);
-            }
-            [] => {}
-        }
-    }
-
-    name(headers, &mut r);
-
-    r
+    String::from_utf8(out).expect("serialized email headers are valid UTF-8")
 }
 
 /// Canonicalize header tag
@@ -417,10 +441,14 @@ fn dkim_sign_fixed_time(message: &mut Message, dkim_config: &DkimConfig, timesta
         &bh,
         &signature,
     );
-    message.headers.insert_raw(HeaderValue::new(
-        HeaderName::new_from_ascii_str("DKIM-Signature"),
-        dkim_header.get_raw("DKIM-Signature").unwrap().to_owned(),
-    ));
+    let header = dkim_header.find_header("DKIM-Signature").unwrap();
+    message
+        .headers
+        .insert_raw(HeaderValue::dangerous_new_pre_encoded(
+            HeaderName::new_from_ascii_str("DKIM-Signature"),
+            header.get_raw().to_owned(),
+            header.get_encoded().to_owned(),
+        ));
 }
 
 #[cfg(test)]
@@ -547,23 +575,8 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         //   a:X<CRLF>
         //   b:Y<SP>Z<CRLF>
         //
-        // Name lowercasing happens earlier, in `dkim_canonicalize_header_tag`,
-        // so the relaxed pass itself is fed already-lowercased names.
-        //
-        // DEVIATION: RFC 6376 3.4.2 step 3 deletes
-        // WSP on *both* sides of the colon. This implementation only strips
-        // WSP after it, so the input "b :" survives as "b :" instead of
-        // collapsing to "b:". Unreachable through `HeaderName`, which rejects
-        // names containing a space, but it makes the function wrong for any
-        // externally-supplied header block.
         assert_eq!(
-            dkim_canonicalize_headers_relaxed("a: X\r\nb : Y\t\r\n\tZ  \r\n"),
-            "a:X\r\nb :Y Z\r\n"
-        );
-
-        // Without the space before the colon the output matches the RFC.
-        assert_eq!(
-            dkim_canonicalize_headers_relaxed("a: X\r\nb: Y\t\r\n\tZ  \r\n"),
+            dkim_canonicalize_headers_relaxed("A: X\r\nB : Y\t\r\n\tZ  \r\n"),
             "a:X\r\nb:Y Z\r\n"
         );
     }
@@ -623,13 +636,9 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
 
     #[test]
     fn empty_body_canonicalization() {
-        // DOCUMENTS A BUG. RFC 6376 3.4.3: "a
-        // completely empty or missing body is canonicalized as a single CRLF;
-        // that is, the canonicalized length will be 2 octets." Simple
-        // canonicalization here returns zero octets.
         assert_eq!(
             dkim_canonicalize_body(b"", DkimCanonicalizationType::Simple).into_owned(),
-            b""
+            b"\r\n"
         );
 
         // RFC 6376 3.4.4: relaxed canonicalization of an empty body is the
@@ -642,22 +651,13 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
 
     #[test]
     fn body_of_only_empty_lines_canonicalization() {
-        // DOCUMENTS A BUG. RFC 6376 3.4.4 step b
-        // ignores *all* empty lines at the end of the body, so a body that is
-        // nothing but CRLFs relaxes to the null input. This implementation
-        // stops at one CRLF.
-        //
-        // This is reachable: `Message::body_raw` appends a CRLF before
-        // signing, so `Message::builder().body(String::new())` signed with the
-        // default relaxed/relaxed canonicalization hashes "\r\n" while every
-        // verifier hashes "". The `bh=` tag never matches.
         assert_eq!(
             dkim_canonicalize_body(b"\r\n", DkimCanonicalizationType::Relaxed).into_owned(),
-            b"\r\n"
+            b""
         );
         assert_eq!(
             dkim_canonicalize_body(b"\r\n\r\n\r\n", DkimCanonicalizationType::Relaxed).into_owned(),
-            b"\r\n"
+            b""
         );
 
         // Simple is correct here: RFC 6376 3.4.3 collapses a trailing "*CRLF"
@@ -669,20 +669,39 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
     }
 
     #[test]
-    fn body_canonicalization_does_not_append_a_missing_final_crlf() {
-        // DOCUMENTS A BUG. Both RFC 6376 3.4.3 and
-        // 3.4.4 step b say "If the body is non-empty but does not end with a
-        // CRLF, a CRLF is added." Neither branch does that.
-        //
-        // `dkim_sign` is insulated because `Message::body_raw` appends a CRLF
-        // unconditionally; a direct caller of the canonicalizer is not.
+    fn body_canonicalization_appends_a_missing_final_crlf() {
         assert_eq!(
             dkim_canonicalize_body(b"abc", DkimCanonicalizationType::Simple).into_owned(),
-            b"abc"
+            b"abc\r\n"
         );
         assert_eq!(
             dkim_canonicalize_body(b"abc", DkimCanonicalizationType::Relaxed).into_owned(),
-            b"abc"
+            b"abc\r\n"
+        );
+    }
+
+    #[test]
+    fn dkim_signature_fold_is_stable_when_the_signature_is_inserted() {
+        let signing_key = DkimSigningKey::new(KEY_RSA, DkimSigningAlgorithm::Rsa).unwrap();
+        let config = DkimConfig::new(
+            "dkimtest".to_owned(),
+            "example.org".to_owned(),
+            signing_key,
+            vec![HeaderName::new_from_ascii_str("Date")],
+            DkimCanonicalization {
+                header: DkimCanonicalizationType::Simple,
+                body: DkimCanonicalizationType::Simple,
+            },
+        );
+        let empty = super::dkim_header_format(&config, 0, "Date", &"B".repeat(44), "");
+        let signed =
+            super::dkim_header_format(&config, 0, "Date", &"B".repeat(44), &"A".repeat(344));
+        let empty = empty.find_header("DKIM-Signature").unwrap().get_encoded();
+        let signed = signed.find_header("DKIM-Signature").unwrap().get_encoded();
+
+        assert_eq!(
+            empty.strip_suffix("b=").unwrap(),
+            signed.split_once("b=").unwrap().0
         );
     }
 

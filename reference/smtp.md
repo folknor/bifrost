@@ -39,7 +39,7 @@ LMTP final delivery-status loop holds `Broken` until every accepted recipient's 
 
 ## PIPELINING
 
-When the server advertises PIPELINING, `MAIL FROM`, every `RCPT TO`, and `DATA` are written in one batch. Replies are drained in order before the body is sent. The body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is aborted before the body.
+When the server advertises PIPELINING, `MAIL FROM`, every `RCPT TO`, and `DATA` are written in one batch. Replies are drained in order before the body is sent. The body is never in the pipelined batch. On RCPT failure mid-pipeline the transaction is aborted before the body. Very large recipient groups remain a bounded-write-timeout robustness concern; chunked pipelining is future work.
 
 ## DSN and SendOptions
 
@@ -49,7 +49,9 @@ When the server advertises PIPELINING, `MAIL FROM`, every `RCPT TO`, and `DATA` 
 - Uniform RCPT TO params: DSN `NOTIFY`.
 - Recipient-specific RCPT TO params: DSN `NOTIFY` overrides per recipient, `ORCPT` (default addr-type `rfc822`).
 
-Server-advertised `DSN` is verified before DSN parameters are emitted. Recipient-specific params override matching global keywords (RFC 3461 §4.1 no-duplicate-keyword).
+Server-advertised `DSN` is verified before DSN parameters are emitted. Recipient-specific params override matching global keywords (RFC 3461 §4.1 no-duplicate-keyword). Automatic DATA `SIZE` declarations account for the DATA terminator's leading CRLF but exclude the terminator line itself and transparency dots, as RFC 1870 requires; BDAT uses its raw payload length.
+
+Batch sends validate every recipient's RCPT parameters before `MAIL FROM`, in both sync and async paths. A local parameter error is an unsent `RcptTo` failure, never a silent downgrade to an unparameterized RCPT command.
 
 Public entry points: `send_raw_with_options(...)` on SMTP and LMTP, sync and async.
 
@@ -68,6 +70,10 @@ Opt-in via explicit `send_raw_bdat` / `send_raw_bdat_with_options`. Defaults sti
 ## SIZE enforcement
 
 If the server advertises `SIZE=<bytes>`, message size is checked client-side before MAIL FROM, and the advertised value is included as `SIZE=<bytes>` on the wire.
+
+`SIZE 0` means "no declared maximum" per RFC 1870 section 3 and is stored as no limit. An unparseable limit is a hard `Parse` error on the EHLO reply rather than a silently dropped ceiling.
+
+For DATA the declared size is `message.len() + 2`. Every DATA writer terminates with `\r\n.\r\n` unconditionally, so the CRLF before the terminating dot is always an extra octet pair on the wire - a message that already ends in CRLF gains a trailing empty line rather than reusing its own CRLF as the terminator's line break. Declaring the bare buffer length would under-report by two octets for every well-formed message. BDAT declares the raw chunk length because it has no terminator or transparency layer.
 
 ## Auth
 
@@ -114,6 +120,8 @@ Display-name encoding emits RFC 5322 phrase text when the name is atom-shaped, R
 
 `MultiPart` kinds: `Mixed`, `Alternative`, `Related`, `Signed`, `Encrypted`, `Report { report_type }`. `Mixed` is the default for `MultiPart::builder().build()`.
 
+Multipart builders ensure a `boundary` is present even when a caller supplies a boundary-less multipart `Content-Type`. `try_boundary`, `try_encrypted`, and `try_signed` are fallible validation entry points; default boundaries use OS randomness, and a caller-supplied boundary is regenerated if it appears at a MIME delimiter position in an added part.
+
 `SinglePartBuilder::body(String)` and `MessageBuilder::body(String)` infer `Content-Type: text/plain; charset=utf-8` when no content type is set.
 
 Typed headers for list management: `List-ID`, `List-Help`, `List-Unsubscribe`, `List-Unsubscribe-Post` (fixed value `List-Unsubscribe=One-Click` per RFC 8058), `List-Subscribe`, `List-Post`, `List-Owner`, `List-Archive`.
@@ -126,13 +134,15 @@ Batch builders: `MultiPart::multiparts(...)` and `.singleparts(...)`.
 
 Default canonicalization is `relaxed/relaxed`. Signing keys: `From<rsa::RsaPrivateKey>` and `From<ed25519_dalek::SigningKey>` on `DkimSigningKey`. SHA-2 via `sha2` 0.10 to match `rsa` 0.9 digest traits.
 
+Canonicalization follows RFC 6376 for empty bodies and missing final CRLFs. Relaxed headers are normalized iteratively, and `DKIM-Signature` is folded before `b=` before hashing so simple header canonicalization signs the exact emitted bytes. The signer intentionally does not support the `l=` body-length tag because it enables content-append attacks.
+
 ## Pool
 
-`PoolConfig` configures min idle, max size, and idle timeout. `min_idle` defaults to 0 (no background DNS / reconnect). `test_connected()` runs before reuse and aborts on failure.
+`PoolConfig` configures min idle, max size, and idle timeout. `min_idle` defaults to 0: no background pool worker is started, and expired connections are discarded at checkout. A positive `min_idle` enables the worker that expires and replenishes warm connections. `test_connected()` runs before reuse and aborts on failure.
 
 ## Error model
 
-`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Local buckets are `Parse`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter.
+`Error::kind()` returns `&ErrorKind`. SMTP reply failures are `Transient(Response)` or `Permanent(Response)`, so callers can inspect the full server reply through `smtp_response()`, `status()`, and `enhanced_status_code()`. Local buckets are `Parse`, `InvalidInput`, `FeatureUnsupported`, `ParameterOverLimit`, `Internal`, `Policy`, `Connection`, `Network`, `Timeout`, `Tls`, and `TransportShutdown`. `Policy` covers local refusals such as plaintext-AUTH refusal. `FeatureUnsupported` / `ParameterOverLimit` are the FUTURERELEASE discriminators (a relay that did not advertise the extension vs a HOLDFOR over the advertised max interval), kept distinct from generic `InvalidInput` so the account-error mapping can tell scheduled-send-unsupported apart from a malformed parameter. SMTP replies are line-bounded before allocation and decoded from bytes, so oversized or non-UTF-8 replies are `Parse`, not retryable network errors.
 
 Internal pipeline errors carry two value-side decorations the classifier reads:
 

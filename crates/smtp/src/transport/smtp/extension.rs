@@ -59,6 +59,26 @@ impl Display for ClientId {
     }
 }
 
+impl ClientId {
+    /// Creates a validated domain identity for EHLO or LHLO.
+    pub fn domain(value: impl Into<String>) -> Result<Self, Error> {
+        let value = value.into();
+        validate_esmtp_raw_value(&value).map_err(|_| {
+            error::invalid_input("EHLO domain must be printable ASCII without spaces")
+        })?;
+        Ok(Self::Domain(value))
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Domain(value) => validate_esmtp_raw_value(value).map_err(|_| {
+                error::invalid_input("EHLO domain must be printable ASCII without spaces")
+            }),
+            Self::Ipv4(_) | Self::Ipv6(_) => Ok(()),
+        }
+    }
+}
+
 /// Supported ESMTP keywords
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -198,9 +218,7 @@ impl Display for ServerInfo {
 impl ServerInfo {
     /// Parses a EHLO response to create a `ServerInfo`
     pub(crate) fn from_response(response: &Response) -> Result<ServerInfo, Error> {
-        let Some(name) = response.first_word() else {
-            return Err(error::parse("Could not read server name"));
-        };
+        let name = response.first_word().unwrap_or_default();
 
         let mut features: HashSet<Extension> = HashSet::new();
 
@@ -211,6 +229,13 @@ impl ServerInfo {
 
             let mut split = line.split_whitespace();
             let keyword = split.next().unwrap();
+            if let (Some(prefix), Some(mechanism)) = (keyword.get(..5), keyword.get(5..))
+                && prefix.eq_ignore_ascii_case("AUTH=")
+                && !mechanism.is_empty()
+            {
+                insert_auth_mechanisms(&mut features, std::iter::once(mechanism).chain(split));
+                continue;
+            }
             match keyword.to_ascii_uppercase().as_str() {
                 "8BITMIME" => {
                     features.insert(Extension::EightBitMime);
@@ -219,9 +244,15 @@ impl ServerInfo {
                     features.insert(Extension::Pipelining);
                 }
                 "SIZE" => {
-                    features.insert(Extension::Size(
-                        split.next().and_then(|limit| limit.parse().ok()),
-                    ));
+                    let limit = match split.next() {
+                        None | Some("0") => None,
+                        Some(limit) => Some(
+                            limit
+                                .parse()
+                                .map_err(|_| error::parse("invalid SIZE limit"))?,
+                        ),
+                    };
+                    features.insert(Extension::Size(limit));
                 }
                 "SMTPUTF8" => {
                     features.insert(Extension::SmtpUtfEight);
@@ -277,37 +308,7 @@ impl ServerInfo {
                     features.insert(Extension::Expn);
                 }
                 "AUTH" => {
-                    for mechanism in split {
-                        match mechanism.to_ascii_uppercase().as_str() {
-                            "PLAIN" => {
-                                features.insert(Extension::Authentication(Mechanism::Plain));
-                            }
-                            "LOGIN" => {
-                                features.insert(Extension::Authentication(Mechanism::Login));
-                            }
-                            "XOAUTH2" => {
-                                features.insert(Extension::Authentication(Mechanism::Xoauth2));
-                            }
-                            "OAUTHBEARER" => {
-                                features.insert(Extension::Authentication(Mechanism::OAuthBearer));
-                            }
-                            "SCRAM-SHA-1" => {
-                                features.insert(Extension::Authentication(Mechanism::ScramSha1));
-                            }
-                            "SCRAM-SHA-256" => {
-                                features.insert(Extension::Authentication(Mechanism::ScramSha256));
-                            }
-                            "SCRAM-SHA-1-PLUS" => {
-                                features
-                                    .insert(Extension::Authentication(Mechanism::ScramSha1Plus));
-                            }
-                            "SCRAM-SHA-256-PLUS" => {
-                                features
-                                    .insert(Extension::Authentication(Mechanism::ScramSha256Plus));
-                            }
-                            _ => (),
-                        }
-                    }
+                    insert_auth_mechanisms(&mut features, split);
                 }
                 _ => (),
             }
@@ -430,6 +431,26 @@ impl ServerInfo {
     }
 }
 
+fn insert_auth_mechanisms<'a>(
+    features: &mut HashSet<Extension>,
+    mechanisms: impl Iterator<Item = &'a str>,
+) {
+    for mechanism in mechanisms {
+        let mechanism = match mechanism.to_ascii_uppercase().as_str() {
+            "PLAIN" => Mechanism::Plain,
+            "LOGIN" => Mechanism::Login,
+            "XOAUTH2" => Mechanism::Xoauth2,
+            "OAUTHBEARER" => Mechanism::OAuthBearer,
+            "SCRAM-SHA-1" => Mechanism::ScramSha1,
+            "SCRAM-SHA-256" => Mechanism::ScramSha256,
+            "SCRAM-SHA-1-PLUS" => Mechanism::ScramSha1Plus,
+            "SCRAM-SHA-256-PLUS" => Mechanism::ScramSha256Plus,
+            _ => continue,
+        };
+        features.insert(Extension::Authentication(mechanism));
+    }
+}
+
 /// A `MAIL FROM` extension parameter
 #[derive(PartialEq, Eq, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -520,6 +541,9 @@ impl MailParameter {
 
     pub(crate) fn validate_syntax(&self) -> Result<(), Error> {
         match self {
+            MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(datetime)) => {
+                validate_esmtp_raw_value(datetime)
+            }
             MailParameter::EnvelopeId(value) => validate_envelope_id(value),
             MailParameter::Other { keyword, .. } => validate_esmtp_keyword(keyword),
             MailParameter::OtherRaw {
@@ -1430,23 +1454,15 @@ mod test {
     }
 
     #[test]
-    fn size_with_an_unparsable_limit_disables_the_client_side_check() {
-        let info = ServerInfo::from_response(&ehlo(&["me", "SIZE not-a-number"])).unwrap();
-
-        assert!(info.supports_size());
-        // The advertised value is dropped silently, so `mail_options` emits
-        // `SIZE=<len>` without any client-side ceiling check.
-        assert_eq!(info.size_limit(), None);
+    fn size_with_an_unparsable_limit_is_rejected() {
+        assert!(ServerInfo::from_response(&ehlo(&["me", "SIZE not-a-number"])).is_err());
     }
 
     #[test]
     fn size_zero_means_no_declared_maximum() {
-        // RFC 1870 3: `SIZE 0` means the server declares no fixed maximum.
-        // Bifrost stores it verbatim, so every non-empty message fails the
-        // client-side check before MAIL FROM.
         let info = ServerInfo::from_response(&ehlo(&["me", "SIZE 0"])).unwrap();
 
-        assert_eq!(info.size_limit(), Some(0));
+        assert_eq!(info.size_limit(), None);
     }
 
     #[test]
@@ -1458,12 +1474,17 @@ mod test {
     }
 
     #[test]
-    fn legacy_auth_equals_form_is_not_recognized() {
-        // Old servers advertise `AUTH=LOGIN` next to `AUTH LOGIN`. Only the
-        // space-separated form is parsed; the `=` form is ignored entirely.
-        let info = ServerInfo::from_response(&ehlo(&["me", "AUTH=LOGIN"])).unwrap();
+    fn legacy_auth_equals_form_is_recognized() {
+        let info = ServerInfo::from_response(&ehlo(&[
+            "me",
+            "AUTH=LOGIN PLAIN",
+            "auth=scram-sha-256-plus",
+        ]))
+        .unwrap();
 
-        assert!(!info.supports_auth_mechanism(Mechanism::Login));
+        assert!(info.supports_auth_mechanism(Mechanism::Login));
+        assert!(info.supports_auth_mechanism(Mechanism::Plain));
+        assert!(info.supports_auth_mechanism(Mechanism::ScramSha256Plus));
     }
 
     #[test]
@@ -1483,22 +1504,24 @@ mod test {
             "mail.example.org with no supported features"
         );
 
-        // A reply whose first line has no word at all has no server name.
-        assert!(ServerInfo::from_response(&ehlo(&["", "PIPELINING"])).is_err());
+        let unnamed = ServerInfo::from_response(&ehlo(&["", "PIPELINING"])).unwrap();
+        assert!(unnamed.supports_pipelining());
     }
 
     #[test]
-    fn hold_until_datetime_is_not_syntax_validated() {
-        // DOCUMENTS A BUG: `validate_syntax` has no
-        // arm for `FutureRelease`, and `Display` interpolates the datetime
-        // verbatim, so a caller-supplied HOLDUNTIL carrying CRLF writes a
-        // second command line into the MAIL FROM slot.
+    fn hold_until_datetime_is_syntax_validated() {
         let parameter = MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(
             "20260519T120000Z\r\nRSET".to_owned(),
         ));
 
-        assert!(parameter.validate_syntax().is_ok());
-        assert_eq!(format!("{parameter}"), "HOLDUNTIL=20260519T120000Z\r\nRSET");
+        assert!(parameter.validate_syntax().is_err());
+        assert!(
+            MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(
+                "2026-05-19T12:00:00+00:00".to_owned()
+            ))
+            .validate_syntax()
+            .is_ok()
+        );
     }
 
     #[test]

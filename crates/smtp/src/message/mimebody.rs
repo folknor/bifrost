@@ -1,4 +1,4 @@
-use std::{io::Write, iter::repeat_with};
+use std::io::Write;
 
 use mime::Mime;
 
@@ -192,19 +192,43 @@ pub enum MultiPartKind {
     Signed { protocol: String, micalg: String },
 }
 
-/// Create a random MIME boundary.
-/// (Not cryptographically random)
+/// Create a cryptographically random MIME boundary.
 fn make_boundary() -> String {
-    repeat_with(fastrand::alphanumeric).take(40).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut random = [0_u8; 20];
+    getrandom::fill(&mut random).expect("operating system random source is unavailable");
+    let mut boundary = String::with_capacity(random.len() * 2);
+    for byte in random {
+        boundary.push(HEX[usize::from(byte >> 4)] as char);
+        boundary.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    boundary
 }
 
 impl MultiPartKind {
     pub(crate) fn to_mime<S: Into<String>>(&self, boundary: Option<S>) -> Mime {
         let boundary = boundary.map_or_else(make_boundary, Into::into);
+        assert!(
+            is_mime_boundary(&boundary),
+            "multipart boundary must contain 1 to 70 RFC 2046 boundary characters and must not end in a space"
+        );
         if let Self::Report { report_type } = self {
             assert!(
                 is_mime_token(report_type),
                 "multipart/report report-type must be a MIME token"
+            );
+        }
+        match self {
+            Self::Encrypted { protocol } | Self::Signed { protocol, .. } => assert!(
+                is_mime_quoted_value(protocol),
+                "multipart protocol must be printable ASCII without quotes or backslashes"
+            ),
+            _ => {}
+        }
+        if let Self::Signed { micalg, .. } = self {
+            assert!(
+                is_mime_quoted_value(micalg),
+                "multipart micalg must be printable ASCII without quotes or backslashes"
             );
         }
 
@@ -262,6 +286,24 @@ fn is_mime_token(value: &str) -> bool {
             .all(|byte| byte > b' ' && byte < 0x7f && !TSPECIALS.contains(&byte))
 }
 
+fn is_mime_boundary(value: &str) -> bool {
+    const BCHARS_NO_SPACE: &[u8] =
+        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'()+_,-./:=?";
+
+    (1..=70).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte == b' ' || BCHARS_NO_SPACE.contains(&byte))
+        && !value.ends_with(' ')
+}
+
+fn is_mime_quoted_value(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| (b' '..=b'~').contains(&byte) && !matches!(byte, b'"' | b'\\'))
+}
+
 /// Multipart builder
 #[derive(Debug, Clone)]
 pub struct MultiPartBuilder {
@@ -288,7 +330,23 @@ impl MultiPartBuilder {
     }
 
     /// Set custom boundary
-    pub fn boundary<S: Into<String>>(mut self, boundary: S) -> Self {
+    pub fn boundary<S: Into<String>>(self, boundary: S) -> Self {
+        self.try_boundary(boundary)
+            .expect("invalid multipart boundary")
+    }
+
+    /// Set a custom boundary after validating it against RFC 2046.
+    pub fn try_boundary<S: Into<String>>(
+        mut self,
+        boundary: S,
+    ) -> Result<Self, crate::error::Error> {
+        let boundary = boundary.into();
+        if !is_mime_boundary(&boundary) {
+            return Err(crate::error::Error::InvalidInput(
+                "multipart boundary must contain 1 to 70 RFC 2046 boundary characters and must not end in a space"
+                    .to_owned(),
+            ));
+        }
         let kind = self
             .headers
             .get::<ContentType>()
@@ -296,15 +354,22 @@ impl MultiPartBuilder {
             .unwrap_or(MultiPartKind::Mixed);
         let mime = kind.to_mime(Some(boundary));
         self.headers.set(ContentType::from_mime(mime));
-        self
+        Ok(self)
     }
 
     /// Creates multipart without parts
     pub fn build(mut self) -> MultiPart {
-        if self.headers.get::<ContentType>().is_none() {
-            self.headers.set(ContentType::from_mime(
+        match self.headers.get::<ContentType>() {
+            None => self.headers.set(ContentType::from_mime(
                 MultiPartKind::Mixed.to_mime::<String>(None),
-            ));
+            )),
+            Some(content_type) if content_type.as_ref().get_param("boundary").is_none() => {
+                let kind =
+                    MultiPartKind::from_mime(content_type.as_ref()).unwrap_or(MultiPartKind::Mixed);
+                self.headers
+                    .set(ContentType::from_mime(kind.to_mime::<String>(None)));
+            }
+            Some(_) => {}
         }
 
         MultiPart {
@@ -405,14 +470,46 @@ impl MultiPart {
     ///
     /// Shortcut for `MultiPart::builder().kind(MultiPartKind::Encrypted{ protocol })`
     pub fn encrypted(protocol: String) -> MultiPartBuilder {
-        MultiPart::builder().kind(MultiPartKind::Encrypted { protocol })
+        Self::try_encrypted(protocol)
+            .expect("multipart/encrypted protocol must be a safe quoted MIME value")
+    }
+
+    /// Creates an encrypted multipart builder after validating `protocol`.
+    pub fn try_encrypted(
+        protocol: impl Into<String>,
+    ) -> Result<MultiPartBuilder, crate::error::Error> {
+        let protocol = protocol.into();
+        if !is_mime_quoted_value(&protocol) {
+            return Err(crate::error::Error::InvalidInput(
+                "multipart/encrypted protocol must be printable ASCII without quotes or backslashes"
+                    .to_owned(),
+            ));
+        }
+        Ok(MultiPart::builder().kind(MultiPartKind::Encrypted { protocol }))
     }
 
     /// Creates signed multipart builder
     ///
     /// Shortcut for `MultiPart::builder().kind(MultiPartKind::Signed{ protocol, micalg })`
     pub fn signed(protocol: String, micalg: String) -> MultiPartBuilder {
-        MultiPart::builder().kind(MultiPartKind::Signed { protocol, micalg })
+        Self::try_signed(protocol, micalg)
+            .expect("multipart/signed parameters must be safe quoted MIME values")
+    }
+
+    /// Creates a signed multipart builder after validating its MIME parameters.
+    pub fn try_signed(
+        protocol: impl Into<String>,
+        micalg: impl Into<String>,
+    ) -> Result<MultiPartBuilder, crate::error::Error> {
+        let protocol = protocol.into();
+        let micalg = micalg.into();
+        if !is_mime_quoted_value(&protocol) || !is_mime_quoted_value(&micalg) {
+            return Err(crate::error::Error::InvalidInput(
+                "multipart/signed parameters must be printable ASCII without quotes or backslashes"
+                    .to_owned(),
+            ));
+        }
+        Ok(MultiPart::builder().kind(MultiPartKind::Signed { protocol, micalg }))
     }
 
     /// Alias for HTML and plain text versions of an email
@@ -424,7 +521,9 @@ impl MultiPart {
 
     /// Add single part to multipart
     pub fn singlepart(mut self, part: SinglePart) -> Self {
+        let added = self.parts.len();
         self.parts.push(Part::Single(part));
+        self.ensure_boundary_absent(added);
         self
     }
 
@@ -433,13 +532,17 @@ impl MultiPart {
     where
         I: IntoIterator<Item = SinglePart>,
     {
+        let added = self.parts.len();
         self.parts.extend(parts.into_iter().map(Part::Single));
+        self.ensure_boundary_absent(added);
         self
     }
 
     /// Add multi part to multipart
     pub fn multipart(mut self, part: MultiPart) -> Self {
+        let added = self.parts.len();
         self.parts.push(Part::Multi(part));
+        self.ensure_boundary_absent(added);
         self
     }
 
@@ -448,7 +551,9 @@ impl MultiPart {
     where
         I: IntoIterator<Item = MultiPart>,
     {
+        let added = self.parts.len();
         self.parts.extend(parts.into_iter().map(Part::Multi));
+        self.ensure_boundary_absent(added);
         self
     }
 
@@ -494,6 +599,48 @@ impl MultiPart {
         out.extend_from_slice(b"--");
         out.extend_from_slice(boundary.as_bytes());
         out.extend_from_slice(b"--\r\n");
+    }
+
+    /// Re-roll the boundary when a part added at or after `from` would forge a
+    /// delimiter.
+    ///
+    /// Parts before `from` were already cleared against the current boundary by
+    /// the call that added them, so only the newcomers need scanning; a re-roll
+    /// is the sole case that has to re-scan everything. Without that split,
+    /// assembling an N-part message re-encodes every earlier part on each add
+    /// and the cost is quadratic in total body size.
+    fn ensure_boundary_absent(&mut self, from: usize) {
+        let current = self.boundary();
+        if !self.parts_contain_boundary(&current, from) {
+            return;
+        }
+
+        let kind = self
+            .headers
+            .get::<ContentType>()
+            .and_then(|content_type| MultiPartKind::from_mime(content_type.as_ref()))
+            .unwrap_or(MultiPartKind::Mixed);
+        loop {
+            let boundary = make_boundary();
+            if !self.parts_contain_boundary(&boundary, 0) {
+                self.headers
+                    .set(ContentType::from_mime(kind.to_mime(Some(boundary))));
+                return;
+            }
+        }
+    }
+
+    fn parts_contain_boundary(&self, boundary: &str, from: usize) -> bool {
+        let opening = format!("--{boundary}");
+        let marker = format!("\r\n{opening}");
+        self.parts[from..].iter().any(|part| {
+            let mut formatted = Vec::new();
+            part.format(&mut formatted);
+            formatted.starts_with(opening.as_bytes())
+                || formatted
+                    .windows(marker.len())
+                    .any(|window| window == marker.as_bytes())
+        })
     }
 }
 
@@ -879,7 +1026,7 @@ mod test {
         let part = MultiPart::mixed()
             .boundary("0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
             .multipart(MultiPart::related()
-                            .boundary("0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
+                            .boundary("1oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1")
                             .singlepart(SinglePart::builder()
                                              .header(header::ContentType::TEXT_HTML)
                                              .header(header::ContentTransferEncoding::Binary)
@@ -903,14 +1050,14 @@ mod test {
                 "\r\n",
                 "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
                 "Content-Type: multipart/related;\r\n",
-                " boundary=\"0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\"\r\n",
+                " boundary=\"1oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\"\r\n",
                 "\r\n",
-                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "--1oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
                 "Content-Type: text/html; charset=utf-8\r\n",
                 "Content-Transfer-Encoding: binary\r\n",
                 "\r\n",
                 "<p>Текст <em>письма</em> в <a href=\"https://ru.wikipedia.org/wiki/Юникод\">уникоде</a><p>\r\n",
-                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
+                "--1oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
                 "Content-Type: image/png\r\n",
                 "Content-Location: /image.png\r\n",
                 "Content-Transfer-Encoding: base64\r\n",
@@ -918,7 +1065,7 @@ mod test {
                 "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3\r\n",
                 "ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0\r\n",
                 "NTY3ODkwMTIzNDU2Nzg5MA==\r\n",
-                "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n",
+                "--1oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1--\r\n",
                 "--0oVZ2r6AoLAhLlb0gPNSKy6BEqdS2IfwxrcbUuo1\r\n",
                 "Content-Type: text/plain; charset=utf-8\r\n",
                 "Content-Disposition: attachment; filename=\"example.c\"\r\n",
@@ -931,28 +1078,17 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn multipart_with_a_boundary_less_content_type_panics_when_formatted() {
-        // DOCUMENTS A BUG: `MultiPartBuilder::build`
-        // only injects a default Content-Type - and therefore a boundary -
-        // when none is set. Setting a multipart Content-Type by hand that
-        // carries no `boundary` parameter leaves `MultiPart::boundary()`
-        // unwrapping `None`, so formatting the message panics instead of
-        // returning an error or generating a boundary.
+    fn multipart_with_a_boundary_less_content_type_gets_a_boundary() {
         let part = MultiPart::builder()
             .header(ContentType::parse("multipart/mixed").unwrap())
             .singlepart(SinglePart::plain("hello".to_owned()));
 
-        let _ = part.formatted();
+        assert!(!part.boundary().is_empty());
+        assert!(!part.formatted().is_empty());
     }
 
     #[test]
-    fn a_body_containing_the_boundary_forges_a_part_delimiter() {
-        // The boundary is chosen without ever looking at the part bodies.
-        // `make_boundary` picks 40 random alphanumerics, which makes an
-        // accidental collision negligible, but `MultiPartBuilder::boundary`
-        // lets a caller pin a short, guessable one and performs no check that
-        // it is absent from the content. The delimiter then appears twice.
+    fn a_body_containing_the_boundary_regenerates_it() {
         let part = MultiPart::mixed()
             .boundary("BOUNDARY")
             .singlepart(SinglePart::plain(
@@ -961,7 +1097,18 @@ mod test {
 
         let formatted = String::from_utf8(part.formatted()).unwrap();
 
-        assert_eq!(formatted.matches("\r\n--BOUNDARY\r\n").count(), 2);
+        assert_ne!(part.boundary(), "BOUNDARY");
+        assert_eq!(formatted.matches("\r\n--BOUNDARY\r\n").count(), 1);
+    }
+
+    #[test]
+    fn invalid_multipart_parameters_are_rejected() {
+        assert!(MultiPart::mixed().try_boundary("").is_err());
+        assert!(MultiPart::mixed().try_boundary("a\"b").is_err());
+        assert!(MultiPart::mixed().try_boundary("a\r\nb").is_err());
+        assert!(MultiPart::mixed().try_boundary("a".repeat(71)).is_err());
+        assert!(MultiPart::try_encrypted("application/pgp\r\nRSET").is_err());
+        assert!(MultiPart::try_signed("application/pgp-signature", "sha256\"").is_err());
     }
 
     #[test]

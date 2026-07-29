@@ -316,7 +316,7 @@ pub(crate) fn response_to_account_error(
         .unwrap_or_else(|| status.to_string());
     let text_first = response.message().next().map(str::to_owned);
 
-    let (kind, primary_cause) = classify_response(response, phase);
+    let (kind, primary_cause) = classify_response(response, phase, ctx.protocol);
 
     let mut builder = AccountErrorBuilder::new(kind, primary_cause)
         .protocol(ctx.protocol)
@@ -333,14 +333,18 @@ pub(crate) fn response_to_account_error(
     }
     // Wire 4xx rate-limit text gets a throttle-scope hint so recovery can
     // surface throttle scope. Default to ThrottleScope::Account.
-    if builder_kind_is_rate_or_quota(response, phase) {
+    if builder_kind_is_rate_or_quota(response, phase, ctx.protocol) {
         builder = builder.throttle_scope(ThrottleScope::Account);
     }
     finish(builder)
 }
 
-fn builder_kind_is_rate_or_quota(response: &Response, phase: Option<SmtpCommandPhase>) -> bool {
-    let (kind, _) = classify_response(response, phase);
+fn builder_kind_is_rate_or_quota(
+    response: &Response,
+    phase: Option<SmtpCommandPhase>,
+    protocol: Protocol,
+) -> bool {
+    let (kind, _) = classify_response(response, phase, protocol);
     matches!(
         kind,
         AccountErrorKind::Server(ServerErrorKind::RateLimited | ServerErrorKind::QuotaExhausted)
@@ -350,15 +354,16 @@ fn builder_kind_is_rate_or_quota(response: &Response, phase: Option<SmtpCommandP
 fn classify_response(
     response: &Response,
     phase: Option<SmtpCommandPhase>,
+    protocol: Protocol,
 ) -> (AccountErrorKind, Cause) {
     let status = u16::from(response.code());
     let enhanced = response.enhanced_status_code();
     if let Some(code) = enhanced
-        && let Some(mapping) = classify_enhanced(code, response, phase)
+        && let Some(mapping) = classify_enhanced(code, response, phase, protocol)
     {
         return mapping;
     }
-    classify_status(status, response, phase)
+    classify_status(status, response, phase, protocol)
 }
 
 fn diag_detail(response: &Response) -> DiagnosticText {
@@ -374,6 +379,7 @@ fn classify_enhanced(
     code: WireEnhancedStatusCode,
     response: &Response,
     phase: Option<SmtpCommandPhase>,
+    protocol: Protocol,
 ) -> Option<(AccountErrorKind, Cause)> {
     let class = code.class;
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
@@ -381,7 +387,7 @@ fn classify_enhanced(
     // appeared on a path that already classified as an error. Handle first so
     // it does not fall through to the X.* arms.
     if class == 2 {
-        return Some(contract_violation(response));
+        return Some(contract_violation(response, protocol));
     }
     match (class, code.subject, code.detail) {
         // X.1 address status
@@ -470,7 +476,7 @@ fn classify_enhanced(
             server_error(u16::from(response.code()))
         }),
         // X.5 delivery protocol status
-        (_, 5, 0 | 1) => Some(contract_violation(response)),
+        (_, 5, 0 | 1) => Some(contract_violation(response, protocol)),
         (_, 5, 2) => Some(malformed(response)),
         (_, 5, 3) => Some((
             AccountErrorKind::Server(ServerErrorKind::RateLimited),
@@ -483,7 +489,7 @@ fn classify_enhanced(
         (_, 6, 4) => Some((
             AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
             Cause::Wire(WireCause::MalformedResponse {
-                protocol: Protocol::Smtp,
+                protocol,
                 detail: Some(diag_detail(response)),
             }),
         )),
@@ -543,6 +549,7 @@ fn classify_status(
     status: u16,
     response: &Response,
     phase: Option<SmtpCommandPhase>,
+    protocol: Protocol,
 ) -> (AccountErrorKind, Cause) {
     let is_recipient_lane = matches!(phase, Some(SmtpCommandPhase::RcptTo));
     match status {
@@ -565,7 +572,7 @@ fn classify_status(
         ),
         500 | 501 => malformed(response),
         502 | 504 => unsupported_send(),
-        503 => contract_violation(response),
+        503 => contract_violation(response, protocol),
         530 | 535 => auth_reauth(),
         534 | 538 => policy_blocked(),
         550 => {
@@ -610,7 +617,7 @@ fn classify_status(
         }
         555 => unsupported_send(),
         500..=599 => server_error(status),
-        _ => contract_violation(response),
+        _ => contract_violation(response, protocol),
     }
 }
 
@@ -660,11 +667,11 @@ fn permission_denied() -> (AccountErrorKind, Cause) {
     )
 }
 
-fn contract_violation(response: &Response) -> (AccountErrorKind, Cause) {
+fn contract_violation(response: &Response, protocol: Protocol) -> (AccountErrorKind, Cause) {
     (
         AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
         Cause::Wire(WireCause::MalformedResponse {
-            protocol: Protocol::Smtp,
+            protocol,
             detail: Some(diag_detail(response)),
         }),
     )
@@ -1221,5 +1228,38 @@ mod tests {
         let view = account.telemetry_fields();
         assert_eq!(view.status, Some(550));
         assert_eq!(view.native_code, Some("5.1.1"));
+    }
+
+    #[test]
+    fn lmtp_contract_violations_keep_the_lmtp_protocol() {
+        let status_response = response(
+            Severity::PositiveCompletion,
+            Category::MailSystem,
+            Detail::Zero,
+            &["bad command sequence"],
+        );
+        let (_, status_cause) = classify_response(&status_response, None, Protocol::Lmtp);
+        assert!(matches!(
+            status_cause,
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Lmtp,
+                ..
+            })
+        ));
+
+        let enhanced_response = response(
+            Severity::PermanentNegativeCompletion,
+            Category::MailSystem,
+            Detail::Four,
+            &["5.6.4 conversion required"],
+        );
+        let (_, enhanced_cause) = classify_response(&enhanced_response, None, Protocol::Lmtp);
+        assert!(matches!(
+            enhanced_cause,
+            Cause::Wire(WireCause::MalformedResponse {
+                protocol: Protocol::Lmtp,
+                ..
+            })
+        ));
     }
 }
