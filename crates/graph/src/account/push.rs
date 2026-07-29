@@ -9,6 +9,7 @@ use bifrost_types::{
 
 use crate::webhooks::{
     create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
+    subscription_is_gone,
 };
 
 use super::graph_error::{GraphErrorContext, into_account_error};
@@ -20,6 +21,9 @@ const RENEWAL_THRESHOLD_MINUTES: i64 = 30;
 #[derive(Debug, Clone)]
 pub(crate) struct PushEndpoint {
     pub(crate) webhook_url: String,
+    /// A consumer-owned account-wide secret carried in every Graph webhook
+    /// subscription so its out-of-process receiver can validate clientState.
+    pub(crate) client_state: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +35,7 @@ pub(crate) struct GraphSubscriptionGroup {
 pub(crate) struct GraphSubscriptionState {
     pub(crate) server_id: String,
     pub(crate) expires_at: String,
+    pub(crate) resource: String,
 }
 
 #[derive(Debug, Clone)]
@@ -115,10 +120,19 @@ async fn subscribe_graph(
 
     let mut subscriptions = Vec::new();
     for (resource, _) in grouped {
-        match create_subscription(&account.client, &resource, &endpoint.webhook_url, None).await {
+        match create_subscription(
+            &account.client,
+            &resource,
+            &endpoint.webhook_url,
+            endpoint.client_state.as_deref(),
+            None,
+        )
+        .await
+        {
             Ok(response) => subscriptions.push(GraphSubscriptionState {
                 server_id: response.id,
                 expires_at: response.expiration_date_time,
+                resource,
             }),
             Err(error) => {
                 // The handle is never registered on the account and never
@@ -215,7 +229,11 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                 .flat_map(|(handle, group)| {
                     group.subscriptions.iter().filter_map(move |state| {
                         if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
-                            Some((handle.clone(), state.server_id.clone()))
+                            Some((
+                                handle.clone(),
+                                state.server_id.clone(),
+                                state.resource.clone(),
+                            ))
                         } else {
                             None
                         }
@@ -225,7 +243,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
         };
 
         let mut had_error = false;
-        for (handle, server_id) in due {
+        for (handle, server_id, resource) in due {
             match renew_subscription(&account.client, &server_id, None).await {
                 Ok(new_expiry) => {
                     let mut groups = account.graph_subscriptions.write().await;
@@ -239,6 +257,48 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                     }
                 }
                 Err(error) => {
+                    // Graph retains no deleted subscription to PATCH, so a
+                    // vanished (404/410) subscription is replaced by a fresh
+                    // create for the same resource; otherwise every renewal
+                    // tick retries a permanent 404. The stale state stays
+                    // installed until the replacement is in hand: dropping it
+                    // first meant a failed create left the resource with no
+                    // state at all, so no later tick could ever see it as due
+                    // and coverage was lost until reopen.
+                    let (phase, error) = match account.push_endpoint.as_ref() {
+                        Some(endpoint) if subscription_is_gone(&error) => {
+                            match replace_gone_subscription(
+                                &account, endpoint, &handle, &server_id, &resource,
+                            )
+                            .await
+                            {
+                                Ok(Replacement::Installed) => {
+                                    // The resource had NO live subscription
+                                    // between its disappearance and this
+                                    // create, and Graph does not replay
+                                    // notifications for that window.
+                                    // `Reconnected` is the only event the
+                                    // engine turns into a full reconcile
+                                    // across every registered scope, so
+                                    // without it the changes missed while the
+                                    // subscription was absent wait for the
+                                    // ordinary poll interval.
+                                    let _ = account.push_tx.send(WatchEvent::Reconnected);
+                                    disconnected = false;
+                                    continue;
+                                }
+                                Ok(Replacement::HandleUnsubscribed) => continue,
+                                // Classify the failure that actually blocks
+                                // recovery. The original 404 only says the
+                                // old subscription is gone, which is already
+                                // known and acted on; the create error is the
+                                // one whose recovery class decides whether
+                                // this is worth another tick.
+                                Err(recreate_error) => ("recreate", recreate_error),
+                            }
+                        }
+                        _ => ("renew", error),
+                    };
                     let account_error = into_account_error(
                         error,
                         GraphErrorContext::graph(AccountOperation::PushSubscribe),
@@ -260,10 +320,12 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
                             message_key = telemetry.message_key,
                             recovery = telemetry.recovery_discriminant,
                             server_id = %server_id,
+                            phase = phase,
                             "Graph webhook renewal failed"
                         );
                     }
                     if account_error.recovery().is_terminal() {
+                        remove_subscription_state(&account, &handle, &server_id).await;
                         let _ = account.push_tx.send(WatchEvent::Terminated(account_error));
                     }
                     had_error = true;
@@ -280,6 +342,112 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
             let _ = account.push_tx.send(WatchEvent::Reconnected);
             disconnected = false;
         }
+    }
+}
+
+/// What happened to a subscription the renewal worker had to recreate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replacement {
+    /// The fresh subscription took the vanished one's place in the group.
+    Installed,
+    /// The handle stopped being registered while the create was in flight,
+    /// so the fresh subscription was deleted again instead of installed.
+    HandleUnsubscribed,
+}
+
+/// Create a replacement for a vanished subscription and install it under
+/// `handle`, or undo the create when the handle is no longer registered.
+///
+/// The create happens before any local state changes so a failure leaves the
+/// stale entry in place for the next renewal tick to retry - the resource
+/// keeps a row that reads as due rather than silently losing coverage.
+async fn replace_gone_subscription(
+    account: &GraphAccount,
+    endpoint: &PushEndpoint,
+    handle: &SubscriptionHandle,
+    stale_server_id: &str,
+    resource: &str,
+) -> Result<Replacement, crate::error::GraphError> {
+    let response = create_subscription(
+        &account.client,
+        resource,
+        &endpoint.webhook_url,
+        endpoint.client_state.as_deref(),
+        None,
+    )
+    .await?;
+    let replacement = GraphSubscriptionState {
+        server_id: response.id,
+        expires_at: response.expiration_date_time,
+        resource: resource.to_string(),
+    };
+    let created_id = replacement.server_id.clone();
+
+    let mut groups = account.graph_subscriptions.write().await;
+    let installed = install_replacement(&mut groups, handle, stale_server_id, replacement);
+    drop(groups);
+    if installed {
+        return Ok(Replacement::Installed);
+    }
+
+    // `push_unsubscribe` removed the handle while the create was in flight.
+    // It deleted every subscription it knew about and reported teardown as
+    // successful, so installing this one would keep notifications flowing
+    // for a subscription the caller believes is gone - and re-registering
+    // the group would resurrect a handle nothing will ever tear down again.
+    // Delete the subscription we just minted instead. Best effort: the
+    // caller's `push_unsubscribe` has already returned, so there is nobody
+    // left to report a cleanup failure to.
+    if let Err(cleanup_error) = delete_subscription(&account.client, &created_id).await {
+        tracing::warn!(
+            target: "bifrost_graph::webhooks",
+            server_id = %created_id,
+            error = ?cleanup_error,
+            "failed to delete a Graph webhook subscription recreated for an unsubscribed handle"
+        );
+    }
+    Ok(Replacement::HandleUnsubscribed)
+}
+
+/// Swap `replacement` in for `stale_server_id` under `handle`.
+///
+/// Returns `false` when `handle` is no longer registered. The lookup is a
+/// plain `get_mut`, never an `entry().or_insert_with()`: the worker's due
+/// list is a snapshot, and a concurrent `push_unsubscribe` can retire the
+/// handle before the replacement lands. Re-creating the group there would
+/// contradict a teardown the caller was already told succeeded.
+fn install_replacement(
+    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+    handle: &SubscriptionHandle,
+    stale_server_id: &str,
+    replacement: GraphSubscriptionState,
+) -> bool {
+    let Some(group) = groups.get_mut(handle) else {
+        return false;
+    };
+    group
+        .subscriptions
+        .retain(|state| state.server_id != stale_server_id);
+    group.subscriptions.push(replacement);
+    true
+}
+
+async fn remove_subscription_state(
+    account: &GraphAccount,
+    handle: &SubscriptionHandle,
+    server_id: &str,
+) {
+    let mut groups = account.graph_subscriptions.write().await;
+    let remove_group = if let Some(group) = groups.get_mut(handle) {
+        group
+            .subscriptions
+            .retain(|state| state.server_id != server_id);
+        group.subscriptions.is_empty()
+    } else {
+        false
+    };
+    if remove_group {
+        groups.remove(handle);
     }
 }
 
@@ -485,6 +653,7 @@ mod tests {
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
         account.push_endpoint = Some(PushEndpoint {
             webhook_url: "https://example.test/webhook".to_string(),
+            client_state: None,
         });
         // CursorScope::Account is not a `FolderType` and so cannot
         // be mapped to a Graph subscription resource. This must
@@ -625,6 +794,113 @@ mod tests {
         assert_eq!(first.0.len(), 32);
         assert!(u128::from_str_radix(&first.0, 16).is_ok(), "{}", first.0);
         assert_ne!(first, second);
+    }
+
+    fn state(server_id: &str, resource: &str) -> GraphSubscriptionState {
+        GraphSubscriptionState {
+            server_id: server_id.to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            resource: resource.to_string(),
+        }
+    }
+
+    /// A recreated subscription takes the vanished one's place inside the
+    /// SAME group rather than piling up beside it: the stale `server_id`
+    /// would otherwise stay in the due list forever, 404 on every renewal
+    /// tick, and drive an endless recreate loop. Sibling resources under
+    /// the same handle are untouched.
+    #[test]
+    fn a_recreated_subscription_replaces_the_vanished_one_in_place() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup {
+                subscriptions: vec![
+                    state("gone", "/me/mailFolders/inbox/messages"),
+                    state("healthy", "/me/events"),
+                ],
+            },
+        )]);
+
+        assert!(install_replacement(
+            &mut groups,
+            &handle,
+            "gone",
+            state("fresh", "/me/mailFolders/inbox/messages"),
+        ));
+
+        let subscriptions = &groups[&handle].subscriptions;
+        assert_eq!(subscriptions.len(), 2);
+        assert!(
+            !subscriptions.iter().any(|s| s.server_id == "gone"),
+            "the vanished subscription must not survive its replacement"
+        );
+        let fresh = subscriptions
+            .iter()
+            .find(|s| s.server_id == "fresh")
+            .expect("replacement installed");
+        assert_eq!(fresh.resource, "/me/mailFolders/inbox/messages");
+        assert!(subscriptions.iter().any(|s| s.server_id == "healthy"));
+        assert_eq!(groups.len(), 1);
+    }
+
+    /// The renewal worker walks a SNAPSHOT of the due subscriptions, so a
+    /// concurrent `push_unsubscribe` can retire the handle (and delete its
+    /// server subscriptions) while a replacement create is in flight.
+    /// Re-registering the group there would tell the caller teardown
+    /// succeeded while notifications kept arriving; the replacement is
+    /// refused instead, and `replace_gone_subscription` deletes the
+    /// server-side subscription it just minted.
+    #[test]
+    fn a_replacement_never_resurrects_an_unsubscribed_handle() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups: HashMap<SubscriptionHandle, GraphSubscriptionGroup> = HashMap::new();
+        assert!(!install_replacement(
+            &mut groups,
+            &handle,
+            "gone",
+            state("fresh", "/me/mailFolders/inbox/messages"),
+        ));
+        assert!(groups.is_empty(), "an unsubscribed handle stays retired");
+
+        // A DIFFERENT live handle is not a substitute: the replacement is
+        // scoped to the handle whose subscription vanished.
+        let other = SubscriptionHandle("other".to_string());
+        groups.insert(
+            other.clone(),
+            GraphSubscriptionGroup {
+                subscriptions: vec![state("other-sub", "/me/events")],
+            },
+        );
+        assert!(!install_replacement(
+            &mut groups,
+            &handle,
+            "gone",
+            state("fresh", "/me/mailFolders/inbox/messages"),
+        ));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[&other].subscriptions.len(), 1);
+    }
+
+    /// A group that lost its stale row some other way (a terminal renewal
+    /// on the same tick) still takes the replacement: the handle is live,
+    /// so the resource needs coverage.
+    #[test]
+    fn a_replacement_installs_into_a_live_group_that_lost_the_stale_row() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup {
+                subscriptions: vec![state("healthy", "/me/events")],
+            },
+        )]);
+        assert!(install_replacement(
+            &mut groups,
+            &handle,
+            "already-removed",
+            state("fresh", "/me/mailFolders/inbox/messages"),
+        ));
+        assert_eq!(groups[&handle].subscriptions.len(), 2);
     }
 
     #[tokio::test]

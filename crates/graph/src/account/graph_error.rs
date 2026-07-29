@@ -192,6 +192,15 @@ fn soap_fault_to_account_error(
             }),
             false,
         ),
+        // A streaming subscription is intentionally short lived. These
+        // server codes mean the current stream must be discarded and the
+        // outer worker must Subscribe again, not that the account contract
+        // is terminally broken.
+        SoapFaultCode::ErrorStreamingSubscriptionInvalid => (
+            AccountErrorKind::Server(ServerErrorKind::Unavailable),
+            Cause::Server(ServerCause::Unavailable { retry_hint: None }),
+            false,
+        ),
         SoapFaultCode::Unknown => (
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
             Cause::Wire(WireCause::MalformedResponse {
@@ -1892,21 +1901,8 @@ mod tests {
         }
     }
 
-    /// Documents a defect, NOT the intended contract.
-    /// EWS reports an expired, unsubscribed,
-    /// or unknown streaming subscription as `ErrorSubscriptionNotFound` /
-    /// `ErrorInvalidSubscription` / `ErrorInvalidWatermark` inside a 200 OK.
-    /// None of those tokens is in `SoapFaultCode::parse`, so they collapse
-    /// onto `Unknown` -> `Protocol(ContractViolation)` -> a TERMINAL
-    /// recovery class. `run_get_events_loop` then returns
-    /// `StreamLoopExit::Terminated`, `run_streaming_worker` emits
-    /// `WatchEvent::Terminated` and RETURNS - so in-process EWS push dies
-    /// permanently on a routine subscription expiry that the worker's own
-    /// outer loop would have fixed with a re-Subscribe. Genuinely transient
-    /// codes such as `ErrorInternalServerTransientError` take the same
-    /// terminal path.
     #[test]
-    fn unrecognized_ews_response_codes_are_terminal_contract_violations() {
+    fn streaming_subscription_response_codes_reconnect() {
         for code in [
             "ErrorSubscriptionNotFound",
             "ErrorInvalidSubscription",
@@ -1935,17 +1931,13 @@ mod tests {
                 parsed,
                 GraphErrorContext::ews(AccountOperation::PushStream),
             );
+            assert!(matches!(
+                err.kind(),
+                AccountErrorKind::Server(ServerErrorKind::Unavailable)
+            ));
             assert!(
-                matches!(
-                    err.kind(),
-                    AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
-                ),
-                "{code} classified as {:?}",
-                err.kind()
-            );
-            assert!(
-                err.recovery().is_terminal(),
-                "{code} recovery {:?} is not terminal",
+                err.recovery().is_retryable(),
+                "{code} recovery {:?} is not retryable",
                 err.recovery()
             );
         }

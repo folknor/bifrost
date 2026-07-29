@@ -4,41 +4,10 @@ Scope: `crates/graph/src/**`. This is the current-gap list after the
 2026-07-29 repair pass. Resolved findings live in git history and are not
 retained here.
 
-## Bugs
-
-### G-4 - Bulk category add/remove/patch can report an empty PATCH as applied
-
-`patch_for_flags` can produce `{}` for category-only `FlagOp::Add`, `Remove`,
-or `Patch`. The bulk pipeline sends that PATCH and turns a 2xx response into
-`Applied` even though no category changed. Either do a read-modify-write of
-the category array or reject the affected item as unsupported before sending a
-request. At minimum, an empty PATCH must never be counted as applied.
-
-### G-5 - Unknown EWS subscription lifecycle errors terminate streaming push
-
-`SoapFaultCode::parse` maps unrecognised EWS response codes to `Unknown`, and
-the Graph error adapter treats that as a terminal provider-contract violation.
-Codes such as `ErrorSubscriptionNotFound`, `ErrorInvalidSubscription`, and
-`ErrorInvalidWatermark` should instead cause the worker to reconnect and
-subscribe again. The long-lived worker should not permanently stop for
-forward-compatible EWS server vocabulary unless it is clearly auth or policy
-terminal.
-
-### G-8 - Webhook `clientState` cannot be validated by consumers
-
-`create_subscription` generates a random client state for each resource and
-discards it. The webhook receiver lives outside this crate, so it has no value
-to validate. Expose a caller-supplied account-wide webhook secret through the
-factory endpoint configuration and reuse it for every resource, or expose the
-generated values on an appropriate public handle.
-
-### G-11 - Webhook renewal never retires terminal or deleted subscriptions
-
-The renewal worker emits `Terminated` for a terminal renewal error but leaves
-the stale state in its map, causing repeated terminal events on every renewal
-tick. A 404/410 subscription is similarly retried forever. Terminal entries
-must be removed after one event; deleted server subscriptions should be
-re-created for the same resource rather than patched again.
+No open bugs remain: every G-numbered finding from this hunt is fixed and
+its regression pinned or explicitly named as unpinnable below. What is left
+is observations - design questions and ergonomics risks, none of them a
+defect on their own. None has been started.
 
 ## Observations
 
@@ -72,11 +41,6 @@ shared-contract level, not in this crate.
 **O-8 - `api_beta_base` is unused outside tests.** It remains a public
 constructor parameter and is cloned through the client, but production code
 does not read it. Wire a beta call site or remove the parameter.
-
-**O-9 - The message select relies on `@odata.etag`.** `MESSAGE_SELECT` omits
-`changeKey`; current mutation concurrency depends on Graph supplying the
-OData annotation. This is functional but load-bearing and should be made
-explicit, preferably by selecting `changeKey`.
 
 **O-10 - EWS notification-to-scope mapping cannot match foreign folders.**
 The mapper compares native notification folder ids with encoded scope ids.
@@ -123,6 +87,39 @@ Fixed in this pass:
   the error it carried was a terminal `ContractViolation` with default
   `Unsent` evidence, telling a consumer that a re-read of an idempotent
   read was pointless.
+- G-4: incremental category `FlagOp::Add`, `Remove`, and `Patch` now fail
+  locally as `Unsupported(UpdateFlags)` before etag preflight or `$batch`
+  construction. `Set` continues to replace the full categories array.
+- G-5: EWS streaming subscription lifecycle response codes now classify as
+  retryable unavailable failures, so the worker reconnects and re-subscribes.
+- G-8: `GraphAccountFactory::with_push_endpoint_client_state(url, secret)`
+  reuses one consumer-owned account-wide `clientState` for every resource,
+  allowing the external webhook receiver to validate notifications.
+- G-11: terminal renewal state is removed after its one event; a 404/410
+  recreates the vanished subscription for the same resource.
+- O-9: `MESSAGE_SELECT` explicitly requests the documented `changeKey`.
+
+Review follow-ups on G-11 (same pass):
+
+- the replacement create now runs BEFORE the stale state is dropped. The
+  old order removed the state first, so a failed create left the resource
+  with no row at all: no later tick could see it as due, and webhook
+  coverage stayed lost until reopen or an explicit resubscribe. A failed
+  create also classifies the create error rather than logging it and
+  re-reporting the already-known 404, so its recovery class decides whether
+  another tick is worth it.
+- the replacement installs through `install_replacement`, a `get_mut` that
+  refuses an unregistered handle, instead of `entry().or_insert_with()`.
+  The worker walks a snapshot, so a concurrent `push_unsubscribe` could
+  retire the handle mid-create and have both the server subscription and
+  the local group resurrected under it - teardown reported as successful
+  while notifications kept arriving. The worker now deletes the
+  subscription it just minted in that case.
+- a successful replacement emits `Reconnected`. The resource had no live
+  subscription for the whole gap and Graph does not replay it;
+  `Reconnected` is the only event `sync::push::reconciler` turns into a
+  full reconcile, so the changes missed in the gap otherwise waited for the
+  ordinary poll interval (up to the 30-minute ceiling).
 
 Regression-pinned hermetically: the `PartialResponse` classification across
 idempotent and non-idempotent operations; hydration and mutation `$batch`
@@ -131,10 +128,22 @@ ids) through the extracted pure `reconcile_hydration_responses` /
 `reconcile_mutation_responses`; the EWS subscribable-scope predicate; owner-
 tag dedup with two folders in one shared mailbox plus a second mailbox; the
 foreign-membership native fallback; the shared-mailbox metadata projection;
-beta-base derivation; and expiry-offset rejection.
+beta-base derivation; expiry-offset rejection; the renewal worker's
+`subscription_is_gone` recreate gate (404/410 only, never a throttle, auth,
+or transport failure); and `install_replacement`'s two rules - the
+replacement swaps in place inside a live group, and an unregistered handle
+is never resurrected.
 
-**Not pinned, and why.** Partial webhook rollback and the inventory
-neither-link branch are both reachable only through a live `GraphClient`.
+**Not pinned, and why.** Partial webhook rollback, the inventory
+neither-link branch, and the renewal worker's end-to-end sequencing (the
+`Reconnected` emission after a successful replacement, the cleanup DELETE
+when the handle was unsubscribed mid-create, and the stale row surviving a
+failed create into the next tick) are all reachable only through a live
+`GraphClient`. The renewal decision rules were factored out - the pure
+`install_replacement` and the `subscription_is_gone` gate carry everything
+that does not need a socket, and both are pinned above - but the worker
+loop itself still calls `create_subscription` / `renew_subscription` /
+`delete_subscription` directly, and those need a transport seam.
 `GraphClient` owns a concrete `bifrost_net::AccountNet` behind
 `Arc<ClientInner>` with every request funnelled through a private
 `execute_request`, so there is no in-process seam to stage a canned

@@ -37,6 +37,7 @@ pub(crate) async fn create_subscription(
     client: &GraphClient,
     resource: &str,
     notification_url: &str,
+    client_state: Option<&str>,
     expiration_minutes: Option<u32>,
 ) -> Result<SubscriptionResponse, GraphError> {
     let minutes = expiration_minutes
@@ -48,7 +49,10 @@ pub(crate) async fn create_subscription(
         notification_url: notification_url.to_string(),
         resource: resource.to_string(),
         expiration_date_time: compute_expiry_iso8601(minutes),
-        client_state: Some(generate_client_state()?),
+        client_state: Some(match client_state {
+            Some(client_state) => client_state.to_string(),
+            None => generate_client_state()?,
+        }),
     };
 
     let response: SubscriptionResponse = client.post("/subscriptions", &body).await?;
@@ -81,6 +85,10 @@ pub(crate) async fn renew_subscription(
         "[Graph webhooks] Renewed subscription {subscription_id} (new expiry: {new_expiry})"
     );
     Ok(new_expiry)
+}
+
+pub(crate) fn subscription_is_gone(error: &GraphError) -> bool {
+    matches!(error, GraphError::Response(response) if response.status == reqwest::StatusCode::NOT_FOUND || response.status == reqwest::StatusCode::GONE)
 }
 
 pub(crate) async fn delete_subscription(
@@ -334,14 +342,44 @@ mod tests {
         assert!(default_remaining < want);
     }
 
-    /// Each `create_subscription` mints its OWN random `clientState`, and
-    /// `SubscriptionResponse` decodes only `id` + `expirationDateTime`, so
-    /// the secret is written to Graph and then dropped. Pinned here because
-    /// it is the mechanical reason consumer-side `clientState` validation is
-    /// unavailable today: there is no per-subscription value to compare
-    /// against, and no two resources even share one. A fix has to thread a
-    /// caller-supplied account-wide secret through the endpoint config, so
-    /// this test is expected to change shape when that lands.
+    /// The legacy endpoint constructor still mints a random fallback when a
+    /// caller does not opt into a receiver-owned account-wide clientState.
+    /// The configured path is exercised by account construction; this pins
+    /// only the fallback's entropy and encoding.
+    /// `subscription_is_gone` is the gate on the renewal worker's
+    /// recreate path: only a subscription Graph no longer has may be
+    /// replaced by a fresh create. A throttle or an auth failure must
+    /// stay a plain renewal failure - recreating on those would mint a
+    /// duplicate subscription beside one the server still holds.
+    #[test]
+    fn only_a_vanished_subscription_routes_to_recreation() {
+        let gone = |status| {
+            GraphError::Response(crate::error::GraphResponseError::from_response(
+                status,
+                reqwest::header::HeaderMap::new(),
+                bytes::Bytes::new(),
+            ))
+        };
+        assert!(subscription_is_gone(&gone(reqwest::StatusCode::NOT_FOUND)));
+        assert!(subscription_is_gone(&gone(reqwest::StatusCode::GONE)));
+        for still_there in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!subscription_is_gone(&gone(still_there)), "{still_there}");
+        }
+        assert!(!subscription_is_gone(&GraphError::Net(
+            bifrost_net::Error::Network {
+                message: "connection reset".to_string(),
+                transmission_state: bifrost_types::TransmissionState::Unsent,
+                source: None,
+            }
+        )));
+    }
+
     #[test]
     fn each_client_state_is_a_distinct_unexported_secret() {
         let first = generate_client_state().expect("rng");

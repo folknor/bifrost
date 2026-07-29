@@ -145,7 +145,7 @@ pub(crate) const MESSAGE_SELECT: &str = "\
 id,conversationId,subject,bodyPreview,body,uniqueBody,from,\
 toRecipients,ccRecipients,bccRecipients,replyTo,\
 receivedDateTime,sentDateTime,isRead,isDraft,hasAttachments,\
-importance,parentFolderId,categories,flag,\
+importance,parentFolderId,categories,flag,changeKey,\
 inferenceClassification,isReadReceiptRequested,internetMessageHeaders,internetMessageId";
 
 /// The `$select` fields we request for contact sync.

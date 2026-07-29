@@ -955,14 +955,11 @@ mod tests {
     }
 
     #[test]
-    fn the_metadata_select_relies_on_the_odata_etag_annotation() {
-        // `MESSAGE_SELECT` does NOT list `changeKey`, unlike the other
-        // projections' selects. That is only safe because `graph_etag`
-        // falls back to the `@odata.etag` annotation Graph returns on
-        // entities regardless of `$select` - the whole `If-Match` chain for
-        // metadata-hydrated messages hangs on that fallback, so pin the
-        // dependency explicitly rather than leaving it implicit.
-        assert!(!MESSAGE_SELECT.contains("changeKey"));
+    fn metadata_select_explicitly_requests_the_change_key() {
+        // `changeKey` is the documented message concurrency token. Keep it
+        // explicit rather than making the whole If-Match chain depend on an
+        // OData annotation Graph happens to include.
+        assert!(MESSAGE_SELECT.contains("changeKey"));
         assert!(select_for_projection(Projection::FlagsOnly).contains("changeKey"));
         assert!(select_for_projection(Projection::Full).contains("changeKey"));
 

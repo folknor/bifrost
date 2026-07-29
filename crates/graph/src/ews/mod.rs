@@ -133,6 +133,10 @@ pub(crate) enum SoapFaultCode {
     /// Microsoft EWS: the requested item no longer exists. Routes to
     /// `NotFound(Message)`.
     ErrorItemNotFound,
+    /// Microsoft EWS: a streaming subscription or its watermark expired,
+    /// was deleted, or is otherwise no longer usable. The worker reconnects
+    /// and creates a fresh subscription.
+    ErrorStreamingSubscriptionInvalid,
     /// Unrecognized fault code. Microsoft EWS uses many other
     /// `ErrorXxx` codes; the ones we don't classify explicitly land
     /// here and route to `Protocol(ContractViolation)`.
@@ -154,6 +158,11 @@ impl SoapFaultCode {
             "ErrorMailboxMoveInProgress" => Self::ErrorMailboxMoveInProgress,
             "ErrorNonExistentMailbox" => Self::ErrorNonExistentMailbox,
             "ErrorItemNotFound" => Self::ErrorItemNotFound,
+            "ErrorSubscriptionNotFound"
+            | "ErrorInvalidSubscription"
+            | "ErrorSubscriptionUnsubscribed"
+            | "ErrorInvalidWatermark"
+            | "ErrorInternalServerTransientError" => Self::ErrorStreamingSubscriptionInvalid,
             _ => Self::Unknown,
         }
     }

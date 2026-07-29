@@ -839,9 +839,9 @@ mod tests {
             assert!(url.contains(field), "{field} missing from {url}");
         }
         assert!(url.contains("$top=50"));
-        // Note: `changeKey` is deliberately absent - the etag comes from
-        // the `@odata.etag` annotation via `graph_etag`'s fallback.
-        assert!(!url.contains("changeKey"), "{url}");
+        // `changeKey` is the documented concurrency token. The OData etag
+        // remains a useful fallback, but inventory must request it directly.
+        assert!(url.contains("changeKey"), "{url}");
     }
 
     #[test]

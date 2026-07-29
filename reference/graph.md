@@ -118,9 +118,13 @@ retagged instead, which moves its token rather than minting a new one.
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
 `PushEndpoint`, a `shared_mailboxes: Vec<String>`, and
 `public_folders: Option<PublicFolderScope>`.
-`with_push_endpoint(url)` selects `GraphSubscriptions`; `with_ews_streaming()`
-selects `EwsStreaming` and clears the endpoint; default webhook-mode without an
-endpoint makes `push_subscribe` return `Error::MissingCoreCapability`.
+`with_push_endpoint(url)` selects `GraphSubscriptions` with the historical
+random `clientState` fallback. New webhook consumers should use
+`with_push_endpoint_client_state(url, secret)`: it reuses the caller-owned
+account-wide secret for every resource so the out-of-process receiver can
+validate Graph notifications. `with_ews_streaming()` selects `EwsStreaming`
+and clears the endpoint; default webhook-mode without an endpoint makes
+`push_subscribe` return `Error::MissingCoreCapability`.
 `with_shared_mailbox(id)` registers a delegate/shared mailbox by its
 `/users/{id}` routing key. `with_public_folders(scope)` opts in to
 public-folder discovery (default off) and says which folders may SYNC:
@@ -159,7 +163,7 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
   `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS) + worker join slots
   and a `CancellationToken`.
 - An `etag_index: Arc<RwLock<HashMap<String, String>>>` of change keys (powering
-  `If-Match`) and a `routing_map: Arc<RwLock<HashMap<FolderId,
+  `If-Match`; `MESSAGE_SELECT` explicitly requests `changeKey`) and a `routing_map: Arc<RwLock<HashMap<FolderId,
   PublicFolderRouting>>>` from public-folder discovery, plus
   `public_folders_enabled` and the discovered `user_email`.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
@@ -471,21 +475,47 @@ no-bytes-sent over live server-side subscriptions and invite a duplicating
 retry. It stores `(server_id, expires_at)` in a
 `GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
 deletes each subscription and aborts the renewal worker when no groups
-remain. The worker wakes every 10 min, renews inside the 30 min threshold,
-and emits `Disconnected`/`Reconnected`/`Terminated` accordingly. The
-webhook receiver is not in this crate: consumers mount an HTTPS endpoint at
-`PushEndpoint::webhook_url` and feed invalidations into the engine
-`InvalidationSink`; `push_stream` carries health only.
+remain. The webhook receiver is not in this crate: consumers mount an HTTPS
+endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
+engine `InvalidationSink`; `push_stream` carries health only.
 
-`clientState` validation is **not available today.** `create_subscription`
-mints a fresh random `clientState` per resource, sends it, and discards it -
-no accessor on `GraphAccount`, `GraphSubscriptionGroup`, or the returned
-`SubscriptionHandle` exposes the value, and per-resource randomness means
-there is no single account-wide secret a receiver could compare against
-anyway. Until a caller-supplied account-wide secret is threaded through the
-factory endpoint configuration, a consumer's webhook endpoint has no
-`clientState` to check and must authenticate forged invalidations by other
-means (or treat every invalidation as an untrusted re-check hint).
+`clientState` validation is available through
+`GraphAccountFactory::with_push_endpoint_client_state(url, secret)`, which
+sends the caller-owned account-wide secret on every resource's subscription
+so the out-of-process receiver can compare it. The older
+`with_push_endpoint(url)` keeps the legacy behavior: `create_subscription`
+mints a fresh random `clientState` per resource, sends it, and discards it,
+and nothing on `GraphAccount`, `GraphSubscriptionGroup`, or the returned
+`SubscriptionHandle` exposes the value - a receiver behind that constructor
+still has no secret to check and must authenticate forged invalidations by
+other means.
+
+#### Renewal worker
+
+The worker wakes every 10 min, renews everything inside the 30 min
+threshold, and emits `Disconnected` / `Reconnected` / `Terminated`
+accordingly. Three rules make the renewal path safe:
+
+- A renewal that 404/410s (`subscription_is_gone`) is not retryable - Graph
+  retains no deleted subscription to PATCH - so the worker creates a
+  replacement for the same resource. The stale state stays installed until
+  the replacement is in hand: dropping it first meant a failed create left
+  the resource with no row at all, so no later tick could see it as due and
+  coverage was lost until reopen or an explicit resubscribe. A failed
+  create classifies **the create error**, not the already-known 404, so its
+  recovery class decides whether another tick is worth it.
+- `install_replacement` is a plain `get_mut`, never
+  `entry().or_insert_with()`. The due list is a snapshot, so a concurrent
+  `push_unsubscribe` can retire the handle while the create is in flight;
+  re-registering the group there would tell the caller teardown succeeded
+  while notifications kept arriving. When the handle is gone the worker
+  deletes the subscription it just minted instead (best effort - the
+  caller's `push_unsubscribe` already returned).
+- A successful replacement emits `Reconnected`. The resource had NO live
+  subscription between its disappearance and the create, and Graph does not
+  replay notifications for that window; `Reconnected` is the only event the
+  reconciler turns into a full reconcile across every registered scope, so
+  without it the missed changes wait for the ordinary poll interval.
 
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 

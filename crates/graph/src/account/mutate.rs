@@ -15,6 +15,7 @@ use super::GraphAccount;
 use super::get::folder_destination;
 use super::graph_error::{
     GraphErrorContext, into_account_error, mutation_item_outcome, protocol_violation,
+    unsupported_account_error,
 };
 use super::inventory::graph_etag;
 
@@ -113,6 +114,28 @@ async fn submit_batch(
 ) -> Result<Vec<SyncEvent<ItemOutcome<MutationSuccess>>>, crate::error::GraphError> {
     if ids.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Graph only accepts a full replacement for `categories`; its PATCH
+    // surface has no add/remove member operation. Sending the partial flag
+    // patch below would omit category tokens entirely, and a category-only
+    // request would become `{}` and falsely report Applied on a 2xx. A
+    // read-modify-write implementation can replace this rejection later,
+    // but it must never silently claim the incremental category change.
+    if matches!(kind, MutationKind::SetFlags(op) if flag_op_requires_category_rmw(op)) {
+        let error = unsupported_account_error(AccountOperation::UpdateFlags);
+        return Ok(vec![SyncEvent::Batch(Batch {
+            items: ids
+                .iter()
+                .map(|id| {
+                    ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone()))
+                })
+                .collect(),
+            page_boundary: PageBoundary::Page,
+            server_latency: Duration::default(),
+            bytes_in: 0,
+            checkpoint: None::<Checkpoint>,
+        })]);
     }
 
     let mut etags = account.etag_index.read().await.clone();
@@ -505,6 +528,16 @@ fn categories_from_flags(flags: &HashSet<String>) -> Vec<String> {
     categories
 }
 
+fn flag_op_requires_category_rmw(op: &FlagOp) -> bool {
+    let has_categories =
+        |flags: &HashSet<String>| flags.iter().any(|flag| flag.starts_with("category:"));
+    match op {
+        FlagOp::Add(flags) | FlagOp::Remove(flags) => has_categories(flags),
+        FlagOp::Patch { add, remove } => has_categories(add) || has_categories(remove),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,35 +887,50 @@ mod tests {
         }
     }
 
-    /// Documents a defect, NOT the intended contract.
-    /// `FlagOp::Add` / `Remove` / `Patch`
-    /// ignore `category:` flags entirely - only `Set` writes `categories`.
-    /// A `bulk_set_flags(Add{category:Work})` therefore PATCHes an EMPTY
-    /// object, Graph answers 200, and `mutation_item_outcome` reports
-    /// `Succeeded(Applied)` for a mutation that changed nothing. The
-    /// consumer's read-back guard is the only thing that would notice.
+    /// Incremental category changes need a category-array read-modify-write.
+    /// Until that exists, every shape containing a category is rejected as a
+    /// unit so a mixed flag/category request cannot partially apply either.
     #[test]
-    fn add_and_remove_silently_drop_category_flags_into_an_empty_patch() {
-        assert_eq!(
-            patch_for_flags(&FlagOp::Add(flag_set(&["category:Work"]))),
-            json!({})
-        );
-        assert_eq!(
-            patch_for_flags(&FlagOp::Remove(flag_set(&["category:Work"]))),
-            json!({})
-        );
-        assert_eq!(
-            patch_for_flags(&FlagOp::Patch {
-                add: flag_set(&["category:Work"]),
-                remove: flag_set(&["category:Old"]),
-            }),
-            json!({})
-        );
-        // An unrecognized flag is dropped the same way.
-        assert_eq!(
-            patch_for_flags(&FlagOp::Add(flag_set(&["\\Draft"]))),
-            json!({})
-        );
+    fn category_incremental_ops_are_detected_before_building_a_patch() {
+        assert!(flag_op_requires_category_rmw(&FlagOp::Add(flag_set(&[
+            "category:Work"
+        ]))));
+        assert!(flag_op_requires_category_rmw(&FlagOp::Remove(flag_set(&[
+            "category:Work"
+        ]))));
+        assert!(flag_op_requires_category_rmw(&FlagOp::Patch {
+            add: flag_set(&["category:Work"]),
+            remove: flag_set(&["category:Old"]),
+        }));
+        assert!(!flag_op_requires_category_rmw(&FlagOp::Set(flag_set(&[
+            "category:Work"
+        ]))));
+        assert!(!flag_op_requires_category_rmw(&FlagOp::Add(flag_set(&[
+            "\\Seen"
+        ]))));
+    }
+
+    #[tokio::test]
+    async fn category_incremental_ops_fail_without_emitting_an_empty_patch() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        let events = submit_batch(
+            &account,
+            std::slice::from_ref(&id),
+            &MutationKind::SetFlags(FlagOp::Add(flag_set(&["category:Work"]))),
+        )
+        .await
+        .expect("preflight category rejection is local");
+        let SyncEvent::Batch(batch) = &events[0] else {
+            panic!("expected a batch outcome");
+        };
+        let ItemOutcome::Failed(failure) = &batch.items[0] else {
+            panic!("category operation must not be applied");
+        };
+        assert!(matches!(
+            failure.error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(AccountOperation::UpdateFlags)
+        ));
     }
 
     #[test]

@@ -324,6 +324,24 @@ impl GraphAccountFactory {
     pub fn with_push_endpoint(mut self, webhook_url: impl Into<String>) -> Self {
         self.push_endpoint = Some(PushEndpoint {
             webhook_url: webhook_url.into(),
+            client_state: None,
+        });
+        self.push_mode = PushMode::GraphSubscriptions;
+        self
+    }
+
+    /// Configure Graph webhook delivery with an account-wide `clientState`
+    /// secret. Use the same value in the consumer's webhook receiver to
+    /// reject notifications not minted for this account.
+    #[must_use]
+    pub fn with_push_endpoint_client_state(
+        mut self,
+        webhook_url: impl Into<String>,
+        client_state: impl Into<String>,
+    ) -> Self {
+        self.push_endpoint = Some(PushEndpoint {
+            webhook_url: webhook_url.into(),
+            client_state: Some(client_state.into()),
         });
         self.push_mode = PushMode::GraphSubscriptions;
         self
