@@ -282,6 +282,96 @@ mod tests {
         }
     }
 
+    /// `ResponseClass="Error"` and `ResponseCode="NoError"` are mutually
+    /// exclusive. The pair says the operation failed but refuses to say how,
+    /// which is the same position an error-classed message with no code at
+    /// all leaves us in: a failure we cannot classify, never a success.
+    #[test]
+    fn error_class_carrying_no_error_is_malformed() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        match check_response_error(xml).expect_err("contradictory response must fail") {
+            EwsError::MalformedXml(detail) => {
+                assert!(detail.as_str().contains("NoError"), "{}", detail.as_str());
+                assert!(
+                    detail.as_str().contains("FindItemResponseMessage"),
+                    "{}",
+                    detail.as_str()
+                );
+            }
+            other => panic!("expected MalformedXml, got {other:?}"),
+        }
+    }
+
+    /// The contradictory pair is unclassifiable, not authoritative: a later
+    /// message that names a real code still decides the body, exactly as it
+    /// does after a code-less error. Otherwise a multi-item response whose
+    /// first message is contradictory would report `Protocol(ParseFailed)`
+    /// and throw away an `ErrorAccessDenied` sitting right behind it.
+    #[test]
+    fn classifiable_error_after_a_no_error_contradiction_wins() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Error">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:GetItemResponseMessage>
+        <m:GetItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Access is denied.</m:MessageText>
+          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        match check_response_error(xml).expect_err("error response must classify") {
+            EwsError::SoapFault { code, .. } => assert_eq!(code, SoapFaultCode::ErrorAccessDenied),
+            other => panic!("expected SoapFault, got {other:?}"),
+        }
+    }
+
+    /// ... but a SUCCESS message behind it must not rehabilitate it, and its
+    /// `NoError` must not be read as the contradictory message's code.
+    #[test]
+    fn a_success_message_after_a_no_error_contradiction_does_not_clear_it() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Error">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:GetItemResponseMessage>
+        <m:GetItemResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        match check_response_error(xml).expect_err("contradictory response must fail") {
+            EwsError::MalformedXml(detail) => {
+                assert!(detail.as_str().contains("NoError"), "{}", detail.as_str());
+            }
+            other => panic!("expected MalformedXml, got {other:?}"),
+        }
+    }
+
     // An error-classed response message with no `<m:ResponseCode>` is a
     // FAILED response we cannot classify. Passing it through would hand the
     // body to the operation parsers, which read a missing result set as an

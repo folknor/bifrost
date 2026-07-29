@@ -108,7 +108,7 @@ pub(crate) fn changes_stream(
             if !etags.is_empty() || !removed_etag_ids.is_empty() {
                 let mut cache = account.etag_index.write().await;
                 for (id, etag) in etags {
-                    super::insert_etag(&mut cache, id, etag);
+                    cache.insert(id, etag);
                 }
                 for id in removed_etag_ids {
                     cache.remove(&id);

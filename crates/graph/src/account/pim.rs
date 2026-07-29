@@ -1564,7 +1564,7 @@ async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value: &Value) {
         return;
     };
     let mut cache = account.etag_index.write().await;
-    super::insert_etag(&mut cache, id.0.clone(), etag);
+    cache.insert(id.0.clone(), etag);
 }
 
 fn object_id_from_value(

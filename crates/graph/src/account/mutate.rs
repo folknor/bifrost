@@ -138,7 +138,15 @@ async fn submit_batch(
         })]);
     }
 
-    let mut etags = account.etag_index.read().await.clone();
+    let mut etags = HashMap::new();
+    {
+        let mut cache = account.etag_index.write().await;
+        for id in ids {
+            if let Some(etag) = cache.get(&id.0) {
+                etags.insert(id.0.clone(), etag);
+            }
+        }
+    }
     let mut preflight_outcomes = refresh_missing_etags(account, ids, kind, &mut etags).await;
     let mut requests = Vec::new();
     let mut request_ids = Vec::new();
@@ -378,7 +386,7 @@ async fn refresh_missing_etags(
     if !refreshed.is_empty() {
         let mut cache = account.etag_index.write().await;
         for (id, etag) in refreshed {
-            super::insert_etag(&mut cache, id, etag);
+            cache.insert(id, etag);
         }
     }
     failed

@@ -421,6 +421,64 @@ container projection itself.
   Graph host bucket. Cosmetic today (the injected net owns its own limits) but
   it is an inconsistency waiting to mislead.
 
+## Cross-crate items from the bug-hunt loop (2026-07-29)
+
+Surfaced while working the `plans/bugs-*.md` files crate by crate. Each of
+these was found from inside one crate but cannot be resolved there: the fix,
+or the decision, belongs to a shared contract or to a second crate's API.
+They are collected here rather than in the per-crate sections above so they
+can be adjudicated together, from a higher vantage point, later. None is
+blocking; each is a real defect or a real decision, not a cleanup.
+
+- **xc-1 (graph + sync)** The push-teardown retry lane has no retrier.
+  `bifrost-graph` was fixed (G-15, commit 578c1ff) so that a failed webhook
+  DELETE keeps its subscription ids registered under the same handle,
+  specifically so teardown can be retried - an orphaned Graph subscription
+  otherwise keeps delivering to the consumer's webhook endpoint until its 24h
+  expiry. But `SyncEngine::unsubscribe_push` (`crates/sync/src/engine.rs:982`)
+  does `self.subscriptions.take(account_id)` *before* its per-handle loop and
+  only logs a warning when `Account::push_unsubscribe` fails. The registry
+  entry is gone either way, so nothing engine-side can drive the retry the
+  account crate now supports; only a consumer holding its own handle can.
+  Either retain the entry until every teardown reports success, or surface the
+  failure to the caller instead of swallowing it. Tracked crate-side as R6 in
+  `plans/bugs-types-sync.md`.
+
+- **xc-2 (types + sync + every account crate)** Subscription teardown depends
+  entirely on the caller, and the contract says so deliberately.
+  `Account::close` is idempotent LOCAL teardown and explicitly does not delete
+  durable server-side subscriptions (`reference/types.md`); engine detach
+  cancels workers and calls `close`; the engine tells consumers to call
+  `unsubscribe_push` themselves. So a consumer that detaches without
+  unsubscribing strands live server subscriptions - for Graph, up to 24h, with
+  provider-side expiry as the only backstop. This is the documented contract
+  rather than a defect, and `bifrost-graph` correctly must NOT add best-effort
+  deletion in `close`. The open question is whether the shared contract should
+  keep placing that burden on the consumer at all. Tracked crate-side as O-7
+  in `plans/bugs-graph.md`, where it is explicitly marked as not belonging to
+  that crate.
+
+- **xc-3 (net + graph, related in jmap)** `bifrost-net` exposes no in-process
+  seam for staging a canned HTTP response, so account crates that ride it
+  cannot hermetically test any path whose behavior depends on what the server
+  returned. `bifrost_net::Response` is `#[non_exhaustive]` with no public
+  constructor, and the crate's `Dispatch` / `ScriptedDispatch` are
+  crate-private and test-only. Concretely this is why several `bifrost-graph`
+  paths are pinned only at the level of extracted pure decision functions,
+  with the surrounding request/response sequencing left unpinned and named as
+  such in `plans/bugs-graph.md`: partial webhook-creation rollback, the
+  inventory neither-link branch, the unsubscribe DELETE loop as a loop, a
+  mixed reaction batch actually reaching `$batch`, and the renewal leg past
+  `due_renewals`. `bifrost-jmap` hit the same wall and solved it locally by
+  introducing a two-method `PushTransport` trait over the transport it owns,
+  which worked precisely because jmap owns that transport - Graph does not.
+  The choice is between a Graph-local `GraphTransport` trait (or a
+  `#[cfg(test)]` response queue on `ClientInner`), and promoting net's
+  existing `Dispatch` seam to a supported test surface that every net-riding
+  crate can use. The second is the smaller total amount of code and the larger
+  API commitment. Related: `jmap-O2`, the jmap sync layer hardwiring
+  `ReqwestTransport`, which is the same testability problem one crate over.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

@@ -98,9 +98,12 @@ sentinel routed through `/me/events/{id}`. Contact search uses exact email
 ## `GraphAccount` / `GraphAccountFactory` shape and lifecycle
 
 The `account` module path is public (consumers construct the factory
-through it); helper modules and `GraphAccount` stay crate-private. `GraphClient` is public only as factory input. `new` /
-`with_api_base*` take a raw token; `with_source` / `with_account_net` take
-a shared `Arc<dyn TokenSource>` that `attach_account` hands to bifrost-net.
+through it); helper modules and `GraphAccount` stay crate-private.
+`GraphClient` is public only as factory input. `new` / `with_api_base` take a
+raw token; `with_source` / `with_account_net` take a shared
+`Arc<dyn TokenSource>` that `attach_account` hands to bifrost-net. There is
+one api-base: the client speaks `v1.0` only, and a beta endpoint is not
+configurable because no call site reads one.
 
 `attach_account` is called again on every reopen with the same engine
 id. When the client owns a parent `Net` it mints a fresh `AccountNet`,
@@ -162,9 +165,15 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
 - `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
   `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS) + worker join slots
   and a `CancellationToken`.
-- A bounded `etag_index: Arc<RwLock<HashMap<String, String>>>` of change keys
-  (powering `If-Match`; `MESSAGE_SELECT` explicitly requests `changeKey`;
-  tombstones and confirmed destroys evict their keys) and a `routing_map: Arc<RwLock<HashMap<FolderId,
+- A bounded LRU `etag_index` of change keys (powering `If-Match`; mutation
+  preflight reads refresh recency, `MESSAGE_SELECT` explicitly requests
+  `changeKey`, and tombstones and confirmed destroys evict their keys). It is
+  a `HashMap<Arc<str>, _>` paired with a `BTreeMap<u64, Arc<str>>` of recency
+  tickets, so insert / hit / evict are each one hash lookup plus a couple of
+  tree nodes and never a scan: the write lock is taken once per hydrated page
+  and once per mutation preflight, where a scanning policy would cost
+  `messages * capacity` comparisons serialized behind it. Alongside it a
+  `routing_map: Arc<RwLock<HashMap<FolderId,
   PublicFolderRouting>>>` from public-folder discovery, plus
   `public_folders_enabled` and the discovered `user_email`.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
@@ -283,7 +292,7 @@ The inventory walk reads pages via `get_json` / `get_absolute` (the
 `delta_link`, then a `Final` Batch + `Checkpoint::Change`. A page with neither
 link is a contract violation, never a successful cursor-less completion.
 `@removed` entries are skipped and evict their cached change key; harvested
-etags fold into the bounded `account.etag_index` for the next `If-Match`.
+etags fold into the bounded LRU `account.etag_index` for the next `If-Match`.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
@@ -563,6 +572,18 @@ scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
 When started before any scopes exist, it waits for a subscription-map change
 instead of polling the empty map.
+
+`scope_matches_notification_folder` does the mapping, and it is a byte
+comparison against PRIMARY-mailbox scopes only. It deliberately claims
+nothing more: a scope's `FolderId` is a Graph `restId` while a notification
+carries an `ewsId`, and Microsoft's supported conversion between the two is
+`translateExchangeIds`, so equal bytes match but unequal bytes do not prove
+a mismatch. A foreign-encoded scope never matches, because a notification
+carries no owning mailbox to disambiguate it with. A miss degrades to
+`HintPayload::Unknown` (account-wide re-check), which is why the imprecision
+is survivable here. The Subscribe request has the same id-format gap without
+the safe degradation - it puts Graph `restId`s in `<t:FolderId>` - and is an
+open finding, not settled behavior.
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
 `ews_scope_is_subscribable`: only a PRIMARY-mailbox `FolderType` scope is
@@ -579,9 +600,10 @@ the EWS branch re-spawns its worker on demand.
 
 `bulk_set_flags`, `bulk_move`, `bulk_destroy` share
 `bulk_mutation_stream`: chunk to `batching_policy.max_items` (20), then
-`submit_batch` (1) snapshots the etag cache and refreshes missing
-`SetFlags`/`Move` etags via `GET /messages/{id}?$select=id` (`Destroy`
-needs none), (2) builds one `BatchRequestItem` per id - `PATCH` /
+`submit_batch` (1) reads the batch's own ids out of the etag cache (a
+per-id lookup that marks them hot, not a clone of the whole map) and
+refreshes missing `SetFlags`/`Move` etags via
+`GET /messages/{id}?$select=id` (`Destroy` needs none), (2) builds one `BatchRequestItem` per id - `PATCH` /
 `POST .../move` / `DELETE` - attaching `If-Match: <changeKey>` (mandatory
 for `SetFlags`/`Move`, opportunistic for `Destroy`), (3) sends `/$batch`,
 status driving `mutation_item_outcome`.
@@ -740,12 +762,14 @@ through the REST `response_to_account_error` path, `SoapFault` onto
 most operation failures inside a 200 as `ResponseClass="Error"` +
 `<m:ResponseCode>`. That scan is per-response-message (a later warning or
 success never donates its code to an earlier error), and an error-classed
-message that closes with NO `ResponseCode` is `MalformedXml`, never success -
-the operation parsers read a missing result set as an empty successful one, so
-passing it through made public folders or items silently disappear. A complete
-error later in the same body still outranks the malformed report, since its
-code carries the real classification (`ErrorAccessDenied` quarantines just that
-scope).
+message that cannot be classified is `MalformedXml`, never success - the
+operation parsers read a missing result set as an empty successful one, so
+passing it through made public folders or items silently disappear.
+Unclassifiable means either NO `ResponseCode` or the self-contradictory
+`NoError` on a `ResponseClass="Error"` message; the two share one path. A
+CLASSIFIABLE error later in the same body outranks the malformed report,
+since its code carries the real classification (`ErrorAccessDenied`
+quarantines just that scope).
 
 Known Graph vocabulary lands on typed `WireCause::Graph(GraphSignal::*)` variants
 (auth/access/throttle/cursor codes; see `classify`). `GraphSignal::Unknown
@@ -808,7 +832,11 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
   needs a public HTTPS endpoint (else `Error::MissingCoreCapability`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox
   scopes need mailbox-specific EWS routing headers and are not yet grouped by
-  owner.
+  owner. It also has no id translation: folder scopes carry Graph `restId`s
+  and EWS speaks `ewsId`, so both the Subscribe request and the notification
+  mapping are unsound until a `translateExchangeIds` step lands at the
+  subscription boundary. Webhook mode is unaffected (it addresses folders
+  over Graph REST).
 - Blob range per-handle (fileAttachment only); delta-token expiry reactive (410
   / 400 InvalidDeltaToken -> `RestartScope`); `MutationReplaySafety::None`.
 - Unsupported: `remove_from_container`, keyword/label writes,

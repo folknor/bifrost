@@ -172,22 +172,23 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
 /// public folder would read as "zero items" and the deletion reconcile
 /// would emit a spurious mass-`Destroyed` while the cursor advanced.
 ///
-/// The first `ResponseMessage` whose `ResponseClass="Error"` wins; its
-/// `<m:ResponseCode>` token is mapped through `SoapFaultCode::parse`
-/// (the same `ErrorXxx` vocabulary) and the optional `<m:MessageText>`
-/// becomes the support-only detail. A `ResponseClass="Warning"` is not
-/// an error and is ignored. `NoError` / `Success` pass through.
+/// The first `ResponseMessage` that is `ResponseClass="Error"` AND names a
+/// fault wins; its `<m:ResponseCode>` token is mapped through
+/// `SoapFaultCode::parse` (the same `ErrorXxx` vocabulary) and the optional
+/// `<m:MessageText>` becomes the support-only detail. A
+/// `ResponseClass="Warning"` is not an error and is ignored, as is any
+/// message that is not error-classed.
 ///
-/// An error-classed message that closes without a `ResponseCode` is
-/// `MalformedXml`, never success. The scan state is per-message (a later
-/// warning or success must not donate its code to an earlier error), but
-/// dropping the incomplete message entirely would hand a FAILED response to
-/// the operation parsers, several of which project an absent result set as an
-/// empty successful one - public folders or items would silently disappear.
-/// A complete error later in the same body still wins over the malformed
-/// report: its code carries the real classification (`ErrorAccessDenied`
-/// quarantines just that scope), which is strictly more actionable than
-/// `Protocol(ParseFailed)`.
+/// An error-classed message that closes without a `ResponseCode`, or that
+/// carries the self-contradictory `NoError`, is unclassifiable but still a
+/// FAILURE: it reports as `MalformedXml`, never success. Dropping it would
+/// hand a failed response to the operation parsers, several of which project
+/// an absent result set as an empty successful one - public folders or items
+/// would silently disappear. The scan state is per-message, so a later
+/// warning or success cannot donate its code to such a message; a later
+/// CLASSIFIABLE error outranks it, because a real code carries the real
+/// classification (`ErrorAccessDenied` quarantines just that scope) where
+/// `Protocol(ParseFailed)` throws it away.
 pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
     use super::SoapFaultCode;
     use bifrost_types::DiagnosticText;
@@ -200,7 +201,9 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
     let mut response_code = String::new();
     let mut message_text = String::new();
     let mut buf = String::new();
-    let mut incomplete_error: Option<String> = None;
+    // The first error-classed message that carried no usable code, as the
+    // detail text it will be reported with if nothing classifiable follows.
+    let mut unclassifiable_error: Option<String> = None;
 
     loop {
         match reader.read_event() {
@@ -238,26 +241,29 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                     message_text = buf.trim().to_string();
                     in_message_text = false;
                 }
-                // The first errored ResponseMessage decides the
-                // classification; stop once we have its code.
-                if in_error_message && !response_code.is_empty() {
+                // The first errored ResponseMessage that names a fault
+                // decides the classification; stop once we have its code.
+                if in_error_message && is_classifiable(&response_code) {
                     break;
                 }
                 if error_message_element.as_deref() == Some(local) {
-                    // An incomplete error response must not make a later
-                    // warning or success response donate its code to this
-                    // message. Remember that the body contained a failed
-                    // response we could not classify - it is malformed, not
-                    // successful - and keep scanning for a complete error,
-                    // which outranks the malformed report.
-                    if incomplete_error.is_none() {
-                        incomplete_error = Some(local.to_string());
+                    // An error response we could not classify must not make a
+                    // later warning or success response donate its code to
+                    // this message. Remember that the body contained a failed
+                    // response - it is malformed, not successful - and keep
+                    // scanning for a classifiable error, which outranks the
+                    // malformed report.
+                    if unclassifiable_error.is_none() {
+                        unclassifiable_error = Some(unclassifiable_detail(local, &response_code));
                     }
                     in_error_message = false;
                     in_response_code = false;
                     in_message_text = false;
                     error_message_element = None;
                     message_text.clear();
+                    // A `NoError` code belongs to the message that closed
+                    // here; leaving it set would leak into the next one.
+                    response_code.clear();
                 }
                 buf.clear();
             }
@@ -274,31 +280,51 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
         }
     }
 
-    if in_error_message && !response_code.is_empty() {
-        // `NoError` on an Error-classed message is contradictory; treat
-        // any non-NoError code as the fault. `SoapFaultCode::parse` maps
-        // the EWS `ErrorXxx` vocabulary onto the shared taxonomy and
-        // collapses the unrecognized rest onto `Unknown`.
-        if response_code != "NoError" {
-            let detail = if message_text.is_empty() {
-                format!("EWS ResponseCode {response_code}")
-            } else {
-                format!("{response_code}: {message_text}")
-            };
-            return Err(super::EwsError::SoapFault {
-                code: SoapFaultCode::parse(&response_code),
-                detail: DiagnosticText::support_only(detail),
-            });
-        }
+    if in_error_message && is_classifiable(&response_code) {
+        let detail = if message_text.is_empty() {
+            format!("EWS ResponseCode {response_code}")
+        } else {
+            format!("{response_code}: {message_text}")
+        };
+        return Err(super::EwsError::SoapFault {
+            code: SoapFaultCode::parse(&response_code),
+            detail: DiagnosticText::support_only(detail),
+        });
     }
 
-    if let Some(element) = incomplete_error {
+    // An error message truncated before its closing tag never reached the
+    // per-message branch above, so record it here.
+    if in_error_message && unclassifiable_error.is_none() {
+        let element = error_message_element
+            .as_deref()
+            .unwrap_or("ResponseMessage");
+        unclassifiable_error = Some(unclassifiable_detail(element, &response_code));
+    }
+
+    if let Some(detail) = unclassifiable_error {
         return Err(super::EwsError::MalformedXml(DiagnosticText::support_only(
-            format!("EWS {element} is ResponseClass=\"Error\" with no ResponseCode"),
+            detail,
         )));
     }
 
     Ok(())
+}
+
+/// Whether a `ResponseCode` on an error-classed message names a fault this
+/// scan can map onto the shared taxonomy. An absent code says nothing, and
+/// `NoError` contradicts the `ResponseClass="Error"` it arrived with; both
+/// are failures the crate refuses to read as success, but neither can be
+/// classified, so a later message carrying a real code outranks them.
+fn is_classifiable(response_code: &str) -> bool {
+    !response_code.is_empty() && response_code != "NoError"
+}
+
+fn unclassifiable_detail(element: &str, response_code: &str) -> String {
+    if response_code == "NoError" {
+        format!("EWS {element} is ResponseClass=\"Error\" with ResponseCode NoError")
+    } else {
+        format!("EWS {element} is ResponseClass=\"Error\" with no ResponseCode")
+    }
 }
 
 // quick-xml 0.36+ emits Event::GeneralRef separately from Event::Text, so

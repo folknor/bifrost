@@ -13,7 +13,6 @@ use tokio::sync::Semaphore;
 use crate::error::{GraphError, GraphResponseError};
 
 pub(crate) const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
-pub(crate) const GRAPH_API_BETA: &str = "https://graph.microsoft.com/beta";
 
 /// Production origin for the two non-Graph Microsoft surfaces this crate
 /// talks to: Exchange Autodiscover (`/autodiscover/autodiscover.xml`,
@@ -38,7 +37,6 @@ struct ClientInner {
     net: Option<Net>,
     account_net: RwLock<Option<AccountNet>>,
     api_base: String,
-    api_beta_base: String,
     /// Origin for the Autodiscover + EWS surfaces. Derived from `api_base`
     /// (see [`derive_outlook_base`]) unless a consumer overrode it with
     /// [`GraphClient::with_outlook_base`].
@@ -52,48 +50,23 @@ struct ClientInner {
 impl GraphClient {
     // pub: ergonomic constructor for the default Microsoft Graph endpoint.
     pub fn new(access_token: impl Into<String>) -> Self {
-        Self::with_api_bases(GRAPH_API_BASE, GRAPH_API_BETA, access_token)
+        Self::with_api_base(GRAPH_API_BASE, access_token)
     }
 
     // pub: consumers may need sovereign-cloud or test Graph API endpoints before registration.
     pub fn with_api_base(api_base: impl Into<String>, access_token: impl Into<String>) -> Self {
-        let api_base = api_base.into();
-        let api_beta_base =
-            derive_beta_base(&api_base).unwrap_or_else(|| GRAPH_API_BETA.to_string());
-        Self::with_api_bases(api_base, api_beta_base, access_token)
-    }
-
-    // pub: lets callers configure v1.0 and beta endpoints independently for non-public clouds.
-    pub fn with_api_bases(
-        api_base: impl Into<String>,
-        api_beta_base: impl Into<String>,
-        access_token: impl Into<String>,
-    ) -> Self {
         // Bases are trimmed once in `with_bases_and_source`.
         let token_source: Arc<dyn TokenSource> =
             Arc::new(StaticTokenSource::new(access_token, None));
-        Self::with_bases_and_source(api_base, api_beta_base, token_source)
+        Self::with_source(api_base, token_source)
     }
 
     // pub: source-accepting constructor. ratatoskr hands in a shared
     // `Arc<dyn TokenSource>` (typically an `OAuthRefresher` over its own
     // refresh-token store) so a token it refreshes and persists is read
     // live at every wire authentication without reopening the client.
-    pub fn with_source(
-        api_base: impl Into<String>,
-        api_beta_base: impl Into<String>,
-        source: Arc<dyn TokenSource>,
-    ) -> Self {
-        Self::with_bases_and_source(api_base, api_beta_base, source)
-    }
-
-    fn with_bases_and_source(
-        api_base: impl Into<String>,
-        api_beta_base: impl Into<String>,
-        token_source: Arc<dyn TokenSource>,
-    ) -> Self {
+    pub fn with_source(api_base: impl Into<String>, source: Arc<dyn TokenSource>) -> Self {
         let api_base = trim_base(api_base.into());
-        let api_beta_base = trim_base(api_beta_base.into());
         let rate_limit_host = host_from_api_base(&api_base);
         let outlook_base = derive_outlook_base(&api_base);
         Self {
@@ -101,10 +74,9 @@ impl GraphClient {
                 net: Some(Net::shared_default()),
                 account_net: RwLock::new(None),
                 api_base,
-                api_beta_base,
                 outlook_base,
                 rate_limit_host,
-                token_source,
+                token_source: source,
                 mailbox_id: None,
                 semaphore: Arc::new(Semaphore::new(CONCURRENCY_LIMIT)),
             }),
@@ -115,7 +87,6 @@ impl GraphClient {
     pub fn with_account_net(
         net: AccountNet,
         api_base: impl Into<String>,
-        api_beta_base: impl Into<String>,
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
         let api_base = trim_base(api_base.into());
@@ -125,7 +96,6 @@ impl GraphClient {
                 net: None,
                 account_net: RwLock::new(Some(net)),
                 api_base,
-                api_beta_base: trim_base(api_beta_base.into()),
                 outlook_base,
                 rate_limit_host: GRAPH_HOST.to_string(),
                 token_source,
@@ -226,7 +196,6 @@ impl GraphClient {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
                 api_base: self.inner.api_base.clone(),
-                api_beta_base: self.inner.api_beta_base.clone(),
                 outlook_base: trim_base(outlook_base.into()),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
@@ -234,11 +203,6 @@ impl GraphClient {
                 semaphore: Arc::clone(&self.inner.semaphore),
             }),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn api_beta_base(&self) -> &str {
-        &self.inner.api_beta_base
     }
 
     #[cfg(test)]
@@ -266,7 +230,6 @@ impl GraphClient {
                 net: self.inner.net.clone(),
                 account_net: RwLock::new(self.account_net()),
                 api_base: self.inner.api_base.clone(),
-                api_beta_base: self.inner.api_beta_base.clone(),
                 outlook_base: self.inner.outlook_base.clone(),
                 rate_limit_host: self.inner.rate_limit_host.clone(),
                 token_source: Arc::clone(&self.inner.token_source),
@@ -565,17 +528,6 @@ fn derive_outlook_base(api_base: &str) -> String {
     }
 }
 
-fn derive_beta_base(api_base: &str) -> Option<String> {
-    let base = api_base.trim_end_matches('/');
-    match base.strip_suffix("/v1.0") {
-        Some(prefix) => Some(format!("{prefix}/beta")),
-        None => reqwest::Url::parse(base).ok().map(|url| {
-            let origin = url.origin().ascii_serialization();
-            format!("{origin}/beta")
-        }),
-    }
-}
-
 fn build_url(base: &str, path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         path.to_string()
@@ -621,14 +573,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn trims_api_bases() {
-        let client = GraphClient::with_api_bases(
-            "https://example.test/v1.0/",
-            "https://example.test/beta/",
-            "token",
-        );
+    async fn trims_api_base() {
+        let client = GraphClient::with_api_base("https://example.test/v1.0/", "token");
         assert_eq!(client.api_base(), "https://example.test/v1.0");
-        assert_eq!(client.api_beta_base(), "https://example.test/beta");
         assert_eq!(client.access_token().await, "token");
     }
 
@@ -679,19 +626,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn derives_beta_base_from_v1_base() {
-        let client = GraphClient::with_api_base("https://example.test/v1.0/", "token");
-        assert_eq!(client.api_beta_base(), "https://example.test/beta");
-    }
-
     #[tokio::test]
     async fn rotated_token_source_is_read() {
         use bifrost_net::AccessToken;
 
         let source = StaticTokenSource::new("old-token", None);
-        let client =
-            GraphClient::with_source(GRAPH_API_BASE, GRAPH_API_BETA, Arc::new(source.clone()));
+        let client = GraphClient::with_source(GRAPH_API_BASE, Arc::new(source.clone()));
         assert_eq!(client.access_token().await, "old-token");
         source.set(AccessToken::new("new-token", None));
         assert_eq!(client.access_token().await, "new-token");
@@ -714,21 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn beta_base_stays_on_the_configured_origin_without_a_v1_suffix() {
+    fn non_versioned_api_base_keeps_its_path() {
         let client = GraphClient::with_api_base("http://127.0.0.1:8181/graph", "token");
         assert_eq!(client.api_base(), "http://127.0.0.1:8181/graph");
-        assert_eq!(client.api_beta_base(), "http://127.0.0.1:8181/beta");
         // The Outlook origin, by contrast, correctly follows the redirect.
         assert_eq!(client.outlook_base(), "http://127.0.0.1:8181");
-
-        assert_eq!(
-            derive_beta_base("https://example.test/v1.0").as_deref(),
-            Some("https://example.test/beta")
-        );
-        assert_eq!(
-            derive_beta_base("https://example.test/graph").as_deref(),
-            Some("https://example.test/beta")
-        );
     }
 
     #[test]

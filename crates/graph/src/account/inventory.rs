@@ -95,7 +95,7 @@ pub(crate) fn inventory_stream(
             if !etags.is_empty() {
                 let mut cache = account.etag_index.write().await;
                 for (id, etag) in etags {
-                    super::insert_etag(&mut cache, id, etag);
+                    cache.insert(id, etag);
                 }
             }
 
