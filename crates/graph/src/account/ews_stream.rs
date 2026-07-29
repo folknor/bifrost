@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use bifrost_types::{
@@ -365,19 +366,28 @@ async fn run_get_events_loop(
                         // is a hint for a scope that does not exist. Emit
                         // an account-wide `Unknown` hint so the reconciler
                         // re-checks broadly instead of chasing an empty id.
-                        let payload = match notification.parent_folder_id.as_deref() {
-                            Some(folder_id) => match scope_for_folder(account, folder_id).await {
-                                Some(scope) => HintPayload::SpecificCursorScope(scope),
-                                None => HintPayload::Unknown,
-                            },
-                            None => HintPayload::Unknown,
+                        let payloads = match notification.parent_folder_id.as_deref() {
+                            Some(folder_id) => {
+                                let scopes = scopes_for_folder(account, folder_id).await;
+                                if scopes.is_empty() {
+                                    vec![HintPayload::Unknown]
+                                } else {
+                                    scopes
+                                        .into_iter()
+                                        .map(HintPayload::SpecificCursorScope)
+                                        .collect()
+                                }
+                            }
+                            None => vec![HintPayload::Unknown],
                         };
-                        let _ = account.push_tx.send(WatchEvent::Invalidated {
-                            hint: InvalidationHint {
-                                source: PushSource::EwsStreaming,
-                                payload,
-                            },
-                        });
+                        for payload in payloads {
+                            let _ = account.push_tx.send(WatchEvent::Invalidated {
+                                hint: InvalidationHint {
+                                    source: PushSource::EwsStreaming,
+                                    payload,
+                                },
+                            });
+                        }
                     }
                 }
                 Err(error) => {
@@ -428,11 +438,34 @@ async fn run_get_events_loop(
 
 async fn active_ews_scopes(account: &GraphAccount) -> Vec<EwsSubscriptionScope> {
     let states = account.ews_subscriptions.read().await;
-    let mut scopes = Vec::new();
-    for state in states.values() {
-        scopes.extend(state.scopes.clone());
+    dedupe_by_ews_folder(states.values().flat_map(|state| state.scopes.iter()))
+}
+
+/// The union of every handle's registrations, one entry per EWS folder.
+///
+/// `build_subscribe_request` emits one `<t:FolderId>` per entry, and the
+/// same folder can be registered more than once (two `push_subscribe`
+/// calls over overlapping scopes, or two `FolderType` scopes differing
+/// only in `ObjectType` - the translation request already collapses those
+/// onto one `ewsId`). A repeated `FolderId` in a Subscribe body is
+/// something EWS may accept, ignore, or reject the whole subscription
+/// over; nothing here can find out, so the body simply never contains one.
+/// Which registration survives is immaterial - only `ews_folder_id` is
+/// read from it.
+///
+/// Pure over the scope registrations so the rule is pinnable without a
+/// live client.
+fn dedupe_by_ews_folder<'a>(
+    scopes: impl Iterator<Item = &'a EwsSubscriptionScope>,
+) -> Vec<EwsSubscriptionScope> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut deduped = Vec::new();
+    for scope in scopes {
+        if seen.insert(scope.ews_folder_id.as_str()) {
+            deduped.push(scope.clone());
+        }
     }
-    scopes
+    deduped
 }
 
 async fn record_subscription_id(account: &GraphAccount, subscription: &EwsStreamingSubscription) {
@@ -473,15 +506,40 @@ async fn current_watermark(account: &GraphAccount) -> Option<String> {
     states.values().find_map(|state| state.watermark.clone())
 }
 
-async fn scope_for_folder(account: &GraphAccount, folder_id: &str) -> Option<CursorScope> {
+async fn scopes_for_folder(account: &GraphAccount, folder_id: &str) -> Vec<CursorScope> {
     let states = account.ews_subscriptions.read().await;
-    states.values().find_map(|state| {
-        state
-            .scopes
-            .iter()
-            .find(|scope| scope.ews_folder_id == folder_id)
-            .map(|scope| scope.scope.clone())
-    })
+    unique_scopes_for_folder(
+        states.values().flat_map(|state| state.scopes.iter()),
+        folder_id,
+    )
+}
+
+/// Every DISTINCT cursor scope registered against `folder_id`, in
+/// first-seen order.
+///
+/// Fan-out is per scope, not per registration: one EWS folder can back
+/// several scopes (a `FolderType` per `ObjectType` over one container),
+/// and each of those needs its own invalidation because each owns its own
+/// delta cursor. The SAME scope reaching us twice is a different story -
+/// two handles registering overlapping scopes, or one request naming a
+/// scope twice - and every repeat costs the reconciler another full
+/// `changes_stream` run over a scope it is already reconciling. Distinct
+/// scopes are kept; equal ones collapse.
+///
+/// Pure over the scope registrations so the routing rule is pinnable
+/// without a live client.
+fn unique_scopes_for_folder<'a>(
+    scopes: impl Iterator<Item = &'a EwsSubscriptionScope>,
+    folder_id: &str,
+) -> Vec<CursorScope> {
+    let mut seen: HashSet<&CursorScope> = HashSet::new();
+    let mut routed = Vec::new();
+    for scope in scopes {
+        if scope.ews_folder_id == folder_id && seen.insert(&scope.scope) {
+            routed.push(scope.scope.clone());
+        }
+    }
+    routed
 }
 
 fn finish_notification(builder: &NotificationBuilder) -> Option<EwsStreamingNotification> {
@@ -611,6 +669,121 @@ mod tests {
             scope: email_scope(rest_id),
             ews_folder_id: ews_id.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn active_scopes_deduplicate_ews_folder_ids_but_routing_keeps_every_scope() {
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            super::super::PushMode::EwsStreaming,
+        );
+        account.ews_subscriptions.write().await.insert(
+            bifrost_types::SubscriptionHandle("first".to_string()),
+            super::super::push::EwsSubscriptionState {
+                ews_subscription_id: None,
+                watermark: None,
+                scopes: vec![ews_scope("rest-a", "ews-shared")],
+            },
+        );
+        account.ews_subscriptions.write().await.insert(
+            bifrost_types::SubscriptionHandle("second".to_string()),
+            super::super::push::EwsSubscriptionState {
+                ews_subscription_id: None,
+                watermark: None,
+                scopes: vec![ews_scope("rest-b", "ews-shared")],
+            },
+        );
+
+        let active = active_ews_scopes(&account).await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].ews_folder_id, "ews-shared");
+
+        let mut routed = scopes_for_folder(&account, "ews-shared")
+            .await
+            .into_iter()
+            .map(|scope| match scope {
+                CursorScope::FolderType { folder, .. } => folder.0,
+                other => panic!("unexpected scope {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        routed.sort();
+        assert_eq!(routed, ["rest-a", "rest-b"]);
+    }
+
+    /// Two handles registering the SAME scope is the overlap case
+    /// `push_subscribe` allows: without collapsing them, one notification
+    /// would drive the reconciler through `changes_stream` twice over one
+    /// cursor. Scopes that merely share a folder stay distinct - each owns
+    /// its own delta cursor and must be invalidated separately.
+    #[test]
+    fn routing_collapses_repeated_scopes_but_keeps_distinct_ones() {
+        let mail = ews_scope("rest-a", "ews-shared");
+        let duplicate = ews_scope("rest-a", "ews-shared");
+        let contacts = EwsSubscriptionScope {
+            scope: CursorScope::FolderType {
+                folder: bifrost_types::FolderId("rest-a".to_string()),
+                ty: bifrost_types::ObjectType::Contact,
+            },
+            ews_folder_id: "ews-shared".to_string(),
+        };
+        let elsewhere = ews_scope("rest-z", "ews-other");
+        let registrations = [
+            mail.clone(),
+            duplicate,
+            contacts.clone(),
+            elsewhere.clone(),
+            mail.clone(),
+        ];
+
+        let routed = unique_scopes_for_folder(registrations.iter(), "ews-shared");
+        assert_eq!(routed, vec![mail.scope.clone(), contacts.scope]);
+
+        // A folder nothing registered routes nowhere; the caller turns the
+        // empty result into an account-wide `Unknown` hint.
+        assert!(unique_scopes_for_folder(registrations.iter(), "ews-absent").is_empty());
+    }
+
+    /// The Subscribe body must name each EWS folder once even though the
+    /// registrations that produced it are per scope.
+    #[test]
+    fn the_subscribe_union_carries_one_entry_per_ews_folder() {
+        let registrations = [
+            ews_scope("rest-a", "ews-shared"),
+            ews_scope("rest-b", "ews-shared"),
+            ews_scope("rest-z", "ews-other"),
+            ews_scope("rest-a", "ews-shared"),
+        ];
+
+        let deduped = dedupe_by_ews_folder(registrations.iter());
+        let folders = deduped
+            .iter()
+            .map(|scope| scope.ews_folder_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(folders, ["ews-shared", "ews-other"]);
+
+        let body = build_subscribe_request(&deduped, None);
+        assert_eq!(body.matches(r#"<t:FolderId Id="ews-shared"/>"#).count(), 1);
+        assert_eq!(body.matches(r#"<t:FolderId Id="ews-other"/>"#).count(), 1);
+    }
+
+    /// The Subscribe body's folder set is the subscription's scope, which
+    /// EWS answers once; the long poll names one subscription. Both stay
+    /// inside the single-answer invariant `build_soap_envelope` enforces.
+    #[test]
+    fn the_ews_stream_bodies_stay_within_the_single_answer_invariant() {
+        let subscribe = build_subscribe_request(
+            &[
+                ews_scope("r1", "f1"),
+                ews_scope("r2", "f2"),
+                ews_scope("r3", "f3"),
+            ],
+            Some("wm-1"),
+        );
+        assert_eq!(crate::ews::per_answer_request_ids(&subscribe), 0);
+        assert_eq!(
+            crate::ews::per_answer_request_ids(&build_get_streaming_events_request("sub-1", 30)),
+            1
+        );
     }
 
     #[test]

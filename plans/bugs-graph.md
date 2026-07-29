@@ -5,7 +5,7 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-Open work, in full: O-2, O-7, O-18 and O-21. O-7 is a shared-contract question
+Open work, in full: O-2, O-7 and O-22. O-7 is a shared-contract question
 rather than a Graph defect and is tracked as `xc-2` in `TODO.md`. This file
 is not finished while that list has entries.
 
@@ -29,37 +29,28 @@ consumer that detaches without unsubscribing strands subscriptions for up to
 24h, and Graph's 24h expiry is the only backstop. Worth revisiting at the
 shared-contract level, not in this crate.
 
-**O-18 - the response-error scan is whole-response, not per item.** The
-first errored `ResponseMessage` that names a code decides the outcome of the
-entire body, and an unclassifiable one (no code, or the contradictory
-`NoError`) fails it too. Every EWS request this crate sends today carries
-exactly one item - public-folder hydration deliberately issues one `GetItem`
-per item because the routing headers differ - so the granularity is
-currently exact. It stops being exact the moment a multi-item `GetItem` /
-`DeleteItem` body is introduced: one item's `ErrorItemNotFound` would
-discard the siblings' results. That is the same per-request-answer-on-a-
-per-item-surface mistake the Graph `$batch` funnel already had to unlearn -
-a single unsupported id must fail its own item, not the request. Latent, and
-worth pinning before any batched EWS request lands.
-
-**O-21 - the EWS Subscribe body can list one folder twice.**
-`active_ews_scopes` unions every handle's scopes with no deduplication, and
-`build_subscribe_request` emits one `<t:FolderId>` per entry. Two scopes can
-now resolve to the SAME `ews_folder_id`: `push_subscribe` called twice for
-overlapping scopes without an intervening `push_unsubscribe`, or two
-`FolderType` scopes differing only in `ObjectType` over one container (the
-translation request already deduplicates those, so both get one id back).
-The result is a repeated `FolderId` in the Subscribe request; whether EWS
-accepts it, ignores the duplicate, or rejects the whole subscription is not
-determinable here, and nothing in the crate normalizes it either way. The
-routing side has the matching imprecision: `scope_for_folder` returns the
-FIRST scope whose `ews_folder_id` matches, so a notification for a
-double-registered folder invalidates one arbitrary scope of the pair rather
-than both. Dedup the union by `ews_folder_id` for the request, and route to
-every matching scope rather than the first. Latent and low-severity - the
-degradation on the routing side is a narrower invalidation, not a wrong one -
-but it is now a byte-exact match rather than a best-effort one, so the
-first-match shortcut has no remaining excuse.
+**O-22 - a subscription change never reaches a live EWS stream.** The EWS
+subscription is minted once per `run_get_events_loop` and the loop re-issues
+`GetStreamingEvents` against that same id forever; it exits only on an HTTP
+error, a parse failure, or shutdown. `subscribe_ews` / `unsubscribe_ews`
+mutate `ews_subscriptions` and call `ews_subscription_changed.notify_one()`,
+but the only await on that `Notify` is the idle branch of
+`run_streaming_worker` - the one taken when the map is EMPTY - and
+`ensure_ews_worker` deliberately does not restart a worker that is still
+running. So a `push_subscribe` issued while the stream is live adds folders
+that the live EWS subscription does not cover: no notification for them
+arrives until something knocks the connection over, which the 30-minute
+`ConnectionTimeout` does not (it returns a well-formed empty body and the
+loop simply re-polls the SAME id). Those scopes fall back to the ordinary
+poll interval with no signal that push is not covering them. The
+unsubscribe direction degrades rather than breaks: the removed handle's
+folders keep notifying, routing no longer resolves them, and each one
+becomes an account-wide `HintPayload::Unknown` reconcile. The fix is to make
+the loop cancellable on `ews_subscription_changed` and re-subscribe -
+`select!` against it around the `execute` await, then return a
+`Resubscribe`-style exit that skips the `Disconnected` emission, since this
+is a local topology change and not a transport fault. Verifying it needs the
+transport seam below.
 
 ## Test coverage: the standing seam
 
@@ -74,8 +65,11 @@ subscribable-scope predicate, the REST-to-EWS translation rules
 (`translation_input_chunks` dedup + 1,000-id chunking,
 `reconcile_translated_ews_scopes` pairing and its three failure arms, the
 `convertIdResult` wire shape, and the translation context's idempotency
-override run through `bifrost_net::Error` directly), and the bounded LRU
-change-key cache.
+override run through `bifrost_net::Error` directly), the EWS notification
+routing rules (`dedupe_by_ews_folder` for the Subscribe body,
+`unique_scopes_for_folder` for the invalidation fan-out), the single-answer
+request guard (`per_answer_request_ids` plus a per-builder sweep and the
+`build_soap_envelope` debug assert), and the bounded LRU change-key cache.
 
 What is NOT pinned is everything that only exists inside a live request:
 partial webhook-creation rollback; the inventory neither-link branch; the

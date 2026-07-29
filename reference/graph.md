@@ -53,8 +53,10 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
   `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
   request cap - to `ewsId`s and retained beside their `CursorScope` in
   subscription state: the SOAP Subscribe body uses those EWS ids and
-  notification routing maps the returned EWS parent id back to the original
-  scope without a second request.
+  notification routing maps the returned EWS parent id back to every original
+  scope without a second request. The worker deduplicates equal `ewsId`s for
+  the Subscribe body while preserving every DISTINCT matching scope for
+  invalidation.
 - `public_folder.rs` - no-delta-token public-folder sync: the
   watermark + throttled deletion-scan poll, inventory/changes streams,
   `EwsItem` -> entry/change projectors, hierarchy discovery driver.
@@ -579,7 +581,11 @@ worker: it subscribes to the union of active folders, long-polls
 scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
 When started before any scopes exist, it waits for a subscription-map change
-instead of polling the empty map.
+instead of polling the empty map. That wait is the ONLY consumer of
+`ews_subscription_changed`: the subscription id is minted once per
+`run_get_events_loop` and the loop re-polls it until an error, a parse
+failure, or shutdown, so a scope registered while the stream is live does not
+join the live EWS subscription until the worker reconnects.
 
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
@@ -602,9 +608,21 @@ distinct opaque formats whose only supported conversion is
 `translateExchangeIds`. `subscribe_ews` therefore translates once, at the
 subscription boundary, and retains the pair: `EwsSubscriptionScope { scope,
 ews_folder_id }` is what `EwsSubscriptionState` stores, what
-`build_subscribe_request` puts in `<t:FolderId>`, and what `scope_for_folder`
+`build_subscribe_request` puts in `<t:FolderId>`, and what `scopes_for_folder`
 matches a notification's parent id against to route back to the original
-`CursorScope` without a second request. Nothing downstream re-derives an id.
+`CursorScope`s without a second request. Nothing downstream re-derives an id.
+The mapping is many-to-one in both directions, so two pure rules sit under
+it. `dedupe_by_ews_folder` collapses the union onto one entry per
+`ews_folder_id` before the Subscribe body is built: overlapping
+`push_subscribe` calls, or two `FolderType` scopes over one container
+(translation already returns them one `ewsId`), would otherwise repeat a
+`<t:FolderId>`, and whether EWS accepts, ignores, or rejects that is not
+determinable here. `unique_scopes_for_folder` routes a notification to EVERY
+distinct scope registered against the folder, not one arbitrary match: each
+scope owns its own delta cursor, so invalidating one of a pair leaves the
+other stale. Equal scopes collapse, because every repeat costs the
+reconciler another full `changes_stream` run over a cursor it is already
+reconciling.
 Before this, Subscribe shipped `restId`s EWS cannot parse, so the whole
 opt-in `with_ews_streaming()` path terminated on an opaque
 `SoapFaultCode::Unknown` rather than establishing.
@@ -829,6 +847,25 @@ Unclassifiable means either NO `ResponseCode` or the self-contradictory
 CLASSIFIABLE error later in the same body outranks the malformed report,
 since its code carries the real classification (`ErrorAccessDenied`
 quarantines just that scope).
+
+That scan is whole-RESPONSE: it produces one verdict for the body, exactly
+as the operation parsers produce one result. EWS, however, answers per entry
+of an `m:`-namespaced id collection (`m:ItemIds`, `m:FolderIds`,
+`m:ParentFolderIds`, `m:AttachmentIds`, `m:SubscriptionIds`), so the two
+agree only while a request names at most one such id - otherwise one item's
+`ErrorItemNotFound` discards its siblings' results, the same
+per-request-answer-on-a-per-item-surface mistake the `$batch` funnel had to
+unlearn. Every read builder does name exactly one (public-folder hydration
+deliberately issues one `GetItem` per item because the routing headers
+differ), and that is ENFORCED rather than assumed: `build_soap_envelope` -
+the single funnel `EwsClient::execute` puts every request through -
+`debug_assert!`s `per_answer_request_ids(body) <= 1`, so a multi-item body
+panics at construction in any dev or test build, no transport needed. The
+Subscribe folder set is exempt by construction, not by exception: it rides
+in `t:FolderIds` inside `m:StreamingSubscriptionRequest`, which EWS answers
+with one `SubscribeResponseMessage` however many folders it names, and the
+counter keys on the namespace prefix. Making the response scan per item is a
+prerequisite for any batched EWS request, not a follow-up to one.
 
 Known Graph vocabulary lands on typed `WireCause::Graph(GraphSignal::*)` variants
 (auth/access/throttle/cursor codes; see `classify`). `GraphSignal::Unknown

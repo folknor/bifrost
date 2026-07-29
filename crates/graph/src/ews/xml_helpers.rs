@@ -5,6 +5,24 @@ use quick_xml::events::{BytesRef, Event};
 // SOAP envelope.
 
 pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
+    // Every EWS request this crate sends is funnelled through here by
+    // `EwsClient::execute`, which makes it the one place the
+    // single-answer invariant can be enforced rather than merely
+    // observed. `check_response_error` collapses a whole response body
+    // into ONE verdict, and the per-operation parsers each project a
+    // single result, so both are exact only while a request names at
+    // most one per-answer id. A multi-id body would let one item's
+    // `ErrorItemNotFound` discard its siblings' results - the same
+    // per-request-answer-on-a-per-item-surface mistake the Graph
+    // `$batch` funnel had to unlearn. Reintroducing it requires making
+    // the response scan per item first; until then this trips in every
+    // dev build the moment such a body is constructed.
+    debug_assert!(
+        per_answer_request_ids(body_xml) <= 1,
+        "EWS request names more than one per-answer id; the response-error \
+         scan and the operation parsers are whole-response and would report \
+         one item's outcome for all of them"
+    );
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -17,6 +35,74 @@ pub(crate) fn build_soap_envelope(body_xml: &str) -> String {
     {body_xml}
   </soap:Body>
 </soap:Envelope>"#
+    )
+}
+
+/// How many ids a request body names on a surface EWS answers PER ID.
+///
+/// EWS emits one `ResponseMessage` per entry of an `m:`-namespaced id
+/// collection (`m:ItemIds`, `m:FolderIds`, `m:ParentFolderIds`,
+/// `m:AttachmentIds`, `m:SubscriptionIds`), so a body naming N ids gets N
+/// independent verdicts back. This crate's response handling is
+/// whole-response - see `build_soap_envelope` - so the count must stay at
+/// most one.
+///
+/// The subscription folder set is deliberately NOT counted. Subscribe
+/// carries its folders in `t:FolderIds` inside
+/// `m:StreamingSubscriptionRequest`: that is the subscription's scope, not
+/// a request-item list, and EWS answers it with exactly one
+/// `SubscribeResponseMessage` however many folders it names. The namespace
+/// prefix is precisely what separates the two cases, which is why this
+/// matches on the prefixed name rather than the local one. The builders in
+/// this crate hardcode the `m:` / `t:` prefixes declared by
+/// `build_soap_envelope`, so the prefix is authoritative here.
+pub(crate) fn per_answer_request_ids(body_xml: &str) -> usize {
+    let mut reader = Reader::from_str(body_xml);
+    let mut ids = 0usize;
+    let mut depth = 0usize;
+    // Depth of the enclosing per-answer id collection, if we are inside one.
+    let mut collection_depth: Option<usize> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if collection_depth.is_some_and(|start| depth == start + 1) {
+                    ids += 1;
+                } else if collection_depth.is_none() && is_per_answer_id_collection(&name) {
+                    collection_depth = Some(depth);
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(_)) => {
+                // A self-closing collection element has no children, so only
+                // a child of an open collection counts.
+                if collection_depth.is_some_and(|start| depth == start + 1) {
+                    ids += 1;
+                }
+            }
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+                if collection_depth == Some(depth) {
+                    collection_depth = None;
+                }
+            }
+            Ok(Event::Eof) => break,
+            // A body this crate cannot re-read is not a body whose id count
+            // we can vouch for; report zero rather than a wrong number, and
+            // let the request fail on the wire where it is classifiable.
+            Err(_) => return 0,
+            _ => {}
+        }
+    }
+
+    ids
+}
+
+fn is_per_answer_id_collection(name: &str) -> bool {
+    matches!(
+        name,
+        "m:ItemIds" | "m:FolderIds" | "m:ParentFolderIds" | "m:AttachmentIds" | "m:SubscriptionIds"
     )
 }
 

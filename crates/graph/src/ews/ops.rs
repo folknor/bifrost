@@ -284,6 +284,30 @@ mod tests {
         assert!(body.contains(r#"<t:FolderId Id="AAMkPF="/>"#));
     }
 
+    /// Every read this crate issues names exactly one id on the surface EWS
+    /// answers per id. The whole-response error scan
+    /// (`check_response_error`) and the single-result operation parsers are
+    /// exact only under that invariant, so it is pinned per builder rather
+    /// than left to inspection.
+    #[test]
+    fn every_ews_read_body_names_exactly_one_per_answer_id() {
+        for body in [
+            find_folder_body("publicfoldersroot"),
+            find_folder_body("AAMkAGFk="),
+            get_folder_body("AAMkPF="),
+            find_items_body("AAMk=", None, 0, 50),
+            find_items_body("AAMk=", Some("2026-03-01T10:00:00Z"), 100, 50),
+            get_item_body("AAMkItem="),
+            get_attachment_body("AAMkAtt="),
+        ] {
+            assert_eq!(
+                super::super::per_answer_request_ids(&body),
+                1,
+                "not a single-answer request: {body}"
+            );
+        }
+    }
+
     #[test]
     fn routing_headers_pairs() {
         let both = EwsHeaders {

@@ -190,6 +190,64 @@ mod tests {
         assert!(envelope.contains(body));
     }
 
+    /// The per-answer id count is what makes the whole-response error scan
+    /// exact. `m:`-namespaced collections are per-item surfaces; a body
+    /// naming two ids gets two verdicts back and cannot be answered once.
+    #[test]
+    fn per_answer_ids_counts_each_entry_of_an_m_namespaced_collection() {
+        let one = r#"<m:GetItem><m:ItemIds><t:ItemId Id="a"/></m:ItemIds></m:GetItem>"#;
+        assert_eq!(per_answer_request_ids(one), 1);
+
+        let two = r#"<m:GetItem>
+  <m:ItemIds>
+    <t:ItemId Id="a"/>
+    <t:ItemId Id="b"/>
+  </m:ItemIds>
+</m:GetItem>"#;
+        assert_eq!(per_answer_request_ids(two), 2);
+
+        // A non-self-closing id element is still one id, not two.
+        let expanded = r#"<m:GetStreamingEvents><m:SubscriptionIds><t:SubscriptionId>s</t:SubscriptionId></m:SubscriptionIds></m:GetStreamingEvents>"#;
+        assert_eq!(per_answer_request_ids(expanded), 1);
+
+        // No collection at all, and an empty collection.
+        assert_eq!(per_answer_request_ids("<m:GetItem/>"), 0);
+        assert_eq!(
+            per_answer_request_ids("<m:GetItem><m:ItemIds/></m:GetItem>"),
+            0
+        );
+    }
+
+    /// Subscribe's folder set is `t:FolderIds`, not `m:FolderIds`: it is the
+    /// subscription's scope and EWS answers it with a single
+    /// `SubscribeResponseMessage` regardless of how many folders it names.
+    /// Counting it would make the guard reject a legitimate request.
+    #[test]
+    fn per_answer_ids_ignores_the_subscription_folder_set() {
+        let body = r#"<m:Subscribe>
+  <m:StreamingSubscriptionRequest>
+    <t:FolderIds>
+      <t:FolderId Id="f1"/>
+      <t:FolderId Id="f2"/>
+      <t:FolderId Id="f3"/>
+    </t:FolderIds>
+  </m:StreamingSubscriptionRequest>
+</m:Subscribe>"#;
+        assert_eq!(per_answer_request_ids(body), 0);
+    }
+
+    /// The guard lives in the envelope builder because that is the single
+    /// funnel every EWS request passes through, so a future multi-item body
+    /// trips it at construction time - no live transport needed.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "more than one per-answer id")]
+    fn the_envelope_refuses_a_multi_item_body_in_debug_builds() {
+        let _ = build_soap_envelope(
+            r#"<m:GetItem><m:ItemIds><t:ItemId Id="a"/><t:ItemId Id="b"/></m:ItemIds></m:GetItem>"#,
+        );
+    }
+
     #[test]
     fn soap_fault_detected() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
