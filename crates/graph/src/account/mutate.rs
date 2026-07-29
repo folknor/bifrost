@@ -187,6 +187,14 @@ async fn submit_batch(
             .post_batch(&BatchRequest { requests })
             .await?;
         reconcile_mutation_responses(&request_ids, response.responses, kind, &mut item_outcomes);
+        if matches!(kind, MutationKind::Destroy) {
+            let mut cache = account.etag_index.write().await;
+            for outcome in &item_outcomes {
+                if let ItemOutcome::Succeeded(success) = outcome {
+                    cache.remove(&success.item.0);
+                }
+            }
+        }
     }
 
     let events = vec![SyncEvent::Batch(Batch {
@@ -370,7 +378,7 @@ async fn refresh_missing_etags(
     if !refreshed.is_empty() {
         let mut cache = account.etag_index.write().await;
         for (id, etag) in refreshed {
-            cache.insert(id, etag);
+            super::insert_etag(&mut cache, id, etag);
         }
     }
     failed

@@ -1499,11 +1499,14 @@ async fn submit_write_batch_with_targets(
         // the caller provided a parallel `targets` slice; otherwise
         // we fall back to `ErrorScope::Account` (graph-F3 done for
         // patch/move/destroy paths; remaining callers pass empty).
-        let scope = item
+        let target = item
             .id
             .parse::<usize>()
             .ok()
             .and_then(|idx| targets.get(idx))
+            .cloned();
+        let scope = target
+            .as_ref()
             .map(|id| ErrorScope::Message { id: id.0.clone() })
             .unwrap_or(ErrorScope::Account);
         let outcome = mutation_item_outcome(
@@ -1516,7 +1519,11 @@ async fn submit_write_batch_with_targets(
             scope,
         );
         match outcome {
-            bifrost_types::ItemOutcome::Succeeded(_) => {}
+            bifrost_types::ItemOutcome::Succeeded(_) => {
+                if destroy && let Some(id) = target {
+                    account.etag_index.write().await.remove(&id.0);
+                }
+            }
             bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
             bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
         }
@@ -1556,7 +1563,8 @@ async fn cache_etag_for(account: &GraphAccount, id: &ObjectId, value: &Value) {
     let Some(etag) = graph_etag(value) else {
         return;
     };
-    account.etag_index.write().await.insert(id.0.clone(), etag);
+    let mut cache = account.etag_index.write().await;
+    super::insert_etag(&mut cache, id.0.clone(), etag);
 }
 
 fn object_id_from_value(

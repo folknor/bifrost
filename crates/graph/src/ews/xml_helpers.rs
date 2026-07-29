@@ -177,17 +177,30 @@ pub(crate) fn check_soap_fault(xml: &str) -> Result<(), super::EwsError> {
 /// (the same `ErrorXxx` vocabulary) and the optional `<m:MessageText>`
 /// becomes the support-only detail. A `ResponseClass="Warning"` is not
 /// an error and is ignored. `NoError` / `Success` pass through.
+///
+/// An error-classed message that closes without a `ResponseCode` is
+/// `MalformedXml`, never success. The scan state is per-message (a later
+/// warning or success must not donate its code to an earlier error), but
+/// dropping the incomplete message entirely would hand a FAILED response to
+/// the operation parsers, several of which project an absent result set as an
+/// empty successful one - public folders or items would silently disappear.
+/// A complete error later in the same body still wins over the malformed
+/// report: its code carries the real classification (`ErrorAccessDenied`
+/// quarantines just that scope), which is strictly more actionable than
+/// `Protocol(ParseFailed)`.
 pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
     use super::SoapFaultCode;
     use bifrost_types::DiagnosticText;
 
     let mut reader = Reader::from_str(xml);
     let mut in_error_message = false;
+    let mut error_message_element = None;
     let mut in_response_code = false;
     let mut in_message_text = false;
     let mut response_code = String::new();
     let mut message_text = String::new();
     let mut buf = String::new();
+    let mut incomplete_error: Option<String> = None;
 
     loop {
         match reader.read_event() {
@@ -196,6 +209,7 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                 let local = strip_ns(&name);
                 if extract_attribute(e, "ResponseClass") == "Error" {
                     in_error_message = true;
+                    error_message_element = Some(local.to_string());
                 }
                 if in_error_message && local == "ResponseCode" {
                     in_response_code = true;
@@ -229,6 +243,22 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                 if in_error_message && !response_code.is_empty() {
                     break;
                 }
+                if error_message_element.as_deref() == Some(local) {
+                    // An incomplete error response must not make a later
+                    // warning or success response donate its code to this
+                    // message. Remember that the body contained a failed
+                    // response we could not classify - it is malformed, not
+                    // successful - and keep scanning for a complete error,
+                    // which outranks the malformed report.
+                    if incomplete_error.is_none() {
+                        incomplete_error = Some(local.to_string());
+                    }
+                    in_error_message = false;
+                    in_response_code = false;
+                    in_message_text = false;
+                    error_message_element = None;
+                    message_text.clear();
+                }
                 buf.clear();
             }
             Ok(Event::Eof) => break,
@@ -260,6 +290,12 @@ pub(crate) fn check_response_error(xml: &str) -> Result<(), super::EwsError> {
                 detail: DiagnosticText::support_only(detail),
             });
         }
+    }
+
+    if let Some(element) = incomplete_error {
+        return Err(super::EwsError::MalformedXml(DiagnosticText::support_only(
+            format!("EWS {element} is ResponseClass=\"Error\" with no ResponseCode"),
+        )));
     }
 
     Ok(())

@@ -63,6 +63,7 @@ pub(crate) fn changes_stream(
             let mut changes = Vec::new();
             let mut last_seen_id = None;
             let mut etags = Vec::new();
+            let mut removed_etag_ids = Vec::new();
             for value in page.value {
                 if let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_string) {
                     last_seen_id = Some(id);
@@ -73,8 +74,10 @@ pub(crate) fn changes_stream(
                         // Updated ids are encoded, so a foreign item's
                         // remove carries the same bytes its add did
                         // (ratatoskr equality-joins on this id).
+                        let id = super::foreign::encode_message_id(&scope, &id.0);
+                        removed_etag_ids.push(id.0.clone());
                         changes.push(Change::ScopeChange(ScopeChange {
-                            id: super::foreign::encode_message_id(&scope, &id.0),
+                            id,
                             membership: membership_from_value(&scope, &value),
                             kind: ScopeChangeKind::Removed,
                         }));
@@ -102,10 +105,13 @@ pub(crate) fn changes_stream(
                 }
             }
 
-            if !etags.is_empty() {
+            if !etags.is_empty() || !removed_etag_ids.is_empty() {
                 let mut cache = account.etag_index.write().await;
                 for (id, etag) in etags {
-                    cache.insert(id, etag);
+                    super::insert_etag(&mut cache, id, etag);
+                }
+                for id in removed_etag_ids {
+                    cache.remove(&id);
                 }
             }
 

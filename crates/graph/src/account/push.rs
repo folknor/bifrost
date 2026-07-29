@@ -225,11 +225,24 @@ async fn unsubscribe_graph(
             })?;
         remove_subscription_state(&account, &handle, &server_id).await;
     }
-    if account.graph_subscriptions.read().await.is_empty()
+    // "No groups left" and "stop the worker" must be one atomic step against
+    // a concurrent `push_subscribe`, which inserts its live group under the
+    // WRITE lock and only then calls `ensure_graph_worker`. Sampling
+    // emptiness and dropping the guard first would let that subscribe see the
+    // still-running worker, decline to spawn a replacement, and then have it
+    // aborted here - leaving a live subscription with nothing renewing it.
+    // Holding the guard makes the insert wait until the slot is empty. The
+    // named binding is deliberate: the same guarantee via a temporary in the
+    // condition would rest on `if`-temporary scoping rather than on
+    // something a reader can see. Lock order is subscriptions-then-worker
+    // here and in the worker's own retire path; nothing takes them inverted.
+    let groups = account.graph_subscriptions.read().await;
+    if groups.is_empty()
         && let Some(worker) = account.graph_worker.lock().await.take()
     {
         worker.abort();
     }
+    drop(groups);
     Ok(())
 }
 
@@ -293,7 +306,16 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
 
         let due = {
             let groups = account.graph_subscriptions.read().await;
-            if groups.is_empty() {
+            if !has_live_graph_subscription_group(&groups) {
+                // Retire the slot BEFORE releasing the guard that made this
+                // decision. A concurrent `push_subscribe` cannot install its
+                // live group until this guard drops, so by the time its
+                // `ensure_graph_worker` runs the slot is empty and it spawns a
+                // replacement. Observing the emptiness here and letting the
+                // task merely run out instead left a window where the new
+                // subscription saw a still-unfinished `JoinHandle`, declined
+                // to spawn, and was never renewed until some later subscribe.
+                retire_graph_worker_slot(&account).await;
                 return;
             }
             due_renewals(&groups)
@@ -400,6 +422,28 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
             disconnected = false;
         }
     }
+}
+
+fn has_live_graph_subscription_group(
+    groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+) -> bool {
+    groups.values().any(|group| !group.tearing_down)
+}
+
+/// Clear the worker slot on the way out of `run_graph_subscription_worker`,
+/// so `ensure_graph_worker` starts a fresh worker for the next subscription.
+///
+/// Dropping whatever is in the slot is safe without identifying the handle:
+/// `ensure_graph_worker` installs one only when the slot is empty or its task
+/// has already finished, and the caller here is neither, so the slot holds
+/// either this task's own handle or `None` (`push_unsubscribe` took it to
+/// abort us). Dropping a `JoinHandle` detaches, it does not cancel.
+///
+/// Lock order is subscriptions-then-worker everywhere (`push_unsubscribe`
+/// holds its read guard across the same acquisition in a let-chain), and
+/// `ensure_graph_worker` takes only the worker lock, so this cannot deadlock.
+async fn retire_graph_worker_slot(account: &GraphAccount) {
+    drop(account.graph_worker.lock().await.take());
 }
 
 /// The `(handle, server_id, resource)` triples inside the renewal threshold.
@@ -1165,6 +1209,80 @@ mod tests {
         groups.get_mut(&live).expect("live group").subscriptions[0].expires_at =
             "2099-01-01T00:00:00Z".to_string();
         assert!(due_renewals(&groups).is_empty());
+    }
+
+    /// Letting the worker exit on condemned-only groups opened a window in
+    /// which a brand-new subscription got NO renewal worker: the worker had
+    /// decided to exit but its `JoinHandle` was not finished yet, so the
+    /// concurrent `push_subscribe`'s `ensure_graph_worker` saw a live handle
+    /// and declined to spawn; the old task then completed and nothing renewed
+    /// the new subscription until some later subscribe. The exit therefore
+    /// clears the slot itself, under the guard that made the decision.
+    ///
+    /// The tick here is driven with paused time and the map holds only a
+    /// condemned group, so the worker reaches its exit without a single HTTP
+    /// call - the renewal leg itself stays unpinnable in-process (Graph has
+    /// no transport seam: `bifrost_net::Response` has no public constructor
+    /// and net's `Dispatch` is crate-private).
+    #[tokio::test(start_paused = true)]
+    async fn a_retiring_worker_clears_its_slot_so_the_next_subscribe_respawns() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let handle = SubscriptionHandle("condemned".to_string());
+        {
+            let mut groups = account.graph_subscriptions.write().await;
+            groups.insert(
+                handle.clone(),
+                GraphSubscriptionGroup::live(vec![state("sub", "/me/events")]),
+            );
+            assert!(mark_group_tearing_down(&mut groups, &handle).is_some());
+        }
+
+        ensure_graph_worker(account.clone()).await;
+        assert!(
+            account.graph_worker.lock().await.is_some(),
+            "the worker slot is occupied while the worker runs"
+        );
+
+        // Drive renewal ticks until the worker retires. Time is paused, so
+        // this advances the test clock rather than the wall clock; the extra
+        // iterations only exist because the worker has to be scheduled onto
+        // its first `sleep` before a tick can fire at all.
+        for _ in 0..64 {
+            if account.graph_worker.lock().await.is_none() {
+                break;
+            }
+            tokio::time::advance(RENEWAL_CHECK_INTERVAL + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            account.graph_worker.lock().await.is_none(),
+            "a retiring worker must clear its own slot"
+        );
+
+        // The next subscription therefore gets a worker again.
+        account.graph_subscriptions.write().await.insert(
+            SubscriptionHandle("fresh".to_string()),
+            GraphSubscriptionGroup::live(vec![state("fresh-sub", "/me/events")]),
+        );
+        ensure_graph_worker(account.clone()).await;
+        assert!(
+            account.graph_worker.lock().await.is_some(),
+            "a live subscription must always have a renewal worker"
+        );
+        account.shutdown.cancel();
+    }
+
+    #[test]
+    fn condemned_only_groups_do_not_keep_the_renewal_worker_alive() {
+        let handle = SubscriptionHandle("condemned".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![expiring("sub", "/me/events")]),
+        )]);
+        assert!(has_live_graph_subscription_group(&groups));
+        assert!(mark_group_tearing_down(&mut groups, &handle).is_some());
+        assert!(!has_live_graph_subscription_group(&groups));
     }
 
     /// An empty scope list is not a subscription. Registering one minted a

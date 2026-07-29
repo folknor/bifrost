@@ -162,8 +162,9 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
 - `HashMap<SubscriptionHandle, GraphSubscriptionGroup>` (webhook) +
   `HashMap<SubscriptionHandle, EwsSubscriptionState>` (EWS) + worker join slots
   and a `CancellationToken`.
-- An `etag_index: Arc<RwLock<HashMap<String, String>>>` of change keys (powering
-  `If-Match`; `MESSAGE_SELECT` explicitly requests `changeKey`) and a `routing_map: Arc<RwLock<HashMap<FolderId,
+- A bounded `etag_index: Arc<RwLock<HashMap<String, String>>>` of change keys
+  (powering `If-Match`; `MESSAGE_SELECT` explicitly requests `changeKey`;
+  tombstones and confirmed destroys evict their keys) and a `routing_map: Arc<RwLock<HashMap<FolderId,
   PublicFolderRouting>>>` from public-folder discovery, plus
   `public_folders_enabled` and the discovered `user_email`.
 - `set_priority` / `set_bandwidth_cap` delegate to `AccountNet`.
@@ -221,7 +222,7 @@ selecting against the same token.
 `envelope_version = GRAPH_CURSOR_ENVELOPE_VERSION` (currently `1`);
 `CHANGE_CURSOR_ENVELOPE_VERSION` is the matching
 `ChangeCursor.envelope_version`. `GraphCursorPayload` carries a kind, final
-`@odata.deltaLink`, issue timestamp, and optional mid-walk page marker
+`@odata.deltaLink`, and optional mid-walk page marker
 (landing in `OpaqueChangeState::bytes`; page markers also in
 `ChangeCursor::advanced_through`).
 
@@ -281,8 +282,8 @@ The inventory walk reads pages via `get_json` / `get_absolute` (the
 `@odata.nextLink` chain), yielding `PageBoundary::Page` Batches until a
 `delta_link`, then a `Final` Batch + `Checkpoint::Change`. A page with neither
 link is a contract violation, never a successful cursor-less completion.
-`@removed` entries are skipped; harvested etags fold into
-`account.etag_index` for the next `If-Match`.
+`@removed` entries are skipped and evict their cached change key; harvested
+etags fold into the bounded `account.etag_index` for the next `If-Match`.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
@@ -500,9 +501,16 @@ them, because a replacement created after the snapshot is one teardown can
 never name - it would stay registered and delivering while
 `push_unsubscribe` reported success. The marker is monotone (a later
 `push_subscribe` mints a new handle) and a plain flag rather than a lock, so
-neither path holds anything across a round trip. Teardown
-aborts the renewal worker only when no
-groups remain. The webhook receiver is not in this crate: consumers mount an HTTPS
+neither path holds anything across a round trip. Teardown lets the renewal
+worker exit once no live groups remain; condemned groups retained for a DELETE
+retry do not keep it ticking. A worker that decides to exit clears its own
+`graph_worker` slot BEFORE releasing the subscriptions guard that made the
+decision, and `push_unsubscribe` holds that same guard across its abort: a
+concurrent `push_subscribe` cannot install its live group until the slot is
+empty, so its `ensure_graph_worker` always spawns a replacement. Without that
+ordering a new subscription could observe a still-unfinished `JoinHandle`,
+decline to spawn, and never be renewed. Lock order is subscriptions-then-worker
+on every path. The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
 engine `InvalidationSink`; `push_stream` carries health only.
 
@@ -726,6 +734,18 @@ through the REST `response_to_account_error` path, `SoapFault` onto
 `SoapFaultCode` (Server -> Unavailable, Client/MustUnderstand/VersionMismatch
 -> 400, Unknown -> ContractViolation), and `MalformedXml` to
 `Protocol(ParseFailed)`. EWS errors stamp `Protocol::Ews`.
+
+`EwsClient::execute` screens every 200-OK body through `check_soap_fault` then
+`check_response_error` before any operation parser sees it, because EWS reports
+most operation failures inside a 200 as `ResponseClass="Error"` +
+`<m:ResponseCode>`. That scan is per-response-message (a later warning or
+success never donates its code to an earlier error), and an error-classed
+message that closes with NO `ResponseCode` is `MalformedXml`, never success -
+the operation parsers read a missing result set as an empty successful one, so
+passing it through made public folders or items silently disappear. A complete
+error later in the same body still outranks the malformed report, since its
+code carries the real classification (`ErrorAccessDenied` quarantines just that
+scope).
 
 Known Graph vocabulary lands on typed `WireCause::Graph(GraphSignal::*)` variants
 (auth/access/throttle/cursor codes; see `classify`). `GraphSignal::Unknown

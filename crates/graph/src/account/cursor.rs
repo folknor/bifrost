@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use bifrost_types::{
     ChangeCursor, CursorScope, FolderId, ObjectType, OpaqueChangeState, OpaqueProgressBytes,
     ProtocolKind,
@@ -166,7 +164,6 @@ pub(crate) struct GraphPageMarker {
 pub(crate) struct GraphCursorPayload {
     pub(crate) kind: GraphCursorKind,
     pub(crate) delta_link: String,
-    pub(crate) issued_at_unix_secs: u64,
     #[serde(default)]
     pub(crate) advanced_through: Option<GraphPageMarker>,
 }
@@ -180,7 +177,6 @@ impl GraphCursorPayload {
         Self {
             kind,
             delta_link,
-            issued_at_unix_secs: now_unix_secs(),
             advanced_through,
         }
     }
@@ -192,7 +188,6 @@ impl GraphCursorPayload {
         Self {
             kind: GraphCursorKind::PublicFolder(cursor),
             delta_link: String::new(),
-            issued_at_unix_secs: now_unix_secs(),
             advanced_through: None,
         }
     }
@@ -297,13 +292,6 @@ pub(crate) fn decode_page_marker(
     progress: &OpaqueProgressBytes,
 ) -> Result<GraphPageMarker, CursorError> {
     serde_json::from_slice(&progress.0).map_err(|error| CursorError::Encode(error.to_string()))
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

@@ -282,6 +282,94 @@ mod tests {
         }
     }
 
+    // An error-classed response message with no `<m:ResponseCode>` is a
+    // FAILED response we cannot classify. Passing it through would hand the
+    // body to the operation parsers, which read a missing result set as an
+    // empty successful one, so a revoked folder's items would silently
+    // vanish. It must be `MalformedXml`, and it must NOT borrow the code of
+    // the following (warning-classed) message.
+    #[test]
+    fn incomplete_error_response_is_malformed_not_success() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Malformed response without a code.</m:MessageText>
+        </m:FindItemResponseMessage>
+        <m:FindItemResponseMessage ResponseClass="Warning">
+          <m:ResponseCode>ErrorServerBusy</m:ResponseCode>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        match check_response_error(xml).expect_err("incomplete error must not read as success") {
+            EwsError::MalformedXml(detail) => {
+                assert!(
+                    detail.as_str().contains("FindItemResponseMessage"),
+                    "unexpected detail: {}",
+                    detail.as_str()
+                );
+            }
+            other => panic!("expected MalformedXml, got {other:?}"),
+        }
+    }
+
+    /// A complete error later in the same body outranks the malformed
+    /// report: its code carries the real classification (here the
+    /// scope-quarantining `ErrorAccessDenied`), which
+    /// `Protocol(ParseFailed)` would throw away.
+    #[test]
+    fn complete_error_after_an_incomplete_one_wins() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:GetItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Malformed response without a code.</m:MessageText>
+        </m:GetItemResponseMessage>
+        <m:GetItemResponseMessage ResponseClass="Error">
+          <m:MessageText>Access is denied.</m:MessageText>
+          <m:ResponseCode>ErrorAccessDenied</m:ResponseCode>
+        </m:GetItemResponseMessage>
+      </m:ResponseMessages>
+    </m:GetItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        match check_response_error(xml).expect_err("error response must classify") {
+            EwsError::SoapFault { code, .. } => {
+                assert_eq!(code, SoapFaultCode::ErrorAccessDenied);
+            }
+            other => panic!("expected SoapFault, got {other:?}"),
+        }
+    }
+
+    /// The empty-`ResponseMessages` success shape must stay a success: the
+    /// malformed-error path keys on `ResponseClass="Error"`, not on the
+    /// absence of a code.
+    #[test]
+    fn warning_class_without_a_code_still_passes() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:FindItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:FindItemResponseMessage ResponseClass="Warning">
+          <m:MessageText>Partial results.</m:MessageText>
+        </m:FindItemResponseMessage>
+      </m:ResponseMessages>
+    </m:FindItemResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        assert!(check_response_error(xml).is_ok());
+    }
+
     #[test]
     fn response_class_success_passes() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>

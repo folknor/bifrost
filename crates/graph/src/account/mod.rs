@@ -122,6 +122,21 @@ pub(crate) struct GraphAccount {
     pub(crate) user_email: Option<String>,
 }
 
+/// Change keys are a best-effort mutation optimization. Retaining one per
+/// object forever turns a long-running high-churn account into an unbounded
+/// cache, so keep only a fixed working set.
+pub(crate) const ETAG_INDEX_MAX_ENTRIES: usize = 10_000;
+
+pub(crate) fn insert_etag(cache: &mut HashMap<String, String>, id: String, etag: String) {
+    if !cache.contains_key(&id)
+        && cache.len() >= ETAG_INDEX_MAX_ENTRIES
+        && let Some(evicted) = cache.keys().next().cloned()
+    {
+        cache.remove(&evicted);
+    }
+    cache.insert(id, etag);
+}
+
 impl GraphAccount {
     pub(crate) fn new(
         client: GraphClient,
@@ -1234,6 +1249,19 @@ mod tests {
         assert_eq!(
             account.describe_cursor(&messages).strategy,
             SyncStrategy::ServerCursor
+        );
+    }
+
+    #[test]
+    fn etag_cache_evicts_before_exceeding_its_fixed_capacity() {
+        let mut cache = HashMap::new();
+        for index in 0..=ETAG_INDEX_MAX_ENTRIES {
+            insert_etag(&mut cache, format!("id-{index}"), format!("etag-{index}"));
+        }
+        assert_eq!(cache.len(), ETAG_INDEX_MAX_ENTRIES);
+        assert_eq!(
+            cache.get("id-10000").map(String::as_str),
+            Some("etag-10000")
         );
     }
 

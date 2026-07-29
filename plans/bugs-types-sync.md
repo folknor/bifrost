@@ -85,6 +85,27 @@ and `ConcurrencyBudget { global: 0, .. }` there yields a
 `validate()` covers the `SyncEngineBuilder` path only. Latent while
 the gate is unwired.
 
+### R6. `unsubscribe_push` retires the handle before it knows teardown succeeded
+
+`crates/sync/src/engine.rs:982`.
+
+`SyncEngine::unsubscribe_push` does `self.subscriptions.take(account_id)`
+*before* the per-handle loop, then only logs a warning when
+`Account::push_unsubscribe` fails. The registry entry is gone either way,
+so a failed teardown leaves no engine-side record to retry through.
+
+This became load-bearing when `bifrost-graph` fixed its own half (G-15,
+commit 578c1ff): Graph now deliberately keeps a subscription's server ids
+registered after a failed DELETE precisely so the teardown can be retried,
+and orphaned Graph subscriptions otherwise keep delivering to the webhook
+endpoint until their 24h expiry. That retry lane currently has no retrier
+on the engine side - only a consumer holding its own handle can drive it.
+
+Either retain the registry entry until every `push_unsubscribe` reports
+success, or surface the failure to the caller instead of swallowing it into
+a log line. Found while reviewing the Graph teardown work, not by a review
+of `bifrost-sync` itself.
+
 ## Nits
 
 - **N1. Push forwarder polls capabilities once a second while

@@ -99,7 +99,7 @@ pub(crate) async fn delete_subscription(
         .delete(&format!("/subscriptions/{subscription_id}"))
         .await;
     if let Err(error) = server_result {
-        if !is_not_found(&error) {
+        if !subscription_is_gone(&error) {
             return Err(error);
         }
         tracing::info!(
@@ -126,13 +126,6 @@ fn generate_client_state() -> Result<String, GraphError> {
         })
     })?;
     Ok(hex_encode(&buf))
-}
-
-fn is_not_found(error: &GraphError) -> bool {
-    matches!(
-        error,
-        GraphError::Response(response) if response.status == reqwest::StatusCode::NOT_FOUND
-    )
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -378,6 +371,20 @@ mod tests {
                 source: None,
             }
         )));
+    }
+
+    #[test]
+    fn subscription_deletion_accepts_every_vanished_status() {
+        let gone = |status| {
+            GraphError::Response(crate::error::GraphResponseError::from_response(
+                status,
+                reqwest::header::HeaderMap::new(),
+                bytes::Bytes::new(),
+            ))
+        };
+
+        assert!(subscription_is_gone(&gone(reqwest::StatusCode::NOT_FOUND)));
+        assert!(subscription_is_gone(&gone(reqwest::StatusCode::GONE)));
     }
 
     #[test]
