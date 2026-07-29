@@ -47,8 +47,10 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
   receiver against the shutdown token and spawning the EWS worker on demand.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
-  Subscribe / GetStreamingEvents XML, watermark tracking, scope
-  recovery, the long-lived worker loop. At `push_subscribe` (in `push.rs`),
+  Subscribe / GetStreamingEvents / Unsubscribe XML, scope
+  recovery, the long-lived worker loop - generic over the crate-private
+  `EwsExecute` transport seam (`EwsClient` in production, a scripted
+  double in tests). At `push_subscribe` (in `push.rs`),
   Graph REST folder `restId`s are translated once through
   `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
   request cap - to `ewsId`s and retained beside their `CursorScope` in
@@ -577,15 +579,30 @@ accordingly. Three rules make the renewal path safe:
 
 `push_subscribe` installs an `EwsSubscriptionState` and starts the EWS
 worker: it subscribes to the union of active folders, long-polls
-`GetStreamingEvents`, records watermarks, maps notifications to cursor
-scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
+`GetStreamingEvents`, maps notifications to cursor scopes, and emits
+`Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
-When started before any scopes exist, it waits for a subscription-map change
-instead of polling the empty map. That wait is the ONLY consumer of
-`ews_subscription_changed`: the subscription id is minted once per
-`run_get_events_loop` and the loop re-polls it until an error, a parse
-failure, or shutdown, so a scope registered while the stream is live does not
-join the live EWS subscription until the worker reconnects.
+Scope registrations ride a `watch`-channel generation counter
+(`ews_topology`): the worker marks the generation seen immediately before
+every read of the subscription map, so a change can never fall between a
+read and a wait - a stored-permit `Notify` here turned the registration
+that starts the worker into a phantom topology change and a guaranteed
+redundant second subscription. Started before any scopes exist, the worker
+waits on that generation instead of polling the empty map. A bump while
+the stream is live cancels the in-flight `GetStreamingEvents`: the worker
+retires the abandoned subscription with a best-effort EWS `Unsubscribe`
+(Exchange holds streaming subscriptions against a per-mailbox quota, so
+leaking one per scope change accrues until each times out), subscribes to
+the current union, and then emits `Reconnected` - never `Disconnected`,
+since nothing failed - because a change raised in the handoff window was
+delivered to neither subscription and `Reconnected` is the engine's
+full-reconcile trigger. Streaming subscriptions carry no resume state:
+`StreamingSubscriptionRequest` admits only `FolderIds` and `EventTypes`,
+so the Subscribe body is watermark-free (a `<t:Watermark>` there is a
+schema violation that broke every resubscribe once a watermark had been
+recorded), and gap coverage is always the `Reconnected` reconcile. The
+subscribe / long-poll / unsubscribe cycle is pinned hermetically through
+`EwsExecute` with a scripted transport.
 
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via

@@ -44,7 +44,7 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -91,10 +91,17 @@ pub(crate) struct GraphAccount {
     pub(crate) graph_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
     pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Wakes an idle EWS worker when a new subscription makes work
-    /// available. Without this, a worker started by `push_stream` polled an
-    /// empty map once a second until somebody subscribed.
-    pub(crate) ews_subscription_changed: Arc<Notify>,
+    /// Monotone generation counter bumped by `subscribe_ews` /
+    /// `unsubscribe_ews` on every change to `ews_subscriptions`. The EWS
+    /// worker marks the current generation seen immediately before each
+    /// read of that map, so a bump can never be lost between reading and
+    /// waiting: an idle worker wakes to subscribe, a live one abandons its
+    /// long poll and re-subscribes to the new scope union. A `watch`
+    /// generation rather than a `Notify` because a `Notify` permit stored
+    /// by the registration that starts the worker would be consumed right
+    /// after its first Subscribe and read as a topology change - turning
+    /// every first registration into a guaranteed redundant resubscribe.
+    pub(crate) ews_topology: Arc<watch::Sender<u64>>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<EtagIndex>>,
     /// Public-folder routing map, keyed by native EWS `FolderId`. A
@@ -253,7 +260,7 @@ impl GraphAccount {
             graph_worker: Arc::new(Mutex::new(None)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: Arc::new(Mutex::new(None)),
-            ews_subscription_changed: Arc::new(Notify::new()),
+            ews_topology: Arc::new(watch::channel(0_u64).0),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(EtagIndex::default())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),

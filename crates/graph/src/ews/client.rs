@@ -1,7 +1,15 @@
 use super::{
-    EwsClient, EwsError, EwsHeaders, build_soap_envelope, check_response_error, check_soap_fault,
-    ews_url,
+    EwsClient, EwsError, EwsExecute, EwsHeaders, build_soap_envelope, check_response_error,
+    check_soap_fault, ews_url,
 };
+
+impl EwsExecute for EwsClient {
+    async fn execute(&self, body_xml: &str, headers: &EwsHeaders) -> Result<String, EwsError> {
+        // Inherent methods outrank trait methods in resolution, so this
+        // delegates rather than recursing.
+        EwsClient::execute(self, body_xml, headers).await
+    }
+}
 
 impl EwsClient {
     /// Build a client whose SOAP endpoint sits under `outlook_base` (the

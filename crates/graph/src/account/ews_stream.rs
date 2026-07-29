@@ -8,8 +8,9 @@ use bifrost_types::{
 use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
+use tokio::sync::watch;
 
-use crate::ews::{EwsClient, EwsError, EwsHeaders};
+use crate::ews::{EwsClient, EwsError, EwsExecute, EwsHeaders};
 
 use super::GraphAccount;
 use super::graph_error::{GraphErrorContext, ews_error_to_account_error};
@@ -29,7 +30,6 @@ pub(crate) enum EwsStreamingEventType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EwsStreamingNotification {
     pub(crate) subscription_id: Option<String>,
-    pub(crate) watermark: Option<String>,
     pub(crate) event_type: EwsStreamingEventType,
     pub(crate) item_id: Option<String>,
     pub(crate) item_change_key: Option<String>,
@@ -37,16 +37,9 @@ pub(crate) struct EwsStreamingNotification {
     pub(crate) parent_folder_change_key: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EwsStreamingSubscription {
-    pub(crate) subscription_id: String,
-    pub(crate) watermark: Option<String>,
-}
-
 #[derive(Default)]
 struct NotificationBuilder {
     subscription_id: Option<String>,
-    watermark: Option<String>,
     event_type: Option<EwsStreamingEventType>,
     item_id: Option<String>,
     item_change_key: Option<String>,
@@ -56,6 +49,14 @@ struct NotificationBuilder {
 
 #[derive(Debug)]
 enum StreamLoopExit {
+    /// The registered EWS scope set changed. Re-subscribe without reporting
+    /// a transport disconnect: this is a local topology update, not a
+    /// degraded push connection. The worker still emits `Reconnected` once
+    /// the replacement subscription is live, because a change arriving in
+    /// the handoff window - queued only on the abandoned subscription, or
+    /// predating the new one - is delivered to neither, and `Reconnected`
+    /// is the engine's full-reconcile trigger.
+    Resubscribe,
     Disconnected,
     Shutdown,
     /// Terminal classification (auth lost, conditional-access, etc.)
@@ -70,32 +71,67 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
         return;
     };
     let ews = EwsClient::new(account_net, account.client.outlook_base());
+    run_worker(account, ews).await;
+}
+
+/// The worker loop behind `run_streaming_worker`, generic over the EWS
+/// transport so the Subscribe / GetStreamingEvents / Unsubscribe cycle is
+/// drivable by an in-process scripted transport in tests.
+async fn run_worker<E: EwsExecute>(account: GraphAccount, ews: E) {
+    let mut topology = account.ews_topology.subscribe();
+    // A transport failure was reported as `Disconnected`; the next
+    // successful Subscribe owes a `Reconnected`.
     let mut disconnected = false;
+    // A topology handoff abandoned a live subscription; the replacement owes
+    // a `Reconnected` for the coverage gap, without any `Disconnected`
+    // having been (correctly) emitted.
+    let mut coverage_gap = false;
 
     loop {
         if account.shutdown.is_cancelled() {
             return;
         }
+        // Mark the current topology generation seen BEFORE reading the scope
+        // map. A bump landing after this point - even while the Subscribe
+        // below is in flight - makes the next `changed()` fire, so no
+        // registration can slip between the read and the wait.
+        topology.borrow_and_update();
         let scopes = active_ews_scopes(&account).await;
         if scopes.is_empty() {
             // `push_stream` may start this worker before a caller has
-            // registered any EWS scopes. Wait for that map to change rather
-            // than polling it once a second for the lifetime of the account.
+            // registered any EWS scopes. Wait for the topology to change
+            // rather than polling the empty map.
             tokio::select! {
                 () = account.shutdown.cancelled() => return,
-                () = account.ews_subscription_changed.notified() => {}
+                changed = topology.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
             }
             continue;
         }
 
-        match subscribe(&ews, &account, &scopes).await {
-            Ok(subscription) => {
-                record_subscription_id(&account, &subscription).await;
-                if disconnected {
+        match subscribe(&ews, &scopes).await {
+            Ok(subscription_id) => {
+                if disconnected || coverage_gap {
+                    // The only event the engine turns into a full reconcile
+                    // across every registered scope. It covers both the
+                    // transport outage and the topology-handoff window, in
+                    // which EWS delivered notifications to nobody.
                     let _ = account.push_tx.send(WatchEvent::Reconnected);
+                    disconnected = false;
+                    coverage_gap = false;
                 }
-                match run_get_events_loop(&ews, &account, subscription).await {
-                    StreamLoopExit::Disconnected => disconnected = true,
+                match run_get_events_loop(&ews, &account, &mut topology, &subscription_id).await {
+                    StreamLoopExit::Resubscribe => {
+                        coverage_gap = true;
+                        release_subscription(&ews, &subscription_id).await;
+                    }
+                    StreamLoopExit::Disconnected => {
+                        disconnected = true;
+                        release_subscription(&ews, &subscription_id).await;
+                    }
                     StreamLoopExit::Terminated(error) => {
                         let _ = account.push_tx.send(WatchEvent::Terminated(error));
                         return;
@@ -126,6 +162,26 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+/// Best-effort EWS `Unsubscribe` for a streaming subscription the worker is
+/// abandoning (reconnect or topology handoff). Dropping the hanging
+/// `GetStreamingEvents` request does not retire the server-side
+/// subscription: Exchange caps concurrent streaming subscriptions per
+/// mailbox, so silently leaking one per scope change accumulates against
+/// that quota until each abandoned subscription times out on its own.
+/// Failure is logged, never surfaced - the replacement Subscribe is the
+/// operation whose outcome matters, and after a transport failure this
+/// request is expected to fail right along with it.
+async fn release_subscription<E: EwsExecute>(ews: &E, subscription_id: &str) {
+    let body = build_unsubscribe_request(subscription_id);
+    if let Err(error) = ews.execute(&body, &EwsHeaders::default()).await {
+        tracing::debug!(
+            target: "bifrost_graph::ews",
+            error = ?error,
+            "EWS Unsubscribe for an abandoned streaming subscription failed"
+        );
     }
 }
 
@@ -188,10 +244,8 @@ pub(crate) fn parse_streaming_notifications(
                 let local = local_name(event.name().as_ref()).to_string();
                 let trimmed = buf.trim();
                 if in_event {
-                    match current_tag.as_str() {
-                        "SubscriptionId" => current.subscription_id = non_empty(trimmed),
-                        "Watermark" => current.watermark = non_empty(trimmed),
-                        _ => {}
+                    if current_tag == "SubscriptionId" {
+                        current.subscription_id = non_empty(trimmed);
                     }
                 } else if current_tag == "SubscriptionId" {
                     notification_subscription_id = non_empty(trimmed);
@@ -215,12 +269,19 @@ pub(crate) fn parse_streaming_notifications(
     Ok(notifications)
 }
 
-pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubscription>, String> {
+/// The subscription ids a `SubscribeResponse` names, in document order.
+///
+/// Streaming subscriptions carry no resume state: the `Watermark` a
+/// Subscribe response may include belongs to the pull/push subscription
+/// families and cannot be fed back into a `StreamingSubscriptionRequest`
+/// (the schema admits only `FolderIds` and `EventTypes`), so nothing here
+/// extracts it. Gap coverage is the worker's `Reconnected` emission, not a
+/// resume token.
+pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<String>, String> {
     let mut reader = Reader::from_str(xml);
     let mut current_tag = String::new();
     let mut buf = String::new();
     let mut current_subscription_id = None;
-    let mut current_watermark = None;
     let mut subscriptions = Vec::new();
 
     loop {
@@ -239,18 +300,13 @@ pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubs
             Ok(Event::End(ref event)) => {
                 let local = local_name(event.name().as_ref()).to_string();
                 let trimmed = buf.trim();
-                match current_tag.as_str() {
-                    "SubscriptionId" => current_subscription_id = non_empty(trimmed),
-                    "Watermark" => current_watermark = non_empty(trimmed),
-                    _ => {}
+                if current_tag == "SubscriptionId" {
+                    current_subscription_id = non_empty(trimmed);
                 }
                 if (local == "StreamingSubscription" || local == "SubscribeResponseMessage")
                     && let Some(subscription_id) = current_subscription_id.take()
                 {
-                    subscriptions.push(EwsStreamingSubscription {
-                        subscription_id,
-                        watermark: current_watermark.take(),
-                    });
+                    subscriptions.push(subscription_id);
                 }
                 current_tag.clear();
                 buf.clear();
@@ -264,10 +320,12 @@ pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubs
     Ok(subscriptions)
 }
 
-pub(crate) fn build_subscribe_request(
-    scopes: &[EwsSubscriptionScope],
-    watermark: Option<&str>,
-) -> String {
+/// The streaming Subscribe body. Deliberately watermark-free:
+/// `StreamingSubscriptionRequest` admits only `FolderIds` and `EventTypes`,
+/// so a `<t:Watermark>` here is a schema violation EWS rejects - once one
+/// had been recorded, every resubscribe (reconnect or topology change)
+/// failed instead of re-establishing push.
+pub(crate) fn build_subscribe_request(scopes: &[EwsSubscriptionScope]) -> String {
     let mut folder_ids = String::new();
     for scope in scopes {
         folder_ids.push_str(&format!(
@@ -275,9 +333,6 @@ pub(crate) fn build_subscribe_request(
             xml_escape(&scope.ews_folder_id)
         ));
     }
-    let watermark_xml = watermark
-        .map(|watermark| format!("<t:Watermark>{}</t:Watermark>", xml_escape(watermark)))
-        .unwrap_or_default();
 
     format!(
         r#"<m:Subscribe>
@@ -291,7 +346,6 @@ pub(crate) fn build_subscribe_request(
       <t:EventType>MovedEvent</t:EventType>
       <t:EventType>CopiedEvent</t:EventType>
     </t:EventTypes>
-    {watermark_xml}
   </m:StreamingSubscriptionRequest>
 </m:Subscribe>"#
     )
@@ -313,13 +367,25 @@ pub(crate) fn build_get_streaming_events_request(
     )
 }
 
-async fn subscribe(
-    ews: &EwsClient,
-    account: &GraphAccount,
+/// The body that retires an abandoned streaming subscription. The single
+/// `m:SubscriptionId` is not an `m:`-namespaced id COLLECTION, and EWS
+/// answers Unsubscribe with exactly one `UnsubscribeResponseMessage`, so
+/// this stays inside the single-answer invariant `build_soap_envelope`
+/// enforces.
+pub(crate) fn build_unsubscribe_request(subscription_id: &str) -> String {
+    format!(
+        r#"<m:Unsubscribe>
+  <m:SubscriptionId>{}</m:SubscriptionId>
+</m:Unsubscribe>"#,
+        xml_escape(subscription_id)
+    )
+}
+
+async fn subscribe<E: EwsExecute>(
+    ews: &E,
     scopes: &[EwsSubscriptionScope],
-) -> Result<EwsStreamingSubscription, EwsError> {
-    let watermark = current_watermark(account).await;
-    let body = build_subscribe_request(scopes, watermark.as_deref());
+) -> Result<String, EwsError> {
+    let body = build_subscribe_request(scopes);
     let xml = ews.execute(&body, &EwsHeaders::default()).await?;
     let subscriptions = parse_subscribe_response(&xml)
         .map_err(|error| EwsError::MalformedXml(DiagnosticText::support_only(error)))?;
@@ -330,34 +396,44 @@ async fn subscribe(
     })
 }
 
-async fn run_get_events_loop(
-    ews: &EwsClient,
+async fn run_get_events_loop<E: EwsExecute>(
+    ews: &E,
     account: &GraphAccount,
-    subscription: EwsStreamingSubscription,
+    topology: &mut watch::Receiver<u64>,
+    subscription_id: &str,
 ) -> StreamLoopExit {
     // The subscription this loop polls is fixed for the lifetime of the
-    // loop; the worker re-subscribes (minting a fresh id) on reconnect.
-    // Re-reading the id from the shared state map each iteration was
-    // fragile - it returned the first state's id, which under the
-    // stamp-all behavior is whatever the last resubscribe wrote.
-    let subscription_id = subscription.subscription_id;
+    // loop and lives nowhere else; the worker re-subscribes (minting a
+    // fresh id) on reconnect or a local scope-topology change, retiring
+    // this one with a best-effort Unsubscribe.
     loop {
         if account.shutdown.is_cancelled() {
             return StreamLoopExit::Shutdown;
         }
-        let body = build_get_streaming_events_request(&subscription_id, 30);
-        match ews.execute(&body, &EwsHeaders::default()).await {
+        let body = build_get_streaming_events_request(subscription_id, 30);
+        // A streaming subscription covers the scope union that existed when
+        // `subscribe` ran. Adding or removing a handle changes that union,
+        // so do not leave the old subscription alive until its 30-minute
+        // request expires. Dropping this in-flight request is intentional:
+        // the outer worker retires the abandoned subscription and
+        // immediately subscribes to the current scope set.
+        let headers = EwsHeaders::default();
+        let result = tokio::select! {
+            () = account.shutdown.cancelled() => return StreamLoopExit::Shutdown,
+            changed = topology.changed() => {
+                return match changed {
+                    Ok(()) => StreamLoopExit::Resubscribe,
+                    // The sender lives on the account this worker holds a
+                    // clone of; a closed channel means teardown.
+                    Err(_) => StreamLoopExit::Shutdown,
+                };
+            }
+            result = ews.execute(&body, &headers) => result,
+        };
+        match result {
             Ok(xml) => match parse_streaming_notifications(&xml) {
                 Ok(notifications) => {
                     for notification in notifications {
-                        if let Some(watermark) = notification.watermark.as_ref() {
-                            record_watermark(
-                                account,
-                                notification.subscription_id.as_deref(),
-                                watermark,
-                            )
-                            .await;
-                        }
                         // A notification with a parent folder id resolves
                         // to a known subscribed scope -> a specific hint.
                         // One without it (a status/keep-alive-style frame,
@@ -468,44 +544,6 @@ fn dedupe_by_ews_folder<'a>(
     deduped
 }
 
-async fn record_subscription_id(account: &GraphAccount, subscription: &EwsStreamingSubscription) {
-    let mut states = account.ews_subscriptions.write().await;
-    for state in states.values_mut() {
-        state.ews_subscription_id = Some(subscription.subscription_id.clone());
-        // Seed the watermark only for a state that has none yet. The
-        // worker subscribes to the union of all handles' folders and
-        // resubscribes on every reconnect; blindly overwriting here would
-        // discard per-handle watermark progress recorded by
-        // `record_watermark` since the last subscribe, replaying already
-        // delivered notifications (or, worse, regressing past them).
-        if state.watermark.is_none() {
-            state.watermark = subscription.watermark.clone();
-        }
-    }
-}
-
-async fn record_watermark(account: &GraphAccount, subscription_id: Option<&str>, watermark: &str) {
-    let mut states = account.ews_subscriptions.write().await;
-    let mut matched = false;
-    for state in states.values_mut() {
-        if subscription_id.is_some() && state.ews_subscription_id.as_deref() != subscription_id {
-            continue;
-        }
-        state.watermark = Some(watermark.to_string());
-        matched = true;
-    }
-    if !matched && subscription_id.is_none() {
-        for state in states.values_mut() {
-            state.watermark = Some(watermark.to_string());
-        }
-    }
-}
-
-async fn current_watermark(account: &GraphAccount) -> Option<String> {
-    let states = account.ews_subscriptions.read().await;
-    states.values().find_map(|state| state.watermark.clone())
-}
-
 async fn scopes_for_folder(account: &GraphAccount, folder_id: &str) -> Vec<CursorScope> {
     let states = account.ews_subscriptions.read().await;
     unique_scopes_for_folder(
@@ -545,7 +583,6 @@ fn unique_scopes_for_folder<'a>(
 fn finish_notification(builder: &NotificationBuilder) -> Option<EwsStreamingNotification> {
     Some(EwsStreamingNotification {
         subscription_id: builder.subscription_id.clone(),
-        watermark: builder.watermark.clone(),
         event_type: builder.event_type.clone()?,
         item_id: builder.item_id.clone(),
         item_change_key: builder.item_change_key.clone(),
@@ -592,39 +629,19 @@ fn xml_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use bifrost_types::SubscriptionHandle;
+
+    use super::super::PushMode;
+    use super::super::push::EwsSubscriptionState;
     use super::*;
+    use crate::client::GraphClient;
 
     #[test]
     fn parses_streaming_notification_xml() {
-        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-  <s:Body>
-    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
-                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
-      <m:ResponseMessages>
-        <m:GetStreamingEventsResponseMessage ResponseClass="Success">
-          <m:Notifications>
-            <t:Notification>
-              <t:SubscriptionId>sub-1</t:SubscriptionId>
-              <t:NewMailEvent>
-                <t:Watermark>wm-1</t:Watermark>
-                <t:ItemId Id="item-1" ChangeKey="ck-1"/>
-                <t:ParentFolderId Id="folder-1" ChangeKey="fck-1"/>
-              </t:NewMailEvent>
-              <t:ModifiedEvent>
-                <t:Watermark>wm-2</t:Watermark>
-                <t:ItemId Id="item-2"/>
-                <t:ParentFolderId Id="folder-1"/>
-              </t:ModifiedEvent>
-            </t:Notification>
-          </m:Notifications>
-        </m:GetStreamingEventsResponseMessage>
-      </m:ResponseMessages>
-    </m:GetStreamingEventsResponse>
-  </s:Body>
-</s:Envelope>"#;
-
-        let notifications = parse_streaming_notifications(xml).expect("parse should succeed");
+        let notifications =
+            parse_streaming_notifications(NOTIFICATION_XML).expect("parse should succeed");
         assert_eq!(notifications.len(), 2);
         assert_eq!(notifications[0].event_type, EwsStreamingEventType::NewMail);
         assert_eq!(notifications[0].item_id.as_deref(), Some("item-1"));
@@ -632,29 +649,15 @@ mod tests {
             notifications[0].parent_folder_id.as_deref(),
             Some("folder-1")
         );
-        assert_eq!(notifications[1].watermark.as_deref(), Some("wm-2"));
+        assert_eq!(notifications[1].event_type, EwsStreamingEventType::Modified);
+        assert_eq!(notifications[1].item_id.as_deref(), Some("item-2"));
     }
 
     #[test]
     fn parses_subscribe_response_xml() {
-        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-  <s:Body>
-    <m:SubscribeResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
-                         xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
-      <m:ResponseMessages>
-        <m:SubscribeResponseMessage ResponseClass="Success">
-          <m:SubscriptionId>sub-1</m:SubscriptionId>
-          <m:Watermark>wm-1</m:Watermark>
-        </m:SubscribeResponseMessage>
-      </m:ResponseMessages>
-    </m:SubscribeResponse>
-  </s:Body>
-</s:Envelope>"#;
-
-        let subscriptions = parse_subscribe_response(xml).expect("parse should succeed");
-        assert_eq!(subscriptions.len(), 1);
-        assert_eq!(subscriptions[0].subscription_id, "sub-1");
-        assert_eq!(subscriptions[0].watermark.as_deref(), Some("wm-1"));
+        let subscriptions =
+            parse_subscribe_response(&subscribe_response_xml("sub-1")).expect("parse succeeds");
+        assert_eq!(subscriptions, vec!["sub-1".to_string()]);
     }
 
     fn email_scope(folder: &str) -> CursorScope {
@@ -679,17 +682,13 @@ mod tests {
         );
         account.ews_subscriptions.write().await.insert(
             bifrost_types::SubscriptionHandle("first".to_string()),
-            super::super::push::EwsSubscriptionState {
-                ews_subscription_id: None,
-                watermark: None,
+            EwsSubscriptionState {
                 scopes: vec![ews_scope("rest-a", "ews-shared")],
             },
         );
         account.ews_subscriptions.write().await.insert(
             bifrost_types::SubscriptionHandle("second".to_string()),
-            super::super::push::EwsSubscriptionState {
-                ews_subscription_id: None,
-                watermark: None,
+            EwsSubscriptionState {
                 scopes: vec![ews_scope("rest-b", "ews-shared")],
             },
         );
@@ -761,34 +760,36 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(folders, ["ews-shared", "ews-other"]);
 
-        let body = build_subscribe_request(&deduped, None);
+        let body = build_subscribe_request(&deduped);
         assert_eq!(body.matches(r#"<t:FolderId Id="ews-shared"/>"#).count(), 1);
         assert_eq!(body.matches(r#"<t:FolderId Id="ews-other"/>"#).count(), 1);
     }
 
     /// The Subscribe body's folder set is the subscription's scope, which
-    /// EWS answers once; the long poll names one subscription. Both stay
-    /// inside the single-answer invariant `build_soap_envelope` enforces.
+    /// EWS answers once; the long poll and the unsubscribe each name one
+    /// subscription. All three stay inside the single-answer invariant
+    /// `build_soap_envelope` enforces.
     #[test]
     fn the_ews_stream_bodies_stay_within_the_single_answer_invariant() {
-        let subscribe = build_subscribe_request(
-            &[
-                ews_scope("r1", "f1"),
-                ews_scope("r2", "f2"),
-                ews_scope("r3", "f3"),
-            ],
-            Some("wm-1"),
-        );
+        let subscribe = build_subscribe_request(&[
+            ews_scope("r1", "f1"),
+            ews_scope("r2", "f2"),
+            ews_scope("r3", "f3"),
+        ]);
         assert_eq!(crate::ews::per_answer_request_ids(&subscribe), 0);
         assert_eq!(
             crate::ews::per_answer_request_ids(&build_get_streaming_events_request("sub-1", 30)),
             1
         );
+        assert_eq!(
+            crate::ews::per_answer_request_ids(&build_unsubscribe_request("sub-1")),
+            0
+        );
     }
 
     #[test]
     fn subscribe_request_lists_every_folder_and_the_six_event_types() {
-        let body = build_subscribe_request(&[ews_scope("r1", "f1"), ews_scope("r2", "f2")], None);
+        let body = build_subscribe_request(&[ews_scope("r1", "f1"), ews_scope("r2", "f2")]);
         assert!(body.contains(r#"<t:FolderId Id="f1"/>"#), "{body}");
         assert!(body.contains(r#"<t:FolderId Id="f2"/>"#), "{body}");
         for event in [
@@ -801,38 +802,30 @@ mod tests {
         ] {
             assert!(body.contains(event), "{event} missing from {body}");
         }
-        assert!(!body.contains("<t:Watermark>"));
-    }
-
-    #[test]
-    fn subscribe_request_carries_a_resume_watermark_when_one_is_known() {
-        let body = build_subscribe_request(&[ews_scope("r1", "f1")], Some("wm-1"));
-        assert!(body.contains("<t:Watermark>wm-1</t:Watermark>"), "{body}");
+        // `StreamingSubscriptionRequest` admits only FolderIds and
+        // EventTypes; a Watermark is a schema violation EWS rejects.
+        assert!(!body.contains("Watermark"));
     }
 
     #[test]
     fn subscribe_request_escapes_xml_metacharacters() {
-        let body = build_subscribe_request(&[ews_scope("rest-id", r#"a&b<c>"d'"#)], Some("wm&1"));
+        let body = build_subscribe_request(&[ews_scope("rest-id", r#"a&b<c>"d'"#)]);
         assert!(
             body.contains(r#"<t:FolderId Id="a&amp;b&lt;c&gt;&quot;d&apos;"/>"#),
-            "{body}"
-        );
-        assert!(
-            body.contains("<t:Watermark>wm&amp;1</t:Watermark>"),
             "{body}"
         );
     }
 
     #[test]
     fn subscribe_request_uses_the_translated_ews_id_not_the_graph_rest_id() {
-        let body = build_subscribe_request(&[ews_scope("rest-AAMk", "ews-AAE=")], None);
+        let body = build_subscribe_request(&[ews_scope("rest-AAMk", "ews-AAE=")]);
         assert!(body.contains(r#"<t:FolderId Id="ews-AAE="/>"#), "{body}");
         assert!(!body.contains("rest-AAMk"), "{body}");
     }
 
     #[test]
     fn subscribe_request_builder_emits_an_empty_list_only_for_no_translations() {
-        let body = build_subscribe_request(&[], None);
+        let body = build_subscribe_request(&[]);
         assert!(body.contains("<t:FolderIds></t:FolderIds>"), "{body}");
     }
 
@@ -849,6 +842,16 @@ mod tests {
         assert!(
             build_get_streaming_events_request("a&b", 30)
                 .contains("<t:SubscriptionId>a&amp;b</t:SubscriptionId>")
+        );
+    }
+
+    #[test]
+    fn unsubscribe_request_names_the_subscription_and_escapes_it() {
+        let body = build_unsubscribe_request("a&b");
+        assert!(body.contains("<m:Unsubscribe>"), "{body}");
+        assert!(
+            body.contains("<m:SubscriptionId>a&amp;b</m:SubscriptionId>"),
+            "{body}"
         );
     }
 
@@ -890,10 +893,6 @@ mod tests {
         }
         assert_eq!(notifications[0].event_type, EwsStreamingEventType::Created);
         assert_eq!(notifications[1].event_type, EwsStreamingEventType::Deleted);
-        // `PreviousWatermark` / `MoreEvents` must not be mistaken for the
-        // per-event watermark.
-        assert_eq!(notifications[0].watermark.as_deref(), Some("wm-1"));
-        assert_eq!(notifications[1].watermark.as_deref(), Some("wm-2"));
     }
 
     #[test]
@@ -925,7 +924,6 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].parent_folder_id.is_none());
         assert!(notifications[0].item_id.is_none());
-        assert_eq!(notifications[0].watermark.as_deref(), Some("wm-9"));
     }
 
     #[test]
@@ -986,5 +984,281 @@ mod tests {
         assert_eq!(local_name(b"t:ItemId"), "ItemId");
         assert_eq!(local_name(b"ItemId"), "ItemId");
         assert_eq!(local_name(b""), "");
+    }
+
+    // ----- worker-loop tests over the scripted EWS transport -----
+
+    const NOTIFICATION_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Success">
+          <m:Notifications>
+            <t:Notification>
+              <t:SubscriptionId>sub-1</t:SubscriptionId>
+              <t:NewMailEvent>
+                <t:Watermark>wm-1</t:Watermark>
+                <t:ItemId Id="item-1" ChangeKey="ck-1"/>
+                <t:ParentFolderId Id="folder-1" ChangeKey="fck-1"/>
+              </t:NewMailEvent>
+              <t:ModifiedEvent>
+                <t:Watermark>wm-2</t:Watermark>
+                <t:ItemId Id="item-2"/>
+                <t:ParentFolderId Id="folder-1"/>
+              </t:ModifiedEvent>
+            </t:Notification>
+          </m:Notifications>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+    fn subscribe_response_xml(subscription_id: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:SubscribeResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:SubscribeResponseMessage ResponseClass="Success">
+          <m:SubscriptionId>{subscription_id}</m:SubscriptionId>
+        </m:SubscribeResponseMessage>
+      </m:ResponseMessages>
+    </m:SubscribeResponse>
+  </s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    fn unsubscribe_response_xml() -> String {
+        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:UnsubscribeResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:UnsubscribeResponseMessage ResponseClass="Success">
+          <m:ResponseCode>NoError</m:ResponseCode>
+        </m:UnsubscribeResponseMessage>
+      </m:ResponseMessages>
+    </m:UnsubscribeResponse>
+  </s:Body>
+</s:Envelope>"#
+            .to_string()
+    }
+
+    enum ScriptStep {
+        Respond(String),
+        /// A long poll with nothing to say: the request is reported to the
+        /// test and the future then never resolves, exactly like a hanging
+        /// `GetStreamingEvents`. The worker leaves it via its `select!`
+        /// (shutdown or topology change).
+        Hang,
+    }
+
+    /// In-process scripted EWS transport. Each `execute` reports its body
+    /// on the channel (which is how tests sequence deterministically,
+    /// without wall-clock waits) and then plays the next scripted step.
+    struct ScriptedEws {
+        steps: tokio::sync::Mutex<VecDeque<ScriptStep>>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    fn scripted(
+        steps: Vec<ScriptStep>,
+    ) -> (ScriptedEws, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            ScriptedEws {
+                steps: tokio::sync::Mutex::new(steps.into()),
+                request_tx,
+            },
+            request_rx,
+        )
+    }
+
+    impl EwsExecute for ScriptedEws {
+        async fn execute(&self, body_xml: &str, _headers: &EwsHeaders) -> Result<String, EwsError> {
+            let step = self
+                .steps
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or_else(|| panic!("EWS script exhausted by request: {body_xml}"));
+            let _ = self.request_tx.send(body_xml.to_string());
+            match step {
+                ScriptStep::Respond(xml) => Ok(xml),
+                ScriptStep::Hang => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Registers a handle's scopes the way `subscribe_ews` does: map write,
+    /// then topology bump.
+    async fn register(account: &GraphAccount, handle: &str, scopes: Vec<EwsSubscriptionScope>) {
+        account.ews_subscriptions.write().await.insert(
+            SubscriptionHandle(handle.to_string()),
+            EwsSubscriptionState { scopes },
+        );
+        account
+            .ews_topology
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    /// The registration that starts the worker bumps the topology BEFORE
+    /// the worker exists. That pre-recorded change must not read as a
+    /// later topology update: the worker subscribes once and settles into
+    /// its long poll, rather than immediately abandoning the first
+    /// subscription and minting a redundant second one.
+    #[tokio::test]
+    async fn the_first_registration_subscribes_exactly_once() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Hang,
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let subscribe_body = requests.recv().await.expect("subscribe request");
+        assert!(subscribe_body.contains("<m:Subscribe>"), "{subscribe_body}");
+        assert!(
+            subscribe_body.contains(r#"<t:FolderId Id="folder-1"/>"#),
+            "{subscribe_body}"
+        );
+        let poll_body = requests.recv().await.expect("long-poll request");
+        assert!(
+            poll_body.contains("<t:SubscriptionId>sub-1</t:SubscriptionId>"),
+            "{poll_body}"
+        );
+
+        account.shutdown.cancel();
+        worker.await.expect("worker joins");
+        assert!(
+            requests.try_recv().is_err(),
+            "one Subscribe and one long poll are the whole conversation"
+        );
+    }
+
+    /// A `push_subscribe` while the stream is live: the worker abandons the
+    /// long poll, retires the old subscription with an EWS Unsubscribe (the
+    /// server holds streaming subscriptions against a per-mailbox quota),
+    /// subscribes to the enlarged union without a watermark (the streaming
+    /// schema has none), and emits exactly one `Reconnected` - covering the
+    /// handoff window EWS delivered into nowhere - with no false
+    /// `Disconnected`.
+    #[tokio::test]
+    async fn a_topology_change_hands_off_the_stream_without_a_false_disconnect() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Hang,
+            ScriptStep::Respond(unsubscribe_response_xml()),
+            ScriptStep::Respond(subscribe_response_xml("sub-2")),
+            ScriptStep::Hang,
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let first_subscribe = requests.recv().await.expect("first subscribe");
+        assert!(
+            first_subscribe.contains(r#"<t:FolderId Id="folder-1"/>"#),
+            "{first_subscribe}"
+        );
+        let _first_poll = requests.recv().await.expect("first long poll");
+
+        // A second handle registers while the long poll hangs.
+        register(&account, "h2", vec![ews_scope("rest-b", "folder-2")]).await;
+
+        let unsubscribe = requests.recv().await.expect("unsubscribe of sub-1");
+        assert!(unsubscribe.contains("<m:Unsubscribe>"), "{unsubscribe}");
+        assert!(
+            unsubscribe.contains("<m:SubscriptionId>sub-1</m:SubscriptionId>"),
+            "{unsubscribe}"
+        );
+
+        let second_subscribe = requests.recv().await.expect("replacement subscribe");
+        assert!(
+            second_subscribe.contains(r#"<t:FolderId Id="folder-1"/>"#),
+            "{second_subscribe}"
+        );
+        assert!(
+            second_subscribe.contains(r#"<t:FolderId Id="folder-2"/>"#),
+            "{second_subscribe}"
+        );
+        assert!(
+            !second_subscribe.contains("Watermark"),
+            "{second_subscribe}"
+        );
+
+        let second_poll = requests.recv().await.expect("second long poll");
+        assert!(
+            second_poll.contains("<t:SubscriptionId>sub-2</t:SubscriptionId>"),
+            "{second_poll}"
+        );
+
+        // `Reconnected` was sent before the second poll's request went out,
+        // so it is already buffered: the handoff gap gets its reconcile.
+        let event = events.try_recv().expect("one push event");
+        assert!(
+            matches!(event, WatchEvent::Reconnected),
+            "expected Reconnected, got {event:?}"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a local topology change is not a transport disconnect"
+        );
+
+        account.shutdown.cancel();
+        worker.await.expect("worker joins");
+    }
+
+    /// End-to-end dispatch: a streamed notification for a subscribed folder
+    /// comes back as `Invalidated` hints naming that folder's scope, and
+    /// the loop keeps polling the same subscription.
+    #[tokio::test]
+    async fn a_streamed_notification_invalidates_the_folder_scope() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::EwsStreaming);
+        let mut events = account.push_tx.subscribe();
+        register(&account, "h1", vec![ews_scope("rest-a", "folder-1")]).await;
+        let (scripted, mut requests) = scripted(vec![
+            ScriptStep::Respond(subscribe_response_xml("sub-1")),
+            ScriptStep::Respond(NOTIFICATION_XML.to_string()),
+            ScriptStep::Hang,
+        ]);
+        let worker = tokio::spawn(run_worker(account.clone(), scripted));
+
+        let _subscribe = requests.recv().await.expect("subscribe");
+        let _first_poll = requests.recv().await.expect("first long poll");
+        let _second_poll = requests
+            .recv()
+            .await
+            .expect("re-poll after the notification");
+
+        // The fixture carries two events on folder-1; each maps to the one
+        // registered scope.
+        for _ in 0..2 {
+            let event = events.try_recv().expect("invalidation");
+            match event {
+                WatchEvent::Invalidated { hint } => {
+                    assert!(matches!(hint.source, PushSource::EwsStreaming));
+                    match hint.payload {
+                        HintPayload::SpecificCursorScope(scope) => {
+                            assert_eq!(scope, email_scope("rest-a"));
+                        }
+                        other => panic!("expected a specific scope hint, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Invalidated, got {other:?}"),
+            }
+        }
+        assert!(events.try_recv().is_err());
+
+        account.shutdown.cancel();
+        worker.await.expect("worker joins");
     }
 }

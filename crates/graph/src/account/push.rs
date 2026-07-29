@@ -71,10 +71,11 @@ pub(crate) struct GraphSubscriptionState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EwsSubscriptionState {
-    pub(crate) ews_subscription_id: Option<String>,
-    pub(crate) watermark: Option<String>,
     /// The Graph cursor scope and EWS id for its folder. Graph `restId` and
-    /// EWS `ewsId` are distinct opaque formats.
+    /// EWS `ewsId` are distinct opaque formats. The live EWS subscription id
+    /// is NOT stored here: it is worker-local state, minted per Subscribe
+    /// and abandoned (with a best-effort Unsubscribe) on every reconnect or
+    /// topology handoff, so nothing outside the worker's loop may hold it.
     pub(crate) scopes: Vec<EwsSubscriptionScope>,
 }
 
@@ -708,15 +709,17 @@ async fn subscribe_ews(
     }
     let scopes = translate_ews_scopes(&account, pending).await?;
     let handle = new_handle()?;
-    account.ews_subscriptions.write().await.insert(
-        handle.clone(),
-        EwsSubscriptionState {
-            ews_subscription_id: None,
-            watermark: None,
-            scopes,
-        },
-    );
-    account.ews_subscription_changed.notify_one();
+    account
+        .ews_subscriptions
+        .write()
+        .await
+        .insert(handle.clone(), EwsSubscriptionState { scopes });
+    // Bump the topology generation AFTER the map write: the worker only
+    // re-reads the map after observing a generation it has not seen, so the
+    // read this bump provokes is guaranteed to include the new registration.
+    account
+        .ews_topology
+        .send_modify(|generation| *generation = generation.wrapping_add(1));
     super::push_stream::ensure_ews_worker(account).await;
     Ok(handle)
 }
@@ -857,8 +860,20 @@ async fn unsubscribe_ews(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    account.ews_subscriptions.write().await.remove(&handle);
-    account.ews_subscription_changed.notify_one();
+    let removed = account
+        .ews_subscriptions
+        .write()
+        .await
+        .remove(&handle)
+        .is_some();
+    // Only a registration that actually existed changes the scope union;
+    // bumping on an idempotent re-unsubscribe would churn the live stream
+    // through a pointless resubscribe.
+    if removed {
+        account
+            .ews_topology
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
     Ok(())
 }
 
