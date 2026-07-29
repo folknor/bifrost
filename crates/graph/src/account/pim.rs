@@ -175,7 +175,7 @@ async fn delete_extended_property(
         // ids; route the clear DELETE to the owning mailbox.
         let suffix = format!(
             "/singleValueExtendedProperties/{}",
-            bifrost_net::url::encode_component(property_id)
+            bifrost_net::url::encode_path_component(property_id)
         );
         requests.push(BatchRequestItem {
             id: index.to_string(),
@@ -469,7 +469,7 @@ async fn stamp_deferred_send_time(
     let path = format!(
         "{}/messages/{}",
         client.api_path_prefix(),
-        bifrost_net::url::encode_component(&draft.0)
+        bifrost_net::url::encode_path_component(&draft.0)
     );
     let body = deferred_send_time_body(at);
     client
@@ -511,7 +511,7 @@ pub(crate) async fn cancel_scheduled_send(
     let path = format!(
         "{}/messages/{}",
         client.api_path_prefix(),
-        bifrost_net::url::encode_component(draft_id)
+        bifrost_net::url::encode_path_component(draft_id)
     );
     client.delete(&path).await.map_err(|e| {
         into_account_error(
@@ -564,7 +564,7 @@ pub(crate) async fn draft_update(
     let path = format!(
         "{}/messages/{}",
         account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&draft.0)
+        bifrost_net::url::encode_path_component(&draft.0)
     );
     account
         .client
@@ -580,7 +580,7 @@ pub(crate) async fn draft_discard(
     let path = format!(
         "{}/messages/{}",
         account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&draft.0)
+        bifrost_net::url::encode_path_component(&draft.0)
     );
     account.client.delete(&path).await.map_err(|e| {
         into_account_error(e, GraphErrorContext::graph(AccountOperation::DraftDiscard))
@@ -824,7 +824,7 @@ pub(crate) async fn container_create(
     let path = match parent {
         Some(parent) => format!(
             "{prefix}/mailFolders/{}/childFolders",
-            bifrost_net::url::encode_component(&parent.0)
+            bifrost_net::url::encode_path_component(&parent.0)
         ),
         None => format!("{prefix}/mailFolders"),
     };
@@ -851,7 +851,7 @@ pub(crate) async fn container_rename(
     let path = format!(
         "{}/mailFolders/{}",
         account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&container.0)
+        bifrost_net::url::encode_path_component(&container.0)
     );
     account
         .client
@@ -874,7 +874,7 @@ pub(crate) async fn container_move(
     let path = format!(
         "{}/mailFolders/{}/move",
         account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&container.0)
+        bifrost_net::url::encode_path_component(&container.0)
     );
     let _: GraphMailFolder = account
         .client
@@ -893,7 +893,7 @@ pub(crate) async fn container_delete(
     let path = format!(
         "{}/mailFolders/{}",
         account.client.api_path_prefix(),
-        bifrost_net::url::encode_component(&container.0)
+        bifrost_net::url::encode_path_component(&container.0)
     );
     account.client.delete(&path).await.map_err(|e| {
         into_account_error(
@@ -1246,7 +1246,7 @@ async fn fetch_message_value(
     let path = format!(
         "{}/messages/{}?{}",
         client.api_path_prefix(),
-        bifrost_net::url::encode_component(parsed.native_id()),
+        bifrost_net::url::encode_path_component(parsed.native_id()),
         select_query(select)
     );
     let value = client
@@ -1270,7 +1270,7 @@ async fn message_values_for_thread(
         "{}/messages?{}&$filter={}&$top=50",
         account.client.api_path_prefix(),
         select_query(select),
-        bifrost_net::url::encode_component(&filter)
+        bifrost_net::url::encode_query_value(&filter)
     );
     fetch_paged_values(account, path).await
 }
@@ -1306,7 +1306,7 @@ async fn fetch_paged_values(
 pub(crate) fn message_batch_url(account: &GraphAccount, id: &ObjectId, suffix: &str) -> String {
     let parsed = super::foreign::parse_message_id(id);
     let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
-    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+    let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
     format!("{prefix}/messages/{enc_id}{suffix}")
 }
 
@@ -1800,7 +1800,7 @@ async fn send_draft_message(client: &GraphClient, draft: &DraftHandle) -> Result
     let path = format!(
         "{}/messages/{}/send",
         client.api_path_prefix(),
-        bifrost_net::url::encode_component(&draft.0)
+        bifrost_net::url::encode_path_component(&draft.0)
     );
     client
         .post_empty(&path)
@@ -1888,7 +1888,7 @@ fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountEr
         };
         params.push(format!(
             "$search={}",
-            bifrost_net::url::encode_component(&format!("\"{search}\""))
+            bifrost_net::url::encode_query_value(&format!("\"{search}\""))
         ));
     } else {
         if let Some(filter) = &request.filter {
@@ -1896,14 +1896,14 @@ fn search_url(prefix: &str, request: &SearchRequest) -> Result<String, AccountEr
             if !filter.is_empty() {
                 params.push(format!(
                     "$filter={}",
-                    bifrost_net::url::encode_component(&filter)
+                    bifrost_net::url::encode_query_value(&filter)
                 ));
             }
         }
         if let Some(provider_query) = &request.provider_query {
             params.push(format!(
                 "$search={}",
-                bifrost_net::url::encode_component(&format!(
+                bifrost_net::url::encode_query_value(&format!(
                     "\"{}\"",
                     graph_search_escape(provider_query)
                 ))
@@ -2280,7 +2280,7 @@ async fn well_known_folder_roles(account: &GraphAccount) -> HashMap<String, Fold
         let path = format!(
             "{}/mailFolders/{}?$select=id",
             account.client.api_path_prefix(),
-            bifrost_net::url::encode_component(name)
+            bifrost_net::url::encode_path_component(name)
         );
         if let Ok(value) = account.client.get_json::<Value>(&path).await
             && let Some(id) = value.get("id").and_then(Value::as_str)
@@ -2984,14 +2984,14 @@ mod tests {
         assert!(!url.contains("$filter="), "{url}");
         assert_eq!(
             search_param(&url),
-            bifrost_net::url::encode_component("\"from:\"alice\"\"")
+            bifrost_net::url::encode_query_value("\"from:\"alice\"\"")
         );
 
         let to = SearchRequest::filter(SearchFilter::To("bob@x".to_string()));
         let to_url = search_url("/me", &to).expect("url builds");
         assert_eq!(
             search_param(&to_url),
-            bifrost_net::url::encode_component("\"(to:\"bob@x\" OR cc:\"bob@x\")\"")
+            bifrost_net::url::encode_query_value("\"(to:\"bob@x\" OR cc:\"bob@x\")\"")
         );
     }
 
@@ -3021,7 +3021,7 @@ mod tests {
         assert!(!url.contains("$filter="), "{url}");
         assert_eq!(
             search_param(&url),
-            bifrost_net::url::encode_component("\"(from:\"alice\") AND (received>=1970-01-01)\"")
+            bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (received>=1970-01-01)\"")
         );
     }
 
@@ -3036,7 +3036,7 @@ mod tests {
         assert!(!url.contains("$filter="), "{url}");
         assert_eq!(
             search_param(&url),
-            bifrost_net::url::encode_component("\"(from:\"alice\") AND (importance:high)\"")
+            bifrost_net::url::encode_query_value("\"(from:\"alice\") AND (importance:high)\"")
         );
     }
 

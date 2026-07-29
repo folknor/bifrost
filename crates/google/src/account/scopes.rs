@@ -141,7 +141,7 @@ pub(crate) fn scope_lifecycle_stream(
             let old = snapshot(&state.cache);
             match refresh_scope_snapshot(&state.client, &state.cache).await {
                 Ok(new) => {
-                    state.pending = diff_snapshots(&old, &new).into();
+                    state.pending = lifecycle_diff(&old, &new).into();
                 }
                 Err(error) => {
                     // Classify: terminal / engine-action -> emit
@@ -166,6 +166,14 @@ pub(crate) fn scope_lifecycle_stream(
             }
         }
     }))
+}
+
+fn lifecycle_diff(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycle> {
+    if old.fetched_at.is_none() {
+        Vec::new()
+    } else {
+        diff_snapshots(old, new)
+    }
 }
 
 /// The label vocabulary every flag-canonicalizing call site must go
@@ -273,6 +281,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn first_successful_lifecycle_snapshot_seeds_without_created_events() {
+        let old = ScopeSnapshot::empty();
+        let new = ScopeSnapshot {
+            labels: vec![label("Label_1", "One", "user")],
+            fetched_at: Some(Instant::now()),
+        };
+        assert!(lifecycle_diff(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn populated_lifecycle_snapshot_still_emits_real_changes() {
+        let old = ScopeSnapshot {
+            labels: vec![label("Label_1", "One", "user")],
+            fetched_at: Some(Instant::now()),
+        };
+        let new = ScopeSnapshot {
+            labels: vec![
+                label("Label_1", "One", "user"),
+                label("Label_2", "Two", "user"),
+            ],
+            fetched_at: Some(Instant::now()),
+        };
+        assert!(matches!(
+            lifecycle_diff(&old, &new).as_slice(),
+            [ScopeLifecycle::Created(MembershipScope::Label(LabelId(id)))]
+                if id == "Label_2"
+        ));
+    }
+
     fn snapshot_of(labels: Vec<GmailLabel>) -> ScopeSnapshot {
         ScopeSnapshot {
             labels,
@@ -321,11 +359,8 @@ mod tests {
         assert!(matches!(events[0], ScopeLifecycle::Renamed { .. }));
     }
 
-    /// DOCUMENTS CURRENT BEHAVIOUR, NOT AN ENDORSEMENT. Gmail's label id
-    /// is stable across a rename, so the `Renamed` event carries the
-    /// same scope on both sides. A consumer cannot learn the old or the
-    /// new display name from the event and must re-read
-    /// `containers_list` to find out what actually changed.
+    /// Gmail's stable label id makes Renamed an invalidation signal.
+    /// The consumer re-reads container metadata to obtain the new name.
     #[test]
     fn rename_events_carry_the_same_scope_on_both_sides() {
         let old = snapshot_of(vec![label("Label_1", "Work", "user")]);

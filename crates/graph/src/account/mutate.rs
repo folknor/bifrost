@@ -279,7 +279,7 @@ async fn refresh_missing_etags(
         let parsed = super::foreign::parse_message_id(&id);
         let client = account.client_for_owner(parsed.owner());
         let prefix = client.api_path_prefix();
-        let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+        let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
         let path = format!("{prefix}/messages/{enc_id}?$select=id");
         match client.get_json::<Value>(&path).await {
             Ok(value) => {
@@ -343,7 +343,7 @@ fn request_for_mutation(
     // only the URL is built from the decoded native id + owner prefix.
     let parsed = super::foreign::parse_message_id(id);
     let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
-    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+    let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let mut headers = HashMap::new();
     match kind {
         MutationKind::SetFlags(op) => {

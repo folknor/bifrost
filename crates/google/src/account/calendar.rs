@@ -60,14 +60,14 @@ pub(crate) fn events_in_range(
                 )
             })?;
         let calendar_id = range.calendar_id.0;
-        let encoded = bifrost_net::url::encode_component(&calendar_id);
+        let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let time_min = google_range_bound(&range.start, "timeMin")?;
         let time_max = google_range_bound(&range.end, "timeMax")?;
         let mut url = format!(
             "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&timeMin={}&timeMax={}",
             calendar_api_base(),
-            bifrost_net::url::encode_component(&time_min),
-            bifrost_net::url::encode_component(&time_max)
+            bifrost_net::url::encode_query_value(&time_min),
+            bifrost_net::url::encode_query_value(&time_max)
         );
         if let Some(limit) = range.limit {
             url.push_str("&maxResults=");
@@ -75,7 +75,7 @@ pub(crate) fn events_in_range(
         }
         if let Some(token) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(&bifrost_net::url::encode_component(&token));
+            url.push_str(&bifrost_net::url::encode_query_value(&token));
         }
         let response: EventsResponse = client
             .get(&url)
@@ -107,7 +107,7 @@ pub(crate) fn create(
     Box::pin(async move {
         reject_create_organizer(&event)?;
         let calendar_id = event.calendar_id.0.clone();
-        let encoded = bifrost_net::url::encode_component(&calendar_id);
+        let encoded = bifrost_net::url::encode_path_component(&calendar_id);
         let url = format!("{}/calendars/{encoded}/events", calendar_api_base());
         let created: GoogleEvent = client
             .post(&url, &google_event_from_create(&event))
@@ -303,11 +303,11 @@ async fn search_one_calendar(
     limit: Option<u32>,
     page_token: Option<String>,
 ) -> Result<Page<CalendarEvent>, AccountError> {
-    let encoded = bifrost_net::url::encode_component(&calendar_id);
+    let encoded = bifrost_net::url::encode_path_component(&calendar_id);
     let mut url = format!(
         "{}/calendars/{encoded}/events?singleEvents=true&orderBy=startTime&q={}",
         calendar_api_base(),
-        bifrost_net::url::encode_component(query)
+        bifrost_net::url::encode_query_value(query)
     );
     if let Some(limit) = limit {
         url.push_str("&maxResults=");
@@ -315,7 +315,7 @@ async fn search_one_calendar(
     }
     if let Some(token) = page_token {
         url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_component(&token));
+        url.push_str(&bifrost_net::url::encode_query_value(&token));
     }
     let response: EventsResponse = client
         .get(&url)
@@ -660,8 +660,8 @@ fn event_url(calendar_id: &str, event_id: &str) -> String {
     format!(
         "{}/calendars/{}/events/{}",
         calendar_api_base(),
-        bifrost_net::url::encode_component(calendar_id),
-        bifrost_net::url::encode_component(event_id)
+        bifrost_net::url::encode_path_component(calendar_id),
+        bifrost_net::url::encode_path_component(event_id)
     )
 }
 
@@ -669,7 +669,7 @@ fn event_move_url(calendar_id: &str, event_id: &str, target_calendar_id: &str) -
     format!(
         "{}/move?destination={}",
         event_url(calendar_id, event_id),
-        bifrost_net::url::encode_component(target_calendar_id)
+        bifrost_net::url::encode_path_component(target_calendar_id)
     )
 }
 

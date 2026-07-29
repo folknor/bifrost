@@ -338,27 +338,6 @@ fn invalid_request_is_client_bug_without_attempt() {
 }
 
 #[test]
-fn net_setup_legacy_routes_to_request_malformed() {
-    let err = convert(
-        Error::NetSetup {
-            message: "legacy setup failure".to_owned(),
-            source: None,
-        },
-        ctx(AccountOperation::Discover),
-    );
-
-    assert_eq!(
-        err.kind(),
-        &AccountErrorKind::Request(RequestErrorKind::Malformed)
-    );
-}
-
-#[test]
-fn malformed_redirect_missing_location_is_contract_violation() {
-    assert_malformed_redirect_kind(MalformedRedirectKind::MissingLocation);
-}
-
-#[test]
 fn malformed_redirect_invalid_encoding_is_contract_violation() {
     assert_malformed_redirect_kind(MalformedRedirectKind::InvalidLocationEncoding);
 }

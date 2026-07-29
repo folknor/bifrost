@@ -151,8 +151,22 @@ impl GraphClient {
                     default_retry: RetryPolicy::default(),
                 },
             );
-            if let Ok(mut slot) = self.inner.account_net.write() {
-                *slot = Some(account_net);
+            // Install the replacement first, then tear down whatever
+            // registration it displaced. `Net::attach_account` mints a
+            // fresh token on every call and no longer unregisters a
+            // previous attachment for the same id, so a reopen that
+            // dropped its old handle without detaching would leak one
+            // meter attachment and one governor attach count per
+            // cycle - the host bucket would never be reclaimed.
+            // Detaching after the install keeps the shared counts from
+            // dipping to zero, so in-flight requests on the old handle
+            // keep metering against the same counters.
+            let displaced = match self.inner.account_net.write() {
+                Ok(mut slot) => slot.replace(account_net),
+                Err(_) => None,
+            };
+            if let Some(displaced) = displaced {
+                displaced.detach();
             }
             return;
         }
@@ -240,7 +254,7 @@ impl GraphClient {
 
     pub(crate) fn api_path_prefix(&self) -> String {
         match &self.inner.mailbox_id {
-            Some(id) => format!("/users/{}", bifrost_net::url::encode_component(id)),
+            Some(id) => format!("/users/{}", bifrost_net::url::encode_path_component(id)),
             None => "/me".to_string(),
         }
     }
@@ -793,6 +807,35 @@ mod tests {
         assert_eq!(
             account_net.account(),
             &AccountId("engine-account".to_string())
+        );
+    }
+
+    /// Every reopen calls `attach_account` again with the same engine
+    /// id. `Net` mints a fresh registration token per attach and no
+    /// longer unregisters a previous one, so the displaced handle has
+    /// to be detached explicitly or the host bucket leaks an attach
+    /// count per cycle and is never reclaimed.
+    /// `GraphClient::new` rides the process-wide `Net`, so this keys
+    /// on a meter entry for an id no other test touches rather than on
+    /// the shared `GRAPH_HOST` bucket.
+    #[test]
+    fn reattaching_the_same_engine_id_does_not_leak_registrations() {
+        let client = GraphClient::new("token");
+        let id = AccountId("graph-reattach-leak-probe".to_string());
+        let net = client.inner.net.clone().expect("default client owns a Net");
+
+        for _ in 0..3 {
+            client.attach_account(id.clone());
+        }
+        bifrost_net::MeterSink::record_bytes_in(net.meter(), &id, 5);
+        assert_eq!(net.meter().account(id.clone()).bytes_in(), 5);
+
+        client.account_net().expect("account net attached").detach();
+
+        assert_eq!(
+            net.meter().account(id).bytes_in(),
+            0,
+            "three attaches must leave exactly one live registration to detach"
         );
     }
 }

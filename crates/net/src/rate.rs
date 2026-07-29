@@ -9,9 +9,10 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::error::Error;
 
@@ -46,6 +47,7 @@ pub trait RequestCost {
 
 /// Per-host token-bucket governor. Holds one `HostBucket` per
 /// registered host and looks them up by `&str` on every call.
+#[derive(Clone)]
 pub struct RateLimitGovernor {
     /// Per-host bucket state. Behind `Arc<Mutex<_>>` rather than
     /// plain `Mutex<_>` because `acquire(...)` returns a
@@ -114,7 +116,11 @@ impl RateLimitGovernor {
     /// merge) would let any consumer poison shared host quotas via a
     /// misconfiguration; sticking with the first registration keeps
     /// the rule deterministic.
-    pub fn register(&self, limit: RateLimit) {
+    ///
+    /// Returns true when this registration joined a bucket and must
+    /// later be balanced by `unregister`. Returns false when a new
+    /// host declaration was rejected as invalid.
+    pub fn register(&self, limit: RateLimit) -> bool {
         let mut map = self.buckets.lock().expect("rate-governor lock poisoned");
         match map.get_mut(&limit.host) {
             Some(existing) => {
@@ -136,8 +142,18 @@ impl RateLimitGovernor {
                     );
                 }
                 existing.attach_count = existing.attach_count.saturating_add(1);
+                true
             }
             None => {
+                if !limit.quota_per_second.is_finite() || limit.quota_per_second <= 0.0 {
+                    tracing::warn!(
+                        target: "bifrost_net::rate",
+                        host = %limit.host,
+                        quota_per_second = limit.quota_per_second,
+                        "ignoring RateLimit registration with a non-finite or non-positive quota",
+                    );
+                    return false;
+                }
                 map.insert(
                     limit.host.clone(),
                     HostBucket {
@@ -151,6 +167,7 @@ impl RateLimitGovernor {
                         attach_count: 1,
                     },
                 );
+                true
             }
         }
     }
@@ -249,15 +266,11 @@ impl RateLimitGovernor {
                     // the bucket can satisfy the request, capped at
                     // 250 ms so the loop also picks up refunds via
                     // `Notify` wakes promptly even if our refill math
-                    // is off. A zero refill rate would compute to
-                    // infinity; the 250 ms cap collapses that to a
-                    // bounded poll interval.
+                    // is off. Registration rejects non-finite and
+                    // non-positive refill rates, so this calculation
+                    // is always finite and positive.
                     let deficit = cost_f - bucket.tokens;
-                    let wait_secs = if bucket.refill_rate > 0.0 {
-                        deficit / bucket.refill_rate
-                    } else {
-                        f64::INFINITY
-                    };
+                    let wait_secs = deficit / bucket.refill_rate;
                     let wait_capped = wait_secs.clamp(0.005, 0.25);
                     let dur = Duration::from_secs_f64(wait_capped);
                     (Arc::clone(&bucket.notify), dur)

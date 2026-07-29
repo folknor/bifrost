@@ -26,6 +26,7 @@ use crate::request::parse_retry_after;
 /// `OAuthRefresher::with_max_age` so callers can lengthen or shorten
 /// it.
 pub const DEFAULT_TOKEN_MAX_AGE: Duration = Duration::from_secs(55 * 60);
+const PROACTIVE_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Source of OAuth bearer tokens. Implementations are responsible for
 /// holding the refresh token (or whatever provider-specific material
@@ -245,21 +246,45 @@ impl OAuthRefresher {
                 RefreshState::Fresh {
                     token,
                     refreshed_at,
-                } if !force && !needs_refresh(token, *refreshed_at, self.max_age) => {
+                    refresh_not_before,
+                } if !force
+                    && (!needs_refresh(token, *refreshed_at, self.max_age)
+                        || refresh_is_deferred(token, *refresh_not_before)) =>
+                {
                     // Steady state: cached token is fresh enough.
                     return Ok(token.clone());
                 }
-                RefreshState::Fresh { .. } | RefreshState::Empty => {
+                RefreshState::Fresh {
+                    token,
+                    refreshed_at,
+                    ..
+                } => {
                     // This caller is responsible for spawning the
                     // refresh driver. Register it as the first waiter
                     // before dropping the lock so cancellation of this
                     // future cannot leave the state stuck in
                     // `Refreshing`.
                     let (tx, rx) = oneshot::channel();
-                    *state = RefreshState::Refreshing { waiters: vec![tx] };
+                    let fallback = if force {
+                        None
+                    } else {
+                        Some((token.clone(), *refreshed_at))
+                    };
+                    *state = RefreshState::Refreshing {
+                        waiters: vec![tx],
+                        fallback,
+                    };
                     DriverRole::Driver(rx)
                 }
-                RefreshState::Refreshing { waiters } => {
+                RefreshState::Empty => {
+                    let (tx, rx) = oneshot::channel();
+                    *state = RefreshState::Refreshing {
+                        waiters: vec![tx],
+                        fallback: None,
+                    };
+                    DriverRole::Driver(rx)
+                }
+                RefreshState::Refreshing { waiters, .. } => {
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
                     DriverRole::Waiter(rx)
@@ -289,12 +314,12 @@ impl OAuthRefresher {
         // We were the driver. Whatever state we left behind in
         // `Refreshing` must be replaced; pull the waiters out before
         // installing the new `Fresh` or rolling back to `Empty`.
-        let waiters = match std::mem::replace(&mut *state, RefreshState::Empty) {
-            RefreshState::Refreshing { waiters } => waiters,
+        let (waiters, fallback) = match std::mem::replace(&mut *state, RefreshState::Empty) {
+            RefreshState::Refreshing { waiters, fallback } => (waiters, fallback),
             // The only way this can happen is if a second driver
             // claimed the role concurrently, which the single-flight
             // protocol forbids. Defensive.
-            _ => Vec::new(),
+            _ => (Vec::new(), None),
         };
 
         match result {
@@ -302,6 +327,7 @@ impl OAuthRefresher {
                 *state = RefreshState::Fresh {
                     token: token.clone(),
                     refreshed_at: Instant::now(),
+                    refresh_not_before: None,
                 };
                 drop(state);
                 for waiter in waiters {
@@ -310,6 +336,24 @@ impl OAuthRefresher {
                 Ok(token)
             }
             Err(err) => {
+                let can_fallback = !is_terminal_auth_error(&err)
+                    && fallback
+                        .as_ref()
+                        .and_then(|(token, _)| token.expires_at())
+                        .is_some_and(|expires_at| Instant::now() < expires_at);
+                if can_fallback {
+                    let (token, refreshed_at) = fallback.expect("fallback was checked as present");
+                    *state = RefreshState::Fresh {
+                        token: token.clone(),
+                        refreshed_at,
+                        refresh_not_before: Some(Instant::now() + PROACTIVE_REFRESH_RETRY_DELAY),
+                    };
+                    drop(state);
+                    for waiter in waiters {
+                        let _ = waiter.send(Ok(token.clone()));
+                    }
+                    return Ok(token);
+                }
                 // Leave state as `Empty` so the next caller drives a
                 // fresh attempt rather than parking on a dead
                 // `Refreshing` entry.
@@ -436,6 +480,14 @@ fn needs_refresh(token: &AccessToken, refreshed_at: Instant, max_age: Duration) 
     now.saturating_duration_since(refreshed_at) >= max_age
 }
 
+fn refresh_is_deferred(token: &AccessToken, not_before: Option<Instant>) -> bool {
+    let now = Instant::now();
+    not_before.is_some_and(|not_before| now < not_before)
+        && token
+            .expires_at()
+            .is_some_and(|expires_at| now < expires_at)
+}
+
 /// Convert an `Arc<Error>` (the wrapper that lets us fan one refresh
 /// failure out to N waiters) back into a fresh owned `Error`. We
 /// cannot move out of the `Arc` because waiters may still hold
@@ -482,6 +534,16 @@ fn arc_err_to_error(err: Arc<Error>) -> Error {
     }
 }
 
+fn is_terminal_auth_error(err: &Error) -> bool {
+    matches!(err, Error::AuthLost { .. })
+        || matches!(
+            err,
+            Error::Status { code, .. }
+                if *code == reqwest::StatusCode::UNAUTHORIZED
+                    || *code == reqwest::StatusCode::FORBIDDEN
+        )
+}
+
 fn retry_after_deadline(err: &Error) -> Option<SystemTime> {
     let duration = match err {
         Error::RateLimited {
@@ -526,6 +588,9 @@ pub enum RefreshState {
         token: AccessToken,
         /// Wall-clock instant at which the cached token was minted.
         refreshed_at: Instant,
+        /// Earliest next proactive refresh attempt after a transient
+        /// failure. Forced refreshes ignore this deadline.
+        refresh_not_before: Option<Instant>,
     },
     /// A refresh is in flight. The task that transitioned the state
     /// to `Refreshing` is driving the network call; concurrent
@@ -542,6 +607,12 @@ pub enum RefreshState {
         /// driving task is NOT in this list - it owns the refresh
         /// future directly.
         waiters: Vec<oneshot::Sender<Result<AccessToken, Arc<Error>>>>,
+        /// Still-valid cached token displaced by a proactive refresh.
+        /// A transient refresh failure restores this entry so the
+        /// caller can use the remaining token lifetime. Forced
+        /// refreshes never carry a fallback because a target 401 is
+        /// evidence that the cached credential is unusable.
+        fallback: Option<(AccessToken, Instant)>,
     },
 }
 
@@ -550,6 +621,71 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingRefreshSource {
+        calls: AtomicUsize,
+    }
+
+    impl TokenSource for FailingRefreshSource {
+        fn current(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.refresh()
+        }
+
+        fn refresh(&self) -> AccountFuture<Result<AccessToken, Error>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(Error::Network {
+                    message: "transient refresh failure".to_string(),
+                    transmission_state: bifrost_types::TransmissionState::Unsent,
+                    source: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn proactive_refresh_failure_restores_a_still_valid_token() {
+        let source = Arc::new(FailingRefreshSource {
+            calls: AtomicUsize::new(0),
+        });
+        let refresher = OAuthRefresher::new(Arc::clone(&source) as Arc<dyn TokenSource>);
+        let token = AccessToken::new(
+            "still-valid",
+            Some(Instant::now() + Duration::from_secs(30)),
+        );
+        *refresher.state.lock().await = RefreshState::Fresh {
+            token,
+            refreshed_at: Instant::now(),
+            refresh_not_before: None,
+        };
+
+        let returned = refresher
+            .token()
+            .await
+            .expect("transient proactive refresh failure should use cached token");
+
+        assert_eq!(returned.as_str(), "still-valid");
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            refresher
+                .token()
+                .await
+                .expect("retry suppression reuses the fallback token")
+                .as_str(),
+            "still-valid"
+        );
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            1,
+            "the next request must not immediately retry the failed refresh"
+        );
+        let state = refresher.state.lock().await;
+        let RefreshState::Fresh { token, .. } = &*state else {
+            panic!("still-valid token was not restored");
+        };
+        assert_eq!(token.as_str(), "still-valid");
+    }
 
     #[test]
     fn retry_after_deadline_parses_status_header() {

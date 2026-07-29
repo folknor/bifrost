@@ -253,7 +253,7 @@ pub(crate) fn initial_delta_url(
     match scope {
         CursorScope::FolderType { folder, ty } => {
             let native = super::foreign::parse_folder(folder).native_id().to_string();
-            let encoded = bifrost_net::url::encode_component(&native);
+            let encoded = bifrost_net::url::encode_path_component(&native);
             match ty {
                 ObjectType::Email => Ok(format!(
                     "{prefix}/mailFolders/{encoded}/messages/delta?$select={MESSAGE_SELECT}&$top=50"

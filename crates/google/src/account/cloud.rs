@@ -283,6 +283,7 @@ async fn create_sharing_permission(
         }),
     };
 
+    let file_id = bifrost_net::url::encode_path_component(file_id);
     let path = format!("https://www.googleapis.com/drive/v3/files/{file_id}/permissions?fields=id");
     let _perm: serde::de::IgnoredAny = client.post(&path, &body).await?;
 

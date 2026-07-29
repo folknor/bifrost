@@ -293,13 +293,13 @@ fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<Str
         CursorScope::FolderType { folder, ty } => match ty {
             ObjectType::Email => {
                 let native = super::foreign::parse_folder(folder).native_id().to_string();
-                let encoded = bifrost_net::url::encode_component(&native);
+                let encoded = bifrost_net::url::encode_path_component(&native);
                 Some(format!("{prefix}/mailFolders/{encoded}/messages"))
             }
             ObjectType::Event | ObjectType::CalendarEvent => Some(format!("{prefix}/events")),
             ObjectType::Contact => {
                 let native = super::foreign::parse_folder(folder).native_id().to_string();
-                let encoded = bifrost_net::url::encode_component(&native);
+                let encoded = bifrost_net::url::encode_path_component(&native);
                 Some(format!("{prefix}/contactFolders/{encoded}/contacts"))
             }
             _ => None,

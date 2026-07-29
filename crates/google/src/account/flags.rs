@@ -94,20 +94,39 @@ pub(crate) fn canonical_flags(label_ids: &[String], labels: &[GmailLabel]) -> Ca
         .collect::<HashMap<_, _>>();
     let mut flags = Vec::new();
 
-    if !label_ids.iter().any(|label| label == LABEL_UNREAD) {
+    if !label_ids
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(LABEL_UNREAD))
+    {
         flags.push(FLAG_SEEN.to_string());
     }
 
     for label_id in label_ids {
-        match label_id.as_str() {
-            LABEL_UNREAD | "INBOX" | "SENT" | "TRASH" | "SPAM" | "CHAT" => {}
-            LABEL_STARRED => flags.push(FLAG_FLAGGED.to_string()),
-            LABEL_DRAFT => flags.push(FLAG_DRAFT.to_string()),
-            LABEL_IMPORTANT => flags.push(FLAG_IMPORTANT.to_string()),
-            other => {
-                let name = names_by_id.get(other).copied().unwrap_or(other);
-                flags.push(format!("$gmail-label:{other}:{name}"));
-            }
+        if [
+            LABEL_UNREAD,
+            LABEL_INBOX,
+            "SENT",
+            LABEL_TRASH,
+            LABEL_SPAM,
+            "CHAT",
+        ]
+        .iter()
+        .any(|system| label_id.eq_ignore_ascii_case(system))
+        {
+            continue;
+        }
+        if label_id.eq_ignore_ascii_case(LABEL_STARRED) {
+            flags.push(FLAG_FLAGGED.to_string());
+        } else if label_id.eq_ignore_ascii_case(LABEL_DRAFT) {
+            flags.push(FLAG_DRAFT.to_string());
+        } else if label_id.eq_ignore_ascii_case(LABEL_IMPORTANT) {
+            flags.push(FLAG_IMPORTANT.to_string());
+        } else {
+            let name = names_by_id
+                .get(label_id.as_str())
+                .copied()
+                .unwrap_or(label_id);
+            flags.push(format!("$gmail-label:{label_id}:{name}"));
         }
     }
 
@@ -269,8 +288,7 @@ fn flag_to_remove_label(flag: &str, labels: &[GmailLabel]) -> FlagTranslation {
 /// category labels (`CATEGORY_PROMOTIONS` and friends, which come back
 /// with `name == id`). Type-filtering here makes those flags unresolvable,
 /// which lands them in `unsupported_flags`, which `apply_label_patch`
-/// turns into `MutationSuccess::Skipped` for the whole batch - a success
-/// lane reporting that nothing happened. The ids that would genuinely be
+/// turns into a failed outcome for the whole batch. The ids that would genuinely be
 /// dangerous to resolve this way (UNREAD, INBOX, SENT, TRASH, SPAM, CHAT,
 /// STARRED, DRAFT, IMPORTANT) can never reach this spelling because
 /// `canonical_flags` matches them before its fallback arm.
@@ -546,7 +564,7 @@ mod tests {
     /// `$gmail-label:` fallback exactly like a user label. If
     /// `user_label_id_from_flag` ever grows a `label_type == "user"`
     /// filter again, this round trip breaks and every affected batch
-    /// reports `Succeeded(Skipped)` while applying nothing.
+    /// fails as malformed instead of applying the resolvable label.
     #[test]
     fn a_system_category_label_flag_round_trips_through_translation() {
         let labels = vec![GmailLabel {
@@ -643,7 +661,7 @@ mod tests {
         assert_eq!(patch.unsupported_flags, vec!["$Junk".to_string()]);
         assert!(
             !patch.remove_label_ids.is_empty(),
-            "the canonical half still translates; the driver skips on unsupported_flags",
+            "the canonical half still translates; the driver fails on unsupported_flags",
         );
     }
 
@@ -735,10 +753,9 @@ mod tests {
         );
     }
 
-    /// DOCUMENTS CURRENT BEHAVIOUR. An unknown label id renders with
-    /// the id in the name position, so the flag spelling silently
-    /// changes once the label list catches up. That is the same
-    /// mechanism that makes `flags_hash` cache-order dependent.
+    /// A label id missing from a freshly fetched vocabulary uses its
+    /// stable id as the display-name fallback. A later vocabulary
+    /// refresh can update the display-bearing flag and its hash.
     #[test]
     fn an_unknown_label_id_renders_its_id_in_the_name_slot() {
         let canonical = canonical_flags(&["Label_9".to_string()], &[]);
@@ -749,19 +766,19 @@ mod tests {
         );
     }
 
-    /// The `UNREAD` check that derives `\Seen` is an exact match, while
-    /// the exclusive-container check in `move_placement_patch` is
-    /// case-insensitive. Gmail only ever emits uppercase system ids, so
-    /// this is latent, but the two halves of the crate disagree.
     #[test]
-    fn the_unread_projection_is_case_sensitive_unlike_the_move_rule() {
+    fn system_label_projection_is_case_insensitive() {
         let upper = canonical_flags(&[LABEL_UNREAD.to_string()], &[]);
         assert!(!upper.flags.contains(&FLAG_SEEN.to_string()));
 
         let lower = canonical_flags(&["unread".to_string()], &[]);
         assert!(
-            lower.flags.contains(&FLAG_SEEN.to_string()),
-            "a lowercased UNREAD is not recognised and the message reads as seen",
+            !lower.flags.contains(&FLAG_SEEN.to_string()),
+            "a lowercased UNREAD still projects as unread",
+        );
+        assert!(
+            lower.flags.is_empty(),
+            "a system label must not leak into the user-label namespace"
         );
     }
 

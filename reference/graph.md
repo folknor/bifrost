@@ -102,6 +102,19 @@ through it); helper modules and `GraphAccount` stay crate-private. `GraphClient`
 `with_api_base*` take a raw token; `with_source` / `with_account_net` take
 a shared `Arc<dyn TokenSource>` that `attach_account` hands to bifrost-net.
 
+`attach_account` is called again on every reopen with the same engine
+id. When the client owns a parent `Net` it mints a fresh `AccountNet`,
+installs it, and then calls `detach()` on the handle it displaced.
+`Net::attach_account` issues a distinct registration token per call and
+does not unregister a previous attachment for the same id, so without
+that explicit teardown each reopen would leak one meter attachment and
+one governor attach count and the host bucket would never be reclaimed.
+Detaching after the install keeps the shared counts from reaching zero,
+so requests still in flight on the displaced handle continue to meter
+against the same counters. When the client was built with
+`with_account_net` there is no parent `Net` and the existing handle is
+retagged instead, which moves its token rather than minting a new one.
+
 `GraphAccountFactory` carries a `GraphClient`, a `PushMode`, an optional
 `PushEndpoint`, a `shared_mailboxes: Vec<String>`, and
 `public_folders: Option<PublicFolderScope>`.

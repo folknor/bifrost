@@ -34,12 +34,15 @@ let account = net.attach_account(account_id, spec);     // per-account
   call `Net::new` and hand the result to the protocol clients
   explicitly.
 
-`Net::detach_account` is symmetric: it forgets the bandwidth
-counters and decrements the governor's per-host attach count for
-every host the matching `attach_account` registered. Host buckets
-drop when the attach count reaches zero, so five Gmail accounts
-sharing one host bucket survive any one detach but the bucket is
-reclaimed when the last account detaches.
+Every `attach_account` receives a monotone registration token carried
+by its `AccountNet`. `AccountNet::detach()` removes that exact
+registration, decrements the meter's per-id attach count, and
+decrements the governor for only the hosts that attachment
+successfully registered. This remains safe when two live handles have
+the same `AccountId`: a stale Drop cannot detach the replacement.
+`Net::detach_account(id)` remains the ID-only compatibility entry point
+and removes one registration. Host buckets and meter counters are
+reclaimed only after their final matching detach.
 
 `AccountNet::retag(new_id)` re-mints the handle under a different
 engine `AccountId`. Used by protocol-crate factories whose
@@ -47,12 +50,12 @@ engine `AccountId`. Used by protocol-crate factories whose
 consumer built the `AccountNet` ahead of time via
 `*Client::with_account_net` and the parent `Net` is no longer
 reachable through the client. The meter registers `new_id`,
-`Net`'s per-account host map moves under `new_id` (so a later
-`detach_account(new_id)` is symmetric), and the new handle inherits
-token source, retry policy, priority, and bandwidth cap from the
-old. Governor refcounts are per-host and not touched. The old
-handle keeps working for in-flight clones; it just no longer owns
-the host registrations.
+the exact token's per-account host entry moves under `new_id`, and the
+meter transfers one attachment count. The new handle inherits token
+source, retry policy, priority, and bandwidth cap from the old.
+Governor refcounts are per-host and not touched. The old handle keeps
+working for in-flight clones; its old-id teardown is a no-op because
+the token moved.
 
 ## Request flow
 
@@ -73,6 +76,13 @@ fresh wire request: governor debit + outbound metering + body send
 + inbound metering. Buffered (`send`) and streaming
 (`send_streaming`) share `send_streaming_inner`; the buffered path
 drains the body through the same metering reader.
+
+The loop sends through a crate-private `Dispatch` seam. Production
+dispatch delegates to reqwest. Unit tests install a scripted dispatcher
+that accepts real reqwest request builders and returns in-process
+responses or typed transport errors. This covers retry,
+authentication, redirect, range, metering, and cancellation behavior
+without sockets or listeners.
 
 `AccountNet` exposes `get`, `post`, `put`, `patch`, `delete` - one
 constructor per HTTP method routing into the same `RequestBuilder`.
@@ -134,6 +144,11 @@ The rate-limit slot is **refunded on every retried failure**, not
 just 429-with-Retry-After, so 5xx retries don't burn quota for work
 the server didn't perform.
 
+Each acquired slot is held by an armed guard until a response arrives.
+Dropping or cancelling the request future before server
+acknowledgement refunds the slot automatically. Response-backed retry
+and redirect paths retain their explicit refund rules.
+
 ## OAuth single-flight (`OAuthRefresher`)
 
 State machine: `Empty` -> `Refreshing` -> `Fresh`. The first
@@ -149,6 +164,14 @@ transient-vs-permanent: `Network`/`Timeout` survive as themselves;
 true auth failures (token-endpoint 401/403) map to `AuthLost`.
 OAuth 429/503 `Retry-After` hints are projected to the wrapper's
 absolute deadline.
+
+When a proactive refresh displaces a cached token with a known expiry,
+`Refreshing` retains that token as a fallback. A transient refresh
+failure restores and returns it if it is still valid, and defers the
+next proactive attempt for 30 seconds so an endpoint outage does not
+cause one refresh call per request. Token expiry overrides that delay.
+Forced refreshes after a target 401 and terminal token-endpoint
+authentication failures never use the fallback.
 
 `AccessToken` wraps `Zeroizing<String>`; `Debug` redacts the bytes
 and surfaces only length + expiry.
@@ -192,13 +215,23 @@ HostBucket>>>`. `acquire(host, cost)` returns a `Send + 'static`
 future that captures `Arc::clone(&self.buckets)`, refills tokens
 based on elapsed time, debits `cost` if available, otherwise awaits
 the bucket's `Notify` (with a 250 ms poll cap so refunds don't
-deadlock). `refund(host, cost)` wakes one waiter.
+deadlock). Refill timestamps use `tokio::time::Instant`, so paused-time
+tests advance deterministically. `refund(host, cost)` wakes one waiter.
 
 `cost > burst` short-circuits to `Error::CostExceedsBurst` instead
 of hanging: the bucket can never fill that high. Configuration bug,
 not a runtime condition.
 
 Unregistered hosts are unmetered (no-op `acquire`).
+
+For a previously unregistered host, registration rejects non-finite,
+zero, and negative `quota_per_second` values with a warning and
+returns `false`. `Net` records only successful registrations in the
+attachment token's host set, so a rejected account cannot later
+unregister another account's valid bucket. A duplicate declaration,
+even an invalid one, joins the first valid bucket, increments its
+attach count, and returns `true`. Invalid quota configuration
+therefore cannot panic, spin, park forever, or unbalance teardown.
 
 ### Cost defaults
 
@@ -228,6 +261,13 @@ Outbound metering is wired in `send_streaming_inner` (records
 `body.len()` per attempt). Inbound metering is per-chunk on the
 response body reader, both buffered and streaming.
 
+`AccountNet` caches its `AccountMeter` at attach or retag time, avoiding
+an account-id allocation and meter-map lookup on each request attempt.
+Meter registrations are counted per `AccountId`; one detach cannot
+remove the live entry of a concurrent reopen. After the final detach,
+an already-cached handle retains a frozen counter snapshot while new
+lookups return zero.
+
 `MeterSink` trait lets IMAP/SMTP (which bypass this crate's
 transport) feed `record_bytes_in` / `record_bytes_out` into the
 same meter when the engine wires them. `MeterSinkHandle` is the
@@ -237,7 +277,9 @@ site does not have to thread the id alongside every byte count.
 `MeterSinkHandle::from_meter` wraps the process-wide
 `BandwidthMeter` directly; the trait-object form
 `MeterSinkHandle::new` accepts any `Arc<dyn MeterSink>` for test
-doubles. Wiring against IMAP / SMTP lands in S1-W2.
+doubles. Both the direct HTTP meter and `MeterSink` are lookup-only:
+recording against an unknown or detached account is a no-op and never
+re-registers it. Wiring against IMAP / SMTP lands in S1-W2.
 
 ### Bandwidth cap
 
@@ -245,7 +287,9 @@ Per-account cap stored on `AccountNet` in `AtomicU64` with
 `u64::MAX` sentinel for `None`. Throttles via `ByteBucket` on the
 response-body reader. Chunks larger than the per-second cap are
 admitted after `(chunk_size / cap)` seconds of sleep (the cap is a
-smoothing throttle, not a hard ceiling on chunk size).
+smoothing throttle, not a hard ceiling on chunk size). `ByteBucket`
+also uses `tokio::time::Instant`, matching its Tokio sleep clock and
+allowing deterministic virtual-time tests.
 
 `set_bandwidth_cap(Some(0))` is **not** a sentinel for unlimited
 (that is `None`'s job). It is normalised to `Some(1)` with a
@@ -259,6 +303,11 @@ When a `Range` was requested, the response **MUST** be
 returns `Error::RangeNotHonored` (the server collapsed the range,
 so the bytes don't match the request). Bare requests accept
 `200 OK` as before.
+
+For a closed request whose end exceeds the resource length, a legal
+shortened response is accepted when its end is exactly the known
+resource tail. A shorter window before the resource tail remains a
+`ContentRangeMismatch`.
 
 ### Open-ended `Content-Range` validation
 
@@ -339,9 +388,10 @@ and any caller-set `Authorization` header sitting in the request's
 runs in the redirect loop after `classify_redirect` flags
 `keep_auth: false`, so a credential never travels to a host the
 original request did not target. `max_hops` (default 10) caps the
-chain; `Error::RedirectLoop` surfaces past it. Each redirect hop
-resets the retry counter to 0 - hops are fresh logical requests,
-not retries.
+chain; the pipeline uses a widened counter so even `max_hops = 255`
+terminates on hop 256 with `Error::RedirectLoop`. Each redirect hop
+resets the retry counter to 0 - hops are fresh logical requests, not
+retries.
 
 `RedirectPolicy::reqwest_policy()` is the bare-client entry point for
 callers that build their own `reqwest::Client` instead of routing
@@ -372,8 +422,7 @@ let callers configure the policy without naming the outer enum.
 configuration data: corrupt native-tls root cert DER, reqwest
 rejection of the re-encoded DER, or client-builder failure. These
 route to the account error model as `Request(Malformed)`, not as a
-retryable transport setup failure. `Error::NetSetup` remains only as
-a legacy representable variant.
+retryable transport setup failure.
 
 ## traceparent
 
@@ -434,15 +483,10 @@ variants:
   the configured `RedirectPolicy::trusted_hosts` allowlist.
 - `MalformedRedirect { kind, message }` - acknowledged 3xx response
   with a present-but-broken `Location` (non-UTF-8 or unresolvable). A
-  *missing* `Location` is no longer an error: it passes through (see
-  the redirect loop above). The `MissingLocation` kind remains in the
-  enum for the error-mapping contract but is no longer produced by
-  `classify_redirect`.
+  *missing* `Location` is not an error: it passes through (see the
+  redirect loop above).
 - `RedirectLoop { hops }` - redirect chain exceeded
   `RedirectPolicy::max_hops`.
-- `NetSetup { message, source }` - `Net::new` construction
-  failure retained as a legacy representable variant, no longer
-  constructed by current `Net::new` paths.
 
 `Status`/`Response` carry `reqwest::StatusCode` and `HeaderMap`
 straight through. Documented coupling cost; acceptable for v1.
@@ -469,16 +513,16 @@ and leaves provider JSON interpretation to JMAP, Gmail, and Graph.
 
 ## URL helpers
 
-`url::encode_component(value: &str) -> String` percent-encodes one
-URL path or query component, preserving RFC 3986 unreserved
-characters and escaping everything else (space, `"`, `#`, `$`, `%`,
-`&`, `'`, `(`, `)`, `*`, `+`, `,`, `/`, `:`, `;`, `=`, `?`, `@`,
-`[`, `]`, plus all `CONTROLS`). Backed by `percent-encoding`'s
-`utf8_percent_encode`. The HTTP protocol crates (gmail, graph) call
-this on every dynamic segment they splice into a URL so callers do
-not have to remember which escape set the API expects; pulling it
-into `bifrost-net` keeps the set defined exactly once for the
-whole workspace.
+`url::encode_path_component(value)` and
+`url::encode_query_value(value)` share the RFC 3986 component escape
+set: unreserved characters survive and every other ASCII character
+plus all controls is escaped. The path form additionally
+double-escapes a complete `.` or `..` component so the WHATWG parser
+cannot resolve it as navigation while parsing the assembled URL. The
+query form leaves those values literal because dots have no structural
+meaning there. The HTTP protocol crates name the grammar at every call
+site, preventing path hardening from corrupting search and filter
+values.
 
 ## File map
 
@@ -490,7 +534,7 @@ crates/net/src/
   net.rs          // Net + AccountNet; shared_default; attach/detach;
                   // download_stream
   request.rs      // RequestBuilder + Response/StreamingResponse;
-                  // retry loop + method-aware redirect walk
+                  // Dispatch seam, retry loop, redirect walk
   redirect.rs     // FollowRedirects + RedirectPolicy + classify_redirect
                   // (RFC 7231 §6.4 method rewriting, trusted-host
                   //  allowlist, Authorization stripping)
@@ -503,5 +547,5 @@ crates/net/src/
                   // MeterSinkHandle
   error.rs        // Error + cap_status_body
   trace.rs        // traceparent injection (current: uuid trace id)
-  url.rs          // encode_component for URL path/query segments
+  url.rs          // distinct path-component and query-value encoders
 ```

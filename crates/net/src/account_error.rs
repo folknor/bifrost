@@ -137,12 +137,6 @@ pub fn into_account_error(error: Error, ctx: NetErrorContext) -> AccountError {
                 contract_violation(&ctx, message, TransmissionState::Acknowledged)
             }
         },
-        Error::NetSetup { message, source } => invalid_argument_with_source(
-            &ctx,
-            "client_config",
-            message,
-            source.as_ref().map(ToString::to_string),
-        ),
         Error::RedirectRejected { message } => {
             let builder = invalid_argument_builder(&ctx, "redirect_policy", message);
             finish(push_attempt(builder, TransmissionState::Acknowledged), &ctx)
@@ -687,7 +681,6 @@ fn support_cause_from_source(error: &Error) -> Option<Cause> {
         | Error::InvalidHeader { .. }
         | Error::InvalidRequest { .. }
         | Error::RangeNotHonored { .. }
-        | Error::NetSetup { .. }
         | Error::RedirectRejected { .. }
         | Error::MalformedRedirect { .. }
         | Error::RedirectLoop { .. } => None,

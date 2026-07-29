@@ -485,7 +485,7 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
 fn hydrate_url_for_id(account: &GraphAccount, id: &ObjectId, select: &str) -> String {
     let parsed = super::foreign::parse_message_id(id);
     let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
-    let enc_id = bifrost_net::url::encode_component(parsed.native_id());
+    let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
     format!("{prefix}/messages/{enc_id}?$select={select}")
 }
 

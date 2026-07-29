@@ -67,6 +67,13 @@ pub(crate) struct PubSubControl {
     health_tx: broadcast::Sender<WatchEvent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandleRemoval {
+    Last,
+    Remaining,
+    NotPresent,
+}
+
 impl PubSubControl {
     pub(crate) fn new(config: Option<PubSubConfig>) -> Self {
         let (health_tx, _) = broadcast::channel(32);
@@ -99,10 +106,16 @@ impl PubSubControl {
         self.active_handles.lock().await.insert(handle.0.clone());
     }
 
-    async fn remove_handle(&self, handle: &SubscriptionHandle) -> bool {
+    async fn remove_handle(&self, handle: &SubscriptionHandle) -> HandleRemoval {
         let mut handles = self.active_handles.lock().await;
-        handles.remove(&handle.0);
-        handles.is_empty()
+        if !handles.remove(&handle.0) {
+            return HandleRemoval::NotPresent;
+        }
+        if handles.is_empty() {
+            HandleRemoval::Last
+        } else {
+            HandleRemoval::Remaining
+        }
     }
 
     fn report_health(&self, event: WatchEvent) {
@@ -199,8 +212,9 @@ pub(crate) fn push_unsubscribe(
                     error::GmailErrorContext::push_unsubscribe(),
                 )
             })?;
-        if !pubsub.remove_handle(&handle).await {
-            return Ok(());
+        match pubsub.remove_handle(&handle).await {
+            HandleRemoval::Last => {}
+            HandleRemoval::Remaining | HandleRemoval::NotPresent => return Ok(()),
         }
         stop_watch(&client).await.map_err(|error| {
             error::into_account_error(error, error::GmailErrorContext::push_unsubscribe())
@@ -479,6 +493,34 @@ mod tests {
         assert!(
             serde_json::from_str::<GmailSubscriptionHandle>(r#"{"topic":"t"}"#).is_err(),
             "history_id is required in the envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_removal_distinguishes_unknown_remaining_and_last() {
+        let control = PubSubControl::new(None);
+        let first = SubscriptionHandle("first".to_string());
+        let second = SubscriptionHandle("second".to_string());
+        let unknown = SubscriptionHandle("unknown".to_string());
+
+        assert_eq!(
+            control.remove_handle(&unknown).await,
+            HandleRemoval::NotPresent
+        );
+        control.insert_handle(&first).await;
+        control.insert_handle(&second).await;
+        assert_eq!(
+            control.remove_handle(&unknown).await,
+            HandleRemoval::NotPresent
+        );
+        assert_eq!(
+            control.remove_handle(&first).await,
+            HandleRemoval::Remaining
+        );
+        assert_eq!(control.remove_handle(&second).await, HandleRemoval::Last);
+        assert_eq!(
+            control.remove_handle(&second).await,
+            HandleRemoval::NotPresent
         );
     }
 

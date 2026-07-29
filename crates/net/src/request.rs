@@ -9,7 +9,7 @@ use std::error::Error as StdError;
 use std::pin::Pin;
 use std::time::Duration;
 
-use bifrost_types::TransmissionState;
+use bifrost_types::{AccountFuture, TransmissionState};
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::{
@@ -21,6 +21,7 @@ use serde::Serialize;
 use crate::auth::AccessToken;
 use crate::error::{Error, FinalResponse, STATUS_BODY_CAP};
 use crate::net::{AccountNet, into_byte_stream, wrap_metered};
+use crate::rate::RateLimitGovernor;
 use crate::redirect::{FollowRedirects, RedirectAction, RedirectPolicy, classify_redirect};
 use crate::retry::RetryPolicy;
 
@@ -28,6 +29,54 @@ use crate::retry::RetryPolicy;
 /// One element per chunk reqwest yields off the underlying socket;
 /// bandwidth metering wraps every chunk.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Error>> + Send + 'static>>;
+
+pub(crate) trait Dispatch: Send + Sync + 'static {
+    fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> AccountFuture<Result<reqwest::Response, Error>>;
+}
+
+pub(crate) struct ReqwestDispatch;
+
+impl Dispatch for ReqwestDispatch {
+    fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> AccountFuture<Result<reqwest::Response, Error>> {
+        Box::pin(async move { request.send().await.map_err(send_error_to_error) })
+    }
+}
+
+struct RateDebit {
+    governor: RateLimitGovernor,
+    host: String,
+    cost: u32,
+    armed: bool,
+}
+
+impl RateDebit {
+    fn new(governor: RateLimitGovernor, host: String, cost: u32) -> Self {
+        Self {
+            governor,
+            host,
+            cost,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RateDebit {
+    fn drop(&mut self) {
+        if self.armed {
+            self.governor.refund(&self.host, self.cost);
+        }
+    }
+}
 
 /// Fluent request builder. Consumes `self` on every setter so the
 /// final `send` call is a single move.
@@ -365,7 +414,7 @@ pub(crate) async fn send_streaming_inner(
     // Redirect hop count. Each redirect hop is a fresh logical
     // request - retry-budget zero, auth-budget zero, but one tick
     // against the configured `RedirectPolicy::max_hops`.
-    let mut redirect_hops: u8 = 0;
+    let mut redirect_hops: u16 = 0;
 
     'outer: loop {
         attempt = attempt.saturating_add(1);
@@ -377,6 +426,14 @@ pub(crate) async fn send_streaming_inner(
         if let Some(ref h) = host {
             account.net().governor().acquire(h, cost_units).await?;
         }
+        // Until the server acknowledges the request, cancellation or
+        // any early return must restore the debited slot. Once a
+        // response arrives the guard is disarmed because the server
+        // has consumed the attempt. Explicit retry and redirect paths
+        // below retain their existing refund rules.
+        let mut rate_debit = host
+            .as_ref()
+            .map(|h| RateDebit::new(account.net().governor().clone(), h.clone(), cost_units));
 
         // Mint a fresh `Authorization` from the token source. The
         // token source itself handles single-flight refresh.
@@ -392,15 +449,7 @@ pub(crate) async fn send_streaming_inner(
         let token = if auth_for_next_hop {
             match account.token_source().current().await {
                 Ok(t) => Some(t),
-                Err(e) => {
-                    // The request never reached the wire; refund the
-                    // rate-limit slot so neighbours aren't starved by
-                    // a bookkeeping leak.
-                    if let Some(ref h) = host {
-                        account.net().governor().refund(h, cost_units);
-                    }
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         } else {
             None
@@ -428,24 +477,26 @@ pub(crate) async fn send_streaming_inner(
             timeout,
         );
 
-        let response = match request.send().await {
-            Ok(r) => r,
+        let response = match account.net().dispatch().send(request).await {
+            Ok(r) => {
+                if let Some(debit) = rate_debit.as_mut() {
+                    debit.disarm();
+                }
+                r
+            }
             Err(e) => {
-                if let Some(ref h) = host {
-                    account.net().governor().refund(h, cost_units);
-                }
-                if e.is_builder() {
-                    return Err(Error::InvalidRequest {
-                        field: "request",
-                        detail: format!("{e}"),
-                    });
-                }
-                if policy.network_errors && attempt < policy.max_attempts {
+                if policy.network_errors
+                    && attempt < policy.max_attempts
+                    && matches!(
+                        e,
+                        Error::Network { .. } | Error::Timeout { .. } | Error::Tls { .. }
+                    )
+                {
                     let delay = backoff_for(&policy, attempt);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                return Err(send_error_to_error(e));
+                return Err(e);
             }
         };
 
@@ -560,7 +611,7 @@ pub(crate) async fn send_streaming_inner(
                         }
                         RedirectAction::Follow(step) => {
                             redirect_hops = redirect_hops.saturating_add(1);
-                            if redirect_hops > policy.max_hops {
+                            if redirect_hops > u16::from(policy.max_hops) {
                                 return Err(Error::RedirectLoop {
                                     hops: redirect_hops,
                                 });
@@ -740,9 +791,8 @@ fn build_reqwest(
 fn send_error_to_error(e: reqwest::Error) -> Error {
     let message = format!("{e}");
     if e.is_builder() {
-        // Kept defensive for future callers of this helper; the
-        // current send loop shortcuts builder errors before retry
-        // policy handling.
+        // Builder failures become `InvalidRequest`; the retry loop's
+        // typed retry guard excludes that variant.
         return Error::InvalidRequest {
             field: "request",
             detail: message,
@@ -905,10 +955,502 @@ pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::StaticTokenSource;
+    use crate::config::NetConfig;
+    use crate::net::{AccountSpec, Net};
     use crate::rate::{RateLimit, RateLimitGovernor};
+    use crate::redirect::FollowRedirects;
+    use bifrost_types::AccountId;
+    use reqwest::header::LOCATION;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    enum Canned {
+        Response {
+            status: StatusCode,
+            headers: HeaderMap,
+            body: Bytes,
+        },
+        Error(Error),
+        Pending,
+    }
+
+    #[derive(Clone)]
+    struct RequestSnapshot {
+        method: reqwest::Method,
+        url: reqwest::Url,
+        headers: HeaderMap,
+        body: Option<Bytes>,
+    }
+
+    struct ScriptedDispatch {
+        steps: Mutex<VecDeque<Canned>>,
+        requests: Mutex<Vec<RequestSnapshot>>,
+    }
+
+    impl ScriptedDispatch {
+        fn new(steps: impl IntoIterator<Item = Canned>) -> Arc<Self> {
+            Arc::new(Self {
+                steps: Mutex::new(steps.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn requests(&self) -> Vec<RequestSnapshot> {
+            self.requests
+                .lock()
+                .expect("scripted request lock poisoned")
+                .clone()
+        }
+    }
+
+    impl Dispatch for ScriptedDispatch {
+        fn send(
+            &self,
+            request: reqwest::RequestBuilder,
+        ) -> AccountFuture<Result<reqwest::Response, Error>> {
+            let request = match request.build() {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(send_error_to_error(error)) }),
+            };
+            let body = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .map(Bytes::copy_from_slice);
+            self.requests
+                .lock()
+                .expect("scripted request lock poisoned")
+                .push(RequestSnapshot {
+                    method: request.method().clone(),
+                    url: request.url().clone(),
+                    headers: request.headers().clone(),
+                    body,
+                });
+            let step = self
+                .steps
+                .lock()
+                .expect("scripted step lock poisoned")
+                .pop_front()
+                .expect("scripted dispatch exhausted");
+            Box::pin(async move {
+                match step {
+                    Canned::Response {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let mut response = http::Response::builder().status(status);
+                        for (name, value) in &headers {
+                            response = response.header(name, value);
+                        }
+                        Ok(response.body(body).expect("valid canned response").into())
+                    }
+                    Canned::Error(error) => Err(error),
+                    Canned::Pending => futures::future::pending().await,
+                }
+            })
+        }
+    }
+
+    fn canned(status: StatusCode, body: &'static [u8]) -> Canned {
+        Canned::Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(body),
+        }
+    }
+
+    fn canned_with_headers(status: StatusCode, headers: HeaderMap, body: &'static [u8]) -> Canned {
+        Canned::Response {
+            status,
+            headers,
+            body: Bytes::from_static(body),
+        }
+    }
+
+    fn scripted_account(
+        script: &Arc<ScriptedDispatch>,
+        config: NetConfig,
+        hosts: Vec<RateLimit>,
+        retry: RetryPolicy,
+    ) -> crate::net::AccountNet {
+        let net = Net::new_with_dispatch(config, Arc::clone(script) as Arc<dyn Dispatch>)
+            .expect("scripted net builds");
+        net.attach_account(
+            AccountId("scripted".to_string()),
+            AccountSpec {
+                hosts,
+                token_source: Arc::new(StaticTokenSource::new("token", None)),
+                default_retry: retry,
+            },
+        )
+    }
 
     fn hv(value: &str) -> HeaderValue {
         HeaderValue::from_str(value).expect("test header value")
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_retry_refunds_quota_and_preserves_final_response() {
+        let mut retry_after = HeaderMap::new();
+        retry_after.insert(RETRY_AFTER, HeaderValue::from_static("0"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::SERVICE_UNAVAILABLE, retry_after, b"retry"),
+            canned(StatusCode::OK, b"ok"),
+        ]);
+        let retry = RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            vec![RateLimit {
+                host: "retry.test".to_string(),
+                quota_per_second: 0.0001,
+                cost_default: 1,
+                burst: 1,
+            }],
+            retry,
+        );
+        let started = tokio::time::Instant::now();
+
+        let response = account
+            .post("https://retry.test/resource")
+            .body(Bytes::from_static(b"payload"))
+            .send()
+            .await
+            .expect("second scripted attempt succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body, Bytes::from_static(b"ok"));
+        assert_eq!(script.requests().len(), 2);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the retried 503 must refund the only quota token"
+        );
+        assert_eq!(account.meter().bytes_out(), 14);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_network_failure_retries_through_the_same_loop() {
+        let script = ScriptedDispatch::new([
+            Canned::Error(Error::Network {
+                message: "synthetic reset".to_string(),
+                transmission_state: TransmissionState::Unsent,
+                source: None,
+            }),
+            canned(StatusCode::OK, b"recovered"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy {
+                max_attempts: 2,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                ..RetryPolicy::default()
+            },
+        );
+
+        let response = account
+            .get("https://network.test/resource")
+            .without_bearer_auth()
+            .send()
+            .await
+            .expect("network retry succeeds");
+
+        assert_eq!(response.body, Bytes::from_static(b"recovered"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_401_refresh_has_a_separate_attempt_budget() {
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::UNAUTHORIZED, b"stale"),
+            canned(StatusCode::OK, b"fresh"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy {
+                max_attempts: 1,
+                ..RetryPolicy::default()
+            },
+        );
+
+        let response = account
+            .get("https://auth.test/resource")
+            .send()
+            .await
+            .expect("401 refresh retry does not consume max_attempts");
+
+        assert_eq!(response.body, Bytes::from_static(b"fresh"));
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_second_401_preserves_auth_lost_response() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer"),
+        );
+        let script = ScriptedDispatch::new([
+            canned(StatusCode::UNAUTHORIZED, b"first"),
+            canned_with_headers(StatusCode::UNAUTHORIZED, headers, b"second"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let error = match account.get("https://auth.test/resource").send().await {
+            Err(error) => error,
+            Ok(_) => panic!("a second 401 must be terminal auth loss"),
+        };
+
+        let Error::AuthLost {
+            transmission_state: Some(TransmissionState::Acknowledged),
+            final_response: Some(final_response),
+        } = error
+        else {
+            panic!("expected acknowledged AuthLost");
+        };
+        assert_eq!(final_response.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(final_response.body, Bytes::from_static(b"second"));
+        assert!(
+            final_response
+                .headers
+                .contains_key(reqwest::header::WWW_AUTHENTICATE)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_redirect_rewrites_post_and_strips_cross_host_auth() {
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(
+            LOCATION,
+            HeaderValue::from_static("https://target.test/final"),
+        );
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::FOUND, redirect_headers, b""),
+            canned(StatusCode::OK, b"done"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let response = account
+            .post("https://origin.test/start")
+            .header(AUTHORIZATION.as_str(), "Basic caller-secret")
+            .body(Bytes::from_static(b"body"))
+            .send()
+            .await
+            .expect("redirect target succeeds");
+
+        assert_eq!(response.body, Bytes::from_static(b"done"));
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, reqwest::Method::POST);
+        assert_eq!(requests[0].body, Some(Bytes::from_static(b"body")));
+        assert!(requests[0].headers.contains_key(AUTHORIZATION));
+        assert_eq!(requests[1].method, reqwest::Method::GET);
+        assert_eq!(requests[1].url.as_str(), "https://target.test/final");
+        assert_eq!(requests[1].body, None);
+        assert!(!requests[1].headers.contains_key(AUTHORIZATION));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn max_255_redirect_policy_terminates_on_hop_256() {
+        let mut redirect_headers = HeaderMap::new();
+        redirect_headers.insert(LOCATION, HeaderValue::from_static("/next"));
+        let steps = (0..=255).map(|_| {
+            canned_with_headers(
+                StatusCode::TEMPORARY_REDIRECT,
+                redirect_headers.clone(),
+                b"",
+            )
+        });
+        let script = ScriptedDispatch::new(steps);
+        let config = NetConfig::default()
+            .follow_redirects(FollowRedirects::Enabled(RedirectPolicy::with_hops(255)));
+        let account = scripted_account(&script, config, Vec::new(), RetryPolicy::disabled());
+
+        let error = match account
+            .get("https://redirect.test/start")
+            .without_bearer_auth()
+            .send()
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the widened counter must terminate after the configured maximum"),
+        };
+
+        assert!(matches!(error, Error::RedirectLoop { hops: 256 }));
+        assert_eq!(script.requests().len(), 256);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn exhausted_status_retry_keeps_the_final_hint_and_body() {
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        let mut final_headers = HeaderMap::new();
+        final_headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        let script = ScriptedDispatch::new([
+            canned_with_headers(StatusCode::SERVICE_UNAVAILABLE, first_headers, b"first"),
+            canned_with_headers(StatusCode::SERVICE_UNAVAILABLE, final_headers, b"final"),
+        ]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy {
+                max_attempts: 2,
+                honor_retry_after_cap: Duration::from_secs(10),
+                ..RetryPolicy::default()
+            },
+        );
+
+        let error = match account
+            .get("https://retry.test/resource")
+            .without_bearer_auth()
+            .send()
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("retry budget must be exhausted"),
+        };
+
+        let Error::RetryBudgetExhausted {
+            final_response: Some(final_response),
+            retry_after_history,
+        } = error
+        else {
+            panic!("expected retry budget evidence");
+        };
+        assert_eq!(final_response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(final_response.body, Bytes::from_static(b"final"));
+        assert_eq!(
+            retry_after_history,
+            vec![Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scripted_download_accepts_a_legal_shortened_closed_range() {
+        use futures::TryStreamExt;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 0-49/50"),
+        );
+        let script = ScriptedDispatch::new([Canned::Response {
+            status: StatusCode::PARTIAL_CONTENT,
+            headers,
+            body: Bytes::from(vec![7; 50]),
+        }]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            Vec::new(),
+            RetryPolicy::disabled(),
+        );
+
+        let chunks = account
+            .download_stream(
+                "https://range.test/blob",
+                Some(bifrost_types::ByteRange {
+                    start: 0,
+                    length: Some(100),
+                }),
+            )
+            .await
+            .expect("the server returned the complete shorter resource tail")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("body stream succeeds");
+
+        assert_eq!(chunks.concat(), vec![7; 50]);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn dropping_an_armed_rate_debit_refunds_the_slot() {
+        let governor = RateLimitGovernor::new();
+        governor.register(RateLimit {
+            host: "cancel.test".to_string(),
+            quota_per_second: 0.0001,
+            cost_default: 1,
+            burst: 1,
+        });
+        governor
+            .acquire("cancel.test", 1)
+            .await
+            .expect("initial debit");
+        drop(RateDebit::new(
+            governor.clone(),
+            "cancel.test".to_string(),
+            1,
+        ));
+
+        governor
+            .acquire("cancel.test", 1)
+            .await
+            .expect("guard drop restored the slot");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancelling_an_in_flight_request_refunds_its_rate_debit() {
+        let script = ScriptedDispatch::new([Canned::Pending]);
+        let account = scripted_account(
+            &script,
+            NetConfig::default(),
+            vec![RateLimit {
+                host: "cancel.test".to_string(),
+                quota_per_second: 0.0001,
+                cost_default: 1,
+                burst: 1,
+            }],
+            RetryPolicy::disabled(),
+        );
+        let request_account = account.clone();
+        let request = tokio::spawn(async move {
+            request_account
+                .get("https://cancel.test/resource")
+                .without_bearer_auth()
+                .send()
+                .await
+        });
+        for _ in 0..100 {
+            if !script.requests().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !script.requests().is_empty(),
+            "request never reached the scripted dispatcher"
+        );
+
+        request.abort();
+        let _ = request.await;
+
+        account
+            .net()
+            .governor()
+            .acquire("cancel.test", 1)
+            .await
+            .expect("cancelling before a response restores the only token");
     }
 
     // ---- backoff_for -------------------------------------------------

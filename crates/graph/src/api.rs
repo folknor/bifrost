@@ -43,7 +43,7 @@ impl GraphClient {
             .collect();
 
         while let Some(parent_id) = queue.pop_front() {
-            let enc_parent_id = bifrost_net::url::encode_component(&parent_id);
+            let enc_parent_id = bifrost_net::url::encode_path_component(&parent_id);
             let mut next_url = Some(format!(
                 "{prefix}/mailFolders/{enc_parent_id}/childFolders?$select=id,displayName,parentFolderId,childFolderCount&$top=100"
             ));
@@ -100,7 +100,7 @@ impl GraphClient {
         patch: &serde_json::Value,
     ) -> Result<GraphMessageRule, GraphError> {
         let prefix = self.api_path_prefix();
-        let encoded = bifrost_net::url::encode_component(rule_id);
+        let encoded = bifrost_net::url::encode_path_component(rule_id);
         self.patch_json(
             &format!("{prefix}/mailFolders/inbox/messageRules/{encoded}"),
             patch,
@@ -110,7 +110,7 @@ impl GraphClient {
 
     pub(crate) async fn delete_message_rule(&self, rule_id: &str) -> Result<(), GraphError> {
         let prefix = self.api_path_prefix();
-        let encoded = bifrost_net::url::encode_component(rule_id);
+        let encoded = bifrost_net::url::encode_path_component(rule_id);
         self.delete(&format!(
             "{prefix}/mailFolders/inbox/messageRules/{encoded}"
         ))

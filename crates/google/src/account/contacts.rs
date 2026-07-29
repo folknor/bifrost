@@ -96,11 +96,11 @@ pub(crate) fn list(
         let mut url = format!(
             "{}/people/me/connections?personFields={}&pageSize=1000",
             client.people_base(),
-            bifrost_net::url::encode_component(PERSON_FIELDS)
+            bifrost_net::url::encode_query_value(PERSON_FIELDS)
         );
         if let Some(token) = page_token {
             url.push_str("&pageToken=");
-            url.push_str(&bifrost_net::url::encode_component(&token));
+            url.push_str(&bifrost_net::url::encode_query_value(&token));
         }
         let response: PeopleConnectionsResponse = client
             .get(&url)
@@ -131,11 +131,11 @@ async fn list_other_contacts(
     let mut url = format!(
         "{}/otherContacts?readMask={}&pageSize=1000",
         client.people_base(),
-        bifrost_net::url::encode_component(OTHER_CONTACTS_READ_MASK)
+        bifrost_net::url::encode_query_value(OTHER_CONTACTS_READ_MASK)
     );
     if let Some(token) = page_token {
         url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_component(&token));
+        url.push_str(&bifrost_net::url::encode_query_value(&token));
     }
     let response: OtherContactsResponse = client
         .get(&url)
@@ -175,7 +175,7 @@ pub(crate) fn create(
         let url = format!(
             "{}/people:createContact?personFields={}",
             client.people_base(),
-            bifrost_net::url::encode_component(PERSON_FIELDS)
+            bifrost_net::url::encode_query_value(PERSON_FIELDS)
         );
         let person: Person = client
             .post(&url, &person)
@@ -212,8 +212,8 @@ pub(crate) fn update(
             let url = format!(
                 "{}/{encoded}:updateContact?updatePersonFields={}&personFields={}",
                 client.people_base(),
-                bifrost_net::url::encode_component(&update_fields),
-                bifrost_net::url::encode_component(PERSON_FIELDS)
+                bifrost_net::url::encode_query_value(&update_fields),
+                bifrost_net::url::encode_query_value(PERSON_FIELDS)
             );
             let _: Person = client.patch(&url, &person).await.map_err(|error| {
                 contact_error(error, AccountOperation::ContactUpdate, contact.0.clone())
@@ -263,7 +263,7 @@ fn update_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> S
 fn delete_contact_photo_url(people_base: &str, encoded_resource_name: &str) -> String {
     format!(
         "{people_base}/{encoded_resource_name}:deleteContactPhoto?personFields={}",
-        bifrost_net::url::encode_component(PERSON_FIELDS)
+        bifrost_net::url::encode_query_value(PERSON_FIELDS)
     )
 }
 
@@ -280,12 +280,12 @@ fn update_contact_photo_request(photo: bifrost_types::ContactPhoto) -> UpdateCon
 /// (which 404s) - so each `/`-delimited part is component-encoded and the
 /// parts are rejoined on a literal `/`. Any genuinely unsafe character
 /// inside a part is still escaped. This is deliberately not folded into
-/// `bifrost_net::url::encode_component`, whose other callers rely on it
+/// `bifrost_net::url::encode_path_component`, whose other callers rely on it
 /// escaping `/` as a normal component character.
 fn encode_resource_name_path(resource_name: &str) -> String {
     resource_name
         .split('/')
-        .map(bifrost_net::url::encode_component)
+        .map(bifrost_net::url::encode_path_component)
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -299,7 +299,7 @@ async fn get_person(
     let url = format!(
         "{}/{encoded}?personFields={}",
         client.people_base(),
-        bifrost_net::url::encode_component(PERSON_FIELDS)
+        bifrost_net::url::encode_query_value(PERSON_FIELDS)
     );
     client
         .get(&url)
@@ -470,7 +470,7 @@ const DIRECTORY_SOURCES: &str = "DIRECTORY_SOURCE_TYPE_DOMAIN_PROFILE";
 fn directory_search_warmup_url(people_base: &str) -> String {
     format!(
         "{people_base}/people:searchDirectoryPeople?query=&readMask={}&sources={DIRECTORY_SOURCES}",
-        bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+        bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
     )
 }
 
@@ -484,20 +484,20 @@ fn directory_search_url(
     let mut url = if query.is_empty() {
         format!(
             "{people_base}/people:listDirectoryPeople?readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
-            bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+            bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
         )
     } else {
         format!(
             "{people_base}/people:searchDirectoryPeople?query={}&readMask={}&sources={DIRECTORY_SOURCES}&pageSize={page_size}",
-            bifrost_net::url::encode_component(query),
-            bifrost_net::url::encode_component(DIRECTORY_READ_MASK)
+            bifrost_net::url::encode_query_value(query),
+            bifrost_net::url::encode_query_value(DIRECTORY_READ_MASK)
         )
     };
     if let Some(cursor) = page_cursor {
         let token = std::str::from_utf8(cursor)
             .map_err(|error| local_error(AccountOperation::DirectorySearch, error.to_string()))?;
         url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_component(token));
+        url.push_str(&bifrost_net::url::encode_query_value(token));
     }
     Ok(url)
 }
@@ -574,11 +574,11 @@ fn validate_address_book(
 fn contact_groups_url(people_base: &str, page_token: Option<&str>) -> String {
     let mut url = format!(
         "{people_base}/contactGroups?groupFields={}&pageSize=1000",
-        bifrost_net::url::encode_component("metadata,name")
+        bifrost_net::url::encode_query_value("metadata,name")
     );
     if let Some(token) = page_token {
         url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_component(token));
+        url.push_str(&bifrost_net::url::encode_query_value(token));
     }
     url
 }
@@ -586,15 +586,15 @@ fn contact_groups_url(people_base: &str, page_token: Option<&str>) -> String {
 fn search_warmup_url(people_base: &str) -> String {
     format!(
         "{people_base}/people:searchContacts?query=&readMask={}",
-        bifrost_net::url::encode_component(PERSON_FIELDS)
+        bifrost_net::url::encode_query_value(PERSON_FIELDS)
     )
 }
 
 fn search_url(people_base: &str, request: &ContactSearchRequest) -> Result<String, AccountError> {
     let mut url = format!(
         "{people_base}/people:searchContacts?query={}&readMask={}",
-        bifrost_net::url::encode_component(&request.query),
-        bifrost_net::url::encode_component(PERSON_FIELDS)
+        bifrost_net::url::encode_query_value(&request.query),
+        bifrost_net::url::encode_query_value(PERSON_FIELDS)
     );
     if let Some(limit) = request.limit {
         url.push_str("&pageSize=");
@@ -604,7 +604,7 @@ fn search_url(people_base: &str, request: &ContactSearchRequest) -> Result<Strin
         let token = std::str::from_utf8(cursor)
             .map_err(|error| local_error(AccountOperation::ContactSearch, error.to_string()))?;
         url.push_str("&pageToken=");
-        url.push_str(&bifrost_net::url::encode_component(token));
+        url.push_str(&bifrost_net::url::encode_query_value(token));
     }
     Ok(url)
 }

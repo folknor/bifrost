@@ -389,7 +389,7 @@ async fn fetch_raw_stream(
     let parsed = super::foreign::parse_message_id(message);
     let client = account.client_for_owner(parsed.owner());
     let prefix = client.api_path_prefix();
-    let enc_message_id = bifrost_net::url::encode_component(parsed.native_id());
+    let enc_message_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let url = format!(
         "{}{prefix}/messages/{enc_message_id}/$value",
         client.api_base()
@@ -420,8 +420,8 @@ async fn fetch_blob_stream(
     let parsed = super::foreign::parse_message_id(&ObjectId(locator.message_id.clone()));
     let client = account.client_for_owner(parsed.owner());
     let prefix = client.api_path_prefix();
-    let enc_message_id = bifrost_net::url::encode_component(parsed.native_id());
-    let enc_attachment_id = bifrost_net::url::encode_component(&locator.attachment_id);
+    let enc_message_id = bifrost_net::url::encode_path_component(parsed.native_id());
+    let enc_attachment_id = bifrost_net::url::encode_path_component(&locator.attachment_id);
     let url = format!(
         "{}{prefix}/messages/{enc_message_id}/attachments/{enc_attachment_id}/$value",
         client.api_base()

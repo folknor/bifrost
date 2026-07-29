@@ -348,8 +348,8 @@ pub(crate) fn applied_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSucc
         .collect()
 }
 
-/// Build per-id `MutationSuccess::Skipped` outcomes (empty patch or
-/// unsupported flag set).
+/// Build per-id `MutationSuccess::Skipped` outcomes for a legitimate
+/// empty patch.
 pub(crate) fn skipped_outcomes(ids: &[ObjectId]) -> Vec<ItemOutcome<MutationSuccess>> {
     ids.iter()
         .map(|id| {
@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_unsupported_flag_yields_skipped() {
+    fn mutation_empty_patch_yields_skipped() {
         let ids = vec![ObjectId("m1".into()), ObjectId("m2".into())];
         let outcomes = skipped_outcomes(&ids);
         assert_eq!(outcomes.len(), 2);

@@ -22,7 +22,9 @@ use crate::bandwidth::{AccountMeter, BandwidthMeter};
 use crate::config::NetConfig;
 use crate::error::{Error, RangeFailureKind};
 use crate::rate::{RateLimit, RateLimitGovernor};
-use crate::request::{ByteStream, InternalStreaming, RequestBuilder, send_streaming_inner};
+use crate::request::{
+    ByteStream, Dispatch, InternalStreaming, RequestBuilder, ReqwestDispatch, send_streaming_inner,
+};
 use crate::retry::RetryPolicy;
 use crate::{AccountId, ByteRange, Priority};
 
@@ -42,18 +44,23 @@ pub(crate) struct NetInner {
     pub(crate) config: NetConfig,
     /// Shared reqwest client built from `config` at `Net::new`.
     pub(crate) client: reqwest::Client,
+    /// Crate-private wire dispatch seam. Production delegates to
+    /// reqwest; unit tests install a scripted in-process dispatcher.
+    pub(crate) dispatch: Arc<dyn Dispatch>,
     /// Per-host rate-limit governor. Shared across every account so
     /// multi-account quota sharing on Gmail / Graph works out of the
     /// box.
     pub(crate) governor: RateLimitGovernor,
     /// Bandwidth meter, partitioned per account.
     pub(crate) meter: BandwidthMeter,
-    /// Hosts each registered account asked the governor to track.
-    /// Indexed by `AccountId` and populated at `attach_account`;
-    /// `detach_account` decrements the governor's per-host attach
-    /// count using this list so unused buckets drop to zero and the
-    /// map does not grow without bound across attach/detach cycles.
-    pub(crate) account_hosts: Mutex<HashMap<AccountId, Vec<String>>>,
+    /// Successfully registered hosts, indexed first by `AccountId`
+    /// and then by the exact attachment token.
+    pub(crate) account_hosts: Mutex<HashMap<AccountId, HashMap<u64, Vec<String>>>>,
+    /// Monotone identity for each `attach_account` registration.
+    /// AccountNet carries this token so teardown targets the exact
+    /// attachment even when the same AccountId is reopened before an
+    /// older handle drops.
+    pub(crate) next_registration_id: AtomicU64,
 }
 
 impl Net {
@@ -76,6 +83,14 @@ impl Net {
     // for a process-wide constructor that runs once at startup.
     #[allow(clippy::result_large_err)]
     pub fn new(config: NetConfig) -> Result<Self, Error> {
+        Self::new_with_dispatch(config, Arc::new(ReqwestDispatch))
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn new_with_dispatch(
+        config: NetConfig,
+        dispatch: Arc<dyn Dispatch>,
+    ) -> Result<Self, Error> {
         let mut builder = reqwest::ClientBuilder::new()
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
@@ -120,9 +135,11 @@ impl Net {
             inner: Arc::new(NetInner {
                 config,
                 client,
+                dispatch,
                 governor: RateLimitGovernor::new(),
                 meter: BandwidthMeter::new(),
                 account_hosts: Mutex::new(HashMap::new()),
+                next_registration_id: AtomicU64::new(1),
             }),
         })
     }
@@ -142,51 +159,37 @@ impl Net {
     /// `AccountNet` carrying the per-account token source, rate
     /// limits, and default retry policy.
     pub fn attach_account(&self, id: AccountId, spec: AccountSpec) -> AccountNet {
-        let previous_hosts = {
-            let mut map = self
-                .inner
-                .account_hosts
-                .lock()
-                .expect("net account_hosts lock poisoned");
-            map.remove(&id).unwrap_or_default()
-        };
-        if !previous_hosts.is_empty() {
-            tracing::warn!(
-                target: "bifrost_net::rate",
-                account = ?id,
-                "attach_account called for an already-attached account; replacing previous host registrations",
-            );
-        }
-        for host in previous_hosts {
-            self.inner.governor.unregister(&host);
-        }
-
         // Register the meter so the per-account counters exist before
         // any request lands. Rate-limit registration walks the host
         // list the caller supplied.
         self.inner.meter.register_account(id.clone());
+        let account_meter = self.inner.meter.account(id.clone());
         let mut registered_hosts = Vec::with_capacity(spec.hosts.len());
         for limit in &spec.hosts {
-            registered_hosts.push(limit.host.clone());
-            self.inner.governor.register(limit.clone());
+            if self.inner.governor.register(limit.clone()) {
+                registered_hosts.push(limit.host.clone());
+            }
         }
-        // Remember which hosts this account registered so
-        // `detach_account` can unregister symmetrically. Multiple
-        // attach calls for the same account would overwrite an
-        // earlier entry; callers should not attach twice without
-        // detaching first.
+        let registration_id = self
+            .inner
+            .next_registration_id
+            .fetch_add(1, Ordering::Relaxed);
         {
             let mut map = self
                 .inner
                 .account_hosts
                 .lock()
                 .expect("net account_hosts lock poisoned");
-            map.insert(id.clone(), registered_hosts);
+            map.entry(id.clone())
+                .or_default()
+                .insert(registration_id, registered_hosts);
         }
         AccountNet {
             inner: Arc::new(AccountNetInner {
                 net: self.clone(),
                 account: id,
+                registration_id,
+                meter: account_meter,
                 token_source: Arc::new(
                     OAuthRefresher::new(spec.token_source)
                         .with_max_age(self.inner.config.token_max_age),
@@ -198,28 +201,45 @@ impl Net {
         }
     }
 
-    /// Drop the per-account state.
+    /// Drop one registration for an account id.
     ///
-    /// Symmetric with `attach_account` for both the bandwidth meter
-    /// and the rate-limit governor. Each `attach_account` increments
-    /// the governor's per-host attach count for every host the
-    /// caller registered; `detach_account` decrements those same
-    /// counts, dropping the host bucket only when no other account
-    /// still depends on it. Five Gmail accounts sharing the
-    /// `gmail.googleapis.com` host all bump the same count to 5;
-    /// detaching one drops the count to 4 and the bucket survives.
-    /// Detaching the last account drops the count to 0 and the
-    /// bucket is reclaimed.
+    /// Prefer `AccountNet::detach()` when the handle is available: it
+    /// targets an exact attachment token and is the only form that is
+    /// correct when two live handles share an `AccountId`. This
+    /// compatibility path has no handle to key on, so it removes the
+    /// *oldest* registration under `id` - registration tokens are
+    /// monotone, so "oldest" is well defined and this cannot become an
+    /// arbitrary choice driven by `HashMap` iteration order.
     pub fn detach_account(&self, id: &AccountId) {
-        self.inner.meter.forget_account(id);
+        self.detach_registration(id, None);
+    }
+
+    fn detach_registration(&self, id: &AccountId, registration_id: Option<u64>) {
         let hosts = {
             let mut map = self
                 .inner
                 .account_hosts
                 .lock()
                 .expect("net account_hosts lock poisoned");
-            map.remove(id).unwrap_or_default()
+            let Some(registrations) = map.get_mut(id) else {
+                return;
+            };
+            // No token supplied means the id-only compatibility path;
+            // take the oldest registration rather than whatever the
+            // map happens to yield first.
+            let token = registration_id.or_else(|| registrations.keys().copied().min());
+            let Some(token) = token else {
+                return;
+            };
+            let Some(hosts) = registrations.remove(&token) else {
+                return;
+            };
+            if registrations.is_empty() {
+                map.remove(id);
+            }
+            hosts
         };
+        self.inner.meter.forget_account(id);
         for host in hosts {
             self.inner.governor.unregister(&host);
         }
@@ -251,6 +271,10 @@ impl Net {
     pub(crate) fn client(&self) -> &reqwest::Client {
         &self.inner.client
     }
+
+    pub(crate) fn dispatch(&self) -> &Arc<dyn Dispatch> {
+        &self.inner.dispatch
+    }
 }
 
 /// Sentinel encoding `None` on the `bandwidth_cap: AtomicU64` field.
@@ -274,6 +298,12 @@ pub(crate) struct AccountNetInner {
     pub(crate) net: Net,
     /// Account identity for metering and tracing.
     pub(crate) account: AccountId,
+    /// Exact attach registration owned by this handle.
+    pub(crate) registration_id: u64,
+    /// Cached meter handle. Constructed once at attach/retag time so
+    /// the request hot path does not clone the account id or lock the
+    /// meter map per attempt.
+    pub(crate) meter: AccountMeter,
     /// Provider of OAuth bearer tokens for this account.
     pub(crate) token_source: Arc<dyn TokenSource>,
     /// Default retry policy applied to every request unless the
@@ -416,11 +446,7 @@ impl AccountNet {
     /// Per-account meter handle.
     #[must_use]
     pub fn meter(&self) -> AccountMeter {
-        self.inner
-            .net
-            .inner
-            .meter
-            .account(self.inner.account.clone())
+        self.inner.meter.clone()
     }
 
     /// Set a per-account bandwidth cap in bytes per second.
@@ -491,6 +517,14 @@ impl AccountNet {
         &self.inner.account
     }
 
+    /// Detach this exact account registration. Idempotent across
+    /// cloned handles.
+    pub fn detach(&self) {
+        self.inner
+            .net
+            .detach_registration(&self.inner.account, Some(self.inner.registration_id));
+    }
+
     /// Default retry policy applied to requests on this account.
     #[must_use]
     pub fn default_retry(&self) -> &RetryPolicy {
@@ -519,39 +553,59 @@ impl AccountNet {
     /// `AccountNet` via `Net::attach_account` ahead of time
     /// (`*Client::with_account_net`) and the engine-minted id arrives
     /// only at open time. Idempotent: `retag(self.account())` is a
-    /// cheap rebuild that re-registers the same id on the meter.
+    /// cheap rebuild with no registration-count change.
     ///
     /// Bookkeeping:
     ///
-    /// - The bandwidth meter registers the new id so per-account
-    ///   counters exist before any request lands.
-    /// - The per-account host registrations in `Net` move from the
-    ///   old id to the new id so `Net::detach_account(new_id)`
-    ///   unregisters host buckets symmetrically when the engine
-    ///   eventually drops the account. Governor refcounts are
-    ///   per-host and unchanged by the rename.
+    /// - The bandwidth meter transfers one attachment count from the
+    ///   old id to the new id.
+    /// - The exact token's host registrations move from the old id to
+    ///   the new id. Governor refcounts are unchanged by the rename.
     /// - The old `AccountNet` clone the caller holds keeps working
     ///   for in-flight requests but no longer owns the host
-    ///   registrations; dropping it and calling `detach_account` on
-    ///   the old id is a no-op afterwards. The new handle is the
+    ///   registrations; calling `detach()` on the old handle is a
+    ///   no-op afterwards. The new handle is the
     ///   one engine code should propagate forward.
     #[must_use]
     pub fn retag(&self, new_id: AccountId) -> AccountNet {
         let net_inner = &self.inner.net.inner;
-        net_inner.meter.register_account(new_id.clone());
+        let mut moved = false;
         if new_id != self.inner.account {
             let mut map = net_inner
                 .account_hosts
                 .lock()
                 .expect("net account_hosts lock poisoned");
-            if let Some(hosts) = map.remove(&self.inner.account) {
-                map.insert(new_id.clone(), hosts);
+            let hosts = map
+                .get_mut(&self.inner.account)
+                .and_then(|registrations| registrations.remove(&self.inner.registration_id));
+            if map.get(&self.inner.account).is_some_and(HashMap::is_empty) {
+                map.remove(&self.inner.account);
+            }
+            if let Some(hosts) = hosts {
+                map.entry(new_id.clone())
+                    .or_default()
+                    .insert(self.inner.registration_id, hosts);
+                moved = true;
             }
         }
+        if moved {
+            net_inner
+                .meter
+                .retag_account(&self.inner.account, new_id.clone());
+        }
+        let account_meter = if new_id == self.inner.account {
+            self.inner.meter.clone()
+        } else if moved {
+            net_inner.meter.account(new_id.clone())
+        } else {
+            BandwidthMeter::inert_account(new_id.clone())
+        };
         AccountNet {
             inner: Arc::new(AccountNetInner {
                 net: self.inner.net.clone(),
                 account: new_id,
+                registration_id: self.inner.registration_id,
+                meter: account_meter,
                 token_source: Arc::clone(&self.inner.token_source),
                 default_retry: self.inner.default_retry.clone(),
                 priority: AtomicU8::new(self.inner.priority.load(Ordering::Relaxed)),
@@ -628,8 +682,10 @@ pub(crate) fn encode_range(range: ByteRange) -> Result<String, Error> {
 /// `bytes <first>-<last>/<total>` or `bytes <first>-<last>/*`.
 /// Returns `true` if:
 ///
-/// - Closed request (`bytes=N-M`): the response's first/last match
-///   the request's first/last exactly.
+/// - Closed request (`bytes=N-M`): the response's first matches
+///   exactly. The last either matches exactly or, when the
+///   resource is shorter than the requested window, equals the
+///   known resource tail.
 /// - Open-ended request (`bytes=N-`): the response's first matches
 ///   the request's first AND, when the total is known
 ///   (`/<total>`), the response's last equals `total - 1` (i.e.
@@ -694,7 +750,11 @@ fn content_range_matches(req_range: &str, resp_range: &str) -> bool {
         return false;
     }
     match req_end_n {
-        Some(end) => resp_end_n == end,
+        Some(end) => {
+            resp_end_n == end
+                || total_known
+                    .is_some_and(|total| total > 0 && resp_end_n == total - 1 && resp_end_n < end)
+        }
         // Open-ended request: must cover the full tail of the
         // resource when the total is known. With total unknown
         // (`*`), we cannot verify and accept any end >= start.
@@ -746,7 +806,7 @@ struct ByteBucketState {
     /// Tokens currently available, in bytes.
     tokens: f64,
     /// Last refill instant.
-    last_refill: std::time::Instant,
+    last_refill: tokio::time::Instant,
 }
 
 impl ByteBucket {
@@ -758,7 +818,7 @@ impl ByteBucket {
         Self {
             state: Arc::new(std::sync::Mutex::new(ByteBucketState {
                 tokens: initial,
-                last_refill: std::time::Instant::now(),
+                last_refill: tokio::time::Instant::now(),
             })),
         }
     }
@@ -803,13 +863,13 @@ impl ByteBucket {
             tokio::time::sleep(Duration::from_secs_f64(secs)).await;
             let mut state = self.state.lock().expect("byte-bucket lock poisoned");
             state.tokens = 0.0;
-            state.last_refill = std::time::Instant::now();
+            state.last_refill = tokio::time::Instant::now();
             return;
         }
         loop {
             let wait = {
                 let mut state = self.state.lock().expect("byte-bucket lock poisoned");
-                let now = std::time::Instant::now();
+                let now = tokio::time::Instant::now();
                 let elapsed = now.duration_since(state.last_refill).as_secs_f64();
                 state.tokens = (state.tokens + elapsed * cap_f).min(cap_f);
                 state.last_refill = now;
@@ -852,12 +912,13 @@ pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
 #[cfg(test)]
 mod tests {
     use super::content_range_matches;
-    use super::{AccountId, AccountSpec, ByteRange, Net, encode_range};
+    use super::{AccountId, AccountSpec, ByteBucket, ByteRange, Net, encode_range};
     use crate::StaticTokenSource;
     use crate::config::NetConfig;
     use crate::rate::RateLimit;
     use crate::retry::RetryPolicy;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn content_range_rejects_inverted_response_range() {
@@ -965,17 +1026,14 @@ mod tests {
         assert!(content_range_matches("bytes=0-99", "bytes 0-99/*"));
     }
 
-    /// DOCUMENTS CURRENT BEHAVIOUR. RFC 9110 lets a server answer a
-    /// closed range that runs past the end of the resource with the
-    /// smaller satisfiable window (`bytes=0-99` against a 50-byte
-    /// resource returns `bytes 0-49/50`). This check requires an exact
-    /// end match and therefore rejects that legal response as
-    /// `RangeNotHonored`, so a caller reading a tail with an
-    /// over-long length gets a hard error instead of the correct
-    /// truncated bytes.
     #[test]
-    fn content_range_rejects_a_legally_shortened_closed_window() {
-        assert!(!content_range_matches("bytes=0-99", "bytes 0-49/50"));
+    fn content_range_accepts_a_legally_shortened_closed_window() {
+        assert!(content_range_matches("bytes=0-99", "bytes 0-49/50"));
+    }
+
+    #[test]
+    fn content_range_rejects_a_short_window_before_the_resource_tail() {
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-49/1000"));
     }
 
     #[test]
@@ -1010,6 +1068,23 @@ mod tests {
         assert!(!content_range_matches("bytes=0-", "bytes 0-0/0"));
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn byte_bucket_refills_on_tokio_virtual_time() {
+        let bucket = ByteBucket::new(Some(10));
+        bucket.consume(10, Some(10)).await;
+        let waiting = {
+            let bucket = bucket.clone();
+            tokio::spawn(async move {
+                bucket.consume(10, Some(10)).await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiting.await.expect("byte-bucket waiter completes");
+    }
+
     fn build_net() -> Net {
         Net::new(NetConfig::default()).expect("default NetConfig should build")
     }
@@ -1033,7 +1108,8 @@ mod tests {
             .account_hosts
             .lock()
             .expect("net account_hosts lock poisoned");
-        map.get(id).cloned()
+        map.get(id)
+            .and_then(|registrations| registrations.values().next().cloned())
     }
 
     #[test]
@@ -1076,5 +1152,117 @@ mod tests {
             vec!["retag.example".to_string()],
             "retag with same id must not drop the host registration",
         );
+    }
+
+    /// The id-only compatibility path has no token to key on. It must
+    /// still be deterministic: registration tokens are monotone, so it
+    /// takes the oldest attachment rather than whatever `HashMap`
+    /// iteration order yields.
+    #[test]
+    fn id_only_detach_removes_the_oldest_registration() {
+        let net = build_net();
+        let id = AccountId("compat".to_string());
+        let _first = net.attach_account(id.clone(), build_spec("first.example"));
+        let _second = net.attach_account(id.clone(), build_spec("second.example"));
+
+        net.detach_account(&id);
+
+        assert_eq!(
+            net.governor().cost_default_for("first.example"),
+            None,
+            "the oldest attachment is the one that went away"
+        );
+        assert_eq!(net.governor().cost_default_for("second.example"), Some(1));
+
+        net.detach_account(&id);
+        assert_eq!(net.governor().cost_default_for("second.example"), None);
+        net.detach_account(&id);
+    }
+
+    /// `retag` on a handle whose registration has already been torn
+    /// down has nothing to move. The replacement handle must be inert
+    /// rather than silently adopting another attachment's counters.
+    #[test]
+    fn retag_of_a_detached_registration_yields_an_inert_meter() {
+        let net = build_net();
+        let id = AccountId("gone".to_string());
+        let account = net.attach_account(id.clone(), build_spec("gone.example"));
+        account.meter().record_bytes_in(7);
+        account.detach();
+
+        let retagged = account.retag(AccountId("renamed".to_string()));
+
+        retagged.meter().record_bytes_in(11);
+        assert_eq!(
+            retagged.meter().bytes_in(),
+            0,
+            "a retag with no live registration must not record or report bytes"
+        );
+        assert!(
+            account_hosts_snapshot(&net, &AccountId("renamed".to_string())).is_none(),
+            "a dead registration must not resurrect host bookkeeping under the new id"
+        );
+        assert_eq!(net.governor().cost_default_for("gone.example"), None);
+    }
+
+    #[test]
+    fn duplicate_account_ids_detach_by_exact_registration() {
+        let net = build_net();
+        let id = AccountId("reopened".to_string());
+        let first = net.attach_account(id.clone(), build_spec("old.example"));
+        first.meter().record_bytes_in(10);
+        let second = net.attach_account(id.clone(), build_spec("new.example"));
+        assert_eq!(second.meter().bytes_in(), 10);
+
+        first.detach();
+
+        assert_eq!(net.governor().cost_default_for("old.example"), None);
+        assert_eq!(net.governor().cost_default_for("new.example"), Some(1));
+        assert_eq!(
+            net.meter().account(id.clone()).bytes_in(),
+            10,
+            "the live attachment keeps the shared meter registered"
+        );
+        first.detach();
+        assert_eq!(
+            net.governor().cost_default_for("new.example"),
+            Some(1),
+            "repeated stale teardown is idempotent"
+        );
+
+        second.meter().record_bytes_in(5);
+        second.detach();
+        assert_eq!(net.governor().cost_default_for("new.example"), None);
+        assert_eq!(net.meter().account(id).bytes_in(), 0);
+        assert_eq!(
+            second.meter().bytes_in(),
+            15,
+            "the detached cached handle retains its frozen snapshot"
+        );
+    }
+
+    #[test]
+    fn rejected_registration_cannot_unregister_a_later_valid_account() {
+        let net = build_net();
+        let id = AccountId("invalid-first".to_string());
+        let invalid = net.attach_account(
+            id.clone(),
+            AccountSpec {
+                hosts: vec![RateLimit {
+                    host: "shared.example".to_string(),
+                    quota_per_second: f64::NAN,
+                    cost_default: 1,
+                    burst: 1,
+                }],
+                token_source: Arc::new(StaticTokenSource::new("test-token", None)),
+                default_retry: RetryPolicy::default(),
+            },
+        );
+        let valid = net.attach_account(id, build_spec("shared.example"));
+
+        invalid.detach();
+        assert_eq!(net.governor().cost_default_for("shared.example"), Some(1));
+        valid.detach();
+        assert_eq!(net.governor().cost_default_for("shared.example"), None);
     }
 }

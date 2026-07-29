@@ -92,7 +92,7 @@ pub(crate) async fn get(
     contact: ContactId,
 ) -> Result<ContactCard, AccountError> {
     let prefix = account.client.api_path_prefix();
-    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}?$select={CONTACT_SELECT}");
     let contact = account
         .client
@@ -134,7 +134,7 @@ pub(crate) async fn update(
     let current = get(account.clone(), contact.clone()).await?;
     let etag = current.etag.clone();
     let prefix = account.client.api_path_prefix();
-    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
     let body = graph_contact_from_patch(&patch);
     let result = if let Some(etag) = etag.as_deref() {
@@ -148,7 +148,7 @@ pub(crate) async fn update(
 pub(crate) async fn delete(account: GraphAccount, contact: ContactId) -> Result<(), AccountError> {
     let current = get(account.clone(), contact.clone()).await?;
     let prefix = account.client.api_path_prefix();
-    let encoded = bifrost_net::url::encode_component(&contact.0);
+    let encoded = bifrost_net::url::encode_path_component(&contact.0);
     let path = format!("{prefix}/contacts/{encoded}");
     let result = if let Some(etag) = current.etag.as_deref() {
         account.client.delete_if_match(&path, etag).await
@@ -293,7 +293,7 @@ fn directory_search_path(prefix: &str, query: &str, top: u32) -> String {
     let filter = format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')");
     format!(
         "{base}&$filter={}",
-        bifrost_net::url::encode_component(&filter)
+        bifrost_net::url::encode_query_value(&filter)
     )
 }
 
@@ -356,7 +356,7 @@ fn contacts_path(prefix: &str, address_book: Option<&AddressBookId>, top: u32) -
             format!("{prefix}/contacts?$select={CONTACT_SELECT}&$top={top}")
         }
         Some(folder) => {
-            let encoded = bifrost_net::url::encode_component(folder);
+            let encoded = bifrost_net::url::encode_path_component(folder);
             format!(
                 "{prefix}/contactFolders/{encoded}/contacts?$select={CONTACT_SELECT}&$top={top}"
             )
@@ -379,7 +379,7 @@ fn contact_search_path(
     let filter = format!("emailAddresses/any(a:a/address eq '{escaped}')");
     format!(
         "{base}&$filter={}",
-        bifrost_net::url::encode_component(&filter)
+        bifrost_net::url::encode_query_value(&filter)
     )
 }
 
@@ -400,7 +400,7 @@ fn create_url(account: &GraphAccount, address_book: Option<&AddressBookId>) -> S
     match address_book.map(|id| id.0.as_str()) {
         Some(DEFAULT_CONTACTS_ID) | None => format!("{prefix}/contacts"),
         Some(folder) => {
-            let encoded = bifrost_net::url::encode_component(folder);
+            let encoded = bifrost_net::url::encode_path_component(folder);
             format!("{prefix}/contactFolders/{encoded}/contacts")
         }
     }
@@ -1078,7 +1078,7 @@ mod tests {
         let filter = "startswith(displayName,'O''Hara') or startswith(mail,'O''Hara')";
         assert!(path.contains(&format!(
             "&$filter={}",
-            bifrost_net::url::encode_component(filter)
+            bifrost_net::url::encode_query_value(filter)
         )));
     }
 

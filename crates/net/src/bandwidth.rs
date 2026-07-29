@@ -156,7 +156,12 @@ pub struct BandwidthMeter {
     /// shrinks on `forget_account`; lookups on the hot path go
     /// through `Arc` clones so the map lock is not held while the
     /// counter is updated.
-    accounts: Mutex<HashMap<AccountId, Arc<AccountCounters>>>,
+    accounts: Mutex<HashMap<AccountId, MeterRegistration>>,
+}
+
+struct MeterRegistration {
+    counters: Arc<AccountCounters>,
+    attach_count: u64,
 }
 
 impl BandwidthMeter {
@@ -168,18 +173,58 @@ impl BandwidthMeter {
         }
     }
 
-    /// Register an account with the meter. Idempotent.
+    /// Register one account attachment with the meter.
     pub fn register_account(&self, account: AccountId) {
         let mut map = self.accounts.lock().expect("meter lock poisoned");
         map.entry(account)
-            .or_insert_with(|| Arc::new(AccountCounters::new(Instant::now())));
+            .and_modify(|registration| {
+                registration.attach_count = registration.attach_count.saturating_add(1);
+            })
+            .or_insert_with(|| MeterRegistration {
+                counters: Arc::new(AccountCounters::new(Instant::now())),
+                attach_count: 1,
+            });
     }
 
-    /// Drop the per-account counters. Called from
-    /// `Net::detach_account`.
+    /// Drop one account attachment. Counters remain registered until
+    /// the final matching attachment is forgotten.
     pub fn forget_account(&self, account: &AccountId) {
         let mut map = self.accounts.lock().expect("meter lock poisoned");
-        map.remove(account);
+        let remove = match map.get_mut(account) {
+            Some(registration) => {
+                registration.attach_count = registration.attach_count.saturating_sub(1);
+                registration.attach_count == 0
+            }
+            None => false,
+        };
+        if remove {
+            map.remove(account);
+        }
+    }
+
+    pub(crate) fn retag_account(&self, old: &AccountId, new: AccountId) {
+        if old == &new {
+            return;
+        }
+        let mut map = self.accounts.lock().expect("meter lock poisoned");
+        let remove_old = match map.get_mut(old) {
+            Some(registration) => {
+                registration.attach_count = registration.attach_count.saturating_sub(1);
+                registration.attach_count == 0
+            }
+            None => return,
+        };
+        if remove_old {
+            map.remove(old);
+        }
+        map.entry(new)
+            .and_modify(|registration| {
+                registration.attach_count = registration.attach_count.saturating_add(1);
+            })
+            .or_insert_with(|| MeterRegistration {
+                counters: Arc::new(AccountCounters::new(Instant::now())),
+                attach_count: 1,
+            });
     }
 
     /// Build a handle scoped to one account. Cloneable, cheap.
@@ -189,6 +234,13 @@ impl BandwidthMeter {
         AccountMeter { account, counters }
     }
 
+    pub(crate) fn inert_account(account: AccountId) -> AccountMeter {
+        AccountMeter {
+            account,
+            counters: None,
+        }
+    }
+
     /// Sum bytes/second across every registered account. Used for
     /// process-wide diagnostics; per-account readings go through
     /// `AccountMeter::observed_bps`.
@@ -196,23 +248,16 @@ impl BandwidthMeter {
     pub fn observed_bps(&self) -> u64 {
         let map = self.accounts.lock().expect("meter lock poisoned");
         let mut total: u64 = 0;
-        for c in map.values() {
-            total = total.saturating_add(c.bps());
+        for registration in map.values() {
+            total = total.saturating_add(registration.counters.bps());
         }
         total
     }
 
     fn lookup(&self, account: &AccountId) -> Option<Arc<AccountCounters>> {
         let map = self.accounts.lock().expect("meter lock poisoned");
-        map.get(account).map(Arc::clone)
-    }
-
-    fn lookup_or_register(&self, account: &AccountId) -> Arc<AccountCounters> {
-        let mut map = self.accounts.lock().expect("meter lock poisoned");
-        Arc::clone(
-            map.entry(account.clone())
-                .or_insert_with(|| Arc::new(AccountCounters::new(Instant::now()))),
-        )
+        map.get(account)
+            .map(|registration| Arc::clone(&registration.counters))
     }
 }
 
@@ -224,10 +269,14 @@ impl Default for BandwidthMeter {
 
 impl MeterSink for BandwidthMeter {
     fn record_bytes_in(&self, account: &AccountId, n: u64) {
-        self.lookup_or_register(account).record_in(n);
+        if let Some(counters) = self.lookup(account) {
+            counters.record_in(n);
+        }
     }
     fn record_bytes_out(&self, account: &AccountId, n: u64) {
-        self.lookup_or_register(account).record_out(n);
+        if let Some(counters) = self.lookup(account) {
+            counters.record_out(n);
+        }
     }
 }
 
@@ -527,11 +576,8 @@ mod tests {
 
     /// `AccountMeter` for an unregistered account is inert: every
     /// reading is zero and every record is dropped. This is the
-    /// asymmetry the HTTP path inherits, because `AccountNet::meter()`
-    /// snapshots via `BandwidthMeter::account` (lookup only) while the
-    /// `MeterSink` impl auto-registers.
     #[test]
-    fn unregistered_account_meter_is_inert_but_meter_sink_auto_registers() {
+    fn unregistered_accounts_are_inert_on_both_meter_entry_points() {
         let meter = BandwidthMeter::new();
         let account = AccountId("never-registered".to_owned());
 
@@ -543,13 +589,16 @@ mod tests {
             "a handle minted before registration silently drops bytes"
         );
 
-        // The MeterSink path takes the other branch and registers.
         MeterSink::record_bytes_in(&meter, &account, 4_096);
-        assert_eq!(meter.account(account).bytes_in(), 4_096);
+        assert_eq!(
+            meter.account(account).bytes_in(),
+            0,
+            "MeterSink must not resurrect a detached or unknown account"
+        );
     }
 
     #[test]
-    fn register_account_is_idempotent_and_forget_clears_counters() {
+    fn account_registration_is_counted_and_final_forget_clears_counters() {
         let meter = BandwidthMeter::new();
         let account = AccountId("acct".to_owned());
         meter.register_account(account.clone());
@@ -558,11 +607,39 @@ mod tests {
         assert_eq!(
             meter.account(account.clone()).bytes_in(),
             10,
-            "re-registering must not reset live counters"
+            "a second attachment must not reset live counters"
         );
 
         meter.forget_account(&account);
+        assert_eq!(
+            meter.account(account.clone()).bytes_in(),
+            10,
+            "one attachment remains registered"
+        );
+        meter.forget_account(&account);
         assert_eq!(meter.account(account).bytes_in(), 0);
+    }
+
+    #[test]
+    fn cached_handle_freezes_after_the_final_detach() {
+        let meter = BandwidthMeter::new();
+        let account = AccountId("acct".to_owned());
+        meter.register_account(account.clone());
+        let cached = meter.account(account.clone());
+        cached.record_bytes_in(10);
+
+        meter.forget_account(&account);
+
+        assert_eq!(
+            cached.bytes_in(),
+            10,
+            "an already-cached handle retains its detached counter snapshot"
+        );
+        assert_eq!(
+            meter.account(account).bytes_in(),
+            0,
+            "new lookups do not discover detached counters"
+        );
     }
 
     #[test]

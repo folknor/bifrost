@@ -14,8 +14,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
-    AccountError, AccountOperation, AccountStream, Batch, FlagOp, IdempotencyKey, ItemOutcome,
-    LabelId, MembershipScope, MutationSuccess, ObjectId, PageBoundary, SyncEvent,
+    AccountError, AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, FlagOp,
+    IdempotencyKey, ItemOutcome, LabelId, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
+    SyncEvent,
 };
 use futures::{StreamExt, stream};
 use serde::Serialize;
@@ -86,6 +87,7 @@ fn mutation_stream(
         kind,
         key,
         patch: None,
+        pending_target: None,
         finished: false,
         emitted_done: false,
     };
@@ -127,10 +129,23 @@ fn mutation_stream(
         }
 
         let mut ids = Vec::new();
+        if let Some(id) = state.pending_target.take() {
+            ids.push(id);
+        }
+        let mut targets_exhausted = false;
         while ids.len() < GMAIL_BATCH_MODIFY_LIMIT {
             match state.targets.next().await {
                 Some(id) => ids.push(id),
-                None => break,
+                None => {
+                    targets_exhausted = true;
+                    break;
+                }
+            }
+        }
+        if !targets_exhausted && ids.len() == GMAIL_BATCH_MODIFY_LIMIT {
+            match state.targets.next().await {
+                Some(id) => state.pending_target = Some(id),
+                None => targets_exhausted = true,
             }
         }
         if ids.is_empty() {
@@ -150,16 +165,25 @@ fn mutation_stream(
         };
 
         match event {
-            MutationApply::Batch(items) => Some((
-                SyncEvent::Batch(Batch {
-                    items,
-                    page_boundary: PageBoundary::Page,
-                    server_latency: started.elapsed(),
-                    bytes_in: 0,
-                    checkpoint: None,
-                }),
-                state,
-            )),
+            MutationApply::Batch(items) => {
+                if targets_exhausted {
+                    state.finished = true;
+                }
+                Some((
+                    SyncEvent::Batch(Batch {
+                        items,
+                        page_boundary: if targets_exhausted {
+                            PageBoundary::Final
+                        } else {
+                            PageBoundary::Page
+                        },
+                        server_latency: started.elapsed(),
+                        bytes_in: 0,
+                        checkpoint: None,
+                    }),
+                    state,
+                ))
+            }
             MutationApply::Terminate(error) => {
                 state.finished = true;
                 state.emitted_done = true;
@@ -195,6 +219,7 @@ struct MutationState {
     kind: MutationKind,
     key: IdempotencyKey,
     patch: Option<LabelPatch>,
+    pending_target: Option<ObjectId>,
     finished: bool,
     emitted_done: bool,
 }
@@ -212,7 +237,21 @@ async fn apply_label_patch(
     operation: AccountOperation,
 ) -> MutationApply {
     if !patch.unsupported_flags.is_empty() {
-        return MutationApply::Batch(skipped_outcomes(ids));
+        let detail = format!(
+            "unsupported Gmail mutation flags or scope: {}",
+            patch.unsupported_flags.join(", ")
+        );
+        let error = account_error::into_account_error(
+            GmailError::invalid_request(operation, detail),
+            GmailErrorContext::mutation(operation),
+        );
+        return MutationApply::Batch(
+            ids.iter()
+                .map(|id| {
+                    ItemOutcome::Failed(BatchFailure::new(BatchItemId(id.0.clone()), error.clone()))
+                })
+                .collect(),
+        );
     }
     if patch.add_label_ids.is_empty() && patch.remove_label_ids.is_empty() {
         return MutationApply::Batch(skipped_outcomes(ids));
@@ -381,7 +420,7 @@ async fn post_empty_json<B: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bifrost_types::FolderId;
+    use bifrost_types::{FolderId, ProtocolSalt, RunId};
 
     fn label(id: &str) -> MembershipScope {
         MembershipScope::Label(LabelId(id.to_string()))
@@ -495,5 +534,69 @@ mod tests {
         assert!(patch.add_label_ids.is_empty());
         assert!(patch.remove_label_ids.is_empty());
         assert_eq!(patch.unsupported_flags.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_label_move_fails_each_id_and_marks_the_last_batch_final() {
+        let client = Arc::new(GmailClient::new("token"));
+        let targets: AccountStream<ObjectId> = Box::pin(stream::iter([ObjectId("m1".to_string())]));
+        let mut events = bulk_move(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            targets,
+            MembershipScope::Folder(FolderId("INBOX".to_string())),
+            None,
+            IdempotencyKey {
+                run_id: RunId("run".to_string()),
+                sequence: 1,
+                protocol_salt: ProtocolSalt::Gmail("test".to_string()),
+            },
+        );
+
+        let first = events.next().await.expect("mutation batch");
+        let SyncEvent::Batch(batch) = first else {
+            panic!("invalid destination should produce per-id outcomes");
+        };
+        assert!(matches!(batch.page_boundary, PageBoundary::Final));
+        assert!(matches!(batch.items.as_slice(), [ItemOutcome::Failed(_)]));
+        assert!(matches!(events.next().await, Some(SyncEvent::Done(None))));
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mutation_lookahead_marks_only_the_last_batch_final() {
+        let client = Arc::new(GmailClient::new("token"));
+        let targets: AccountStream<ObjectId> = Box::pin(stream::iter(
+            (0..=GMAIL_BATCH_MODIFY_LIMIT).map(|index| ObjectId(format!("m{index}"))),
+        ));
+        let mut events = bulk_move(
+            client,
+            Arc::new(std::sync::RwLock::new(
+                super::super::scopes::ScopeSnapshot::empty(),
+            )),
+            targets,
+            MembershipScope::Folder(FolderId("INBOX".to_string())),
+            None,
+            IdempotencyKey {
+                run_id: RunId("run".to_string()),
+                sequence: 2,
+                protocol_salt: ProtocolSalt::Gmail("test".to_string()),
+            },
+        );
+
+        let Some(SyncEvent::Batch(first)) = events.next().await else {
+            panic!("first mutation page");
+        };
+        assert_eq!(first.items.len(), GMAIL_BATCH_MODIFY_LIMIT);
+        assert!(matches!(first.page_boundary, PageBoundary::Page));
+
+        let Some(SyncEvent::Batch(last)) = events.next().await else {
+            panic!("last mutation page");
+        };
+        assert_eq!(last.items.len(), 1);
+        assert!(matches!(last.page_boundary, PageBoundary::Final));
+        assert!(matches!(events.next().await, Some(SyncEvent::Done(None))));
     }
 }

@@ -55,7 +55,6 @@ pub enum RangeFailureKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MalformedRedirectKind {
-    MissingLocation,
     InvalidLocationEncoding,
     UnresolvableLocation,
 }
@@ -245,18 +244,6 @@ pub enum Error {
         message: String,
     },
 
-    /// Legacy setup failure variant retained for representability.
-    /// Current `Net::new` configuration failures use
-    /// `InvalidRequest` instead.
-    #[error("Net construction failed: {message}")]
-    NetSetup {
-        /// Description of the setup failure.
-        message: String,
-        /// Boxed underlying error from `native_tls` or `reqwest`.
-        #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
-    },
-
     /// Server attempted to redirect to a host outside the configured
     /// `RedirectPolicy::trusted_hosts` allowlist. Returned by the
     /// `bifrost-net` redirect loop before any further request is
@@ -282,7 +269,7 @@ pub enum Error {
     #[error("redirect loop: {hops} hops exceeded the configured maximum")]
     RedirectLoop {
         /// Hops walked before the loop was aborted.
-        hops: u8,
+        hops: u16,
     },
 }
 

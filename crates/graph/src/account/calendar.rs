@@ -71,11 +71,11 @@ pub(crate) async fn events_in_range(
         .map_err(|error| local_error(AccountOperation::EventsInRange, error.to_string()))?;
     let url = next_url.unwrap_or_else(|| {
         let prefix = account.client.api_path_prefix();
-        let calendar = bifrost_net::url::encode_component(&range.calendar_id.0);
+        let calendar = bifrost_net::url::encode_path_component(&range.calendar_id.0);
         format!(
             "{prefix}/calendars/{calendar}/calendarView?startDateTime={}&endDateTime={}&$select={EVENT_SELECT}&$top={}",
-            bifrost_net::url::encode_component(&range.start.value),
-            bifrost_net::url::encode_component(&range.end.value),
+            bifrost_net::url::encode_query_value(&range.start.value),
+            bifrost_net::url::encode_query_value(&range.end.value),
             range.limit.unwrap_or(250).clamp(1, 250)
         )
     });
@@ -116,7 +116,7 @@ pub(crate) async fn create(
     validate_event_create_timezones(&event)?;
     let calendar_id = event.calendar_id.0.clone();
     let prefix = account.client.api_path_prefix();
-    let encoded = bifrost_net::url::encode_component(&calendar_id);
+    let encoded = bifrost_net::url::encode_path_component(&calendar_id);
     let path = format!("{prefix}/calendars/{encoded}/events");
     let created = account
         .client
@@ -621,7 +621,7 @@ fn graph_event_from_patch(patch: &EventPatch) -> GraphEventPatch {
 
 fn event_url(account: &GraphAccount, calendar_id: &str, event_id: &str) -> String {
     let prefix = account.client.api_path_prefix();
-    let event = bifrost_net::url::encode_component(event_id);
+    let event = bifrost_net::url::encode_path_component(event_id);
     if calendar_id == MAILBOX_SCOPE {
         // Graph event ids are mailbox-unique; the mailbox-scoped path
         // resolves the hit without knowing its hosting calendar.
@@ -629,14 +629,14 @@ fn event_url(account: &GraphAccount, calendar_id: &str, event_id: &str) -> Strin
     } else {
         format!(
             "{prefix}/calendars/{}/events/{event}",
-            bifrost_net::url::encode_component(calendar_id),
+            bifrost_net::url::encode_path_component(calendar_id),
         )
     }
 }
 
 fn event_search_path(prefix: &str, calendar_id: Option<&CalendarId>) -> String {
     if let Some(calendar_id) = calendar_id {
-        let calendar = bifrost_net::url::encode_component(&calendar_id.0);
+        let calendar = bifrost_net::url::encode_path_component(&calendar_id.0);
         format!("{prefix}/calendars/{calendar}/events")
     } else {
         format!("{prefix}/events")

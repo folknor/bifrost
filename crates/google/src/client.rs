@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bifrost_net::{
     AccountId, AccountNet, AccountSpec, Net, RateLimit, RequestBuilder, Response, RetryPolicy,
@@ -23,7 +22,7 @@ pub(crate) struct GmailClient {
 }
 
 struct ClientInner {
-    net: AccountNet,
+    net: Option<AccountNet>,
     parent_net: Net,
     api_base: String,
     // People/contacts API base. A third, independent Google surface:
@@ -67,15 +66,9 @@ impl GmailClient {
         token_source: Arc<dyn TokenSource>,
     ) -> Self {
         let parent_net = Net::shared_default();
-        let net = default_account_net(
-            &parent_net,
-            AccountId("gmail-direct".to_string()),
-            "www.googleapis.com",
-            Arc::clone(&token_source),
-        );
         Self {
             inner: Arc::new(ClientInner {
-                net,
+                net: None,
                 parent_net,
                 api_base: api_base.into().trim_end_matches('/').to_string(),
                 people_base: PEOPLE_API_BASE.to_string(),
@@ -110,7 +103,7 @@ impl GmailClient {
         );
         Self {
             inner: Arc::new(ClientInner {
-                net,
+                net: Some(net),
                 parent_net: self.inner.parent_net.clone(),
                 api_base: self.inner.api_base.clone(),
                 people_base: self.inner.people_base.clone(),
@@ -120,7 +113,16 @@ impl GmailClient {
     }
 
     pub(crate) fn account_net(&self) -> &AccountNet {
-        &self.inner.net
+        self.inner
+            .net
+            .as_ref()
+            .expect("GmailClient must be scoped with for_account before issuing requests")
+    }
+
+    pub(crate) fn detach_account(&self) {
+        if let Some(account_net) = &self.inner.net {
+            account_net.detach();
+        }
     }
 
     pub(crate) fn api_base(&self) -> &str {
@@ -217,11 +219,11 @@ impl GmailClient {
         body: Option<&B>,
     ) -> Result<Response> {
         let mut builder = match method {
-            "GET" => self.inner.net.get(url),
-            "POST" => self.inner.net.post(url),
-            "PUT" => self.inner.net.put(url),
-            "PATCH" => self.inner.net.patch(url),
-            "DELETE" => self.inner.net.delete(url),
+            "GET" => self.account_net().get(url),
+            "POST" => self.account_net().post(url),
+            "PUT" => self.account_net().put(url),
+            "PATCH" => self.account_net().patch(url),
+            "DELETE" => self.account_net().delete(url),
             // gmail-N3: every internal caller routes through the typed
             // `get` / `post` / `put` / `patch` / `delete` wrappers, so
             // this branch is unreachable. Previously we synthesized a
@@ -291,7 +293,7 @@ fn default_account_net(
     token_source: Arc<dyn TokenSource>,
 ) -> AccountNet {
     net.attach_account(
-        uniquify_account_id(account),
+        account,
         AccountSpec {
             hosts: vec![
                 RateLimit {
@@ -313,15 +315,6 @@ fn default_account_net(
     )
 }
 
-fn uniquify_account_id(account: AccountId) -> AccountId {
-    if account.0 == "gmail-direct" {
-        static NEXT_DEFAULT_ACCOUNT_ID: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_DEFAULT_ACCOUNT_ID.fetch_add(1, Ordering::Relaxed);
-        return AccountId(format!("gmail-direct-{id}"));
-    }
-    account
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +323,10 @@ mod tests {
     async fn trims_api_base() {
         let client = GmailClient::with_api_base("https://example.test/base/", "token");
         assert_eq!(client.api_base(), "https://example.test/base");
+        assert!(
+            client.inner.net.is_none(),
+            "constructing a factory client must not attach a throwaway account"
+        );
     }
 
     #[tokio::test]
@@ -354,5 +351,13 @@ mod tests {
         assert_eq!(client.access_token().await, "old-token");
         source.set(AccessToken::new("new-token", None));
         assert_eq!(client.access_token().await, "new-token");
+    }
+
+    #[test]
+    fn account_scope_is_attached_only_by_for_account() {
+        let client = GmailClient::new("token");
+        let opened = client.for_account(AccountId("client-test".to_string()));
+        assert!(opened.inner.net.is_some());
+        opened.detach_account();
     }
 }

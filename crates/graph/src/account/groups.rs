@@ -89,14 +89,14 @@ fn decode_cursor(
 }
 
 fn groups_list_path(prefix: &str) -> String {
-    let filter = bifrost_net::url::encode_component("mailEnabled eq true");
+    let filter = bifrost_net::url::encode_query_value("mailEnabled eq true");
     format!(
         "{prefix}/memberOf/microsoft.graph.group?$filter={filter}&$select={GROUP_SELECT}&$top=999"
     )
 }
 
 fn transitive_members_path(group: &DirectoryGroupId) -> String {
-    let encoded = bifrost_net::url::encode_component(&group.0);
+    let encoded = bifrost_net::url::encode_path_component(&group.0);
     format!(
         "/groups/{encoded}/transitiveMembers/microsoft.graph.user?$select={MEMBER_SELECT}&$top=999"
     )
@@ -251,7 +251,7 @@ mod tests {
     fn groups_list_path_filters_mail_enabled_under_prefix() {
         let path = groups_list_path("/me");
         assert!(path.starts_with("/me/memberOf/microsoft.graph.group?$filter="));
-        assert!(path.contains(&bifrost_net::url::encode_component("mailEnabled eq true")));
+        assert!(path.contains(&bifrost_net::url::encode_query_value("mailEnabled eq true")));
         assert!(path.contains(&format!("$select={GROUP_SELECT}")));
     }
 

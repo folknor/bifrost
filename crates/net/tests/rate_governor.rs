@@ -59,6 +59,26 @@ async fn token_bucket_drains_refills_and_refunds_wake_waiter() {
     );
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn token_bucket_refills_on_tokio_virtual_time() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("virtual.test", 1.0, 1));
+    governor
+        .acquire("virtual.test", 1)
+        .await
+        .expect("initial token");
+    let waiting = governor.acquire("virtual.test", 1);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut waiting)
+            .await
+            .is_err()
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    waiting.await.expect("virtual second refills the bucket");
+}
+
 /// T4: cost > burst returns `Error::CostExceedsBurst` immediately,
 /// without parking. The integers in the variant are the caller's
 /// original `u32` values, not the floating-point bucket size.
@@ -232,35 +252,36 @@ async fn duplicate_registration_keeps_the_first_configuration() {
         .expect("the first registration's burst of 250 is still in force");
 }
 
-/// DOCUMENTS A HAZARD, NOT AN ENDORSEMENT. `quota_per_second: 0.0` is
-/// accepted at registration, and the bucket then never refills: once
-/// the initial burst is spent every further `acquire` parks forever
-/// (polling every 250 ms) with no error and no deadline. Only an
-/// explicit `refund` can ever release it. `cost > burst` is caught as a
-/// configuration bug; a zero refill rate is not.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn zero_quota_never_refills_and_parks_forever() {
+async fn invalid_quotas_are_ignored_and_leave_the_host_unmetered() {
     let governor = RateLimitGovernor::new();
-    governor.register(limit("stalled.test", 0.0, 1));
-    governor
-        .acquire("stalled.test", 1)
-        .await
-        .expect("the initial burst is spendable");
-
-    let blocked =
-        tokio::time::timeout(Duration::from_secs(60), governor.acquire("stalled.test", 1)).await;
-    assert!(
-        blocked.is_err(),
-        "a zero refill rate parks the caller indefinitely instead of erroring",
-    );
+    for (host, quota) in [
+        ("zero.test", 0.0),
+        ("negative.test", -1.0),
+        ("nan.test", f64::NAN),
+        ("infinite.test", f64::INFINITY),
+    ] {
+        governor.register(limit(host, quota, 1));
+        assert_eq!(governor.cost_default_for(host), None);
+        governor
+            .acquire(host, u32::MAX)
+            .await
+            .expect("a host with an invalid registration is unmetered");
+    }
 }
 
-// There is deliberately no test here for a negative or NaN
-// `quota_per_second`. `RateLimit` validates neither, and a governor
-// registered with one wedges on the very first `acquire`: the wait
-// computation clamps to a zero-length sleep, so under a paused runtime
-// the executor never goes idle, virtual time never advances, and even a
-// `tokio::time::timeout` around the call cannot fire. Any test that
-// exercises it hangs the suite instead of failing it. Validating the
-// rate at registration is the fix; until then this stays untested on
-// purpose.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn invalid_duplicate_still_balances_the_existing_attach_count() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("shared.test", 10.0, 10));
+    governor.register(limit("shared.test", f64::NAN, 1));
+
+    governor.unregister("shared.test");
+    assert_eq!(
+        governor.cost_default_for("shared.test"),
+        Some(1),
+        "the first detach must leave the first account's bucket registered"
+    );
+    governor.unregister("shared.test");
+    assert_eq!(governor.cost_default_for("shared.test"), None);
+}

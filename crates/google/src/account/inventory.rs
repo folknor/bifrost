@@ -271,12 +271,15 @@ async fn list_messages_page(
     client: &GmailClient,
     page_token: Option<&str>,
 ) -> crate::Result<ListMessagesResponse> {
-    let mut path = format!("/messages?maxResults={LIST_PAGE_SIZE}");
-    if let Some(page_token) = page_token {
-        path.push_str("&pageToken=");
-        path.push_str(&bifrost_net::url::encode_component(page_token));
-    }
+    let path = inventory_list_path(page_token);
     client.get(&path).await
+}
+
+fn inventory_list_path(page_token: Option<&str>) -> String {
+    format!(
+        "/messages{}",
+        crate::api::mail_list_query(None, Some(LIST_PAGE_SIZE), page_token)
+    )
 }
 
 fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoint>> {
@@ -630,6 +633,18 @@ mod tests {
             "500 is the users.messages.list maximum"
         );
         assert_eq!(HYDRATE_BATCH_SIZE, 32);
+    }
+
+    #[test]
+    fn inventory_lists_spam_and_trash_and_encodes_its_page_token() {
+        assert_eq!(
+            inventory_list_path(None),
+            "/messages?includeSpamTrash=true&maxResults=500"
+        );
+        assert_eq!(
+            inventory_list_path(Some("next+page")),
+            "/messages?includeSpamTrash=true&maxResults=500&pageToken=next%2Bpage"
+        );
     }
 
     #[test]

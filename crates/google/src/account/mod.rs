@@ -145,8 +145,13 @@ impl AccountFactory for GoogleAccountFactory {
         let client = Arc::new(self.client.for_account(account_id));
         let pubsub = self.pubsub.clone();
         Box::pin(async move {
-            let account = GoogleAccount::open(client, pubsub).await?;
-            Ok(account as Arc<dyn Account>)
+            match GoogleAccount::open(Arc::clone(&client), pubsub).await {
+                Ok(account) => Ok(account as Arc<dyn Account>),
+                Err(error) => {
+                    client.detach_account();
+                    Err(error)
+                }
+            }
         })
     }
 }
@@ -194,6 +199,15 @@ impl GoogleAccount {
             shutdown: CancellationToken::new(),
             closed: AtomicBool::new(false),
         }))
+    }
+}
+
+impl Drop for GoogleAccount {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.client.detach_account();
+        }
     }
 }
 
@@ -839,6 +853,7 @@ impl Account for GoogleAccount {
             return Box::pin(async { Ok(()) });
         }
         self.shutdown.cancel();
+        self.client.detach_account();
         let pubsub = Arc::clone(&self.pubsub);
         Box::pin(async move {
             pubsub.abort_renewer().await;

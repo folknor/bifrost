@@ -59,6 +59,13 @@ Internal modules:
 - `error.rs` - translation boundary from `crate::Error` to
   `AccountError` via the central `AccountErrorBuilder`.
 
+`crates/google/src/api.rs` is the Gmail wire wrapper used by these
+modules. Every dynamic label, thread, message, attachment, draft,
+filter, send-as, and page-token component is passed through
+the matching `bifrost_net::url` path or query encoder before URL
+assembly. The Drive hosting path applies the path rule to returned
+file ids.
+
 ## GoogleAccount / GoogleAccountFactory
 
 Consumers construct `GoogleAccountFactory` with
@@ -91,9 +98,11 @@ account-scoped clone attached to `bifrost-net` under the engine
 - `set_priority` / `set_bandwidth_cap` delegate to the underlying `AccountNet`.
 
 Clients (`from_access_token` or `from_token_source`) retain their parent
-`Net`, so `open(account_id)` mints a fresh `AccountNet` under the engine
-id on every reopen. There is no public custom-`Net` constructor after
-S1-W3; callers use the factory and the shared `Account` trait.
+`Net` without attaching a placeholder account. `open(account_id)` is
+the first point that mints an `AccountNet`, under the engine id. A
+failed open detaches that registration before returning the error.
+There is no public custom-`Net` constructor after S1-W3; callers use
+the factory and the shared `Account` trait.
 
 `AccountFactory::open(account_id)` returns `Arc<dyn Account>`. `reopen`
 flows from the engine: it drops the previous `Arc` and calls the factory
@@ -101,8 +110,10 @@ again with the same `AccountId`. The factory holds the credentials and
 client, so the new `GoogleAccount` carries a fresh
 `shutdown`/`pubsub`/`scope_cache` and reads the current profile at open.
 
-`close()` is idempotent: it marks `closed`, cancels `shutdown`, and aborts the
-Pub/Sub renewer. The renewer and `push_stream` both select on
+`close()` is idempotent: it marks `closed`, cancels `shutdown`, detaches
+the engine account from `bifrost-net`, and aborts the Pub/Sub renewer.
+`Drop` also cancels and detaches as a fallback when a consumer omits
+`close()`. The renewer and `push_stream` both select on
 `shutdown.cancelled()` and exit cleanly.
 
 ## Capabilities
@@ -235,7 +246,11 @@ Search translates the shared `SearchRequest` AST into Gmail query
 strings and uses `users.threads.list` for thread-shaped search and
 `users.messages.list` for message-shaped search. `provider_query` is
 appended verbatim so consumers can use Gmail-specific operators such
-as `larger:5M`.
+as `larger:5M`. Both list endpoints explicitly send
+`includeSpamTrash=true`; inventory and search therefore see the same
+first-class Spam and Trash containers that history changes can name.
+The inventory page walk calls the same `mail_list_query` builder as
+search, including its page-token query encoding.
 
 Container CRUD treats Gmail labels as `ContainerKind::Label` and returns
 native label ids. System labels `INBOX`, `SENT`, `DRAFT`, `TRASH`, `SPAM`
@@ -277,7 +292,10 @@ The Gmail overrides for multi-call conveniences are:
 Other conveniences inherit the trait default. `set_starred` routes
 through `set_label_membership` because capabilities advertise
 `LabelMembership`. `apply_label` and `remove_label` use the default
-provenance dispatch for Gmail label ids.
+provenance dispatch for Gmail label ids. The synthetic `archive`
+container is label-shaped for round trips, but applying it is the
+documented relocation operation: it removes INBOX, SPAM, and TRASH
+rather than adding a native Gmail label.
 
 People contacts use `people/me/connections`, `people:get`,
 `people:createContact`, `people:updateContact`, and `people:deleteContact`.
@@ -405,6 +423,13 @@ nothing cached, the operation fails rather than canonicalizing against
 an empty vocabulary; a populated stale cache stays usable when a later
 refresh fails.
 
+`scope_lifecycle_stream` treats a never-populated cache as a seeding
+state. Its first successful label fetch updates the cache and emits no
+Created events. Later polls diff populated snapshots. Rename events
+carry the same stable label id in `old` and `new`; they are invalidation
+signals telling the consumer to re-read container metadata, not a
+carrier for the old and new display names.
+
 `get_stream` consumes a stream of `ObjectId`s in batches of 32
 and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
 Per-item hydration outcomes flow as `ItemOutcome::Succeeded` for a
@@ -479,11 +504,12 @@ The renewer task in `start_renewer`:
 - Selects on `shutdown.cancelled()` between every sleep and
   every watch call so `close()` cuts the loop promptly.
 
-`push_unsubscribe` decodes the handle envelope, removes the
-handle from the active-handle set, and only when the set
-empties does it call `users.stop`, clear the stored expiration
-and last-history-id, and abort the renewer. The active-handle
-set lets multiple subscribers share one Gmail watch.
+`push_unsubscribe` decodes the handle envelope, removes the handle from
+the active-handle set, and only when a present handle was the last
+member does it call `users.stop`, clear the stored expiration and
+last-history-id, and abort the renewer. An unknown or replayed
+well-formed handle is a no-op. The active-handle set lets multiple
+subscribers share one Gmail watch.
 
 `push_stream` is a `broadcast::Receiver<WatchEvent>` adapter
 with shutdown wiring. `Lagged` is treated as a skip rather than
@@ -518,14 +544,21 @@ share a single `mutation_stream` driver:
     back to a label patch that moves the messages into `TRASH`,
     matching the scopes Gmail OAuth tokens with the
     `gmail.modify` scope can perform but `gmail.metadata` cannot.
+- The driver reads one item ahead at the 1000-item boundary. Every
+  final mutation batch is marked `PageBoundary::Final`, including a
+  stream whose item count is exactly divisible by 1000, followed by
+  `SyncEvent::Done(None)`.
 
 Result classification:
 
 - All ids in a successful batch -> `ItemOutcome::Succeeded` with
   `MutationSuccess::Applied`.
-- An empty patch (label op with no changes) or an
-  unsupported-flag patch -> `ItemOutcome::Succeeded` with
-  `MutationSuccess::Skipped` per id.
+- A legitimate empty patch (label op with no changes) ->
+  `ItemOutcome::Succeeded` with `MutationSuccess::Skipped` per id.
+- An unsupported flag or non-label move scope is malformed caller
+  input and produces `ItemOutcome::Failed` per id with a
+  `Request(Malformed)` account error. It is never reported as a
+  successful skip.
 - A retry-class or auth-class error -> stream-level
   `SyncEvent::Terminated(AccountError)` so the engine can re-issue
   via `error.recovery()`. The driver does not split applied vs
@@ -538,8 +571,9 @@ Flag canonicalization in `flags.rs`:
 - Gmail labels project to IMAP-style flags: `UNREAD` toggles
   `\Seen` (presence of `UNREAD` removes `\Seen`), `STARRED` is
   `\Flagged`, `DRAFT` is `\Draft`, `IMPORTANT` is
-  `$Important`. Folder-like labels (`INBOX`, `SENT`, `TRASH`,
-  `SPAM`, `CHAT`) drop out. Every other label id - user labels and
+  `$Important`. Provider system-label comparisons are
+  ASCII-case-insensitive. Folder-like labels (`INBOX`, `SENT`,
+  `TRASH`, `SPAM`, `CHAT`) drop out. Every other label id - user labels and
   the `CATEGORY_*` system labels alike - projects to
   `$gmail-label:<id>:<name>`.
 - The reverse direction in `translate_flag_op` handles `Add`,
@@ -559,8 +593,8 @@ Flag canonicalization in `flags.rs`:
   so they resolve without poisoning the patch but are never added or
   removed by a `Set`.
 - Any unrecognized flag is added verbatim and any unknown `Set` flag
-  falls into `unsupported_flags`. The driver emits `Skipped` for ids
-  in a patch with non-empty `unsupported_flags`.
+  falls into `unsupported_flags`. The driver emits a failed per-id
+  outcome for a patch with non-empty `unsupported_flags`.
 - A canonical flag set is hashed (FNV-1a) into the
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 
