@@ -41,12 +41,20 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
   `$select` lists.
 - `push.rs` - `/subscriptions` webhook subscribe/unsubscribe, per-handle
   `GraphSubscriptionGroup`, the renewal health worker that re-issues expiring
-  subscriptions and emits Disconnected/Reconnected on renewal failure.
+  subscriptions and emits Disconnected/Reconnected on renewal failure, plus
+  the EWS arm's `restId` -> `ewsId` translation
+  (`translation_input_chunks` / `reconcile_translated_ews_scopes`).
 - `push_stream.rs` - the broadcast-backed `push_stream` adapter, selecting the
   receiver against the shutdown token and spawning the EWS worker on demand.
 - `ews_stream.rs` - EWS Streaming Notifications fallback:
   Subscribe / GetStreamingEvents XML, watermark tracking, scope
-  recovery, the long-lived worker loop.
+  recovery, the long-lived worker loop. At `push_subscribe` (in `push.rs`),
+  Graph REST folder `restId`s are translated once through
+  `/me/translateExchangeIds` - deduplicated and chunked to Graph's 1,000-id
+  request cap - to `ewsId`s and retained beside their `CursorScope` in
+  subscription state: the SOAP Subscribe body uses those EWS ids and
+  notification routing maps the returned EWS parent id back to the original
+  scope without a second request.
 - `public_folder.rs` - no-delta-token public-folder sync: the
   watermark + throttled deletion-scan poll, inventory/changes streams,
   `EwsItem` -> entry/change projectors, hierarchy discovery driver.
@@ -573,28 +581,74 @@ scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
 When started before any scopes exist, it waits for a subscription-map change
 instead of polling the empty map.
 
-`scope_matches_notification_folder` does the mapping, and it is a byte
-comparison against PRIMARY-mailbox scopes only. It deliberately claims
-nothing more: a scope's `FolderId` is a Graph `restId` while a notification
-carries an `ewsId`, and Microsoft's supported conversion between the two is
-`translateExchangeIds`, so equal bytes match but unequal bytes do not prove
-a mismatch. A foreign-encoded scope never matches, because a notification
-carries no owning mailbox to disambiguate it with. A miss degrades to
-`HintPayload::Unknown` (account-wide re-check), which is why the imprecision
-is survivable here. The Subscribe request has the same id-format gap without
-the safe degradation - it puts Graph `restId`s in `<t:FolderId>` - and is an
-open finding, not settled behavior.
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
-`ews_scope_is_subscribable`: only a PRIMARY-mailbox `FolderType` scope is
+`ews_subscribable_folder_id`: only a PRIMARY-mailbox `FolderType` scope is
 accepted. A non-folder scope contributes nothing to the Subscribe body's
 `FolderIds` (an empty element EWS rejects outright), and a foreign folder is
 addressable only with its mailbox's routing headers while Subscribe sends
 `EwsHeaders::default()`, so its native id would resolve against the primary
 namespace. Both are refused locally rather than turned into a remote failure
-that reads as a provider fault. `push_stream` is a
+that reads as a provider fault. The predicate returns the scope's native
+`restId` instead of a bool, so the check and the extraction are one step and
+no later phase can re-derive the id differently. `push_stream` is a
 `broadcast::Receiver<WatchEvent>` adapter that selects against shutdown;
 the EWS branch re-spawns its worker on demand.
+
+#### REST-to-EWS id translation
+
+A Graph folder scope carries a `restId`; EWS speaks `ewsId`, and the two are
+distinct opaque formats whose only supported conversion is
+`translateExchangeIds`. `subscribe_ews` therefore translates once, at the
+subscription boundary, and retains the pair: `EwsSubscriptionScope { scope,
+ews_folder_id }` is what `EwsSubscriptionState` stores, what
+`build_subscribe_request` puts in `<t:FolderId>`, and what `scope_for_folder`
+matches a notification's parent id against to route back to the original
+`CursorScope` without a second request. Nothing downstream re-derives an id.
+Before this, Subscribe shipped `restId`s EWS cannot parse, so the whole
+opt-in `with_ews_streaming()` path terminated on an opaque
+`SoapFaultCode::Unknown` rather than establishing.
+
+Three rules govern the translation call, all pinned as pure functions
+because the request itself has no in-process seam:
+
+- **Deduplicate, then chunk** (`translation_input_chunks`). A `restId` is per
+  folder, not per scope, so scopes sharing a folder ask once; Graph caps
+  `inputIds` at 1,000 strings and rejects the whole request above it, so a
+  large mailbox fans out over several POSTs instead of failing before EWS
+  setup is attempted. First-seen order is preserved, so chunk boundaries are
+  deterministic.
+- **Per-id answers, per-id errors** (`reconcile_translated_ews_scopes`).
+  Graph's `convertIdResult` reports failure PER id inside an otherwise
+  successful 200: a converted id carries `targetId`, a refused one carries
+  `errorDetails` and no target. `targetId` is therefore optional on the wire
+  type - requiring it made one bad id fail deserialization of the whole
+  response and surface as a terminal `Protocol(ParseFailed)` naming nothing.
+  A refusal classifies `Request(Malformed)` -> `ClientBug` via
+  `graph_error::id_translation_refused`, carrying `ErrorScope::Cursor(scope)`
+  and Graph's verbatim code as a typed `WireCause::Graph`. It does not route
+  through `response_to_account_error`: that needs a status, and a
+  synthesized 400 on a cursor scope would classify `SyncState(CursorInvalid)`
+  and send the engine to `RestartScope`, which cannot fix an id the server
+  declines to convert. An omitted answer, or one with neither a target nor
+  error details, is `Protocol(ContractViolation)` with the same scope. No
+  arm degrades to sending the untranslated `restId`.
+- **Idempotent despite the operation** (`GraphErrorContext::idempotent`). The
+  call keeps `operation: PushSubscribe` - that is what the caller asked for -
+  but overrides the derived idempotency. `PushSubscribe` is non-idempotent,
+  so an in-flight transport drop would derive
+  `Reconcile(TransportDropAfterSend)`; this read-only POST runs before any
+  handle, local state, or EWS subscription exists, so there is no target to
+  probe and a plain `Retry(SameRequest)` is correct. The override rides on
+  `GraphErrorContext` and is applied in `finish` for builder-constructed
+  errors; the `bifrost-net` transport arm re-applies it through
+  `AccountError::into_builder`, since `NetErrorContext` has no override
+  channel and the builder-only override does not survive that round trip.
+
+Notification routing is an exact `ews_folder_id` byte match against the ids
+this crate itself received from Graph, so a miss no longer means "the
+formats may disagree". A miss still degrades to `HintPayload::Unknown`
+(account-wide re-check) rather than dropping the notification.
 
 ## Mutation pipeline
 
@@ -748,8 +802,13 @@ for `fileAttachment` (item/reference false); no pre-download digest.
 
 `graph_error::into_account_error(error, ctx)` converts the crate-internal
 `GraphError` into an `AccountError` via `try_build`. `GraphErrorContext
-{ protocol, operation, scope }` threads the operation so `recovery::derive`
-computes `RecoveryClass` (no private recovery table). `GraphErrorContext::ews(op)`
+{ protocol, operation, scope, idempotency_override }` threads the operation so
+`recovery::derive` computes `RecoveryClass` (no private recovery table).
+`idempotency_override` is `None` everywhere except the one call site that
+needs it (the EWS id-translation POST, via `.idempotent()`): it corrects the
+retry-vs-reconcile derivation for a read-only preflight issued under a
+mutating operation, without renaming the operation the caller invoked.
+`GraphErrorContext::ews(op)`
 is the EWS constructor; `ews_error_to_account_error` routes
 `EwsError::Transport` through `bifrost_net::into_account_error`, `HttpStatus`
 through the REST `response_to_account_error` path, `SoapFault` onto
@@ -832,11 +891,10 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
   needs a public HTTPS endpoint (else `Error::MissingCoreCapability`). EWS
   streaming currently supports primary-mailbox folders only: shared-mailbox
   scopes need mailbox-specific EWS routing headers and are not yet grouped by
-  owner. It also has no id translation: folder scopes carry Graph `restId`s
-  and EWS speaks `ewsId`, so both the Subscribe request and the notification
-  mapping are unsound until a `translateExchangeIds` step lands at the
-  subscription boundary. Webhook mode is unaffected (it addresses folders
-  over Graph REST).
+  owner. Folder ids ARE translated (`restId` -> `ewsId` once at
+  `push_subscribe`, retained beside the scope), so Subscribe and notification
+  routing both speak the format EWS expects. Webhook mode never needed it (it
+  addresses folders over Graph REST).
 - Blob range per-handle (fileAttachment only); delta-token expiry reactive (410
   / 400 InvalidDeltaToken -> `RestartScope`); `MutationReplaySafety::None`.
 - Unsupported: `remove_from_container`, keyword/label writes,

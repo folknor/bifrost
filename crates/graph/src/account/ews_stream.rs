@@ -12,6 +12,7 @@ use crate::ews::{EwsClient, EwsError, EwsHeaders};
 
 use super::GraphAccount;
 use super::graph_error::{GraphErrorContext, ews_error_to_account_error};
+use super::push::EwsSubscriptionScope;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -262,14 +263,16 @@ pub(crate) fn parse_subscribe_response(xml: &str) -> Result<Vec<EwsStreamingSubs
     Ok(subscriptions)
 }
 
-pub(crate) fn build_subscribe_request(scopes: &[CursorScope], watermark: Option<&str>) -> String {
+pub(crate) fn build_subscribe_request(
+    scopes: &[EwsSubscriptionScope],
+    watermark: Option<&str>,
+) -> String {
     let mut folder_ids = String::new();
     for scope in scopes {
-        if let CursorScope::FolderType { folder, .. } = scope {
-            let parsed = super::foreign::parse_folder(folder);
-            let native = parsed.native_id();
-            folder_ids.push_str(&format!(r#"<t:FolderId Id="{}"/>"#, xml_escape(native)));
-        }
+        folder_ids.push_str(&format!(
+            r#"<t:FolderId Id="{}"/>"#,
+            xml_escape(&scope.ews_folder_id)
+        ));
     }
     let watermark_xml = watermark
         .map(|watermark| format!("<t:Watermark>{}</t:Watermark>", xml_escape(watermark)))
@@ -312,7 +315,7 @@ pub(crate) fn build_get_streaming_events_request(
 async fn subscribe(
     ews: &EwsClient,
     account: &GraphAccount,
-    scopes: &[CursorScope],
+    scopes: &[EwsSubscriptionScope],
 ) -> Result<EwsStreamingSubscription, EwsError> {
     let watermark = current_watermark(account).await;
     let body = build_subscribe_request(scopes, watermark.as_deref());
@@ -423,7 +426,7 @@ async fn run_get_events_loop(
     }
 }
 
-async fn active_ews_scopes(account: &GraphAccount) -> Vec<CursorScope> {
+async fn active_ews_scopes(account: &GraphAccount) -> Vec<EwsSubscriptionScope> {
     let states = account.ews_subscriptions.read().await;
     let mut scopes = Vec::new();
     for state in states.values() {
@@ -476,38 +479,9 @@ async fn scope_for_folder(account: &GraphAccount, folder_id: &str) -> Option<Cur
         state
             .scopes
             .iter()
-            .find(|scope| scope_matches_notification_folder(scope, folder_id))
-            .cloned()
+            .find(|scope| scope.ews_folder_id == folder_id)
+            .map(|scope| scope.scope.clone())
     })
-}
-
-/// Whether `scope` is the one an EWS notification for `folder_id` belongs to.
-///
-/// This is a byte comparison against a primary-mailbox scope, and it is
-/// deliberately NOT more than that. Two things it does not establish, both
-/// tracked as O-10:
-///
-/// - a Graph folder scope carries a REST id (`restId`) while an EWS
-///   notification carries an `ewsId`. Microsoft documents the two as
-///   distinct formats and `translateExchangeIds` as the supported
-///   conversion, so equal bytes are sufficient for a match but not
-///   necessary: an unequal pair may still name the same folder. That is why
-///   this returns a bool rather than pretending to decode.
-/// - a notification carries no owning mailbox, so a foreign-encoded scope
-///   cannot be identified by folder id alone - nothing in the Graph contract
-///   makes one mailbox's folder ids distinct from another's. Foreign scopes
-///   therefore never match. They are also not subscribable
-///   (`ews_scope_is_subscribable`), so today this excludes nothing that
-///   could have produced the notification.
-///
-/// A miss is safe but imprecise: `run_get_events_loop` degrades to
-/// `HintPayload::Unknown`, an account-wide re-check, instead of a scoped one.
-fn scope_matches_notification_folder(scope: &CursorScope, folder_id: &str) -> bool {
-    let CursorScope::FolderType { folder, .. } = scope else {
-        return false;
-    };
-    let parsed = super::foreign::parse_folder(folder);
-    parsed.foreign().is_none() && parsed.native_id() == folder_id
 }
 
 fn finish_notification(builder: &NotificationBuilder) -> Option<EwsStreamingNotification> {
@@ -632,9 +606,16 @@ mod tests {
         }
     }
 
+    fn ews_scope(rest_id: &str, ews_id: &str) -> EwsSubscriptionScope {
+        EwsSubscriptionScope {
+            scope: email_scope(rest_id),
+            ews_folder_id: ews_id.to_string(),
+        }
+    }
+
     #[test]
     fn subscribe_request_lists_every_folder_and_the_six_event_types() {
-        let body = build_subscribe_request(&[email_scope("f1"), email_scope("f2")], None);
+        let body = build_subscribe_request(&[ews_scope("r1", "f1"), ews_scope("r2", "f2")], None);
         assert!(body.contains(r#"<t:FolderId Id="f1"/>"#), "{body}");
         assert!(body.contains(r#"<t:FolderId Id="f2"/>"#), "{body}");
         for event in [
@@ -652,13 +633,13 @@ mod tests {
 
     #[test]
     fn subscribe_request_carries_a_resume_watermark_when_one_is_known() {
-        let body = build_subscribe_request(&[email_scope("f1")], Some("wm-1"));
+        let body = build_subscribe_request(&[ews_scope("r1", "f1")], Some("wm-1"));
         assert!(body.contains("<t:Watermark>wm-1</t:Watermark>"), "{body}");
     }
 
     #[test]
     fn subscribe_request_escapes_xml_metacharacters() {
-        let body = build_subscribe_request(&[email_scope(r#"a&b<c>"d'"#)], Some("wm&1"));
+        let body = build_subscribe_request(&[ews_scope("rest-id", r#"a&b<c>"d'"#)], Some("wm&1"));
         assert!(
             body.contains(r#"<t:FolderId Id="a&amp;b&lt;c&gt;&quot;d&apos;"/>"#),
             "{body}"
@@ -669,72 +650,16 @@ mod tests {
         );
     }
 
-    /// The Subscribe body decodes a foreign `FolderId` like every other
-    /// request builder (`push::resource_for_scope`,
-    /// `inventory::initial_delta_url`): the raw `mailbox\u{1f}folder` string
-    /// would put U+001F inside an XML attribute, which is not a legal XML
-    /// character at all. `ews_scope_is_subscribable` rejects foreign scopes
-    /// before they reach here, so this pins the codec, not a live path.
     #[test]
-    fn subscribe_request_uses_the_native_folder_id() {
-        let scope = CursorScope::FolderType {
-            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
-            ty: bifrost_types::ObjectType::Email,
-        };
-        let body = build_subscribe_request(&[scope], None);
-        assert!(!body.contains('\u{1f}'), "{body:?}");
-        assert!(!body.contains("shared@contoso.com"), "{body}");
-        assert!(body.contains(r#"<t:FolderId Id="AAMk"/>"#), "{body}");
+    fn subscribe_request_uses_the_translated_ews_id_not_the_graph_rest_id() {
+        let body = build_subscribe_request(&[ews_scope("rest-AAMk", "ews-AAE=")], None);
+        assert!(body.contains(r#"<t:FolderId Id="ews-AAE="/>"#), "{body}");
+        assert!(!body.contains("rest-AAMk"), "{body}");
     }
 
     #[test]
-    fn only_a_primary_scope_is_identified_by_a_bare_notification_folder_id() {
-        assert!(scope_matches_notification_folder(
-            &email_scope("AAMk"),
-            "AAMk"
-        ));
-        assert!(!scope_matches_notification_folder(
-            &email_scope("AAMk"),
-            "other"
-        ));
-
-        // A foreign scope names a folder in ANOTHER mailbox and the
-        // notification says nothing about which mailbox it came from. It
-        // must not be matched on the decoded native id: that would claim an
-        // equivalence the id formats do not give us (O-10), and the same
-        // native id in a second mailbox would resolve to whichever scope the
-        // map iterated first.
-        let foreign = CursorScope::FolderType {
-            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
-            ty: bifrost_types::ObjectType::Email,
-        };
-        assert!(!scope_matches_notification_folder(&foreign, "AAMk"));
-        assert!(!scope_matches_notification_folder(
-            &foreign,
-            &foreign_folder_id("shared@contoso.com", "AAMk")
-        ));
-
-        // Only folder-typed scopes are subscribable at all.
-        assert!(!scope_matches_notification_folder(
-            &CursorScope::Account,
-            "AAMk"
-        ));
-        assert!(!scope_matches_notification_folder(
-            &CursorScope::Folder(bifrost_types::FolderId("AAMk".to_string())),
-            "AAMk"
-        ));
-    }
-
-    fn foreign_folder_id(mailbox: &str, folder: &str) -> String {
-        super::super::foreign::encode_foreign(mailbox, folder).0
-    }
-
-    /// The body builder assumes `push_subscribe` already validated every
-    /// scope as `FolderType`. Keeping that validation at the public boundary
-    /// prevents an empty FolderIds request from reaching EWS.
-    #[test]
-    fn subscribe_request_builder_omits_unvalidated_non_folder_scopes() {
-        let body = build_subscribe_request(&[CursorScope::Account], None);
+    fn subscribe_request_builder_emits_an_empty_list_only_for_no_translations() {
+        let body = build_subscribe_request(&[], None);
         assert!(body.contains("<t:FolderIds></t:FolderIds>"), "{body}");
     }
 

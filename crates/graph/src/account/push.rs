@@ -1,18 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::WatchEvent;
 use bifrost_types::{
     AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
-    ObjectType, Protocol, Provider, RequestCause, SubscriptionHandle, TransmissionState,
+    ErrorScope, ObjectType, Protocol, ProtocolErrorKind, Provider, RequestCause,
+    SubscriptionHandle, TransmissionState,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::webhooks::{
     create_subscription, delete_subscription, is_expiring_soon, renew_subscription,
     subscription_is_gone,
 };
 
-use super::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
+use super::graph_error::{
+    GraphErrorContext, id_translation_refused, into_account_error, invalid_account_error,
+    protocol_violation,
+};
 use super::{GraphAccount, PushMode};
 
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -68,8 +73,57 @@ pub(crate) struct GraphSubscriptionState {
 pub(crate) struct EwsSubscriptionState {
     pub(crate) ews_subscription_id: Option<String>,
     pub(crate) watermark: Option<String>,
-    pub(crate) scopes: Vec<CursorScope>,
+    /// The Graph cursor scope and EWS id for its folder. Graph `restId` and
+    /// EWS `ewsId` are distinct opaque formats.
+    pub(crate) scopes: Vec<EwsSubscriptionScope>,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct EwsSubscriptionScope {
+    pub(crate) scope: CursorScope,
+    pub(crate) ews_folder_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslateExchangeIdsRequest {
+    input_ids: Vec<String>,
+    source_id_type: &'static str,
+    target_id_type: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslateExchangeIdsResponse {
+    value: Vec<TranslatedExchangeId>,
+}
+
+/// One `convertIdResult`.
+///
+/// Graph answers PER input id inside an otherwise successful 200: a converted
+/// id carries `targetId`, an id it could not convert carries `errorDetails`
+/// and no target. Requiring `targetId` made a single refused id fail
+/// deserialization of the whole response, so one stale folder surfaced as a
+/// terminal `Protocol(ParseFailed)` naming nothing instead of a
+/// scope-correlated refusal naming the folder and Graph's own code.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslatedExchangeId {
+    source_id: String,
+    target_id: Option<String>,
+    error_details: Option<ConvertIdError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvertIdError {
+    code: Option<String>,
+    message: Option<String>,
+}
+
+/// Graph caps `translateExchangeIds`' `inputIds` collection at 1,000 strings
+/// and rejects the whole request above it.
+const TRANSLATE_EXCHANGE_IDS_MAX_INPUTS: usize = 1_000;
 
 pub(crate) async fn push_subscribe(
     account: GraphAccount,
@@ -609,7 +663,8 @@ fn remove_subscription_from_groups(
     remove_group
 }
 
-/// Whether the EWS streaming worker can actually subscribe to `scope`.
+/// The Graph `restId` this scope contributes to the EWS Subscribe request, or
+/// `None` when the EWS streaming worker cannot subscribe to it at all.
 ///
 /// Two exclusions, both of which the worker would otherwise turn into a
 /// remote failure that reads as a provider fault instead of the caller's
@@ -624,22 +679,34 @@ fn remove_subscription_from_groups(
 ///   against the PRIMARY mailbox's namespace - a wrong folder or a miss,
 ///   never the intended one. Mailbox-grouped EWS subscriptions are the fix;
 ///   until then this rejects rather than silently mis-targets.
-fn ews_scope_is_subscribable(scope: &CursorScope) -> bool {
-    match scope {
-        CursorScope::FolderType { folder, .. } => {
-            super::foreign::parse_folder(folder).foreign().is_none()
-        }
-        _ => false,
+///
+/// Returning the id rather than a bool fuses the check with the extraction:
+/// the translation request, the reconciliation, and the retained state all
+/// read the one string this produced, so no later phase can re-derive it
+/// differently or have to assert a shape the predicate already guaranteed.
+fn ews_subscribable_folder_id(scope: &CursorScope) -> Option<String> {
+    let CursorScope::FolderType { folder, .. } = scope else {
+        return None;
+    };
+    let parsed = super::foreign::parse_folder(folder);
+    if parsed.foreign().is_some() {
+        return None;
     }
+    Some(parsed.native_id().to_string())
 }
 
 async fn subscribe_ews(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
 ) -> Result<SubscriptionHandle, AccountError> {
-    if !scopes.iter().all(ews_scope_is_subscribable) {
-        return Err(unsupported_push_error());
+    let mut pending = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let Some(source_id) = ews_subscribable_folder_id(&scope) else {
+            return Err(unsupported_push_error());
+        };
+        pending.push((scope, source_id));
     }
+    let scopes = translate_ews_scopes(&account, pending).await?;
     let handle = new_handle()?;
     account.ews_subscriptions.write().await.insert(
         handle.clone(),
@@ -652,6 +719,138 @@ async fn subscribe_ews(
     account.ews_subscription_changed.notify_one();
     super::push_stream::ensure_ews_worker(account).await;
     Ok(handle)
+}
+
+/// The error context for the translation request itself.
+///
+/// The operation stays `PushSubscribe` - that IS what the caller asked for,
+/// and borrowing an unrelated idempotent operation would put a name in every
+/// telemetry export that no call site matches. What the context corrects is
+/// the recovery derivation: `PushSubscribe` is non-idempotent, so an
+/// in-flight transport drop would derive
+/// `Reconcile(TransportDropAfterSend, [CheckTarget])` and send the engine
+/// looking for a subscription to probe. This POST is a read-only id
+/// conversion that runs BEFORE any local subscription state, EWS
+/// subscription, or handle exists: there is no target, nothing was created,
+/// and repeating it is free.
+fn translate_error_context() -> GraphErrorContext {
+    GraphErrorContext::graph(AccountOperation::PushSubscribe).idempotent()
+}
+
+/// Converts Graph REST ids into the EWS ids required by this subscription's
+/// SOAP request and its notification folder ids. The response can be
+/// unordered, and is fanned out over several requests once the folder count
+/// passes Graph's cap, so each scope is preserved by matching its `sourceId`
+/// rather than by position.
+async fn translate_ews_scopes(
+    account: &GraphAccount,
+    pending: Vec<(CursorScope, String)>,
+) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
+    let mut translated = Vec::new();
+    for input_ids in translation_input_chunks(&pending) {
+        let request = TranslateExchangeIdsRequest {
+            input_ids,
+            source_id_type: "restId",
+            target_id_type: "ewsId",
+        };
+        let response: TranslateExchangeIdsResponse = account
+            .client
+            .post("/me/translateExchangeIds", &request)
+            .await
+            .map_err(|error| into_account_error(error, translate_error_context()))?;
+        translated.extend(response.value);
+    }
+    reconcile_translated_ews_scopes(pending, translated)
+}
+
+/// The `inputIds` collections one subscription's translation needs.
+///
+/// Two scopes can name the same folder - an `Email` and a `Contact` scope
+/// over one container decode to the same native id - and Graph caps
+/// `inputIds` at `TRANSLATE_EXCHANGE_IDS_MAX_INPUTS`, rejecting the whole
+/// request above it. So deduplicate first (that alone keeps a mailbox under
+/// the cap for the folder counts that produce duplicates) and then chunk, so
+/// a genuinely large mailbox fans out instead of failing before EWS setup is
+/// even attempted. First-seen order is preserved so the chunk boundaries are
+/// deterministic and a failure names a stable set of ids.
+fn translation_input_chunks(pending: &[(CursorScope, String)]) -> Vec<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::with_capacity(pending.len());
+    for (_, source_id) in pending {
+        if seen.insert(source_id.as_str()) {
+            unique.push(source_id.clone());
+        }
+    }
+    unique
+        .chunks(TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
+        .map(<[String]>::to_vec)
+        .collect()
+}
+
+/// Pairs every submitted scope back with its translated EWS id, or fails the
+/// subscription.
+///
+/// One answer can serve several scopes (the deduplicated request asked once
+/// for a folder two scopes share), and the three ways an answer can fail are
+/// distinct enough to classify apart:
+///
+/// - refused (`errorDetails`, no target): Graph answered, and the answer is
+///   "not this id". Terminal, scope-correlated, carries Graph's code.
+/// - omitted: Graph must answer every id it was given. A missing answer is
+///   the provider breaking its own contract, not a malformed request.
+/// - answered with neither a target nor an error: the same contract
+///   violation in a different shape, and the one case where falling through
+///   would leave a scope with no id at all.
+///
+/// None of the three may degrade to sending the untranslated `restId`: EWS
+/// cannot parse it, so the Subscribe would fail as an opaque
+/// `SoapFaultCode::Unknown` instead of the diagnosable local error.
+fn reconcile_translated_ews_scopes(
+    pending: Vec<(CursorScope, String)>,
+    translated: Vec<TranslatedExchangeId>,
+) -> Result<Vec<EwsSubscriptionScope>, AccountError> {
+    let answers: HashMap<String, TranslatedExchangeId> = translated
+        .into_iter()
+        .map(|entry| (entry.source_id.clone(), entry))
+        .collect();
+    pending
+        .into_iter()
+        .map(|(scope, source_id)| {
+            let error_scope = ErrorScope::Cursor(scope.clone());
+            let Some(answer) = answers.get(&source_id) else {
+                return Err(protocol_violation(
+                    ProtocolErrorKind::ContractViolation,
+                    AccountOperation::PushSubscribe,
+                    Some(error_scope),
+                    "translateExchangeIds omitted a subscribed folder",
+                ));
+            };
+            if let Some(ews_folder_id) = answer
+                .target_id
+                .as_ref()
+                .filter(|target| !target.trim().is_empty())
+            {
+                return Ok(EwsSubscriptionScope {
+                    scope,
+                    ews_folder_id: ews_folder_id.clone(),
+                });
+            }
+            match answer.error_details.as_ref() {
+                Some(details) => Err(id_translation_refused(
+                    AccountOperation::PushSubscribe,
+                    error_scope,
+                    details.code.as_deref(),
+                    details.message.as_deref(),
+                )),
+                None => Err(protocol_violation(
+                    ProtocolErrorKind::ContractViolation,
+                    AccountOperation::PushSubscribe,
+                    Some(error_scope),
+                    "translateExchangeIds answered without a target id or error details",
+                )),
+            }
+        })
+        .collect()
 }
 
 async fn unsubscribe_ews(
@@ -736,20 +935,25 @@ mod tests {
             folder: FolderId("inbox".to_string()),
             ty: ObjectType::Email,
         };
-        assert!(ews_scope_is_subscribable(&primary));
+        // The accepted scope also yields the id the translation request
+        // sends: bare, never the raw foreign-encoded string.
+        assert_eq!(
+            ews_subscribable_folder_id(&primary).as_deref(),
+            Some("inbox")
+        );
 
         let foreign = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
             ty: ObjectType::Email,
         };
-        assert!(!ews_scope_is_subscribable(&foreign));
+        assert!(ews_subscribable_folder_id(&foreign).is_none());
 
         // A public-folder scope, and the account-wide scope the webhook
         // path already rejects loudly.
-        assert!(!ews_scope_is_subscribable(&CursorScope::Folder(FolderId(
-            "pf".to_string()
-        ))));
-        assert!(!ews_scope_is_subscribable(&CursorScope::Account));
+        assert!(
+            ews_subscribable_folder_id(&CursorScope::Folder(FolderId("pf".to_string()))).is_none()
+        );
+        assert!(ews_subscribable_folder_id(&CursorScope::Account).is_none());
     }
 
     #[test]
@@ -1314,5 +1518,235 @@ mod tests {
         unsubscribe_graph(account, SubscriptionHandle("never-issued".to_string()))
             .await
             .expect("unknown handle unsubscribes cleanly");
+    }
+
+    fn email_scope(folder: &str) -> CursorScope {
+        CursorScope::FolderType {
+            folder: FolderId(folder.to_string()),
+            ty: ObjectType::Email,
+        }
+    }
+
+    /// What `subscribe_ews` hands the translation phase: every scope already
+    /// validated and paired with the native id it contributes.
+    fn pending(folders: &[&str]) -> Vec<(CursorScope, String)> {
+        folders
+            .iter()
+            .map(|folder| {
+                let scope = email_scope(folder);
+                let source_id =
+                    ews_subscribable_folder_id(&scope).expect("a primary folder scope is pending");
+                (scope, source_id)
+            })
+            .collect()
+    }
+
+    fn converted(source_id: &str, target_id: &str) -> TranslatedExchangeId {
+        TranslatedExchangeId {
+            source_id: source_id.to_string(),
+            target_id: Some(target_id.to_string()),
+            error_details: None,
+        }
+    }
+
+    #[test]
+    fn translated_ews_ids_stay_paired_with_their_graph_scopes_when_response_is_reordered() {
+        let translated = vec![
+            converted("rest-archive", "ews-archive"),
+            converted("rest-inbox", "ews-inbox"),
+        ];
+
+        let resolved =
+            reconcile_translated_ews_scopes(pending(&["rest-inbox", "rest-archive"]), translated)
+                .expect("every subscribed folder was translated");
+        assert_eq!(resolved[0].ews_folder_id, "ews-inbox");
+        assert_eq!(resolved[1].ews_folder_id, "ews-archive");
+    }
+
+    /// Graph must answer every id it was given. A dropped answer is the
+    /// provider breaking its own contract, so it classifies as one - and it
+    /// still names the folder, because "a subscription failed" without a
+    /// container is not a diagnosable report.
+    #[test]
+    fn a_missing_ews_translation_rejects_the_subscription() {
+        let error = reconcile_translated_ews_scopes(pending(&["rest-inbox"]), Vec::new())
+            .expect_err("a REST id must never be sent to EWS as a fallback");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        ));
+        assert_eq!(
+            error.scope(),
+            Some(&ErrorScope::Cursor(email_scope("rest-inbox")))
+        );
+    }
+
+    /// Graph converts ids one at a time and reports a failure per id inside
+    /// an otherwise successful 200. The refused id must fail its own
+    /// subscription with its own scope and Graph's own code - not take the
+    /// whole response down as an unparseable body, which is what a required
+    /// `targetId` produced.
+    #[test]
+    fn a_per_id_translation_failure_names_its_scope_and_the_provider_code() {
+        let translated = vec![
+            converted("rest-inbox", "ews-inbox"),
+            TranslatedExchangeId {
+                source_id: "rest-stale".to_string(),
+                target_id: None,
+                error_details: Some(ConvertIdError {
+                    code: Some("ErrorInvalidIdMalformed".to_string()),
+                    message: Some("Id is malformed.".to_string()),
+                }),
+            },
+        ];
+
+        let error =
+            reconcile_translated_ews_scopes(pending(&["rest-inbox", "rest-stale"]), translated)
+                .expect_err("a folder with no EWS id cannot be subscribed");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert!(error.recovery().is_terminal());
+        assert_eq!(
+            error.scope(),
+            Some(&ErrorScope::Cursor(email_scope("rest-stale")))
+        );
+        let carries_code = error.chain().iter().any(|cause| {
+            matches!(
+                cause,
+                Cause::Wire(bifrost_types::WireCause::Graph(
+                    bifrost_types::GraphSignal::Unknown { code }
+                )) if code == "ErrorInvalidIdMalformed"
+            )
+        });
+        assert!(carries_code, "the provider code must survive to support");
+    }
+
+    /// The one shape that would otherwise fall through with no id at all.
+    #[test]
+    fn a_translation_answer_with_neither_target_nor_error_is_a_contract_violation() {
+        let translated = vec![TranslatedExchangeId {
+            source_id: "rest-inbox".to_string(),
+            target_id: Some("   ".to_string()),
+            error_details: None,
+        }];
+        let error = reconcile_translated_ews_scopes(pending(&["rest-inbox"]), translated)
+            .expect_err("a blank target id is not a translation");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+        ));
+    }
+
+    /// A `restId` is per folder, not per scope, so one answer serves every
+    /// scope over that folder. Asking twice would waste a slot against
+    /// Graph's cap for no gain.
+    #[test]
+    fn scopes_sharing_a_folder_translate_once_and_both_resolve() {
+        let pending = vec![
+            (email_scope("rest-shared"), "rest-shared".to_string()),
+            (
+                CursorScope::FolderType {
+                    folder: FolderId("rest-shared".to_string()),
+                    ty: ObjectType::Contact,
+                },
+                "rest-shared".to_string(),
+            ),
+        ];
+        let chunks = translation_input_chunks(&pending);
+        assert_eq!(chunks, vec![vec!["rest-shared".to_string()]]);
+
+        let resolved =
+            reconcile_translated_ews_scopes(pending, vec![converted("rest-shared", "ews-shared")])
+                .expect("one answer serves both scopes");
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|s| s.ews_folder_id == "ews-shared"));
+    }
+
+    /// Graph rejects an `inputIds` collection over 1,000 strings outright,
+    /// so a large mailbox has to fan out. Before chunking, every scope went
+    /// into one collection and the subscription failed before EWS setup was
+    /// even attempted.
+    #[test]
+    fn translation_requests_stay_inside_the_graph_input_id_cap() {
+        let folders: Vec<String> = (0..2_500).map(|n| format!("rest-{n}")).collect();
+        let pending: Vec<(CursorScope, String)> = folders
+            .iter()
+            .map(|folder| (email_scope(folder), folder.clone()))
+            .collect();
+
+        let chunks = translation_input_chunks(&pending);
+        assert_eq!(chunks.len(), 3);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.len() <= TRANSLATE_EXCHANGE_IDS_MAX_INPUTS)
+        );
+        let flattened: Vec<String> = chunks.into_iter().flatten().collect();
+        assert_eq!(flattened, folders, "order and coverage both survive");
+    }
+
+    /// The response Graph documents, decoded end to end: a converted id and
+    /// a refused one in the same 200. Deserialization must survive the
+    /// refused entry - the whole finding was that it did not.
+    #[test]
+    fn a_mixed_convert_id_result_deserializes() {
+        let body = r#"{
+            "value": [
+                { "sourceId": "rest-a", "targetId": "ews-a" },
+                {
+                    "sourceId": "rest-b",
+                    "errorDetails": {
+                        "code": "ErrorInvalidIdMalformed",
+                        "message": "Id is malformed."
+                    }
+                }
+            ]
+        }"#;
+        let response: TranslateExchangeIdsResponse =
+            serde_json::from_str(body).expect("a per-id failure is not a parse failure");
+        assert_eq!(response.value.len(), 2);
+        assert_eq!(response.value[0].target_id.as_deref(), Some("ews-a"));
+        assert!(response.value[1].target_id.is_none());
+        assert_eq!(
+            response.value[1]
+                .error_details
+                .as_ref()
+                .and_then(|details| details.code.as_deref()),
+            Some("ErrorInvalidIdMalformed")
+        );
+    }
+
+    /// The translation POST creates nothing: it runs before the handle, the
+    /// local state, and the EWS subscription all exist. A drop mid-flight
+    /// has no target to reconcile against, so it must stay a plain retry
+    /// even though `PushSubscribe` is a non-idempotent operation.
+    #[test]
+    fn a_dropped_translation_request_retries_instead_of_reconciling() {
+        let dropped = crate::error::GraphError::Net(bifrost_net::Error::Network {
+            message: "connection reset".to_string(),
+            transmission_state: TransmissionState::InFlight,
+            source: None,
+        });
+        let error = into_account_error(dropped, translate_error_context());
+        assert!(
+            error.recovery().is_retryable(),
+            "recovery was {:?}",
+            error.recovery()
+        );
+
+        // The same drop under the plain PushSubscribe context is the
+        // behavior the override corrects, not a coincidence of the kind.
+        let dropped = crate::error::GraphError::Net(bifrost_net::Error::Network {
+            message: "connection reset".to_string(),
+            transmission_state: TransmissionState::InFlight,
+            source: None,
+        });
+        let reconciled = into_account_error(
+            dropped,
+            GraphErrorContext::graph(AccountOperation::PushSubscribe),
+        );
+        assert!(reconciled.recovery().requires_reconciliation());
     }
 }

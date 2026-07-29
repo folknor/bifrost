@@ -31,6 +31,9 @@ pub(crate) struct GraphErrorContext {
     pub(crate) protocol: Protocol,
     pub(crate) operation: AccountOperation,
     pub(crate) scope: Option<ErrorScope>,
+    /// Overrides `AccountOperation::is_idempotent` for one call site.
+    /// `None` leaves the operation's own answer in force.
+    pub(crate) idempotency_override: Option<bool>,
 }
 
 impl GraphErrorContext {
@@ -40,6 +43,7 @@ impl GraphErrorContext {
             protocol: Protocol::Graph,
             operation,
             scope: None,
+            idempotency_override: None,
         }
     }
 
@@ -53,12 +57,30 @@ impl GraphErrorContext {
             protocol: Protocol::Ews,
             operation,
             scope: None,
+            idempotency_override: None,
         }
     }
 
     #[must_use]
     pub(crate) fn with_scope(mut self, scope: ErrorScope) -> Self {
         self.scope = Some(scope);
+        self
+    }
+
+    /// Declare this request safely repeatable even though its
+    /// `AccountOperation` is not.
+    ///
+    /// `recovery::derive` reads `AccountOperation::is_idempotent` to choose
+    /// between `Retry(SameRequest)` and `Reconcile(TransportDropAfterSend)`
+    /// for an in-flight transport drop, and that answer is per operation, not
+    /// per request. A read-only preflight issued under a mutating operation -
+    /// the `translateExchangeIds` POST that runs before any push subscription
+    /// exists - has no target to reconcile against and is safe to repeat, so
+    /// it says so here rather than borrowing an unrelated operation whose
+    /// name would then lie in every telemetry export.
+    #[must_use]
+    pub(crate) fn idempotent(mut self) -> Self {
+        self.idempotency_override = Some(true);
         self
     }
 
@@ -78,10 +100,33 @@ impl GraphErrorContext {
 #[must_use]
 pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> AccountError {
     match error {
-        GraphError::Net(net) => bifrost_net::into_account_error(net, ctx.to_net_ctx()),
+        GraphError::Net(net) => {
+            apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), &ctx)
+        }
         GraphError::Response(response) => response_to_account_error(response, &ctx),
         GraphError::Json { message, body } => json_parse_to_account_error(&message, body, &ctx),
     }
+}
+
+/// Re-apply the context's idempotency override onto an error `bifrost-net`
+/// built.
+///
+/// `NetErrorContext` carries no override channel, and the override is a
+/// builder-only input that `into_builder` deliberately drops, so the
+/// transport arm re-derives the recovery class through the documented
+/// decoration path instead of teaching every net consumer a new field. The
+/// kind and cause chain are untouched; only `recovery` recomputes. A call
+/// site that declared nothing pays nothing - there is no rebuild.
+#[must_use]
+fn apply_idempotency_override(error: AccountError, ctx: &GraphErrorContext) -> AccountError {
+    let Some(idempotent) = ctx.idempotency_override else {
+        return error;
+    };
+    error
+        .into_builder()
+        .idempotency_override(idempotent)
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Convert a structured `EwsError` into the opaque `AccountError`.
@@ -92,7 +137,9 @@ pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> A
 pub(crate) fn ews_error_to_account_error(error: EwsError, ctx: GraphErrorContext) -> AccountError {
     debug_assert!(matches!(ctx.protocol, Protocol::Ews));
     match error {
-        EwsError::Transport(net) => bifrost_net::into_account_error(net, ctx.to_net_ctx()),
+        EwsError::Transport(net) => {
+            apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), &ctx)
+        }
         EwsError::HttpStatus { status, body } => {
             // Wrap the raw HTTP failure as a Graph-style response so
             // the standard status-fallback classification applies,
@@ -600,6 +647,10 @@ fn finish(builder: AccountErrorBuilder, ctx: &GraphErrorContext) -> AccountError
         Some(scope) => builder.scope(scope.clone()),
         None => builder,
     };
+    let builder = match ctx.idempotency_override {
+        Some(idempotent) => builder.idempotency_override(idempotent),
+        None => builder,
+    };
     builder
         .try_build()
         .expect("valid account error classification")
@@ -876,6 +927,64 @@ pub(crate) fn invalid_account_error(
     .protocol(Protocol::Graph)
     .try_build()
     .expect("valid account error classification")
+}
+
+/// Build an `AccountError` for ONE id `translateExchangeIds` refused inside
+/// an otherwise successful 200.
+///
+/// Graph answers per input id: a converted id carries `targetId`, a refused
+/// one carries `errorDetails` and no target. The HTTP response itself
+/// succeeded, so this cannot route through `response_to_account_error` - that
+/// path needs a status, and synthesizing one is worse than useless here: a
+/// fabricated 400 on the cursor scope this error must carry would classify
+/// `SyncState(CursorInvalid)` and send the engine to `RestartScope`, which
+/// cannot fix an id the server declines to convert.
+///
+/// The refusal is terminal by construction (resending the same id returns the
+/// same answer), and what the caller submitted is the only thing that could
+/// change, so it classifies `Request(Malformed)` -> `ClientBug`. The scope
+/// names the folder whose id was rejected - without it the operator sees
+/// "a subscription failed" and not which container - and the provider's
+/// verbatim code rides as a typed `WireCause::Graph` for the support export.
+#[must_use]
+pub(crate) fn id_translation_refused(
+    operation: AccountOperation,
+    scope: ErrorScope,
+    code: Option<&str>,
+    message: Option<&str>,
+) -> AccountError {
+    let code = code.map(str::trim).filter(|code| !code.is_empty());
+    let detail = DiagnosticText::support_only(match code {
+        Some(code) => format!("translateExchangeIds refused an id: {code}"),
+        None => "translateExchangeIds refused an id without a code".to_string(),
+    });
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::Malformed {
+            detail: detail.clone(),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(scope)
+    .text(detail);
+    if let Some(code) = code {
+        builder = builder
+            .native_code(code.to_string())
+            .push_cause(Cause::Wire(WireCause::Graph(crate::error::classify_code(
+                code,
+            ))));
+    }
+    if let Some(message) = message.map(str::trim).filter(|m| !m.is_empty()) {
+        builder = builder.text(DiagnosticText::support_only(message.to_string()));
+    }
+    // A complete response arrived and named this id; only the conversion
+    // failed.
+    builder = push_attempt(builder, TransmissionState::Acknowledged);
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 /// Translate a `CursorError` into the account-boundary `AccountError`.
