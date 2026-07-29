@@ -103,30 +103,46 @@ pub(crate) async fn message_reactions(
     let count_id = reactions_count_property_id();
     let filter = format!("$filter=id eq '{owner_id}' or id eq '{count_id}'");
 
+    let suffix = format!("/singleValueExtendedProperties?{filter}");
     for chunk in supported.chunks(BATCH_LIMIT) {
-        let requests: Vec<BatchRequestItem> = chunk
-            .iter()
+        // An id whose shared mailbox is no longer configured has no URL to
+        // build. It fails in the FAILED LANE, like the public-folder ids
+        // above, and for a second reason on top of the per-item one: past
+        // the 20-id chunk limit, earlier chunks have already been
+        // transmitted, so a top-level `Err` here would both discard their
+        // accumulated outcomes and contradict the boundary contract that
+        // `Err(_)` means nothing was transmitted.
+        let (routable, rejected) = super::batch_routing::partition_routable(chunk, |id| {
+            message_batch_url(&account, id, &suffix, operation)
+        });
+        for (id, error) in rejected {
+            builder.push_failed(BatchItemId(id.0.clone()), error);
+        }
+        let (chunk, urls): (Vec<ObjectId>, Vec<String>) = routable.into_iter().unzip();
+        if chunk.is_empty() {
+            continue;
+        }
+        // Index after the split so `classify_chunk` projects responses onto
+        // exactly the ids that went out.
+        let requests: Vec<BatchRequestItem> = urls
+            .into_iter()
             .enumerate()
-            .map(|(index, id)| BatchRequestItem {
+            .map(|(index, url)| BatchRequestItem {
                 id: index.to_string(),
                 method: "GET".to_string(),
-                url: message_batch_url(
-                    &account,
-                    id,
-                    &format!("/singleValueExtendedProperties?{filter}"),
-                ),
+                url,
                 body: None,
                 headers: None,
             })
             .collect();
         match account.client.post_batch(&BatchRequest { requests }).await {
-            Ok(response) => classify_chunk(chunk, response.responses, operation, &mut builder),
+            Ok(response) => classify_chunk(&chunk, response.responses, operation, &mut builder),
             Err(e) => {
                 // The whole chunk never returned: every item's fate is
                 // unknown. Uncertain, never an empty succeeded state.
                 let ctx = GraphErrorContext::graph(operation);
                 let error = into_account_error(e, ctx);
-                for id in chunk {
+                for id in &chunk {
                     builder.push_uncertain(BatchItemId(id.0.clone()), error.clone());
                 }
             }
@@ -364,6 +380,58 @@ mod tests {
                 bifrost_types::AccountOperation::MessageReactionsRead
             )
         ));
+    }
+
+    /// A stale shared-mailbox id fails in the FAILED LANE too, never as a
+    /// top-level `Err`. Two contracts forbid the propagation this builder
+    /// used to do: the surface answers per item, and past the 20-id chunk
+    /// limit earlier chunks have already been transmitted - so an `Err(_)`,
+    /// which the boundary contract defines as "nothing was transmitted",
+    /// would both misreport that and discard the outcomes it accumulated.
+    ///
+    /// Hermetic because nothing in this batch routes, so no chunk reaches
+    /// `$batch`.
+    #[tokio::test]
+    async fn a_stale_shared_mailbox_id_fails_in_its_lane_not_the_whole_request() {
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            super::super::PushMode::GraphSubscriptions,
+        );
+        let scope = bifrost_types::CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("gone@contoso.com", "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let stale = super::super::foreign::encode_message_id(&scope, "AAMkmsg");
+        let public = public_id("pf", "item");
+        let outcome = message_reactions(account, &[stale.clone(), public.clone()])
+            .await
+            .expect("a stale id is a per-item failure, not a request failure");
+        assert!(outcome.succeeded().is_empty());
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 2);
+        let stale_entry = outcome
+            .failed()
+            .iter()
+            .find(|failure| failure.item.0 == stale.0)
+            .expect("the stale id holds its own lane entry");
+        assert!(matches!(
+            stale_entry.error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        // The error names the message, not just the operation, so an
+        // operator can tell which id the configuration no longer covers.
+        assert_eq!(
+            stale_entry.error.scope(),
+            Some(&ErrorScope::Message {
+                id: stale.0.clone()
+            })
+        );
+        assert!(
+            outcome
+                .failed()
+                .iter()
+                .any(|failure| failure.item.0 == public.0)
+        );
     }
 
     /// The mixed-batch rule the per-item split exists for: one public id

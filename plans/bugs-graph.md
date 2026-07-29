@@ -5,17 +5,11 @@ else. Resolved findings live in git history - the commit that fixed one is
 its record - and so do the per-pass repair logs; retaining either here means
 maintaining a second, drifting copy of `git log`.
 
-Open work, in full: O-2 and O-7. O-7 is a shared-contract question
-rather than a Graph defect and is tracked as `xc-2` in `TODO.md`. This file
-is not finished while that list has entries.
+Open work, in full: O-7. It is a shared-contract question rather than a
+Graph defect and is tracked as `xc-2` in `TODO.md`. This file is not
+finished while that list has entries.
 
 ## Open findings
-
-**O-2 - An unconfigured foreign mailbox falls back to the primary client.**
-`client_for_scope` / `client_for_owner` decode the foreign id but fall back to
-`/me` when its owner is no longer configured. Folder-scoped calls can then
-target a different namespace. Decide whether those call sites should fail
-locally as stale configuration instead.
 
 **O-7 - Subscription teardown depends entirely on the caller.** Settled as a
 Graph question: `Account::close` is idempotent LOCAL teardown and explicitly
@@ -34,7 +28,14 @@ shared-contract level, not in this crate.
 Everything hermetically pinnable in this crate is a decision rule that was
 factored out of a request path: cursor and payload projections, `$batch`
 reconciliation (`reconcile_hydration_responses` /
-`reconcile_mutation_responses`), the webhook group state machine
+`reconcile_mutation_responses`), the per-item chunk routing split
+(`batch_routing::partition_routable`, plus each site's builder run over a
+mixed live/stale id set), the wholly-unroutable chunk end to end on three
+surfaces (reaction read, bulk destroy, hydration) - which is hermetic
+precisely because nothing routes, so no `$batch` leaves the process - both
+cursor doors rejecting a stale foreign scope before any request
+(`ScopeRevoked` -> scope-bearing `DisableScope`, at `initial_delta_url` and
+at `changes_stream`'s delta-link resume), the webhook group state machine
 (`install_replacement`, `mark_group_tearing_down`, `due_renewals`,
 `remove_subscription_from_groups`, `subscription_is_gone`), the EWS response
 scan, the foreign/public id codec, `partition_supported_ids`, the EWS
@@ -54,10 +55,14 @@ renewal worker's HTTP legs (create / renew / delete, the `Reconnected`
 emission after a successful replacement, the cleanup DELETE when the handle
 was unsubscribed mid-create, the stale row surviving a failed create, and the
 `Retry-After` throttle path); the `@odata.nextLink` walk;
-`unsubscribe_graph`'s DELETE loop as a loop; a mixed reaction batch actually
-reaching `$batch` with its Graph ids after the public ones were failed; the
-etag-eviction call sites; and the `translateExchangeIds` POST itself (that a
-multi-chunk fan-out issues N requests and accumulates their answers is
+`unsubscribe_graph`'s DELETE loop as a loop; a MIXED batch actually reaching
+`$batch` with its routable ids after the public / unroutable ones were failed
+(true for the reaction read, hydration, and the mutation funnel alike - the
+split itself is pinned, the subsequent round trip beside the surviving ids is
+not); the etag-eviction call sites, including
+`submit_write_batch_with_targets` draining past a failed subresponse so a
+later destroy still evicts; and the `translateExchangeIds` POST itself
+(that a multi-chunk fan-out issues N requests and accumulates their answers is
 asserted only through the pure chunker, never over a wire).
 
 The reason is one missing seam, not an oversight per finding. `GraphClient`

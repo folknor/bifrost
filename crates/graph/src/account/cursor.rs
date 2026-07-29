@@ -17,6 +17,9 @@ pub(crate) enum CursorError {
     SchemaIncompatible,
     /// Cursor operation is not supported for this scope.
     Unsupported,
+    /// A persisted foreign scope refers to a shared mailbox no longer
+    /// configured on this account.
+    Configuration(String),
     /// Serialization / deserialization error.
     Encode(String),
 }
@@ -28,8 +31,32 @@ impl std::fmt::Display for CursorError {
             Self::EnvelopeUnknown => f.write_str("cursor envelope version unknown"),
             Self::SchemaIncompatible => f.write_str("cursor schema incompatible"),
             Self::Unsupported => f.write_str("unsupported cursor scope"),
+            Self::Configuration(msg) => write!(f, "cursor configuration mismatch: {msg}"),
             Self::Encode(msg) => write!(f, "cursor encode/decode error: {msg}"),
         }
+    }
+}
+
+/// Project a scope-routing failure onto the cursor vocabulary.
+///
+/// `client_for_scope` refuses only for configuration reasons - it resolves
+/// a map entry and issues no request - so `Configuration` is the arm that
+/// matters, and it must reach `ScopeRevoked` so the engine disables just
+/// the stale scope. `GraphError` is the crate-wide type, though, so the
+/// remaining arms fold into `Encode`: a transport or response error
+/// arriving from a purely local lookup would be a contract violation of
+/// this function's own precondition, not a syncable condition.
+///
+/// Shared by both cursor entry points. `initial_delta_url` rejects the
+/// scope before the first request; `changes_stream` rejects it before
+/// resuming a persisted `@odata.deltaLink`, which is namespace-correct and
+/// would otherwise keep succeeding for a mailbox this account no longer
+/// configures - leaving a live scope whose every object id fails hydration
+/// and mutation terminally, because those paths DO consult the map.
+pub(crate) fn routing_error(error: crate::error::GraphError) -> CursorError {
+    match error {
+        crate::error::GraphError::Configuration { message } => CursorError::Configuration(message),
+        other => CursorError::Encode(format!("{other:?}")),
     }
 }
 

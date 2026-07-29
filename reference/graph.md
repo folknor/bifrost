@@ -39,6 +39,13 @@ to the final page. Public folders (opt-in) instead poll a watermark cursor
   cached `@odata.deltaLink`.
 - `get.rs` - `$batch`-backed hydration with per-projection
   `$select` lists.
+- `batch_routing.rs` - `partition_routable`, the pure per-item split every
+  `$batch` chunk builder runs before it sends: ids whose subrequest was
+  built, and ids whose subrequest could not be built at all (a stale
+  shared-mailbox owner). The rejected half goes to the caller's failed lane
+  and the chunk proceeds; an empty routable half skips the POST. Generic
+  over the per-site URL builder, so the lane rule is pinned once while each
+  site keeps its own classification.
 - `push.rs` - `/subscriptions` webhook subscribe/unsubscribe, per-handle
   `GraphSubscriptionGroup`, the renewal health worker that re-issues expiring
   subscriptions and emits Disconnected/Reconnected on renewal failure, plus
@@ -170,6 +177,33 @@ Autodiscover lookups), constructs a `GraphAccount`, and runs
 
 - The shared primary `GraphClient` plus `shared_clients: Arc<HashMap<String,
   GraphClient>>`, one `for_shared_mailbox(id)` client per foreign mailbox.
+  Foreign folder and object ids are routed only through an owner present in
+  that map, and an EMPTY routing key never enters it (`with_shared_mailbox("")`
+  is constructible and used to install a client whose prefix was the
+  malformed `/users/`, turning a local configuration error into an opaque
+  remote 400; `merge_shared_mailboxes` already applied the same rule on the
+  Autodiscover leg). A persisted id whose owner was removed from
+  configuration is rejected locally rather than stripped and sent to `/me`,
+  which would address a different mailbox namespace. Where that rejection
+  lands depends on the surface's answer shape:
+  - **Both cursor doors**, per scope: `initial_delta_url` refuses before the
+    first delta request and `changes_stream` refuses before resuming a
+    persisted `@odata.deltaLink`. The second is not redundant - the delta
+    link Graph minted is namespace-correct, so that walk keeps SUCCEEDING
+    for a mailbox this account no longer configures, leaving a live scope
+    whose every object id fails hydration and mutation. Both classify
+    `SyncState(ScopeRevoked)` carrying `ErrorScope::Cursor`, so the engine
+    disables exactly that scope.
+  - **Per-item batch surfaces** (`get_stream` hydration, `message_reactions`,
+    the `bulk_*` mutation funnel), per id: the id is filed
+    `Failed(Request(Malformed))` on its own lane through
+    `batch_routing::partition_routable` and the rest of the chunk goes to
+    the wire. A top-level `Err` there would discard valid siblings, and on
+    `message_reactions` would additionally claim nothing was transmitted
+    while earlier chunks had already completed.
+  - **Per-request surfaces** (`push_subscribe`, the single-message `pim`
+    writes, blobs), per call: the call fails, carrying the scope of the
+    offending id.
 - The built `AccountCapabilities`; the push mode plus optional endpoint; a
   `broadcast::Sender<WatchEvent>` feeding `push_stream`.
 - An `Arc<RwLock<CursorIndex>>` (scope list) and `Arc<RwLock<FolderTree>>`
@@ -319,7 +353,12 @@ final page checkpoints the fresh `delta_link`, `advanced_through` cleared.
 `Succeeded`, 4xx/5xx -> `Failed` with a structured `AccountError` (via
 `response_to_account_error_pub`), 2xx-no-body -> `Failed(Protocol(MissingField))`.
 Locally-invalid items `Failed` without poisoning the batch; a whole-request
-transport drop terminates.
+transport drop terminates. "Locally-invalid" includes an id that cannot be
+ROUTED (`batch_routing::partition_routable` over `hydrate_url_for_id`): the
+split runs before the POST, so a stale shared-mailbox id costs itself an
+outcome and neither its valid REST siblings nor the EWS outcomes already
+fetched for the same chunk. The subrequest index is assigned AFTER that
+split, so it always indexes the ids actually sent.
 
 `reconcile_hydration_responses` is the pure projector that enforces the
 one-outcome-per-id contract, and `reconcile_mutation_responses` is its
@@ -346,6 +385,15 @@ routes the non-idempotent ones (`BulkMove`, `BulkDestroy`) to
 also rides the **uncertain** lane rather than `failed`, so the engine's
 read-back guard resolves it.
 
+`pim::submit_write_batch_with_targets` is the one `$batch` path that answers
+per REQUEST - its callers are single-`Result` trait methods - but it still
+DRAINS every subresponse before returning. `$batch` response order is
+Graph's, not the caller's, so returning on the first bad item left the etag
+of a message that demonstrably was destroyed in the LRU whenever its
+subresponse sorted after a failing sibling's, and a later conditioned write
+on that id then sent an `If-Match` for a message that no longer exists. The
+error surfaced is unchanged: the first failure in response order.
+
 `message_reactions` (`reactions.rs`) reads the two Outlook
 `singleValueExtendedProperties` (`OwnerReactionType`, `ReactionsCount`) over
 the same chunked `$batch`, dedupes its ids, and answers every submitted id in
@@ -355,6 +403,11 @@ them off and files each one `Failed(Unsupported(MessageReactionsRead))`
 locally while the Graph ids of the same batch still go to `$batch` - a
 top-level rejection would be a per-request answer on a per-item surface and
 would discard the outcomes of every ordinary message beside the public id.
+An unroutable id (stale shared mailbox) files the same way, through
+`batch_routing::partition_routable` per chunk. Here the boundary contract
+adds a second reason: past the 20-id chunk limit earlier chunks have already
+been transmitted, so a top-level `Err` - which means "nothing was
+transmitted" - would be false as well as lossy.
 
 The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
@@ -697,6 +750,17 @@ refreshes missing `SetFlags`/`Move` etags via
 for `SetFlags`/`Move`, opportunistic for `Destroy`), (3) sends `/$batch`,
 status driving `mutation_item_outcome`.
 
+Step (2) can fail per id, and every such failure joins the chunk's outcome
+list instead of aborting it: an id with no cached or refreshable etag, a
+`Move` that does not resolve to a same-mailbox folder destination, and an id
+whose shared mailbox is no longer configured. The last one only reaches
+`request_for_mutation` on the `Destroy` path - `SetFlags` / `Move` are
+filtered out one step earlier by the etag preflight, which already files
+them per item - which is precisely why propagating it there was invisible
+until a bulk destroy hit it. If step (2) leaves nothing routable, no
+`/$batch` is sent and the chunk is answered entirely from those local
+outcomes.
+
 `bulk_set_flags` translates `FlagOp` to a PATCH body (`isRead`,
 `flag.flagStatus`, sorted `categories`); unrecognized flags ignored; `Set`
 rewrites the `categories` array, `Add`/`Remove`/`Patch` touch named fields.
@@ -843,6 +907,13 @@ for `fileAttachment` (item/reference false); no pre-download digest.
 needs it (the EWS id-translation POST, via `.idempotent()`): it corrects the
 retry-vs-reconcile derivation for a read-only preflight issued under a
 mutating operation, without renaming the operation the caller invoked.
+`GraphError::Configuration` - the locally-detected stale-shared-mailbox
+rejection, raised before any request - classifies `Request(Malformed)`
+through the same `base_builder` / `finish` funnel as every other arm rather
+than through `invalid_account_error`, which takes an operation and nothing
+else: the rejection is always raised about a specific message, cursor scope,
+or subscription resource, and dropping `ctx.scope` left an operator a bare
+`request.malformed` with nothing to act on.
 `GraphErrorContext::ews(op)`
 is the EWS constructor; `ews_error_to_account_error` routes
 `EwsError::Transport` through `bifrost_net::into_account_error`, `HttpStatus`
@@ -920,7 +991,16 @@ Mapping highlights:
 
 Cursor-decode failures (`CursorProtocolMismatch`, `CursorEnvelopeUnknown`,
 `SchemaIncompatible`, malformed payload) build an AccountError with
-`SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`.
+`SyncState(SchemaIncompatible)`, routed to `Engine(SchemaIncompatible)`; a
+scope whose shared mailbox left the configuration
+(`cursor::routing_error` -> `CursorError::Configuration`) builds
+`SyncState(ScopeRevoked)`. `cursor_error_to_account_error` terminates EVERY
+arm through `finish`, so `ctx.scope` is stamped on all of them. That is not
+just telemetry for the revoked arm: `ScopeRevoked` derives
+`DisableScope(scope)` with a scope and `RestartAccount` without one, and
+account-wide rediscovery cannot restore a mailbox that left the
+configuration - the scope-less form put the engine into a rediscovery loop
+on every pass instead of quarantining one folder.
 
 Non-byte-stream attachments emit a `BlobNotByteStream` `Warning` rather than a
 terminal error, so the engine continues past a referenceAttachment in a batch.

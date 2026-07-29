@@ -100,6 +100,24 @@ impl GraphErrorContext {
 #[must_use]
 pub(crate) fn into_account_error(error: GraphError, ctx: GraphErrorContext) -> AccountError {
     match error {
+        // Routed through the context funnel rather than
+        // `invalid_account_error`, which takes only an operation: a
+        // configuration rejection is raised per message, per cursor scope,
+        // or per subscription resource, and the caller always knows which.
+        // Dropping `ctx.scope` here erased the affected id from telemetry
+        // and every support export, leaving an operator a
+        // `request.malformed` with nothing to act on. `ctx.protocol` rides
+        // along for the same reason (the EWS constructor sets it).
+        GraphError::Configuration { message } => finish(
+            base_builder(
+                &ctx,
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed),
+                Cause::Request(RequestCause::Malformed {
+                    detail: DiagnosticText::support_only(message),
+                }),
+            ),
+            &ctx,
+        ),
         GraphError::Net(net) => {
             apply_idempotency_override(bifrost_net::into_account_error(net, ctx.to_net_ctx()), &ctx)
         }
@@ -1000,7 +1018,17 @@ pub(crate) fn cursor_error_to_account_error(
     ctx: GraphErrorContext,
 ) -> AccountError {
     use crate::account::cursor::CursorError;
-    match error {
+    // Every arm terminates through `finish`, which stamps `ctx.scope`.
+    // Skipping it (the old `try_build` per arm) was not merely a telemetry
+    // loss: `SyncState(ScopeRevoked)` derives `DisableScope(scope)` WITH a
+    // scope and `RestartAccount` without one, so a single stale
+    // shared-mailbox cursor escalated into an account-wide rediscovery -
+    // which cannot restore a mailbox that left the configuration, so the
+    // engine would take the whole account around that loop on every pass
+    // instead of quarantining one folder. The other arms want the scope for
+    // the ordinary reason: these errors are raised per cursor, and the
+    // support export has to name which.
+    let builder = match error {
         CursorError::ProtocolMismatch
         | CursorError::EnvelopeUnknown
         | CursorError::SchemaIncompatible => base_builder(
@@ -1008,18 +1036,20 @@ pub(crate) fn cursor_error_to_account_error(
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible),
             Cause::State(StateCause::SchemaIncompatible),
         )
-        .text(DiagnosticText::support_only(error.to_string()))
-        .try_build()
-        .expect("valid account error classification"),
+        .text(DiagnosticText::support_only(error.to_string())),
         CursorError::Unsupported => base_builder(
             &ctx,
             AccountErrorKind::Unsupported(ctx.operation),
             Cause::Request(RequestCause::Unsupported {
                 operation: ctx.operation,
             }),
+        ),
+        CursorError::Configuration(msg) => base_builder(
+            &ctx,
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked),
+            Cause::State(StateCause::ScopeRevoked),
         )
-        .try_build()
-        .expect("valid account error classification"),
+        .text(DiagnosticText::support_only(msg)),
         CursorError::Encode(msg) => base_builder(
             &ctx,
             AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation),
@@ -1027,10 +1057,9 @@ pub(crate) fn cursor_error_to_account_error(
                 protocol: ctx.protocol,
                 detail: Some(DiagnosticText::support_only(msg)),
             }),
-        )
-        .try_build()
-        .expect("valid account error classification"),
-    }
+        ),
+    };
+    finish(builder, &ctx)
 }
 
 /// Build a typed `Protocol(_)` `AccountError` for graph-side
@@ -1184,6 +1213,106 @@ mod tests {
 
     fn graph_ctx(op: AccountOperation) -> GraphErrorContext {
         GraphErrorContext::graph(op)
+    }
+
+    /// A locally-detected configuration rejection is raised PER id (a stale
+    /// shared-mailbox message), per cursor scope, or per subscription
+    /// resource, and every caller supplies the one it means. Routing it
+    /// through `invalid_account_error` - which takes an operation and
+    /// nothing else - discarded that scope, so telemetry and every support
+    /// export carried a bare `request.malformed` an operator could not tie
+    /// to a message.
+    #[test]
+    fn a_configuration_rejection_keeps_the_callers_error_scope() {
+        let error = into_account_error(
+            GraphError::Configuration {
+                message: "shared mailbox not configured on this account: gone@contoso.com"
+                    .to_string(),
+            },
+            graph_ctx(AccountOperation::BulkDestroy).with_scope(ErrorScope::Message {
+                id: "AAMkmsg".to_string(),
+            }),
+        );
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        // Stale configuration is nothing the engine can retry its way out
+        // of; the operator has to restore the mailbox or drop the id.
+        assert!(error.recovery().is_terminal());
+        assert_eq!(
+            error.scope(),
+            Some(&ErrorScope::Message {
+                id: "AAMkmsg".to_string()
+            })
+        );
+    }
+
+    /// Cursor errors are raised PER cursor, and one of them changes
+    /// classification on the scope's presence rather than merely losing
+    /// telemetry: `SyncState(ScopeRevoked)` derives `DisableScope(scope)`
+    /// with a scope and `RestartAccount` without. A stale shared mailbox is
+    /// exactly what account-wide rediscovery cannot fix, so the scope-less
+    /// form sent the engine around a rediscovery loop on every pass instead
+    /// of quarantining the one folder.
+    #[test]
+    fn a_revoked_cursor_scope_disables_that_scope_rather_than_the_account() {
+        let scope = CursorScope::FolderType {
+            folder: bifrost_types::FolderId("gone@contoso.com\u{1f}AAMk".to_string()),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let error = cursor_error_to_account_error(
+            crate::account::cursor::CursorError::Configuration("mailbox gone".to_string()),
+            graph_ctx(AccountOperation::SyncInventory)
+                .with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        match error.recovery() {
+            RecoveryClass::Engine(EngineDirective::DisableScope(disabled)) => {
+                assert_eq!(disabled, &scope);
+            }
+            other => panic!("expected DisableScope, got {other:?}"),
+        }
+    }
+
+    /// The same stamping applies to every other cursor arm, which is the
+    /// ordinary reason to want it: the support export has to say which
+    /// cursor the envelope belonged to.
+    #[test]
+    fn a_cursor_schema_rejection_names_its_cursor() {
+        let scope = CursorScope::FolderType {
+            folder: bifrost_types::FolderId("inbox".to_string()),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let error = cursor_error_to_account_error(
+            crate::account::cursor::CursorError::SchemaIncompatible,
+            graph_ctx(AccountOperation::SyncChanges).with_scope(ErrorScope::Cursor(scope.clone())),
+        );
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+        assert_eq!(error.scope(), Some(&ErrorScope::Cursor(scope)));
+    }
+
+    /// The scope is genuinely optional - the call sites that have no id to
+    /// name (a factory-level misconfiguration) must still classify.
+    #[test]
+    fn a_scopeless_configuration_rejection_still_classifies() {
+        let error = into_account_error(
+            GraphError::Configuration {
+                message: "no shared mailbox".to_string(),
+            },
+            graph_ctx(AccountOperation::Hydrate),
+        );
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(error.scope(), None);
     }
 
     /// An omitted `$batch` subrequest is AMBIGUOUS, and the shared

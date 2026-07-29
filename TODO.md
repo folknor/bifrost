@@ -479,6 +479,18 @@ blocking; each is a real defect or a real decision, not a cleanup.
   API commitment. Related: `jmap-O2`, the jmap sync layer hardwiring
   `ReqwestTransport`, which is the same testability problem one crate over.
 
+  UPDATE (commit 6829767): the EWS half is solved Graph-locally. Every EWS
+  request goes through one funnel, `EwsClient::execute`, so a crate-private
+  `EwsExecute` trait plus a scripted in-crate double made the whole streaming
+  worker loop hermetically drivable - and immediately paid for itself by
+  verifying four defects that three prior review-only rounds had each failed
+  to prevent. That is evidence for the general shape of the fix, and it
+  narrows this item rather than closing it: the REST paths above still have
+  no seam, because they funnel through `ClientInner::execute_request` against
+  a concrete `AccountNet` rather than through a trait. The open question is
+  unchanged - Graph-local `GraphTransport` (now with a working precedent one
+  module over) or promote net's `Dispatch`.
+
 ## Notes
 
 - The error-model design docs (`plans/error-model-*.md`) and the

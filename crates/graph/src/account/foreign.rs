@@ -361,13 +361,38 @@ mod tests {
     fn an_empty_mailbox_prefix_still_parses_as_foreign() {
         // Degenerate but constructible from a misconfigured
         // `with_shared_mailbox("")`: the id parses foreign with an empty
-        // owner, which `client_for_owner` will not find in
-        // `shared_clients`, so the request falls back to `/me` and the
-        // server reports the real miss. Pinned so the fallback is not
-        // mistaken for a primary-mailbox id.
+        // owner. Routing rejects that owner as stale configuration; it
+        // must never be mistaken for a primary-mailbox id.
         let parsed = parse_message_id(&ObjectId(format!("{FOREIGN_SEP}AAMkmsg")));
         assert_eq!(parsed.owner(), Some(""));
         assert_eq!(parsed.native_id(), "AAMkmsg");
+    }
+
+    /// And the rejection is real even when the misconfiguration is
+    /// literally present: `with_shared_mailbox("")` no longer installs a
+    /// client under the empty key, so the empty owner above resolves to
+    /// nothing. An installed empty key produced the malformed prefix
+    /// `/users/` and turned a local configuration error into an opaque
+    /// remote 400.
+    #[test]
+    fn an_empty_configured_mailbox_installs_no_client_to_route_to() {
+        let account = super::super::GraphAccount::new_for_tests_with_shared(
+            crate::client::GraphClient::new("token"),
+            super::super::PushMode::GraphSubscriptions,
+            &[String::new(), "shared@contoso.com".to_string()],
+        );
+        assert!(matches!(
+            account.client_for_owner(Some("")),
+            Err(crate::error::GraphError::Configuration { .. })
+        ));
+        // The well-formed sibling of the same configuration still routes.
+        assert_eq!(
+            account
+                .client_for_owner(Some("shared@contoso.com"))
+                .expect("configured")
+                .api_path_prefix(),
+            "/users/shared%40contoso.com"
+        );
     }
 
     #[test]

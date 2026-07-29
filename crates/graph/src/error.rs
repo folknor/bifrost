@@ -22,6 +22,10 @@ use serde::Deserialize;
 #[derive(Debug)]
 #[non_exhaustive]
 pub(crate) enum GraphError {
+    /// A locally detected account configuration mismatch. No request was
+    /// issued, so it must not be disguised as a Graph `/me` response.
+    Configuration { message: String },
+
     /// Transport / retry / auth-loss / rate-limit failure surfaced by
     /// `bifrost-net`. The original error is preserved so the account
     /// boundary can delegate to `bifrost_net::into_account_error` with

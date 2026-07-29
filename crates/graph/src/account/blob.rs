@@ -387,7 +387,7 @@ async fn fetch_raw_stream(
     // fetch routes to `/users/{owner}/messages/{native}/$value`; a primary
     // id keeps `/me`.
     let parsed = super::foreign::parse_message_id(message);
-    let client = account.client_for_owner(parsed.owner());
+    let client = account.client_for_owner(parsed.owner()).map_err(Box::new)?;
     let prefix = client.api_path_prefix();
     let enc_message_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let url = format!(
@@ -418,7 +418,9 @@ async fn fetch_blob_stream(
     // `/me`. The attachment id is always native (it has no mailbox of its
     // own - it rides on the message).
     let parsed = super::foreign::parse_message_id(&ObjectId(locator.message_id.clone()));
-    let client = account.client_for_owner(parsed.owner());
+    let client = account
+        .client_for_owner(parsed.owner())
+        .map_err(|error| BlobFetchError::Failed(Box::new(error)))?;
     let prefix = client.api_path_prefix();
     let enc_message_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let enc_attachment_id = bifrost_net::url::encode_path_component(&locator.attachment_id);
@@ -536,7 +538,10 @@ mod tests {
         // Both fetch_raw_stream and fetch_blob_stream build their URL from
         // exactly these two pieces: the owner's prefix + the native id.
         assert_eq!(
-            account.client_for_owner(parsed.owner()).api_path_prefix(),
+            account
+                .client_for_owner(parsed.owner())
+                .expect("configured")
+                .api_path_prefix(),
             "/users/shared%40contoso.com"
         );
         assert_eq!(parsed.native_id(), "AAMkmsg");
@@ -547,6 +552,7 @@ mod tests {
         assert_eq!(
             account
                 .client_for_owner(parsed_primary.owner())
+                .expect("primary")
                 .api_path_prefix(),
             "/me"
         );

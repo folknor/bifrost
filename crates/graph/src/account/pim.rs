@@ -180,7 +180,7 @@ async fn delete_extended_property(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "DELETE".to_string(),
-            url: message_batch_url(account, id, &suffix),
+            url: message_batch_url(account, id, &suffix, operation)?,
             body: None,
             headers: None,
         });
@@ -1242,7 +1242,13 @@ async fn fetch_message_value(
     // and every pim read-modify-write that starts from `fetch_message_value`
     // mailbox-correct.
     let parsed = super::foreign::parse_message_id(id);
-    let client = account.client_for_owner(parsed.owner());
+    let client = account.client_for_owner(parsed.owner()).map_err(|error| {
+        into_account_error(
+            error,
+            GraphErrorContext::graph(AccountOperation::Hydrate)
+                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+        )
+    })?;
     let path = format!(
         "{}/messages/{}?{}",
         client.api_path_prefix(),
@@ -1303,11 +1309,28 @@ async fn fetch_paged_values(
 /// `/singleValueExtendedProperties/...` clear). The `$batch` envelope is
 /// always posted on the primary client; routing rides entirely in the
 /// per-item URL prefix, mirroring the read paths in `get.rs`.
-pub(crate) fn message_batch_url(account: &GraphAccount, id: &ObjectId, suffix: &str) -> String {
+pub(crate) fn message_batch_url(
+    account: &GraphAccount,
+    id: &ObjectId,
+    suffix: &str,
+    operation: AccountOperation,
+) -> Result<String, AccountError> {
     let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    // A stale foreign owner is rejected per MESSAGE: this helper is the
+    // per-item URL builder for four `$batch` surfaces, and the id it could
+    // not route is the only thing that makes the failure actionable.
+    let prefix = account
+        .client_for_owner(parsed.owner())
+        .map_err(|error| {
+            into_account_error(
+                error,
+                GraphErrorContext::graph(operation)
+                    .with_scope(ErrorScope::Message { id: id.0.clone() }),
+            )
+        })?
+        .api_path_prefix();
     let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
-    format!("{prefix}/messages/{enc_id}{suffix}")
+    Ok(format!("{prefix}/messages/{enc_id}{suffix}"))
 }
 
 async fn patch_messages(
@@ -1323,7 +1346,7 @@ async fn patch_messages(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "PATCH".to_string(),
-            url: message_batch_url(account, &patch.id, ""),
+            url: message_batch_url(account, &patch.id, "", operation)?,
             body: Some(patch.body.clone()),
             headers: Some(headers),
         });
@@ -1377,7 +1400,7 @@ async fn move_messages(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "POST".to_string(),
-            url: message_batch_url(account, id, "/move"),
+            url: message_batch_url(account, id, "/move", operation)?,
             body: Some(json!({ "destinationId": dest.native_id() })),
             headers: Some(headers),
         });
@@ -1404,7 +1427,7 @@ async fn destroy_messages(
         requests.push(BatchRequestItem {
             id: index.to_string(),
             method: "DELETE".to_string(),
-            url: message_batch_url(account, id, ""),
+            url: message_batch_url(account, id, "", operation)?,
             body: None,
             headers: (!headers.is_empty()).then_some(headers),
         });
@@ -1458,8 +1481,14 @@ async fn submit_write_batch_with_targets(
     // message was never patched. Silently returning `Ok(())` would
     // violate the batch accounting contract (every id accounted for
     // exactly once), so an unaccounted id surfaces as an error.
-    let expected_ids: HashSet<String> = requests.iter().map(|r| r.id.clone()).collect();
+    // Kept as an ordered `Vec`, not a set: the sweep below reports ONE
+    // missing id and stamps its message on the error scope, so drawing it
+    // from a `HashSet` made the message an operator saw for a reproducible
+    // failure differ between runs. Submission order is the only stable
+    // choice, and a linear scan over at most 20 ids is free.
+    let expected_ids: Vec<String> = requests.iter().map(|r| r.id.clone()).collect();
     let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut first_error: Option<AccountError> = None;
     let response: BatchResponse = account
         .client
         .post_batch(&BatchRequest { requests })
@@ -1524,9 +1553,29 @@ async fn submit_write_batch_with_targets(
                     account.etag_index.write().await.remove(&id.0);
                 }
             }
-            bifrost_types::ItemOutcome::Failed(failure) => return Err(failure.error),
-            bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
+            bifrost_types::ItemOutcome::Failed(failure) => {
+                if first_error.is_none() {
+                    first_error = Some(failure.error);
+                }
+            }
+            bifrost_types::ItemOutcome::Uncertain(uncertain) => {
+                if first_error.is_none() {
+                    first_error = Some(uncertain.error);
+                }
+            }
         }
+    }
+    // The loop DRAINS rather than returning on the first bad item, even
+    // though this surface answers once. `$batch` response order is Graph's,
+    // not the caller's, so returning early left the etag of a message that
+    // demonstrably WAS destroyed in the cache whenever its subresponse
+    // happened to sort after a failing sibling's - and a later conditioned
+    // write on that id then sent an `If-Match` for a message that no longer
+    // exists. Draining costs one pass over an already-decoded response and
+    // changes nothing the caller sees: the error returned is still the
+    // first failure in response order.
+    if let Some(error) = first_error {
+        return Err(error);
     }
     // Any submitted id with no corresponding response is ambiguous. The
     // outer request was acknowledged (a 200 for the `$batch` envelope),
@@ -1537,7 +1586,7 @@ async fn submit_write_batch_with_targets(
     // the target. These direct write methods bypass the engine's bulk
     // mutation funnel, so this is the only classification their callers
     // see - the same rule the bulk path applies via its uncertain lane.
-    if let Some(missing) = expected_ids.difference(&seen_ids).next() {
+    if let Some(missing) = expected_ids.iter().find(|id| !seen_ids.contains(*id)) {
         let scope = missing
             .parse::<usize>()
             .ok()
@@ -2473,7 +2522,7 @@ mod tests {
     use crate::account::PushMode;
     use crate::account::foreign::{encode_foreign, encode_message_id, encode_public_item_id};
     use crate::client::GraphClient;
-    use bifrost_types::{CursorScope, ObjectType};
+    use bifrost_types::{AccountErrorKind, CursorScope, ObjectType, RequestErrorKind};
 
     // The single-id hydration door must reach the EWS arm for a public
     // item. Before this, `message_hydrate` fell through to
@@ -2782,21 +2831,49 @@ mod tests {
         // Per-message PATCH / DELETE (suffix "") and the move suffix both
         // route to `/users/{owner}/messages/{native}` with no `\u{1f}`.
         assert_eq!(
-            message_batch_url(&account, &id, ""),
+            message_batch_url(&account, &id, "", AccountOperation::Hydrate).expect("configured"),
             "/users/shared%40contoso.com/messages/AAMkmsg"
         );
         assert_eq!(
-            message_batch_url(&account, &id, "/move"),
+            message_batch_url(&account, &id, "/move", AccountOperation::Hydrate)
+                .expect("configured"),
             "/users/shared%40contoso.com/messages/AAMkmsg/move"
         );
-        assert!(!message_batch_url(&account, &id, "").contains('\u{1f}'));
+        assert!(
+            !message_batch_url(&account, &id, "", AccountOperation::Hydrate)
+                .expect("configured")
+                .contains('\u{1f}')
+        );
     }
 
     #[test]
     fn message_batch_url_keeps_primary_id_on_me() {
         let account = shared_account();
         let id = ObjectId("AAMkmsg".to_string());
-        assert_eq!(message_batch_url(&account, &id, ""), "/me/messages/AAMkmsg");
+        assert_eq!(
+            message_batch_url(&account, &id, "", AccountOperation::Hydrate).expect("primary"),
+            "/me/messages/AAMkmsg"
+        );
+    }
+
+    #[test]
+    fn message_batch_url_rejects_an_unconfigured_foreign_owner() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let id = foreign_message_id("other@contoso.com", "AAMkfolder", "AAMkmsg");
+        let error = message_batch_url(&account, &id, "", AccountOperation::Hydrate)
+            .expect_err("stale foreign owner must not route through /me");
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        ));
+        // This helper is the per-item URL builder for four `$batch`
+        // surfaces, so the id it refused is what makes the failure
+        // actionable on the lane it lands in.
+        assert_eq!(
+            error.scope(),
+            Some(&ErrorScope::Message { id: id.0.clone() })
+        );
     }
 
     #[test]

@@ -257,7 +257,10 @@ pub(crate) fn initial_delta_url(
     // shared mailbox) and use the *native* folder id in the path - the
     // foreign-mailbox prefix lives in the URL's `/users/{id}` segment,
     // not in the `/mailFolders/{id}` segment.
-    let prefix = account.client_for_scope(scope).api_path_prefix();
+    let prefix = account
+        .client_for_scope(scope)
+        .map_err(super::cursor::routing_error)?
+        .api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => {
             let native = super::foreign::parse_folder(folder).native_id().to_string();
@@ -422,23 +425,68 @@ mod tests {
         // The foreign scope routes through the shared client, whose
         // prefix targets `/users/{mailbox}`.
         assert_eq!(
-            account.client_for_scope(&foreign_scope).api_path_prefix(),
+            account
+                .client_for_scope(&foreign_scope)
+                .expect("configured")
+                .api_path_prefix(),
             "/users/shared%40contoso.com"
         );
-        // The primary scope - and any unconfigured foreign mailbox -
-        // stays on `/me`.
+        // A primary scope stays on `/me`.
         assert_eq!(
-            account.client_for_scope(&primary_scope).api_path_prefix(),
+            account
+                .client_for_scope(&primary_scope)
+                .expect("primary")
+                .api_path_prefix(),
             "/me"
         );
         let unconfigured = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("other@contoso.com", "AAMk"),
             ty: ObjectType::Email,
         };
-        assert_eq!(
-            account.client_for_scope(&unconfigured).api_path_prefix(),
-            "/me"
+        assert!(matches!(
+            account.client_for_scope(&unconfigured),
+            Err(crate::error::GraphError::Configuration { .. })
+        ));
+    }
+
+    /// The engine-facing half of that rejection: a persisted scope whose
+    /// shared mailbox left the configuration must quarantine ONE scope, not
+    /// escalate. `ScopeRevoked` carrying `ErrorScope::Cursor` derives
+    /// `DisableScope`; the same kind without a scope would derive
+    /// `RestartAccount` and re-run discovery for every other mailbox over a
+    /// condition discovery cannot fix.
+    ///
+    /// Hermetic: the scope is refused before the first delta request.
+    #[tokio::test]
+    async fn a_stale_foreign_scope_disables_only_itself() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
         );
+        let stale = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("gone@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        let mut stream = inventory_stream(account, stale.clone());
+        let SyncEvent::Terminated(error) = stream.next().await.expect("an event") else {
+            panic!("expected SyncEvent::Terminated");
+        };
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::SyncState(
+                bifrost_types::SyncStateErrorKind::ScopeRevoked
+            )
+        ));
+        assert_eq!(error.scope(), Some(&ErrorScope::Cursor(stale.clone())));
+        match error.recovery() {
+            bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(
+                scope,
+            )) => assert_eq!(scope, &stale),
+            other => panic!("expected DisableScope, got {other:?}"),
+        }
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

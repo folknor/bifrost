@@ -156,7 +156,30 @@ async fn submit_batch(
             // `preflight_outcomes` by `refresh_missing_etags`.
             continue;
         }
-        let Some(request) = request_for_mutation(account, id, kind, &etags)? else {
+        let built = match request_for_mutation(account, id, kind, &etags) {
+            Ok(built) => built,
+            Err(error) => {
+                // The id has no endpoint: its shared mailbox is gone from
+                // configuration. `SetFlags` / `Move` never reach here (the
+                // etag preflight above already filed them), but `Destroy`
+                // needs no etag, so this is the only place its stale ids
+                // are caught - and propagating would leave every valid
+                // sibling of the chunk with no outcome at all, which the
+                // engine's mutation pipeline cannot sweep for read-back
+                // either, since the terminal `Request(Malformed)` it would
+                // raise names the whole request rather than the one id.
+                preflight_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+                    BatchItemId(id.0.clone()),
+                    into_account_error(
+                        error,
+                        GraphErrorContext::graph(operation_for_kind(kind))
+                            .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                    ),
+                )));
+                continue;
+            }
+        };
+        let Some(request) = built else {
             // `request_for_mutation` returns `Ok(None)` when the
             // mutation cannot be built. For `Move` kinds the etag is
             // preflight-checked above, so this fires either because the
@@ -343,7 +366,20 @@ async fn refresh_missing_etags(
         // stays the encoded `id.0` (F1's etag_index keying), only the
         // request URL uses the native id + owner prefix.
         let parsed = super::foreign::parse_message_id(&id);
-        let client = account.client_for_owner(parsed.owner());
+        let client = match account.client_for_owner(parsed.owner()) {
+            Ok(client) => client,
+            Err(error) => {
+                failed.push(ItemOutcome::Failed(BatchFailure::new(
+                    BatchItemId(id.0.clone()),
+                    into_account_error(
+                        error,
+                        GraphErrorContext::graph(operation_for_kind(kind))
+                            .with_scope(ErrorScope::Message { id: id.0.clone() }),
+                    ),
+                )));
+                continue;
+            }
+        };
         let prefix = client.api_path_prefix();
         let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
         let path = format!("{prefix}/messages/{enc_id}?$select=id");
@@ -408,7 +444,7 @@ fn request_for_mutation(
     // encoded `id.0` (F1's etag_index), so the lookups below use `id.0`;
     // only the URL is built from the decoded native id + owner prefix.
     let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
     let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
     let mut headers = HashMap::new();
     match kind {
@@ -775,6 +811,69 @@ mod tests {
             .expect("builds")
             .is_none()
         );
+    }
+
+    /// A stale shared-mailbox id has no endpoint, and `Destroy` is the kind
+    /// that reaches `request_for_mutation` with it: `SetFlags` / `Move` are
+    /// filtered out earlier by the etag preflight, which already files them
+    /// per item, while `Destroy` needs no etag at all. Propagating the
+    /// routing error - what this path used to do - left every valid sibling
+    /// of the chunk with no outcome in any lane, and the terminal
+    /// `Request(Malformed)` it raised named the request rather than the id,
+    /// so the engine's mutation pipeline could not sweep the unseen ids for
+    /// read-back either.
+    ///
+    /// Wholly unroutable, hence hermetic: no chunk reaches `$batch`.
+    #[tokio::test]
+    async fn a_stale_destroy_chunk_answers_every_id_instead_of_aborting() {
+        let account = shared_account();
+        let ids = [
+            foreign_message_id("gone@contoso.com", "AAMkfolder", "AAMkone"),
+            foreign_message_id("gone@contoso.com", "AAMkfolder", "AAMktwo"),
+        ];
+        let events = submit_batch(&account, &ids, &MutationKind::Destroy)
+            .await
+            .expect("a stale id is a per-item failure, not a chunk failure");
+        let [SyncEvent::Batch(batch)] = events.as_slice() else {
+            panic!("expected exactly one Batch event, got {events:?}");
+        };
+        assert_eq!(batch.items.len(), 2);
+        for (item, id) in batch.items.iter().zip(ids.iter()) {
+            let ItemOutcome::Failed(failure) = item else {
+                panic!("expected a failed outcome, got {item:?}");
+            };
+            assert_eq!(failure.item.0, id.0);
+            assert!(matches!(
+                failure.error.kind(),
+                bifrost_types::AccountErrorKind::Request(
+                    bifrost_types::RequestErrorKind::Malformed
+                )
+            ));
+            assert_eq!(
+                failure.error.scope(),
+                Some(&ErrorScope::Message { id: id.0.clone() })
+            );
+        }
+    }
+
+    /// The other half of the same rule: the routing decision is per id, so
+    /// a live sibling of a stale id still builds its request. Whether that
+    /// request then reaches `$batch` alongside nothing else is the part
+    /// that needs the REST transport seam this crate does not yet have.
+    #[test]
+    fn a_stale_id_rejects_while_its_live_sibling_still_builds() {
+        let account = shared_account();
+        let stale = foreign_message_id("gone@contoso.com", "AAMkfolder", "AAMkmsg");
+        let live = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        assert!(
+            request_for_mutation(&account, &stale, &MutationKind::Destroy, &HashMap::new())
+                .is_err()
+        );
+        let request =
+            request_for_mutation(&account, &live, &MutationKind::Destroy, &HashMap::new())
+                .expect("the configured mailbox still routes")
+                .expect("some request");
+        assert_eq!(request.url, "/users/shared%40contoso.com/messages/AAMkmsg");
     }
 
     #[test]

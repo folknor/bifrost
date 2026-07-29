@@ -38,6 +38,26 @@ pub(crate) fn changes_stream(
             return;
         }
 
+        // The resume URL is an absolute `@odata.deltaLink` Graph itself
+        // minted, so it already names the right mailbox and this walk would
+        // keep SUCCEEDING for a shared mailbox the account no longer
+        // configures. That is worse than a wrong-namespace request: the
+        // scope stays live and emits changes whose object ids then fail
+        // hydration and every mutation terminally, because those paths do
+        // consult the shared-client map. Reject the scope here for the same
+        // reason `initial_delta_url` does, so the engine disables it once
+        // rather than syncing a scope it can never read through.
+        if let Err(error) = account.client_for_scope(&cursor.scope) {
+            let ctx = GraphErrorContext::graph(AccountOperation::SyncChanges)
+                .with_scope(ErrorScope::Cursor(cursor.scope.clone()));
+            yield SyncEvent::Terminated(cursor_error_to_account_error(
+                super::cursor::routing_error(error),
+                ctx,
+            ));
+            yield SyncEvent::Done(None);
+            return;
+        }
+
         let scope = cursor.scope.clone();
         let mut current_url = payload.resume_url().to_string();
 
@@ -308,6 +328,41 @@ mod tests {
         assert!(matches!(
             error.kind(),
             AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+    }
+
+    /// A persisted foreign scope whose shared mailbox left the
+    /// configuration must be disabled, not resumed. The `@odata.deltaLink`
+    /// it carries was minted by Graph against `/users/{mailbox}`, so the
+    /// walk itself would keep working - and would keep emitting object ids
+    /// that hydration and every mutation now refuse locally, because those
+    /// paths consult the shared-client map. Inventory already reported
+    /// `ScopeRevoked` for the same scope; the two cursor doors have to
+    /// agree, or which one the engine calls first decides whether the scope
+    /// lives.
+    #[tokio::test]
+    async fn a_stale_foreign_scope_is_revoked_before_the_delta_link_is_resumed() {
+        let stale_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("gone@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&stale_scope).expect("email scope maps"),
+            "https://graph.example/users/gone@contoso.com/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(stale_scope.clone(), payload).expect("encode");
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::ScopeRevoked)
+        ));
+        // Scope-bearing, so the engine disables just this cursor instead of
+        // restarting the whole account.
+        assert_eq!(error.scope(), Some(&ErrorScope::Cursor(stale_scope)));
+        assert!(matches!(
+            error.recovery(),
+            bifrost_types::RecoveryClass::Engine(bifrost_types::EngineDirective::DisableScope(_))
         ));
     }
 

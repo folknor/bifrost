@@ -251,46 +251,57 @@ async fn fetch_batch(
         return Ok(Vec::new());
     }
     // Public-folder ids read over EWS; everything else over Graph REST.
-    let (ews_ids, ids) = partition_ews_ids(account, ids).await;
-    let mut ews_outcomes = fetch_ews_outcomes(account, &ews_ids, projection).await;
-    if ids.is_empty() {
-        return Ok(vec![SyncEvent::Batch(Batch {
-            items: ews_outcomes,
-            page_boundary: if is_final {
-                PageBoundary::Final
-            } else {
-                PageBoundary::Page
-            },
-            server_latency: std::time::Duration::default(),
-            bytes_in: 0,
-            checkpoint: None::<Checkpoint>,
-        })]);
-    }
+    let (ews_ids, rest_ids) = partition_ews_ids(account, ids).await;
+    // The EWS-hydrated items ride in the same batch as the REST ones: the
+    // consumer sees one outcome per pulled id regardless of which arm served
+    // it - or of whether its arm could build a request at all.
+    let mut outcomes = fetch_ews_outcomes(account, &ews_ids, projection).await;
+
     let select = select_for_projection(projection);
-    let requests = ids
-        .iter()
+    // Decode the (possibly foreign-encoded) id: a shared-mailbox item routes
+    // to `/users/{owner}/messages/{native}`, a primary item to
+    // `/me/messages/{id}`. The owning mailbox rides in the path prefix, the
+    // native id in the `/messages/{id}` segment.
+    //
+    // An id whose shared mailbox is no longer configured has no endpoint at
+    // all. That is ONE id's failure: propagating it would discard the valid
+    // REST siblings of the same chunk AND the EWS outcomes already fetched
+    // above, so it is filed on the failed lane and the chunk goes on.
+    let (routable, rejected) = super::batch_routing::partition_routable(&rest_ids, |id| {
+        hydrate_url_for_id(account, id, select)
+    });
+    for (id, error) in rejected {
+        let ctx = GraphErrorContext::graph(AccountOperation::Hydrate)
+            .with_scope(ErrorScope::Message { id: id.0.clone() });
+        outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId(id.0.clone()),
+            into_account_error(error, ctx),
+        )));
+    }
+    let (rest_ids, urls): (Vec<ObjectId>, Vec<String>) = routable.into_iter().unzip();
+    if rest_ids.is_empty() {
+        // Nothing left to ask Graph. An empty `requests` array is a 400,
+        // and every id already holds an outcome.
+        return Ok(vec![hydration_batch(outcomes, is_final)]);
+    }
+    // The subrequest index is assigned AFTER the routing split, so it
+    // indexes `rest_ids` and `reconcile_hydration_responses` can project
+    // responses back onto exactly the ids that were sent.
+    let requests = urls
+        .into_iter()
         .enumerate()
-        .map(|(index, id)| {
-            // Decode the (possibly foreign-encoded) id: a shared-mailbox
-            // item routes to `/users/{owner}/messages/{native}`, a primary
-            // item to `/me/messages/{id}`. The owning mailbox rides in the
-            // path prefix, the native id in the `/messages/{id}` segment.
-            BatchRequestItem {
-                id: index.to_string(),
-                method: "GET".to_string(),
-                url: hydrate_url_for_id(account, id, select),
-                body: None,
-                headers: None,
-            }
+        .map(|(index, url)| BatchRequestItem {
+            id: index.to_string(),
+            method: "GET".to_string(),
+            url,
+            body: None,
+            headers: None,
         })
         .collect();
     let request = BatchRequest { requests };
     let response: BatchResponse = account.client.post_batch(&request).await?;
-    // The EWS-hydrated items ride in the same batch as the REST ones: the
-    // consumer sees one outcome per pulled id regardless of which arm served
-    // it.
-    let mut outcomes: Vec<ItemOutcome<HydratedObject>> = std::mem::take(&mut ews_outcomes);
-    let etags = reconcile_hydration_responses(&ids, response.responses, projection, &mut outcomes);
+    let etags =
+        reconcile_hydration_responses(&rest_ids, response.responses, projection, &mut outcomes);
 
     if !etags.is_empty() {
         let mut cache = account.etag_index.write().await;
@@ -299,8 +310,17 @@ async fn fetch_batch(
         }
     }
 
-    Ok(vec![SyncEvent::Batch(Batch {
-        items: outcomes,
+    Ok(vec![hydration_batch(outcomes, is_final)])
+}
+
+/// Wrap one chunk's accumulated outcomes in the `Batch` envelope, tagging
+/// the boundary the streaming loop computed.
+fn hydration_batch(
+    items: Vec<ItemOutcome<HydratedObject>>,
+    is_final: bool,
+) -> SyncEvent<ItemOutcome<HydratedObject>> {
+    SyncEvent::Batch(Batch {
+        items,
         page_boundary: if is_final {
             PageBoundary::Final
         } else {
@@ -309,7 +329,7 @@ async fn fetch_batch(
         server_latency: std::time::Duration::default(),
         bytes_in: 0,
         checkpoint: None::<Checkpoint>,
-    })])
+    })
 }
 
 /// Project the REST arm's `$batch` responses onto the submitted ids,
@@ -551,11 +571,15 @@ pub(crate) fn folder_destination(destination: MembershipScope) -> Option<FolderI
 /// Build the per-id Graph `/$batch` GET URL for hydration, decoding the
 /// (possibly foreign-encoded) id to route to `/users/{owner}` vs `/me`.
 /// Extracted so the routing is unit-testable without a live `$batch`.
-fn hydrate_url_for_id(account: &GraphAccount, id: &ObjectId, select: &str) -> String {
+fn hydrate_url_for_id(
+    account: &GraphAccount,
+    id: &ObjectId,
+    select: &str,
+) -> Result<String, crate::error::GraphError> {
     let parsed = super::foreign::parse_message_id(id);
-    let prefix = account.client_for_owner(parsed.owner()).api_path_prefix();
+    let prefix = account.client_for_owner(parsed.owner())?.api_path_prefix();
     let enc_id = bifrost_net::url::encode_path_component(parsed.native_id());
-    format!("{prefix}/messages/{enc_id}?$select={select}")
+    Ok(format!("{prefix}/messages/{enc_id}?$select={select}"))
 }
 
 #[cfg(test)]
@@ -683,14 +707,76 @@ mod tests {
         // request site decodes it back to `/users/{owner}/messages/{native}`.
         let foreign_id = super::super::foreign::encode_message_id(&foreign_scope, "AAMkmsg");
         assert_eq!(
-            hydrate_url_for_id(&account, &foreign_id, "id"),
+            hydrate_url_for_id(&account, &foreign_id, "id").expect("configured"),
             "/users/shared%40contoso.com/messages/AAMkmsg?$select=id"
         );
         // A primary id stays bare and routes through `/me`.
         let primary_id = ObjectId("AAMkmsg".to_string());
         assert_eq!(
-            hydrate_url_for_id(&account, &primary_id, "id"),
+            hydrate_url_for_id(&account, &primary_id, "id").expect("primary"),
             "/me/messages/AAMkmsg?$select=id"
+        );
+    }
+
+    /// A stale shared-mailbox id costs ITSELF a hydration outcome and
+    /// nothing else. `fetch_batch` used to `?` the URL-construction error
+    /// out of the chunk builder, which discarded the valid REST siblings
+    /// AND the EWS outcomes already fetched for the same chunk - a
+    /// per-request answer on a per-item surface, the mistake the `$batch`
+    /// reconcilers had to unlearn once already.
+    ///
+    /// The routing split is what is pinned here; the round trip the
+    /// routable half then makes still needs the REST transport seam this
+    /// crate does not have.
+    #[test]
+    fn a_stale_foreign_id_is_split_out_and_its_siblings_still_route() {
+        let account = GraphAccount::new_for_tests_with_shared(
+            GraphClient::new("token"),
+            PushMode::GraphSubscriptions,
+            &["shared@contoso.com".to_string()],
+        );
+        let live_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let stale_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("gone@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let ids = [
+            ObjectId("AAMkprimary".to_string()),
+            super::super::foreign::encode_message_id(&stale_scope, "AAMkstale"),
+            super::super::foreign::encode_message_id(&live_scope, "AAMkshared"),
+        ];
+        let (routable, rejected) = super::super::batch_routing::partition_routable(&ids, |id| {
+            hydrate_url_for_id(&account, id, "id")
+        });
+        let urls: Vec<&str> = routable.iter().map(|(_, url)| url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "/me/messages/AAMkprimary?$select=id",
+                "/users/shared%40contoso.com/messages/AAMkshared?$select=id"
+            ]
+        );
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].0, ids[1]);
+
+        // And the outcome the rejected id gets names the message, so the
+        // consumer can tell which id it must stop pulling.
+        let (id, error) = rejected.into_iter().next().expect("one rejection");
+        let account_error = into_account_error(
+            error,
+            GraphErrorContext::graph(AccountOperation::Hydrate)
+                .with_scope(ErrorScope::Message { id: id.0.clone() }),
+        );
+        assert!(matches!(
+            account_error.kind(),
+            bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        ));
+        assert_eq!(
+            account_error.scope(),
+            Some(&ErrorScope::Message { id: id.0.clone() })
         );
     }
 
@@ -987,7 +1073,8 @@ mod tests {
     fn hydration_url_percent_encodes_the_native_id_and_keeps_the_select() {
         let account =
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-        let url = hydrate_url_for_id(&account, &ObjectId("AAMk/GI2=".to_string()), "id,changeKey");
+        let url = hydrate_url_for_id(&account, &ObjectId("AAMk/GI2=".to_string()), "id,changeKey")
+            .expect("primary");
         assert!(!url.contains("AAMk/GI2="), "unencoded id in {url}");
         assert!(url.ends_with("?$select=id,changeKey"), "{url}");
     }
@@ -1006,7 +1093,7 @@ mod tests {
             &FolderId("AAMkPF=".to_string()),
             "AAMkItem=",
         );
-        let url = hydrate_url_for_id(&account, &id, "id");
+        let url = hydrate_url_for_id(&account, &id, "id").expect("primary");
         assert!(url.starts_with("/me/messages/"), "{url}");
         assert!(!url.contains('\u{1e}'), "{url}");
     }

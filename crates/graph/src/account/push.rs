@@ -195,10 +195,22 @@ async fn subscribe_graph(
     let mut grouped: HashMap<String, Vec<CursorScope>> = HashMap::new();
     for scope in scopes {
         match resource_for_scope(&account, &scope) {
-            Some(resource) => {
+            Ok(Some(resource)) => {
                 grouped.entry(resource).or_default().push(scope);
             }
-            None => return Err(unsupported_push_error()),
+            Ok(None) => return Err(unsupported_push_error()),
+            Err(error) => {
+                // A stale shared mailbox has no subscribable resource.
+                // `push_subscribe` answers per REQUEST (one handle covers
+                // the whole scope list), so refusing the call is right -
+                // but the refusal must name the scope that caused it, or
+                // the caller cannot tell which registration to drop.
+                return Err(into_account_error(
+                    error,
+                    GraphErrorContext::graph(AccountOperation::PushSubscribe)
+                        .with_scope(ErrorScope::Cursor(scope)),
+                ));
+            }
         }
     }
 
@@ -877,30 +889,33 @@ async fn unsubscribe_ews(
     Ok(())
 }
 
-fn resource_for_scope(account: &GraphAccount, scope: &CursorScope) -> Option<String> {
+fn resource_for_scope(
+    account: &GraphAccount,
+    scope: &CursorScope,
+) -> Result<Option<String>, crate::error::GraphError> {
     // Route the resource through the scope's owning client (primary `/me`
     // or a shared mailbox's `/users/{owner}`) and use the *native* folder
     // id in the path. A foreign scope carries the owning mailbox inside the
     // `FolderId`; percent-encoding that raw foreign id into the URL (the
     // old behavior) produced a `/me/mailFolders/{owner%1Ffolder}/...`
     // resource Graph cannot resolve.
-    let prefix = account.client_for_scope(scope).api_path_prefix();
+    let prefix = account.client_for_scope(scope)?.api_path_prefix();
     match scope {
         CursorScope::FolderType { folder, ty } => match ty {
             ObjectType::Email => {
                 let native = super::foreign::parse_folder(folder).native_id().to_string();
                 let encoded = bifrost_net::url::encode_path_component(&native);
-                Some(format!("{prefix}/mailFolders/{encoded}/messages"))
+                Ok(Some(format!("{prefix}/mailFolders/{encoded}/messages")))
             }
-            ObjectType::Event | ObjectType::CalendarEvent => Some(format!("{prefix}/events")),
+            ObjectType::Event | ObjectType::CalendarEvent => Ok(Some(format!("{prefix}/events"))),
             ObjectType::Contact => {
                 let native = super::foreign::parse_folder(folder).native_id().to_string();
                 let encoded = bifrost_net::url::encode_path_component(&native);
-                Some(format!("{prefix}/contactFolders/{encoded}/contacts"))
+                Ok(Some(format!("{prefix}/contactFolders/{encoded}/contacts")))
             }
-            _ => None,
+            _ => Ok(None),
         },
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -980,7 +995,9 @@ mod tests {
             ty: ObjectType::Email,
         };
         assert_eq!(
-            resource_for_scope(&account, &scope).as_deref(),
+            resource_for_scope(&account, &scope)
+                .expect("primary")
+                .as_deref(),
             Some("/me/mailFolders/inbox/messages")
         );
     }
@@ -994,7 +1011,9 @@ mod tests {
             ty: ObjectType::Event,
         };
         assert_eq!(
-            resource_for_scope(&account, &scope).as_deref(),
+            resource_for_scope(&account, &scope)
+                .expect("primary")
+                .as_deref(),
             Some("/me/events")
         );
     }
@@ -1013,7 +1032,9 @@ mod tests {
         // The owning mailbox rides in the `/users/{id}` segment and only
         // the native folder id is in `/mailFolders/{id}` - no raw foreign
         // id (no `%1F` separator) is percent-encoded into the URL.
-        let resource = resource_for_scope(&account, &scope).expect("foreign scope resolves");
+        let resource = resource_for_scope(&account, &scope)
+            .expect("configured mailbox")
+            .expect("foreign scope resolves");
         assert_eq!(
             resource,
             "/users/shared%40contoso.com/mailFolders/AAMk/messages"
@@ -1055,7 +1076,9 @@ mod tests {
             ty: ObjectType::Contact,
         };
         assert_eq!(
-            resource_for_scope(&account, &scope).as_deref(),
+            resource_for_scope(&account, &scope)
+                .expect("primary")
+                .as_deref(),
             Some("/me/contactFolders/contacts/contacts")
         );
     }
@@ -1064,13 +1087,18 @@ mod tests {
     fn unsubscribable_scopes_have_no_graph_resource() {
         let account =
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
-        assert!(resource_for_scope(&account, &CursorScope::Account).is_none());
+        assert!(
+            resource_for_scope(&account, &CursorScope::Account)
+                .expect("primary")
+                .is_none()
+        );
         // A public folder is poll-only; it must not resolve to a resource.
         assert!(
             resource_for_scope(
                 &account,
                 &CursorScope::Folder(FolderId("AAMkPF=".to_string()))
             )
+            .expect("primary")
             .is_none()
         );
         assert!(
@@ -1081,6 +1109,7 @@ mod tests {
                     ty: ObjectType::Mailbox,
                 }
             )
+            .expect("primary")
             .is_none()
         );
     }
@@ -1093,31 +1122,27 @@ mod tests {
             folder: FolderId("AAMk/GI2=".to_string()),
             ty: ObjectType::Email,
         };
-        let resource = resource_for_scope(&account, &scope).expect("email scope resolves");
+        let resource = resource_for_scope(&account, &scope)
+            .expect("primary")
+            .expect("email scope resolves");
         assert!(!resource.contains("AAMk/GI2="), "{resource}");
         assert!(resource.ends_with("/messages"), "{resource}");
     }
 
-    /// Documents current behavior worth knowing about, NOT an endorsement:
-    /// `client_for_scope` falls back to the
-    /// PRIMARY client for a foreign scope whose mailbox is not configured,
-    /// while `parse_folder` still strips the owner off the folder id. The
-    /// result subscribes `/me` to a folder id that belongs to a different
-    /// mailbox. Only reachable when a persisted scope outlives the
-    /// `with_shared_mailbox` entry that minted it, but it fails silently
-    /// (Graph 404s the resource) rather than reporting the stale config.
+    /// A persisted scope whose shared mailbox was removed must fail before
+    /// it can be rewritten into a `/me` subscription resource.
     #[test]
-    fn an_unconfigured_foreign_mailbox_subscribes_against_the_primary_prefix() {
+    fn an_unconfigured_foreign_mailbox_is_rejected_locally() {
         let account =
             GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
         let scope = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("other@contoso.com", "AAMk"),
             ty: ObjectType::Email,
         };
-        assert_eq!(
-            resource_for_scope(&account, &scope).as_deref(),
-            Some("/me/mailFolders/AAMk/messages")
-        );
+        assert!(matches!(
+            resource_for_scope(&account, &scope),
+            Err(crate::error::GraphError::Configuration { .. })
+        ));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 mod autodiscover;
+mod batch_routing;
 mod blob;
 mod calendar;
 mod capabilities;
@@ -314,30 +315,39 @@ impl GraphAccount {
     /// Select the `GraphClient` whose `/users/{mailbox}` prefix routes
     /// this scope. A `FolderType` scope whose `FolderId` parses as a
     /// foreign-mailbox folder and whose mailbox has a configured shared
-    /// client routes there; everything else (primary folders, unknown
-    /// mailboxes) routes through the primary client.
-    pub(crate) fn client_for_scope(&self, scope: &CursorScope) -> &GraphClient {
+    /// client routes there. A foreign id whose mailbox is no longer
+    /// configured is rejected locally: stripping its owner and sending it
+    /// to `/me` can target a different mailbox namespace.
+    pub(crate) fn client_for_scope(
+        &self,
+        scope: &CursorScope,
+    ) -> Result<&GraphClient, crate::error::GraphError> {
         if let CursorScope::FolderType { folder, .. } = scope
             && let Some(foreign) = foreign::parse_folder(folder).foreign()
-            && let Some(client) = self.shared_clients.get(&foreign.mailbox)
         {
-            client
+            self.client_for_owner(Some(&foreign.mailbox))
         } else {
-            &self.client
+            Ok(&self.client)
         }
     }
 
     /// Select the `GraphClient` for an owning mailbox decoded from a
     /// foreign-encoded message/blob id. `None` (a primary-mailbox item)
     /// routes through `/me`; a configured shared mailbox routes through
-    /// its `/users/{mailbox}` client. An unconfigured mailbox falls back
-    /// to the primary client - the subsequent request will surface the
-    /// real `/me` 404, which is more honest than a silent local error for
-    /// an id this account never minted.
-    pub(crate) fn client_for_owner(&self, owner: Option<&str>) -> &GraphClient {
-        owner
-            .and_then(|mailbox| self.shared_clients.get(mailbox))
-            .unwrap_or(&self.client)
+    /// its `/users/{mailbox}` client. An unconfigured foreign owner is a
+    /// stale account configuration, never a primary-mailbox id.
+    pub(crate) fn client_for_owner(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<&GraphClient, crate::error::GraphError> {
+        match owner {
+            None => Ok(&self.client),
+            Some(mailbox) => self.shared_clients.get(mailbox).ok_or_else(|| {
+                crate::error::GraphError::Configuration {
+                    message: format!("shared mailbox not configured on this account: {mailbox}"),
+                }
+            }),
+        }
     }
 
     /// Look up the public-folder routing for a native EWS folder id, or
@@ -1245,9 +1255,20 @@ impl Account for GraphAccount {
 /// exact string later looked up by `client_for_scope` / `client_for_owner`
 /// and minted into foreign scope/owner tags by `discover_cursor_scopes`,
 /// so seeding a key here is self-consistent with every routing site.
+/// Build the per-mailbox client map, dropping empty routing keys.
+///
+/// `with_shared_mailbox("")` is constructible, and an empty key used to
+/// install a client whose prefix is the malformed `/users/` - which every
+/// foreign id with an empty owner then routed to, producing an opaque
+/// remote 400 for what is a local configuration error. Dropping it here
+/// makes that id fall to the same local `Configuration` rejection every
+/// other unconfigured owner gets. `merge_shared_mailboxes` already applies
+/// the identical rule on the Autodiscover leg; this is the config leg,
+/// which had no such filter.
 fn shared_clients_map(client: &GraphClient, mailboxes: &[String]) -> HashMap<String, GraphClient> {
     mailboxes
         .iter()
+        .filter(|mailbox| !mailbox.is_empty())
         .map(|mailbox| (mailbox.clone(), client.for_shared_mailbox(mailbox.clone())))
         .collect()
 }
