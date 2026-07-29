@@ -97,14 +97,6 @@ response shapes make the first error win, which is acceptable, but the flag's
 lifetime is non-obvious and future parser changes could turn it into a false
 positive.
 
-**O-14 - `classify_chunk` is a third `$batch` consumer outside the shared
-reconciler.** `reactions.rs` does its own answered-set and range-filter
-accounting and builds its own error rather than routing through
-`graph_error::batch_response_missing`. Whether its missing-id classification
-carries the same terminal-instead-of-ambiguous defect that was repaired in
-`get.rs`, `mutate.rs`, and `pim.rs` was not checked. Audit it, and fold it
-into the shared helper if it matches.
-
 ## Repair pass: 2026-07-29
 
 Fixed in this pass:
@@ -124,7 +116,13 @@ Fixed in this pass:
 - EWS rejects unsupported and shared-mailbox subscription scopes;
 - beta-base derivation stays on the configured origin;
 - expiry parsing rejects numeric UTC offsets;
-- membership discovery emits one owner tag per shared mailbox.
+- membership discovery emits one owner tag per shared mailbox;
+- (review follow-up, O-14) the reaction read's `classify_chunk` routes its
+  unanswered ids through `graph_error::batch_response_missing` like the
+  other three `$batch` consumers - it already used the uncertain lane, but
+  the error it carried was a terminal `ContractViolation` with default
+  `Unsent` evidence, telling a consumer that a re-read of an idempotent
+  read was pointless.
 
 Regression-pinned hermetically: the `PartialResponse` classification across
 idempotent and non-idempotent operations; hydration and mutation `$batch`
@@ -140,7 +138,11 @@ neither-link branch are both reachable only through a live `GraphClient`.
 `GraphClient` owns a concrete `bifrost_net::AccountNet` behind
 `Arc<ClientInner>` with every request funnelled through a private
 `execute_request`, so there is no in-process seam to stage a canned
-response against. A `#[cfg(test)] responses: Mutex<VecDeque<..>>` field on
+response against. Verified at review: `bifrost_net::Response` is
+`#[non_exhaustive]` with no public constructor and the net crate's
+`Dispatch` seam plus its `ScriptedDispatch` are crate-private/test-only,
+so a Graph test cannot mint or inject responses today - the seam has to
+be Graph-local (jmap's `PushTransport` precedent), not borrowed. A `#[cfg(test)] responses: Mutex<VecDeque<..>>` field on
 `ClientInner` (or a `GraphTransport` trait) would unlock those two plus the
 `Retry-After` throttle path and the `@odata.nextLink` walk in one move; it
 is a deliberate follow-up, not an oversight.

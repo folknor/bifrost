@@ -31,7 +31,8 @@ use serde_json::Value;
 
 use super::GraphAccount;
 use super::graph_error::{
-    GraphErrorContext, into_account_error, protocol_violation, response_to_account_error_pub,
+    GraphErrorContext, batch_response_missing, into_account_error, protocol_violation,
+    response_to_account_error_pub,
 };
 use super::pim::message_batch_url;
 use crate::error::GraphResponseError;
@@ -172,12 +173,17 @@ fn classify_chunk(
     }
     // Any submitted id the envelope did not answer was acknowledged as a
     // batch but never individually resolved - uncertain by definition.
+    // The error rides `batch_response_missing` like the other `$batch`
+    // consumers: `Protocol(PartialResponse)` with `Acknowledged`
+    // transmission evidence, which derives retryable for this idempotent
+    // read. The `ContractViolation` this replaced derived terminal, so a
+    // consumer inspecting `recovery()` was told a re-read is pointless for
+    // an omission that says nothing about the resource.
     for (index, message_id) in chunk.iter().enumerate() {
         if !answered.contains(&index) {
             builder.push_uncertain(
                 BatchItemId(message_id.0.clone()),
-                protocol_violation(
-                    ProtocolErrorKind::ContractViolation,
+                batch_response_missing(
                     operation,
                     Some(ErrorScope::Message {
                         id: message_id.0.clone(),
@@ -342,6 +348,25 @@ mod tests {
         assert_eq!(outcome.failed()[0].item.0, "gone");
         assert_eq!(outcome.uncertain().len(), 1);
         assert_eq!(outcome.uncertain()[0].item.0, "unanswered");
+
+        // The unanswered id's error must carry the shared `$batch`
+        // ambiguity classification: `Protocol(PartialResponse)` with
+        // `Acknowledged` evidence, retryable for this idempotent read.
+        // A terminal `ContractViolation` here would tell the consumer a
+        // re-read is pointless for an omission that says nothing about
+        // the resource.
+        let error = &outcome.uncertain()[0].error;
+        assert!(matches!(
+            error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        ));
+        assert!(error.recovery().is_retryable());
+        assert_eq!(
+            error.telemetry_fields().transmission_state,
+            Some(bifrost_types::TransmissionState::Acknowledged)
+        );
     }
 
     #[test]

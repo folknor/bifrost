@@ -305,8 +305,10 @@ never answered.
 
 An unanswered subrequest classifies `Protocol(PartialResponse)` with
 `TransmissionState::Acknowledged` (`graph_error::batch_response_missing`), on
-all three `$batch` paths - hydration, the bulk mutation funnel, and
-`pim::submit_write_batch_with_targets`. The outer envelope decoding is
+all four `$batch` paths - hydration, the bulk mutation funnel,
+`pim::submit_write_batch_with_targets`, and the reaction read's
+`classify_chunk` (whose unanswered ids ride the `BatchOutcome` uncertain
+lane). The outer envelope decoding is
 evidence about the envelope only: a `move` or `DELETE` that committed and
 lost its subresponse is indistinguishable from one that never ran, so the
 error must not assert the item was left alone. `ContractViolation` would
