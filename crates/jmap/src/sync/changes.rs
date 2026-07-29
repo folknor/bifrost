@@ -92,11 +92,16 @@ pub(crate) fn stream(
         ),
         JmapScopeRepr::Query(query_id) => query_changes(mail, limits, query_id, state_string),
         // A foreign (shared/delegate) account mailbox: its emails sync
-        // against that foreign account's `Email/changes` state. The
-        // membership is the foreign mailbox; the owner tag drives
-        // revocation isolation. `Email/changes` is account-wide, so the
-        // per-mailbox membership rides on the change items' scope
-        // changes rather than filtering the changes call.
+        // against that foreign account's `Email/changes` state. The owner
+        // tag drives revocation isolation. `Email/changes` is
+        // account-wide and cannot be filtered by mailbox, so this leg
+        // emits every changed id of the account under this one scope and
+        // nothing attributes an id to its actual mailbox (no
+        // `ScopeChange` is emitted here); consumers learn membership at
+        // hydration via `mailboxIds`. With M seeded mailboxes the same
+        // account-wide change set therefore streams M times - a known
+        // cost, accepted until the per-mailbox scope topology for
+        // foreign accounts is revisited.
         JmapScopeRepr::Folder { .. } => email_changes(
             mail,
             account_id,

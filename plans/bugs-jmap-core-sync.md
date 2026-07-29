@@ -158,12 +158,12 @@ identical change events for one message, attributed to 12 different scopes,
 id (the per-scope streams are independent), so the wire cost is O(mailboxes)
 per change.
 
-Related, and worse for correctness: the code comment at 94-99 claims *"the
-per-mailbox membership rides on the change items' scope changes rather than
-filtering the changes call"* - but `email_changes` emits only
-`Change::ObjectChange`, never `Change::ScopeChange`. The compensating
-mechanism the comment names does not exist, so nothing tells the engine which
-of the 12 folders the message actually landed in.
+Related, and worse for correctness: `email_changes` emits only
+`Change::ObjectChange`, never `Change::ScopeChange`, so nothing tells the
+engine which of the 12 folders the message actually landed in - membership is
+only learned at hydration via `mailboxIds`. (The dispatch comment in
+`changes.rs` used to claim a compensating scope-change mechanism that does
+not exist; it now states this reality instead.)
 
 **Interaction with push routing (added after the routing fix landed).**
 `push.rs::emit_state_change` now routes a foreign `StateChange` onto one exact
@@ -183,9 +183,8 @@ the fanout as-is. This is an argument for (a), not a new bug.
 (a) seed one `Folder` scope per foreign *account* rather than per mailbox, and
     derive per-mailbox membership from the hydrated `mailboxIds`; or
 (b) keep per-mailbox scopes but have the foreign changes leg hydrate
-    `mailboxIds` for each changed id and emit `ScopeChange`s, so the comment
-    becomes true and the engine can attribute the change.
-Either way the comment must stop describing behavior the code does not have.
+    `mailboxIds` for each changed id and emit `ScopeChange`s, so the engine
+    can attribute the change.
 This is a design call, not a mechanical fix.
 
 ## 2. Gaps and smells
@@ -392,6 +391,5 @@ file, not a substitute for genericizing the tree.
 ## 4. Doc contradictions found
 
 1. `reference/jmap.md:46` - *`CallHandle<M>` validates call_id and method name*. It validates the call id only. See B8.
-2. `sync/changes.rs:94-99` - the comment claims foreign per-mailbox membership *"rides on the change items' scope changes"*. No `ScopeChange` is ever emitted on that path. See B9.
-3. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
-4. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.
+2. `sync/capabilities.rs:194-196` - the comment claims JMAP foreign accounts are not open-time discovery. They are. See G1.
+3. `reference/jmap.md:219` - lists `Type(Thread)` changes as supported without noting that discovery never offers the scope. See G2.

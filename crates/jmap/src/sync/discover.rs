@@ -105,6 +105,23 @@ pub(crate) async fn fetch_mailbox_names(
     Ok((state, names))
 }
 
+/// Pause between lifecycle polls without outliving shutdown.
+///
+/// The stream is pull-based, so a bare sleep cannot leak a task - but a
+/// consumer still polling after `close()` cancels the token would wait
+/// out the rest of the interval before the loop's top-of-iteration check
+/// ends the stream. Selecting on the token makes the end prompt by
+/// construction; every call site falls through to that check, which is
+/// where cancellation terminates the loop.
+async fn poll_pause(shutdown: &CancellationToken) {
+    tokio::select! {
+        () = shutdown.cancelled() => {}
+        () = tokio::time::sleep(POLL_INTERVAL) => {}
+    }
+}
+
+const POLL_INTERVAL: Duration = Duration::from_secs(300);
+
 pub(crate) fn scope_lifecycle(
     mail: MailAccount,
     limits: CoreLimits,
@@ -122,7 +139,7 @@ pub(crate) fn scope_lifecycle(
             let since_state = state_cache::get(&mailbox_states, &account_id).await;
 
             let Some(since_state) = since_state else {
-                tokio::time::sleep(Duration::from_secs(300)).await;
+                poll_pause(&shutdown).await;
                 continue;
             };
 
@@ -161,7 +178,7 @@ pub(crate) fn scope_lifecycle(
                                 // Do not advance the changes state: retrying
                                 // this response is the only way to preserve
                                 // the created/renamed lifecycle event.
-                                tokio::time::sleep(Duration::from_secs(300)).await;
+                                poll_pause(&shutdown).await;
                                 continue;
                             }
                         }
@@ -216,7 +233,7 @@ pub(crate) fn scope_lifecycle(
                     state_cache::set(&mailbox_states, &account_id, new_state).await;
 
                     if !response.has_more_changes() {
-                        tokio::time::sleep(Duration::from_secs(300)).await;
+                        poll_pause(&shutdown).await;
                     }
                 }
                 Err(err) => {
@@ -242,7 +259,7 @@ pub(crate) fn scope_lifecycle(
                         yield ScopeLifecycleEvent::Terminated(acct);
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    poll_pause(&shutdown).await;
                 }
             }
         }

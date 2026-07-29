@@ -414,17 +414,33 @@ async fn reader_pass<T: PushTransport>(
     };
 
     // A re-enable that never completes means the sink is wedged even
-    // though the handshake answered, so drop the connection rather than
-    // read from a link whose subscription was never applied.
-    if bounded(
+    // though the handshake answered; one that fails FAST means the link
+    // died between handshake and subscribe (`enable_push_ws` errors only
+    // when the sink send fails or the connection is already gone - a
+    // server-side rejection of the frame would arrive as a `RequestError`
+    // on the read stream instead). Either way this connection carries no
+    // applied subscription, so reading from it would announce
+    // `Reconnected` and then fall silent: a dead-push state the engine
+    // cannot tell apart from a quiet mailbox. Drop the connection and
+    // reconnect. Terminality is deliberately not consulted here: the only
+    // terminal-classified error this path produces is
+    // `WebSocketNotConnected -> Unsupported`, which in this position
+    // means the socket raced away (transient), and a genuinely terminal
+    // condition surfaces as such at the next handshake.
+    match bounded(
         shutdown,
         policy.connect_timeout,
         reenable_current_push_set(transport, enabled),
     )
     .await
-    .is_none()
     {
-        return interrupted(shutdown);
+        None => return interrupted(shutdown),
+        Some(Err(_)) => {
+            return ReaderStep::Retry {
+                reset_backoff: false,
+            };
+        }
+        Some(Ok(())) => {}
     }
 
     let _ = tx.send(WatchEvent::Reconnected);
@@ -470,12 +486,12 @@ async fn reader_pass<T: PushTransport>(
 async fn reenable_current_push_set<T: PushTransport>(
     transport: &T,
     enabled: &Arc<Mutex<DataTypeSet>>,
-) {
+) -> Result<(), AccountError> {
     let current = {
         let guard = enabled.lock().await;
         guard.clone()
     };
-    let _ = transport.set_push_data_types(&current).await;
+    transport.set_push_data_types(&current).await
 }
 
 fn emit_push(push: PushObject, tx: &broadcast::Sender<WatchEvent>, routing: &PushRouting) {
@@ -929,6 +945,76 @@ mod tests {
     #[tokio::test]
     async fn a_shutdown_during_the_push_re_enable_ends_the_reader() {
         assert_cancel_unblocks(Hang::Reenable).await;
+    }
+
+    /// Push transport whose handshake succeeds (silent but live stream)
+    /// and whose re-enable fails immediately, counting attempts.
+    struct FailingReenableTransport {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PushTransport for FailingReenableTransport {
+        type Stream = BoxedWsStream;
+
+        async fn connect_push(&self) -> crate::Result<Self::Stream> {
+            let stream: Self::Stream = Box::pin(futures::stream::pending());
+            Ok(stream)
+        }
+
+        fn set_push_data_types(
+            &self,
+            _data_types: &DataTypeSet,
+        ) -> impl Future<Output = Result<(), AccountError>> + Send {
+            let attempts = Arc::clone(&self.attempts);
+            async move {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(super::super::error::unsupported_error(
+                    AccountOperation::PushSubscribe,
+                    None,
+                    "JMAP push: WebSocket not connected",
+                ))
+            }
+        }
+    }
+
+    // A re-enable that fails FAST (dead sink detected immediately) must
+    // end the pass as a transient disconnect. Proceeding to the read
+    // loop instead would announce `Reconnected` over a connection with
+    // no applied subscription - a silent dead-push state the
+    // `connect_timeout` bound cannot see.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_push_re_enable_disconnects_instead_of_announcing_reconnected() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let reader = tokio::spawn(reader_loop(
+            FailingReenableTransport {
+                attempts: Arc::clone(&attempts),
+            },
+            tx,
+            Arc::new(Mutex::new(HashSet::new())),
+            shutdown.clone(),
+            ReconnectPolicy::default(),
+            Arc::new(routing()),
+        ));
+
+        // Two consecutive passes: each must surface as `Disconnected`
+        // with no `Reconnected` in between, proving the reader both
+        // refuses the unsubscribed link and keeps reconnecting rather
+        // than parking on it.
+        for _ in 0..2 {
+            match rx.recv().await {
+                Ok(WatchEvent::Disconnected) => {}
+                other => panic!("expected Disconnected, got {other:?}"),
+            }
+        }
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the reader must retry the connect + re-enable cycle"
+        );
+
+        shutdown.cancel();
+        reader.await.expect("reader task panicked");
     }
 
     // Independently of shutdown: a handshake that never answers must
