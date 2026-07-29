@@ -240,7 +240,10 @@ impl<'a> CursorBytes<'a> {
 
     fn take_uid_set(&mut self) -> Result<CompactUidSet, AccountError> {
         let count = self.take_u32()? as usize;
-        let mut ranges = Vec::with_capacity(count);
+        // A range consumes two u32 fields. Do not reserve from the
+        // untrusted declared count when the payload cannot contain that
+        // many ranges.
+        let mut ranges = Vec::with_capacity(count.min(self.remaining() / 8));
         for _ in 0..count {
             let start = self.take_u32()?;
             let end = self.take_u32()?;
@@ -250,14 +253,15 @@ impl<'a> CursorBytes<'a> {
             // backwards `UidRange`; reject it rather than silently decode
             // a corrupt cursor into a nonsensical set.
             let range = if end == 0 {
-                crate::types::UidRange::single(start)
+                crate::types::UidRange::try_single(start)
             } else if end < start {
                 return Err(schema_incompatible(
                     "IMAP cursor UID range has end before start",
                 ));
             } else {
-                crate::types::UidRange::range(start, end)
-            };
+                crate::types::UidRange::try_range(start, end)
+            }
+            .ok_or_else(|| schema_incompatible("IMAP cursor UID range contains a zero UID"))?;
             ranges.push(range);
         }
         Ok(CompactUidSet::from_ranges(ranges))
@@ -578,6 +582,32 @@ mod tests {
             err.kind(),
             AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::SchemaIncompatible)
         ));
+    }
+
+    #[test]
+    fn cursor_uid_set_rejects_zero_without_panicking() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(3); // Basic
+        push_u32(&mut bytes, 7); // uidvalidity
+        push_u32(&mut bytes, 20); // uidnext
+        push_u32(&mut bytes, 1); // one range
+        push_u32(&mut bytes, 0); // invalid zero start
+        push_u32(&mut bytes, 0); // single-UID sentinel
+        let err = decode_folder_cursor(&bytes).expect_err("zero UID must be rejected");
+        assert!(is_schema_incompatible(&err));
+    }
+
+    #[test]
+    fn cursor_uid_set_does_not_reserve_from_an_untrusted_count() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.push(3); // Basic
+        push_u32(&mut bytes, 7); // uidvalidity
+        push_u32(&mut bytes, 20); // uidnext
+        push_u32(&mut bytes, u32::MAX); // impossible declared range count
+        let err = decode_folder_cursor(&bytes).expect_err("truncated uid set");
+        assert!(is_schema_incompatible(&err));
     }
 
     #[test]

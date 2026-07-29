@@ -63,6 +63,7 @@ impl Pool {
             .map_err(|_| Error::closed())?;
         let member = {
             let mut idle = self.inner.idle.lock().expect("pool lock poisoned");
+            idle.retain(|member| member.conn.is_alive());
             let idx = idle
                 .iter()
                 .position(|member| member.selected.as_ref() == Some(folder));
@@ -160,6 +161,7 @@ impl Drop for PooledConn {
                 member.conn.session_state(),
                 crate::connection::SessionState::Logout
             )
+            && member.conn.is_alive()
             && !self.pool.closed.load(std::sync::atomic::Ordering::Acquire)
         {
             self.pool

@@ -152,6 +152,14 @@ fn scanner_terminates_on_unclosed_group() {
 }
 
 #[test]
+fn scanner_terminates_on_unmatched_closing_parentheses() {
+    assert!(!has(")", "MODSEQ"));
+    assert!(!has("FROM alice)", "MODSEQ"));
+    assert!(has("FROM alice) MODSEQ 5", "MODSEQ"));
+    assert!(!has("(UNSEEN))", "MODSEQ"));
+}
+
+#[test]
 fn scanner_handles_non_ascii_operands() {
     // Byte-index slicing must land on char boundaries.
     assert!(!has("SUBJECT MODSEQ\u{e5}", "MODSEQ"));

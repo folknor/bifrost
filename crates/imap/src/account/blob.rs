@@ -125,7 +125,16 @@ async fn run_blob(
         }
     }
 
-    let attr = blob_attr(decoded.section.as_deref(), range, handle.size);
+    let Some(attr) = blob_attr(decoded.section.as_deref(), range, handle.size) else {
+        tx.send(batch(
+            vec![Bytes::new()],
+            PageBoundary::Page,
+            None::<Checkpoint>,
+        ))
+        .await
+        .map_err(|_| BlobError::ChannelDropped)?;
+        return Ok(());
+    };
     run_fetch(
         &account,
         &decoded.folder,
@@ -281,7 +290,11 @@ async fn run_fetch(
     Ok(())
 }
 
-fn blob_attr(section: Option<&str>, range: Option<ByteRange>, size: Option<u64>) -> FetchAttr {
+fn blob_attr(
+    section: Option<&str>,
+    range: Option<ByteRange>,
+    size: Option<u64>,
+) -> Option<FetchAttr> {
     let partial = range.map(|range| {
         let length = range
             .length
@@ -289,11 +302,14 @@ fn blob_attr(section: Option<&str>, range: Option<ByteRange>, size: Option<u64>)
             .unwrap_or(u32::MAX as u64);
         (range.start, length)
     });
-    FetchAttr::BodySection {
+    if partial.is_some_and(|(_, length)| length == 0) {
+        return None;
+    }
+    Some(FetchAttr::BodySection {
         peek: true,
         section: section.map(str::to_owned),
         partial,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -315,13 +331,13 @@ mod tests {
     // carry no `<origin.count>` so the server streams the entire section.
     #[test]
     fn blob_attr_without_a_range_peeks_the_whole_section() {
-        let attr = blob_attr(Some("2.1"), None, Some(4096));
+        let attr = blob_attr(Some("2.1"), None, Some(4096)).expect("fetch attr");
         let (peek, section, partial) = parts(&attr);
         assert!(peek, "blob reads must use BODY.PEEK");
         assert_eq!(section, Some("2.1"));
         assert_eq!(partial, None);
 
-        let attr = blob_attr(None, None, None);
+        let attr = blob_attr(None, None, None).expect("fetch attr");
         let (_, section, partial) = parts(&attr);
         assert_eq!(section, None, "no section means the whole message");
         assert_eq!(partial, None);
@@ -336,7 +352,8 @@ mod tests {
                 length: Some(50),
             }),
             Some(4096),
-        );
+        )
+        .expect("fetch attr");
         let (peek, _, partial) = parts(&attr);
         assert!(peek);
         assert_eq!(partial, Some((100, 50)));
@@ -354,7 +371,8 @@ mod tests {
                 length: None,
             }),
             Some(4096),
-        );
+        )
+        .expect("fetch attr");
         let (_, _, partial) = parts(&attr);
         assert_eq!(partial, Some((100, 3996)));
 
@@ -367,8 +385,7 @@ mod tests {
             }),
             Some(4096),
         );
-        let (_, _, partial) = parts(&attr);
-        assert_eq!(partial, Some((4096, 0)));
+        assert!(attr.is_none(), "a range at EOF is answered locally");
     }
 
     #[test]
@@ -380,7 +397,8 @@ mod tests {
                 length: None,
             }),
             None,
-        );
+        )
+        .expect("fetch attr");
         let (_, _, partial) = parts(&attr);
         assert_eq!(
             partial,
@@ -389,13 +407,8 @@ mod tests {
         );
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG. RFC 3501
-    // Section 9 defines the partial count as `nz-number`, so `<start.0>`
-    // is not a legal FETCH partial; a zero-length `ByteRange` should be
-    // answered locally with an empty body rather than encoded onto the
-    // wire.
     #[test]
-    fn blob_attr_encodes_a_zero_length_range_verbatim() {
+    fn blob_attr_rejects_a_zero_length_partial() {
         let attr = blob_attr(
             None,
             Some(ByteRange {
@@ -404,7 +417,6 @@ mod tests {
             }),
             Some(4096),
         );
-        let (_, _, partial) = parts(&attr);
-        assert_eq!(partial, Some((10, 0)));
+        assert!(attr.is_none());
     }
 }

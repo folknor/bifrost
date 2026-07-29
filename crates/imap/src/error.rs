@@ -290,6 +290,24 @@ impl PartialEq for Error {
 impl Eq for Error {}
 
 impl Error {
+    /// Whether a driver-side failure makes the wire stream unsafe to reuse.
+    ///
+    /// Server rejections and local validation failures leave command
+    /// framing intact. Transport loss, BYE, parse failure, and protocol
+    /// desynchronization do not.
+    pub(crate) const fn is_connection_fatal(&self) -> bool {
+        matches!(
+            self,
+            Self::Io { .. }
+                | Self::Bye { .. }
+                | Self::Protocol(_)
+                | Self::Parse(_)
+                | Self::Closed { .. }
+                | Self::DriverPanicked { .. }
+                | Self::DriverGone { .. }
+        )
+    }
+
     /// Construct a transport-flavored I/O error with no attempt-state evidence.
     pub(crate) fn io(source: std::io::Error) -> Self {
         Self::Io {

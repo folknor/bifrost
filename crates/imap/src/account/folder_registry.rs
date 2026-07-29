@@ -283,6 +283,31 @@ pub(crate) fn shared_overrides_personal(name: &str, namespace_prefix: &str) -> b
     !namespace_prefix.is_empty() && name.starts_with(namespace_prefix)
 }
 
+/// The trailing path segment of a mailbox name under the server's own
+/// hierarchy delimiter.
+///
+/// The single home for this rule. Both the `FolderRole` name fallback
+/// (`pim.rs::folder_role`) and the Drafts probe that decides
+/// `draft_create` (`capabilities.rs`) key roles off the leaf, and they
+/// have to agree: a server where one sees `INBOX.Drafts` and the other
+/// sees `Drafts` advertises a draft capability whose APPEND target then
+/// fails to resolve. Two private copies of the split is how that drifts.
+///
+/// A `None` delimiter is LIST reporting a flat namespace, where the whole
+/// name IS the leaf. We still split on `/` there, deliberately: it is the
+/// long-standing behavior, and a server that reports NIL while genuinely
+/// nesting under `/` is likelier than a flat server with a literal `/` in
+/// a mailbox name. The cost of being wrong is a false role match on a
+/// name like `Foo/Sent`; revisit if a real server hits it.
+///
+/// Pure so the delimiter rule is unit-pinnable without a live server.
+pub(crate) fn leaf_name(name: &str, delimiter: Option<char>) -> &str {
+    match delimiter {
+        Some(delimiter) => name.rsplit_once(delimiter).map_or(name, |(_, leaf)| leaf),
+        None => name.rsplit('/').next().unwrap_or(name),
+    }
+}
+
 /// Whether a folder may be SELECTed, given LIST's own selectability
 /// (`\Noselect` / `\NonExistent`) and the MYRIGHTS set discovery captured.
 ///
@@ -796,6 +821,32 @@ mod tests {
         // sibling root that merely shares a leading substring still counts
         // only when the declared prefix matches.
         assert!(!shared_overrides_personal("SharedOther/x", "#user/"));
+    }
+
+    /// One leaf rule for both the `FolderRole` name fallback and the
+    /// `draft_create` Drafts probe. If these two ever diverge again, a
+    /// Courier/Dovecot `.`-delimited server advertises `draft_create`
+    /// against a Drafts folder `role_folder` cannot then find.
+    #[test]
+    fn leaf_name_follows_the_servers_delimiter() {
+        assert_eq!(leaf_name("INBOX.Drafts", Some('.')), "Drafts");
+        assert_eq!(leaf_name("[Gmail]/Sent Mail", Some('/')), "Sent Mail");
+        assert_eq!(
+            leaf_name("INBOX", Some('.')),
+            "INBOX",
+            "a name with no delimiter occurrence is its own leaf"
+        );
+        assert_eq!(
+            leaf_name("INBOX.Drafts", Some('/')),
+            "INBOX.Drafts",
+            "a dot is an ordinary character when the server delimits on slash"
+        );
+        assert_eq!(
+            leaf_name("INBOX/Sent", None),
+            "Sent",
+            "NIL keeps the slash fallback; see the helper's doc comment"
+        );
+        assert_eq!(leaf_name("Drafts", None), "Drafts");
     }
 
     // A mid-session personal re-LIST (after a create / rename / move /

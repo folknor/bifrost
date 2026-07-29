@@ -28,8 +28,13 @@ pub(crate) fn build_capabilities(
             .attributes
             .iter()
             .any(|attr| matches!(attr, MailboxAttribute::Drafts))
-            || folder.name.as_str().eq_ignore_ascii_case("drafts")
+            // Same leaf rule `folder_role` uses for its name fallback, so
+            // the Drafts folder this flag promises is the one
+            // `role_folder(Drafts)` later resolves.
+            || super::folder_registry::leaf_name(folder.name.as_str(), folder.delimiter)
+                .eq_ignore_ascii_case("drafts")
     });
+    let can_expunge_by_uid = profile.supports(Capability::UidPlus) || profile.imap4rev2;
     let has_thread_references = profile.capabilities.iter().any(
         |cap| matches!(cap, Capability::Thread(alg) if alg.eq_ignore_ascii_case("REFERENCES")),
     );
@@ -64,7 +69,7 @@ pub(crate) fn build_capabilities(
             category_definitions: false,
             message_reactions: false,
             add_to_container: true,
-            remove_from_container: true,
+            remove_from_container: can_expunge_by_uid,
             set_keyword: true,
             set_label_membership: false,
             set_category: false,
@@ -74,9 +79,9 @@ pub(crate) fn build_capabilities(
             send_message: submission_configured,
             attachment_upload: false,
             host_attachment: false,
-            draft_create: has_drafts && profile.supports(Capability::UidPlus),
+            draft_create: has_drafts && can_expunge_by_uid,
             draft_update: false,
-            draft_discard: true,
+            draft_discard: can_expunge_by_uid,
             draft_send: submission_configured,
             // IMAP relay FUTURERELEASE is per-connection (advertised in
             // EHLO at send time), unknown at open. The honest snapshot
@@ -317,6 +322,15 @@ mod tests {
         assert!(!caps.pim_methods.draft_create, "nowhere to APPEND a draft");
     }
 
+    #[test]
+    fn drafts_name_fallback_uses_the_list_delimiter() {
+        let profile = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
+        let mut drafts = mailbox("INBOX.Drafts", Vec::new());
+        drafts.delimiter = Some('.');
+        let caps = build_capabilities(&profile, &[drafts], false, None, None, false, false);
+        assert!(caps.pim_methods.draft_create);
+    }
+
     // Thread search and thread hydration are implemented over the THREAD
     // command with the REFERENCES algorithm; a server offering only
     // ORDEREDSUBJECT must not have them advertised.
@@ -363,21 +377,25 @@ mod tests {
         assert!(caps.pim_methods.quota_get);
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG.
-    // `remove_from_container` and `draft_discard` both run
-    // `+FLAGS \Deleted` followed by UID EXPUNGE, and UID EXPUNGE requires
-    // UIDPLUS (RFC 4315 Section 2) - the same gate `draft_create` already
-    // applies. On a non-UIDPLUS, non-rev2 server these advertise support
-    // the account cannot deliver.
     #[test]
-    fn expunge_backed_methods_are_advertised_without_uidplus() {
+    fn expunge_backed_methods_require_uidplus_or_rev2() {
         let bare = ServerProfile::new(Vec::new(), Vec::new());
         let caps = build_capabilities(&bare, &[], false, None, None, false, false);
+        assert!(!caps.pim_methods.remove_from_container);
+        assert!(!caps.pim_methods.draft_discard);
+        assert!(!caps.pim_methods.draft_create);
+
+        let uidplus = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
+        let caps = build_capabilities(&uidplus, &[], false, None, None, false, false);
         assert!(caps.pim_methods.remove_from_container);
         assert!(caps.pim_methods.draft_discard);
-        // The sibling APPENDUID-dependent flag DOES gate, which is what
-        // makes the pair above look like an oversight rather than a rule.
-        assert!(!caps.pim_methods.draft_create);
+
+        let rev2 = ServerProfile::new(vec![Capability::Imap4Rev2], vec!["IMAP4REV2".to_owned()]);
+        let drafts = [mailbox("Drafts", Vec::new())];
+        let caps = build_capabilities(&rev2, &drafts, false, None, None, false, false);
+        assert!(caps.pim_methods.remove_from_container);
+        assert!(caps.pim_methods.draft_discard);
+        assert!(caps.pim_methods.draft_create);
     }
 
     #[test]

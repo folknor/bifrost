@@ -1072,14 +1072,14 @@ pub(crate) fn delete_thread(
     Box::pin(async move {
         if let Some(current) = current {
             let folder = folder_from_container(&current)?;
+            let entry = account.folders.get(&folder);
             if folder_role(
-                account
-                    .folders
-                    .get(&folder)
+                entry
                     .as_deref()
                     .map(|entry| entry.attributes.as_slice())
                     .unwrap_or(&[]),
                 folder.as_str(),
+                entry.as_deref().and_then(|entry| entry.delimiter),
             ) == Some(FolderRole::Trash)
             {
                 return remove_from_container(account, MutationTarget::Thread(thread), current)
@@ -1324,6 +1324,7 @@ fn imap_flag_for_keyword(keyword: &str) -> Flag {
     }
 }
 
+#[derive(Debug)]
 struct SearchPlan {
     criteria: String,
     folder: Option<MailboxName>,
@@ -1342,6 +1343,7 @@ fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
         .as_deref()
         .filter(|raw| !raw.trim().is_empty())
     {
+        validate_provider_query(raw)?;
         if plan.criteria == "ALL" {
             plan.criteria = raw.trim().to_owned();
         } else {
@@ -1356,6 +1358,68 @@ fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
         criteria: plan.criteria,
         folder: plan.folder,
     })
+}
+
+fn validate_provider_query(raw: &str) -> Result<(), AccountError> {
+    let bytes = raw.as_bytes();
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            pos += 1;
+            continue;
+        }
+
+        match byte {
+            b'"' => quoted = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| pim_malformed("provider query has an unmatched ')'"))?;
+            }
+            b'{' => {
+                let mut end = pos + 1;
+                let digits_start = end;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > digits_start {
+                    if bytes.get(end) == Some(&b'+') {
+                        end += 1;
+                    }
+                    if bytes.get(end) == Some(&b'}') {
+                        return Err(pim_malformed(
+                            "provider query must not contain an IMAP literal",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+
+    if quoted {
+        return Err(pim_malformed(
+            "provider query has an unterminated quoted string",
+        ));
+    }
+    if depth != 0 {
+        return Err(pim_malformed("provider query has an unmatched '('"));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1639,7 +1703,7 @@ fn container_from_folder_entry(
     Container::new(
         ContainerId(native.clone()),
         ContainerKind::Folder,
-        folder_role(&entry.attributes, &native),
+        folder_role(&entry.attributes, &native, entry.delimiter),
         Provenance {
             provider: ProtocolKind::Imap,
             kind: ContainerKind::Folder,
@@ -1692,7 +1756,7 @@ fn rights_from_myrights(rights: &MailboxRights) -> ContainerRights {
     }
 }
 
-fn folder_role(attributes: &[MailboxAttribute], name: &str) -> Option<FolderRole> {
+fn folder_role_from_attributes(attributes: &[MailboxAttribute]) -> Option<FolderRole> {
     for attr in attributes {
         match attr {
             MailboxAttribute::Sent => return Some(FolderRole::Sent),
@@ -1706,7 +1770,22 @@ fn folder_role(attributes: &[MailboxAttribute], name: &str) -> Option<FolderRole
             _ => {}
         }
     }
-    let lower = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    None
+}
+
+fn folder_role(
+    attributes: &[MailboxAttribute],
+    name: &str,
+    delimiter: Option<char>,
+) -> Option<FolderRole> {
+    if let Some(role) = folder_role_from_attributes(attributes) {
+        return Some(role);
+    }
+    // SPECIAL-USE is authoritative; this is the name fallback for servers
+    // that publish none. The leaf split is shared with the `draft_create`
+    // Drafts probe - see `folder_registry::leaf_name` for why it is one
+    // function and what a `None` delimiter means.
+    let lower = super::folder_registry::leaf_name(name, delimiter).to_ascii_lowercase();
     match lower.as_str() {
         "inbox" => Some(FolderRole::Inbox),
         "sent" | "sent mail" | "sent messages" => Some(FolderRole::Sent),
@@ -1726,23 +1805,41 @@ fn parent_id(delimiter: Option<char>, native: &str) -> Option<ContainerId> {
 }
 
 fn role_folder(account: &ImapAccount, role: FolderRole) -> Option<MailboxName> {
-    account
-        .folders
-        .entries()
+    role_folder_from_entries(account.folders.entries(), role)
+}
+
+fn role_folder_from_entries(
+    entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
+    role: FolderRole,
+) -> Option<MailboxName> {
+    entries
         .into_iter()
-        .find(|entry| folder_role(&entry.attributes, entry.name.as_str()) == Some(role))
+        .filter(|entry| {
+            folder_role(&entry.attributes, entry.name.as_str(), entry.delimiter) == Some(role)
+        })
+        .min_by(|left, right| {
+            let left_rank = u8::from(folder_role_from_attributes(&left.attributes) != Some(role));
+            let right_rank = u8::from(folder_role_from_attributes(&right.attributes) != Some(role));
+            left_rank
+                .cmp(&right_rank)
+                .then_with(|| left.name.as_str().cmp(right.name.as_str()))
+        })
         .map(|entry| entry.name.clone())
 }
 
 fn quota_probe_folder(account: &ImapAccount) -> Option<MailboxName> {
-    role_folder(account, FolderRole::Inbox).or_else(|| {
-        account
-            .folders
-            .entries()
-            .into_iter()
-            .find(|entry| entry.selectable)
-            .map(|entry| entry.name.clone())
-    })
+    role_folder(account, FolderRole::Inbox)
+        .or_else(|| first_selectable_folder(account.folders.entries()))
+}
+
+fn first_selectable_folder(
+    entries: Vec<std::sync::Arc<super::folder_registry::FolderEntry>>,
+) -> Option<MailboxName> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.selectable)
+        .min_by(|left, right| left.name.as_str().cmp(right.name.as_str()))
+        .map(|entry| entry.name.clone())
 }
 
 fn child_name(
@@ -2361,18 +2458,19 @@ body text\r\n";
         // A localized mailbox is only recognizable by its SPECIAL-USE
         // attribute, and a mislabelled name must not beat the attribute.
         assert_eq!(
-            folder_role(&[MailboxAttribute::Sent], "Gesendete Objekte"),
+            folder_role(&[MailboxAttribute::Sent], "Gesendete Objekte", None),
             Some(FolderRole::Sent)
         );
         assert_eq!(
-            folder_role(&[MailboxAttribute::Junk], "Archive"),
+            folder_role(&[MailboxAttribute::Junk], "Archive", None),
             Some(FolderRole::Spam),
             "the attribute wins over the name",
         );
         assert_eq!(
             folder_role(
                 &[MailboxAttribute::Custom("\\INBOX".to_owned())],
-                "Posteingang"
+                "Posteingang",
+                None,
             ),
             Some(FolderRole::Inbox),
             "the \\Inbox custom attribute is matched case-insensitively",
@@ -2381,37 +2479,92 @@ body text\r\n";
 
     #[test]
     fn folder_role_falls_back_to_the_slash_delimited_leaf_name() {
-        assert_eq!(folder_role(&[], "INBOX"), Some(FolderRole::Inbox));
-        assert_eq!(folder_role(&[], "inbox"), Some(FolderRole::Inbox));
         assert_eq!(
-            folder_role(&[], "[Gmail]/Sent Mail"),
+            folder_role(&[], "INBOX", Some('/')),
+            Some(FolderRole::Inbox)
+        );
+        assert_eq!(
+            folder_role(&[], "inbox", Some('/')),
+            Some(FolderRole::Inbox)
+        );
+        assert_eq!(
+            folder_role(&[], "[Gmail]/Sent Mail", Some('/')),
             Some(FolderRole::Sent)
         );
         assert_eq!(
-            folder_role(&[], "Deleted Messages"),
+            folder_role(&[], "Deleted Messages", Some('/')),
             Some(FolderRole::Trash)
         );
-        assert_eq!(folder_role(&[], "Projects/Q3"), None);
+        assert_eq!(folder_role(&[], "Projects/Q3", Some('/')), None);
         assert_eq!(
-            folder_role(&[MailboxAttribute::HasChildren], "Whatever"),
+            folder_role(&[MailboxAttribute::HasChildren], "Whatever", Some('/')),
             None,
             "a non-special-use attribute contributes no role",
         );
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG. The
-    // leaf-name fallback splits on `/` only, but the hierarchy delimiter
-    // is per-server (Courier and several Dovecot layouts use `.`), and
-    // the real delimiter is already known - it rides on `FolderEntry`.
-    // On such a server no role resolves, so `role_folder(Sent)` is None
-    // and the Sent-copy APPEND, `draft_create` and `delete_thread`
-    // silently lose their targets.
     #[test]
-    fn folder_role_misses_the_leaf_when_the_delimiter_is_not_a_slash() {
-        assert_eq!(folder_role(&[], "INBOX.Sent"), None);
-        assert_eq!(folder_role(&[], "INBOX.Trash"), None);
-        // The same layout with `/` resolves, which is the asymmetry.
-        assert_eq!(folder_role(&[], "INBOX/Sent"), Some(FolderRole::Sent));
+    fn folder_role_uses_the_servers_hierarchy_delimiter() {
+        assert_eq!(
+            folder_role(&[], "INBOX.Sent", Some('.')),
+            Some(FolderRole::Sent)
+        );
+        assert_eq!(
+            folder_role(&[], "INBOX.Trash", Some('.')),
+            Some(FolderRole::Trash)
+        );
+        assert_eq!(
+            folder_role(&[], "INBOX/Sent", Some('/')),
+            Some(FolderRole::Sent)
+        );
+        assert_eq!(
+            folder_role(&[], "INBOX/Sent", None),
+            Some(FolderRole::Sent),
+            "unknown delimiter preserves the slash fallback",
+        );
+    }
+
+    fn role_entry(
+        name: &str,
+        delimiter: Option<char>,
+        attributes: Vec<MailboxAttribute>,
+    ) -> std::sync::Arc<crate::account::folder_registry::FolderEntry> {
+        std::sync::Arc::new(crate::account::folder_registry::FolderEntry::from_mailbox(
+            MailboxInfo {
+                name: MailboxName::new(name).expect("valid mailbox"),
+                delimiter,
+                attributes,
+                ..Default::default()
+            },
+        ))
+    }
+
+    #[test]
+    fn role_and_quota_folder_choices_are_deterministic() {
+        let entries = vec![
+            role_entry("Z/Sent", Some('/'), Vec::new()),
+            role_entry("A/Sent", Some('/'), Vec::new()),
+            role_entry("Special", Some('/'), vec![MailboxAttribute::Sent]),
+        ];
+        assert_eq!(
+            role_folder_from_entries(entries, FolderRole::Sent)
+                .as_ref()
+                .map(MailboxName::as_str),
+            Some("Special"),
+            "SPECIAL-USE wins over lexical name fallback",
+        );
+
+        let entries = vec![
+            role_entry("Zeta", Some('/'), Vec::new()),
+            role_entry("Hidden", Some('/'), vec![MailboxAttribute::NoSelect]),
+            role_entry("Archive", Some('/'), Vec::new()),
+        ];
+        assert_eq!(
+            first_selectable_folder(entries)
+                .as_ref()
+                .map(MailboxName::as_str),
+            Some("Archive"),
+        );
     }
 
     #[test]
@@ -2545,18 +2698,25 @@ body text\r\n";
         assert_eq!(plan.criteria, "ALL");
     }
 
-    // NOTE: this pins CURRENT behavior, which is believed WRONG.
-    // `provider_query` is spliced into the criteria string with no
-    // syntactic validation whatsoever, so an unbalanced `)` reaches the
-    // connection layer's SEARCH-criteria scanner - where it currently
-    // spins forever.
     #[test]
-    fn search_plan_passes_an_unbalanced_provider_query_straight_through() {
-        let plan = search_plan(&SearchRequest::provider(")")).expect("plan");
-        assert_eq!(plan.criteria, ")", "no parenthesis balancing is applied");
-
+    fn search_plan_rejects_structurally_unsafe_provider_queries() {
+        for raw in [")", "(UNSEEN", "SUBJECT \"unterminated", "BODY {4}"] {
+            let err = search_plan(&SearchRequest::provider(raw)).expect_err("malformed query");
+            assert_eq!(
+                *err.kind(),
+                AccountErrorKind::Request(RequestErrorKind::Malformed)
+            );
+        }
+        let plan = search_plan(&SearchRequest::provider(
+            "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")",
+        ))
+        .expect("balanced query");
+        assert_eq!(plan.criteria, "OR (FROM \"a\\\\\\\"b\") (SUBJECT \"{4}\")");
         let plan = search_plan(&SearchRequest::provider("FROM")).expect("plan");
-        assert_eq!(plan.criteria, "FROM", "no operand-arity check is applied");
+        assert_eq!(
+            plan.criteria, "FROM",
+            "the structural guard does not attempt operand-arity parsing"
+        );
     }
 
     #[test]

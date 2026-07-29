@@ -405,13 +405,31 @@ recovery mapping resolves an `Unsupported` kind to the terminal
 `inventory_stream` samples `users.getProfile` before the first list
 page, then walks `users.messages.list` in pages of 500 ids and
 hydrates each page through `users.messages.get` with the `metadata`
-format under `buffer_unordered` concurrency of 32. The final page
-commits the cursor derived from that initial profile sample. Changes
-that race the inventory are therefore replayed by `changes_stream`
-instead of falling into the gap between the inventory walk and its
-checkpoint. Page boundaries are `PageBoundary::Page` for intermediate
-batches and `PageBoundary::Final` for the last batch that carries the
-checkpoint.
+format under `buffer_unordered` concurrency of 32. Page boundaries are
+`PageBoundary::Page` for intermediate batches and `PageBoundary::Final`
+for the last batch.
+
+The checkpoint that final batch and the terminal `Done` carry is
+derived from the pre-walk profile sample, and **the engine does not
+read it**. Gmail answers `establish_initial_cursor` with
+`CursorEstablishment::Ready`, not `EstablishViaInventory`, so the
+change cursor is anchored at `open()` from `seed_state` and
+`changes_stream` starts from it immediately, in parallel with the
+inventory walk - a message that races the walk is caught there, not by
+anything inventory emits. Gmail's inventory therefore only ever feeds
+the backfill path (the default `inventory_partition_stream` resolves
+`InventoryPartition::Full` to `inventory_stream`), and
+`BackfillRunner::run_partition` substitutes its own
+`Checkpoint::Backfill` on every page and discards the terminal `Done`
+checkpoint outright.
+
+Sampling the profile before rather than after the walk is kept because
+it is the honest ordering for a value that claims to describe the start
+of the pass, but it is presently inert: nothing downstream consumes it.
+Emitting a `Checkpoint::Change` at all is a mild deviation from the
+`inventory_stream` contract, which reserves the terminal checkpoint for
+scopes that returned `EstablishViaInventory`. Revisit both if Gmail
+ever moves to inventory-established cursors.
 
 Inventory and hydration resolve the label vocabulary through
 `labels_for_flags` before canonicalizing flags, never through

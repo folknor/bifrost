@@ -117,7 +117,7 @@ fn mutation_stream(
         // - Anything else (transient transport, rate limit, per-folder
         //   server error) emits per-item `Uncertain` for the failing
         //   folder and continues to the next folder.
-        for (_name, (folder, ids)) in grouped {
+        for (folder, ids) in sorted_mutation_groups(grouped) {
             match run_folder_mutation(&account, &folder, ids.clone(), &kind).await {
                 Ok(results) => {
                     let _ = tx.send(batch(results, PageBoundary::Page, None)).await;
@@ -148,6 +148,14 @@ fn mutation_stream(
         let _ = tx.send(SyncEvent::Done(None)).await;
     });
     boxed_receiver_stream(rx)
+}
+
+fn sorted_mutation_groups(
+    grouped: HashMap<String, (MailboxName, Vec<DecodedObjectId>)>,
+) -> Vec<(MailboxName, Vec<DecodedObjectId>)> {
+    let mut grouped: Vec<_> = grouped.into_values().collect();
+    grouped.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    grouped
 }
 
 async fn run_folder_mutation(
@@ -759,6 +767,20 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(atoms.contains("\\Seen"));
         assert!(atoms.contains("$Important"));
+    }
+
+    #[test]
+    fn mutation_groups_are_processed_in_mailbox_order() {
+        let mut grouped = HashMap::new();
+        for name in ["Zeta", "Archive", "INBOX"] {
+            let folder = MailboxName::new(name).expect("valid mailbox");
+            grouped.insert(name.to_owned(), (folder, Vec::new()));
+        }
+        let names: Vec<_> = sorted_mutation_groups(grouped)
+            .into_iter()
+            .map(|(folder, _)| folder.as_str().to_owned())
+            .collect();
+        assert_eq!(names, ["Archive", "INBOX", "Zeta"]);
     }
 
     #[test]

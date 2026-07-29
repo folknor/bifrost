@@ -430,6 +430,10 @@ pub(super) async fn driver_task(
                                 ).await
                             }
                         };
+                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                            state.apply_infrastructure_failure();
+                            cmd_rx.close();
+                        }
                         let _ = result_tx.send(result);
                     }
                     DriverCommand::Upgrade { payload, result_tx } => {
@@ -440,6 +444,10 @@ pub(super) async fn driver_task(
                             &mut event_sink,
                             payload,
                         ).await;
+                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                            state.apply_infrastructure_failure();
+                            cmd_rx.close();
+                        }
                         let _ = result_tx.send(result.map(|()| {
                             Box::new(()) as Box<dyn std::any::Any + Send>
                         }));
@@ -453,6 +461,10 @@ pub(super) async fn driver_task(
                             commands,
                             consumers,
                         ).await;
+                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                            state.apply_infrastructure_failure();
+                            cmd_rx.close();
+                        }
                         let _ = result_tx.send(result);
                     }
                     DriverCommand::SetKeepalive { keepalive, result_tx } => {
@@ -474,6 +486,10 @@ pub(super) async fn driver_task(
                             &mut event_sink,
                             done_rx,
                         ).await;
+                        if result.as_ref().is_err_and(Error::is_connection_fatal) {
+                            state.apply_infrastructure_failure();
+                            cmd_rx.close();
+                        }
                         let _ = result_tx.send(result);
                     }
                 }

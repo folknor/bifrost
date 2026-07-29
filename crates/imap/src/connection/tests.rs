@@ -577,6 +577,21 @@ async fn prebuilt_tags_are_prefixed_and_monotonic() {
     assert_eq!(conn.next_prebuilt_tag(), "P003");
 }
 
+#[tokio::test]
+async fn driver_channel_liveness_is_independent_of_session_state() {
+    let detached =
+        crate::connection::test_support::detached(SessionState::Selected, Vec::new(), &[]);
+    assert_eq!(detached.session_state(), SessionState::Selected);
+    assert!(!detached.is_alive(), "the command receiver was dropped");
+
+    let (live, _server) =
+        crate::connection::test_support::driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    assert!(
+        live.is_alive(),
+        "the driver still owns the command receiver"
+    );
+}
+
 // ===========================================================================
 // Byte-level command transcripts over the in-memory duplex
 // ===========================================================================
@@ -644,6 +659,7 @@ async fn select_no_response_leaves_the_session_authenticated() {
 
     assert!(matches!(err, Error::No { .. }), "got {err:?}");
     assert_eq!(conn.session_state(), SessionState::Authenticated);
+    assert!(conn.is_alive(), "a tagged NO leaves the wire reusable");
 }
 
 #[tokio::test]
@@ -810,6 +826,10 @@ async fn bye_mid_command_is_swallowed_and_surfaces_as_closed() {
     assert!(
         conn.drain_events().await.is_empty(),
         "current behavior: the BYE never reaches the event queue either"
+    );
+    assert!(
+        !conn.is_alive(),
+        "a closed wire must close the driver command channel"
     );
 }
 

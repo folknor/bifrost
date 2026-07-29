@@ -49,9 +49,11 @@ engine `AccountId`. Used by protocol-crate factories whose
 `open(account_id)` needs to honor an engine-minted id when the
 consumer built the `AccountNet` ahead of time via
 `*Client::with_account_net` and the parent `Net` is no longer
-reachable through the client. The meter registers `new_id`,
-the exact token's per-account host entry moves under `new_id`, and the
-meter transfers one attachment count. The new handle inherits token
+reachable through the client. The exact token's per-account host entry
+moves under `new_id`, and the meter transfers one attachment count from
+the old id to the new one (it does not separately register the new id,
+so a retag never inflates the total attach count). The new handle
+inherits token
 source, retry policy, priority, and bandwidth cap from the old.
 Governor refcounts are per-host and not touched. The old handle keeps
 working for in-flight clones; its old-id teardown is a no-op because

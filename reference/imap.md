@@ -14,12 +14,21 @@ No boxed-transport escape hatch. Supported transport is `tokio::net::TcpStream` 
 
 ## Connection state machine
 
-State is `Ok` / `Broken` / `Closed`. The state machine is the cancel-safety mechanism:
+The driver-owned command channel is the connection liveness signal.
+`ImapConnection::is_alive()` reports whether the driver still owns the
+receiver; this is separate from RFC session state, which can still say
+`Selected` after a socket failure.
 
-- Every async write, flush, and read sets state to `Broken` before the await; only success restores `Ok`.
-- `abort()` transitions to `Closed` without sending LOGOUT. A dropped future leaves the connection `Broken`; the pool discards it.
+Driver-side I/O loss, BYE, parse failure, and protocol desynchronization
+are connection-fatal. Before returning such an error, the driver closes
+the command receiver and moves the session to `Logout`. The pool filters
+dead parked members during checkout and never returns a dead checked-out
+member to the idle list. Tagged NO/BAD responses and local validation or
+capability errors leave the connection reusable.
 
-LMTP multi-response paths and the LMTP final delivery-status loop hold `Broken` across the entire post-DATA recipient loop.
+Cancellation safety comes from socket ownership: dropping a caller's
+future does not cancel an in-flight wire exchange. The driver completes
+the command and preserves framing before accepting the next command.
 
 ## Typed events
 
@@ -151,7 +160,7 @@ Capabilities advertise `MutationConcurrency::None`: the MODSEQ cache is opportun
 - Search messages: UID SEARCH across selectable folders, `SearchFilter::In` restricting the selected mailbox. Thread search is advertised only with `THREAD=REFERENCES`, returning synthetic thread ids containing folder, UIDVALIDITY, and member UIDs.
 - Containers: LIST-backed enumeration plus CREATE, RENAME-as-rename, RENAME-as-move, and guarded DELETE (checks `STATUS MESSAGES`, refuses non-empty mailboxes).
 - Quota: `GETQUOTAROOT`, mapped from STORAGE units to bytes when QUOTA is advertised. Hydration: one-shot message FETCH and synthetic thread hydration.
-- Draft create/discard: APPEND to Drafts with `\Draft` when Drafts and UIDPLUS are present; discard deletes the draft object id. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
+- Draft create/discard: APPEND to Drafts with `\Draft` when a delimiter-aware Drafts role and UIDPLUS or active IMAP4rev2 are present; discard is advertised only when UID EXPUNGE is available. Draft bodies use the shared `bifrost-types::mime` assembler (inline attachments supported; uploaded-attachment handles rejected as `AttachmentUpload`), preserving the `Bcc:` header in the saved draft.
 - Send / draft-send: real when `ImapAccountConfig::with_submission(SmtpSubmissionConfig)` is set (see "Submission" below); `Unsupported` otherwise.
 
 Unsupported PIM methods return `Error::Unsupported` with false flags: attachment upload, `host_attachment` (Gmail/Graph only), draft update, Gmail label membership, Graph categories/extended properties, identities + identity update, vacation get/set, `scheduled_send` (cancel/reschedule too). `scheduled_send` is statically false even with submission because FUTURERELEASE is a per-connection EHLO truth unknown at open; the send is attempted and the relay's EHLO decides. SMTP send/draft-send are unsupported only without submission config. IMAP identities and vacation responders are not in Stage 1.
@@ -209,7 +218,7 @@ Composition is first-class for sync, not just primitives (subs are full `Arc<dyn
 
 `ConvenienceShape` declares IMAP starred/replied/forwarded as keyword-shaped. `move_thread`/`delete_thread` override the trait defaults via the cloneable account handle (add-then-remove); delete moves to the Trash role unless already in Trash, where it expunges from that mailbox.
 
-Containers use native mailbox paths as primitive/provenance ids. `containers_list` maps SPECIAL-USE attributes to `FolderRole` (`\Sent`, `\Drafts`, `\Archive`, `\Trash`, `\Junk`, custom `\Inbox`), falling back to name-based INBOX/Sent/Drafts/Archive/Trash/Spam detection without SPECIAL-USE.
+Containers use native mailbox paths as primitive/provenance ids. `containers_list` maps SPECIAL-USE attributes to `FolderRole` (`\Sent`, `\Drafts`, `\Archive`, `\Trash`, `\Junk`, custom `\Inbox`), falling back to name-based INBOX/Sent/Drafts/Archive/Trash/Spam detection on the leaf selected with the LIST hierarchy delimiter. `folder_registry::leaf_name` is the single owner of that split, shared with the `draft_create` Drafts probe so a `.`-delimited server cannot advertise a draft capability whose APPEND target `role_folder` then fails to resolve; a NIL delimiter keeps the legacy `/` fallback rather than treating the whole name as the leaf. When several folders map to one role, SPECIAL-USE wins over name fallback and mailbox path breaks remaining ties deterministically.
 
 `container_from_folder_entry` also projects the shared-namespace metadata: a folder with a `shared_owner` gets `namespace = Shared`, `owner = MailboxId(owner)`, and `owner_local_id` = the full mailbox path (IMAP has no separate per-owner id space - the path IS the native id in every namespace, so `native_id` stays byte-identical to the `CursorScope::Folder` string discovery emits). `rights` projects the MYRIGHTS set `discover_shared_folders` captured at open (`rights_from_myrights`, RFC 4314 Section 4: `l`+`r` -> read, `i` -> add, `t` -> remove, `s` -> seen, `w` -> keywords, `k`/`c` -> create child, `x`/`d` -> rename+delete, `p` -> submit). The rights set is now RETAINED on `FolderEntry`, not just used as the discovery read-gate - without it a read-only share is indistinguishable from a writable one downstream. `None` means unreported (a personal folder we never probed, or a server without ACL), which is distinct from an explicit empty rights set. A rename/recreate inherits both the owner tag and the rights, since a LIST/IDLE `MailboxInfo` carries neither.
 

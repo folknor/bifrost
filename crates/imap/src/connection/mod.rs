@@ -359,6 +359,15 @@ const _: fn() = || {
 };
 
 impl ImapConnection {
+    /// Whether the driver command channel still has a receiver.
+    ///
+    /// Session state only describes the IMAP protocol state. A connection
+    /// can remain Selected after its socket or driver task has died, so
+    /// pool reuse must consult the command-channel liveness separately.
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
+    }
+
     /// Generate the next tag for a pre-built command (APPEND/MULTIAPPEND).
     ///
     /// Uses `P` prefix to avoid collision with the driver's hex-format

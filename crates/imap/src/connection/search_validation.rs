@@ -290,6 +290,13 @@ impl ImapConnection {
         if *pos > start {
             Some(SearchCriteriaItem::Bare(&criteria[start..*pos]))
         } else {
+            // A malformed top-level closing parenthesis is not an item,
+            // but the scanner must still make progress. Parenthesized
+            // groups consume their own closing delimiter before reaching
+            // this branch.
+            if bytes[*pos] == b')' {
+                *pos += 1;
+            }
             None
         }
     }
