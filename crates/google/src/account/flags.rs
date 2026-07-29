@@ -72,6 +72,7 @@ const FLAG_SEEN: &str = "\\Seen";
 const FLAG_FLAGGED: &str = "\\Flagged";
 const FLAG_DRAFT: &str = "\\Draft";
 const FLAG_IMPORTANT: &str = "$Important";
+const USER_LABEL_FLAG_PREFIX: &str = "$gmail-label:";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LabelPatch {
@@ -154,6 +155,34 @@ fn patch_for_set(flags: &HashSet<String>, labels: &[GmailLabel]) -> LabelPatch {
         }
     }
 
+    // `Set` means "the flag set is exactly this", so an omitted user label
+    // has to be removed, not just left alone. We cannot know which labels
+    // the message currently carries from here, so the patch names every
+    // user label in the vocabulary - `batchModify` ignores removals for
+    // labels a message does not have. Consequence to keep in mind:
+    // `remove_label_ids` scales with the account's user label count, not
+    // with the size of the incoming flag set.
+    //
+    // The `user` filter is the point of this loop and is NOT the same
+    // mistake as type-filtering `user_label_id_from_flag`. Gmail's
+    // classifier owns the `CATEGORY_*` system labels; stripping them on
+    // every `Set` would fight it. Those flags therefore round-trip as
+    // no-ops here: resolvable (so they never poison `unsupported_flags`),
+    // but never added or removed by an exact-set operation.
+    for label in labels
+        .iter()
+        .filter(|label| label.label_type.as_deref() == Some("user"))
+    {
+        let flag = format!("{USER_LABEL_FLAG_PREFIX}{}:{}", label.id, label.name);
+        if flags.iter().any(|candidate| {
+            user_label_id_from_flag(candidate, labels).as_deref() == Some(label.id.as_str())
+        }) {
+            add.insert(flag);
+        } else {
+            remove.insert(flag);
+        }
+    }
+
     for flag in flags {
         if !is_known_flag(flag, labels) {
             add.insert(flag.clone());
@@ -227,10 +256,29 @@ fn flag_to_remove_label(flag: &str, labels: &[GmailLabel]) -> FlagTranslation {
     }
 }
 
+/// Resolve a `$gmail-label:<id>:<name>` flag back to its Gmail label id.
+///
+/// The id is the stable key and the embedded display name is advisory, so
+/// a label renamed on the server between the read that minted the flag and
+/// the write that replays it still resolves. Splitting on the *first* `:`
+/// after the prefix is deliberate: ids never contain a colon, names may.
+///
+/// Do NOT filter this lookup by `label_type == "user"`, tempting as the
+/// function name makes it. `canonical_flags` renders every label id it has
+/// no canonical flag for into this spelling - including Gmail's system
+/// category labels (`CATEGORY_PROMOTIONS` and friends, which come back
+/// with `name == id`). Type-filtering here makes those flags unresolvable,
+/// which lands them in `unsupported_flags`, which `apply_label_patch`
+/// turns into `MutationSuccess::Skipped` for the whole batch - a success
+/// lane reporting that nothing happened. The ids that would genuinely be
+/// dangerous to resolve this way (UNREAD, INBOX, SENT, TRASH, SPAM, CHAT,
+/// STARRED, DRAFT, IMPORTANT) can never reach this spelling because
+/// `canonical_flags` matches them before its fallback arm.
 fn user_label_id_from_flag(flag: &str, labels: &[GmailLabel]) -> Option<String> {
+    let (id, _advisory_name) = flag.strip_prefix(USER_LABEL_FLAG_PREFIX)?.split_once(':')?;
     labels
         .iter()
-        .find(|label| flag == format!("$gmail-label:{}:{}", label.id, label.name))
+        .find(|label| label.id == id)
         .map(|label| label.id.clone())
 }
 
@@ -454,27 +502,14 @@ mod tests {
         assert_eq!(patch.remove_label_ids, vec!["Label_1".to_string()]);
     }
 
-    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. The user-label lookup keys
-    /// on the WHOLE `<id>:<name>` spelling, so a label renamed on the
-    /// server between the read that minted the flag and the write that
-    /// replays it no longer resolves. The flag lands in
-    /// `unsupported_flags`, and `apply_label_patch` turns a non-empty
-    /// `unsupported_flags` into `MutationSuccess::Skipped` for every id
-    /// in the batch - a success lane. A stale name therefore silently
-    /// drops the whole flag operation for up to 1000 messages instead
-    /// of resolving by id or reporting a failure.
     #[test]
-    fn a_user_label_flag_with_a_stale_name_becomes_unsupported() {
+    fn a_user_label_flag_with_a_stale_name_resolves_by_id() {
         let patch = translate_flag_op(
             &FlagOp::Add(set(&["$gmail-label:Label_1:OldName"])),
             &work_label(),
         );
-        assert!(patch.add_label_ids.is_empty());
-        assert_eq!(
-            patch.unsupported_flags,
-            vec!["$gmail-label:Label_1:OldName".to_string()],
-            "the id is right there in the flag, but the lookup requires the name to match too"
-        );
+        assert_eq!(patch.add_label_ids, vec!["Label_1".to_string()]);
+        assert!(patch.unsupported_flags.is_empty());
     }
 
     /// Same shape, reached the other way: an empty label vocabulary
@@ -487,29 +522,116 @@ mod tests {
         assert_eq!(patch.unsupported_flags.len(), 1);
     }
 
-    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `FlagOp::Set` means "the
-    /// flag set is exactly this". `patch_for_set` re-derives add/remove
-    /// over the four canonical flags but never walks the known user
-    /// label vocabulary, so a user label the message currently carries
-    /// and the `Set` omits is left attached. `reference/google.md`
-    /// describes `Set` as re-deriving "over the canonical four flags
-    /// plus the user label vocabulary", which the code does not do.
     #[test]
-    fn set_does_not_remove_user_labels_the_new_set_omits() {
+    fn set_removes_user_labels_the_new_set_omits() {
         let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &work_label());
         assert!(
-            !patch.remove_label_ids.contains(&"Label_1".to_string()),
-            "an exact-set operation leaves known user labels attached",
+            patch.remove_label_ids.contains(&"Label_1".to_string()),
+            "an exact-set operation removes omitted known user labels",
         );
         assert_eq!(
             patch.remove_label_ids,
             vec![
                 LABEL_DRAFT.to_string(),
                 LABEL_IMPORTANT.to_string(),
+                "Label_1".to_string(),
                 LABEL_STARRED.to_string(),
                 LABEL_UNREAD.to_string()
             ]
         );
+    }
+
+    /// Regression guard. `canonical_flags` has no canonical spelling for
+    /// Gmail's system category labels, so it renders them through the
+    /// `$gmail-label:` fallback exactly like a user label. If
+    /// `user_label_id_from_flag` ever grows a `label_type == "user"`
+    /// filter again, this round trip breaks and every affected batch
+    /// reports `Succeeded(Skipped)` while applying nothing.
+    #[test]
+    fn a_system_category_label_flag_round_trips_through_translation() {
+        let labels = vec![GmailLabel {
+            id: "CATEGORY_PROMOTIONS".to_string(),
+            name: "CATEGORY_PROMOTIONS".to_string(),
+            label_type: Some("system".to_string()),
+            color: None,
+        }];
+        let canonical = canonical_flags(&["CATEGORY_PROMOTIONS".to_string()], &labels);
+        assert!(
+            canonical
+                .flags
+                .contains(&"$gmail-label:CATEGORY_PROMOTIONS:CATEGORY_PROMOTIONS".to_string())
+        );
+
+        let patch = translate_flag_op(&FlagOp::Add(canonical.flags.into_iter().collect()), &labels);
+        assert_eq!(patch.add_label_ids, vec!["CATEGORY_PROMOTIONS".to_string()]);
+        assert!(
+            patch.unsupported_flags.is_empty(),
+            "a flag this crate itself minted must translate back"
+        );
+    }
+
+    /// The other half of the category-label contract: resolvable, but
+    /// left alone by an exact set in both directions, because Gmail's
+    /// classifier owns those labels.
+    #[test]
+    fn set_neither_adds_nor_removes_system_category_labels() {
+        let labels = vec![GmailLabel {
+            id: "CATEGORY_SOCIAL".to_string(),
+            name: "CATEGORY_SOCIAL".to_string(),
+            label_type: Some("system".to_string()),
+            color: None,
+        }];
+        let omitted = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &labels);
+        assert!(
+            !omitted
+                .remove_label_ids
+                .contains(&"CATEGORY_SOCIAL".to_string())
+        );
+        assert!(omitted.unsupported_flags.is_empty());
+
+        let named = translate_flag_op(
+            &FlagOp::Set(set(&[
+                FLAG_SEEN,
+                "$gmail-label:CATEGORY_SOCIAL:CATEGORY_SOCIAL",
+            ])),
+            &labels,
+        );
+        assert!(!named.add_label_ids.contains(&"CATEGORY_SOCIAL".to_string()));
+        assert!(named.unsupported_flags.is_empty());
+    }
+
+    /// Documents the cost of exact-set semantics: the removal list is
+    /// sized by the account's user label vocabulary, not by the incoming
+    /// flag set, because the patch is built without knowledge of what the
+    /// target messages currently carry.
+    #[test]
+    fn set_removals_scale_with_the_user_label_vocabulary() {
+        let labels = (0..50)
+            .map(|n| GmailLabel {
+                id: format!("Label_{n}"),
+                name: format!("Name {n}"),
+                label_type: Some("user".to_string()),
+                color: None,
+            })
+            .collect::<Vec<_>>();
+        let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &labels);
+        assert_eq!(
+            patch.remove_label_ids.len(),
+            50 + 4,
+            "every known user label, plus STARRED / DRAFT / IMPORTANT for the \
+             omitted canonical flags and UNREAD for the asserted \\Seen"
+        );
+    }
+
+    #[test]
+    fn set_keeps_a_user_label_selected_with_its_stale_name() {
+        let patch = translate_flag_op(
+            &FlagOp::Set(set(&[FLAG_SEEN, "$gmail-label:Label_1:OldName"])),
+            &work_label(),
+        );
+        assert!(patch.add_label_ids.contains(&"Label_1".to_string()));
+        assert!(!patch.remove_label_ids.contains(&"Label_1".to_string()));
+        assert!(patch.unsupported_flags.is_empty());
     }
 
     /// An unknown flag inside a `Set` is added verbatim and then fails

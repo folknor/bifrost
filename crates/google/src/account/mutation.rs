@@ -102,7 +102,18 @@ fn mutation_stream(
         if state.patch.is_none() {
             match &state.kind {
                 MutationKind::SetFlags(op) => {
-                    let labels = labels_for_flags(&state.client, &state.cache).await;
+                    let labels = match labels_for_flags(&state.client, &state.cache).await {
+                        Ok(labels) => labels,
+                        Err(error) => {
+                            state.finished = true;
+                            state.emitted_done = true;
+                            let account_error = account_error::into_account_error(
+                                error,
+                                GmailErrorContext::mutation(AccountOperation::UpdateFlags),
+                            );
+                            return Some((SyncEvent::Terminated(account_error), state));
+                        }
+                    };
                     state.patch = Some(translate_flag_op(op, &labels));
                 }
                 MutationKind::Move {

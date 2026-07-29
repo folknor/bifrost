@@ -384,15 +384,26 @@ stream each reject any other scope with a
 recovery mapping resolves an `Unsupported` kind to the terminal
 `Unsupported` `RecoveryClass`.
 
-`inventory_stream` walks `users.messages.list` in pages of 500
-ids, then hydrates each page through `users.messages.get` with
-the `metadata` format under `buffer_unordered` concurrency of
-32. The final page emits an `inventory_checkpoint` derived from
-`users.getProfile` so the engine can commit a cursor anchored to
-the historyId observed at the end of the inventory pass. Page
-boundaries are `PageBoundary::Page` for intermediate batches and
-`PageBoundary::Final` for the last batch that carries the
+`inventory_stream` samples `users.getProfile` before the first list
+page, then walks `users.messages.list` in pages of 500 ids and
+hydrates each page through `users.messages.get` with the `metadata`
+format under `buffer_unordered` concurrency of 32. The final page
+commits the cursor derived from that initial profile sample. Changes
+that race the inventory are therefore replayed by `changes_stream`
+instead of falling into the gap between the inventory walk and its
+checkpoint. Page boundaries are `PageBoundary::Page` for intermediate
+batches and `PageBoundary::Final` for the last batch that carries the
 checkpoint.
+
+Inventory and hydration resolve the label vocabulary through
+`labels_for_flags` before canonicalizing flags, never through
+`snapshot` directly. `ScopeSnapshot.fetched_at` is an
+`Option<Instant>`, so a cache that has never been populated is stale
+regardless of age while a successful fetch that returned no labels is
+fresh for the usual five minutes. If the initial refresh fails with
+nothing cached, the operation fails rather than canonicalizing against
+an empty vocabulary; a populated stale cache stays usable when a later
+refresh fails.
 
 `get_stream` consumes a stream of `ObjectId`s in batches of 32
 and emits `AccountStream<SyncEvent<ItemOutcome<HydratedObject>>>`.
@@ -417,10 +428,12 @@ yields a `SyncEvent::Terminated(AccountError)` with kind
 `SyncState(SchemaIncompatible)`, which the central mapping
 resolves to `Engine(SchemaIncompatible)`. With the identity
 confirmed, the stream pages `users.history.list` from
-`startHistoryId`. Each page emits a `Batch` whose `checkpoint`
-is a `Checkpoint::Change(cursor_for_history(history_id,
-email))`, and the final page (no `nextPageToken`) terminates
-with `SyncEvent::Done(None)`.
+`startHistoryId`. Intermediate pages emit `checkpoint: None`, because
+Gmail's opaque page token is not represented in the cursor and the
+response `historyId` is the mailbox-wide final position rather than a
+per-page resume marker. Only the final page emits
+`Checkpoint::Change(cursor_for_history(history_id, email))`, then the
+stream terminates with `SyncEvent::Done(None)`.
 
 History entries map to `Change` variants in
 `changes_from_history`:
@@ -448,7 +461,10 @@ The renewer task in `start_renewer`:
 
 - Sleeps until `renewal_delay(expiration)` - one day before
   the expiration timestamp from Gmail, or `DEFAULT_RENEW_AFTER`
-  (six days) if no expiration was returned.
+  (six days) if no expiration was returned. Computed renewal delays
+  have a five-minute floor, including already-expired timestamps, so
+  a short or unchanged watch expiration cannot create a successful
+  hot renewal loop.
 - Re-issues `users.watch` and updates the stored expiration.
 - On failure: classifies via
   `error::into_account_error(_, GmailErrorContext::push_subscribe())`
@@ -523,15 +539,28 @@ Flag canonicalization in `flags.rs`:
   `\Seen` (presence of `UNREAD` removes `\Seen`), `STARRED` is
   `\Flagged`, `DRAFT` is `\Draft`, `IMPORTANT` is
   `$Important`. Folder-like labels (`INBOX`, `SENT`, `TRASH`,
-  `SPAM`, `CHAT`) drop out. User labels project to
+  `SPAM`, `CHAT`) drop out. Every other label id - user labels and
+  the `CATEGORY_*` system labels alike - projects to
   `$gmail-label:<id>:<name>`.
 - The reverse direction in `translate_flag_op` handles `Add`,
-  `Remove`, `Patch`, and `Set`. `Set` re-derives an add/remove
-  patch over the canonical four flags plus the user label
-  vocabulary; any unrecognized flag is added verbatim and any
-  unknown `Set` flag falls into `unsupported_flags`. The
-  driver emits `Skipped` for ids in a patch with non-empty
-  `unsupported_flags`.
+  `Remove`, `Patch`, and `Set`. A `$gmail-label:` flag resolves on
+  its label id alone; the embedded display name is advisory, so a
+  server-side rename does not invalidate a queued mutation. The
+  lookup deliberately does not filter on `labelType`, because
+  canonicalization mints this spelling for system category labels
+  too and a flag this crate itself produced has to translate back.
+- `Set` re-derives an add/remove patch over the canonical four flags
+  plus the *user* label vocabulary. Since the patch is built without
+  knowing what the target messages currently carry, an exact set
+  names every known user label it omits, so `remove_label_ids`
+  scales with the account's user label count rather than with the
+  incoming flag set. `CATEGORY_*` labels are exempt from that
+  re-derivation in both directions - Gmail's classifier owns them,
+  so they resolve without poisoning the patch but are never added or
+  removed by a `Set`.
+- Any unrecognized flag is added verbatim and any unknown `Set` flag
+  falls into `unsupported_flags`. The driver emits `Skipped` for ids
+  in a patch with non-empty `unsupported_flags`.
 - A canonical flag set is hashed (FNV-1a) into the
   `Fingerprint.flags_hash` field of an `InventoryEntry`.
 

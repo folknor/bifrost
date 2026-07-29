@@ -19,6 +19,16 @@ use super::error;
 const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const RENEW_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+/// Floor for any *computed* renewal delay.
+///
+/// `start_renewer` clears `retry_after` on a successful re-watch, so the
+/// failure-path damper never engages on the success path. Without a floor,
+/// any expiration inside the one-day renewal window - a clock skewed
+/// forward, a watch whose real TTL is under a day, an expiration Gmail
+/// returns unchanged - collapses the delay to zero and turns the renewer
+/// into an unthrottled `users.watch` storm. Deliberately not applied to
+/// the `None` fallback, which is already six days.
+const MIN_RENEW_DELAY: Duration = RENEW_RETRY_AFTER;
 
 /// Gmail Cloud Pub/Sub watch configuration for `GoogleAccountFactory`.
 #[derive(Debug, Clone)]
@@ -331,11 +341,12 @@ fn renewal_delay(expiration: Option<SystemTime>) -> Duration {
         return DEFAULT_RENEW_AFTER;
     };
     let Ok(until_expiration) = expiration.duration_since(SystemTime::now()) else {
-        return Duration::ZERO;
+        return MIN_RENEW_DELAY;
     };
     until_expiration
         .checked_sub(RENEW_BEFORE_EXPIRY)
         .unwrap_or(Duration::ZERO)
+        .max(MIN_RENEW_DELAY)
 }
 
 #[cfg(test)]
@@ -401,35 +412,26 @@ mod tests {
         );
     }
 
-    /// DOCUMENTS A HOT-LOOP HAZARD, NOT AN ENDORSEMENT. Any expiration
-    /// inside the one-day renewal window - including one already in the
-    /// past, which is what a skewed local clock or a Gmail policy
-    /// shortening the watch produces - collapses the delay to zero.
-    /// `start_renewer` sleeps for exactly this delay and, on a
-    /// *successful* re-watch, clears `retry_after` and loops. With a
-    /// zero delay and an expiration that stays inside the window, that
-    /// is an unthrottled `users.watch` storm: no floor, no backoff, and
-    /// the success path never engages the five-minute retry timer.
     #[test]
-    fn an_expiration_inside_the_renewal_window_yields_a_zero_delay() {
+    fn an_expiration_inside_the_renewal_window_uses_the_minimum_delay() {
         assert_eq!(
             renewal_delay(Some(in_future(Duration::from_secs(60)))),
-            Duration::ZERO,
+            MIN_RENEW_DELAY,
             "one minute from expiry is inside the one-day window"
         );
         assert_eq!(
             renewal_delay(Some(in_future(RENEW_BEFORE_EXPIRY))),
-            Duration::ZERO,
+            MIN_RENEW_DELAY,
             "exactly at the window boundary"
         );
         assert_eq!(
             renewal_delay(Some(SystemTime::now() - Duration::from_secs(3600))),
-            Duration::ZERO,
-            "an already-expired watch renews immediately, with no floor"
+            MIN_RENEW_DELAY,
+            "an already-expired watch still observes the floor"
         );
         assert_eq!(
             renewal_delay(Some(UNIX_EPOCH)),
-            Duration::ZERO,
+            MIN_RENEW_DELAY,
             "a nonsense epoch-zero expiration behaves the same way"
         );
     }

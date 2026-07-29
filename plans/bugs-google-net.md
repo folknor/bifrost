@@ -1,13 +1,13 @@
 # bugs-google-net - bifrost-google + bifrost-net sweep
 
-Read-only bug hunt plus landed tests over `crates/google/src/**`,
-`crates/net/src/**`, `crates/net/tests/**`. Bugs are reported with a
-proposed fix and **not** applied; triage is the orchestrator's. Tests
-landed in this pass pin behaviour as it exists today - the ones that
-pin behaviour I believe is wrong say so in their own doc comment
+Bug hunt, fixes, and landed tests over `crates/google/src/**`,
+`crates/net/src/**`, and `crates/net/tests/**`. This document contains
+only findings that remain open. Resolved findings are removed rather
+than retained as historical discrepancies. Tests that still pin
+behavior believed to be wrong say so in their own doc comment
 (`DOCUMENTS A BUG, NOT AN ENDORSEMENT`).
 
-Coverage survey result: the handed-down read was accurate.
+Initial coverage survey result: the handed-down read was accurate.
 `request.rs`, `bandwidth.rs`, `rate.rs`, `retry.rs`, `config.rs` and
 `url.rs` had no in-file tests (`rate.rs` had partial coverage from
 `tests/rate_governor.rs`); `net.rs`, `redirect.rs`, `auth.rs` and
@@ -20,231 +20,6 @@ none.
 ## Bugs
 
 Ordered most-severe first.
-
-### B1 - Gmail change stream checkpoints a non-resumable cursor on every intermediate history page (silent data loss)
-
-`crates/google/src/account/changes.rs:148-171`
-
-Every page of the `users.history.list` walk yields
-`Checkpoint::Change(cursor_for_history(response.history_id, email))`.
-Gmail documents that response field as *the mailbox's current history
-record* - it is the same value on every page of the walk, not a
-per-page resume marker. `GmailChangeState` carries only `history_id`,
-and `cursor_from_state` hardcodes `advanced_through: None`, so the
-cursor has nowhere to record "I am three pages into the walk".
-
-The engine treats those checkpoints as real:
-`crates/sync/src/multiplexer/changes.rs:109-131` broadcasts
-`(items, checkpoint)` for **every** batch, calls `cursors.put` on it,
-and returns early (`Paused` / `Done`) whenever a checkpoint-bearing
-batch coincides with a pause or checkpoint-now request. Consumers
-persist and ack it.
-
-Path to failure:
-- Cursor sits at historyId 100. The account has accumulated changes up
-  to 400, spanning three history pages.
-- Page 1 arrives with `nextPageToken`, `historyId: 400`, and the first
-  third of the changes. The batch carries
-  `Checkpoint::Change(historyId 400)`.
-- The consumer commits its items, acks the checkpoint, cursor is
-  durably 400. Now the process restarts (or `pause()` lands, which
-  `changes.rs:126-131` honours precisely because a checkpoint was
-  present).
-- The next `changes_stream` starts at 400. Pages 2 and 3 are never
-  fetched. Those changes are lost permanently - Gmail has no way to
-  re-serve them.
-
-Contrast with the sibling implementation:
-`crates/graph/src/account/changes.rs:112-125` writes
-`payload.advanced_through = Some(page_marker(next_link, last_seen_id))`
-into the cursor *before* yielding an intermediate checkpoint, so an
-intermediate ack resumes exactly where it left off.
-
-Proposed fix: emit `checkpoint: None` on non-final pages (they are
-already `PageBoundary::Page`), so only the `Final` page advances the
-cursor. If mid-walk resumability is wanted instead, bump
-`GMAIL_SCHEMA_VERSION` to 2 and add `page_token: Option<String>` to
-`GmailChangeState`, populating `ChangeCursor::advanced_through` from
-it.
-
-### B2 - Cold-start inventory anchors its checkpoint to the history id observed *after* the walk (permanently missed messages)
-
-`crates/google/src/account/inventory.rs:112-133` and `253-265`
-
-`inventory_checkpoint` calls `users.getProfile` only once the final
-list page has been consumed, and checkpoints that historyId.
-`users.messages.list` returns newest-first, so a message that arrives
-after page 1 has been fetched sorts *before* everything the remaining
-pages will return and is therefore in no page at all.
-
-Path to failure:
-- Inventory begins; account historyId is 100. Page 1 (the newest 500
-  ids) is fetched and hydrated.
-- Message M arrives, historyId 105.
-- Pages 2..N return progressively older ids. M is never listed.
-- The walk finishes; `getProfile` reports historyId 110. The engine
-  commits a change cursor at 110.
-- `changes_stream` starts at 110 and never replays record 105.
-
-M exists on the server, was never inventoried, and will never appear in
-the change stream. It stays invisible until a full re-inventory.
-
-Proposed fix: sample the historyId **before** the first list page and
-checkpoint that. The account already has one - `GoogleAccount::open`
-stores `seed_state` from the same `getProfile` call
-(`account/mod.rs:170-186`). Replaying a handful of overlapping
-`Created` / `ScopeChange` rows is idempotent for the engine; missing
-one is not. This is the standard at-least-once inventory anchor.
-
-### B3 - A never-populated scope cache reports itself fresh, so early flag mutations silently no-op as `Skipped`
-
-`crates/google/src/account/scopes.rs:26-37` and `159-174`
-
-```rust
-pub(crate) fn empty() -> Self {
-    Self { labels: Vec::new(), fetched_at: Instant::now() }
-}
-pub(crate) fn is_stale(&self) -> bool {
-    self.fetched_at.elapsed() > SCOPE_CACHE_STALE_AFTER   // 300 s
-}
-```
-
-`GoogleAccount::open` seeds the cache with `ScopeSnapshot::empty()`
-(`account/mod.rs:193`). For the next five minutes `is_stale()` is
-false, so `labels_for_flags` short-circuits and returns the **empty**
-label vector without ever calling `list_labels`.
-
-Path to failure:
-- `open()` returns. The consumer immediately calls
-  `bulk_set_flags(ids, FlagOp::Add({"$gmail-label:Label_1:Work"}))`.
-- `mutation_stream` calls `labels_for_flags` -> empty vec.
-- `translate_flag_op` -> `user_label_id_from_flag` searches an empty
-  slice -> `FlagTranslation::Unsupported`.
-- `apply_label_patch` (`mutation.rs:203-205`) sees a non-empty
-  `unsupported_flags` and returns `skipped_outcomes(ids)`.
-- Every id in the batch (up to 1000) reports
-  `ItemOutcome::Succeeded(MutationSuccess::Skipped)`.
-
-Nothing was applied, no error surfaced, and the consumer's success
-lane says the operation was consciously skipped. A retry inside the
-same five-minute window behaves identically.
-
-The window closes only by luck: `discover_memberships`,
-`containers_list`, or `scope_lifecycle_stream` all call
-`refresh_scope_snapshot` and populate the cache. Whether they ran first
-is task-scheduling dependent.
-
-Proposed fix: make the empty snapshot born-stale, e.g.
-
-```rust
-fetched_at: Instant::now()
-    .checked_sub(SCOPE_CACHE_STALE_AFTER)
-    .unwrap_or_else(Instant::now),
-```
-
-or add a `populated: bool` that `is_stale` consults. Separately,
-`labels_for_flags`'s refresh-failure arm (`scopes.rs:169-172`) returns
-the stale/empty list after a `tracing::warn!`; a failed label refresh
-that leaves the vocabulary empty should propagate an error so the
-driver produces `Failed`, not `Skipped`.
-
-Pinned by the new test
-`scopes::tests::a_never_populated_scope_cache_reports_itself_fresh`.
-
-### B4 - Inventory and hydration canonicalize flags against an unrefreshed label list, destabilising `flags_hash`
-
-`crates/google/src/account/inventory.rs:72` (`let labels =
-Arc::new(snapshot(&cache).labels);`) and `inventory.rs:189` (`let
-labels = snapshot(&state.cache).labels;`)
-
-Both read the cache and never refresh it. Combined with B3, a
-cold-start inventory hands `canonical_flags` an empty vocabulary, and
-`canonical_flags` falls back to the id in the name slot
-(`flags.rs:106-110`): `$gmail-label:Label_1:Label_1` instead of
-`$gmail-label:Label_1:Work`.
-
-That string feeds the FNV hash stored in
-`InventoryEntry.fingerprint.flags_hash`, which is the field the engine
-compares to decide whether an object changed. So the same unchanged
-message hashes one way during the inventory pass and a different way on
-any later hydrate that happened to have a populated cache. Every
-user-labelled object then looks dirty.
-
-Proposed fix: `await labels_for_flags(&client, &cache)` in both places
-rather than `snapshot(&cache)`, with B3's fix so the first call
-actually fetches.
-
-Pinned by the new test
-`inventory::tests::an_empty_label_list_changes_the_flags_hash_for_user_labels`.
-
-### B5 - `renewal_delay` collapses to zero inside the renewal window, turning the Pub/Sub renewer into an unthrottled watch loop
-
-`crates/google/src/account/push.rs:329-339` and the renewer loop at
-`240-263`
-
-```rust
-let Ok(until_expiration) = expiration.duration_since(SystemTime::now()) else {
-    return Duration::ZERO;
-};
-until_expiration.checked_sub(RENEW_BEFORE_EXPIRY).unwrap_or(Duration::ZERO)
-```
-
-Any expiration inside the 24-hour `RENEW_BEFORE_EXPIRY` window - or in
-the past - yields `Duration::ZERO`. The renewer then does
-`tokio::time::sleep(ZERO)` and immediately re-issues `users.watch`. On
-**success** it sets `retry_after = None`, so the 5-minute
-`RENEW_RETRY_AFTER` damper never engages; only the failure arm uses it.
-
-Path to failure: the stored expiration stays inside the window across
-renewals. Causes that produce this: a local clock skewed forward past
-the watch's 7-day life; a Gmail response whose `expiration` is
-unchanged or already past; any deployment where the watch's real TTL is
-shorter than 24 hours. Result is a hot loop hammering `users.watch`
-with no floor and no backoff until the API's quota classifier finally
-returns something `is_terminal()`.
-
-Proposed fix: floor the delay, e.g.
-
-```rust
-const MIN_RENEW_DELAY: Duration = RENEW_RETRY_AFTER;   // 5 min
-...
-    .max(MIN_RENEW_DELAY)
-```
-
-applied to the computed value (not to the `None` fallback, which is
-already six days).
-
-Pinned by the new test
-`push::tests::an_expiration_inside_the_renewal_window_yields_a_zero_delay`.
-
-### B6 - Gmail page tokens are spliced into query strings without percent-encoding
-
-`crates/google/src/api.rs:91-93` (`list_threads`), `121-123`
-(`list_messages`), `220-222` (`get_history`)
-
-```rust
-if let Some(q) = query {
-    params.push(format!("q={}", bifrost_net::url::encode_component(q)));   // encoded
-}
-...
-if let Some(pt) = page_token {
-    params.push(format!("pageToken={pt}"));                                // NOT encoded
-}
-```
-
-The crate disagrees with itself:
-`inventory.rs:246-249` encodes the same parameter.
-
-Path to failure: a page token containing `+` is decoded server-side as
-a space, so `pageToken=ab+cd` requests page `ab cd` - either a 400 or,
-worse, a silently different page. A token containing `&` truncates the
-query and drops `maxResults`/`historyTypes`; one containing `#` starts
-a fragment and drops the token entirely. Gmail's tokens are opaque and
-carry no documented character-set guarantee. Every paged read - search,
-thread search, and the whole history walk - rides this.
-
-Proposed fix: wrap all three in `bifrost_net::url::encode_component`,
-matching `inventory.rs`.
 
 ### B7 - `max_hops: 255` is an infinite redirect chain
 
@@ -272,59 +47,6 @@ task hangs holding a connection.
 Proposed fix: use `>=`, widen the counter to `u16`, or clamp `max_hops`
 to 254 in `with_hops`. `>=` is the smallest change and is what the
 error message already implies ("exceeded the configured maximum").
-
-### B8 - `FlagOp::Set` never removes user labels the new set omits (code contradicts `reference/google.md`)
-
-`crates/google/src/account/flags.rs:139-164`
-
-`patch_for_set` re-derives add/remove over the four canonical flags
-(`\Seen`, `\Flagged`, `\Draft`, `$Important`) and then adds any
-unrecognised flag verbatim. It never walks `labels` to remove user
-labels that the incoming set omits.
-
-`reference/google.md:528-534` states that `Set` "re-derives an
-add/remove patch over the canonical four flags **plus the user label
-vocabulary**".
-
-Path to failure: message carries `Label_1`. Consumer calls
-`bulk_set_flags(ids, FlagOp::Set({"\\Seen"}))`, whose contract is "the
-flag set is exactly this". Expected: `Label_1` removed. Actual:
-`Label_1` stays attached, and the patch contains only the canonical
-four.
-
-Proposed fix: in `patch_for_set`, after the canonical block, iterate
-`labels` and insert the `$gmail-label:<id>:<name>` spelling into
-`remove` for any label whose flag is not in `flags`. If the narrow
-reading is deliberate, `reference/google.md` needs amending instead.
-
-Pinned by the new test
-`flags::tests::set_does_not_remove_user_labels_the_new_set_omits`.
-
-### B9 - User-label flags resolve by `<id>:<name>`, so a server-side rename turns the whole batch into a silent `Skipped`
-
-`crates/google/src/account/flags.rs:230-235`
-
-```rust
-labels.iter()
-    .find(|label| flag == format!("$gmail-label:{}:{}", label.id, label.name))
-```
-
-The lookup requires the *name* to match too, even though the id is
-right there in the flag and is the stable key.
-
-Path to failure: the engine reads a message and stores the flag
-`$gmail-label:Label_1:Work`. A user renames the label to `Work Stuff`
-in the Gmail UI. The engine replays the flag write. The lookup fails ->
-`unsupported_flags` -> `apply_label_patch` returns `skipped_outcomes`
--> every id in the batch reports `Succeeded(Skipped)`. The whole
-operation vanishes with no error.
-
-Proposed fix: split the flag on the first two `:` after the prefix and
-resolve by id, treating the name as advisory (and fall back to the
-full-string match for compatibility if any consumer depends on it).
-
-Pinned by the new test
-`flags::tests::a_user_label_flag_with_a_stale_name_becomes_unsupported`.
 
 ### B10 - `bulk_move` to a non-`Label` scope reports success-`Skipped` for every id
 
@@ -757,38 +479,45 @@ listeners, no wall-clock sleeps outside `tokio::time`'s virtual clock.
 
 ### bifrost-google
 
-- `src/account/changes.rs` (new `mod tests`, 7 tests) - first coverage
+- `src/account/changes.rs` (new `mod tests`, 8 tests) - final-page-only
+  durable checkpointing plus first coverage
   of `changes_from_history`: empty history, `messagesAdded` ordering
   and per-label scope rows, label-less adds, `messagesDeleted`,
   label add/remove rows, delta-vs-full-label-set, multi-record order
   preservation, all-four-buckets.
 - `src/account/push.rs` (new `mod tests`, 9 tests) - first coverage of
-  `parse_expiration` and `renewal_delay`, including the zero-delay
-  hot-loop boundary (B5); subscription-handle envelope round trip and
+  `parse_expiration` and `renewal_delay`, including the five-minute
+  renewal floor; subscription-handle envelope round trip and
   rejection; watch-response decoding; `PubSubConfig` builder.
-- `src/account/scopes.rs` (new `mod tests`, 10 tests) - first coverage
+- `src/account/scopes.rs` (new `mod tests`, 11 tests) - first coverage
   of `diff_snapshots`: no-op, create/delete, user rename, system-label
   locale flip suppression, untyped label, colour-only edit,
-  empty-old-snapshot; the same-scope rename shape (N10); the
-  never-populated-cache freshness bug (B3); staleness window.
+  empty-old-snapshot; the same-scope rename shape (N10);
+  never-populated caches being born stale, a successfully fetched
+  empty label list being fresh; staleness window.
 - `src/account/blobs.rs` (new `mod tests`, 7 tests) - first coverage
   of `blob_handles_for_message`: no payload, inline-only, attachment
   capabilities, recursive multipart walk, negative size; blob-id round
   trip, malformed rejection, JSON metacharacter survival.
-- `src/account/inventory.rs` (new `mod tests`, 12 tests) - first
+- `src/account/inventory.rs` (new `mod tests`, 13 tests) - pre-page
+  profile checkpoint anchoring plus first
   coverage of `inventory_entry_from_message`: id/thread/size/
   membership projection, `historyId` -> `ServerVersion`,
   case-insensitive threading headers, `References` splitting,
-  absent headers, `flags_hash` stability, and the label-cache
-  divergence (B4); `raw_bytes` decode / missing / undecodable;
+  absent headers, `flags_hash` stability, and why canonicalization
+  requires a populated label vocabulary; `raw_bytes` decode / missing / undecodable;
   `non_negative_u64`; paging constants.
-- `src/account/flags.rs` (+13 tests on the existing module) -
-  user-label translation both directions, the stale-name unsupported
-  path (B9), empty vocabulary, `Set` not removing user labels (B8),
-  unknown-flag poisoning, case-insensitive flag matching,
+- `src/account/flags.rs` (+17 tests on the existing module) -
+  user-label translation both directions, stable-id resolution across
+  renames, empty vocabulary, exact `Set` handling for user labels,
+  the `CATEGORY_*` round trip and its exemption from `Set`
+  re-derivation, `Set` removal lists scaling with the user label
+  vocabulary, unknown-flag poisoning, case-insensitive flag matching,
   contradictory patch, empty ops, order independence and dedup,
   folder-label dropout, unknown-id name fallback, the `UNREAD`
   case-sensitivity asymmetry, FNV boundary separation.
+- `src/api.rs` (new `mod tests`, 1 test) - opaque Gmail page-token
+  percent-encoding.
 
 Tests whose doc comment marks them as documenting a defect rather than
 endorsing it: `url::dot_dot_component_passes_through...`,
@@ -796,12 +525,7 @@ endorsing it: `url::dot_dot_component_passes_through...`,
 `net::content_range_rejects_a_legally_shortened_closed_window`,
 `rate_governor::zero_quota_never_refills_and_parks_forever`,
 `rate_governor::negative_quota_spins_at_the_minimum_poll_interval`,
-`push::an_expiration_inside_the_renewal_window_yields_a_zero_delay`,
-`scopes::a_never_populated_scope_cache_reports_itself_fresh`,
 `scopes::rename_events_carry_the_same_scope_on_both_sides`,
-`inventory::an_empty_label_list_changes_the_flags_hash_for_user_labels`,
-`flags::a_user_label_flag_with_a_stale_name_becomes_unsupported`,
-`flags::set_does_not_remove_user_labels_the_new_set_omits`,
 `flags::an_unknown_label_id_renders_its_id_in_the_name_slot`,
 `flags::the_unread_projection_is_case_sensitive_unlike_the_move_rule`.
 

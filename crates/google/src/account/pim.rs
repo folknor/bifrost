@@ -520,7 +520,12 @@ pub(crate) fn thread_hydrate(
     thread: ThreadId,
 ) -> AccountFuture<Result<ThreadHydration, AccountError>> {
     Box::pin(async move {
-        let labels = labels_for_flags(&client, &cache).await;
+        let labels = labels_for_flags(&client, &cache).await.map_err(|error| {
+            account_error_for(
+                error,
+                error::GmailErrorContext::hydrate_thread(thread.0.clone()),
+            )
+        })?;
         let gmail_thread = client.get_thread(&thread.0, "full").await.map_err(|e| {
             account_error_for(
                 e,
@@ -545,7 +550,12 @@ pub(crate) fn message_hydrate(
     projection: HydrationProjection,
 ) -> AccountFuture<Result<Message, AccountError>> {
     Box::pin(async move {
-        let labels = labels_for_flags(&client, &cache).await;
+        let labels = labels_for_flags(&client, &cache).await.map_err(|error| {
+            account_error_for(
+                error,
+                error::GmailErrorContext::hydrate_message(message.0.clone()),
+            )
+        })?;
         let format = match projection {
             HydrationProjection::Headers | HydrationProjection::Preview(_) => "metadata",
             HydrationProjection::Full | HydrationProjection::FullWithBlobs => "full",

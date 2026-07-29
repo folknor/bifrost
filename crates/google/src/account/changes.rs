@@ -145,12 +145,10 @@ pub(crate) fn changes_stream(
                         return Some((SyncEvent::Terminated(account_error), state));
                     }
                 };
-                let checkpoint = Checkpoint::Change(cursor_for_history(
-                    history_id,
-                    &state.profile.email_address,
-                ));
                 let items = changes_from_history(&response.history);
                 let is_final = response.next_page_token.is_none();
+                let checkpoint =
+                    checkpoint_for_history_page(is_final, history_id, &state.profile.email_address);
                 state.page_token = response.next_page_token;
                 if is_final {
                     state.finished = true;
@@ -165,7 +163,7 @@ pub(crate) fn changes_stream(
                         },
                         server_latency: started.elapsed(),
                         bytes_in: 0,
-                        checkpoint: Some(checkpoint),
+                        checkpoint,
                     }),
                     state,
                 ))
@@ -181,6 +179,29 @@ pub(crate) fn changes_stream(
             }
         }
     }))
+}
+
+/// Only the final page of a history walk may advance the durable cursor.
+///
+/// `response.history_id` is the mailbox's *current* history record, so it
+/// is the same value on every page of the walk rather than a per-page
+/// resume marker, and `GmailChangeState` carries no page token to record
+/// how far into the walk we are. Checkpointing an intermediate page would
+/// therefore tell the engine "durably at 400" while pages two and three
+/// are still unread; a restart or a `pause()` landing on that batch
+/// resumes from 400 and those changes are gone for good, because Gmail
+/// cannot re-serve them.
+///
+/// If mid-walk resumability is ever wanted, it needs a schema bump:
+/// `GMAIL_SCHEMA_VERSION` to 2, a `page_token` on `GmailChangeState`, and
+/// `ChangeCursor::advanced_through` populated from it - the shape
+/// `crates/graph` already uses.
+fn checkpoint_for_history_page(
+    is_final: bool,
+    history_id: u64,
+    profile_email: &str,
+) -> Option<Checkpoint> {
+    is_final.then(|| Checkpoint::Change(cursor_for_history(history_id, profile_email)))
 }
 
 struct ChangeState {
@@ -251,6 +272,18 @@ fn label_ids(message: &GmailMessage) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_the_final_history_page_advances_the_durable_cursor() {
+        assert!(
+            checkpoint_for_history_page(false, 400, "person@example.com").is_none(),
+            "Gmail page tokens are not represented in the cursor, so an intermediate page cannot be resumed",
+        );
+        assert!(matches!(
+            checkpoint_for_history_page(true, 400, "person@example.com"),
+            Some(Checkpoint::Change(_))
+        ));
+    }
 
     fn history(value: serde_json::Value) -> Vec<GmailHistoryItem> {
         serde_json::from_value(value).expect("history fixture deserializes")

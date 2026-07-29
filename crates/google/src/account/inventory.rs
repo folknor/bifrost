@@ -14,13 +14,13 @@ use serde::Deserialize;
 use crate::client::GmailClient;
 use crate::encoding::decode_base64url_nopad;
 use crate::headers::find_header_value_case_insensitive;
-use crate::types::{GmailHeader, GmailLabel, GmailMessage};
+use crate::types::{GmailHeader, GmailLabel, GmailMessage, GmailProfile};
 
 use super::blobs;
 use super::cursor::cursor_for_history;
 use super::error;
 use super::flags;
-use super::scopes::{ScopeCache, snapshot};
+use super::scopes::{ScopeCache, labels_for_flags};
 
 const LIST_PAGE_SIZE: u32 = 500;
 const HYDRATE_BATCH_SIZE: usize = 32;
@@ -52,6 +52,32 @@ pub(crate) fn inventory_stream(
     }
 
     Box::pin(async_stream::stream! {
+        // Both preludes must complete before the first list page.
+        //
+        // The checkpoint anchors to the historyId sampled *before* the
+        // walk, not after it. `users.messages.list` returns newest-first,
+        // so a message arriving mid-walk sorts ahead of every page still
+        // to come and appears in none of them; anchoring to the id
+        // observed at the end would put that message in neither the
+        // inventory nor the subsequent change stream. Anchoring early
+        // replays a few rows instead, which is idempotent for the engine.
+        let prelude = async {
+            let profile = client.get_profile().await?;
+            let checkpoint = inventory_checkpoint(&profile)?;
+            let labels = labels_for_flags(&client, &cache).await?;
+            Ok::<_, crate::Error>((checkpoint, Arc::new(labels)))
+        };
+        let (checkpoint, labels) = match prelude.await {
+            Ok(prelude) => prelude,
+            Err(error) => {
+                let account_error = error::into_account_error(
+                    error,
+                    error::GmailErrorContext::inventory(),
+                );
+                yield SyncEvent::Terminated(account_error);
+                return;
+            }
+        };
         let mut page_token = None;
 
         loop {
@@ -69,7 +95,6 @@ pub(crate) fn inventory_stream(
             };
 
             let final_page = page.next_page_token.is_none();
-            let labels = Arc::new(snapshot(&cache).labels);
             let mut hydrated = stream::iter(page.messages.into_iter().map(|stub| {
                 let client = Arc::clone(&client);
                 let labels = Arc::clone(&labels);
@@ -110,17 +135,6 @@ pub(crate) fn inventory_stream(
             }
 
             if final_page {
-                let checkpoint = match inventory_checkpoint(&client).await {
-                    Ok(checkpoint) => checkpoint,
-                    Err(error) => {
-                        let account_error = error::into_account_error(
-                            error,
-                            error::GmailErrorContext::inventory(),
-                        );
-                        yield SyncEvent::Terminated(account_error);
-                        return;
-                    }
-                };
                 if !items.is_empty() {
                     yield SyncEvent::Batch(Batch {
                         items,
@@ -185,8 +199,23 @@ pub(crate) fn get_stream(
             return Some((SyncEvent::Done(None), state));
         }
 
+        // Resolved after the id drain, not before it: `labels_for_flags`
+        // can hit the network, and the poll that discovers an exhausted
+        // id stream has no hydration to canonicalize for.
+        let labels = match labels_for_flags(&state.client, &state.cache).await {
+            Ok(labels) => labels,
+            Err(error) => {
+                state.finished = true;
+                state.emitted_done = true;
+                let account_error = error::into_account_error(
+                    error,
+                    error::GmailErrorContext::hydrate_message(ids[0].0.clone()),
+                );
+                return Some((SyncEvent::Terminated(account_error), state));
+            }
+        };
+
         let started = Instant::now();
-        let labels = snapshot(&state.cache).labels;
         let mut items: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(ids.len());
         for id in ids {
             // gmail-N1: clone the id so a failing hydrate can attach
@@ -250,8 +279,7 @@ async fn list_messages_page(
     client.get(&path).await
 }
 
-async fn inventory_checkpoint(client: &GmailClient) -> crate::Result<Option<Checkpoint>> {
-    let profile = client.get_profile().await?;
+fn inventory_checkpoint(profile: &GmailProfile) -> crate::Result<Option<Checkpoint>> {
     let history_id = profile.history_id.parse::<u64>().map_err(|error| {
         crate::Error::invalid_request(
             AccountOperation::SyncInventory,
@@ -544,14 +572,11 @@ mod tests {
         assert_ne!(a, c, "flipping UNREAD must move the hash");
     }
 
-    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `canonical_flags` renders a
-    /// user label as `$gmail-label:<id>:<name>` and falls back to the id
-    /// when the label list does not know the id. `inventory_stream` and
-    /// `get_stream` both read the scope cache without refreshing it, and
-    /// `ScopeSnapshot::empty()` claims to be fresh for five minutes
-    /// after `open()` - so a cold-start inventory can hash the fallback
-    /// spelling and then disagree with every later hydrate for the same
-    /// unchanged message.
+    /// `canonical_flags` renders a user label as
+    /// `$gmail-label:<id>:<name>` and falls back to the id when the
+    /// label list does not know the id. The stream entry points refresh
+    /// the vocabulary before calling this helper so they cannot persist
+    /// the fallback hash on a cold start.
     #[test]
     fn an_empty_label_list_changes_the_flags_hash_for_user_labels() {
         let msg = message(json!({
@@ -605,5 +630,22 @@ mod tests {
             "500 is the users.messages.list maximum"
         );
         assert_eq!(HYDRATE_BATCH_SIZE, 32);
+    }
+
+    #[test]
+    fn inventory_checkpoint_uses_the_profile_sampled_before_paging() {
+        let checkpoint = inventory_checkpoint(&GmailProfile {
+            email_address: "person@example.com".to_string(),
+            history_id: "100".to_string(),
+        })
+        .expect("valid profile")
+        .expect("change checkpoint");
+        let Checkpoint::Change(cursor) = checkpoint else {
+            panic!("expected a Gmail change checkpoint");
+        };
+        let state =
+            super::super::cursor::decode_gmail_state(&cursor.server_state).expect("decode state");
+        assert_eq!(state.history_id, 100);
+        assert_eq!(state.profile_email, "person@example.com");
     }
 }

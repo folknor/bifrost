@@ -89,7 +89,7 @@ impl GmailClient {
             params.push(format!("maxResults={max}"));
         }
         if let Some(pt) = page_token {
-            params.push(format!("pageToken={pt}"));
+            params.push(page_token_param(pt));
         }
         let qs = if params.is_empty() {
             String::new()
@@ -119,7 +119,7 @@ impl GmailClient {
             params.push(format!("maxResults={max}"));
         }
         if let Some(pt) = page_token {
-            params.push(format!("pageToken={pt}"));
+            params.push(page_token_param(pt));
         }
         let qs = if params.is_empty() {
             String::new()
@@ -218,7 +218,7 @@ impl GmailClient {
             "historyTypes=labelRemoved".to_string(),
         ];
         if let Some(pt) = page_token {
-            params.push(format!("pageToken={pt}"));
+            params.push(page_token_param(pt));
         }
         let qs = params.join("&");
         self.get(&format!("/history?{qs}")).await
@@ -290,5 +290,28 @@ impl GmailClient {
         settings: &GmailVacationSettings,
     ) -> Result<GmailVacationSettings> {
         self.put("/settings/vacation", settings).await
+    }
+}
+
+/// Gmail's page tokens are opaque and carry no documented character-set
+/// guarantee, so they are percent-encoded like any other value - never
+/// interpolated raw. A `+` would otherwise decode server-side as a space
+/// and fetch a different page, `&` would truncate the query and drop
+/// `maxResults` / `historyTypes`, and `#` would start a fragment and drop
+/// the token entirely. Every paged read in this file routes through here.
+fn page_token_param(token: &str) -> String {
+    format!("pageToken={}", bifrost_net::url::encode_component(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_token_param;
+
+    #[test]
+    fn opaque_page_tokens_are_percent_encoded() {
+        assert_eq!(
+            page_token_param("ab+cd&next#fragment"),
+            "pageToken=ab%2Bcd%26next%23fragment"
+        );
     }
 }

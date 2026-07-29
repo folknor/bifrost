@@ -20,19 +20,31 @@ pub(crate) const SCOPE_CACHE_STALE_AFTER: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeSnapshot {
     pub(crate) labels: Vec<GmailLabel>,
-    pub(crate) fetched_at: Instant,
+    /// When `list_labels` last succeeded, or `None` for a cache that has
+    /// never been populated.
+    ///
+    /// This is an `Option` rather than a bare `Instant` so that the
+    /// never-populated state is representable. Stamping `Instant::now()`
+    /// on an empty snapshot made `is_stale()` report FRESH for the first
+    /// five minutes after `open()`, so the first flag mutation of a
+    /// session translated against an empty vocabulary and silently
+    /// no-opped. Keying staleness on `labels.is_empty()` instead would
+    /// fix that but re-fetch forever for any account whose label list is
+    /// legitimately empty; "was it ever fetched" is the actual question.
+    pub(crate) fetched_at: Option<Instant>,
 }
 
 impl ScopeSnapshot {
     pub(crate) fn empty() -> Self {
         Self {
             labels: Vec::new(),
-            fetched_at: Instant::now(),
+            fetched_at: None,
         }
     }
 
     pub(crate) fn is_stale(&self) -> bool {
-        self.fetched_at.elapsed() > SCOPE_CACHE_STALE_AFTER
+        self.fetched_at
+            .is_none_or(|fetched_at| fetched_at.elapsed() > SCOPE_CACHE_STALE_AFTER)
     }
 }
 
@@ -156,20 +168,32 @@ pub(crate) fn scope_lifecycle_stream(
     }))
 }
 
+/// The label vocabulary every flag-canonicalizing call site must go
+/// through.
+///
+/// Never reach for `snapshot(cache)` directly for this: the cache starts
+/// empty, and canonicalizing against an empty vocabulary is silently wrong
+/// in both directions. Reading, `canonical_flags` falls back to the id in
+/// the name slot and destabilises `Fingerprint.flags_hash`; writing, every
+/// `$gmail-label:` flag becomes unsupported and the batch reports
+/// `Skipped`. A refresh failure with nothing cached therefore propagates
+/// as an error - a stale-but-populated vocabulary is degraded, an empty
+/// one is unusable.
 pub(crate) async fn labels_for_flags(
     client: &Arc<GmailClient>,
     cache: &ScopeCache,
-) -> Vec<GmailLabel> {
+) -> crate::Result<Vec<GmailLabel>> {
     let current = snapshot(cache);
     if !current.is_stale() {
-        return current.labels;
+        return Ok(current.labels);
     }
     match refresh_scope_snapshot(client, cache).await {
-        Ok(snapshot) => snapshot.labels,
-        Err(error) => {
+        Ok(snapshot) => Ok(snapshot.labels),
+        Err(error) if current.fetched_at.is_some() => {
             tracing::warn!("gmail label refresh failed during flag translation: {error}");
-            current.labels
+            Ok(current.labels)
         }
+        Err(error) => Err(error),
     }
 }
 
@@ -187,7 +211,7 @@ pub(crate) async fn refresh_scope_snapshot(
     let labels = client.list_labels().await?;
     let snapshot = ScopeSnapshot {
         labels,
-        fetched_at: Instant::now(),
+        fetched_at: Some(Instant::now()),
     };
     if let Ok(mut guard) = cache.write() {
         *guard = snapshot.clone();
@@ -252,7 +276,7 @@ mod tests {
     fn snapshot_of(labels: Vec<GmailLabel>) -> ScopeSnapshot {
         ScopeSnapshot {
             labels,
-            fetched_at: Instant::now(),
+            fetched_at: Some(Instant::now()),
         }
     }
 
@@ -373,24 +397,13 @@ mod tests {
         );
     }
 
-    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `ScopeSnapshot::empty()`
-    /// stamps `fetched_at` with `Instant::now()`, so a never-populated
-    /// cache reports itself FRESH for the first five minutes after
-    /// `open()`. `labels_for_flags` short-circuits on `!is_stale()` and
-    /// therefore hands `translate_flag_op` an empty label vocabulary,
-    /// which turns any `$gmail-label:<id>:<name>` flag into an
-    /// `unsupported_flags` entry - and the bulk driver reports that as
-    /// `MutationSuccess::Skipped`, a success lane. The same empty list
-    /// reaches `canonical_flags` from `inventory_stream` and
-    /// `get_stream`, where the missing name falls back to the id and
-    /// changes the `flags_hash` in every `Fingerprint`.
     #[test]
-    fn a_never_populated_scope_cache_reports_itself_fresh() {
+    fn a_never_populated_scope_cache_is_born_stale() {
         let empty = ScopeSnapshot::empty();
         assert!(empty.labels.is_empty());
         assert!(
-            !empty.is_stale(),
-            "an empty cache claims freshness, so no refresh is triggered for {SCOPE_CACHE_STALE_AFTER:?}",
+            empty.is_stale(),
+            "the first label-dependent operation must populate the cache",
         );
     }
 
@@ -403,16 +416,28 @@ mod tests {
         {
             let stale = ScopeSnapshot {
                 labels: vec![label("Label_1", "Work", "user")],
-                fetched_at: back_dated,
+                fetched_at: Some(back_dated),
             };
             assert!(stale.is_stale());
         }
 
         let fresh = ScopeSnapshot {
             labels: vec![label("Label_1", "Work", "user")],
-            fetched_at: Instant::now(),
+            fetched_at: Some(Instant::now()),
         };
         assert!(!fresh.is_stale());
+    }
+
+    /// An account whose `labels.list` legitimately returns nothing must
+    /// still cache that answer. Keying staleness on `labels.is_empty()`
+    /// would make every flag-translating call re-fetch forever.
+    #[test]
+    fn a_successfully_fetched_empty_label_list_is_fresh() {
+        let fetched_empty = ScopeSnapshot {
+            labels: Vec::new(),
+            fetched_at: Some(Instant::now()),
+        };
+        assert!(!fetched_empty.is_stale());
     }
 
     #[test]
