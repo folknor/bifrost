@@ -2,18 +2,18 @@ use std::time::Duration;
 
 use base64::Engine;
 use bifrost_types::{
-    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, DiagnosticText,
-    ErrorScope, Protocol, ProtocolErrorKind, RequestCause, RequestErrorKind, ResourceKind,
-    ServerCause, ServerErrorKind, StateCause, TransmissionState, TransportCause,
-    TransportErrorKind, TransportKind, WireCause,
+    AccountError, AccountErrorBuilder, AccountErrorKind, AccountOperation, Cause, CursorScope,
+    DiagnosticText, ErrorScope, ObjectType, Protocol, ProtocolErrorKind, RequestCause,
+    RequestErrorKind, ResourceKind, ServerCause, ServerErrorKind, StateCause, SyncStateErrorKind,
+    TransmissionState, TransportCause, TransportErrorKind, TransportKind, WireCause,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 
 use crate::parse::{
     CalDavFetchedEvent, CalDavMultigetReport, CalDavSyncReport, CalendarCollection,
-    MultigetOutcome, extract_href_property, parse_calendar_collections, parse_multiget_report,
-    parse_propfind_events, parse_sync_collection_report,
+    MultigetOutcome, extract_href_properties, extract_href_property, parse_calendar_collections,
+    parse_multiget_report, parse_propfind_events, parse_sync_collection_report,
 };
 use crate::{CalDavConfig, CalDavCredentials};
 
@@ -115,9 +115,9 @@ impl CalDavClient {
                 AccountOperation::Discover,
             )
             .await?;
-        let href = extract_href_property(&body, "calendar-user-address-set")
+        let hrefs = extract_href_properties(&body, "calendar-user-address-set")
             .map_err(|error| parse_error(AccountOperation::Discover, error))?;
-        Ok(href.and_then(|href| mailto_email(&href)))
+        Ok(hrefs.iter().find_map(|href| mailto_email(href)))
     }
 
     async fn discover_schedule_outbox_from_root(
@@ -264,9 +264,33 @@ impl CalDavClient {
         sync_token: &str,
     ) -> Result<CalDavSyncReport, AccountError> {
         let body = sync_collection_body(sync_token);
+        let operation = AccountOperation::SyncChanges;
+        let method = Method::from_bytes(b"REPORT")
+            .map_err(|error| local_error(operation, error.to_string()))?;
         let response = self
-            .report_raw(calendar_url, &body, AccountOperation::SyncChanges)
-            .await?;
+            .http
+            .request(method, calendar_url)
+            .header(CONTENT_TYPE, "application/xml; charset=utf-8")
+            .header("Depth", "0")
+            .headers(self.auth_headers(operation).await?)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| transport_error(operation, error.to_string()))?;
+        let status = response.status();
+        let response = response
+            .text()
+            .await
+            .map_err(|error| transport_error(operation, error.to_string()))?;
+        if status == StatusCode::GONE
+            || (status == StatusCode::FORBIDDEN
+                && response.to_ascii_lowercase().contains("valid-sync-token"))
+        {
+            return Err(cursor_invalid_error(status, response));
+        }
+        if !status.is_success() && status != StatusCode::MULTI_STATUS {
+            return Err(status_error(operation, status, response));
+        }
         parse_sync_collection_report(&response)
             .map_err(|error| parse_error(AccountOperation::SyncChanges, format!("sync: {error}")))
     }
@@ -319,7 +343,9 @@ impl CalDavClient {
                 request = request.header("If-None-Match", "*");
             }
             PutCondition::IfMatch(etag) => {
-                request = request.header("If-Match", prepare_if_match(etag));
+                if let Some(etag) = prepare_if_match(etag) {
+                    request = request.header("If-Match", etag);
+                }
             }
             PutCondition::None => {}
         }
@@ -531,8 +557,9 @@ fn escape_xml(value: &str) -> String {
 }
 
 fn mailto_email(href: &str) -> Option<String> {
-    href.strip_prefix("mailto:")
-        .or_else(|| href.strip_prefix("MAILTO:"))
+    href.get(.."mailto:".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+        .and_then(|_| href.get("mailto:".len()..))
         .filter(|email| email.contains('@'))
         .map(str::to_ascii_lowercase)
 }
@@ -614,15 +641,52 @@ fn response_etag(headers: &HeaderMap) -> Option<String> {
     headers
         .get("etag")
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim_matches('"').to_string())
+        .map(normalize_http_etag)
 }
 
-fn prepare_if_match(etag: &str) -> String {
-    if etag.starts_with('"') {
-        etag.to_string()
+fn normalize_http_etag(value: &str) -> String {
+    let value = value.trim();
+    if value
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    {
+        format!("W/{}", value[2..].trim())
     } else {
-        format!("\"{etag}\"")
+        value.trim_matches('"').to_string()
     }
+}
+
+fn prepare_if_match(etag: &str) -> Option<String> {
+    if etag
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    {
+        None
+    } else if etag.starts_with('"') {
+        Some(etag.to_string())
+    } else {
+        Some(format!("\"{etag}\""))
+    }
+}
+
+fn cursor_invalid_error(status: StatusCode, body: String) -> AccountError {
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid),
+        Cause::State(StateCause::CursorInvalid),
+    )
+    .protocol(Protocol::CalDav)
+    .operation(AccountOperation::SyncChanges)
+    .scope(ErrorScope::Cursor(CursorScope::Type(
+        ObjectType::CalendarEvent,
+    )))
+    .status(Some(status.as_u16()));
+    let body = body.trim();
+    if !body.is_empty() {
+        builder = builder.text(DiagnosticText::support_only(body.to_string()));
+    }
+    builder
+        .try_build()
+        .expect("valid account error classification")
 }
 
 fn should_fallback_discovery(error: &AccountError) -> bool {
@@ -971,7 +1035,35 @@ mod tests {
             mailto_email("MAILTO:Ada@Example.Test").as_deref(),
             Some("ada@example.test")
         );
+        assert_eq!(
+            mailto_email("Mailto:Ada@Example.Test").as_deref(),
+            Some("ada@example.test")
+        );
         assert_eq!(mailto_email("/principals/ada"), None);
+    }
+
+    #[test]
+    fn weak_etag_is_never_sent_in_if_match() {
+        assert_eq!(normalize_http_etag("W/\"abc\""), "W/\"abc\"");
+        assert_eq!(prepare_if_match("W/\"abc\""), None);
+        assert_eq!(prepare_if_match("abc").as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn stale_sync_token_maps_to_scoped_cursor_invalid() {
+        let error =
+            cursor_invalid_error(StatusCode::FORBIDDEN, "<D:valid-sync-token/>".to_string());
+
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::SyncState(SyncStateErrorKind::CursorInvalid)
+        );
+        assert_eq!(
+            error.scope(),
+            Some(&ErrorScope::Cursor(CursorScope::Type(
+                ObjectType::CalendarEvent
+            )))
+        );
     }
 
     #[test]

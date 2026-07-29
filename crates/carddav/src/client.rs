@@ -11,8 +11,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue}
 use reqwest::{Method, StatusCode, Url};
 
 use crate::parse::{
-    AddressBookCollection, CardDavContactEntry, CardDavContactListing, CardDavFetchedVCard,
-    extract_href_property, parse_addressbook_collections, parse_multiget_report,
+    AddressBookCollection, CardDavContactEntry, CardDavContactListing, CardDavMultigetReport,
+    MultigetOutcome, extract_href_property, parse_addressbook_collections, parse_multiget_report,
     parse_propfind_contacts,
 };
 use crate::{CardDavConfig, CardDavCredentials};
@@ -184,8 +184,8 @@ impl CardDavClient {
         addressbook_url: &str,
         uris: &[String],
         operation: AccountOperation,
-    ) -> Result<Vec<CardDavFetchedVCard>, AccountError> {
-        let mut all_results = Vec::new();
+    ) -> Result<CardDavMultigetReport, AccountError> {
+        let mut all_results = CardDavMultigetReport::default();
         for chunk in uris.chunks(MULTIGET_BATCH_SIZE) {
             let mut href_elements = String::new();
             for uri in chunk {
@@ -206,6 +206,9 @@ impl CardDavClient {
             let response = self.report_raw(addressbook_url, &body, operation).await?;
             let parsed = parse_multiget_report(&response)
                 .map_err(|error| parse_error(operation, format!("multiget: {error}")))?;
+            if let Some(error) = multiget_failure(&parsed, operation) {
+                return Err(error);
+            }
             all_results.extend(parsed);
         }
         Ok(all_results)
@@ -215,8 +218,8 @@ impl CardDavClient {
         &self,
         addressbook_url: &str,
         query: &str,
-    ) -> Result<Vec<CardDavFetchedVCard>, AccountError> {
-        let mut all_results = Vec::new();
+    ) -> Result<CardDavMultigetReport, AccountError> {
+        let mut all_results = CardDavMultigetReport::default();
         for property in ["FN", "N", "EMAIL", "TEL", "ADR", "ORG", "TITLE", "NOTE"] {
             let body = addressbook_text_query_body(property, query);
             let response = self
@@ -225,6 +228,9 @@ impl CardDavClient {
             let parsed = parse_multiget_report(&response).map_err(|error| {
                 parse_error(AccountOperation::ContactSearch, format!("query: {error}"))
             })?;
+            if let Some(error) = multiget_failure(&parsed, AccountOperation::ContactSearch) {
+                return Err(error);
+            }
             all_results.extend(parsed);
         }
         Ok(all_results)
@@ -248,7 +254,9 @@ impl CardDavClient {
                 request = request.header("If-None-Match", "*");
             }
             PutCondition::IfMatch(etag) => {
-                request = request.header("If-Match", prepare_if_match(etag));
+                if let Some(etag) = prepare_if_match(etag) {
+                    request = request.header("If-Match", etag);
+                }
             }
             PutCondition::None => {}
         }
@@ -265,6 +273,17 @@ impl CardDavClient {
             .request(Method::DELETE, url)
             .headers(self.auth_headers(operation).await?);
         self.send_status_request(request, operation).await
+    }
+
+    /// A client that only knows its base URL, for tests that exercise
+    /// href resolution without touching the network.
+    #[cfg(test)]
+    pub(crate) fn for_base_url(base_url: &str) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.to_string(),
+            credentials: CardDavCredentials::bearer("token"),
+        }
     }
 
     pub(crate) fn resolve_url(&self, href: &str) -> String {
@@ -355,7 +374,7 @@ impl CardDavClient {
             .headers()
             .get(ETAG)
             .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string);
+            .map(normalize_http_etag);
         let body = response
             .text()
             .await
@@ -441,11 +460,28 @@ fn addressbook_text_query_body(property: &str, query: &str) -> String {
     )
 }
 
-fn prepare_if_match(etag: &str) -> String {
-    if etag.starts_with('"') {
-        etag.to_string()
+fn normalize_http_etag(value: &str) -> String {
+    let value = value.trim();
+    if value
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    {
+        format!("W/{}", value[2..].trim())
     } else {
-        format!("\"{etag}\"")
+        value.trim_matches('"').to_string()
+    }
+}
+
+fn prepare_if_match(etag: &str) -> Option<String> {
+    if etag
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    {
+        None
+    } else if etag.starts_with('"') {
+        Some(etag.to_string())
+    } else {
+        Some(format!("\"{etag}\""))
     }
 }
 
@@ -454,6 +490,28 @@ fn should_fallback_discovery(error: &AccountError) -> bool {
         error.kind(),
         AccountErrorKind::NotFound(ResourceKind::Contact)
     )
+}
+
+fn multiget_failure(
+    report: &CardDavMultigetReport,
+    operation: AccountOperation,
+) -> Option<AccountError> {
+    match report.classify() {
+        MultigetOutcome::Usable => None,
+        MultigetOutcome::CompleteFailure { status } => {
+            let code = status
+                .and_then(|code| StatusCode::from_u16(code).ok())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            Some(status_error(
+                operation,
+                code,
+                format!(
+                    "multi-status body reported failure for all {} resources",
+                    report.failed.len()
+                ),
+            ))
+        }
+    }
 }
 
 pub(crate) fn unsupported_error(operation: AccountOperation) -> AccountError {
@@ -581,6 +639,14 @@ fn status_error(operation: AccountOperation, status: StatusCode, body: String) -
 
 pub(crate) fn contact_scope(id: impl Into<String>) -> ErrorScope {
     ErrorScope::Contact { id: id.into() }
+}
+
+pub(crate) fn not_found_error(operation: AccountOperation, id: impl Into<String>) -> AccountError {
+    status_error(operation, StatusCode::NOT_FOUND, String::new())
+        .into_builder()
+        .scope(contact_scope(id))
+        .try_build()
+        .expect("valid account error classification")
 }
 
 const PROPFIND_PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
@@ -713,5 +779,32 @@ mod tests {
         assert!(body.contains("<C:address-data/>"));
         assert!(body.contains("<C:prop-filter name=\"EMAIL\">"));
         assert!(body.contains("ada &amp; team"));
+    }
+
+    #[test]
+    fn weak_etag_is_never_sent_in_if_match() {
+        assert_eq!(normalize_http_etag("W/\"abc\""), "W/\"abc\"");
+        assert_eq!(prepare_if_match("W/\"abc\""), None);
+        assert_eq!(prepare_if_match("abc").as_deref(), Some("\"abc\""));
+    }
+
+    #[test]
+    fn complete_multiget_failure_uses_embedded_status_classification() {
+        let report = CardDavMultigetReport {
+            cards: Vec::new(),
+            failed: vec![crate::parse::CardDavFailedResource {
+                href: "/contacts/one.vcf".to_string(),
+                status: Some(401),
+            }],
+        };
+
+        let error = multiget_failure(&report, AccountOperation::ContactsList)
+            .expect("all-401 report is a complete failure");
+        assert_eq!(
+            error.kind(),
+            &AccountErrorKind::Authentication(
+                bifrost_types::AuthErrorKind::ReauthorizationRequired
+            )
+        );
     }
 }

@@ -35,7 +35,8 @@ contact primitives.
   failed within the 207), so the snapshot diff can preserve a
   transiently-failed resource instead of destroying it. Response parsers
   use element-stack parent checks so nested same-name properties do not
-  overwrite response-level hrefs.
+  overwrite response-level hrefs. Every text-bearing parser accepts both
+  XML text and CDATA.
 - `vcard.rs` - small vCard projection between DAV resources and
   `bifrost-types` contact cards. **Parse-in** uses caldata's `LineReader`
   for RFC 6350 line unfolding (deletes exactly one leading WSP, not the
@@ -45,7 +46,7 @@ contact primitives.
   bare-param shorthand (`EMAIL;WORK:`) is read as a bare TYPE value.
   Projection is fallible: a malformed body (unterminated quoted parameter,
   missing value, invalid UTF-8 in a folded run) returns a `VCardParseError`.
-  Bulk listing/search degrade a single bad resource to a `filter_map` skip;
+  Bulk listing/search route a single bad resource into `Page::failed_ids`;
   single-resource get/update surface it as a local error.
   **Serialize/patch** keeps the hand-rolled verbatim-preserving splice:
   preserved (unmodeled) lines are re-emitted byte for byte on their physical
@@ -62,6 +63,10 @@ contact primitives.
   here, would make these fully structural). The create path emits a minimal
   `N` (mandatory in 3.0). A present-but-empty value is still
   indistinguishable from absent (the shared limitation calcard also has).
+  Parameter values use RFC 6868 caret encoding in both directions, so a
+  quote or newline in a parameter survives a write/read round trip. For
+  vCard 4 preference ordinals, only `PREF=1` maps to the shared primary
+  flag.
 - `capabilities.rs` - contact-only `AccountCapabilities`.
 
 ## Account behavior
@@ -79,15 +84,20 @@ Supported contact primitives:
   dropped, so a consumer can tell a transient per-resource hydration
   failure apart from a real remote deletion and preserve the row. Books
   and cards carry `ContactCorpus::Main`; CardDAV has no auto-collected
-  corpus.
+  corpus. Multiget returns a `CardDavMultigetReport` with successful cards
+  and per-resource failures. A wholly failed 207 with any non-404/410
+  failure is routed through normal status classification rather than
+  returned as an empty page; partial failures feed `Page::failed_ids`.
 - `contact_get` - single-resource multiget using the contact id as the
-  DAV href.
+  DAV href. A missing resource maps to `NotFound(Contact)`.
 - `contact_create` - creates a vCard 4.0 resource with a UUID-backed
   `.vcf` path using `PUT`.
 - `contact_update` - fetches the current vCard, applies the shared
   `ContactPatch`, preserves unmodeled vCard lines for unrelated field
-  changes, and writes the replacement vCard with `If-Match` when an etag
-  was present. Inline `ContactPatch.photo` replaces or clears vCard
+  changes, and writes the replacement vCard with `If-Match` when a strong
+  etag was present. Weak ETags retain their `W/` marker for snapshot
+  comparison but make the PUT unconditional because If-Match requires
+  strong comparison. Inline `ContactPatch.photo` replaces or clears vCard
   PHOTO data. Changing `address_book_id` is rejected; CardDAV moves are
   not implemented.
 - `contact_delete` - deletes the DAV resource.
@@ -95,7 +105,9 @@ Supported contact primitives:
   CardDAV `addressbook-query` text-match `REPORT`s over common vCard
   fields, including ADR postal addresses, then keep local filtering and
   offset-cursor paging as a
-  defensive guard. Empty search hydrates the addressbook to preserve
+  defensive guard. Results are sorted by native id before slicing so page
+  order is stable while the remote result set is unchanged. Empty search
+  hydrates the addressbook to preserve
   match-all behavior. This is the *personal* corpus only;
   `directory_search` (org directory / GAL) returns
   `Unsupported(DirectorySearch)` with the capability flag `false`. An RFC
@@ -124,6 +136,11 @@ prior snapshot suppresses the mass-delete (treated as "no observation"),
 and any href in `current.failed_hrefs` is preserved rather than destroyed.
 `inventory_stream` emits contact inventory entries with ETag fingerprints
 for the same contact scope.
+Cursor entry counts are checked against the remaining payload before
+allocation. Multiget response hrefs are rebased onto the same resolved
+absolute native-id namespace the snapshot, inventory, and changes lanes
+use, `failed_ids` included, so a path-only href from the server cannot
+give one contact two ids.
 
 All mail, filter, blob, push, calendar, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CardDav`.

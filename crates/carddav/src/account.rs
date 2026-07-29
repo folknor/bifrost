@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::CardDavConfig;
 use crate::capabilities::carddav_capabilities;
-use crate::client::{CardDavClient, PutCondition, contact_scope, local_error, unsupported_error};
-use crate::parse::{AddressBookCollection, CardDavFetchedVCard};
+use crate::client::{CardDavClient, PutCondition, local_error, not_found_error, unsupported_error};
+use crate::parse::{AddressBookCollection, CardDavFetchedVCard, CardDavMultigetReport};
 use crate::vcard::{VCardParseError, contact_from_vcard, vcard_from_create, vcard_from_patch};
 
 const CONTACT_PAGE_SIZE: usize = 250;
@@ -122,16 +122,14 @@ impl CardDavAccount {
         contact: &ContactId,
         operation: AccountOperation,
     ) -> Result<CardDavFetchedVCard, AccountError> {
-        let cards = client
+        let report = client
             .fetch_vcards(addressbook, std::slice::from_ref(&contact.0), operation)
             .await?;
-        cards.into_iter().next().ok_or_else(|| {
-            unsupported_error(operation)
-                .into_builder()
-                .scope(contact_scope(contact.0.clone()))
-                .try_build()
-                .expect("valid account error classification")
-        })
+        let (cards, _) = resolved_report(client, report);
+        cards
+            .into_iter()
+            .next()
+            .ok_or_else(|| not_found_error(operation, contact.0.clone()))
     }
 
     async fn hydrated_contacts(
@@ -139,31 +137,18 @@ impl CardDavAccount {
         default_addressbook_url: &str,
         address_book: Option<AddressBookId>,
         operation: AccountOperation,
-    ) -> Result<Vec<ContactCard>, AccountError> {
+    ) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
         let entries = client.list_contacts(&addressbook).await?;
         let uris = entries
             .iter()
             .map(|entry| entry.uri.clone())
             .collect::<Vec<_>>();
-        let cards = client
-            .fetch_vcards(&addressbook, &uris, operation)
-            .await?
-            .into_iter()
-            // A single malformed vCard degrades to a skip rather than failing
-            // the whole listing; the resource stays in the snapshot and is
-            // retried on a later poll.
-            .filter_map(|card| {
-                contact_from_vcard(
-                    card.uri,
-                    Some(AddressBookId(addressbook.clone())),
-                    card.etag,
-                    &card.data,
-                )
-                .ok()
-            })
-            .collect();
-        Ok(cards)
+        let report = client.fetch_vcards(&addressbook, &uris, operation).await?;
+        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
+        failed_ids.extend(projection_failures);
+        Ok((cards, failed_ids))
     }
 
     async fn searched_contacts(
@@ -171,25 +156,20 @@ impl CardDavAccount {
         default_addressbook_url: &str,
         address_book: Option<AddressBookId>,
         query: &str,
-    ) -> Result<Vec<ContactCard>, AccountError> {
+    ) -> Result<(Vec<ContactCard>, Vec<String>), AccountError> {
         let addressbook = Self::addressbook_url(client, default_addressbook_url, address_book);
         let mut seen = HashSet::new();
-        let cards = client
-            .query_vcards_text(&addressbook, query)
-            .await?
+        let report = client.query_vcards_text(&addressbook, query).await?;
+        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let fetched = fetched
             .into_iter()
             .filter(|card| seen.insert(card.uri.clone()))
-            .filter_map(|card| {
-                contact_from_vcard(
-                    card.uri,
-                    Some(AddressBookId(addressbook.clone())),
-                    card.etag,
-                    &card.data,
-                )
-                .ok()
-            })
             .collect();
-        Ok(cards)
+        let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
+        failed_ids.extend(projection_failures);
+        failed_ids.sort_unstable();
+        failed_ids.dedup();
+        Ok((cards, failed_ids))
     }
 
     async fn hydrated_contacts_page(
@@ -209,8 +189,10 @@ impl CardDavAccount {
             .take(page_size)
             .map(|entry| entry.uri)
             .collect::<Vec<_>>();
-        let fetched = client.fetch_vcards(&addressbook, &uris, operation).await?;
-        let (cards, failed_ids) = partition_hydrated_vcards(&addressbook, fetched);
+        let report = client.fetch_vcards(&addressbook, &uris, operation).await?;
+        let (fetched, mut failed_ids) = resolved_report(client, report);
+        let (cards, projection_failures) = partition_hydrated_vcards(&addressbook, fetched);
+        failed_ids.extend(projection_failures);
         Ok(Page {
             items: cards,
             next_cursor: (offset + page_size < total)
@@ -913,7 +895,7 @@ impl Account for CardDavAccount {
             let offset =
                 decode_offset_cursor(request.page_cursor.clone(), AccountOperation::ContactSearch)?;
             let needle = request.query.to_lowercase();
-            let cards = if needle.is_empty() {
+            let (cards, failed_ids) = if needle.is_empty() {
                 Self::hydrated_contacts(
                     &client,
                     &default_addressbook_url,
@@ -934,12 +916,16 @@ impl Account for CardDavAccount {
                 .into_iter()
                 .filter(|contact| contact_matches(contact, &needle))
                 .collect::<Vec<_>>();
+            let mut items = items;
+            items.sort_by(|left, right| left.native_id.cmp(&right.native_id));
             let page_size = request
                 .limit
                 .and_then(|limit| usize::try_from(limit).ok())
                 .unwrap_or(CONTACT_PAGE_SIZE)
                 .max(1);
-            Ok(page_from_offset(items, offset, page_size))
+            let mut page = page_from_offset(items, offset, page_size);
+            page.failed_ids = failed_ids;
+            Ok(page)
         })
     }
 
@@ -1042,9 +1028,10 @@ fn unsupported_future<T: Send + 'static>(
 fn unsupported_stream<T: Send + 'static>(
     operation: AccountOperation,
 ) -> AccountStream<SyncEvent<T>> {
-    Box::pin(stream::iter([SyncEvent::Terminated(unsupported_error(
-        operation,
-    ))]))
+    Box::pin(stream::iter([
+        SyncEvent::Terminated(unsupported_error(operation)),
+        SyncEvent::Done(None),
+    ]))
 }
 
 fn append_path(base: &str, path: &str) -> String {
@@ -1069,7 +1056,12 @@ fn same_collection_url(left: &str, right: &str) -> bool {
 }
 
 fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
-    etag.map_or(PutCondition::None, PutCondition::IfMatch)
+    etag.filter(|etag| {
+        !etag
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    })
+    .map_or(PutCondition::None, PutCondition::IfMatch)
 }
 
 /// Map a vCard projection failure to an `AccountError` for the single-resource
@@ -1154,6 +1146,11 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<ContactSnapshot, Acco
     let addressbook_url = read_string(&mut input)?;
     let ctag = read_option_string(&mut input)?;
     let count = read_u32(&mut input)?;
+    if count > input.len() / 5 {
+        return Err(cursor_error(
+            "CardDAV cursor entry count exceeds remaining payload",
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         entries.push(ContactSnapshotEntry {
@@ -1361,6 +1358,34 @@ fn estimated_total(total: usize) -> u64 {
 /// from a real remote deletion and preserve the row instead of
 /// destroying it. The captured id is the same `uri` a successful card
 /// would carry as its native id.
+/// Rebase a multiget report onto the account's native-id namespace.
+///
+/// A server writes multiget response hrefs however it likes - usually
+/// path-only, sometimes absolute. Every id this account hands out
+/// (snapshot entries, inventory, changes) is the resolved absolute URL, so
+/// a raw href would give the hydration lane a second, incompatible id
+/// namespace: the same contact would look created-then-destroyed to a
+/// consumer that indexes on `native_id`.
+fn resolved_report(
+    client: &CardDavClient,
+    report: CardDavMultigetReport,
+) -> (Vec<CardDavFetchedVCard>, Vec<String>) {
+    let cards = report
+        .cards
+        .into_iter()
+        .map(|card| CardDavFetchedVCard {
+            uri: client.resolve_url(&card.uri),
+            ..card
+        })
+        .collect();
+    let failed = report
+        .failed
+        .into_iter()
+        .map(|failure| client.resolve_url(&failure.href))
+        .collect();
+    (cards, failed)
+}
+
 fn partition_hydrated_vcards(
     addressbook: &str,
     fetched: Vec<CardDavFetchedVCard>,
@@ -1494,6 +1519,30 @@ mod tests {
     }
 
     #[test]
+    fn multiget_hrefs_are_rebased_onto_the_snapshot_id_namespace() {
+        // The snapshot lane resolves listing hrefs to absolute URLs, so the
+        // hydration lane must too: a path-only multiget href would give the
+        // same contact two native ids.
+        let client = CardDavClient::for_base_url("https://dav.example.test/");
+        let report = CardDavMultigetReport {
+            cards: vec![CardDavFetchedVCard {
+                uri: "/contacts/one.vcf".to_string(),
+                etag: Some("e1".to_string()),
+                data: "BEGIN:VCARD\r\nFN:Ada\r\nEND:VCARD\r\n".to_string(),
+            }],
+            failed: vec![crate::parse::CardDavFailedResource {
+                href: "/contacts/two.vcf".to_string(),
+                status: Some(403),
+            }],
+        };
+
+        let (cards, failed) = resolved_report(&client, report);
+
+        assert_eq!(cards[0].uri, "https://dav.example.test/contacts/one.vcf");
+        assert_eq!(failed, vec!["https://dav.example.test/contacts/two.vcf"]);
+    }
+
+    #[test]
     fn partition_hydrated_vcards_records_unparseable_ids() {
         // A well-formed vCard projects into `items`; a malformed one is
         // captured in `failed_ids` under its native uri rather than dropped,
@@ -1566,6 +1615,21 @@ mod tests {
         let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn contact_cursor_rejects_impossible_count_before_allocating() {
+        let snapshot = ContactSnapshot {
+            addressbook_url: "https://dav.example.test/contacts/".to_string(),
+            ctag: None,
+            entries: Vec::new(),
+            failed_hrefs: Vec::new(),
+        };
+        let mut cursor = cursor_from_snapshot(CursorScope::Type(ObjectType::Contact), &snapshot);
+        let count_offset = cursor.server_state.bytes.len() - 4;
+        cursor.server_state.bytes[count_offset..].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        assert!(decode_cursor_snapshot(&cursor).is_err());
     }
 
     #[test]

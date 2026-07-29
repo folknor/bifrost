@@ -4,7 +4,7 @@ use bifrost_types::{
     EventTime, EventVisibility, ProtocolKind, ReminderRelativeTo, ReminderTrigger, RsvpStatus,
 };
 use caldata::ContentLineParser;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
 use uuid::Uuid;
 
 /// Projection failed because the resource body could not be tokenized into
@@ -22,7 +22,10 @@ pub(crate) fn event_from_ical(
     etag: Option<String>,
     data: &str,
 ) -> Result<CalendarEvent, IcalParseError> {
-    let block = parse_vevents(data)?.into_iter().next().unwrap_or_default();
+    let block = parse_vevents(data)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| IcalParseError("iCalendar resource contains no VEVENT".to_string()))?;
     Ok(project_event(
         EventId(uri.clone()),
         uri,
@@ -42,6 +45,12 @@ pub(crate) fn event_from_ical(
 /// Override instances share the resource's native id but take a
 /// recurrence-qualified `EventId` so they do not collide with the master
 /// in a consumer index; `native_id` / provenance stay the resource uri.
+///
+/// A tokenizable resource that holds no VEVENT at all (a VTODO or
+/// VJOURNAL sharing the collection, which is legal) yields no events
+/// rather than a fabricated empty one: it is not a projection failure -
+/// nothing is wrong with the resource and a retry cannot change the
+/// outcome - so it belongs in neither the item lane nor `failed_ids`.
 pub(crate) fn events_from_ical(
     uri: String,
     calendar_id: CalendarId,
@@ -49,16 +58,6 @@ pub(crate) fn events_from_ical(
     data: &str,
 ) -> Result<Vec<CalendarEvent>, IcalParseError> {
     let blocks = parse_vevents(data)?;
-    if blocks.is_empty() {
-        return Ok(vec![project_event(
-            EventId(uri.clone()),
-            uri,
-            calendar_id,
-            etag,
-            data,
-            VeventBlock::default(),
-        )]);
-    }
     Ok(blocks
         .into_iter()
         .map(|block| {
@@ -109,6 +108,13 @@ fn project_event(
         .unwrap_or_else(default_time);
     let end = dtend
         .map(event_time_from_property)
+        .or_else(|| {
+            dtstart.and_then(|start| {
+                props
+                    .first("DURATION")
+                    .and_then(|duration| event_end_from_duration(start, duration))
+            })
+        })
         .unwrap_or_else(default_time);
     let is_all_day =
         dtstart.is_some_and(Prop::value_type_date) || dtend.is_some_and(Prop::value_type_date);
@@ -247,7 +253,7 @@ pub(crate) fn patch_to_ical(
     }
     if patch.end.is_some() || patch.is_all_day.is_some() {
         push_time(&mut replacements, "DTEND", &merged.end, merged.is_all_day);
-        replace_names.push("DTEND");
+        replace_names.extend(["DTEND", "DURATION"]);
     }
     if let Some(status) = patch.status {
         replacements.push(format!("STATUS:{}", ical_event_status(status)));
@@ -272,11 +278,8 @@ pub(crate) fn patch_to_ical(
         replace_names.push("ATTENDEE");
     }
 
-    Ok(replace_first_vevent_properties(
-        raw_ical,
-        &replace_names,
-        replacements,
-    ))
+    replace_first_vevent_properties(raw_ical, &replace_names, replacements)
+        .ok_or("iCalendar body has no spliceable VEVENT")
 }
 
 pub(crate) fn patch_event(current: &CalendarEvent, patch: &EventPatch) -> EventCreate {
@@ -544,6 +547,15 @@ impl Prop {
         self.params.get_param(name)
     }
 
+    /// A parameter carrying free text (CN, TZID) rather than a grammar
+    /// token. caldata hands back the raw parameter, so the RFC 6868 caret
+    /// decoding that undoes [`escape_param`] happens here; without it a
+    /// display name written by us - or by any of the many servers that
+    /// caret-encode - reads back with `^'` in it.
+    fn text_param(&self, name: &str) -> Option<String> {
+        self.param(name).map(unescape_param)
+    }
+
     fn value_type_date(&self) -> bool {
         self.param("VALUE")
             .is_some_and(|value| value.eq_ignore_ascii_case("DATE"))
@@ -551,13 +563,13 @@ impl Prop {
 }
 
 fn event_time_from_property(prop: &Prop) -> EventTime {
-    let tzid = prop.param("TZID");
+    let tzid = prop.text_param("TZID");
     EventTime {
         value: format_ical_time(&prop.value, prop.value_type_date(), tzid.is_some()),
         // Map Microsoft/Windows zone names ("W. Europe Standard Time") to
         // their IANA equivalent when caldata's table knows them; otherwise
         // pass the TZID through verbatim.
-        timezone: tzid.map(canonical_tzid),
+        timezone: tzid.as_deref().map(canonical_tzid),
     }
 }
 
@@ -570,6 +582,9 @@ fn canonical_tzid(tzid: &str) -> String {
 }
 
 fn format_ical_time(value: &str, is_date: bool, has_tzid: bool) -> String {
+    if !value.is_ascii() {
+        return value.to_string();
+    }
     if is_date && value.len() == 8 {
         // All-day dates project verbatim. The iCalendar all-day DTEND is
         // already exclusive and `EventTime`'s all-day contract is exclusive
@@ -611,16 +626,46 @@ fn format_ical_time(value: &str, is_date: bool, has_tzid: bool) -> String {
 }
 
 fn ical_offset_suffix(value: &str) -> String {
+    if !value.is_ascii() {
+        return String::new();
+    }
     if value.ends_with('Z') {
         return "Z".to_string();
     }
     if value.len() == 20 {
         let offset = &value[15..20];
-        if offset.as_bytes()[0].is_ascii() && matches!(&offset[0..1], "+" | "-") {
+        if matches!(&offset[0..1], "+" | "-") {
             return format!("{}:{}", &offset[0..3], &offset[3..5]);
         }
     }
     String::new()
+}
+
+fn event_end_from_duration(start: &Prop, duration: &str) -> Option<EventTime> {
+    let duration = caldata::types::parse_duration(duration).ok()?;
+    let start = event_time_from_property(start);
+    let value = if let Ok(value) = DateTime::parse_from_rfc3339(&start.value) {
+        let end = value.checked_add_signed(duration)?;
+        end.to_rfc3339_opts(SecondsFormat::Secs, start.value.ends_with('Z'))
+    } else if let Ok(value) = NaiveDateTime::parse_from_str(&start.value, "%Y-%m-%dT%H:%M:%S") {
+        value
+            .checked_add_signed(duration)?
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string()
+    } else if let Ok(value) = NaiveDate::parse_from_str(&start.value, "%Y-%m-%d") {
+        value
+            .and_hms_opt(0, 0, 0)?
+            .checked_add_signed(duration)?
+            .date()
+            .format("%Y-%m-%d")
+            .to_string()
+    } else {
+        return None;
+    };
+    Some(EventTime {
+        value,
+        timezone: start.timezone,
+    })
 }
 
 fn ical_time_from_event_time(time: &EventTime, is_all_day: bool) -> String {
@@ -673,7 +718,7 @@ fn ical_event_status(status: EventStatus) -> &'static str {
 fn organizer_from_property(prop: &Prop) -> Option<EventOrganizer> {
     Some(EventOrganizer {
         email: mailto(&prop.value)?,
-        name: prop.param("CN").map(unescape_text),
+        name: prop.text_param("CN").as_deref().map(unescape_text),
     })
 }
 
@@ -691,7 +736,7 @@ fn organizer_to_line(organizer: &EventOrganizer) -> String {
 fn attendee_from_property(prop: &Prop) -> Option<EventAttendee> {
     Some(EventAttendee {
         email: mailto(&prop.value)?,
-        name: prop.param("CN").map(unescape_text),
+        name: prop.text_param("CN").as_deref().map(unescape_text),
         role: attendee_role(prop.param("ROLE")),
         status: rsvp_status(prop.param("PARTSTAT")),
     })
@@ -747,8 +792,9 @@ fn rsvp_status(value: Option<&str>) -> RsvpStatus {
 
 fn mailto(value: &str) -> Option<String> {
     value
-        .strip_prefix("mailto:")
-        .or_else(|| value.strip_prefix("MAILTO:"))
+        .get(.."mailto:".len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+        .and_then(|_| value.get("mailto:".len()..))
         .map(ToString::to_string)
 }
 
@@ -979,18 +1025,25 @@ fn classification(visibility: EventVisibility) -> Option<&'static str> {
 /// lines - including their original fold continuations - are emitted byte for
 /// byte; only the freshly emitted replacement lines are folded. A long
 /// preserved value therefore round-trips losslessly through an update.
+///
+/// Returns `None` when the body gave the splice nowhere to land: no
+/// `BEGIN:VEVENT`, or a first VEVENT whose nested components or own
+/// `END` never close. Emitting the body anyway would drop every patched
+/// property and PUT an unchanged resource back, which the caller cannot
+/// tell apart from a successful edit.
 fn replace_first_vevent_properties(
     raw_ical: &str,
     replace_names: &[&str],
     replacements: Vec<String>,
-) -> String {
+) -> Option<String> {
     let mut out = String::new();
     let mut replacements = Some(replacements);
     let mut in_first_event = false;
     let mut finished_first_event = false;
+    let mut nested_component_depth = 0_usize;
     for group in logical_line_groups(raw_ical) {
         let name = ical_line_name(group.logical_head());
-        if name == Some("BEGIN")
+        if name.is_some_and(|name| name.eq_ignore_ascii_case("BEGIN"))
             && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
             && !finished_first_event
         {
@@ -999,7 +1052,8 @@ fn replace_first_vevent_properties(
             continue;
         }
         if in_first_event
-            && name == Some("END")
+            && nested_component_depth == 0
+            && name.is_some_and(|name| name.eq_ignore_ascii_case("END"))
             && line_value(group.logical_head()).is_some_and(|v| v.eq_ignore_ascii_case("VEVENT"))
         {
             if let Some(replacements) = replacements.take() {
@@ -1010,12 +1064,41 @@ fn replace_first_vevent_properties(
             group.push_verbatim(&mut out);
             continue;
         }
-        if in_first_event && name.is_some_and(|name| replace_names.contains(&name)) {
+        if in_first_event
+            && name.is_some_and(|name| name.eq_ignore_ascii_case("BEGIN"))
+            && line_value(group.logical_head()).is_some()
+        {
+            if nested_component_depth == 0
+                && let Some(replacements) = replacements.take()
+            {
+                out.push_str(&fold_ical_lines(replacements));
+            }
+            nested_component_depth += 1;
+            group.push_verbatim(&mut out);
+            continue;
+        }
+        if in_first_event
+            && nested_component_depth > 0
+            && name.is_some_and(|name| name.eq_ignore_ascii_case("END"))
+            && line_value(group.logical_head()).is_some()
+        {
+            nested_component_depth -= 1;
+            group.push_verbatim(&mut out);
+            continue;
+        }
+        if in_first_event
+            && nested_component_depth == 0
+            && name.is_some_and(|name| {
+                replace_names
+                    .iter()
+                    .any(|replace| name.eq_ignore_ascii_case(replace))
+            })
+        {
             continue;
         }
         group.push_verbatim(&mut out);
     }
-    out
+    replacements.is_none().then_some(out)
 }
 
 fn has_recurrence_override_vevent(raw_ical: &str) -> bool {
@@ -1151,12 +1234,52 @@ fn unescape_text(value: &str) -> String {
     out
 }
 
+/// RFC 6868 parameter-value decoding, the inverse of [`escape_param`]:
+/// `^n` is a newline, `^'` a `"`, `^^` a caret. A caret before anything
+/// else is literal, so a value from a producer that predates RFC 6868
+/// survives unchanged.
+fn unescape_param(value: &str) -> String {
+    if !value.contains('^') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '^' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\'') => out.push('"'),
+            Some('^') => out.push('^'),
+            Some(other) => {
+                out.push('^');
+                out.push(other);
+            }
+            None => out.push('^'),
+        }
+    }
+    out
+}
+
 fn escape_param(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\r', "")
-        .replace('\n', "\\n");
+    let mut escaped = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '^' => escaped.push_str("^^"),
+            '"' => escaped.push_str("^'"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                escaped.push_str("^n");
+            }
+            '\n' => escaped.push_str("^n"),
+            _ => escaped.push(ch),
+        }
+    }
     if escaped.contains([';', ',', ':']) {
         format!("\"{escaped}\"")
     } else {
@@ -2123,34 +2246,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "byte index")]
-    fn non_ascii_datetime_value_panics_in_projection() {
-        // BUG (documented, not endorsed): `format_ical_time` slices the raw
-        // DTSTART value at fixed BYTE offsets, so any multi-byte UTF-8 value
-        // whose byte length is >= 15 panics on a char boundary instead of
-        // degrading to a per-resource error like every other malformed body.
-        // A garbage-emitting or hostile server can take down the whole pull
-        // with one resource. Five EURO SIGN characters are 15 bytes.
-        // Replace this test with a non-panicking assertion when the slicing
-        // is made boundary-safe.
+    fn non_ascii_datetime_value_does_not_panic_in_projection() {
         let body = format!(
             "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
             "\u{20ac}".repeat(5)
         );
-        let _ = event_from_ical(
+        let event = event_from_ical(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
             None,
             &body,
-        );
+        )
+        .expect("non-ASCII property value remains a per-resource value");
+
+        assert_eq!(event.start.value, "\u{20ac}".repeat(5));
     }
 
     #[test]
-    fn duration_based_end_is_not_modeled() {
-        // GAP (documented, not endorsed): a VEVENT carrying DTSTART plus
-        // DURATION instead of DTEND (legal per RFC 5545, emitted by several
-        // real producers) projects with an EMPTY end value - DURATION is
-        // never read. Pinned so a future fix flips this loudly.
+    fn duration_based_end_is_projected() {
         let event = parse_event(
             "/cal/one.ics".to_string(),
             CalendarId("/cal/".to_string()),
@@ -2159,7 +2272,136 @@ mod tests {
         );
 
         assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
-        assert_eq!(event.end.value, "");
+        assert_eq!(event.end.value, "2026-06-02T13:00:00Z");
+    }
+
+    #[test]
+    fn end_patch_replaces_duration_instead_of_emitting_both() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                end: Some(EventTime {
+                    value: "2026-06-02T14:00:00Z".to_string(),
+                    timezone: None,
+                }),
+                ..EventPatch::default()
+            },
+        )
+        .expect("end patch should serialize");
+
+        assert!(body.contains("DTEND:20260602T140000Z"));
+        assert!(!body.contains("DURATION:"));
+    }
+
+    #[test]
+    fn scalar_patch_preserves_same_named_valarm_properties() {
+        let current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDESCRIPTION:Event\r\nDTSTART:20260602T120000Z\r\nDTEND:20260602T130000Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Ring\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        let body = patch_to_ical(
+            &current,
+            &EventPatch {
+                description: Some(Some("Updated".to_string())),
+                ..EventPatch::default()
+            },
+        )
+        .expect("description patch should serialize");
+
+        assert!(body.contains("DESCRIPTION:Updated\r\nBEGIN:VALARM"));
+        assert!(body.contains("DESCRIPTION:Ring\r\nEND:VALARM"));
+        assert!(!body.contains("DESCRIPTION:Event"));
+    }
+
+    #[test]
+    fn resource_without_vevent_is_rejected() {
+        let result = event_from_ical(
+            "/cal/todo.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(
+            result.expect_err("VTODO-only resource is not an event").0,
+            "iCalendar resource contains no VEVENT"
+        );
+    }
+
+    #[test]
+    fn unspliceable_body_fails_instead_of_writing_back_unchanged() {
+        // A truncated VEVENT reaches neither splice point (the first nested
+        // component boundary, or END:VEVENT). Returning the body verbatim
+        // would PUT the pre-patch resource back and report success, with the
+        // patched properties silently gone.
+        let mut current = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        current.raw_ical =
+            Some("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nSUMMARY:Old\r\n".to_string());
+
+        let result = patch_to_ical(
+            &current,
+            &EventPatch {
+                title: Some(Some("New".to_string())),
+                ..EventPatch::default()
+            },
+        );
+
+        assert_eq!(result, Err("iCalendar body has no spliceable VEVENT"));
+    }
+
+    #[test]
+    fn bulk_projection_skips_a_resource_without_vevent() {
+        // The listing lanes must not fabricate an empty event for a VTODO
+        // sharing the collection: `event_in_range` waves through an event
+        // with an empty start, so the phantom would reach the consumer and
+        // then fail to open, `event_get` having rejected the same body.
+        let events = events_from_ical(
+            "/cal/todo.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+        )
+        .expect("a VEVENT-less resource is not a projection failure");
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parameter_values_use_rfc6868_caret_encoding() {
+        assert_eq!(escape_param("Ada \"Ace\" ^ Team"), "Ada ^'Ace^' ^^ Team");
+        assert_eq!(escape_param("one\r\ntwo"), "one^ntwo");
+    }
+
+    #[test]
+    fn caret_encoded_parameter_round_trips_through_projection() {
+        // Writing carets a reader keeps verbatim would surface `^'` as part
+        // of an attendee's display name.
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nATTENDEE;CN=Ada ^'Ace^' Lovelace:mailto:ada@example.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(
+            event.attendees[0].name.as_deref(),
+            Some("Ada \"Ace\" Lovelace")
+        );
     }
 
     #[test]

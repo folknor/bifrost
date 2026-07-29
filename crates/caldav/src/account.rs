@@ -722,10 +722,15 @@ impl Account for CalDavAccount {
             // the consumer: a resource the server refused inside the 207
             // (non-2xx propstat), and one that came back 200 but would not
             // tokenize. Neither aborts the rest of the pull.
-            let mut failed = fetched.failed_hrefs();
+            let mut failed = fetched
+                .failed_hrefs()
+                .into_iter()
+                .map(|href| client.resolve_url(&href))
+                .collect::<Vec<_>>();
             for event in fetched.events {
+                let uri = client.resolve_url(&event.uri);
                 match events_from_ical(
-                    event.uri.clone(),
+                    uri.clone(),
                     CalendarId(calendar_url.clone()),
                     event.etag,
                     &event.data,
@@ -735,7 +740,7 @@ impl Account for CalDavAccount {
                             .into_iter()
                             .filter(|event| event_in_range(event, &range.start, &range.end)),
                     ),
-                    Err(_) => failed.push(event.uri),
+                    Err(_) => failed.push(uri),
                 }
             }
             if let Some(limit) = range.limit.and_then(|limit| usize::try_from(limit).ok()) {
@@ -925,27 +930,36 @@ impl Account for CalDavAccount {
             // Search dedups across the four per-property REPORTs, so the
             // failed hrefs need the same treatment before they become
             // `failed_ids`.
-            let mut failed = fetched.failed_hrefs();
+            let mut failed = fetched
+                .failed_hrefs()
+                .into_iter()
+                .map(|href| client.resolve_url(&href))
+                .collect::<Vec<_>>();
             failed.sort_unstable();
             failed.dedup();
-            let mut events = fetched
+            let mut events = Vec::new();
+            for event in fetched
                 .events
                 .into_iter()
                 .filter(|event| seen.insert(event.uri.clone()))
-                .flat_map(|event| {
-                    // Project all VEVENTs (master plus overrides); skip a
-                    // single unparseable resource rather than failing the
-                    // entire search.
-                    events_from_ical(
-                        event.uri,
-                        CalendarId(calendar_url.clone()),
-                        event.etag,
-                        &event.data,
-                    )
-                    .unwrap_or_default()
-                })
-                .filter(|event| event_matches(event, &needle))
-                .collect::<Vec<_>>();
+            {
+                let uri = client.resolve_url(&event.uri);
+                match events_from_ical(
+                    uri.clone(),
+                    CalendarId(calendar_url.clone()),
+                    event.etag,
+                    &event.data,
+                ) {
+                    Ok(projected) => events.extend(
+                        projected
+                            .into_iter()
+                            .filter(|event| event_matches(event, &needle)),
+                    ),
+                    Err(_) => failed.push(uri),
+                }
+            }
+            failed.sort_unstable();
+            failed.dedup();
             if let Some(limit) = request.limit.and_then(|limit| usize::try_from(limit).ok()) {
                 events.truncate(limit);
             }
@@ -1011,7 +1025,12 @@ fn append_path(base: &str, path: &str) -> String {
 }
 
 fn put_condition(etag: Option<&str>) -> PutCondition<'_> {
-    etag.map_or(PutCondition::None, PutCondition::IfMatch)
+    etag.filter(|etag| {
+        !etag
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+    })
+    .map_or(PutCondition::None, PutCondition::IfMatch)
 }
 
 fn same_url(left: &str, right: &str) -> bool {
@@ -1091,6 +1110,11 @@ fn decode_cursor_snapshot(cursor: &ChangeCursor) -> Result<EventSnapshot, Accoun
     let calendar_url = read_string(&mut input)?;
     let sync_token = read_option_string(&mut input)?;
     let count = read_u32(&mut input)?;
+    if count > input.len() / 5 {
+        return Err(cursor_error(
+            "CalDAV cursor entry count exceeds remaining payload",
+        ));
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         entries.push(EventSnapshotEntry {
@@ -1679,6 +1703,22 @@ mod tests {
         let decoded = decode_cursor_snapshot(&cursor).expect("cursor should decode");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn event_cursor_rejects_impossible_count_before_allocating() {
+        let snapshot = EventSnapshot {
+            calendar_url: "https://dav.example.test/cal/".to_string(),
+            sync_token: None,
+            entries: Vec::new(),
+            failed_hrefs: Vec::new(),
+        };
+        let mut cursor =
+            cursor_from_snapshot(CursorScope::Type(ObjectType::CalendarEvent), &snapshot);
+        let count_offset = cursor.server_state.bytes.len() - 4;
+        cursor.server_state.bytes[count_offset..].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        assert!(decode_cursor_snapshot(&cursor).is_err());
     }
 
     #[test]

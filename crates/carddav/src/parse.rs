@@ -27,6 +27,53 @@ pub(crate) struct CardDavFetchedVCard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CardDavFailedResource {
+    pub(crate) href: String,
+    pub(crate) status: Option<u16>,
+}
+
+impl CardDavFailedResource {
+    pub(crate) fn is_missing_resource(&self) -> bool {
+        matches!(self.status, Some(404 | 410))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CardDavMultigetReport {
+    pub(crate) cards: Vec<CardDavFetchedVCard>,
+    pub(crate) failed: Vec<CardDavFailedResource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MultigetOutcome {
+    Usable,
+    CompleteFailure { status: Option<u16> },
+}
+
+impl CardDavMultigetReport {
+    pub(crate) fn extend(&mut self, other: CardDavMultigetReport) {
+        self.cards.extend(other.cards);
+        self.failed.extend(other.failed);
+    }
+
+    pub(crate) fn classify(&self) -> MultigetOutcome {
+        if !self.cards.is_empty() || self.failed.is_empty() {
+            return MultigetOutcome::Usable;
+        }
+        match self
+            .failed
+            .iter()
+            .find(|failure| !failure.is_missing_resource())
+        {
+            Some(failure) => MultigetOutcome::CompleteFailure {
+                status: failure.status,
+            },
+            None => MultigetOutcome::Usable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddressBookCollection {
     pub(crate) href: String,
     pub(crate) display_name: Option<String>,
@@ -61,6 +108,10 @@ pub(crate) fn parse_addressbook_collections(
             }
             Ok(Event::Text(value)) => {
                 push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
             }
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
@@ -131,6 +182,10 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
             Ok(Event::Text(value)) => {
                 push_text(&mut text, value.as_ref())?;
             }
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
@@ -170,9 +225,9 @@ pub(crate) fn parse_propfind_contacts(xml: &str) -> Result<CardDavContactListing
     Ok(listing)
 }
 
-pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard>, String> {
+pub(crate) fn parse_multiget_report(xml: &str) -> Result<CardDavMultigetReport, String> {
     let mut reader = Reader::from_str(xml);
-    let mut results = Vec::new();
+    let mut report = CardDavMultigetReport::default();
     let mut current = ResponseParts::default();
     let mut stack = Vec::new();
     let mut text = String::new();
@@ -188,11 +243,30 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard
                 if current.in_response && name == "propstat" {
                     current.begin_propstat();
                 }
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
+                    current.is_collection = true;
+                }
                 stack.push(name);
                 text.clear();
             }
+            Ok(Event::Empty(element)) => {
+                let name = local_name(element.name().as_ref());
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
+                    current.is_collection = true;
+                }
+            }
             Ok(Event::Text(value)) => {
                 push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
             }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
@@ -205,8 +279,10 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard
                             current.propstat_address_data = trimmed(&text);
                         }
                         (Some("propstat"), "status") => {
+                            current.propstat_status = trimmed(&text);
                             current.propstat_success = Some(is_success_status(&text));
                         }
+                        (Some("response"), "status") => current.status = trimmed(&text),
                         _ => {}
                     }
                 }
@@ -216,7 +292,9 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard
                 if name == "response" {
                     current.in_response = false;
                     if let Some(card) = current.as_fetched_vcard() {
-                        results.push(card);
+                        report.cards.push(card);
+                    } else if let Some(failed) = current.as_failed_multiget_resource() {
+                        report.failed.push(failed);
                     }
                 }
                 stack.pop();
@@ -228,7 +306,7 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<Vec<CardDavFetchedVCard
         }
     }
 
-    Ok(results)
+    Ok(report)
 }
 
 /// Extract the collection `getctag` value from a depth-0 PROPFIND
@@ -260,6 +338,10 @@ pub(crate) fn parse_collection_ctag(xml: &str) -> Result<Option<String>, String>
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
@@ -314,6 +396,10 @@ pub(crate) fn extract_href_property(
             }
             Ok(Event::Text(value)) => {
                 push_text(&mut text, value.as_ref())?;
+            }
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
             }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
@@ -372,7 +458,15 @@ fn status_code(value: &str) -> Option<u16> {
 }
 
 fn normalize_etag(text: &str) -> Option<String> {
-    trimmed(text).map(|value| value.trim_matches('"').to_string())
+    trimmed(text).map(|value| {
+        value
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("W/"))
+            .map_or_else(
+                || value.trim_matches('"').to_string(),
+                |_| format!("W/{}", value[2..].trim()),
+            )
+    })
 }
 
 fn is_vcard_resource(href: &str, content_type: &Option<String>) -> bool {
@@ -397,6 +491,7 @@ struct ResponseParts {
     propstat_success: Option<bool>,
     has_success_propstat: bool,
     saw_failed_propstat: bool,
+    is_collection: bool,
     is_addressbook: bool,
     propstat_is_addressbook: bool,
     href: Option<String>,
@@ -406,6 +501,9 @@ struct ResponseParts {
     propstat_content_type: Option<String>,
     address_data: Option<String>,
     propstat_address_data: Option<String>,
+    status: Option<String>,
+    propstat_status: Option<String>,
+    failed_statuses: Vec<u16>,
     display_name: Option<String>,
     propstat_display_name: Option<String>,
     ctag: Option<String>,
@@ -420,6 +518,7 @@ impl ResponseParts {
         self.propstat_etag = None;
         self.propstat_content_type = None;
         self.propstat_address_data = None;
+        self.propstat_status = None;
         self.propstat_display_name = None;
         self.propstat_ctag = None;
     }
@@ -435,6 +534,9 @@ impl ResponseParts {
     fn commit_propstat(&mut self) {
         if self.propstat_success == Some(false) {
             self.saw_failed_propstat = true;
+            if let Some(code) = self.propstat_status.as_deref().and_then(status_code) {
+                self.failed_statuses.push(code);
+            }
         }
         if self.propstat_success.unwrap_or(true) {
             self.has_success_propstat = true;
@@ -461,6 +563,7 @@ impl ResponseParts {
         self.propstat_etag = None;
         self.propstat_content_type = None;
         self.propstat_address_data = None;
+        self.propstat_status = None;
         self.propstat_display_name = None;
         self.propstat_ctag = None;
     }
@@ -514,6 +617,19 @@ impl ResponseParts {
             etag: self.etag.clone(),
             data: self.address_data.as_ref()?.clone(),
         })
+    }
+
+    fn as_failed_multiget_resource(&self) -> Option<CardDavFailedResource> {
+        if self.is_collection {
+            return None;
+        }
+        let href = self.href.clone()?;
+        let status = self
+            .failed_statuses
+            .first()
+            .copied()
+            .or_else(|| self.status.as_deref().and_then(status_code));
+        Some(CardDavFailedResource { href, status })
     }
 }
 
@@ -620,11 +736,12 @@ END:VCARD</C:address-data>
   </D:response>
 </D:multistatus>"#;
 
-        let cards = parse_multiget_report(xml).expect("valid XML");
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].uri, "/contacts/card-1.vcf");
-        assert_eq!(cards[0].etag.as_deref(), Some("abc"));
-        assert!(cards[0].data.contains("FN:Ada Lovelace"));
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert_eq!(report.cards.len(), 1);
+        assert_eq!(report.cards[0].uri, "/contacts/card-1.vcf");
+        assert_eq!(report.cards[0].etag.as_deref(), Some("abc"));
+        assert!(report.cards[0].data.contains("FN:Ada Lovelace"));
+        assert!(report.failed.is_empty());
     }
 
     #[test]
@@ -645,19 +762,13 @@ END:VCARD</C:address-data>
   </D:response>
 </D:multistatus>"#;
 
-        let cards = parse_multiget_report(xml).expect("valid XML");
-        assert!(cards.is_empty());
+        let report = parse_multiget_report(xml).expect("valid XML");
+        assert!(report.cards.is_empty());
+        assert_eq!(report.failed[0].status, Some(404));
     }
 
     #[test]
-    fn multiget_complete_failure_is_indistinguishable_from_empty() {
-        // GAP (documented, not endorsed): unlike CalDAV's multiget parser,
-        // which returns per-resource failures and classifies an all-failed
-        // 207 as a CompleteFailure (RFC 4918 s13), the CardDAV multiget
-        // returns only the successes. An all-401 body parses to an empty
-        // Vec that the caller cannot tell apart from a legitimately empty
-        // result, so it surfaces as an empty page a consumer records as a
-        // completed walk. Pinned so a future fix flips this loudly.
+    fn multiget_complete_failure_is_classified() {
         let xml = r#"
 <D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
   <D:response>
@@ -676,8 +787,13 @@ END:VCARD</C:address-data>
   </D:response>
 </D:multistatus>"#;
 
-        let cards = parse_multiget_report(xml).expect("valid 207");
-        assert!(cards.is_empty());
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.cards.is_empty());
+        assert_eq!(report.failed.len(), 2);
+        assert_eq!(
+            report.classify(),
+            MultigetOutcome::CompleteFailure { status: Some(401) }
+        );
     }
 
     // The depth-0 getctag PROPFIND backing the brick-8 ctag
@@ -840,5 +956,47 @@ END:VCARD</C:address-data>
 
         let books = parse_addressbook_collections(xml).expect("valid XML");
         assert!(books.is_empty());
+    }
+
+    #[test]
+    fn cdata_is_read_by_carddav_parsers() {
+        let books = parse_addressbook_collections(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:href><![CDATA[/contacts/]]></D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:addressbook/></D:resourcetype><D:displayname><![CDATA[Personal]]></D:displayname></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid collections");
+        assert_eq!(books[0].display_name.as_deref(), Some("Personal"));
+
+        let listing = parse_propfind_contacts(
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href><![CDATA[/contacts/one.vcf]]></D:href><D:propstat><D:prop><D:getetag><![CDATA["one"]]></D:getetag><D:getcontenttype>text/vcard</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid listing");
+        assert_eq!(listing.entries[0].etag.as_deref(), Some("one"));
+
+        let report = parse_multiget_report(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:href><![CDATA[/contacts/one.vcf]]></D:href><D:propstat><D:prop><C:address-data><![CDATA[BEGIN:VCARD
+FN:Ada
+END:VCARD]]></C:address-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid multiget");
+        assert!(report.cards[0].data.contains("FN:Ada"));
+
+        let ctag = parse_collection_ctag(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:CS="http://calendarserver.org/ns/"><D:response><D:propstat><D:prop><CS:getctag><![CDATA[tag-2]]></CS:getctag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid ctag");
+        assert_eq!(ctag.as_deref(), Some("tag-2"));
+
+        let href = extract_href_property(
+            r#"<D:current-user-principal xmlns:D="DAV:"><D:href><![CDATA[/principals/ada/]]></D:href></D:current-user-principal>"#,
+            "current-user-principal",
+        )
+        .expect("valid property");
+        assert_eq!(href.as_deref(), Some("/principals/ada/"));
+    }
+
+    #[test]
+    fn weak_etag_keeps_weakness_marker() {
+        assert_eq!(normalize_etag("W/\"abc\"").as_deref(), Some("W/\"abc\""));
+        assert_eq!(normalize_etag("\"abc\"").as_deref(), Some("abc"));
     }
 }

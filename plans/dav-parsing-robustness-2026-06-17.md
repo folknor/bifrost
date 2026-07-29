@@ -53,12 +53,6 @@ destroy-suppression).
   `crates/types` and every contact provider (jmap, google, graph,
   carddav) - a shared-model contract change, deferred for a decision.
 
-- **Real VTIMEZONE offsets (caldav).** Created events still ship a
-  conservative fixed `+0000` VTIMEZONE stub. A correct offset needs either
-  caldata's `vtimezones-rs` feature or a `chrono-tz` dependency plus the
-  now-canonicalized IANA zone name. New-dependency decision; current
-  behavior does not regress (a strict server re-resolves by TZID name).
-
 - **RDATE/EXDATE multi-value modeling (caldav).** A single
   RDATE/EXDATE property carrying a comma-separated date list (or RDATE
   PERIOD) is treated as one opaque token. Lossless on pass-through

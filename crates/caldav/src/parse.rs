@@ -163,7 +163,10 @@ pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollec
                 if current.in_response && name == "propstat" {
                     current.begin_propstat();
                 }
-                if current.in_response && name == "calendar" {
+                if current.in_response
+                    && name == "calendar"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.mark_calendar();
                 }
                 if current.in_response && name == "privilege" {
@@ -180,7 +183,10 @@ pub(crate) fn parse_calendar_collections(xml: &str) -> Result<Vec<CalendarCollec
             }
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
-                if current.in_response && name == "calendar" {
+                if current.in_response
+                    && name == "calendar"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.mark_calendar();
                 }
                 if current.in_response && name == "privilege" {
@@ -260,7 +266,10 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
                 if current.in_response && name == "propstat" {
                     current.begin_propstat();
                 }
-                if current.in_response && name == "collection" {
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.is_collection = true;
                 }
                 stack.push(name);
@@ -268,11 +277,18 @@ pub(crate) fn parse_propfind_events(xml: &str) -> Result<CalDavEventListing, Str
             }
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
-                if current.in_response && name == "collection" {
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.is_collection = true;
                 }
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
@@ -338,7 +354,10 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
                 if current.in_response && name == "propstat" {
                     current.begin_propstat();
                 }
-                if current.in_response && name == "collection" {
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.is_collection = true;
                 }
                 stack.push(name);
@@ -346,7 +365,10 @@ pub(crate) fn parse_multiget_report(xml: &str) -> Result<CalDavMultigetReport, S
             }
             Ok(Event::Empty(element)) => {
                 let name = local_name(element.name().as_ref());
-                if current.in_response && name == "collection" {
+                if current.in_response
+                    && name == "collection"
+                    && stack.iter().any(|item| item == "resourcetype")
+                {
                     current.is_collection = true;
                 }
             }
@@ -433,6 +455,10 @@ pub(crate) fn parse_sync_collection_report(xml: &str) -> Result<CalDavSyncReport
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 let parent = stack.iter().rev().nth(1).map(String::as_str);
@@ -469,10 +495,20 @@ pub(crate) fn extract_href_property(
     xml: &str,
     property_name: &str,
 ) -> Result<Option<String>, String> {
+    Ok(extract_href_properties(xml, property_name)?
+        .into_iter()
+        .next())
+}
+
+pub(crate) fn extract_href_properties(
+    xml: &str,
+    property_name: &str,
+) -> Result<Vec<String>, String> {
     let mut reader = Reader::from_str(xml);
     let mut in_property = false;
     let mut current_tag = String::new();
     let mut text = String::new();
+    let mut hrefs = Vec::new();
 
     loop {
         match reader.read_event() {
@@ -485,13 +521,17 @@ pub(crate) fn extract_href_property(
                 text.clear();
             }
             Ok(Event::Text(value)) => push_text(&mut text, value.as_ref())?,
+            Ok(Event::CData(value)) => {
+                let value = value.decode().map_err(|error| error.to_string())?;
+                text.push_str(&value);
+            }
             Ok(Event::End(element)) => {
                 let name = local_name(element.name().as_ref());
                 if in_property
                     && current_tag == "href"
                     && let Some(href) = trimmed(&text)
                 {
-                    return Ok(Some(href));
+                    hrefs.push(href);
                 }
                 if name == property_name {
                     in_property = false;
@@ -505,7 +545,7 @@ pub(crate) fn extract_href_property(
         }
     }
 
-    Ok(None)
+    Ok(hrefs)
 }
 
 fn push_text(target: &mut String, raw: &[u8]) -> Result<(), String> {
@@ -526,7 +566,15 @@ fn trimmed(text: &str) -> Option<String> {
 }
 
 fn normalize_etag(text: &str) -> Option<String> {
-    trimmed(text).map(|value| value.trim_matches('"').to_string())
+    trimmed(text).map(|value| {
+        value
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("W/"))
+            .map_or_else(
+                || value.trim_matches('"').to_string(),
+                |_| format!("W/{}", value[2..].trim()),
+            )
+    })
 }
 
 fn is_calendar_resource(href: &str, content_type: &Option<String>) -> bool {
@@ -1312,5 +1360,62 @@ END:VCALENDAR</C:calendar-data></D:prop>
                 },
             ]
         );
+    }
+
+    #[test]
+    fn cdata_is_read_by_listing_sync_and_href_parsers() {
+        let listing = parse_propfind_events(
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href><![CDATA[/cal/one.ics]]></D:href><D:propstat><D:prop><D:getetag><![CDATA["one"]]></D:getetag><D:getcontenttype>text/calendar</D:getcontenttype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid listing");
+        assert_eq!(listing.entries[0].uri, "/cal/one.ics");
+        assert_eq!(listing.entries[0].etag.as_deref(), Some("one"));
+
+        let sync = parse_sync_collection_report(
+            r#"<D:multistatus xmlns:D="DAV:"><D:sync-token><![CDATA[token-2]]></D:sync-token><D:response><D:href><![CDATA[/cal/one.ics]]></D:href><D:propstat><D:prop><D:getetag><![CDATA["two"]]></D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid sync report");
+        assert_eq!(sync.sync_token.as_deref(), Some("token-2"));
+        assert_eq!(sync.entries[0].etag.as_deref(), Some("two"));
+
+        let href = extract_href_property(
+            r#"<D:current-user-principal xmlns:D="DAV:"><D:href><![CDATA[/principals/ada/]]></D:href></D:current-user-principal>"#,
+            "current-user-principal",
+        )
+        .expect("valid property");
+        assert_eq!(href.as_deref(), Some("/principals/ada/"));
+    }
+
+    #[test]
+    fn address_set_extractor_returns_every_href() {
+        let hrefs = extract_href_properties(
+            r#"<C:calendar-user-address-set xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:href>/principals/ada/</D:href><D:href>Mailto:Ada@example.test</D:href></C:calendar-user-address-set>"#,
+            "calendar-user-address-set",
+        )
+        .expect("valid property");
+
+        assert_eq!(
+            hrefs,
+            vec![
+                "/principals/ada/".to_string(),
+                "Mailto:Ada@example.test".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn weak_etag_keeps_weakness_marker() {
+        assert_eq!(normalize_etag("W/\"abc\"").as_deref(), Some("W/\"abc\""));
+        assert_eq!(normalize_etag("\"abc\"").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn calendar_element_outside_resourcetype_does_not_mark_collection() {
+        let collections = parse_calendar_collections(
+            r#"<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:href>/not-a-calendar/</D:href><D:propstat><D:prop><D:owner><C:calendar/></D:owner></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>"#,
+        )
+        .expect("valid multistatus");
+
+        assert!(collections.is_empty());
     }
 }

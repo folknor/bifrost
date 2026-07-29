@@ -35,7 +35,9 @@ calendar primitives.
   diff preserves a transiently-failed resource instead of destroying it.
   Event listing and multiget parsers use element-stack parent checks so
   nested same-name properties do not overwrite response-level hrefs or
-  propstat status.
+  propstat status. Every text-bearing parser accepts both XML text and
+  CDATA. Scheduling address-set extraction returns every nested href;
+  single-valued discovery properties use the first.
 - `ical.rs` - iCalendar projection between DAV resources and
   `bifrost-types` calendar events. Parsing-in uses `caldata`'s streaming
   `ContentLineParser` (RFC 5545 unfolding that strips exactly one fold WSP,
@@ -57,15 +59,32 @@ calendar primitives.
   resolved with a precedence picker (VALUE=DATE > TZID > UTC > floating)
   rather than rejected. A genuinely malformed body (unterminated quoted
   parameter, missing name/value, invalid UTF-8) returns an error;
-  `event_from_ical` is fallible and the listing/search paths degrade a
-  single bad resource to a skip, while `event_get`/`event_update` surface a
-  local error. A TZID-bearing local time projects as a bare wall-clock value
+  `event_from_ical` is fallible and the listing/search paths route a
+  single bad resource into `Page::failed_ids`, while
+  `event_get`/`event_update` surface a local error. A TZID-bearing local time
+  projects as a bare wall-clock value
   (no false `Z`) with the zone in `timezone`; Microsoft/Windows zone names
   (e.g. `W. Europe Standard Time`) are mapped to IANA via caldata's
-  proprietary-TZID table. Serialization-out (create/patch/RSVP) stays
+  proprietary-TZID table. A non-ASCII DATE or DATE-TIME grammar value is
+  preserved verbatim rather than sliced at fixed byte offsets. `DTSTART`
+  plus `DURATION` projects an end when `DTEND` is absent; an explicit end
+  patch removes DURATION before emitting DTEND. A resource with no VEVENT
+  (a VTODO or VJOURNAL sharing the collection) projects to a
+  `event_get`/`event_update` error and to *no* events in the listing lanes,
+  never to a fabricated empty event.
+  Serialization-out (create/patch/RSVP) stays
   hand-rolled and verbatim-preserving: patches splice on *physical* lines,
   folding only newly emitted lines, so long preserved/unmodeled values
-  round-trip byte for byte. VTIMEZONE generation emits a single STANDARD
+  round-trip byte for byte. Replacement matching is case-insensitive and
+  limited to depth-zero VEVENT properties, so VALARM properties are
+  preserved; new event properties are inserted before the first nested
+  component. A body that offers no splice point (no `BEGIN:VEVENT`, or a
+  first VEVENT that never closes) is an error rather than an unchanged
+  write-back that would look like a successful edit. Parameter values use
+  RFC 6868 caret encoding in both directions; caldata hands back raw
+  parameters, so the decode of free-text parameters (CN, TZID) is this
+  crate's. VTIMEZONE
+  generation emits a single STANDARD
   block carrying the real UTC offset for the event's instant (the TZID is
   parsed to a `chrono_tz::Tz` after Windows/Exchange-alias folding, and the
   offset is resolved from the DTSTART wall-clock with the same
@@ -135,7 +154,9 @@ Supported calendar primitives:
   definitions; an unknown zone emits the bare VTIMEZONE with no offset block.
 - `event_update` - fetches the current event, applies the shared
   `EventPatch`, and writes the replacement resource with `If-Match`
-  when an etag was present. When the current resource carried raw
+  when a strong etag was present. Weak ETags retain their `W/` marker for
+  snapshot comparison but deliberately make the PUT unconditional because
+  If-Match requires strong comparison. When the current resource carried raw
   iCalendar data, updates rewrite each VEVENT property the patch carries -
   summary, description, location, start/end, status, transparency
   (TRANSP), class (CLASS), recurrence, and attendees - while preserving
@@ -163,7 +184,9 @@ Supported calendar primitives:
   `CALDAV:calendar-user-address-set`, or configured explicitly). A plain
   RFC 4791 store that advertises neither reports `event_rsvp = false`, so
   a consumer's capability gate rejects the call up front instead of the
-  iTIP POST failing on the wire.
+  iTIP POST failing on the wire. The address-set is treated as a set:
+  discovery examines every href and uses the first case-insensitive
+  `mailto:` URI.
 - `event_search` / `event_autocomplete` - non-empty searches issue
   CalDAV text-match `calendar-query` `REPORT`s over VEVENT summary,
   description, location, and attendee, then keep local filtering as a
@@ -175,7 +198,8 @@ Cursor support is calendar-event only. `discover_cursor_scopes` returns
 builds a hybrid cursor from the calendar URL, the collection
 `sync-token` when present, and a sorted href/etag snapshot.
 `changes_stream` uses WebDAV `sync-collection` when the cursor carries a
-sync token, applies returned href/etag/status entries to the snapshot
+sync token, issuing the REPORT with `Depth: 0` as required by RFC 6578,
+and applies returned href/etag/status entries to the snapshot
 (deleting only on explicit per-entry `404`/`410`), and emits
 created/updated/destroyed event changes. Calendars without a sync token
 fall back to polling snapshot diffs. The PROPFIND-snapshot diff (not the
@@ -184,6 +208,11 @@ empty multistatus against a populated prior snapshot suppresses the
 mass-delete, and any href in `current.failed_hrefs` is preserved rather
 than destroyed. `inventory_stream` emits event inventory entries with ETag
 fingerprints for the same cursor scope.
+An expired token reported as 403 with `DAV:valid-sync-token`, or as 410,
+becomes scoped `SyncState(CursorInvalid)`, which directs the engine to
+restart the calendar-event cursor. Cursor entry counts are payload-bounded
+before allocation. Range, search, inventory, changes, and their failed-id
+lanes all use resolved absolute resource URLs as native ids.
 
 All mail, contact, filter, blob, push, and settings methods return
 `AccountErrorKind::Unsupported` stamped with `Protocol::CalDav`.

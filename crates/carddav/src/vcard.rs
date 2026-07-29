@@ -566,14 +566,14 @@ fn split_content_line(line: &str) -> Result<ContentLine, String> {
                 let (content, remainder) = stripped
                     .split_once('"')
                     .ok_or_else(|| "vCard parameter is missing a closing quote".to_string())?;
-                values.push(content.to_string());
+                values.push(unescape_param(content));
                 rest = remainder;
             } else {
                 let delim = rest
                     .find([';', ':', ','])
                     .ok_or_else(|| "vCard parameter value is missing a delimiter".to_string())?;
                 let (content, remainder) = rest.split_at(delim);
-                values.push(content.to_string());
+                values.push(unescape_param(content));
                 rest = remainder;
             }
             if let Some(stripped) = rest.strip_prefix(',') {
@@ -757,9 +757,12 @@ fn type_from_params(params: &[(String, Vec<String>)]) -> Option<String> {
 
 fn is_primary(params: &[(String, Vec<String>)]) -> bool {
     params.iter().any(|(key, values)| {
-        // 4.0: PREF=1 (any PREF value counts as preferred). 3.0: TYPE=PREF.
+        // 4.0: only the highest preference, PREF=1, maps to the shared
+        // primary flag. 3.0: TYPE=PREF.
         if key == "PREF" {
-            return true;
+            return values
+                .iter()
+                .any(|value| value.parse::<u8>().ok() == Some(1));
         }
         key == "TYPE"
             && values
@@ -768,12 +771,52 @@ fn is_primary(params: &[(String, Vec<String>)]) -> bool {
     })
 }
 
+/// RFC 6868 parameter-value decoding, the inverse of [`escape_param`]:
+/// `^n` is a newline, `^'` a `"`, `^^` a caret. A caret before anything
+/// else is literal, so a value from a producer that predates RFC 6868
+/// survives unchanged.
+fn unescape_param(value: &str) -> String {
+    if !value.contains('^') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '^' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('\'') => out.push('"'),
+            Some('^') => out.push('^'),
+            Some(other) => {
+                out.push('^');
+                out.push(other);
+            }
+            None => out.push('^'),
+        }
+    }
+    out
+}
+
 fn escape_param(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\r', "")
-        .replace('\n', "\\n");
+    let mut escaped = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '^' => escaped.push_str("^^"),
+            '"' => escaped.push_str("^'"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                escaped.push_str("^n");
+            }
+            '\n' => escaped.push_str("^n"),
+            _ => escaped.push(ch),
+        }
+    }
     if escaped.contains([';', ',', ':']) {
         format!("\"{escaped}\"")
     } else {
@@ -1136,6 +1179,44 @@ mod tests {
     }
 
     #[test]
+    fn only_pref_one_maps_to_primary() {
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            None,
+            None,
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEMAIL;PREF=2:second@example.test\r\nEMAIL;PREF=1:first@example.test\r\nEND:VCARD\r\n",
+        );
+
+        assert!(!contact.emails[0].is_primary);
+        assert!(contact.emails[1].is_primary);
+    }
+
+    #[test]
+    fn parameter_values_use_rfc6868_caret_encoding() {
+        assert_eq!(escape_param("Ada \"Ace\" ^ Team"), "Ada ^'Ace^' ^^ Team");
+        assert_eq!(escape_param("one\r\ntwo"), "one^ntwo");
+    }
+
+    #[test]
+    fn parameter_values_round_trip_through_rfc6868_decoding() {
+        // Writing carets a reader keeps verbatim would surface `^'` in a
+        // TYPE label; the decode is what makes the encoding lossless.
+        for value in ["Ada \"Ace\" ^ Team", "one\ntwo", "plain"] {
+            assert_eq!(unescape_param(&escape_param(value)), value);
+        }
+        // A lone caret from a pre-RFC-6868 producer is literal.
+        assert_eq!(unescape_param("50^ off"), "50^ off");
+
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            None,
+            None,
+            "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Ada\r\nEMAIL;TYPE=^'work^':ada@example.test\r\nEND:VCARD\r\n",
+        );
+        assert_eq!(contact.emails[0].kind.as_deref(), Some("\"work\""));
+    }
+
+    #[test]
     fn detect_version_reads_version_line_and_defaults_to_v4() {
         assert_eq!(
             detect_version("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:A\r\nEND:VCARD\r\n"),
@@ -1338,10 +1419,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_resource_degrades_to_skip_not_hard_failure() {
+    fn malformed_resource_is_a_per_resource_projection_failure() {
         // An unterminated quoted parameter is a tokenizer error; the projector
-        // returns Err so the caller can route the resource to failed_hrefs (a
-        // filter_map skip in the bulk paths) instead of failing the whole sync.
+        // returns Err so the caller can route the resource to failed_ids
+        // instead of failing the whole sync.
         let data =
             "BEGIN:VCARD\r\nFN:Ada\r\nEMAIL;TYPE=\"unterminated:ada@example.test\r\nEND:VCARD\r\n";
         assert!(contact_from_vcard("/ab/1.vcf".to_string(), None, None, data).is_err());
