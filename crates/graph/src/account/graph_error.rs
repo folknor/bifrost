@@ -925,6 +925,51 @@ pub(crate) fn protocol_violation(
         .expect("valid account error classification")
 }
 
+/// Build the `AccountError` for a `$batch` subrequest the server never
+/// answered.
+///
+/// The outer `$batch` envelope decoded, so the request WAS acknowledged;
+/// what is unknown is whether the omitted subrequest ran. A decoded outer
+/// response is no evidence that the item was skipped, so this must not
+/// claim the item was left alone: a `move` or `DELETE` that landed and
+/// then lost its response reads identically on the wire.
+///
+/// `Protocol(ContractViolation)` is the wrong kind here because it derives
+/// `ProviderContractViolation`, which is terminal - the engine would file
+/// the mutation as `failed_terminal` with no read-back and never discover
+/// that the write did land. `Protocol(PartialResponse)` is the shared
+/// contract's answer: it retries idempotent work (hydration, absolute-state
+/// flag writes) and routes non-idempotent work (move, destroy) to
+/// `Reconcile(PartialCompletionSignal)` so the caller probes the target.
+#[must_use]
+pub(crate) fn batch_response_missing(
+    operation: AccountOperation,
+    scope: Option<ErrorScope>,
+    detail: impl Into<String>,
+) -> AccountError {
+    let detail = DiagnosticText::support_only(detail.into());
+    let mut builder = AccountErrorBuilder::new(
+        AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse),
+        Cause::Wire(WireCause::MalformedResponse {
+            protocol: Protocol::Graph,
+            detail: Some(detail.clone()),
+        }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .text(detail);
+    if let Some(scope) = scope {
+        builder = builder.scope(scope);
+    }
+    // The `$batch` envelope came back, so transmission evidence is
+    // `Acknowledged`, not the `Unsent` default.
+    builder = push_attempt(builder, TransmissionState::Acknowledged);
+    builder
+        .try_build()
+        .expect("valid account error classification")
+}
+
 /// Translate a single `$batch` response item into an
 /// `ItemOutcome<MutationSuccess>`. Centralizes the mutation outcome
 /// rules from the plan: 2xx -> applied, destroy-404 -> skipped, 404 -> not
@@ -964,7 +1009,8 @@ mod tests {
     use crate::error::{GraphError, GraphResponseError};
     use bifrost_types::{
         AccessErrorKind, AccountErrorKind, AuthErrorKind, CursorScope, EngineDirective,
-        ProtocolErrorKind, RecoveryClass, ServerErrorKind, SyncStateErrorKind,
+        ProtocolErrorKind, ReconcileAction, ReconcileReason, RecoveryClass, ServerErrorKind,
+        SyncStateErrorKind,
     };
     use bytes::Bytes;
     use reqwest::StatusCode;
@@ -997,6 +1043,61 @@ mod tests {
 
     fn graph_ctx(op: AccountOperation) -> GraphErrorContext {
         GraphErrorContext::graph(op)
+    }
+
+    /// An omitted `$batch` subrequest is AMBIGUOUS, and the shared
+    /// contract splits that ambiguity on idempotency: read-back the
+    /// non-idempotent ones, re-issue the idempotent ones. Neither may be
+    /// terminal - `Protocol(ContractViolation)`, the classification this
+    /// replaced, derives `ProviderContractViolation`, so the engine filed
+    /// a move or destroy that may well have LANDED as `failed_terminal`
+    /// with no read-back at all.
+    #[test]
+    fn a_missing_batch_subresponse_is_ambiguous_never_terminal() {
+        for (operation, idempotent) in [
+            (AccountOperation::Hydrate, true),
+            (AccountOperation::UpdateFlags, true),
+            (AccountOperation::BulkMove, false),
+            (AccountOperation::BulkDestroy, false),
+        ] {
+            let err = batch_response_missing(
+                operation,
+                Some(ErrorScope::Message {
+                    id: "m1".to_string(),
+                }),
+                "Graph $batch returned no response for m1",
+            );
+            assert!(matches!(
+                err.kind(),
+                AccountErrorKind::Protocol(ProtocolErrorKind::PartialResponse)
+            ));
+            assert!(!err.recovery().is_terminal(), "{operation:?}");
+            assert_eq!(err.message_key(), "protocol.partial-response");
+
+            if idempotent {
+                assert!(err.recovery().is_retryable(), "{operation:?}");
+            } else {
+                let RecoveryClass::Reconcile(advice) = err.recovery() else {
+                    panic!("{operation:?} should reconcile, got {:?}", err.recovery());
+                };
+                assert_eq!(advice.reason, ReconcileReason::PartialCompletionSignal);
+                assert!(
+                    advice
+                        .guidance
+                        .actions
+                        .contains(&ReconcileAction::CheckTarget)
+                );
+            }
+
+            // The outer `$batch` envelope decoded, so the request was
+            // acknowledged. Defaulting to `Unsent` would tell a consumer
+            // nothing crossed the wire.
+            assert_eq!(
+                err.telemetry_fields().transmission_state,
+                Some(TransmissionState::Acknowledged),
+                "{operation:?}"
+            );
+        }
     }
 
     #[test]

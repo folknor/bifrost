@@ -123,9 +123,15 @@ pub(crate) fn inventory_stream(
                 yield SyncEvent::Done(Some(checkpoint));
                 return;
             } else {
-                if !entries.is_empty() {
-                    yield batch(entries, PageBoundary::Final, None);
-                }
+                // A delta page must advance with either a next link or a
+                // delta link. Completing without a checkpoint would make
+                // the engine restart inventory from page one forever.
+                yield SyncEvent::Terminated(super::graph_error::protocol_violation(
+                    bifrost_types::ProtocolErrorKind::ContractViolation,
+                    AccountOperation::SyncInventory,
+                    Some(ErrorScope::Cursor(scope.clone())),
+                    "Graph delta page had neither @odata.nextLink nor @odata.deltaLink",
+                ));
                 yield SyncEvent::Done(None);
                 return;
             }
@@ -187,7 +193,9 @@ pub(crate) fn inventory_entry_from_value(
 
 pub(crate) fn membership_from_value(scope: &CursorScope, value: &Value) -> MembershipScope {
     let fallback = match scope {
-        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => folder.0.clone(),
+        CursorScope::FolderType { folder, .. } | CursorScope::Folder(folder) => {
+            super::foreign::parse_folder(folder).native_id().to_string()
+        }
         _ => String::new(),
     };
     let native = value
@@ -691,33 +699,16 @@ mod tests {
         }
     }
 
-    /// Documents a defect, NOT the intended contract.
-    /// When a foreign (shared-mailbox) scope's
-    /// item carries no `parentFolderId` - which is every delta `@removed`
-    /// tombstone - `membership_from_value` falls back to the scope's
-    /// ALREADY-ENCODED folder id and then encodes it a second time, so the
-    /// membership names `mailbox\u{1f}mailbox\u{1f}folder`. Discovery never
-    /// emits that folder, so a shared-mailbox deletion is filed against a
-    /// scope the engine does not have. The correct fallback is the scope's
-    /// native folder id.
     #[test]
-    fn foreign_scope_membership_double_encodes_when_parent_is_absent() {
+    fn foreign_scope_membership_uses_the_native_fallback_when_parent_is_absent() {
         let scope = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkRoot"),
             ty: ObjectType::Email,
         };
         let tombstone = json!({ "id": "m1", "@removed": { "reason": "deleted" } });
 
-        let got = membership_from_value(&scope, &tombstone);
         assert_eq!(
-            got,
-            MembershipScope::Folder(FolderId(
-                "shared@contoso.com\u{1f}shared@contoso.com\u{1f}AAMkRoot".to_string()
-            ))
-        );
-        // What discovery emitted for that same folder, for contrast:
-        assert_ne!(
-            got,
+            membership_from_value(&scope, &tombstone),
             MembershipScope::Folder(super::super::foreign::encode_foreign(
                 "shared@contoso.com",
                 "AAMkRoot"

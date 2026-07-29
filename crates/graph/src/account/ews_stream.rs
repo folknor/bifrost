@@ -260,7 +260,9 @@ pub(crate) fn build_subscribe_request(scopes: &[CursorScope], watermark: Option<
     let mut folder_ids = String::new();
     for scope in scopes {
         if let CursorScope::FolderType { folder, .. } = scope {
-            folder_ids.push_str(&format!(r#"<t:FolderId Id="{}"/>"#, xml_escape(&folder.0)));
+            let parsed = super::foreign::parse_folder(folder);
+            let native = parsed.native_id();
+            folder_ids.push_str(&format!(r#"<t:FolderId Id="{}"/>"#, xml_escape(native)));
         }
     }
     let watermark_xml = watermark
@@ -637,31 +639,23 @@ mod tests {
     /// (`push::resource_for_scope`, `inventory::initial_delta_url`); the EWS
     /// Subscribe body does not. A shared-mailbox scope therefore emits the
     /// raw `mailbox\u{1f}folder` string inside an XML attribute - U+001F is
-    /// not a legal XML 1.0 character and `xml_escape` covers only the five
-    /// metacharacters - and even if it parsed, it names a folder id the
-    /// primary mailbox does not own (no routing header is sent either).
     #[test]
-    fn subscribe_request_leaks_the_foreign_separator_into_the_folder_id() {
+    fn subscribe_request_uses_the_native_folder_id() {
         let scope = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
             ty: bifrost_types::ObjectType::Email,
         };
         let body = build_subscribe_request(&[scope], None);
-        assert!(body.contains('\u{1f}'), "{body:?}");
-        assert!(body.contains("shared@contoso.com"), "{body}");
-        // The native-id form the other builders would have produced.
-        assert!(!body.contains(r#"<t:FolderId Id="AAMk"/>"#), "{body}");
+        assert!(!body.contains('\u{1f}'), "{body:?}");
+        assert!(!body.contains("shared@contoso.com"), "{body}");
+        assert!(body.contains(r#"<t:FolderId Id="AAMk"/>"#), "{body}");
     }
 
-    /// Documents a defect, NOT the intended contract.
-    /// A scope that is not `FolderType` is
-    /// silently skipped, so a request built from only such scopes ships an
-    /// empty `<t:FolderIds>`, which EWS rejects with
-    /// `ErrorInvalidSubscriptionRequest` - and that response code is not in
-    /// `SoapFaultCode::parse`, so it lands on the terminal Unknown path and
-    /// kills the worker.
+    /// The body builder assumes `push_subscribe` already validated every
+    /// scope as `FolderType`. Keeping that validation at the public boundary
+    /// prevents an empty FolderIds request from reaching EWS.
     #[test]
-    fn subscribe_request_silently_drops_non_folder_scopes() {
+    fn subscribe_request_builder_omits_unvalidated_non_folder_scopes() {
         let body = build_subscribe_request(&[CursorScope::Account], None);
         assert!(body.contains("<t:FolderIds></t:FolderIds>"), "{body}");
     }

@@ -105,20 +105,47 @@ async fn subscribe_graph(
         }
     }
 
+    // Mint the handle BEFORE the first create. `new_handle` is fallible
+    // (it can fail on host RNG) and classifies its error `Unsent`, which
+    // is only true while nothing has been written. Minting it after the
+    // creates would let an RNG failure return a no-bytes-sent error with
+    // live server-side subscriptions behind it, so a caller acting on
+    // that classification by retrying would duplicate them.
+    let handle = new_handle()?;
+
     let mut subscriptions = Vec::new();
     for (resource, _) in grouped {
-        let response = create_subscription(&account.client, &resource, &endpoint.webhook_url, None)
-            .await
-            .map_err(|e| {
-                into_account_error(e, GraphErrorContext::graph(AccountOperation::PushSubscribe))
-            })?;
-        subscriptions.push(GraphSubscriptionState {
-            server_id: response.id,
-            expires_at: response.expiration_date_time,
-        });
+        match create_subscription(&account.client, &resource, &endpoint.webhook_url, None).await {
+            Ok(response) => subscriptions.push(GraphSubscriptionState {
+                server_id: response.id,
+                expires_at: response.expiration_date_time,
+            }),
+            Err(error) => {
+                // The handle is never registered on the account and never
+                // returned on this path, so nothing downstream could ever
+                // reach these subscriptions to tear them down. Retain none
+                // of them. Cleanup is best effort: preserve the create
+                // error the caller needs to act on even if a DELETE fails.
+                for subscription in &subscriptions {
+                    if let Err(cleanup_error) =
+                        delete_subscription(&account.client, &subscription.server_id).await
+                    {
+                        tracing::warn!(
+                            target: "bifrost_graph::webhooks",
+                            server_id = %subscription.server_id,
+                            error = ?cleanup_error,
+                            "failed to roll back Graph webhook subscription"
+                        );
+                    }
+                }
+                return Err(into_account_error(
+                    error,
+                    GraphErrorContext::graph(AccountOperation::PushSubscribe),
+                ));
+            }
+        }
     }
 
-    let handle = new_handle()?;
     account
         .graph_subscriptions
         .write()
@@ -256,10 +283,37 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
     }
 }
 
+/// Whether the EWS streaming worker can actually subscribe to `scope`.
+///
+/// Two exclusions, both of which the worker would otherwise turn into a
+/// remote failure that reads as a provider fault instead of the caller's
+/// unsupported request:
+///
+/// - A non-`FolderType` scope contributes nothing to the Subscribe body's
+///   `FolderIds`, so a request built only from such scopes ships an empty
+///   `<t:FolderIds></t:FolderIds>` and EWS rejects the whole subscription.
+/// - A foreign (shared-mailbox) folder is addressable only with that
+///   mailbox's EWS routing headers, and the Subscribe path sends
+///   `EwsHeaders::default()`. Its native folder id would be resolved
+///   against the PRIMARY mailbox's namespace - a wrong folder or a miss,
+///   never the intended one. Mailbox-grouped EWS subscriptions are the fix;
+///   until then this rejects rather than silently mis-targets.
+fn ews_scope_is_subscribable(scope: &CursorScope) -> bool {
+    match scope {
+        CursorScope::FolderType { folder, .. } => {
+            super::foreign::parse_folder(folder).foreign().is_none()
+        }
+        _ => false,
+    }
+}
+
 async fn subscribe_ews(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
 ) -> Result<SubscriptionHandle, AccountError> {
+    if !scopes.iter().all(ews_scope_is_subscribable) {
+        return Err(unsupported_push_error());
+    }
     let handle = new_handle()?;
     account.ews_subscriptions.write().await.insert(
         handle.clone(),
@@ -340,6 +394,35 @@ mod tests {
     use crate::client::GraphClient;
 
     use super::*;
+
+    /// The EWS Subscribe boundary and the webhook boundary must agree on
+    /// what "subscribable" means. A non-folder scope contributes nothing
+    /// to `FolderIds` (empty element -> EWS rejects the whole request),
+    /// and a foreign folder would be resolved against the PRIMARY
+    /// mailbox's namespace because the Subscribe path sends no routing
+    /// headers. Both must be refused locally as `Unsupported`, not
+    /// converted into a remote failure that reads as a provider fault.
+    #[test]
+    fn ews_subscribe_accepts_only_primary_mailbox_folder_scopes() {
+        let primary = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        assert!(ews_scope_is_subscribable(&primary));
+
+        let foreign = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        assert!(!ews_scope_is_subscribable(&foreign));
+
+        // A public-folder scope, and the account-wide scope the webhook
+        // path already rejects loudly.
+        assert!(!ews_scope_is_subscribable(&CursorScope::Folder(FolderId(
+            "pf".to_string()
+        ))));
+        assert!(!ews_scope_is_subscribable(&CursorScope::Account));
+    }
 
     #[test]
     fn graph_subscription_resource_uses_folder_messages() {

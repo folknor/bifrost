@@ -290,14 +290,74 @@ async fn fetch_batch(
     // consumer sees one outcome per pulled id regardless of which arm served
     // it.
     let mut outcomes: Vec<ItemOutcome<HydratedObject>> = std::mem::take(&mut ews_outcomes);
-    let mut etags = Vec::new();
+    let etags = reconcile_hydration_responses(&ids, response.responses, projection, &mut outcomes);
 
-    for item in response.responses {
-        let index = item.id.parse::<usize>().ok();
-        let id = index
-            .and_then(|idx| ids.get(idx))
-            .cloned()
-            .unwrap_or_else(|| ObjectId(item.id.clone()));
+    if !etags.is_empty() {
+        let mut cache = account.etag_index.write().await;
+        for (id, etag) in etags {
+            cache.insert(id, etag);
+        }
+    }
+
+    Ok(vec![SyncEvent::Batch(Batch {
+        items: outcomes,
+        page_boundary: if is_final {
+            PageBoundary::Final
+        } else {
+            PageBoundary::Page
+        },
+        server_latency: std::time::Duration::default(),
+        bytes_in: 0,
+        checkpoint: None::<Checkpoint>,
+    })])
+}
+
+/// Project the REST arm's `$batch` responses onto the submitted ids,
+/// appending one `ItemOutcome` per id to `outcomes` and returning the
+/// `(id, etag)` pairs harvested from successful bodies.
+///
+/// Pure over the decoded response, so the accounting rules below are
+/// unit-pinnable without a live `$batch` endpoint. Three of them are
+/// non-obvious:
+///
+/// - A response id that does not parse as a submitted index, or parses out
+///   of range, is DISCARDED rather than turned into an outcome. Minting an
+///   `ObjectId` from the response id would inject an id the caller never
+///   asked for while the real one stays unanswered.
+/// - A duplicate response id is discarded for the same reason: the first
+///   answer already claimed that lane slot, and a second would break the
+///   one-outcome-per-id contract.
+/// - Any submitted id left unanswered gets `Protocol(PartialResponse)`,
+///   not a terminal contract violation. Hydration is idempotent, so the
+///   consumer re-reads; a terminal class would drop the id permanently for
+///   a condition the next GET usually clears.
+fn reconcile_hydration_responses(
+    ids: &[ObjectId],
+    responses: Vec<crate::types::BatchResponseItem>,
+    projection: Projection,
+    outcomes: &mut Vec<ItemOutcome<HydratedObject>>,
+) -> Vec<(String, String)> {
+    let mut etags = Vec::new();
+    let mut seen_indices = HashSet::new();
+
+    for item in responses {
+        let Some(index) = item.id.parse::<usize>().ok().filter(|idx| *idx < ids.len()) else {
+            tracing::warn!(
+                target: "bifrost_graph::batch",
+                response_id = %item.id,
+                "ignoring Graph $batch hydration response with an invalid request id"
+            );
+            continue;
+        };
+        if !seen_indices.insert(index) {
+            tracing::warn!(
+                target: "bifrost_graph::batch",
+                response_id = %item.id,
+                "ignoring duplicate Graph $batch hydration response"
+            );
+            continue;
+        }
+        let id = ids[index].clone();
         let batch_id = BatchItemId(id.0.clone());
         if !(200..=299).contains(&item.status) {
             // Per-item failure: build a structured AccountError via
@@ -348,24 +408,21 @@ async fn fetch_batch(
         )));
     }
 
-    if !etags.is_empty() {
-        let mut cache = account.etag_index.write().await;
-        for (id, etag) in etags {
-            cache.insert(id, etag);
+    for (index, id) in ids.iter().enumerate() {
+        if seen_indices.contains(&index) {
+            continue;
         }
+        outcomes.push(ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId(id.0.clone()),
+            super::graph_error::batch_response_missing(
+                AccountOperation::Hydrate,
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!("Graph $batch returned no response for {}", id.0),
+            ),
+        )));
     }
 
-    Ok(vec![SyncEvent::Batch(Batch {
-        items: outcomes,
-        page_boundary: if is_final {
-            PageBoundary::Final
-        } else {
-            PageBoundary::Page
-        },
-        server_latency: std::time::Duration::default(),
-        bytes_in: 0,
-        checkpoint: None::<Checkpoint>,
-    })])
+    etags
 }
 
 fn reconstruct_headers(h: &std::collections::HashMap<String, String>) -> HeaderMap {
@@ -397,7 +454,7 @@ fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> H
         | Projection::Preview(_)
         | Projection::TextOnly
         | Projection::Full
-        | Projection::FullWithBlobs => metadata_or_flags(value),
+        | Projection::FullWithBlobs => metadata_or_flags(&id, value),
         _ => HydratedObjectKind::FlagsOnly(flags_from_value(value)),
     };
     let blobs = value
@@ -418,20 +475,32 @@ fn hydrated_from_value(id: ObjectId, value: &Value, projection: Projection) -> H
 /// `FlagsOnly` when an inventory entry cannot be constructed. Shared by
 /// the `Metadata` projection and the body-bearing projections that A3
 /// degrades to metadata (the real body path is `open_raw_rfc822`).
-fn metadata_or_flags(value: &Value) -> HydratedObjectKind {
+fn metadata_or_flags(id: &ObjectId, value: &Value) -> HydratedObjectKind {
+    let folder = value
+        .get("parentFolderId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parsed_id = super::foreign::parse_message_id(id);
     let scope = CursorScope::FolderType {
-        folder: FolderId(
-            value
-                .get("parentFolderId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        ),
+        folder: match parsed_id.owner() {
+            Some(owner) => super::foreign::encode_foreign(owner, folder),
+            None => FolderId(folder.to_string()),
+        },
         ty: ObjectType::Email,
     };
-    inventory_entry_from_value(&scope, value)
-        .map(HydratedObjectKind::Metadata)
-        .unwrap_or_else(|| HydratedObjectKind::FlagsOnly(flags_from_value(value)))
+    inventory_entry_from_value(&scope, value).map_or_else(
+        || HydratedObjectKind::FlagsOnly(flags_from_value(value)),
+        |mut entry| {
+            if let Some(owner) = parsed_id.owner() {
+                entry
+                    .memberships
+                    .push(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                        owner.to_string(),
+                    )));
+            }
+            HydratedObjectKind::Metadata(entry)
+        },
+    )
 }
 
 fn flags_from_value(value: &Value) -> HashSet<String> {
@@ -494,7 +563,110 @@ mod tests {
     use super::*;
     use crate::account::PushMode;
     use crate::client::GraphClient;
+    use crate::types::BatchResponseItem;
     use serde_json::json;
+
+    fn ok_response(id: &str, message_id: &str) -> BatchResponseItem {
+        BatchResponseItem {
+            id: id.to_string(),
+            status: 200,
+            headers: None,
+            body: Some(json!({ "id": message_id, "parentFolderId": "inbox" })),
+        }
+    }
+
+    fn outcome_id(outcome: &ItemOutcome<HydratedObject>) -> String {
+        match outcome {
+            ItemOutcome::Succeeded(success) => success.item.0.clone(),
+            ItemOutcome::Failed(failure) => failure.item.0.clone(),
+            ItemOutcome::Uncertain(uncertain) => uncertain.item.0.clone(),
+        }
+    }
+
+    /// Graph is documented to return FEWER `$batch` responses than
+    /// requests under partial failure or throttling. The unanswered ids
+    /// must still reach the consumer on exactly one lane, and must arrive
+    /// as a retryable `Protocol(PartialResponse)`: a GET is idempotent and
+    /// the omission says nothing about the resource, so a terminal
+    /// contract violation would drop the id for good.
+    #[test]
+    fn unanswered_hydration_ids_are_retryable_partial_responses() {
+        let ids = vec![
+            ObjectId("m0".to_string()),
+            ObjectId("m1".to_string()),
+            ObjectId("m2".to_string()),
+        ];
+        let mut outcomes = Vec::new();
+        let etags = reconcile_hydration_responses(
+            &ids,
+            vec![ok_response("1", "m1")],
+            Projection::Metadata,
+            &mut outcomes,
+        );
+
+        assert!(etags.is_empty());
+        assert_eq!(outcomes.len(), 3);
+        let mut reported: Vec<String> = outcomes.iter().map(outcome_id).collect();
+        reported.sort();
+        assert_eq!(reported, vec!["m0", "m1", "m2"]);
+
+        for outcome in &outcomes {
+            match outcome {
+                ItemOutcome::Succeeded(success) => assert_eq!(success.item.0, "m1"),
+                ItemOutcome::Failed(failure) => {
+                    assert!(matches!(
+                        failure.error.kind(),
+                        bifrost_types::AccountErrorKind::Protocol(
+                            bifrost_types::ProtocolErrorKind::PartialResponse
+                        )
+                    ));
+                    assert!(failure.error.recovery().is_retryable());
+                }
+                ItemOutcome::Uncertain(_) => panic!("hydration has no uncertain lane"),
+            }
+        }
+    }
+
+    /// A response id that is not a submitted index is DISCARDED, not
+    /// turned into an `ObjectId`. Minting one would hand the consumer an
+    /// id it never asked for while the id it did ask for stays silently
+    /// unanswered.
+    #[test]
+    fn out_of_range_and_unparsable_hydration_response_ids_are_discarded() {
+        let ids = vec![ObjectId("m0".to_string())];
+        let mut outcomes = Vec::new();
+        reconcile_hydration_responses(
+            &ids,
+            vec![
+                ok_response("7", "stranger"),
+                ok_response("not-a-number", "stranger"),
+            ],
+            Projection::Metadata,
+            &mut outcomes,
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcome_id(&outcomes[0]), "m0");
+        assert!(matches!(outcomes[0], ItemOutcome::Failed(_)));
+    }
+
+    /// A repeated response id answers a lane slot that is already
+    /// claimed. Accepting it would emit two outcomes for one submitted id
+    /// and break the one-outcome-per-id contract the batch model rests on.
+    #[test]
+    fn duplicate_hydration_response_ids_yield_one_outcome() {
+        let ids = vec![ObjectId("m0".to_string())];
+        let mut outcomes = Vec::new();
+        reconcile_hydration_responses(
+            &ids,
+            vec![ok_response("0", "m0"), ok_response("0", "m0")],
+            Projection::Metadata,
+            &mut outcomes,
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], ItemOutcome::Succeeded(_)));
+    }
 
     #[test]
     fn hydrate_routes_foreign_id_to_owner_and_primary_to_me() {
@@ -690,17 +862,8 @@ mod tests {
         assert!(matches!(hydrated.kind, HydratedObjectKind::FlagsOnly(_)));
     }
 
-    /// Documents a defect, NOT the intended contract.
-    /// `metadata_or_flags` rebuilds a
-    /// `CursorScope` from the bare `parentFolderId` alone, discarding the
-    /// owning mailbox the caller's `ObjectId` carries. So hydrating a
-    /// shared-mailbox message at a metadata projection produces an OUTER
-    /// id that is foreign-encoded and an INNER `InventoryEntry` whose id is
-    /// bare and whose membership is a primary-looking folder - the exact
-    /// cross-mailbox conflation `inventory.rs` documents as forbidden, and
-    /// a second wire form for one logical message.
     #[test]
-    fn metadata_projection_strips_the_shared_mailbox_owner_from_the_inner_entry() {
+    fn metadata_projection_preserves_the_shared_mailbox_owner() {
         let foreign_scope = CursorScope::FolderType {
             folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
             ty: ObjectType::Email,
@@ -716,14 +879,19 @@ mod tests {
         assert_eq!(hydrated.id, outer);
         match hydrated.kind {
             HydratedObjectKind::Metadata(entry) => {
-                // Correct behavior would be `outer` and the foreign-encoded
-                // folder plus a `Mailbox(shared@contoso.com)` membership.
-                assert_eq!(entry.id.0, "AAMkmsg");
+                assert_eq!(entry.id, outer);
                 assert_eq!(
                     entry.memberships,
-                    vec![MembershipScope::Folder(FolderId("inbox".to_string()))]
+                    vec![
+                        MembershipScope::Folder(super::super::foreign::encode_foreign(
+                            "shared@contoso.com",
+                            "inbox"
+                        )),
+                        MembershipScope::Mailbox(bifrost_types::MailboxId(
+                            "shared@contoso.com".to_string()
+                        )),
+                    ]
                 );
-                assert_ne!(entry.id, outer);
             }
             other => panic!("expected Metadata, got {other:?}"),
         }

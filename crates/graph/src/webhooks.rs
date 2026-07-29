@@ -173,7 +173,9 @@ fn unix_to_iso8601(secs: i64) -> String {
 }
 
 fn parse_iso8601_to_unix(s: &str) -> i64 {
-    let s = s.trim_end_matches('Z');
+    let Some(s) = s.strip_suffix('Z') else {
+        return 0;
+    };
     let s = if let Some(dot_pos) = s.rfind('.') {
         &s[..dot_pos]
     } else {
@@ -293,22 +295,13 @@ mod tests {
         }
     }
 
-    /// Documents a robustness gap, NOT the intended contract.
-    /// `parse_iso8601_to_unix` strips a
-    /// trailing `Z` but knows nothing about a numeric UTC offset: the
-    /// offset digits are silently dropped by the `filter_map(parse)` and
-    /// the timestamp is read as if it were UTC. Graph documents
-    /// `expirationDateTime` as UTC-with-`Z`, so this is not live today -
-    /// but the failure direction is the dangerous one. A `+05:00` expiry
-    /// reads five hours LATER than it really is, so the renewal worker
-    /// would let the subscription lapse rather than renew early.
     #[test]
-    fn a_numeric_utc_offset_is_silently_dropped_rather_than_rejected() {
+    fn numeric_utc_offsets_are_rejected_instead_of_silently_misread() {
         let utc = parse_iso8601_to_unix("2026-01-01T10:00:00Z");
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+00:00"), utc);
-        // The offset is ignored entirely, not applied.
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+05:00"), utc);
-        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00-05:00"), utc);
+        assert_ne!(utc, 0);
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+00:00"), 0);
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+05:00"), 0);
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00-05:00"), 0);
     }
 
     #[test]
@@ -344,10 +337,11 @@ mod tests {
     /// Each `create_subscription` mints its OWN random `clientState`, and
     /// `SubscriptionResponse` decodes only `id` + `expirationDateTime`, so
     /// the secret is written to Graph and then dropped. Pinned here because
-    /// it is the mechanical reason `reference/graph.md`'s instruction to
-    /// consumers ("validate `clientState`") cannot currently be followed -
-    /// there is no per-subscription value to compare against, and no two
-    /// resources even share one.
+    /// it is the mechanical reason consumer-side `clientState` validation is
+    /// unavailable today: there is no per-subscription value to compare
+    /// against, and no two resources even share one. A fix has to thread a
+    /// caller-supplied account-wide secret through the endpoint config, so
+    /// this test is expected to change shape when that lands.
     #[test]
     fn each_client_state_is_a_distinct_unexported_secret() {
         let first = generate_client_state().expect("rng");

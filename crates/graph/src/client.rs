@@ -566,10 +566,14 @@ fn derive_outlook_base(api_base: &str) -> String {
 }
 
 fn derive_beta_base(api_base: &str) -> Option<String> {
-    api_base
-        .trim_end_matches('/')
-        .strip_suffix("/v1.0")
-        .map(|prefix| format!("{prefix}/beta"))
+    let base = api_base.trim_end_matches('/');
+    match base.strip_suffix("/v1.0") {
+        Some(prefix) => Some(format!("{prefix}/beta")),
+        None => reqwest::Url::parse(base).ok().map(|url| {
+            let origin = url.origin().ascii_serialization();
+            format!("{origin}/beta")
+        }),
+    }
 }
 
 fn build_url(base: &str, path: &str) -> String {
@@ -709,19 +713,11 @@ mod tests {
         assert!(scoped.is_shared_mailbox());
     }
 
-    /// Documents a latent trap, NOT a guarantee. Unlike
-    /// `derive_outlook_base`, which follows any non-production Graph host,
-    /// `derive_beta_base` only rewrites a base that ends in `/v1.0` and
-    /// otherwise falls back to the PRODUCTION `graph.microsoft.com/beta`.
-    /// A harness or sovereign-cloud base shaped any other way would send
-    /// beta traffic to the real service. Nothing reads `api_beta_base`
-    /// today, so this is latent rather than live - pinned so it is not
-    /// wired up without noticing.
     #[test]
-    fn beta_base_falls_back_to_production_for_a_base_without_the_v1_suffix() {
+    fn beta_base_stays_on_the_configured_origin_without_a_v1_suffix() {
         let client = GraphClient::with_api_base("http://127.0.0.1:8181/graph", "token");
         assert_eq!(client.api_base(), "http://127.0.0.1:8181/graph");
-        assert_eq!(client.api_beta_base(), GRAPH_API_BETA);
+        assert_eq!(client.api_beta_base(), "http://127.0.0.1:8181/beta");
         // The Outlook origin, by contrast, correctly follows the redirect.
         assert_eq!(client.outlook_base(), "http://127.0.0.1:8181");
 
@@ -729,7 +725,10 @@ mod tests {
             derive_beta_base("https://example.test/v1.0").as_deref(),
             Some("https://example.test/beta")
         );
-        assert_eq!(derive_beta_base("https://example.test/graph"), None);
+        assert_eq!(
+            derive_beta_base("https://example.test/graph").as_deref(),
+            Some("https://example.test/beta")
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@ use super::GraphAccount;
 use super::GraphClient;
 use super::blob::blob_handle_from_graph_attachment;
 use super::graph_error::{
-    GraphErrorContext, into_account_error, invalid_account_error, mutation_item_outcome,
-    protocol_violation, unsupported_account_error,
+    GraphErrorContext, batch_response_missing, into_account_error, invalid_account_error,
+    mutation_item_outcome, protocol_violation, unsupported_account_error,
 };
 use super::inventory::graph_etag;
 
@@ -1521,22 +1521,26 @@ async fn submit_write_batch_with_targets(
             bifrost_types::ItemOutcome::Uncertain(uncertain) => return Err(uncertain.error),
         }
     }
-    // Any submitted id with no corresponding response was never applied
-    // server-side. The whole request was acknowledged (we got a 200 for
-    // the `$batch` envelope) but this item's fate is unknown, so surface
-    // it rather than reporting a clean `Ok(())`.
+    // Any submitted id with no corresponding response is ambiguous. The
+    // outer request was acknowledged (a 200 for the `$batch` envelope),
+    // which is no evidence either way about the omitted subrequest, so
+    // this must not report a clean `Ok(())` and must not assert the item
+    // was left alone. `Protocol(PartialResponse)` carries that ambiguity:
+    // idempotent operations retry, non-idempotent ones reconcile against
+    // the target. These direct write methods bypass the engine's bulk
+    // mutation funnel, so this is the only classification their callers
+    // see - the same rule the bulk path applies via its uncertain lane.
     if let Some(missing) = expected_ids.difference(&seen_ids).next() {
         let scope = missing
             .parse::<usize>()
             .ok()
             .and_then(|idx| targets.get(idx))
             .map(|id| ErrorScope::Message { id: id.0.clone() });
-        return Err(protocol_violation(
-            ProtocolErrorKind::ContractViolation,
+        return Err(batch_response_missing(
             operation,
             scope,
             format!(
-                "Graph $batch returned no response for request {missing} (item was not applied)"
+                "Graph $batch returned no response for request {missing}; the item's fate is unknown"
             ),
         ));
     }

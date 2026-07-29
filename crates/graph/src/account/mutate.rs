@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bifrost_types::{
-    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, Checkpoint, ErrorScope,
-    FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId, PageBoundary,
-    ProtocolErrorKind, SyncEvent,
+    AccountOperation, AccountStream, Batch, BatchFailure, BatchItemId, BatchUncertain, Checkpoint,
+    ErrorScope, FlagOp, IdempotencyKey, ItemOutcome, MembershipScope, MutationSuccess, ObjectId,
+    PageBoundary, ProtocolErrorKind, SyncEvent,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -159,82 +159,11 @@ async fn submit_batch(
 
     if !requests.is_empty() {
         assign_batch_ids(&mut requests);
-        // Reconcile returned responses against submitted request ids:
-        // Graph can return fewer `$batch` responses than requests, and a
-        // missing id would otherwise surface on no lane, violating the
-        // streaming "every id accounted for exactly once" contract. Track
-        // which request indices we saw and emit a failed outcome for any
-        // that never came back.
-        let submitted_indices: Vec<usize> = (0..requests.len()).collect();
-        let mut seen_indices: HashSet<usize> = HashSet::new();
         let response: BatchResponse = account
             .client
             .post_batch(&BatchRequest { requests })
             .await?;
-        for item in response.responses {
-            let index = item.id.parse::<usize>().ok();
-            if let Some(idx) = index {
-                seen_indices.insert(idx);
-            }
-            let id = index
-                .and_then(|idx| request_ids.get(idx))
-                .cloned()
-                .unwrap_or_else(|| ObjectId(item.id.clone()));
-            let scope = ErrorScope::Message { id: id.0.clone() };
-            let headers = item
-                .headers
-                .map(|h| {
-                    let mut hm = reqwest::header::HeaderMap::new();
-                    for (k, v) in h {
-                        if let (Ok(name), Ok(val)) = (
-                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                            reqwest::header::HeaderValue::from_str(&v),
-                        ) {
-                            hm.insert(name, val);
-                        }
-                    }
-                    hm
-                })
-                .unwrap_or_default();
-            let body = item
-                .body
-                .as_ref()
-                .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
-                .unwrap_or_default();
-            item_outcomes.push(mutation_item_outcome(
-                item.status,
-                headers,
-                body,
-                matches!(kind, MutationKind::Destroy),
-                BatchItemId(id.0.clone()),
-                operation_for_kind(kind),
-                scope,
-            ));
-        }
-
-        // Emit a failed outcome for any submitted request that got no
-        // response: the item was never applied, and dropping it silently
-        // would leave its id on no lane.
-        for idx in submitted_indices {
-            if seen_indices.contains(&idx) {
-                continue;
-            }
-            let Some(id) = request_ids.get(idx) else {
-                continue;
-            };
-            item_outcomes.push(ItemOutcome::Failed(BatchFailure::new(
-                BatchItemId(id.0.clone()),
-                protocol_violation(
-                    ProtocolErrorKind::ContractViolation,
-                    operation_for_kind(kind),
-                    Some(ErrorScope::Message { id: id.0.clone() }),
-                    format!(
-                        "Graph $batch returned no response for {} (item was not applied)",
-                        id.0
-                    ),
-                ),
-            )));
-        }
+        reconcile_mutation_responses(&request_ids, response.responses, kind, &mut item_outcomes);
     }
 
     let events = vec![SyncEvent::Batch(Batch {
@@ -245,6 +174,104 @@ async fn submit_batch(
         checkpoint: None::<Checkpoint>,
     })];
     Ok(events)
+}
+
+/// Project the `$batch` responses onto the submitted request ids,
+/// appending exactly one `ItemOutcome` per id to `item_outcomes`.
+///
+/// Pure over the decoded response so the accounting rules are
+/// unit-pinnable without a live `$batch` endpoint. A response id that does
+/// not parse as a submitted index, parses out of range, or repeats one
+/// already answered is DISCARDED - fabricating an id the caller never
+/// submitted would put a stranger on the lane while the real id stays
+/// unanswered.
+///
+/// An id Graph never answered lands on the UNCERTAIN lane. The `$batch`
+/// envelope decoded, which is evidence about the envelope and nothing
+/// else: a `move` or `DELETE` that committed and then lost its subresponse
+/// is byte-identical to one that never ran. The uncertain lane is exactly
+/// the lane for "this write may have landed, read it back rather than
+/// replay it". Reporting `Failed(ContractViolation)` instead classified
+/// terminal, so the engine recorded `failed_terminal` with no read-back
+/// and permanently mis-stated an applied mutation as a lost one.
+fn reconcile_mutation_responses(
+    request_ids: &[ObjectId],
+    responses: Vec<crate::types::BatchResponseItem>,
+    kind: &MutationKind,
+    item_outcomes: &mut Vec<ItemOutcome<MutationSuccess>>,
+) {
+    let mut seen_indices: HashSet<usize> = HashSet::new();
+    for item in responses {
+        let Some(index) = item
+            .id
+            .parse::<usize>()
+            .ok()
+            .filter(|idx| *idx < request_ids.len())
+        else {
+            tracing::warn!(
+                target: "bifrost_graph::batch",
+                response_id = %item.id,
+                "ignoring Graph $batch mutation response with an invalid request id"
+            );
+            continue;
+        };
+        if !seen_indices.insert(index) {
+            tracing::warn!(
+                target: "bifrost_graph::batch",
+                response_id = %item.id,
+                "ignoring duplicate Graph $batch mutation response"
+            );
+            continue;
+        }
+        let id = request_ids[index].clone();
+        let scope = ErrorScope::Message { id: id.0.clone() };
+        let headers = item
+            .headers
+            .map(|h| {
+                let mut hm = reqwest::header::HeaderMap::new();
+                for (k, v) in h {
+                    if let (Ok(name), Ok(val)) = (
+                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(&v),
+                    ) {
+                        hm.insert(name, val);
+                    }
+                }
+                hm
+            })
+            .unwrap_or_default();
+        let body = item
+            .body
+            .as_ref()
+            .map(|v| bytes::Bytes::from(serde_json::to_vec(v).unwrap_or_default()))
+            .unwrap_or_default();
+        item_outcomes.push(mutation_item_outcome(
+            item.status,
+            headers,
+            body,
+            matches!(kind, MutationKind::Destroy),
+            BatchItemId(id.0.clone()),
+            operation_for_kind(kind),
+            scope,
+        ));
+    }
+
+    for (index, id) in request_ids.iter().enumerate() {
+        if seen_indices.contains(&index) {
+            continue;
+        }
+        item_outcomes.push(ItemOutcome::Uncertain(BatchUncertain::new(
+            BatchItemId(id.0.clone()),
+            super::graph_error::batch_response_missing(
+                operation_for_kind(kind),
+                Some(ErrorScope::Message { id: id.0.clone() }),
+                format!(
+                    "Graph $batch returned no response for {}; the item's fate is unknown",
+                    id.0
+                ),
+            ),
+        )));
+    }
 }
 
 /// Fetch etags for ids that require one but don't have a cached value.
@@ -506,6 +533,103 @@ mod tests {
         let mut etags = HashMap::new();
         etags.insert(id.0.clone(), "W/\"CK1\"".to_string());
         etags
+    }
+
+    fn ok_response(id: &str) -> crate::types::BatchResponseItem {
+        crate::types::BatchResponseItem {
+            id: id.to_string(),
+            status: 200,
+            headers: None,
+            body: None,
+        }
+    }
+
+    fn outcome_item(outcome: &ItemOutcome<MutationSuccess>) -> String {
+        match outcome {
+            ItemOutcome::Succeeded(success) => success.item.0.clone(),
+            ItemOutcome::Failed(failure) => failure.item.0.clone(),
+            ItemOutcome::Uncertain(uncertain) => uncertain.item.0.clone(),
+        }
+    }
+
+    /// A `$batch` response that omits a `move` subresponse is NOT proof
+    /// the move was skipped - a move that committed and then lost its
+    /// subresponse is byte-identical on the wire. The id belongs on the
+    /// uncertain lane so the engine reads it back; the terminal
+    /// `Failed(ContractViolation)` this replaced made the engine record
+    /// `failed_terminal` with no read-back at all, so a landed move was
+    /// reported to the consumer as permanently lost.
+    #[test]
+    fn an_unanswered_move_lands_on_the_uncertain_lane_for_readback() {
+        let request_ids = vec![ObjectId("m0".to_string()), ObjectId("m1".to_string())];
+        let mut outcomes = Vec::new();
+        reconcile_mutation_responses(
+            &request_ids,
+            vec![ok_response("0")],
+            &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
+            &mut outcomes,
+        );
+
+        assert_eq!(outcomes.len(), 2);
+        let ItemOutcome::Uncertain(uncertain) = &outcomes[1] else {
+            panic!("expected uncertain, got {:?}", outcomes[1]);
+        };
+        assert_eq!(uncertain.item.0, "m1");
+        assert!(matches!(
+            uncertain.error.kind(),
+            bifrost_types::AccountErrorKind::Protocol(
+                bifrost_types::ProtocolErrorKind::PartialResponse
+            )
+        ));
+        // Non-idempotent: probe the target rather than replaying the move.
+        assert!(uncertain.error.recovery().requires_reconciliation());
+        assert!(!uncertain.error.recovery().is_terminal());
+    }
+
+    /// An absolute-state flag write is idempotent, so the same ambiguity
+    /// classifies retryable - but it still rides the uncertain lane,
+    /// because the engine's read-back guard is what turns "may have
+    /// landed" into a fact for either shape.
+    #[test]
+    fn an_unanswered_flag_write_is_uncertain_and_retryable() {
+        let request_ids = vec![ObjectId("m0".to_string())];
+        let mut outcomes = Vec::new();
+        reconcile_mutation_responses(
+            &request_ids,
+            Vec::new(),
+            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &mut outcomes,
+        );
+
+        let ItemOutcome::Uncertain(uncertain) = &outcomes[0] else {
+            panic!("expected uncertain, got {:?}", outcomes[0]);
+        };
+        assert!(uncertain.error.recovery().is_retryable());
+    }
+
+    /// A response id outside the submitted range, unparsable, or repeated
+    /// is discarded rather than answered. Accepting one would put an id
+    /// the caller never submitted on a lane (or two outcomes on one id)
+    /// while the real id stays unanswered.
+    #[test]
+    fn invalid_and_duplicate_mutation_response_ids_are_discarded() {
+        let request_ids = vec![ObjectId("m0".to_string())];
+        let mut outcomes = Vec::new();
+        reconcile_mutation_responses(
+            &request_ids,
+            vec![
+                ok_response("0"),
+                ok_response("0"),
+                ok_response("9"),
+                ok_response("nope"),
+            ],
+            &MutationKind::Destroy,
+            &mut outcomes,
+        );
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcome_item(&outcomes[0]), "m0");
+        assert!(matches!(outcomes[0], ItemOutcome::Succeeded(_)));
     }
 
     #[test]

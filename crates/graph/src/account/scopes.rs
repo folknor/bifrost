@@ -184,23 +184,26 @@ async fn discover_memberships_inner(
             cached
         }
     };
-    let mut seen = HashSet::new();
+    let mut seen_folders = HashSet::new();
+    let mut seen_owners = HashSet::new();
     let mut memberships = Vec::new();
     for scope in scopes {
         match scope {
-            CursorScope::FolderType { folder, .. } if seen.insert(folder.clone()) => {
+            CursorScope::FolderType { folder, .. } if seen_folders.insert(folder.clone()) => {
                 // A foreign folder also contributes its owner tag (the
                 // shared-mailbox identity), which the engine's covering
                 // rule cannot form because the folder-id and mailbox-id
                 // strings differ.
-                if let Some(foreign) = parse_folder(&folder).foreign() {
+                if let Some(foreign) = parse_folder(&folder).foreign()
+                    && seen_owners.insert(foreign.mailbox.clone())
+                {
                     memberships.push(owner_tag(&foreign.mailbox));
                 }
                 memberships.push(MembershipScope::Folder(folder));
             }
             // A public folder contributes its content-mailbox owner tag
             // (the same A5a pattern) plus its folder membership.
-            CursorScope::Folder(folder) if seen.insert(folder.clone()) => {
+            CursorScope::Folder(folder) if seen_folders.insert(folder.clone()) => {
                 if let Some(routing) = account.public_folder_routing(&folder).await {
                     memberships.push(MembershipScope::Mailbox(bifrost_types::MailboxId(
                         routing.anchor_mailbox,
@@ -222,54 +225,68 @@ mod tests {
     use super::*;
     use crate::client::GraphClient;
 
+    /// Each foreign folder contributes an owner tag the engine's covering
+    /// rule cannot derive on its own (the folder-id and mailbox-id strings
+    /// differ), but the tag is per-MAILBOX, not per-folder: a shared
+    /// mailbox with forty discovered folders must still contribute exactly
+    /// one `Mailbox` membership. The seed below therefore carries TWO
+    /// folders in one shared mailbox, so the dedup is actually exercised
+    /// rather than being satisfied trivially by a single foreign folder,
+    /// plus a folder in a second mailbox so the dedup is proven to be
+    /// keyed on the owner rather than collapsing all owners into one.
     #[tokio::test]
-    async fn discover_emits_foreign_owner_membership() {
+    async fn discover_emits_one_owner_membership_per_shared_mailbox() {
         let account = GraphAccount::new_for_tests_with_shared(
             GraphClient::new("token"),
             PushMode::GraphSubscriptions,
-            &["shared@contoso.com".to_string()],
+            &[
+                "shared@contoso.com".to_string(),
+                "ops@contoso.com".to_string(),
+            ],
         );
         // Seed the cursor index directly so the membership pass does not
-        // hit the network: one primary folder, one foreign folder.
-        let primary = CursorScope::FolderType {
-            folder: FolderId("inbox".to_string()),
+        // hit the network.
+        let folder_scope = |folder: FolderId| CursorScope::FolderType {
+            folder,
             ty: ObjectType::Email,
         };
-        let foreign = CursorScope::FolderType {
-            folder: encode_foreign("shared@contoso.com", "AAMk"),
-            ty: ObjectType::Email,
-        };
-        account
-            .cursor_index
-            .write()
-            .await
-            .replace(vec![primary.clone(), foreign.clone()]);
+        account.cursor_index.write().await.replace(vec![
+            folder_scope(FolderId("inbox".to_string())),
+            folder_scope(encode_foreign("shared@contoso.com", "AAMk")),
+            folder_scope(encode_foreign("shared@contoso.com", "AAMkSent")),
+            folder_scope(encode_foreign("ops@contoso.com", "AAMkOps")),
+        ]);
 
         let memberships = discover_memberships_inner(&account)
             .await
             .expect("membership discovery succeeds");
 
-        // The foreign folder contributes its owner tag (the shared
-        // mailbox identity) in addition to its folder membership.
-        assert!(memberships.contains(&MembershipScope::Mailbox(MailboxId(
-            "shared@contoso.com".to_string()
-        ))));
-        assert!(
-            memberships.contains(&MembershipScope::Folder(encode_foreign(
-                "shared@contoso.com",
-                "AAMk"
-            )))
-        );
-        // The primary folder contributes only its folder membership - no
-        // owner tag.
-        assert!(memberships.contains(&MembershipScope::Folder(FolderId("inbox".to_string()))));
-        assert_eq!(
-            memberships
-                .iter()
-                .filter(|m| matches!(m, MembershipScope::Mailbox(_)))
-                .count(),
-            1
-        );
+        // Every folder is present, foreign ones in their encoded form.
+        for folder in [
+            FolderId("inbox".to_string()),
+            encode_foreign("shared@contoso.com", "AAMk"),
+            encode_foreign("shared@contoso.com", "AAMkSent"),
+            encode_foreign("ops@contoso.com", "AAMkOps"),
+        ] {
+            assert!(
+                memberships.contains(&MembershipScope::Folder(folder.clone())),
+                "missing folder {folder:?} in {memberships:?}"
+            );
+        }
+
+        // One owner tag per shared mailbox - not one per foreign folder,
+        // and not one collapsed tag for both mailboxes. The primary
+        // mailbox's folder contributes no owner tag at all.
+        let owners: Vec<&MailboxId> = memberships
+            .iter()
+            .filter_map(|m| match m {
+                MembershipScope::Mailbox(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owners.len(), 2, "{memberships:?}");
+        assert!(owners.contains(&&MailboxId("shared@contoso.com".to_string())));
+        assert!(owners.contains(&&MailboxId("ops@contoso.com".to_string())));
     }
 
     #[test]

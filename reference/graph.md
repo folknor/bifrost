@@ -275,9 +275,10 @@ Supported scopes:
 
 The inventory walk reads pages via `get_json` / `get_absolute` (the
 `@odata.nextLink` chain), yielding `PageBoundary::Page` Batches until a
-`delta_link`, then a `Final` Batch + `Checkpoint::Change`. `@removed` entries
-are skipped; harvested etags fold into `account.etag_index` for the next
-`If-Match`.
+`delta_link`, then a `Final` Batch + `Checkpoint::Change`. A page with neither
+link is a contract violation, never a successful cursor-less completion.
+`@removed` entries are skipped; harvested etags fold into
+`account.etag_index` for the next `If-Match`.
 
 `changes_stream(cursor)` decodes the payload, asserts `scope_matches_payload`,
 and walks `delta_link` (or `advanced_through.next_link` on resume). Each
@@ -287,11 +288,37 @@ non-removed entry emits `ObjectChange { Updated }` + `ScopeChange { Added }`
 final page checkpoints the fresh `delta_link`, `advanced_through` cleared.
 
 `get_stream` chunks ids into `batching_policy.max_items` blocks, fires one
-`/$batch` per chunk, and returns per-id `ItemOutcome<HydratedObject>`: 2xx ->
+`/$batch` per chunk, and returns exactly one per-id `ItemOutcome<HydratedObject>`:
+2xx ->
 `Succeeded`, 4xx/5xx -> `Failed` with a structured `AccountError` (via
 `response_to_account_error_pub`), 2xx-no-body -> `Failed(Protocol(MissingField))`.
 Locally-invalid items `Failed` without poisoning the batch; a whole-request
-transport drop terminates. The `hydrated_from_value` projector maps `FlagsOnly`
+transport drop terminates.
+
+`reconcile_hydration_responses` is the pure projector that enforces the
+one-outcome-per-id contract, and `reconcile_mutation_responses` is its
+mutation twin. Both discard a response id that does not parse as a submitted
+index, parses out of range, or repeats an already-answered one - minting an
+`ObjectId` from the response id would put an id the caller never submitted on
+a lane while the real one stays unanswered. Both then sweep the ids Graph
+never answered.
+
+An unanswered subrequest classifies `Protocol(PartialResponse)` with
+`TransmissionState::Acknowledged` (`graph_error::batch_response_missing`), on
+all three `$batch` paths - hydration, the bulk mutation funnel, and
+`pim::submit_write_batch_with_targets`. The outer envelope decoding is
+evidence about the envelope only: a `move` or `DELETE` that committed and
+lost its subresponse is indistinguishable from one that never ran, so the
+error must not assert the item was left alone. `ContractViolation` would
+derive `ProviderContractViolation`, which is terminal, and the engine would
+file the mutation `failed_terminal` with no read-back. `PartialResponse`
+instead retries the idempotent operations (hydration, `UpdateFlags`) and
+routes the non-idempotent ones (`BulkMove`, `BulkDestroy`) to
+`Reconcile(PartialCompletionSignal)`. In the bulk funnel the ambiguous id
+also rides the **uncertain** lane rather than `failed`, so the engine's
+read-back guard resolves it.
+
+The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
 Graph JSON is not assembled RFC822, so body-bearing projections degrade to
 `Metadata` (assembled bytes come from `open_raw_rfc822`).
@@ -433,14 +460,30 @@ capability surface.
 
 `push_subscribe(scopes)` groups scopes by Graph subscription resource and
 rejects the request if any scope is not subscribable, creates one server
-subscription per resource, stores `(server_id, expires_at)` in a
+subscription per resource, and best-effort deletes any already-created
+subscriptions if a later create fails. The `SubscriptionHandle` is minted
+BEFORE the first create: `new_handle` is fallible and classifies its error
+`TransmissionState::Unsent`, which is only honest while nothing has been
+written, so minting it afterwards would let an RNG failure report
+no-bytes-sent over live server-side subscriptions and invite a duplicating
+retry. It stores `(server_id, expires_at)` in a
 `GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
 deletes each subscription and aborts the renewal worker when no groups
 remain. The worker wakes every 10 min, renews inside the 30 min threshold,
 and emits `Disconnected`/`Reconnected`/`Terminated` accordingly. The
 webhook receiver is not in this crate: consumers mount an HTTPS endpoint at
-`PushEndpoint::webhook_url`, validate `clientState`, and feed invalidations
-into the engine `InvalidationSink`; `push_stream` carries health only.
+`PushEndpoint::webhook_url` and feed invalidations into the engine
+`InvalidationSink`; `push_stream` carries health only.
+
+`clientState` validation is **not available today.** `create_subscription`
+mints a fresh random `clientState` per resource, sends it, and discards it -
+no accessor on `GraphAccount`, `GraphSubscriptionGroup`, or the returned
+`SubscriptionHandle` exposes the value, and per-resource randomness means
+there is no single account-wide secret a receiver could compare against
+anyway. Until a caller-supplied account-wide secret is threaded through the
+factory endpoint configuration, a consumer's webhook endpoint has no
+`clientState` to check and must authenticate forged invalidations by other
+means (or treat every invalidation as an untrusted re-check hint).
 
 ### EWS streaming mode (`PushMode::EwsStreaming`)
 
@@ -450,7 +493,14 @@ worker: it subscribes to the union of active folders, long-polls
 scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
 `push_subscribe` rejects any `Folder` (public-folder) scope as
-`Unsupported(PushSubscribe)` in both modes. `push_stream` is a
+`Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
+`ews_scope_is_subscribable`: only a PRIMARY-mailbox `FolderType` scope is
+accepted. A non-folder scope contributes nothing to the Subscribe body's
+`FolderIds` (an empty element EWS rejects outright), and a foreign folder is
+addressable only with its mailbox's routing headers while Subscribe sends
+`EwsHeaders::default()`, so its native id would resolve against the primary
+namespace. Both are refused locally rather than turned into a remote failure
+that reads as a provider fault. `push_stream` is a
 `broadcast::Receiver<WatchEvent>` adapter that selects against shutdown;
 the EWS branch re-spawns its worker on demand.
 
@@ -672,7 +722,10 @@ terminal error, so the engine continues past a referenceAttachment in a batch.
   deletion baseline and support for those remaining item classes are named
   follow-ups.
 - EWS streaming requires EWS reachable with an accepted token; webhook mode
-  needs a public HTTPS endpoint (else `Error::MissingCoreCapability`).
+  needs a public HTTPS endpoint (else `Error::MissingCoreCapability`). EWS
+  streaming currently supports primary-mailbox folders only: shared-mailbox
+  scopes need mailbox-specific EWS routing headers and are not yet grouped by
+  owner.
 - Blob range per-handle (fileAttachment only); delta-token expiry reactive (410
   / 400 InvalidDeltaToken -> `RestartScope`); `MutationReplaySafety::None`.
 - Unsupported: `remove_from_container`, keyword/label writes,
