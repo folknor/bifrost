@@ -324,6 +324,16 @@ routes the non-idempotent ones (`BulkMove`, `BulkDestroy`) to
 also rides the **uncertain** lane rather than `failed`, so the engine's
 read-back guard resolves it.
 
+`message_reactions` (`reactions.rs`) reads the two Outlook
+`singleValueExtendedProperties` (`OwnerReactionType`, `ReactionsCount`) over
+the same chunked `$batch`, dedupes its ids, and answers every submitted id in
+exactly one lane. Public-folder ids name EWS items this Graph-only
+extended-property surface cannot address, so `partition_supported_ids` splits
+them off and files each one `Failed(Unsupported(MessageReactionsRead))`
+locally while the Graph ids of the same batch still go to `$batch` - a
+top-level rejection would be a per-request answer on a per-item surface and
+would discard the outcomes of every ordinary message beside the public id.
+
 The `hydrated_from_value` projector maps `FlagsOnly`
 -> canonical flag `HashSet`; `Metadata`/body-bearing -> `metadata_or_flags`.
 Graph JSON is not assembled RFC822, so body-bearing projections degrade to
@@ -464,7 +474,12 @@ capability surface.
 
 ### Webhook mode (`PushMode::GraphSubscriptions`)
 
-`push_subscribe(scopes)` groups scopes by Graph subscription resource and
+`push_subscribe(scopes)` rejects an EMPTY scope list as `Request(Malformed)`
+before mode dispatch, so in both modes (a subscription covering nothing
+registered a group teardown could never retire and started a renewal worker
+nothing could stop; the engine already skips empty lists at its own reattach
+boundary). It then groups by Graph
+subscription resource and
 rejects the request if any scope is not subscribable, creates one server
 subscription per resource, and best-effort deletes any already-created
 subscriptions if a later create fails. The `SubscriptionHandle` is minted
@@ -474,8 +489,20 @@ written, so minting it afterwards would let an RNG failure report
 no-bytes-sent over live server-side subscriptions and invite a duplicating
 retry. It stores `(server_id, expires_at)` in a
 `GraphSubscriptionGroup`, and emits `Reconnected`. `push_unsubscribe`
-deletes each subscription and aborts the renewal worker when no groups
-remain. The webhook receiver is not in this crate: consumers mount an HTTPS
+deletes each server subscription BEFORE dropping its local state, so a failed
+DELETE leaves that subscription and every not-yet-attempted sibling reachable
+under the handle for a later retry. Keeping the group registered across those
+awaits means "registered" no longer implies "live", so
+`mark_group_tearing_down` sets a `tearing_down` marker on the group in the
+same write-lock acquisition that snapshots its server ids: the renewal worker
+skips condemned groups in `due_renewals` and `install_replacement` refuses
+them, because a replacement created after the snapshot is one teardown can
+never name - it would stay registered and delivering while
+`push_unsubscribe` reported success. The marker is monotone (a later
+`push_subscribe` mints a new handle) and a plain flag rather than a lock, so
+neither path holds anything across a round trip. Teardown
+aborts the renewal worker only when no
+groups remain. The webhook receiver is not in this crate: consumers mount an HTTPS
 endpoint at `PushEndpoint::webhook_url` and feed invalidations into the
 engine `InvalidationSink`; `push_stream` carries health only.
 
@@ -505,12 +532,14 @@ accordingly. Three rules make the renewal path safe:
   create classifies **the create error**, not the already-known 404, so its
   recovery class decides whether another tick is worth it.
 - `install_replacement` is a plain `get_mut`, never
-  `entry().or_insert_with()`. The due list is a snapshot, so a concurrent
-  `push_unsubscribe` can retire the handle while the create is in flight;
-  re-registering the group there would tell the caller teardown succeeded
-  while notifications kept arriving. When the handle is gone the worker
-  deletes the subscription it just minted instead (best effort - the
-  caller's `push_unsubscribe` already returned).
+  `entry().or_insert_with()`, and it also refuses a group marked
+  `tearing_down`. The due list is a snapshot, so a concurrent
+  `push_unsubscribe` can retire the handle - or condemn it and start
+  deleting from its own snapshot - while the create is in flight;
+  re-registering (or quietly joining) the group there would tell the caller
+  teardown succeeded while notifications kept arriving. In both cases the
+  worker deletes the subscription it just minted instead (best effort - the
+  caller's `push_unsubscribe` may already have returned).
 - A successful replacement emits `Reconnected`. The resource had NO live
   subscription between its disappearance and the create, and Graph does not
   replay notifications for that window; `Reconnected` is the only event the
@@ -524,6 +553,8 @@ worker: it subscribes to the union of active folders, long-polls
 `GetStreamingEvents`, records watermarks, maps notifications to cursor
 scopes, and emits `Invalidated`. Failures use `ews_error_to_account_error`
 (terminal terminates; transient emits `Disconnected`, sleeps, reconnects).
+When started before any scopes exist, it waits for a subscription-map change
+instead of polling the empty map.
 `push_subscribe` rejects any `Folder` (public-folder) scope as
 `Unsupported(PushSubscribe)` in both modes. The EWS arm narrows further via
 `ews_scope_is_subscribable`: only a PRIMARY-mailbox `FolderType` scope is

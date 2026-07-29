@@ -44,7 +44,7 @@ use bifrost_types::{
 };
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -91,6 +91,10 @@ pub(crate) struct GraphAccount {
     pub(crate) graph_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub(crate) ews_subscriptions: Arc<RwLock<HashMap<SubscriptionHandle, EwsSubscriptionState>>>,
     pub(crate) ews_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Wakes an idle EWS worker when a new subscription makes work
+    /// available. Without this, a worker started by `push_stream` polled an
+    /// empty map once a second until somebody subscribed.
+    pub(crate) ews_subscription_changed: Arc<Notify>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) etag_index: Arc<RwLock<HashMap<String, String>>>,
     /// Public-folder routing map, keyed by native EWS `FolderId`. A
@@ -141,6 +145,7 @@ impl GraphAccount {
             graph_worker: Arc::new(Mutex::new(None)),
             ews_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             ews_worker: Arc::new(Mutex::new(None)),
+            ews_subscription_changed: Arc::new(Notify::new()),
             shutdown: CancellationToken::new(),
             etag_index: Arc::new(RwLock::new(HashMap::new())),
             routing_map: Arc::new(RwLock::new(HashMap::new())),

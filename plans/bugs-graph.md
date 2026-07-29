@@ -5,9 +5,10 @@ Scope: `crates/graph/src/**`. This is the current-gap list after the
 retained here.
 
 No open bugs remain: every G-numbered finding from this hunt is fixed and
-its regression pinned or explicitly named as unpinnable below. What is left
-is observations - design questions and ergonomics risks, none of them a
-defect on their own. None has been started.
+its regression pinned or explicitly named as unpinnable below. The
+observations below are still OPEN work - design questions and ergonomics
+risks, none of them a defect on their own, none of them started. This file
+is not finished while that list has entries.
 
 ## Observations
 
@@ -47,14 +48,6 @@ The mapper compares native notification folder ids with encoded scope ids.
 Even after mailbox-routed EWS subscriptions are introduced, this must compare
 against the native folder id in the appropriate mailbox group. Verify Graph
 and EWS folder-id equivalence before relying on narrow invalidation hints.
-
-**O-11 - `message_reactions` lacks a public-folder EWS guard.** It routes a
-folder-qualified public item into Graph REST, yielding a per-item 404. Match
-the public-folder partition used by `get_stream` and `message_hydrate`.
-
-**O-12 - An idle EWS worker wakes once per second.** `push_stream` can start
-the worker before any subscription exists. Replace the 1Hz empty-scope loop
-with notification-based wakeup or a materially longer idle wait.
 
 **O-13 - `check_response_error` keeps `in_error_message` set.** Present EWS
 response shapes make the first error win, which is acceptable, but the flag's
@@ -97,7 +90,48 @@ Fixed in this pass:
   allowing the external webhook receiver to validate notifications.
 - G-11: terminal renewal state is removed after its one event; a 404/410
   recreates the vanished subscription for the same resource.
+- G-15: webhook unsubscribe snapshots its group but keeps it registered,
+  deletes each server subscription first, and removes only confirmed
+  deletions. A DELETE failure therefore leaves its id and all later ids
+  reachable under the same handle for a retry instead of orphaning live
+  subscriptions until expiry.
 - O-9: `MESSAGE_SELECT` explicitly requests the documented `changeKey`.
+- O-11: reaction reads now recognize public-folder item ids before `$batch`
+  construction and return `Unsupported(MessageReactionsRead)`, because this
+  Graph-only extended-property surface has no EWS implementation.
+- O-12: an EWS worker with no active scopes waits on a `Notify` from
+  subscribe/unsubscribe rather than polling the empty subscription map once
+  per second.
+
+Found by the review OF this pass, and fixed in it:
+
+- G-16: webhook unsubscribe raced the renewal worker's recreate path -
+  introduced by G-15 itself. Teardown now has to keep the group registered
+  while it deletes (that is what makes a failed DELETE retryable), so
+  "registered" stopped implying "live" and `install_replacement` happily
+  installed a replacement into a group whose server-id snapshot had already
+  been taken. Teardown deleted the stale id, retired the group, returned
+  success - and the replacement stayed registered and delivering. The group
+  now carries a `tearing_down` marker set in the same write-lock
+  acquisition that snapshots the ids; `install_replacement` refuses a
+  condemned group (the worker then deletes the subscription it minted) and
+  `due_renewals` skips one entirely, so teardown intent is never extended
+  by a renewal either. A marker rather than a shared lock: the decision is
+  local and synchronous, whereas serializing the two paths would hold a
+  lock across DELETE and create round trips.
+- G-17: `push_subscribe([])` registered an empty group. The new removal
+  loop had no ids to walk, so the group was never retired and the renewal
+  worker it started was never stopped. An empty scope list is now
+  `Request(Malformed)` in both push modes - it covers nothing, and the
+  engine already skips empty lists at its own reattach boundary - rather
+  than tolerating a nonsense registration that teardown has to special-case.
+- G-18: the O-11 guard rejected the whole request. One public-folder id
+  made `message_reactions` return a top-level `Unsupported`, discarding the
+  outcomes of every ordinary Graph message in the same batch. This surface
+  preserves per-item failures, so `partition_supported_ids` splits the
+  public ids off, files each `Failed(Unsupported(MessageReactionsRead))`
+  with its own `ErrorScope::Message`, and lets the supported ids continue
+  through `$batch`.
 
 Review follow-ups on G-11 (same pass):
 
@@ -130,18 +164,31 @@ tag dedup with two folders in one shared mailbox plus a second mailbox; the
 foreign-membership native fallback; the shared-mailbox metadata projection;
 beta-base derivation; expiry-offset rejection; the renewal worker's
 `subscription_is_gone` recreate gate (404/410 only, never a throttle, auth,
-or transport failure); and `install_replacement`'s two rules - the
-replacement swaps in place inside a live group, and an unregistered handle
-is never resurrected.
+or transport failure); `install_replacement`'s two rules - the replacement
+swaps in place inside a live group, and an unregistered handle is never
+resurrected; G-15's pure state transition, which preserves not-yet-deleted
+server ids after an earlier deletion succeeds; G-16's teardown marker,
+pinned as the full interleaving over pure state (condemn + snapshot, confirm
+one DELETE, refuse the renewal worker's replacement, finish teardown and
+retire the handle) plus the idempotence of re-condemning and `due_renewals`
+skipping a condemned group; G-17's empty-scope rejection in both push modes,
+asserting neither subscription map was touched; and G-18's public/Graph
+partition, which pins the order-preserving split both lanes depend on.
 
 **Not pinned, and why.** Partial webhook rollback, the inventory
-neither-link branch, and the renewal worker's end-to-end sequencing (the
+neither-link branch, the renewal worker's end-to-end sequencing (the
 `Reconnected` emission after a successful replacement, the cleanup DELETE
 when the handle was unsubscribed mid-create, and the stale row surviving a
-failed create into the next tick) are all reachable only through a live
-`GraphClient`. The renewal decision rules were factored out - the pure
-`install_replacement` and the `subscription_is_gone` gate carry everything
-that does not need a socket, and both are pinned above - but the worker
+failed create into the next tick), `unsubscribe_graph`'s DELETE loop as a
+loop (a mid-loop DELETE failure returning the error with the remaining ids
+still registered), and the reaction read's mixed batch reaching `$batch`
+with its Graph ids after the public ones were failed, are all reachable
+only through a live
+`GraphClient`. The decision rules were factored out - the pure
+`install_replacement`, `mark_group_tearing_down`, `due_renewals`,
+`remove_subscription_from_groups`, `partition_supported_ids`, and the
+`subscription_is_gone` gate carry everything
+that does not need a socket, and all are pinned above - but the worker
 loop itself still calls `create_subscription` / `renew_subscription` /
 `delete_subscription` directly, and those need a transport seam.
 `GraphClient` owns a concrete `bifrost_net::AccountNet` behind

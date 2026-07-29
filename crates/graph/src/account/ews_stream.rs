@@ -76,7 +76,13 @@ pub(crate) async fn run_streaming_worker(account: GraphAccount) {
         }
         let scopes = active_ews_scopes(&account).await;
         if scopes.is_empty() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // `push_stream` may start this worker before a caller has
+            // registered any EWS scopes. Wait for that map to change rather
+            // than polling it once a second for the lifetime of the account.
+            tokio::select! {
+                () = account.shutdown.cancelled() => return,
+                () = account.ews_subscription_changed.notified() => {}
+            }
             continue;
         }
 

@@ -11,7 +11,9 @@
 //!   [`MessageReactionState`] whose fields are `None` when the property is
 //!   absent - that is a real "no reaction" answer the consumer may act on
 //!   (its classifier deletes the cached owner row on it);
-//! - a non-2xx item goes to `failed`;
+//! - a non-2xx item goes to `failed`, as does a public-folder id this
+//!   Graph-only surface has no transport for (locally, per item - never as
+//!   a top-level rejection that would discard the rest of the batch);
 //! - a chunk that never returned, or an item the `$batch` envelope did not
 //!   answer, goes to `uncertain`.
 //!
@@ -32,9 +34,9 @@ use serde_json::Value;
 use super::GraphAccount;
 use super::graph_error::{
     GraphErrorContext, batch_response_missing, into_account_error, protocol_violation,
-    response_to_account_error_pub,
+    response_to_account_error_pub, unsupported_item_error,
 };
-use super::pim::message_batch_url;
+use super::pim::{ews_read_folder, message_batch_url};
 use crate::error::GraphResponseError;
 use crate::types::{BatchRequest, BatchRequestItem, BatchResponseItem};
 
@@ -78,12 +80,30 @@ pub(crate) async fn message_reactions(
         .collect();
     let expected: Vec<BatchItemId> = unique.iter().map(|id| BatchItemId(id.0.clone())).collect();
 
+    // Public-folder ids name EWS items, not Graph messages, and this
+    // Graph-only extended-property surface has no EWS implementation. Fail
+    // them locally rather than send a native EWS `ItemId` to
+    // `/me/messages/{id}` and misreport Graph's 404 as a missing message -
+    // the same public-folder discriminator both hydration doors use.
+    //
+    // Per item, never per request: this surface carries a per-item failure
+    // lane, so one public id in a mixed batch must not cost every ordinary
+    // Graph message in it its outcome.
+    let (supported, unsupported) = partition_supported_ids(unique);
+
+    let mut builder = BatchOutcomeBuilder::new();
+    for id in unsupported {
+        builder.push_failed(
+            BatchItemId(id.0.clone()),
+            unsupported_item_error(operation, ErrorScope::Message { id: id.0 }),
+        );
+    }
+
     let owner_id = owner_reaction_property_id();
     let count_id = reactions_count_property_id();
     let filter = format!("$filter=id eq '{owner_id}' or id eq '{count_id}'");
 
-    let mut builder = BatchOutcomeBuilder::new();
-    for chunk in unique.chunks(BATCH_LIMIT) {
+    for chunk in supported.chunks(BATCH_LIMIT) {
         let requests: Vec<BatchRequestItem> = chunk
             .iter()
             .enumerate()
@@ -121,6 +141,17 @@ pub(crate) async fn message_reactions(
             format!("Graph reaction read broke batch accounting: {e}"),
         )
     })
+}
+
+/// Split the requested ids into the ones this Graph-only surface can read
+/// and the public-folder ids it cannot, preserving submission order in both.
+///
+/// Pure so the mixed-batch rule is pinnable: the Graph ids of a batch that
+/// also names a public-folder item must still reach `$batch`. Their actual
+/// round trip needs a `GraphClient` transport seam this crate does not have.
+fn partition_supported_ids(ids: Vec<ObjectId>) -> (Vec<ObjectId>, Vec<ObjectId>) {
+    ids.into_iter()
+        .partition(|id| ews_read_folder(id).is_none())
 }
 
 /// Project one chunk's `$batch` responses into the outcome lanes.
@@ -299,6 +330,59 @@ mod tests {
         let body = props_body(&[(owner_reaction_property_id().to_uppercase().as_str(), "like")]);
         let state = reaction_state(&oid("m1"), Some(&body));
         assert_eq!(state.owner_reaction.as_deref(), Some("like"));
+    }
+
+    fn public_id(folder: &str, item: &str) -> ObjectId {
+        super::super::foreign::encode_public_item_id(
+            &bifrost_types::FolderId(folder.to_string()),
+            item,
+        )
+    }
+
+    /// A public-folder id fails locally rather than being sent to
+    /// `/me/messages/{ItemId}`, which 404s naming a bare EWS item id - but
+    /// it fails in the FAILED LANE, per item. A top-level `Unsupported`
+    /// would be a per-request answer on a per-item surface.
+    #[tokio::test]
+    async fn public_folder_ids_fail_in_their_own_lane_not_the_whole_request() {
+        let id = public_id("folder", "native");
+        let account = GraphAccount::new_for_tests(
+            crate::client::GraphClient::new("token"),
+            super::super::PushMode::GraphSubscriptions,
+        );
+        // No supported ids means no `$batch` leaves the process.
+        let outcome = message_reactions(account, std::slice::from_ref(&id))
+            .await
+            .expect("a public id is a per-item failure, not a request failure");
+        assert!(outcome.succeeded().is_empty());
+        assert!(outcome.uncertain().is_empty());
+        assert_eq!(outcome.failed().len(), 1);
+        assert_eq!(outcome.failed()[0].item.0, id.0);
+        assert!(matches!(
+            outcome.failed()[0].error.kind(),
+            bifrost_types::AccountErrorKind::Unsupported(
+                bifrost_types::AccountOperation::MessageReactionsRead
+            )
+        ));
+    }
+
+    /// The mixed-batch rule the per-item split exists for: one public id
+    /// must not strand the ordinary Graph messages beside it. Their `$batch`
+    /// round trip needs a transport seam this crate does not have, so the
+    /// pure partition is what is pinned - order preserved on both sides.
+    #[test]
+    fn a_public_id_does_not_take_the_graph_ids_of_its_batch_with_it() {
+        let (supported, unsupported) = partition_supported_ids(vec![
+            oid("graph-1"),
+            public_id("pf", "item-1"),
+            oid("graph-2"),
+            public_id("pf", "item-2"),
+        ]);
+        let supported: Vec<&str> = supported.iter().map(|id| id.0.as_str()).collect();
+        assert_eq!(supported, ["graph-1", "graph-2"]);
+        assert_eq!(unsupported.len(), 2);
+        assert_eq!(unsupported[0], public_id("pf", "item-1"));
+        assert_eq!(unsupported[1], public_id("pf", "item-2"));
     }
 
     fn response_item(id: &str, status: u16, body: Option<Value>) -> BatchResponseItem {

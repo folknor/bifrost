@@ -12,7 +12,7 @@ use crate::webhooks::{
     subscription_is_gone,
 };
 
-use super::graph_error::{GraphErrorContext, into_account_error};
+use super::graph_error::{GraphErrorContext, into_account_error, invalid_account_error};
 use super::{GraphAccount, PushMode};
 
 const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -29,6 +29,32 @@ pub(crate) struct PushEndpoint {
 #[derive(Debug, Clone)]
 pub(crate) struct GraphSubscriptionGroup {
     pub(crate) subscriptions: Vec<GraphSubscriptionState>,
+    /// Set the moment `push_unsubscribe` starts deleting this group, and
+    /// never cleared - teardown intent is monotone per handle, because a
+    /// later `push_subscribe` mints a fresh handle rather than reviving
+    /// this one.
+    ///
+    /// Teardown deletes over the network, so the group must stay registered
+    /// across those awaits for a failed DELETE to remain retryable. That
+    /// keeps the handle visible to the renewal worker, whose recreate path
+    /// would otherwise install a replacement into a group teardown has
+    /// already snapshotted: the removal that follows only knows the stale
+    /// server id, so the replacement would stay registered and live while
+    /// `push_unsubscribe` reported success. The marker is a plain flag
+    /// rather than a lock because the decision it drives is local and
+    /// synchronous - serializing the two paths on a mutex would hold it
+    /// across DELETE and create round trips.
+    pub(crate) tearing_down: bool,
+}
+
+impl GraphSubscriptionGroup {
+    /// A freshly registered group, not yet being torn down.
+    fn live(subscriptions: Vec<GraphSubscriptionState>) -> Self {
+        Self {
+            subscriptions,
+            tearing_down: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +75,17 @@ pub(crate) async fn push_subscribe(
     account: GraphAccount,
     scopes: Vec<CursorScope>,
 ) -> Result<SubscriptionHandle, AccountError> {
+    // A subscription covering nothing is not a subscription. Registering it
+    // anyway minted a handle over an empty group: teardown had no server id
+    // to walk, so the group was never retired and the renewal worker it
+    // started was never stopped. The engine already skips an empty scope
+    // list at its own reattach boundary, so this can only be a caller bug.
+    if scopes.is_empty() {
+        return Err(invalid_account_error(
+            AccountOperation::PushSubscribe,
+            "push_subscribe requires at least one scope",
+        ));
+    }
     // Public folders are poll-only in v1: a bare `CursorScope::Folder`
     // has no push surface (EWS streaming notifications do not cover the
     // public-folder hierarchy mailbox). Reject before dispatch so both
@@ -164,7 +201,7 @@ async fn subscribe_graph(
         .graph_subscriptions
         .write()
         .await
-        .insert(handle.clone(), GraphSubscriptionGroup { subscriptions });
+        .insert(handle.clone(), GraphSubscriptionGroup::live(subscriptions));
     let _ = account.push_tx.send(WatchEvent::Reconnected);
     ensure_graph_worker(account).await;
     Ok(handle)
@@ -174,11 +211,11 @@ async fn unsubscribe_graph(
     account: GraphAccount,
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
-    let Some(group) = account.graph_subscriptions.write().await.remove(&handle) else {
+    let Some(server_ids) = begin_graph_teardown(&account, &handle).await else {
         return Ok(());
     };
-    for state in group.subscriptions {
-        delete_subscription(&account.client, &state.server_id)
+    for server_id in server_ids {
+        delete_subscription(&account.client, &server_id)
             .await
             .map_err(|e| {
                 into_account_error(
@@ -186,6 +223,7 @@ async fn unsubscribe_graph(
                     GraphErrorContext::graph(AccountOperation::PushUnsubscribe),
                 )
             })?;
+        remove_subscription_state(&account, &handle, &server_id).await;
     }
     if account.graph_subscriptions.read().await.is_empty()
         && let Some(worker) = account.graph_worker.lock().await.take()
@@ -193,6 +231,40 @@ async fn unsubscribe_graph(
         worker.abort();
     }
     Ok(())
+}
+
+async fn begin_graph_teardown(
+    account: &GraphAccount,
+    handle: &SubscriptionHandle,
+) -> Option<Vec<String>> {
+    let mut groups = account.graph_subscriptions.write().await;
+    mark_group_tearing_down(&mut groups, handle)
+}
+
+/// Condemn one handle's group and snapshot the server ids teardown must
+/// delete, without retiring their local state.
+///
+/// Marking and snapshotting happen under the SAME write lock, which is what
+/// makes the pair race-free against the renewal worker: any recreate that
+/// installs before this call is in the snapshot, and any recreate that
+/// resolves after it sees the marker and refuses. The state itself stays
+/// registered so a failed DELETE leaves that id and every later id
+/// reachable under the handle for a retry.
+///
+/// Returns `None` for an unknown handle - teardown is idempotent.
+fn mark_group_tearing_down(
+    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+    handle: &SubscriptionHandle,
+) -> Option<Vec<String>> {
+    let group = groups.get_mut(handle)?;
+    group.tearing_down = true;
+    Some(
+        group
+            .subscriptions
+            .iter()
+            .map(|state| state.server_id.clone())
+            .collect(),
+    )
 }
 
 async fn ensure_graph_worker(account: GraphAccount) {
@@ -224,22 +296,7 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
             if groups.is_empty() {
                 return;
             }
-            groups
-                .iter()
-                .flat_map(|(handle, group)| {
-                    group.subscriptions.iter().filter_map(move |state| {
-                        if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
-                            Some((
-                                handle.clone(),
-                                state.server_id.clone(),
-                                state.resource.clone(),
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
+            due_renewals(&groups)
         };
 
         let mut had_error = false;
@@ -345,6 +402,35 @@ async fn run_graph_subscription_worker(account: GraphAccount) {
     }
 }
 
+/// The `(handle, server_id, resource)` triples inside the renewal threshold.
+///
+/// A condemned (`tearing_down`) group contributes nothing. Renewing its
+/// subscriptions would extend the life of exactly what the caller asked to
+/// delete, and recreating a vanished one would hand teardown a server id its
+/// snapshot cannot contain. Their rows stay registered only so that a failed
+/// DELETE can be retried against them.
+fn due_renewals(
+    groups: &HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+) -> Vec<(SubscriptionHandle, String, String)> {
+    groups
+        .iter()
+        .filter(|(_, group)| !group.tearing_down)
+        .flat_map(|(handle, group)| {
+            group.subscriptions.iter().filter_map(move |state| {
+                if is_expiring_soon(&state.expires_at, RENEWAL_THRESHOLD_MINUTES) {
+                    Some((
+                        handle.clone(),
+                        state.server_id.clone(),
+                        state.resource.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 /// What happened to a subscription the renewal worker had to recreate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Replacement {
@@ -390,14 +476,15 @@ async fn replace_gone_subscription(
         return Ok(Replacement::Installed);
     }
 
-    // `push_unsubscribe` removed the handle while the create was in flight.
-    // It deleted every subscription it knew about and reported teardown as
-    // successful, so installing this one would keep notifications flowing
-    // for a subscription the caller believes is gone - and re-registering
-    // the group would resurrect a handle nothing will ever tear down again.
-    // Delete the subscription we just minted instead. Best effort: the
-    // caller's `push_unsubscribe` has already returned, so there is nobody
-    // left to report a cleanup failure to.
+    // `push_unsubscribe` retired the handle, or condemned it and is walking
+    // a server-id snapshot that cannot contain this create, while the create
+    // was in flight. Either way it deletes every subscription it knows about
+    // and reports teardown as successful, so installing this one would keep
+    // notifications flowing for a subscription the caller believes is gone -
+    // and re-registering the group would resurrect a handle nothing will
+    // ever tear down again. Delete the subscription we just minted instead.
+    // Best effort: the caller's `push_unsubscribe` may already have
+    // returned, so there may be nobody left to report a cleanup failure to.
     if let Err(cleanup_error) = delete_subscription(&account.client, &created_id).await {
         tracing::warn!(
             target: "bifrost_graph::webhooks",
@@ -411,11 +498,21 @@ async fn replace_gone_subscription(
 
 /// Swap `replacement` in for `stale_server_id` under `handle`.
 ///
-/// Returns `false` when `handle` is no longer registered. The lookup is a
-/// plain `get_mut`, never an `entry().or_insert_with()`: the worker's due
-/// list is a snapshot, and a concurrent `push_unsubscribe` can retire the
-/// handle before the replacement lands. Re-creating the group there would
-/// contradict a teardown the caller was already told succeeded.
+/// Returns `false` when the replacement must not be installed, in which case
+/// the caller deletes the subscription it just minted. Two refusals:
+///
+/// - `handle` is no longer registered. The lookup is a plain `get_mut`,
+///   never an `entry().or_insert_with()`: the worker's due list is a
+///   snapshot, and a concurrent `push_unsubscribe` can retire the handle
+///   before the replacement lands. Re-creating the group there would
+///   contradict a teardown the caller was already told succeeded.
+/// - the group is registered but marked `tearing_down`. Teardown keeps the
+///   group registered while it deletes each server subscription, so
+///   "registered" no longer implies "live". It walks a snapshot of the
+///   server ids taken when the marker went up, so a replacement installed
+///   after that point is invisible to it: teardown would delete the stale
+///   id, retire the group, return success - and the replacement would keep
+///   delivering notifications for a handle the caller believes is gone.
 fn install_replacement(
     groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
     handle: &SubscriptionHandle,
@@ -425,6 +522,9 @@ fn install_replacement(
     let Some(group) = groups.get_mut(handle) else {
         return false;
     };
+    if group.tearing_down {
+        return false;
+    }
     group
         .subscriptions
         .retain(|state| state.server_id != stale_server_id);
@@ -438,6 +538,19 @@ async fn remove_subscription_state(
     server_id: &str,
 ) {
     let mut groups = account.graph_subscriptions.write().await;
+    remove_subscription_from_groups(&mut groups, handle, server_id);
+}
+
+/// Forget one server subscription only after its DELETE has succeeded.
+///
+/// Returns whether this was the group's final subscription. Keeping this
+/// state transition pure pins the teardown invariant without requiring a
+/// live Graph DELETE transport seam.
+fn remove_subscription_from_groups(
+    groups: &mut HashMap<SubscriptionHandle, GraphSubscriptionGroup>,
+    handle: &SubscriptionHandle,
+    server_id: &str,
+) -> bool {
     let remove_group = if let Some(group) = groups.get_mut(handle) {
         group
             .subscriptions
@@ -449,6 +562,7 @@ async fn remove_subscription_state(
     if remove_group {
         groups.remove(handle);
     }
+    remove_group
 }
 
 /// Whether the EWS streaming worker can actually subscribe to `scope`.
@@ -491,6 +605,7 @@ async fn subscribe_ews(
             scopes,
         },
     );
+    account.ews_subscription_changed.notify_one();
     super::push_stream::ensure_ews_worker(account).await;
     Ok(handle)
 }
@@ -500,6 +615,7 @@ async fn unsubscribe_ews(
     handle: SubscriptionHandle,
 ) -> Result<(), AccountError> {
     account.ews_subscriptions.write().await.remove(&handle);
+    account.ews_subscription_changed.notify_one();
     Ok(())
 }
 
@@ -804,6 +920,16 @@ mod tests {
         }
     }
 
+    /// A subscription whose expiry is already past, so it is unconditionally
+    /// inside the renewal threshold.
+    fn expiring(server_id: &str, resource: &str) -> GraphSubscriptionState {
+        GraphSubscriptionState {
+            server_id: server_id.to_string(),
+            expires_at: "2000-01-01T00:00:00Z".to_string(),
+            resource: resource.to_string(),
+        }
+    }
+
     /// A recreated subscription takes the vanished one's place inside the
     /// SAME group rather than piling up beside it: the stale `server_id`
     /// would otherwise stay in the due list forever, 404 on every renewal
@@ -814,12 +940,10 @@ mod tests {
         let handle = SubscriptionHandle("h".to_string());
         let mut groups = HashMap::from([(
             handle.clone(),
-            GraphSubscriptionGroup {
-                subscriptions: vec![
-                    state("gone", "/me/mailFolders/inbox/messages"),
-                    state("healthy", "/me/events"),
-                ],
-            },
+            GraphSubscriptionGroup::live(vec![
+                state("gone", "/me/mailFolders/inbox/messages"),
+                state("healthy", "/me/events"),
+            ]),
         )]);
 
         assert!(install_replacement(
@@ -868,9 +992,7 @@ mod tests {
         let other = SubscriptionHandle("other".to_string());
         groups.insert(
             other.clone(),
-            GraphSubscriptionGroup {
-                subscriptions: vec![state("other-sub", "/me/events")],
-            },
+            GraphSubscriptionGroup::live(vec![state("other-sub", "/me/events")]),
         );
         assert!(!install_replacement(
             &mut groups,
@@ -890,9 +1012,7 @@ mod tests {
         let handle = SubscriptionHandle("h".to_string());
         let mut groups = HashMap::from([(
             handle.clone(),
-            GraphSubscriptionGroup {
-                subscriptions: vec![state("healthy", "/me/events")],
-            },
+            GraphSubscriptionGroup::live(vec![state("healthy", "/me/events")]),
         )]);
         assert!(install_replacement(
             &mut groups,
@@ -901,6 +1021,170 @@ mod tests {
             state("fresh", "/me/mailFolders/inbox/messages"),
         ));
         assert_eq!(groups[&handle].subscriptions.len(), 2);
+    }
+
+    /// Teardown removes only the subscription whose DELETE was confirmed.
+    /// If the next DELETE fails, the remaining server ids are still in the
+    /// group, so retrying the same handle can finish the cleanup rather than
+    /// orphaning notifications until Graph's expiry window closes.
+    #[test]
+    fn unsubscribe_retains_not_yet_deleted_subscriptions_for_retry() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![
+                state("deleted", "/me/mailFolders/inbox/messages"),
+                state("retry-me", "/me/events"),
+                state("not-attempted", "/me/contacts"),
+            ]),
+        )]);
+
+        assert!(!remove_subscription_from_groups(
+            &mut groups,
+            &handle,
+            "deleted"
+        ));
+        let remaining = &groups[&handle].subscriptions;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|state| state.server_id == "retry-me"));
+        assert!(
+            remaining
+                .iter()
+                .any(|state| state.server_id == "not-attempted")
+        );
+    }
+
+    /// The teardown/renewal race the deletes-before-removing repair opened.
+    ///
+    /// Teardown now keeps the group registered while it deletes, so
+    /// "registered" stopped implying "live": the renewal worker's recreate
+    /// path would install a replacement into a group whose server-id
+    /// snapshot had already been taken. Teardown then deleted the stale id,
+    /// retired the group, and returned success while the replacement kept
+    /// delivering notifications. The marker raised by
+    /// `mark_group_tearing_down` is what refuses that install.
+    #[test]
+    fn a_replacement_never_lands_in_a_group_being_torn_down() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![
+                state("first", "/me/mailFolders/inbox/messages"),
+                state("second", "/me/events"),
+            ]),
+        )]);
+
+        // Teardown condemns the group and snapshots its ids under one lock.
+        let snapshot = mark_group_tearing_down(&mut groups, &handle).expect("group registered");
+        assert_eq!(snapshot, vec!["first".to_string(), "second".to_string()]);
+
+        // The first DELETE is confirmed; the group stays registered so the
+        // ids still to delete remain reachable.
+        assert!(!remove_subscription_from_groups(
+            &mut groups,
+            &handle,
+            "first"
+        ));
+
+        // The renewal worker's replacement for the vanished `second` lands
+        // mid-teardown. Installing it would put a live server subscription
+        // under a handle whose snapshot can never name it.
+        assert!(
+            !install_replacement(&mut groups, &handle, "second", state("fresh", "/me/events")),
+            "a condemned group must refuse a replacement"
+        );
+        assert!(
+            !groups[&handle]
+                .subscriptions
+                .iter()
+                .any(|state| state.server_id == "fresh"),
+            "the replacement must not become state teardown cannot see"
+        );
+
+        // Teardown finishes on the ids it snapshotted, and the handle is gone.
+        assert!(remove_subscription_from_groups(
+            &mut groups,
+            &handle,
+            "second"
+        ));
+        assert!(groups.is_empty(), "teardown retires the handle");
+    }
+
+    /// Condemning is idempotent and monotone: a retry after a failed DELETE
+    /// re-marks the same group and returns the ids still to delete, while an
+    /// unknown handle stays a no-op (teardown may be retried after a reopen).
+    #[test]
+    fn marking_teardown_is_idempotent_and_unknown_handles_are_none() {
+        let handle = SubscriptionHandle("h".to_string());
+        let mut groups = HashMap::from([(
+            handle.clone(),
+            GraphSubscriptionGroup::live(vec![state("retry-me", "/me/events")]),
+        )]);
+        assert_eq!(
+            mark_group_tearing_down(&mut groups, &handle),
+            Some(vec!["retry-me".to_string()])
+        );
+        assert!(groups[&handle].tearing_down);
+        assert_eq!(
+            mark_group_tearing_down(&mut groups, &handle),
+            Some(vec!["retry-me".to_string()]),
+            "a teardown retry sees the ids whose DELETE has not been confirmed"
+        );
+        assert!(
+            mark_group_tearing_down(&mut groups, &SubscriptionHandle("never".to_string()))
+                .is_none()
+        );
+    }
+
+    /// A condemned group is not renewed either. Renewal would extend the
+    /// life of exactly what the caller asked to delete, and the recreate
+    /// branch behind it is the same orphan by another route.
+    #[test]
+    fn due_renewals_skip_a_group_being_torn_down() {
+        let live = SubscriptionHandle("live".to_string());
+        let condemned = SubscriptionHandle("condemned".to_string());
+        let mut groups = HashMap::from([
+            (
+                live.clone(),
+                GraphSubscriptionGroup::live(vec![expiring("live-sub", "/me/events")]),
+            ),
+            (
+                condemned.clone(),
+                GraphSubscriptionGroup::live(vec![expiring("condemned-sub", "/me/contacts")]),
+            ),
+        ]);
+        assert!(mark_group_tearing_down(&mut groups, &condemned).is_some());
+
+        let due = due_renewals(&groups);
+        assert_eq!(due.len(), 1, "only the live group is due");
+        assert_eq!(due[0].0, live);
+        assert_eq!(due[0].1, "live-sub");
+        assert_eq!(due[0].2, "/me/events");
+
+        // And an expiry outside the threshold is not due at all.
+        groups.get_mut(&live).expect("live group").subscriptions[0].expires_at =
+            "2099-01-01T00:00:00Z".to_string();
+        assert!(due_renewals(&groups).is_empty());
+    }
+
+    /// An empty scope list is not a subscription. Registering one minted a
+    /// handle over an empty group: teardown had no server id to walk, so the
+    /// group was never retired and the renewal worker it started was never
+    /// stopped. Both modes refuse it before any state is installed.
+    #[tokio::test]
+    async fn subscribing_to_no_scopes_is_rejected_in_both_modes() {
+        for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
+            let account = GraphAccount::new_for_tests(GraphClient::new("token"), mode);
+            let error = push_subscribe(account.clone(), Vec::new())
+                .await
+                .expect_err("an empty scope list covers nothing");
+            assert!(matches!(
+                error.kind(),
+                AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+            ));
+            assert!(account.graph_subscriptions.read().await.is_empty());
+            assert!(account.ews_subscriptions.read().await.is_empty());
+        }
     }
 
     #[tokio::test]

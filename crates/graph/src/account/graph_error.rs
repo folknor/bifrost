@@ -836,6 +836,29 @@ pub(crate) fn unsupported_account_error(operation: AccountOperation) -> AccountE
     .expect("valid account error classification")
 }
 
+/// Build an `AccountError` for ONE item a batch surface cannot address.
+///
+/// The per-item twin of [`unsupported_account_error`], carrying the item's
+/// scope. A surface with a per-item failure lane must not reject the whole
+/// request because a single id needs a transport it does not implement -
+/// that would discard the outcomes of every other id in the batch.
+#[must_use]
+pub(crate) fn unsupported_item_error(
+    operation: AccountOperation,
+    scope: ErrorScope,
+) -> AccountError {
+    AccountErrorBuilder::new(
+        AccountErrorKind::Unsupported(operation),
+        Cause::Request(RequestCause::Unsupported { operation }),
+    )
+    .operation(operation)
+    .provider(Provider::Microsoft)
+    .protocol(Protocol::Graph)
+    .scope(scope)
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Build an `AccountError` for malformed Account-level input.
 #[must_use]
 pub(crate) fn invalid_account_error(
