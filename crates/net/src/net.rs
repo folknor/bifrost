@@ -852,7 +852,7 @@ pub(crate) fn into_byte_stream(response: reqwest::Response) -> ByteStream {
 #[cfg(test)]
 mod tests {
     use super::content_range_matches;
-    use super::{AccountId, AccountSpec, Net};
+    use super::{AccountId, AccountSpec, ByteRange, Net, encode_range};
     use crate::StaticTokenSource;
     use crate::config::NetConfig;
     use crate::rate::RateLimit;
@@ -873,6 +873,141 @@ mod tests {
     #[test]
     fn content_range_accepts_valid_open_ended_tail() {
         assert!(content_range_matches("bytes=10-", "bytes 10-99/100"));
+    }
+
+    // ---- encode_range -------------------------------------------------
+
+    #[test]
+    fn encode_range_emits_inclusive_closed_ranges() {
+        let encoded = encode_range(ByteRange {
+            start: 0,
+            length: Some(100),
+        })
+        .expect("closed range encodes");
+        assert_eq!(
+            encoded, "bytes=0-99",
+            "HTTP ranges are inclusive, so a 100-byte read ends at 99"
+        );
+
+        let encoded = encode_range(ByteRange {
+            start: 500,
+            length: Some(1),
+        })
+        .expect("single-byte range encodes");
+        assert_eq!(encoded, "bytes=500-500");
+    }
+
+    #[test]
+    fn encode_range_emits_the_open_ended_form_for_no_length() {
+        let encoded = encode_range(ByteRange {
+            start: 42,
+            length: None,
+        })
+        .expect("open-ended range encodes");
+        assert_eq!(encoded, "bytes=42-");
+    }
+
+    /// `Some(0)` is degenerate: `bytes=N-N` would be one byte and
+    /// `bytes=N-(N-1)` is RFC-invalid. `download_stream` short-circuits
+    /// it before the encoder is reached; the encoder rejects it so a
+    /// hand-rolled call site still sees the error path.
+    #[test]
+    fn encode_range_rejects_a_zero_length_window() {
+        let err = encode_range(ByteRange {
+            start: 7,
+            length: Some(0),
+        })
+        .expect_err("zero-length range is a local input error");
+        assert!(matches!(
+            err,
+            crate::error::Error::RangeNotHonored {
+                kind: crate::error::RangeFailureKind::LocalInvalid,
+                ..
+            }
+        ));
+    }
+
+    /// `start + length` overflow used to saturate into
+    /// `bytes=N-u64::MAX`, which servers either reject or answer with
+    /// the whole tail. Surfacing the local error keeps the caller's bug
+    /// visible.
+    #[test]
+    fn encode_range_rejects_start_plus_length_overflow() {
+        let err = encode_range(ByteRange {
+            start: u64::MAX - 1,
+            length: Some(10),
+        })
+        .expect_err("overflowing range is a local input error");
+        match err {
+            crate::error::Error::RangeNotHonored { kind, message } => {
+                assert_eq!(kind, crate::error::RangeFailureKind::LocalInvalid);
+                assert!(message.contains("overflow"), "got {message}");
+            }
+            other => panic!("expected RangeNotHonored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_range_accepts_the_largest_representable_window() {
+        let encoded = encode_range(ByteRange {
+            start: 0,
+            length: Some(u64::MAX),
+        })
+        .expect("start 0 plus u64::MAX does not overflow");
+        assert_eq!(encoded, format!("bytes=0-{}", u64::MAX - 1));
+    }
+
+    // ---- content_range_matches ---------------------------------------
+
+    #[test]
+    fn content_range_matches_an_exact_closed_window() {
+        assert!(content_range_matches("bytes=0-99", "bytes 0-99/1000"));
+        assert!(content_range_matches("bytes=0-99", "bytes 0-99/*"));
+    }
+
+    /// DOCUMENTS CURRENT BEHAVIOUR. RFC 9110 lets a server answer a
+    /// closed range that runs past the end of the resource with the
+    /// smaller satisfiable window (`bytes=0-99` against a 50-byte
+    /// resource returns `bytes 0-49/50`). This check requires an exact
+    /// end match and therefore rejects that legal response as
+    /// `RangeNotHonored`, so a caller reading a tail with an
+    /// over-long length gets a hard error instead of the correct
+    /// truncated bytes.
+    #[test]
+    fn content_range_rejects_a_legally_shortened_closed_window() {
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-49/50"));
+    }
+
+    #[test]
+    fn content_range_rejects_a_shifted_start() {
+        assert!(!content_range_matches("bytes=10-19", "bytes 11-19/100"));
+        assert!(!content_range_matches("bytes=10-", "bytes 11-99/100"));
+    }
+
+    #[test]
+    fn content_range_rejects_malformed_syntax_on_either_side() {
+        assert!(!content_range_matches("0-99", "bytes 0-99/100"));
+        assert!(!content_range_matches("bytes=0-99", "bytes=0-99/100"));
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-99"));
+        assert!(!content_range_matches("bytes=0-99", "bytes 0/100"));
+        assert!(!content_range_matches("bytes=abc-99", "bytes 0-99/100"));
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-xyz/100"));
+        assert!(!content_range_matches("bytes=0-99", "bytes 0-99/xyz"));
+        assert!(!content_range_matches("bytes=0-99", ""));
+    }
+
+    /// An open-ended request against an unknown total cannot be
+    /// verified, so any end at or past the start is accepted.
+    #[test]
+    fn content_range_open_ended_with_unknown_total_accepts_any_tail() {
+        assert!(content_range_matches("bytes=10-", "bytes 10-10/*"));
+        assert!(content_range_matches("bytes=10-", "bytes 10-999999/*"));
+        assert!(!content_range_matches("bytes=10-", "bytes 10-9/*"));
+    }
+
+    #[test]
+    fn content_range_rejects_a_zero_total_resource() {
+        assert!(!content_range_matches("bytes=0-", "bytes 0-0/0"));
     }
 
     fn build_net() -> Net {

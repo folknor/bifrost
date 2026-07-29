@@ -523,6 +523,178 @@ mod tests {
     }
 
     #[test]
+    fn progress_bytes_win_over_the_page_marker_serialized_in_the_payload() {
+        // The engine persists `ChangeCursor::advanced_through` separately
+        // from the opaque payload bytes and may ack a later page than the
+        // bytes recorded. `decode_cursor` therefore lets the outer progress
+        // override the inner marker, so a resume follows the checkpoint the
+        // engine actually acknowledged.
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let stale = GraphPageMarker {
+            next_link: "https://graph.example/page-1".to_string(),
+            last_seen_id: Some("m1".to_string()),
+        };
+        let acked = GraphPageMarker {
+            next_link: "https://graph.example/page-9".to_string(),
+            last_seen_id: Some("m9".to_string()),
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            "https://graph.example/delta".to_string(),
+            Some(stale),
+        );
+        let mut cursor = encode_cursor(scope, payload).expect("encode");
+        cursor.advanced_through = Some(encode_page_marker(&acked).expect("encode marker"));
+
+        let decoded = decode_cursor(&cursor).expect("decode");
+        assert_eq!(decoded.advanced_through, Some(acked));
+        assert_eq!(decoded.resume_url(), "https://graph.example/page-9");
+    }
+
+    #[test]
+    fn resume_url_falls_back_to_the_delta_link_without_a_marker() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        assert_eq!(payload.resume_url(), "https://graph.example/delta");
+    }
+
+    #[test]
+    fn encode_does_not_cross_check_the_scope_against_the_payload_kind() {
+        // The scope/kind agreement guard lives in
+        // `inventory::scope_matches_payload`, asserted by `changes_stream`,
+        // NOT in the codec. Pin the split so a future reader does not
+        // assume `decode_cursor` alone is enough to trust a stored cursor:
+        // a persisted cursor whose bytes name a different collection than
+        // its scope decodes cleanly here and is rejected one layer up.
+        let email_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let contact_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Contact,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&contact_scope).expect("contact scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(email_scope.clone(), payload).expect("encode");
+        assert_eq!(cursor.scope, email_scope);
+
+        let decoded = decode_cursor(&cursor).expect("codec accepts the mismatch");
+        assert!(matches!(decoded.kind, GraphCursorKind::Contacts { .. }));
+        assert_ne!(scope_for_kind(&decoded.kind), email_scope);
+    }
+
+    #[test]
+    fn an_empty_delta_link_survives_the_round_trip() {
+        // Nothing in the codec rejects a delta-less delta cursor. It is
+        // reachable only from a corrupted or hand-written cursor; the walk
+        // then requests the API root and fails as a parse error rather than
+        // looping, so this is pinned as a known-benign hole, not a
+        // guarantee that empty is meaningful.
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&scope).expect("scope should map"),
+            String::new(),
+            None,
+        );
+        let cursor = encode_cursor(scope, payload).expect("encode");
+        let decoded = decode_cursor(&cursor).expect("decode");
+        assert_eq!(decoded.resume_url(), "");
+    }
+
+    #[test]
+    fn public_folder_kind_ignores_the_envelope_delta_fields() {
+        // The payload IS the sync state for a public folder; the
+        // delta-specific fields must stay empty so no code path mistakes it
+        // for a server-issued cursor.
+        let payload = GraphCursorPayload::public_folder(public_folder_cursor());
+        assert!(payload.delta_link.is_empty());
+        assert!(payload.advanced_through.is_none());
+        assert_eq!(payload.resume_url(), "");
+    }
+
+    #[test]
+    fn a_v1_public_folder_cursor_without_the_additive_fields_decodes() {
+        // `boundary_ids` / `degraded` / `warned_classes` / `live_ids` are
+        // all `serde(default)` additions. A cursor persisted before they
+        // existed must still decode, or every public folder would reseed.
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "kind": {
+                "PublicFolder": {
+                    "folder_id": "AAMkPF=",
+                    "routing": {
+                        "anchor_mailbox": "content@contoso.com",
+                        "public_folder_mailbox": null
+                    },
+                    "watermark": "2026-03-01T10:00:00Z",
+                    "last_full_scan_at": null
+                }
+            },
+            "delta_link": "",
+            "issued_at_unix_secs": 1700000000
+        }))
+        .expect("serialize legacy payload");
+        let cursor = ChangeCursor {
+            scope: CursorScope::Folder(FolderId("AAMkPF=".to_string())),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                bytes,
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+
+        let decoded = decode_cursor(&cursor).expect("legacy public-folder cursor decodes");
+        match decoded.kind {
+            GraphCursorKind::PublicFolder(pf) => {
+                assert!(pf.live_ids.is_empty());
+                assert!(pf.boundary_ids.is_empty());
+                assert!(pf.warned_classes.is_empty());
+                assert!(!pf.degraded);
+                assert_eq!(pf.routing.public_folder_mailbox, None);
+            }
+            other => panic!("expected PublicFolder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_for_kind_collapses_calendar_event_onto_event() {
+        // Documented lossiness: the Events cursor cannot record whether the
+        // scope asked for `Event` or `CalendarEvent`, so `scope_for_kind`
+        // always answers `Event` and `scope_matches_payload` compensates
+        // with the alias rule.
+        let scope = CursorScope::FolderType {
+            folder: FolderId("calendar".to_string()),
+            ty: ObjectType::CalendarEvent,
+        };
+        let kind = kind_for_scope(&scope).expect("calendar event scope maps");
+        assert_eq!(
+            scope_for_kind(&kind),
+            CursorScope::FolderType {
+                folder: FolderId("calendar".to_string()),
+                ty: ObjectType::Event,
+            }
+        );
+    }
+
+    #[test]
     fn live_ids_capped_degrades_to_additions_only() {
         let under: Vec<String> = (0..3).map(|i| i.to_string()).collect();
         assert_eq!(cap_live_ids(under.clone(), 3), Some(under));

@@ -282,6 +282,104 @@ mod tests {
         assert!(with.foreign_namespaces_advertised);
     }
 
+    fn mailbox(name: &str, attributes: Vec<MailboxAttribute>) -> MailboxInfo {
+        MailboxInfo {
+            name: crate::types::MailboxName::new(name).expect("valid mailbox"),
+            delimiter: Some('/'),
+            attributes,
+            ..Default::default()
+        }
+    }
+
+    // `draft_create` APPENDs to Drafts and needs the APPENDUID from
+    // UIDPLUS to mint the returned handle, so both halves must be present
+    // before the flag goes true.
+    #[test]
+    fn draft_create_requires_both_a_drafts_folder_and_uidplus() {
+        let with_uidplus = ServerProfile::new(vec![Capability::UidPlus], Vec::new());
+        let without_uidplus = ServerProfile::new(Vec::new(), Vec::new());
+        let drafts = [mailbox("Drafts", Vec::new())];
+        let special_use = [mailbox("Brouillons", vec![MailboxAttribute::Drafts])];
+
+        let caps = build_capabilities(&with_uidplus, &drafts, false, None, None, false, false);
+        assert!(caps.pim_methods.draft_create, "name match plus UIDPLUS");
+
+        let caps = build_capabilities(&with_uidplus, &special_use, false, None, None, false, false);
+        assert!(
+            caps.pim_methods.draft_create,
+            "a localized Drafts folder is found by its SPECIAL-USE attribute",
+        );
+
+        let caps = build_capabilities(&without_uidplus, &drafts, false, None, None, false, false);
+        assert!(!caps.pim_methods.draft_create, "no UIDPLUS, no APPENDUID");
+
+        let caps = build_capabilities(&with_uidplus, &[], false, None, None, false, false);
+        assert!(!caps.pim_methods.draft_create, "nowhere to APPEND a draft");
+    }
+
+    // Thread search and thread hydration are implemented over the THREAD
+    // command with the REFERENCES algorithm; a server offering only
+    // ORDEREDSUBJECT must not have them advertised.
+    #[test]
+    fn thread_backed_methods_require_thread_references() {
+        let references = ServerProfile::new(
+            vec![Capability::Thread("REFERENCES".to_owned())],
+            Vec::new(),
+        );
+        let caps = build_capabilities(&references, &[], false, None, None, false, false);
+        assert!(caps.pim_methods.search);
+        assert!(caps.pim_methods.thread_hydrate);
+
+        // The capability match is case-insensitive on the algorithm name.
+        let lowercase = ServerProfile::new(
+            vec![Capability::Thread("references".to_owned())],
+            Vec::new(),
+        );
+        let caps = build_capabilities(&lowercase, &[], false, None, None, false, false);
+        assert!(caps.pim_methods.search);
+
+        let ordered_subject = ServerProfile::new(
+            vec![Capability::Thread("ORDEREDSUBJECT".to_owned())],
+            Vec::new(),
+        );
+        let caps = build_capabilities(&ordered_subject, &[], false, None, None, false, false);
+        assert!(!caps.pim_methods.search);
+        assert!(!caps.pim_methods.thread_hydrate);
+        // Per-message search does not need THREAD at all.
+        assert!(caps.pim_methods.search_messages);
+    }
+
+    #[test]
+    fn push_and_quota_track_their_server_capabilities() {
+        let bare = ServerProfile::new(Vec::new(), Vec::new());
+        let caps = build_capabilities(&bare, &[], false, None, None, false, false);
+        assert_eq!(caps.push, PushCapability::None, "IDLE is what drives push");
+        assert_eq!(caps.quota_signal, QuotaSignal::None);
+        assert!(!caps.pim_methods.quota_get);
+
+        let quota = ServerProfile::new(vec![Capability::Quota], Vec::new());
+        let caps = build_capabilities(&quota, &[], false, None, None, false, false);
+        assert_eq!(caps.quota_signal, QuotaSignal::Implicit);
+        assert!(caps.pim_methods.quota_get);
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG.
+    // `remove_from_container` and `draft_discard` both run
+    // `+FLAGS \Deleted` followed by UID EXPUNGE, and UID EXPUNGE requires
+    // UIDPLUS (RFC 4315 Section 2) - the same gate `draft_create` already
+    // applies. On a non-UIDPLUS, non-rev2 server these advertise support
+    // the account cannot deliver.
+    #[test]
+    fn expunge_backed_methods_are_advertised_without_uidplus() {
+        let bare = ServerProfile::new(Vec::new(), Vec::new());
+        let caps = build_capabilities(&bare, &[], false, None, None, false, false);
+        assert!(caps.pim_methods.remove_from_container);
+        assert!(caps.pim_methods.draft_discard);
+        // The sibling APPENDUID-dependent flag DOES gate, which is what
+        // makes the pair above look like an oversight rather than a rule.
+        assert!(!caps.pim_methods.draft_create);
+    }
+
     #[test]
     fn scheduled_send_flag_stays_false_with_submission_configured() {
         // IMAP relay FUTURERELEASE is per-connection (EHLO at send

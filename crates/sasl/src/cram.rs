@@ -47,4 +47,10 @@ mod tests {
             "dGltIGI5MTNhNjAyYzdlZGE3YTQ5NWI0ZTZlNzMzNGQzODkw"
         );
     }
+
+    #[test]
+    fn cram_md5_rejects_invalid_base64_challenge() {
+        let err = cram_md5_response("tim", "tanstaaftanstaaf", "!!!not-base64!!!").unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
 }

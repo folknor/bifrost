@@ -365,6 +365,170 @@ mod tests {
     use super::*;
     use bifrost_types::{AccountErrorKind, RecoveryClass, RetryDisposition};
 
+    /// Build the `Email/set` body `send_set` would put on the wire for one
+    /// id under one mutation kind, without a transport. Mirrors `send_set`
+    /// exactly, so the assertions below pin the real request shape.
+    fn set_body(kind: &MutationKind, ids: &[&str], state: &str) -> serde_json::Value {
+        let mut set = EmailSet::new().if_in_state(state.to_string());
+        match kind {
+            MutationKind::Destroy => {
+                set = set.destroy(ids.iter().map(|id| EmailId::new(*id)));
+            }
+            MutationKind::Flags(op) => {
+                for id in ids {
+                    apply_flags(set.update(EmailId::new(*id)), op);
+                }
+            }
+            MutationKind::Move(mailbox_id) => {
+                for id in ids {
+                    set.update(EmailId::new(*id))
+                        .mailbox_ids([mailbox_id.clone()]);
+                }
+            }
+        }
+        serde_json::to_value(&set).expect("Email/set serializes")
+    }
+
+    fn flags(values: &[&str]) -> std::collections::HashSet<String> {
+        values.iter().map(|value| String::from(*value)).collect()
+    }
+
+    #[test]
+    fn every_batch_is_gated_by_if_in_state() {
+        // `MutationConcurrency::StateBased` is advertised in
+        // `capabilities.rs`; the guard has to actually be on the wire or
+        // the engine's optimistic-concurrency contract is a fiction.
+        let body = set_body(&MutationKind::Destroy, &["m1"], "state-7");
+        assert_eq!(body["ifInState"], serde_json::json!("state-7"));
+        assert_eq!(body["destroy"], serde_json::json!(["m1"]));
+    }
+
+    #[test]
+    fn flag_add_and_remove_use_dotted_keyword_paths() {
+        // RFC 8620 s5.3: a PatchObject removes a key with `null`, never
+        // with `false`. Add sets `true`, remove sets `null`, and both ride
+        // dotted `keywords/<flag>` paths so unrelated keywords survive.
+        let add = set_body(
+            &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            add["update"]["m1"]["keywords/$seen"],
+            serde_json::json!(true)
+        );
+
+        let remove = set_body(
+            &MutationKind::Flags(FlagOp::Remove(flags(&["$seen"]))),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            remove["update"]["m1"].get("keywords/$seen"),
+            Some(&serde_json::Value::Null),
+            "removal must be an explicit null key, not false and not an omission"
+        );
+        // Neither form assigns the whole `keywords` map.
+        assert!(add["update"]["m1"].get("keywords").is_none());
+        assert!(remove["update"]["m1"].get("keywords").is_none());
+    }
+
+    #[test]
+    fn flag_set_replaces_the_whole_keyword_map() {
+        let body = set_body(
+            &MutationKind::Flags(FlagOp::Set(flags(&["$seen"]))),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            body["update"]["m1"]["keywords"],
+            serde_json::json!({"$seen": true}),
+            "FlagOp::Set is a wholesale replacement, so it assigns the map"
+        );
+        assert!(body["update"]["m1"].get("keywords/$seen").is_none());
+    }
+
+    #[test]
+    fn a_flag_patch_applies_removals_after_additions() {
+        // `FlagOp::Patch` writes adds then removes into one dotted patch.
+        // A flag named in both sets therefore ends up removed - pinning the
+        // precedence so a reordering does not silently invert it.
+        let body = set_body(
+            &MutationKind::Flags(FlagOp::Patch {
+                add: flags(&["$seen", "$flagged"]),
+                remove: flags(&["$seen"]),
+            }),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            body["update"]["m1"]["keywords/$flagged"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            body["update"]["m1"].get("keywords/$seen"),
+            Some(&serde_json::Value::Null),
+            "remove is applied last and wins"
+        );
+    }
+
+    // BUG, documented rather than endorsed. An empty flag set produces an
+    // EMPTY patch object. `Email/set` accepts `{"m1": {}}` as a valid
+    // no-op update and answers with `updated: {"m1": null}`, so
+    // `apply_batch` reports `MutationSuccess::Applied` for every id in the
+    // batch while nothing changed. The same shape is reachable through
+    // `FlagOp::Add(empty)`, `Remove(empty)`, `Patch{empty, empty}`, and
+    // through any future `FlagOp` variant, which `apply_flags` swallows in
+    // its `_ => {}` arm.
+    //
+    // Fix: reject an operation that produces no patch at the boundary
+    // (`Request(Malformed)`), or short-circuit it to a successful no-op
+    // without a round trip - either is honest; reporting `Applied` for an
+    // unrecognized operation is not.
+    #[test]
+    fn an_empty_flag_op_sends_an_empty_patch_that_reads_back_as_success() {
+        let body = set_body(
+            &MutationKind::Flags(FlagOp::Add(std::collections::HashSet::new())),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            body["update"]["m1"],
+            serde_json::json!({}),
+            "an empty add is an empty patch, which the server accepts as a no-op update"
+        );
+    }
+
+    #[test]
+    fn a_move_assigns_the_destination_as_the_only_mailbox() {
+        // JMAP `bulk_move` is a move, not a copy: assigning the whole
+        // `mailboxIds` map (rather than dotted add/remove paths) is what
+        // drops the source membership.
+        let body = set_body(
+            &MutationKind::Move(MailboxId::new("mbx-target")),
+            &["m1"],
+            "s1",
+        );
+        assert_eq!(
+            body["update"]["m1"]["mailboxIds"],
+            serde_json::json!({"mbx-target": true})
+        );
+    }
+
+    #[test]
+    fn a_multi_id_batch_carries_one_update_entry_per_id() {
+        let body = set_body(
+            &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+            &["m1", "m2", "m3"],
+            "s1",
+        );
+        let update = body["update"].as_object().expect("update is an object");
+        assert_eq!(update.len(), 3);
+        for id in ["m1", "m2", "m3"] {
+            assert_eq!(update[id]["keywords/$seen"], serde_json::json!(true));
+        }
+    }
+
     #[test]
     fn surviving_state_mismatch_routes_to_per_item_failed_concurrency_conflict() {
         // A second method-level `stateMismatch` must NOT terminate the

@@ -337,3 +337,174 @@ fn renewal_delay(expiration: Option<SystemTime>) -> Duration {
         .checked_sub(RENEW_BEFORE_EXPIRY)
         .unwrap_or(Duration::ZERO)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_future(after: Duration) -> SystemTime {
+        SystemTime::now() + after
+    }
+
+    // ---- parse_expiration ---------------------------------------------
+
+    /// Gmail returns the watch expiration as epoch milliseconds in a
+    /// JSON string.
+    #[test]
+    fn expiration_parses_epoch_millis() {
+        let parsed = parse_expiration("1700000000000").expect("epoch millis parse");
+        assert_eq!(
+            parsed
+                .duration_since(UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis(),
+            1_700_000_000_000
+        );
+    }
+
+    #[test]
+    fn expiration_rejects_non_numeric_and_negative_values() {
+        assert!(parse_expiration("").is_none());
+        assert!(parse_expiration("not-a-number").is_none());
+        assert!(parse_expiration("-1").is_none());
+        assert!(
+            parse_expiration("1.5e12").is_none(),
+            "a float rendering is not the documented shape"
+        );
+        assert!(
+            parse_expiration(" 1700000000000 ").is_none(),
+            "the parser does not trim; a padded value is rejected rather than guessed at"
+        );
+    }
+
+    // ---- renewal_delay --------------------------------------------------
+
+    /// No expiration in the watch response means Gmail told us nothing;
+    /// fall back to the six-day default rather than renewing eagerly.
+    #[test]
+    fn missing_expiration_falls_back_to_the_six_day_default() {
+        assert_eq!(renewal_delay(None), DEFAULT_RENEW_AFTER);
+        assert_eq!(DEFAULT_RENEW_AFTER, Duration::from_secs(6 * 24 * 60 * 60));
+    }
+
+    /// The normal case: Gmail's watch lasts seven days, so the renewer
+    /// wakes one day before expiry.
+    #[test]
+    fn a_seven_day_expiration_renews_one_day_early() {
+        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+        let delay = renewal_delay(Some(in_future(seven_days)));
+        let expected = seven_days - RENEW_BEFORE_EXPIRY;
+        assert!(delay <= expected, "got {delay:?}");
+        assert!(
+            delay + Duration::from_secs(5) >= expected,
+            "got {delay:?}, expected roughly {expected:?}"
+        );
+    }
+
+    /// DOCUMENTS A HOT-LOOP HAZARD, NOT AN ENDORSEMENT. Any expiration
+    /// inside the one-day renewal window - including one already in the
+    /// past, which is what a skewed local clock or a Gmail policy
+    /// shortening the watch produces - collapses the delay to zero.
+    /// `start_renewer` sleeps for exactly this delay and, on a
+    /// *successful* re-watch, clears `retry_after` and loops. With a
+    /// zero delay and an expiration that stays inside the window, that
+    /// is an unthrottled `users.watch` storm: no floor, no backoff, and
+    /// the success path never engages the five-minute retry timer.
+    #[test]
+    fn an_expiration_inside_the_renewal_window_yields_a_zero_delay() {
+        assert_eq!(
+            renewal_delay(Some(in_future(Duration::from_secs(60)))),
+            Duration::ZERO,
+            "one minute from expiry is inside the one-day window"
+        );
+        assert_eq!(
+            renewal_delay(Some(in_future(RENEW_BEFORE_EXPIRY))),
+            Duration::ZERO,
+            "exactly at the window boundary"
+        );
+        assert_eq!(
+            renewal_delay(Some(SystemTime::now() - Duration::from_secs(3600))),
+            Duration::ZERO,
+            "an already-expired watch renews immediately, with no floor"
+        );
+        assert_eq!(
+            renewal_delay(Some(UNIX_EPOCH)),
+            Duration::ZERO,
+            "a nonsense epoch-zero expiration behaves the same way"
+        );
+    }
+
+    /// Just past the window the delay becomes positive again, so the
+    /// zero above is a boundary behaviour rather than a constant.
+    #[test]
+    fn an_expiration_past_the_renewal_window_yields_a_positive_delay() {
+        let delay = renewal_delay(Some(in_future(
+            RENEW_BEFORE_EXPIRY + Duration::from_secs(600),
+        )));
+        assert!(delay > Duration::ZERO, "got {delay:?}");
+        assert!(delay <= Duration::from_secs(600));
+    }
+
+    #[test]
+    fn retry_cadence_constants_are_the_documented_ones() {
+        assert_eq!(RENEW_RETRY_AFTER, Duration::from_secs(5 * 60));
+        assert_eq!(RENEW_BEFORE_EXPIRY, Duration::from_secs(24 * 60 * 60));
+    }
+
+    // ---- subscription handle envelope ----------------------------------
+
+    /// The handle a consumer holds is a JSON envelope; `push_unsubscribe`
+    /// round-trips it before touching the active-handle set, so a
+    /// malformed handle is rejected as a local request error rather than
+    /// stopping someone else's watch.
+    #[test]
+    fn subscription_handle_round_trips_through_json() {
+        let handle = GmailSubscriptionHandle {
+            topic: "projects/p/topics/t".to_owned(),
+            history_id: "12345".to_owned(),
+            expiration: Some("1700000000000".to_owned()),
+        };
+        let encoded = serde_json::to_string(&handle).expect("encode");
+        let decoded: GmailSubscriptionHandle = serde_json::from_str(&encoded).expect("decode");
+        assert_eq!(decoded.topic, handle.topic);
+        assert_eq!(decoded.history_id, handle.history_id);
+        assert_eq!(decoded.expiration, handle.expiration);
+
+        assert!(
+            serde_json::from_str::<GmailSubscriptionHandle>("not json").is_err(),
+            "a malformed handle must not decode"
+        );
+        assert!(
+            serde_json::from_str::<GmailSubscriptionHandle>(r#"{"topic":"t"}"#).is_err(),
+            "history_id is required in the envelope"
+        );
+    }
+
+    #[test]
+    fn watch_response_decodes_gmails_string_shaped_fields() {
+        let response: GmailWatchResponse =
+            serde_json::from_str(r#"{"historyId":"987","expiration":"1700000000000"}"#)
+                .expect("watch response decodes");
+        assert_eq!(response.history_id, "987");
+        assert_eq!(response.expiration.as_deref(), Some("1700000000000"));
+
+        let no_expiry: GmailWatchResponse =
+            serde_json::from_str(r#"{"historyId":"987"}"#).expect("expiration is optional");
+        assert!(no_expiry.expiration.is_none());
+    }
+
+    // ---- config builder -------------------------------------------------
+
+    #[test]
+    fn pubsub_config_defaults_to_an_account_wide_watch() {
+        let config = PubSubConfig::new("projects/p/topics/t");
+        assert_eq!(config.topic, "projects/p/topics/t");
+        assert!(
+            config.label_ids.is_empty(),
+            "an empty label filter means watch the whole account"
+        );
+
+        let filtered = PubSubConfig::new("t").with_label_ids(["INBOX", "Label_1"]);
+        assert_eq!(filtered.label_ids, vec!["INBOX", "Label_1"]);
+    }
+}

@@ -1791,6 +1791,97 @@ mod tests {
         }
     }
 
+    /// Documents a defect, NOT the intended contract.
+    /// EWS reports an expired, unsubscribed,
+    /// or unknown streaming subscription as `ErrorSubscriptionNotFound` /
+    /// `ErrorInvalidSubscription` / `ErrorInvalidWatermark` inside a 200 OK.
+    /// None of those tokens is in `SoapFaultCode::parse`, so they collapse
+    /// onto `Unknown` -> `Protocol(ContractViolation)` -> a TERMINAL
+    /// recovery class. `run_get_events_loop` then returns
+    /// `StreamLoopExit::Terminated`, `run_streaming_worker` emits
+    /// `WatchEvent::Terminated` and RETURNS - so in-process EWS push dies
+    /// permanently on a routine subscription expiry that the worker's own
+    /// outer loop would have fixed with a re-Subscribe. Genuinely transient
+    /// codes such as `ErrorInternalServerTransientError` take the same
+    /// terminal path.
+    #[test]
+    fn unrecognized_ews_response_codes_are_terminal_contract_violations() {
+        for code in [
+            "ErrorSubscriptionNotFound",
+            "ErrorInvalidSubscription",
+            "ErrorSubscriptionUnsubscribed",
+            "ErrorInvalidWatermark",
+            "ErrorInternalServerTransientError",
+        ] {
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Error">
+          <m:MessageText>subscription problem</m:MessageText>
+          <m:ResponseCode>{code}</m:ResponseCode>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#
+            );
+            let parsed = crate::ews::check_response_error(&xml)
+                .expect_err("an Error-classed response must surface");
+            let err = ews_error_to_account_error(
+                parsed,
+                GraphErrorContext::ews(AccountOperation::PushStream),
+            );
+            assert!(
+                matches!(
+                    err.kind(),
+                    AccountErrorKind::Protocol(ProtocolErrorKind::ContractViolation)
+                ),
+                "{code} classified as {:?}",
+                err.kind()
+            );
+            assert!(
+                err.recovery().is_terminal(),
+                "{code} recovery {:?} is not terminal",
+                err.recovery()
+            );
+        }
+    }
+
+    #[test]
+    fn ews_item_not_found_is_a_scoped_not_found_not_a_contract_violation() {
+        // The classified EWS codes must keep their typed mapping: a
+        // missing public-folder item is a per-item NotFound, so a hydration
+        // batch reports it against that id rather than tearing down.
+        let err = ews_error_to_account_error(
+            EwsError::SoapFault {
+                code: SoapFaultCode::ErrorItemNotFound,
+                detail: DiagnosticText::support_only("gone".to_string()),
+            },
+            GraphErrorContext::ews(AccountOperation::Hydrate).with_scope(ErrorScope::Message {
+                id: "AAMkItem=".to_string(),
+            }),
+        );
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::NotFound(ResourceKind::Message)
+        ));
+    }
+
+    #[test]
+    fn ews_mailbox_move_in_progress_is_retryable_not_terminal() {
+        let err = ews_error_to_account_error(
+            EwsError::SoapFault {
+                code: SoapFaultCode::ErrorMailboxMoveInProgress,
+                detail: DiagnosticText::support_only("moving".to_string()),
+            },
+            GraphErrorContext::ews(AccountOperation::SyncChanges),
+        );
+        assert!(!err.recovery().is_terminal());
+    }
+
     #[test]
     fn primary_mailbox_permission_loss_stays_terminal() {
         let scope = primary_email_scope();

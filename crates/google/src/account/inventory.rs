@@ -378,3 +378,232 @@ fn headers(message: &GmailMessage) -> &[GmailHeader] {
 fn non_negative_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(value: serde_json::Value) -> GmailMessage {
+        serde_json::from_value(value).expect("message fixture deserializes")
+    }
+
+    fn with_headers(id: &str, headers: serde_json::Value) -> GmailMessage {
+        message(json!({
+            "id": id,
+            "threadId": format!("thread-{id}"),
+            "labelIds": ["INBOX"],
+            "historyId": "12345",
+            "sizeEstimate": 2048,
+            "payload": { "mimeType": "text/plain", "headers": headers },
+        }))
+    }
+
+    fn user_label() -> Vec<GmailLabel> {
+        vec![GmailLabel {
+            id: "Label_1".to_owned(),
+            name: "Work".to_owned(),
+            label_type: Some("user".to_owned()),
+            color: None,
+        }]
+    }
+
+    #[test]
+    fn non_negative_conversion_drops_negatives_and_absent_values() {
+        assert_eq!(non_negative_u64(Some(0)), Some(0));
+        assert_eq!(non_negative_u64(Some(2048)), Some(2048));
+        assert_eq!(non_negative_u64(None), None);
+        assert_eq!(
+            non_negative_u64(Some(-1)),
+            None,
+            "a negative size must not wrap into a huge u64"
+        );
+        assert_eq!(non_negative_u64(Some(i64::MIN)), None);
+    }
+
+    #[test]
+    fn inventory_entry_projects_ids_memberships_and_size() {
+        let msg = with_headers("m1", json!([]));
+        let entry = inventory_entry_from_message(&msg, &user_label());
+
+        assert_eq!(entry.id, ObjectId("m1".to_owned()));
+        assert_eq!(entry.thread_id, Some(ThreadId("thread-m1".to_owned())));
+        assert_eq!(entry.size, Some(2048));
+        assert_eq!(entry.fingerprint.size, Some(2048));
+        assert_eq!(
+            entry.memberships,
+            vec![MembershipScope::Label(LabelId("INBOX".to_owned()))]
+        );
+        assert!(
+            entry.blob_id.is_none(),
+            "the inventory pass carries no blob handle"
+        );
+    }
+
+    /// Gmail's per-message `historyId` becomes the fingerprint's server
+    /// version; a missing or unparseable one degrades to `Unavailable`
+    /// rather than to a bogus zero.
+    #[test]
+    fn server_version_comes_from_the_messages_history_id() {
+        let msg = with_headers("m2", json!([]));
+        assert_eq!(
+            inventory_entry_from_message(&msg, &[])
+                .fingerprint
+                .server_version,
+            ServerVersion::HistoryAt(12345)
+        );
+
+        let no_history = message(json!({ "id": "m3", "threadId": "t3" }));
+        assert_eq!(
+            inventory_entry_from_message(&no_history, &[])
+                .fingerprint
+                .server_version,
+            ServerVersion::Unavailable
+        );
+
+        let junk_history =
+            message(json!({ "id": "m4", "threadId": "t4", "historyId": "not-a-number" }));
+        assert_eq!(
+            inventory_entry_from_message(&junk_history, &[])
+                .fingerprint
+                .server_version,
+            ServerVersion::Unavailable
+        );
+    }
+
+    #[test]
+    fn threading_headers_are_read_case_insensitively() {
+        let msg = with_headers(
+            "m5",
+            json!([
+                { "name": "message-id", "value": "<a@example.test>" },
+                { "name": "IN-REPLY-TO", "value": "<parent@example.test>" },
+            ]),
+        );
+        let entry = inventory_entry_from_message(&msg, &[]);
+        assert_eq!(entry.message_id.as_deref(), Some("<a@example.test>"));
+        assert_eq!(
+            entry.in_reply_to.as_deref(),
+            Some("<parent@example.test>"),
+            "header lookup must not depend on Gmail's capitalisation"
+        );
+    }
+
+    /// `References` is split on whitespace and the angle brackets are
+    /// trimmed, so the entry carries bare message ids.
+    #[test]
+    fn references_are_split_and_unbracketed() {
+        let msg = with_headers(
+            "m6",
+            json!([{
+                "name": "References",
+                "value": "<a@example.test> <b@example.test>\r\n\t<c@example.test>",
+            }]),
+        );
+        let entry = inventory_entry_from_message(&msg, &[]);
+        assert_eq!(
+            entry.references,
+            vec![
+                "a@example.test".to_owned(),
+                "b@example.test".to_owned(),
+                "c@example.test".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn absent_threading_headers_yield_empty_projections() {
+        let msg = with_headers("m7", json!([]));
+        let entry = inventory_entry_from_message(&msg, &[]);
+        assert!(entry.message_id.is_none());
+        assert!(entry.in_reply_to.is_none());
+        assert!(entry.references.is_empty());
+    }
+
+    /// The fingerprint's `flags_hash` is what the engine compares to
+    /// decide an object changed. It must move when the label set moves
+    /// and must not move for an identical set.
+    #[test]
+    fn flags_hash_is_stable_for_a_given_label_set() {
+        let unread = message(json!({
+            "id": "m8", "threadId": "t8", "labelIds": ["INBOX", "UNREAD"],
+        }));
+        let read = message(json!({
+            "id": "m8", "threadId": "t8", "labelIds": ["INBOX"],
+        }));
+        let a = inventory_entry_from_message(&unread, &[])
+            .fingerprint
+            .flags_hash;
+        let b = inventory_entry_from_message(&unread, &[])
+            .fingerprint
+            .flags_hash;
+        let c = inventory_entry_from_message(&read, &[])
+            .fingerprint
+            .flags_hash;
+        assert_eq!(a, b, "the same label set must hash identically");
+        assert_ne!(a, c, "flipping UNREAD must move the hash");
+    }
+
+    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `canonical_flags` renders a
+    /// user label as `$gmail-label:<id>:<name>` and falls back to the id
+    /// when the label list does not know the id. `inventory_stream` and
+    /// `get_stream` both read the scope cache without refreshing it, and
+    /// `ScopeSnapshot::empty()` claims to be fresh for five minutes
+    /// after `open()` - so a cold-start inventory can hash the fallback
+    /// spelling and then disagree with every later hydrate for the same
+    /// unchanged message.
+    #[test]
+    fn an_empty_label_list_changes_the_flags_hash_for_user_labels() {
+        let msg = message(json!({
+            "id": "m9", "threadId": "t9", "labelIds": ["Label_1"],
+        }));
+        let with_names = inventory_entry_from_message(&msg, &user_label());
+        let without_names = inventory_entry_from_message(&msg, &[]);
+        assert_ne!(
+            with_names.fingerprint.flags_hash, without_names.fingerprint.flags_hash,
+            "the same message hashes differently depending on whether the label \
+             cache happened to be populated",
+        );
+    }
+
+    // ---- raw_bytes ----------------------------------------------------
+
+    #[test]
+    fn raw_bytes_decodes_base64url_without_padding() {
+        // "From: a@b\r\n\r\nhi" base64url, unpadded.
+        let msg = message(json!({
+            "id": "m10",
+            "threadId": "t10",
+            "raw": "RnJvbTogYUBiDQoNCmhp",
+        }));
+        let bytes = raw_bytes(&msg).expect("raw projection decodes");
+        assert_eq!(bytes.as_ref(), b"From: a@b\r\n\r\nhi");
+    }
+
+    #[test]
+    fn raw_bytes_rejects_a_message_without_raw_octets() {
+        let msg = message(json!({ "id": "m11", "threadId": "t11" }));
+        assert!(
+            raw_bytes(&msg).is_err(),
+            "a raw projection that came back without raw bytes is a protocol fault, \
+             not an empty message",
+        );
+    }
+
+    #[test]
+    fn raw_bytes_rejects_undecodable_base64() {
+        let msg = message(json!({ "id": "m12", "threadId": "t12", "raw": "!!!not base64!!!" }));
+        assert!(raw_bytes(&msg).is_err());
+    }
+
+    // ---- paging constants ---------------------------------------------
+
+    #[test]
+    fn page_and_batch_sizes_stay_inside_the_gmail_limits() {
+        assert_eq!(
+            LIST_PAGE_SIZE, 500,
+            "500 is the users.messages.list maximum"
+        );
+        assert_eq!(HYDRATE_BATCH_SIZE, 32);
+    }
+}

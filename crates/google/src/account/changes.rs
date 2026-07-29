@@ -246,3 +246,228 @@ fn changes_from_history(history: &[GmailHistoryItem]) -> Vec<Change> {
 fn label_ids(message: &GmailMessage) -> Vec<String> {
     message.label_ids.clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn history(value: serde_json::Value) -> Vec<GmailHistoryItem> {
+        serde_json::from_value(value).expect("history fixture deserializes")
+    }
+
+    fn message(id: &str, labels: &[&str]) -> serde_json::Value {
+        json!({
+            "id": id,
+            "threadId": format!("t-{id}"),
+            "labelIds": labels,
+        })
+    }
+
+    fn object_changes(changes: &[Change]) -> Vec<(String, ObjectChangeKind)> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::ObjectChange(oc) => Some((oc.id.0.clone(), oc.kind)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scope_changes(changes: &[Change]) -> Vec<(String, String, ScopeChangeKind)> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::ScopeChange(sc) => match &sc.membership {
+                    MembershipScope::Label(LabelId(label)) => {
+                        Some((sc.id.0.clone(), label.clone(), sc.kind))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_history_yields_no_changes() {
+        assert!(changes_from_history(&[]).is_empty());
+        assert!(changes_from_history(&history(json!([{}]))).is_empty());
+    }
+
+    /// A `messagesAdded` record is both an object birth and a
+    /// membership announcement: the engine needs the `Created` row to
+    /// materialise the object and one `ScopeChange::Added` per label so
+    /// the object lands in the right containers without a follow-up
+    /// hydrate.
+    #[test]
+    fn messages_added_emits_created_then_one_scope_row_per_label() {
+        let changes = changes_from_history(&history(json!([{
+            "messagesAdded": [{ "message": message("m1", &["INBOX", "UNREAD"]) }],
+        }])));
+
+        assert_eq!(
+            object_changes(&changes),
+            vec![("m1".to_owned(), ObjectChangeKind::Created)]
+        );
+        assert_eq!(
+            scope_changes(&changes),
+            vec![
+                ("m1".to_owned(), "INBOX".to_owned(), ScopeChangeKind::Added),
+                ("m1".to_owned(), "UNREAD".to_owned(), ScopeChangeKind::Added),
+            ]
+        );
+        assert!(
+            matches!(changes.first(), Some(Change::ObjectChange(_))),
+            "the object must be created before its memberships are announced"
+        );
+    }
+
+    /// Gmail omits `labelIds` on a message with no labels; the row must
+    /// still create the object.
+    #[test]
+    fn messages_added_without_labels_still_creates_the_object() {
+        let changes = changes_from_history(&history(json!([{
+            "messagesAdded": [{ "message": { "id": "m2", "threadId": "t2" } }],
+        }])));
+        assert_eq!(
+            object_changes(&changes),
+            vec![("m2".to_owned(), ObjectChangeKind::Created)]
+        );
+        assert!(scope_changes(&changes).is_empty());
+    }
+
+    #[test]
+    fn messages_deleted_emits_a_destroyed_row_only() {
+        let changes = changes_from_history(&history(json!([{
+            "messagesDeleted": [{ "message": message("m3", &["INBOX"]) }],
+        }])));
+        assert_eq!(
+            object_changes(&changes),
+            vec![("m3".to_owned(), ObjectChangeKind::Destroyed)]
+        );
+        assert!(
+            scope_changes(&changes).is_empty(),
+            "a destroyed message needs no membership teardown row"
+        );
+    }
+
+    #[test]
+    fn label_add_and_remove_become_scoped_membership_rows() {
+        let changes = changes_from_history(&history(json!([{
+            "labelsAdded": [{
+                "message": message("m4", &["INBOX"]),
+                "labelIds": ["Label_1", "STARRED"],
+            }],
+            "labelsRemoved": [{
+                "message": message("m4", &["INBOX"]),
+                "labelIds": ["UNREAD"],
+            }],
+        }])));
+
+        assert!(
+            object_changes(&changes).is_empty(),
+            "a label flip is not an object birth or death"
+        );
+        assert_eq!(
+            scope_changes(&changes),
+            vec![
+                (
+                    "m4".to_owned(),
+                    "Label_1".to_owned(),
+                    ScopeChangeKind::Added
+                ),
+                (
+                    "m4".to_owned(),
+                    "STARRED".to_owned(),
+                    ScopeChangeKind::Added
+                ),
+                (
+                    "m4".to_owned(),
+                    "UNREAD".to_owned(),
+                    ScopeChangeKind::Removed
+                ),
+            ]
+        );
+    }
+
+    /// The label rows carry the *changed* labels from `labelIds`, not
+    /// the message's full label set. Pinning this matters because the
+    /// wrapper also carries a `message` whose own `labelIds` is the
+    /// post-change full set - reading the wrong one would announce
+    /// memberships that did not change.
+    #[test]
+    fn label_rows_use_the_delta_not_the_messages_full_label_set() {
+        let changes = changes_from_history(&history(json!([{
+            "labelsAdded": [{
+                "message": message("m5", &["INBOX", "UNREAD", "Label_9"]),
+                "labelIds": ["Label_9"],
+            }],
+        }])));
+        assert_eq!(
+            scope_changes(&changes),
+            vec![(
+                "m5".to_owned(),
+                "Label_9".to_owned(),
+                ScopeChangeKind::Added
+            )]
+        );
+    }
+
+    /// Multiple history records fold into one flat, order-preserving
+    /// change list; the engine relies on history order for correctness
+    /// when an object is created and then relabelled in the same page.
+    #[test]
+    fn multiple_history_records_preserve_wire_order() {
+        let changes = changes_from_history(&history(json!([
+            { "messagesAdded": [{ "message": message("m6", &["INBOX"]) }] },
+            {
+                "labelsRemoved": [{
+                    "message": message("m6", &["INBOX"]),
+                    "labelIds": ["INBOX"],
+                }],
+            },
+            { "messagesDeleted": [{ "message": message("m6", &[]) }] },
+        ])));
+
+        assert_eq!(
+            object_changes(&changes),
+            vec![
+                ("m6".to_owned(), ObjectChangeKind::Created),
+                ("m6".to_owned(), ObjectChangeKind::Destroyed),
+            ]
+        );
+        assert_eq!(
+            scope_changes(&changes),
+            vec![
+                ("m6".to_owned(), "INBOX".to_owned(), ScopeChangeKind::Added),
+                (
+                    "m6".to_owned(),
+                    "INBOX".to_owned(),
+                    ScopeChangeKind::Removed
+                ),
+            ]
+        );
+    }
+
+    /// One history record can carry every category at once; all four
+    /// buckets must be drained in the fixed added / deleted / labelled
+    /// order the mapper documents.
+    #[test]
+    fn a_single_record_drains_all_four_buckets() {
+        let changes = changes_from_history(&history(json!([{
+            "messagesAdded": [{ "message": message("a", &[]) }],
+            "messagesDeleted": [{ "message": message("b", &[]) }],
+            "labelsAdded": [{ "message": message("c", &[]), "labelIds": ["L"] }],
+            "labelsRemoved": [{ "message": message("d", &[]), "labelIds": ["L"] }],
+        }])));
+        assert_eq!(changes.len(), 4);
+        assert_eq!(
+            object_changes(&changes),
+            vec![
+                ("a".to_owned(), ObjectChangeKind::Created),
+                ("b".to_owned(), ObjectChangeKind::Destroyed),
+            ]
+        );
+    }
+}

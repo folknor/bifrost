@@ -405,6 +405,61 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_cursor_whose_payload_scope_disagrees_with_its_envelope() {
+        // A cursor is a (scope, payload) pair and the scope is recorded in
+        // both halves. If the engine hands back a `ChangeCursor` whose
+        // outer scope was rewritten - a mis-keyed checkpoint store, a
+        // scope-renaming migration - decoding must refuse rather than
+        // silently sync the payload's scope against the envelope's.
+        let email = cursor_for_scope(CursorScope::Type(ObjectType::Email), "s1")
+            .expect("email scope encodes");
+        let crossed = ChangeCursor {
+            scope: CursorScope::Type(ObjectType::Mailbox),
+            server_state: email.server_state,
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        assert!(matches!(
+            decode_cursor(&crossed),
+            Err(JmapCursorError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn a_folder_scope_naming_a_different_mailbox_is_also_rejected() {
+        // Same guard, but for the foreign shape where the mismatch is
+        // inside the codec-encoded FolderId rather than the variant.
+        let seeded = cursor_for_scope(
+            CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-1")),
+            "s1",
+        )
+        .expect("foreign scope encodes");
+        let crossed = ChangeCursor {
+            scope: CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-2")),
+            server_state: seeded.server_state,
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        assert!(matches!(
+            decode_cursor(&crossed),
+            Err(JmapCursorError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_scope_cannot_be_encoded_at_all() {
+        // A `Folder` id with no foreign separator is not a JMAP scope: it
+        // has no account to route to, so encoding must fail rather than
+        // mint a cursor that decodes to something else.
+        assert!(matches!(
+            JmapScopeRepr::from_cursor_scope(&CursorScope::Folder(bifrost_types::FolderId(
+                "bare-mailbox".to_string()
+            ))),
+            Err(JmapCursorError::UnsupportedScope)
+        ));
+    }
+
+    #[test]
     fn rejects_non_utf8_string() {
         let raw = OpaqueChangeState {
             protocol: ProtocolKind::Jmap,

@@ -1003,6 +1003,161 @@ mod tests {
         assert_eq!(live_uids, BTreeSet::from([1, 2, 3]));
     }
 
+    // A HIGHESTMODSEQ that merely stayed put is not a reset; only a
+    // backwards move (or a mailbox that reports none at all after we had
+    // one) invalidates the cursor.
+    #[test]
+    fn modseq_reset_detection_accepts_equal_and_rejects_absent() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        assert!(validate_modseq_not_reset(&folder, 10, Some(10)).is_ok());
+        assert!(validate_modseq_not_reset(&folder, 10, Some(11)).is_ok());
+        assert!(validate_modseq_not_reset(&folder, 0, Some(0)).is_ok());
+        assert!(validate_modseq_not_reset(&folder, 10, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn uid_count_match_emits_no_warning() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncEvent<Change>>(1);
+        warn_if_uid_count_mismatch(&tx, &folder, 3, 3)
+            .await
+            .expect("agreement is not a failure");
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "EXISTS agreeing with the UID set must stay silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_downgrade_warning_names_both_strategies() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SyncEvent<Change>>(1);
+        send_strategy_downgrade(
+            &tx,
+            SyncStrategy::QResync,
+            SyncStrategy::Condstore,
+            "server said no",
+        )
+        .await
+        .expect("warning should send");
+        let event = rx.recv().await.expect("warning event");
+        assert!(
+            matches!(
+                event,
+                SyncEvent::Warning(Warning {
+                    kind: WarningKind::StrategyDowngraded,
+                    ..
+                })
+            ),
+            "a downgrade must be reported as StrategyDowngraded, not a generic warning",
+        );
+    }
+
+    // The dedup only rewrites a Removed that is still buffered in THIS
+    // batch. Once the Removed has been flushed to the consumer, a later
+    // FETCH for the same UID is a genuine re-add, not an update.
+    #[test]
+    fn a_fetch_after_an_already_flushed_removal_reports_added() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let mut live_uids = BTreeSet::from([1, 2]);
+        let mut fetch_seen = BTreeSet::new();
+        let mut removed_seen = BTreeSet::new();
+        let mut changes = Vec::new();
+
+        record_removed_change(
+            &folder,
+            99,
+            2,
+            &mut live_uids,
+            &mut removed_seen,
+            &mut changes,
+        );
+        // Simulate the batch flush: the Removed already left the process.
+        changes.clear();
+
+        record_fetch_change(
+            &folder,
+            99,
+            Some(2),
+            &mut live_uids,
+            &mut fetch_seen,
+            &mut removed_seen,
+            &mut changes,
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(
+                changes[0],
+                Change::ScopeChange(ScopeChange {
+                    kind: ScopeChangeKind::Added,
+                    ..
+                })
+            ),
+            "a flushed removal cannot be retracted, so the UID re-Adds",
+        );
+        assert!(live_uids.contains(&2), "the UID is live again");
+    }
+
+    // VANISHED and FETCH may name the same UID on a non-conformant
+    // server. When both are still buffered, the message must surface
+    // exactly once, as an update, never as both expunge and update.
+    #[test]
+    fn a_buffered_removal_is_retracted_into_an_update() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let mut live_uids = BTreeSet::from([1, 2]);
+        let mut fetch_seen = BTreeSet::new();
+        let mut removed_seen = BTreeSet::new();
+        let mut changes = Vec::new();
+
+        record_removed_change(
+            &folder,
+            99,
+            2,
+            &mut live_uids,
+            &mut removed_seen,
+            &mut changes,
+        );
+        record_fetch_change(
+            &folder,
+            99,
+            Some(2),
+            &mut live_uids,
+            &mut fetch_seen,
+            &mut removed_seen,
+            &mut changes,
+        );
+
+        assert_eq!(changes.len(), 1, "exactly one change for the UID");
+        assert!(matches!(
+            changes[0],
+            Change::ObjectChange(ObjectChange {
+                kind: ObjectChangeKind::Updated,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_fetch_without_a_uid_is_ignored() {
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let mut live_uids = BTreeSet::new();
+        let mut fetch_seen = BTreeSet::new();
+        let mut removed_seen = BTreeSet::new();
+        let mut changes = Vec::new();
+        record_fetch_change(
+            &folder,
+            99,
+            None,
+            &mut live_uids,
+            &mut fetch_seen,
+            &mut removed_seen,
+            &mut changes,
+        );
+        assert!(changes.is_empty());
+        assert!(live_uids.is_empty());
+    }
+
     #[test]
     fn qresync_disable_fallback_uses_parse_errors_and_enable_misses() {
         assert!(should_disable_qresync(&crate::Error::Parse(

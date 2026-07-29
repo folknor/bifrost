@@ -414,4 +414,144 @@ mod tests {
             AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
         ));
     }
+
+    #[test]
+    fn contact_scope_subscribes_to_the_contact_folder_collection() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("contacts".to_string()),
+            ty: ObjectType::Contact,
+        };
+        assert_eq!(
+            resource_for_scope(&account, &scope).as_deref(),
+            Some("/me/contactFolders/contacts/contacts")
+        );
+    }
+
+    #[test]
+    fn unsubscribable_scopes_have_no_graph_resource() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        assert!(resource_for_scope(&account, &CursorScope::Account).is_none());
+        // A public folder is poll-only; it must not resolve to a resource.
+        assert!(
+            resource_for_scope(
+                &account,
+                &CursorScope::Folder(FolderId("AAMkPF=".to_string()))
+            )
+            .is_none()
+        );
+        assert!(
+            resource_for_scope(
+                &account,
+                &CursorScope::FolderType {
+                    folder: FolderId("inbox".to_string()),
+                    ty: ObjectType::Mailbox,
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn opaque_folder_ids_are_percent_encoded_into_the_resource() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("AAMk/GI2=".to_string()),
+            ty: ObjectType::Email,
+        };
+        let resource = resource_for_scope(&account, &scope).expect("email scope resolves");
+        assert!(!resource.contains("AAMk/GI2="), "{resource}");
+        assert!(resource.ends_with("/messages"), "{resource}");
+    }
+
+    /// Documents current behavior worth knowing about, NOT an endorsement:
+    /// `client_for_scope` falls back to the
+    /// PRIMARY client for a foreign scope whose mailbox is not configured,
+    /// while `parse_folder` still strips the owner off the folder id. The
+    /// result subscribes `/me` to a folder id that belongs to a different
+    /// mailbox. Only reachable when a persisted scope outlives the
+    /// `with_shared_mailbox` entry that minted it, but it fails silently
+    /// (Graph 404s the resource) rather than reporting the stale config.
+    #[test]
+    fn an_unconfigured_foreign_mailbox_subscribes_against_the_primary_prefix() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("other@contoso.com", "AAMk"),
+            ty: ObjectType::Email,
+        };
+        assert_eq!(
+            resource_for_scope(&account, &scope).as_deref(),
+            Some("/me/mailFolders/AAMk/messages")
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_mode_without_an_endpoint_is_unsupported() {
+        // `with_push_endpoint` was never called: there is nowhere for Graph
+        // to deliver, so subscribing must refuse rather than create a
+        // subscription pointing at nothing.
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let err = subscribe_graph(account, vec![scope])
+            .await
+            .expect_err("expected Unsupported");
+        assert!(matches!(
+            err.kind(),
+            AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_public_folder_scope_is_rejected_in_both_push_modes() {
+        // Rejected before mode dispatch, so neither mode can start a worker
+        // for a folder it can never observe.
+        for mode in [PushMode::GraphSubscriptions, PushMode::EwsStreaming] {
+            let account = GraphAccount::new_for_tests(GraphClient::new("token"), mode);
+            let err = push_subscribe(
+                account,
+                vec![
+                    CursorScope::FolderType {
+                        folder: FolderId("inbox".to_string()),
+                        ty: ObjectType::Email,
+                    },
+                    CursorScope::Folder(FolderId("AAMkPF=".to_string())),
+                ],
+            )
+            .await
+            .expect_err("public-folder push is unsupported");
+            assert!(matches!(
+                err.kind(),
+                AccountErrorKind::Unsupported(AccountOperation::PushSubscribe)
+            ));
+        }
+    }
+
+    #[test]
+    fn subscription_handles_are_distinct_hex_tokens() {
+        let first = new_handle().expect("rng");
+        let second = new_handle().expect("rng");
+        // 16 random bytes, lowercase hex: 32 digits, parseable as a u128.
+        assert_eq!(first.0.len(), 32);
+        assert!(u128::from_str_radix(&first.0, 16).is_ok(), "{}", first.0);
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_an_unknown_handle_is_a_no_op() {
+        // Idempotent teardown: the engine may retry `push_unsubscribe`
+        // after a reopen, when the in-memory group map is already empty.
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        unsubscribe_graph(account, SubscriptionHandle("never-issued".to_string()))
+            .await
+            .expect("unknown handle unsubscribes cleanly");
+    }
 }

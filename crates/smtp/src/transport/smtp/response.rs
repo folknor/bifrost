@@ -667,6 +667,133 @@ mod test {
     }
 
     #[test]
+    fn parse_response_leaves_trailing_reply_in_remaining_input() {
+        // Pipelined drains rely on `read_line` framing rather than on the
+        // parser's remaining slice: `read_response_inner` discards it. Pin the
+        // parser contract so a change of framing strategy is visible here.
+        let (remaining, response) = parse_response("250 first\r\n250 second\r\n").unwrap();
+
+        assert_eq!(remaining, "250 second\r\n");
+        assert_eq!(response.first_line(), Some("first"));
+    }
+
+    #[test]
+    fn parse_response_rejects_reply_without_a_space_separator() {
+        // DOCUMENTS A BUG: RFC 5321 4.2 spells the
+        // final reply line as `Reply-code [ SP textstring ] CRLF`, so a bare
+        // `250\r\n` is a legal reply. The parser requires the space and turns
+        // it into a parse error, which aborts the connection.
+        assert!("250\r\n".parse::<Response>().is_err());
+        assert!("250-first\r\n250\r\n".parse::<Response>().is_err());
+    }
+
+    #[test]
+    fn parse_response_accepts_empty_text_after_the_code() {
+        let response: Response = "250 \r\n".parse().unwrap();
+
+        assert!(response.has_code(250));
+        assert_eq!(response.first_line(), Some(""));
+        assert_eq!(response.first_word(), None);
+    }
+
+    #[test]
+    fn parse_response_accepts_empty_continuation_lines() {
+        let response: Response = "250-\r\n250 HELP\r\n".parse().unwrap();
+
+        assert_eq!(response.message().collect::<Vec<&str>>(), vec!["", "HELP"]);
+        // An empty first line has no first word, which is what
+        // `ServerInfo::from_response` reads as the server name.
+        assert_eq!(response.first_word(), None);
+    }
+
+    #[test]
+    fn parse_response_needs_more_input_for_bare_lf_line_endings() {
+        // `take_until("\r\n")` never matches a bare-LF terminated line, so the
+        // reader keeps asking for more bytes instead of accepting the reply.
+        // It terminates on EOF with "incomplete response".
+        assert!(matches!(
+            parse_response("250 ok\n"),
+            Err(nom::Err::Incomplete(_))
+        ));
+    }
+
+    #[test]
+    fn parse_response_rejects_mismatched_continuation_codes() {
+        // A hard `Failure`, not a recoverable `Error`: the codes on a
+        // multiline reply must all match.
+        assert!(matches!(
+            parse_response("250-ok\r\n251 ok\r\n"),
+            Err(nom::Err::Failure(_))
+        ));
+    }
+
+    #[test]
+    fn multiline_response_preserves_every_line_in_order() {
+        let response: Response = concat!(
+            "250-mail.example.org\r\n",
+            "250-PIPELINING\r\n",
+            "250-SIZE 10240000\r\n",
+            "250 HELP\r\n",
+        )
+        .parse()
+        .unwrap();
+
+        assert_eq!(
+            response.message().collect::<Vec<&str>>(),
+            vec!["mail.example.org", "PIPELINING", "SIZE 10240000", "HELP"]
+        );
+        assert_eq!(response.first_word(), Some("mail.example.org"));
+    }
+
+    #[test]
+    fn enhanced_status_codes_skip_mismatched_and_malformed_tokens() {
+        let response: Response = concat!(
+            "550-4.7.1 class does not match the reply\r\n",
+            "550-5.7.1.9 too many components\r\n",
+            "550 5.7.1 policy rejection\r\n",
+        )
+        .parse()
+        .unwrap();
+
+        assert_eq!(
+            response
+                .enhanced_status_codes()
+                .collect::<Vec<EnhancedStatusCode>>(),
+            vec![EnhancedStatusCode {
+                class: 5,
+                subject: 7,
+                detail: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn enhanced_status_code_component_bounds() {
+        for invalid in ["5.1", "5.1.1.1", "5..1", "5.1.a", "1.1.1", "5.-1.1", ""] {
+            assert!(
+                invalid.parse::<EnhancedStatusCode>().is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
+
+        let widest: EnhancedStatusCode = "5.999.999".parse().unwrap();
+        assert_eq!(widest.to_string(), "5.999.999");
+        // A single zero component is legal; a zero-prefixed one is not.
+        assert!("2.0.0".parse::<EnhancedStatusCode>().is_ok());
+        assert!("2.00.0".parse::<EnhancedStatusCode>().is_err());
+    }
+
+    #[test]
+    fn code_converts_to_u16_and_compares_by_digits() {
+        let response: Response = "421 4.7.0 too many connections\r\n".parse().unwrap();
+
+        assert_eq!(u16::from(response.code()), 421);
+        assert!(!response.is_positive());
+        assert!(response.has_code(421));
+        assert!(!response.has_code(42));
+    }
+
+    #[test]
     fn test_response_first_line() {
         assert_eq!(
             Response::new(

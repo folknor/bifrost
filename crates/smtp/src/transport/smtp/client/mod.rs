@@ -156,6 +156,81 @@ mod test {
     }
 
     #[test]
+    fn codec_stuffs_a_dot_at_the_very_start_of_the_message() {
+        let mut buf = Vec::new();
+        let mut codec = ClientCodec::new();
+
+        codec.encode(b".", &mut buf);
+
+        assert_eq!(String::from_utf8(buf).unwrap(), "..");
+    }
+
+    #[test]
+    fn codec_stuffs_across_chunk_boundaries() {
+        // The codec is fed one chunk per `message_iter` item, so the
+        // start-of-line state must survive a CRLF split across two calls.
+        let mut buf = Vec::new();
+        let mut codec = ClientCodec::new();
+
+        codec.encode(b"line\r", &mut buf);
+        codec.encode(b"\n", &mut buf);
+        codec.encode(b".hidden\r\n", &mut buf);
+
+        assert_eq!(String::from_utf8(buf).unwrap(), "line\r\n..hidden\r\n");
+    }
+
+    #[test]
+    fn codec_only_stuffs_a_dot_that_starts_a_line() {
+        let mut buf = Vec::new();
+        let mut codec = ClientCodec::new();
+
+        codec.encode(b"a.b\r\n.c\r\n", &mut buf);
+
+        assert_eq!(String::from_utf8(buf).unwrap(), "a.b\r\n..c\r\n");
+    }
+
+    #[test]
+    fn codec_does_not_treat_a_bare_lf_as_a_line_break() {
+        // DOCUMENTS A BUG: transparency tracking is
+        // CRLF-only. A body with bare-LF line endings - which
+        // `MessageBuilder::body` produces for `Vec<u8>` input, since only
+        // `String` bodies get CRLF normalization - can carry an unstuffed
+        // lone-dot line. A relay that accepts a bare LF as a line terminator
+        // ends DATA there and parses the rest of the body as SMTP commands.
+        let mut buf = Vec::new();
+        let mut codec = ClientCodec::new();
+
+        codec.encode(b"body\n.\nMAIL FROM:<attacker@example.com>\r\n", &mut buf);
+
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "body\n.\nMAIL FROM:<attacker@example.com>\r\n"
+        );
+    }
+
+    #[test]
+    fn connection_state_verify_rejects_anything_but_ok() {
+        assert!(ConnectionState::Ok.verify().is_ok());
+        assert!(ConnectionState::Broken.verify().is_err());
+        assert!(ConnectionState::Closed.verify().is_err());
+        assert!(
+            ConnectionState::Broken
+                .verify()
+                .unwrap_err()
+                .is_connection()
+        );
+    }
+
+    #[test]
+    fn response_caps_match_the_postfix_defaults() {
+        // A regression guard on the caps the response reader enforces: a
+        // change here silently changes how much attacker-controlled data the
+        // reader will buffer.
+        assert_eq!(MAX_RESPONSE_LINE_BYTES, 1000);
+        assert_eq!(MAX_RESPONSE_BYTES, 100_000);
+    }
+
+    #[test]
     #[cfg(feature = "tracing")]
     fn test_escape_crlf() {
         assert_eq!(escape_crlf("\r\n"), "<CRLF>");

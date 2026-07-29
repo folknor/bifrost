@@ -315,4 +315,145 @@ mod tests {
                 .all(|attr| !matches!(attr, FetchAttr::ModSeq))
         );
     }
+
+    fn folder() -> MailboxName {
+        MailboxName::new("INBOX").expect("valid mailbox")
+    }
+
+    fn keyword(name: &str) -> crate::types::Flag {
+        crate::types::Flag::Custom(name.to_owned())
+    }
+
+    // The fingerprint's flags_hash is what the engine diffs to decide
+    // "refetch or not", so it must be stable under wire-order and
+    // wire-case differences that carry no semantic change, and it must
+    // collapse a duplicated flag.
+    #[test]
+    fn flags_hash_ignores_order_case_and_duplicates() {
+        use crate::types::Flag;
+        let a = flags_hash(&[Flag::Seen, Flag::Flagged]);
+        let b = flags_hash(&[Flag::Flagged, Flag::Seen]);
+        assert_eq!(a, b, "flag order must not change the fingerprint");
+
+        let canonical = flags_hash(&[keyword("$Important")]);
+        let shouted = flags_hash(&[keyword("$IMPORTANT")]);
+        assert_eq!(canonical, shouted, "IMAP flags are case-insensitive");
+
+        let once = flags_hash(&[Flag::Seen]);
+        let twice = flags_hash(&[Flag::Seen, Flag::Seen]);
+        assert_eq!(once, twice, "a repeated flag must not change the hash");
+    }
+
+    #[test]
+    fn flags_hash_separates_distinct_flag_sets() {
+        use crate::types::Flag;
+        assert_ne!(flags_hash(&[]), flags_hash(&[Flag::Seen]));
+        assert_ne!(flags_hash(&[Flag::Seen]), flags_hash(&[Flag::Flagged]));
+        assert_ne!(
+            flags_hash(&[Flag::Seen]),
+            flags_hash(&[Flag::Seen, Flag::Flagged])
+        );
+        // The canonical join uses `\n`, so two keywords must not collide
+        // with the single keyword formed by concatenating them.
+        assert_ne!(
+            flags_hash(&[keyword("$a"), keyword("$b")]),
+            flags_hash(&[keyword("$a$b")])
+        );
+    }
+
+    #[test]
+    fn flags_set_lowercases_the_wire_form() {
+        use crate::types::Flag;
+        let set = flags_set(&[Flag::Seen, keyword("$Important")]);
+        assert!(set.contains("\\seen"));
+        assert!(set.contains("$important"));
+        assert!(!set.contains("\\Seen"));
+    }
+
+    #[test]
+    fn inventory_entry_carries_owner_membership_only_for_a_shared_folder() {
+        let fetch = FetchResponse {
+            uid: Some(42),
+            mod_seq: Some(7),
+            rfc822_size: Some(1024),
+            ..Default::default()
+        };
+        let personal = fetch_to_inventory(&folder(), 9, fetch.clone(), None);
+        assert_eq!(
+            personal.memberships,
+            vec![bifrost_types::MembershipScope::Folder(
+                bifrost_types::FolderId("INBOX".to_owned())
+            )]
+        );
+        assert_eq!(personal.id, encode_object_id(&folder(), 9, 42));
+        assert_eq!(personal.size, Some(1024));
+        assert_eq!(
+            personal.fingerprint.server_version,
+            ServerVersion::ModSeq(7)
+        );
+
+        let owner = bifrost_types::MailboxId("alice".to_owned());
+        let shared = fetch_to_inventory(&folder(), 9, fetch, Some(&owner));
+        assert!(
+            shared
+                .memberships
+                .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+            "a shared folder's item must also carry its owning mailbox",
+        );
+        assert_eq!(shared.memberships.len(), 2);
+    }
+
+    // Without CONDSTORE there is no per-message version stamp, so the
+    // fingerprint has to fall back to `Unavailable` and let the
+    // size + flags_hash pair carry the diff.
+    #[test]
+    fn inventory_entry_without_modseq_reports_an_unavailable_server_version() {
+        let fetch = FetchResponse {
+            uid: Some(1),
+            ..Default::default()
+        };
+        let entry = fetch_to_inventory(&folder(), 9, fetch, None);
+        assert_eq!(entry.fingerprint.server_version, ServerVersion::Unavailable);
+        assert_eq!(entry.size, None);
+        assert_eq!(entry.fingerprint.size, None);
+    }
+
+    #[test]
+    fn inventory_entry_prefers_objectid_threadid_over_the_gmail_one() {
+        let both = FetchResponse {
+            uid: Some(1),
+            thread_id: Some("T-objectid".to_owned()),
+            gmail_thread_id: Some(1234),
+            ..Default::default()
+        };
+        let entry = fetch_to_inventory(&folder(), 9, both, None);
+        assert_eq!(entry.thread_id, Some(ThreadId("T-objectid".to_owned())));
+
+        let gmail_only = FetchResponse {
+            uid: Some(1),
+            gmail_thread_id: Some(1234),
+            ..Default::default()
+        };
+        let entry = fetch_to_inventory(&folder(), 9, gmail_only, None);
+        assert_eq!(entry.thread_id, Some(ThreadId("1234".to_owned())));
+    }
+
+    #[test]
+    fn inventory_entry_strips_angle_brackets_from_the_threading_headers() {
+        let envelope = crate::types::Envelope {
+            message_id: Some("<abc@example.test>".to_owned()),
+            in_reply_to: Some("<parent@example.test>".to_owned()),
+            ..Default::default()
+        };
+        let fetch = FetchResponse {
+            uid: Some(1),
+            envelope: Some(envelope),
+            ..Default::default()
+        };
+        let entry = fetch_to_inventory(&folder(), 9, fetch, None);
+        assert_eq!(entry.message_id.as_deref(), Some("abc@example.test"));
+        assert_eq!(entry.in_reply_to.as_deref(), Some("parent@example.test"));
+        // IMAP ENVELOPE has no References field, so the list stays empty.
+        assert!(entry.references.is_empty());
+    }
 }

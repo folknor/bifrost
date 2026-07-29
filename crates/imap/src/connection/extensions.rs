@@ -719,3 +719,7 @@ pub(crate) fn compute_notify_flags(params: &NotifySetParams) -> (bool, bool, boo
 
     (list, status, metadata)
 }
+
+#[cfg(test)]
+#[path = "extensions_tests.rs"]
+mod tests;

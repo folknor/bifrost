@@ -83,3 +83,40 @@ impl fmt::Debug for Secret {
         f.write_str("<redacted>")
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eq_compares_content_including_length_mismatch() {
+        assert_eq!(Secret::from("hunter2"), Secret::from("hunter2"));
+        assert_ne!(Secret::from("hunter2"), Secret::from("hunter3"));
+        // The length difference is folded into the accumulator, so a
+        // prefix does not compare equal.
+        assert_ne!(Secret::from("hunter2"), Secret::from("hunter2x"));
+        assert_ne!(Secret::from("hunter2"), Secret::from(""));
+        assert_eq!(Secret::default(), Secret::from(""));
+    }
+
+    #[test]
+    fn debug_is_redacted() {
+        let secret = Secret::from("hunter2");
+        assert_eq!(format!("{secret:?}"), "<redacted>");
+        // The redaction never leaks any part of the value.
+        assert!(!format!("{secret:?}").contains("hunter"));
+    }
+
+    #[test]
+    fn conversions_expose_the_inner_value_to_auth_code() {
+        let secret = Secret::from(String::from("s3cret"));
+        assert_eq!(secret.as_str(), "s3cret");
+        assert_eq!(secret.as_bytes(), b"s3cret");
+        assert_eq!(&*secret, "s3cret");
+        assert_eq!(secret.as_ref(), "s3cret");
+        assert_eq!(secret.clone().into_zeroizing().as_str(), "s3cret");
+        let from_zeroizing = Secret::from(Zeroizing::new(String::from("s3cret")));
+        assert_eq!(from_zeroizing, secret);
+    }
+}

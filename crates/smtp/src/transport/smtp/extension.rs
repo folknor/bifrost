@@ -1418,6 +1418,199 @@ mod test {
         assert!(!server_info.supports_binary_mime());
     }
 
+    fn ehlo(lines: &[&str]) -> Response {
+        Response::new(
+            Code::new(
+                Severity::PositiveCompletion,
+                Category::MailSystem,
+                Detail::Zero,
+            ),
+            lines.iter().copied().map(str::to_owned).collect(),
+        )
+    }
+
+    #[test]
+    fn size_with_an_unparsable_limit_disables_the_client_side_check() {
+        let info = ServerInfo::from_response(&ehlo(&["me", "SIZE not-a-number"])).unwrap();
+
+        assert!(info.supports_size());
+        // The advertised value is dropped silently, so `mail_options` emits
+        // `SIZE=<len>` without any client-side ceiling check.
+        assert_eq!(info.size_limit(), None);
+    }
+
+    #[test]
+    fn size_zero_means_no_declared_maximum() {
+        // RFC 1870 3: `SIZE 0` means the server declares no fixed maximum.
+        // Bifrost stores it verbatim, so every non-empty message fails the
+        // client-side check before MAIL FROM.
+        let info = ServerInfo::from_response(&ehlo(&["me", "SIZE 0"])).unwrap();
+
+        assert_eq!(info.size_limit(), Some(0));
+    }
+
+    #[test]
+    fn ehlo_keywords_and_mechanisms_are_matched_case_insensitively() {
+        let info = ServerInfo::from_response(&ehlo(&["me", "pipelining", "auth plain"])).unwrap();
+
+        assert!(info.supports_pipelining());
+        assert!(info.supports_auth_mechanism(Mechanism::Plain));
+    }
+
+    #[test]
+    fn legacy_auth_equals_form_is_not_recognized() {
+        // Old servers advertise `AUTH=LOGIN` next to `AUTH LOGIN`. Only the
+        // space-separated form is parsed; the `=` form is ignored entirely.
+        let info = ServerInfo::from_response(&ehlo(&["me", "AUTH=LOGIN"])).unwrap();
+
+        assert!(!info.supports_auth_mechanism(Mechanism::Login));
+    }
+
+    #[test]
+    fn future_release_without_limits_is_still_advertised() {
+        let info = ServerInfo::from_response(&ehlo(&["me", "FUTURERELEASE"])).unwrap();
+
+        assert!(info.supports_future_release());
+        assert_eq!(info.future_release_max_interval(), None);
+    }
+
+    #[test]
+    fn server_name_comes_from_the_first_word_of_the_first_line() {
+        let info = ServerInfo::from_response(&ehlo(&["mail.example.org greets you"])).unwrap();
+
+        assert_eq!(
+            format!("{info}"),
+            "mail.example.org with no supported features"
+        );
+
+        // A reply whose first line has no word at all has no server name.
+        assert!(ServerInfo::from_response(&ehlo(&["", "PIPELINING"])).is_err());
+    }
+
+    #[test]
+    fn hold_until_datetime_is_not_syntax_validated() {
+        // DOCUMENTS A BUG: `validate_syntax` has no
+        // arm for `FutureRelease`, and `Display` interpolates the datetime
+        // verbatim, so a caller-supplied HOLDUNTIL carrying CRLF writes a
+        // second command line into the MAIL FROM slot.
+        let parameter = MailParameter::FutureRelease(FutureReleaseParameter::HoldUntil(
+            "20260519T120000Z\r\nRSET".to_owned(),
+        ));
+
+        assert!(parameter.validate_syntax().is_ok());
+        assert_eq!(format!("{parameter}"), "HOLDUNTIL=20260519T120000Z\r\nRSET");
+    }
+
+    #[test]
+    fn envelope_id_limit_is_measured_in_xtext_bytes() {
+        // RFC 3461 4.4 caps ENVID at 100 xtext characters.
+        assert!(validate_envelope_id(&"a".repeat(100)).is_ok());
+        assert!(validate_envelope_id(&"a".repeat(101)).is_err());
+        // `=` expands to `+3D`, so 33 fit and 34 do not.
+        assert!(validate_envelope_id(&"=".repeat(33)).is_ok());
+        assert!(validate_envelope_id(&"=".repeat(34)).is_err());
+        assert!(validate_envelope_id("").is_err());
+    }
+
+    #[test]
+    fn notify_values_are_deduplicated_in_first_seen_order() {
+        let parameter =
+            DsnNotifyParameter::new([DsnNotify::Failure, DsnNotify::Delay, DsnNotify::Failure])
+                .unwrap();
+
+        assert_eq!(parameter.values().len(), 2);
+        assert_eq!(format!("{parameter}"), "FAILURE,DELAY");
+        // Dedup happens before the NEVER-exclusivity check, so a repeated
+        // NEVER is accepted rather than rejected as a combination.
+        assert!(DsnNotifyParameter::new([DsnNotify::Never, DsnNotify::Never]).is_ok());
+    }
+
+    #[test]
+    fn duplicate_global_rcpt_keywords_collapse_to_the_last_one() {
+        // RFC 3461 4.1 forbids a keyword appearing twice on one RCPT TO.
+        let recipient: Address = "alice@example.com".parse().unwrap();
+        let options = SendOptions::new()
+            .notify([DsnNotify::Failure])
+            .unwrap()
+            .never_notify();
+
+        let parameters = options.rcpt_parameters_for(&recipient);
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(format!("{}", parameters[0]), "NOTIFY=NEVER");
+    }
+
+    #[test]
+    fn recipient_parameters_do_not_leak_to_other_recipients() {
+        let alice: Address = "alice@example.com".parse().unwrap();
+        let bob: Address = "bob@example.com".parse().unwrap();
+        let options = SendOptions::new().recipient_never_notify(alice.clone());
+
+        assert_eq!(options.rcpt_parameters_for(&alice).len(), 1);
+        assert!(options.rcpt_parameters_for(&bob).is_empty());
+    }
+
+    #[test]
+    fn deliver_by_validates_rfc_2852_bounds() {
+        assert!(DeliverByParameter::new(999_999_999, DeliverByMode::Notify, false).is_ok());
+        assert!(DeliverByParameter::new(1_000_000_000, DeliverByMode::Notify, false).is_err());
+        assert!(DeliverByParameter::new(-999_999_999, DeliverByMode::Notify, false).is_ok());
+        assert!(DeliverByParameter::new(-1_000_000_000, DeliverByMode::Notify, false).is_err());
+        // Return mode requires a strictly positive deadline.
+        assert!(DeliverByParameter::new(0, DeliverByMode::Return, false).is_err());
+        assert!(DeliverByParameter::new(-1, DeliverByMode::Return, false).is_err());
+        assert_eq!(
+            format!(
+                "{}",
+                DeliverByParameter::new(-30, DeliverByMode::Notify, true).unwrap()
+            ),
+            "BY=-30;N;T"
+        );
+    }
+
+    #[test]
+    fn mt_priority_bounds_are_inclusive() {
+        assert!(MtPriorityParameter::new(-9).is_ok());
+        assert!(MtPriorityParameter::new(9).is_ok());
+        assert!(MtPriorityParameter::new(-10).is_err());
+        assert!(MtPriorityParameter::new(10).is_err());
+    }
+
+    #[test]
+    fn raw_esmtp_parameter_values_reject_whitespace_and_control_bytes() {
+        for value in ["raw value", "raw\r\nRSET", "raw\0", ""] {
+            assert!(
+                MailParameter::OtherRaw {
+                    keyword: "XTEST".to_owned(),
+                    value: Some(value.to_owned()),
+                }
+                .validate_syntax()
+                .is_err(),
+                "expected {value:?} to be rejected"
+            );
+        }
+
+        // Keywords are alphanumeric plus '-', nothing else.
+        for keyword in ["", "X TEST", "X_TEST", "X=TEST"] {
+            assert!(
+                MailParameter::Other {
+                    keyword: keyword.to_owned(),
+                    value: None,
+                }
+                .validate_syntax()
+                .is_err(),
+                "expected keyword {keyword:?} to be rejected"
+            );
+        }
+        assert!(
+            MailParameter::Other {
+                keyword: "X-TEST".to_owned(),
+                value: None,
+            }
+            .validate_syntax()
+            .is_ok()
+        );
+    }
+
     #[test]
     fn test_mail_parameter_fmt() {
         assert_eq!(

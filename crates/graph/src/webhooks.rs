@@ -255,4 +255,104 @@ mod tests {
     fn hex_encode_lowercase() {
         assert_eq!(hex_encode(&[0x0a, 0xff]), "0aff");
     }
+
+    #[test]
+    fn renewal_threshold_compares_remaining_minutes() {
+        // The worker wakes every 10 min and renews inside a 30 min
+        // threshold; a subscription with 45 min left must not be renewed,
+        // one with 15 min left must be.
+        assert!(!is_expiring_soon(&compute_expiry_iso8601(45), 30));
+        assert!(is_expiring_soon(&compute_expiry_iso8601(15), 30));
+    }
+
+    #[test]
+    fn already_expired_subscription_is_expiring_soon() {
+        assert!(is_expiring_soon("1970-01-01T00:00:01Z", 30));
+    }
+
+    #[test]
+    fn fractional_seconds_expiry_parses_like_the_whole_second_form() {
+        // Graph emits 7-digit fractional seconds on `expirationDateTime`.
+        assert_eq!(
+            parse_iso8601_to_unix("2099-01-01T00:00:00.0000000Z"),
+            parse_iso8601_to_unix("2099-01-01T00:00:00Z")
+        );
+        assert!(!is_expiring_soon("2099-01-01T00:00:00.0000000Z", 30));
+    }
+
+    /// Documents current behavior, not an endorsement.
+    /// `parse_iso8601_to_unix` has no error channel: a value it cannot read
+    /// collapses to epoch 0, which `is_expiring_soon` then reports as "long
+    /// expired". That direction is safe (renew), but it renews on every
+    /// tick forever rather than reporting the bad value once.
+    #[test]
+    fn unreadable_expiry_reads_as_epoch_zero_and_forces_renewal() {
+        for bad in ["", "2099-01-01", "not-a-timestamp", "2099-01-01T00:00"] {
+            assert_eq!(parse_iso8601_to_unix(bad), 0, "{bad}");
+            assert!(is_expiring_soon(bad, 30), "{bad}");
+        }
+    }
+
+    /// Documents a robustness gap, NOT the intended contract.
+    /// `parse_iso8601_to_unix` strips a
+    /// trailing `Z` but knows nothing about a numeric UTC offset: the
+    /// offset digits are silently dropped by the `filter_map(parse)` and
+    /// the timestamp is read as if it were UTC. Graph documents
+    /// `expirationDateTime` as UTC-with-`Z`, so this is not live today -
+    /// but the failure direction is the dangerous one. A `+05:00` expiry
+    /// reads five hours LATER than it really is, so the renewal worker
+    /// would let the subscription lapse rather than renew early.
+    #[test]
+    fn a_numeric_utc_offset_is_silently_dropped_rather_than_rejected() {
+        let utc = parse_iso8601_to_unix("2026-01-01T10:00:00Z");
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+00:00"), utc);
+        // The offset is ignored entirely, not applied.
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00+05:00"), utc);
+        assert_eq!(parse_iso8601_to_unix("2026-01-01T10:00:00-05:00"), utc);
+    }
+
+    #[test]
+    fn iso_round_trip_spans_leap_days_and_year_boundaries() {
+        for iso in [
+            "2024-02-29T23:59:59Z",
+            "2000-02-29T00:00:00Z",
+            "2026-12-31T23:59:59Z",
+            "2027-01-01T00:00:00Z",
+        ] {
+            assert_eq!(unix_to_iso8601(parse_iso8601_to_unix(iso)), iso);
+        }
+    }
+
+    #[test]
+    fn requested_expiry_is_the_minutes_offset_from_now() {
+        // `create_subscription` / `renew_subscription` clamp their argument
+        // to `MAX_EXPIRATION_MINUTES` before calling this, so pinning the
+        // offset arithmetic pins the clamp's effect too.
+        let remaining =
+            parse_iso8601_to_unix(&compute_expiry_iso8601(MAX_EXPIRATION_MINUTES)) - now_unix();
+        let want = i64::from(MAX_EXPIRATION_MINUTES) * 60;
+        assert!(
+            (remaining - want).abs() <= 2,
+            "remaining {remaining} vs want {want}"
+        );
+
+        let default_remaining =
+            parse_iso8601_to_unix(&compute_expiry_iso8601(DEFAULT_EXPIRATION_MINUTES)) - now_unix();
+        assert!(default_remaining < want);
+    }
+
+    /// Each `create_subscription` mints its OWN random `clientState`, and
+    /// `SubscriptionResponse` decodes only `id` + `expirationDateTime`, so
+    /// the secret is written to Graph and then dropped. Pinned here because
+    /// it is the mechanical reason `reference/graph.md`'s instruction to
+    /// consumers ("validate `clientState`") cannot currently be followed -
+    /// there is no per-subscription value to compare against, and no two
+    /// resources even share one.
+    #[test]
+    fn each_client_state_is_a_distinct_unexported_secret() {
+        let first = generate_client_state().expect("rng");
+        let second = generate_client_state().expect("rng");
+        assert_eq!(first.len(), CLIENT_STATE_BYTES * 2);
+        assert_ne!(first, second);
+    }
 }

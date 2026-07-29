@@ -433,8 +433,8 @@ mod test {
             header::{HeaderName, HeaderValue},
         },
         DkimCanonicalization, DkimCanonicalizationType, DkimConfig, DkimSigningAlgorithm,
-        DkimSigningKey, KeyPair, Seed, dkim_canonicalize_body, dkim_canonicalize_headers,
-        dkim_sign_fixed_time,
+        DkimSigningKey, Headers, KeyPair, Seed, dkim_canonicalize_body, dkim_canonicalize_headers,
+        dkim_canonicalize_headers_relaxed, dkim_sign_fixed_time,
     };
     use crate::StdError;
 
@@ -534,6 +534,186 @@ cJ5Ku0OTwRtSMaseRPX+T4EfG1Caa/eunPPN4rh+CSup2BVVarOT
         assert_eq!(
             dkim_canonicalize_body(body, DkimCanonicalizationType::Relaxed).into_owned(),
             b" C\r\nD E\r\n F\r\n"
+        );
+    }
+
+    #[test]
+    fn relaxed_header_canonicalization_matches_the_rfc_6376_example() {
+        // RFC 6376 3.4.5, header example (bracketed descriptors expanded):
+        //   A: X<CRLF>
+        //   B <SP> : <SP> Y <HTAB><CRLF>
+        //   <HTAB> Z <SP><SP><CRLF>
+        // whose "relaxed" output the RFC gives as:
+        //   a:X<CRLF>
+        //   b:Y<SP>Z<CRLF>
+        //
+        // Name lowercasing happens earlier, in `dkim_canonicalize_header_tag`,
+        // so the relaxed pass itself is fed already-lowercased names.
+        //
+        // DEVIATION: RFC 6376 3.4.2 step 3 deletes
+        // WSP on *both* sides of the colon. This implementation only strips
+        // WSP after it, so the input "b :" survives as "b :" instead of
+        // collapsing to "b:". Unreachable through `HeaderName`, which rejects
+        // names containing a space, but it makes the function wrong for any
+        // externally-supplied header block.
+        assert_eq!(
+            dkim_canonicalize_headers_relaxed("a: X\r\nb : Y\t\r\n\tZ  \r\n"),
+            "a:X\r\nb :Y Z\r\n"
+        );
+
+        // Without the space before the colon the output matches the RFC.
+        assert_eq!(
+            dkim_canonicalize_headers_relaxed("a: X\r\nb: Y\t\r\n\tZ  \r\n"),
+            "a:X\r\nb:Y Z\r\n"
+        );
+    }
+
+    #[test]
+    fn simple_header_canonicalization_is_a_byte_identity() {
+        let mut headers = Headers::new();
+        headers.insert_raw(HeaderValue::new(
+            HeaderName::new_from_ascii_str("Subject"),
+            "hello".to_owned(),
+        ));
+
+        assert_eq!(
+            dkim_canonicalize_headers(["Subject"], &headers, DkimCanonicalizationType::Simple),
+            "Subject: hello\r\n"
+        );
+    }
+
+    #[test]
+    fn a_signed_header_absent_from_the_message_contributes_nothing() {
+        // RFC 6376 5.4.2 allows naming a non-existent header in `h=`; the
+        // verifier treats it as an empty value. `dkim_sign_fixed_time` puts
+        // every configured name into `h=` but only hashes the ones that exist,
+        // which is the matching behavior.
+        let message = test_message();
+
+        assert_eq!(
+            dkim_canonicalize_headers(
+                ["Reply-To"],
+                &message.headers,
+                DkimCanonicalizationType::Relaxed
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn only_one_instance_of_a_repeated_header_is_signed() {
+        // `DkimConfig` documents that signing more than one header with the
+        // same name is unsupported. `Headers::insert_raw` overwrites in place,
+        // so the last write wins and the earlier value is not hashed at all.
+        let mut headers = Headers::new();
+        headers.insert_raw(HeaderValue::new(
+            HeaderName::new_from_ascii_str("Received"),
+            "one".to_owned(),
+        ));
+        headers.insert_raw(HeaderValue::new(
+            HeaderName::new_from_ascii_str("Received"),
+            "two".to_owned(),
+        ));
+
+        assert_eq!(
+            dkim_canonicalize_headers(["Received"], &headers, DkimCanonicalizationType::Relaxed),
+            "received:two\r\n"
+        );
+    }
+
+    #[test]
+    fn empty_body_canonicalization() {
+        // DOCUMENTS A BUG. RFC 6376 3.4.3: "a
+        // completely empty or missing body is canonicalized as a single CRLF;
+        // that is, the canonicalized length will be 2 octets." Simple
+        // canonicalization here returns zero octets.
+        assert_eq!(
+            dkim_canonicalize_body(b"", DkimCanonicalizationType::Simple).into_owned(),
+            b""
+        );
+
+        // RFC 6376 3.4.4: relaxed canonicalization of an empty body is the
+        // null input. This half is correct.
+        assert_eq!(
+            dkim_canonicalize_body(b"", DkimCanonicalizationType::Relaxed).into_owned(),
+            b""
+        );
+    }
+
+    #[test]
+    fn body_of_only_empty_lines_canonicalization() {
+        // DOCUMENTS A BUG. RFC 6376 3.4.4 step b
+        // ignores *all* empty lines at the end of the body, so a body that is
+        // nothing but CRLFs relaxes to the null input. This implementation
+        // stops at one CRLF.
+        //
+        // This is reachable: `Message::body_raw` appends a CRLF before
+        // signing, so `Message::builder().body(String::new())` signed with the
+        // default relaxed/relaxed canonicalization hashes "\r\n" while every
+        // verifier hashes "". The `bh=` tag never matches.
+        assert_eq!(
+            dkim_canonicalize_body(b"\r\n", DkimCanonicalizationType::Relaxed).into_owned(),
+            b"\r\n"
+        );
+        assert_eq!(
+            dkim_canonicalize_body(b"\r\n\r\n\r\n", DkimCanonicalizationType::Relaxed).into_owned(),
+            b"\r\n"
+        );
+
+        // Simple is correct here: RFC 6376 3.4.3 collapses a trailing "*CRLF"
+        // to exactly one CRLF.
+        assert_eq!(
+            dkim_canonicalize_body(b"\r\n\r\n\r\n", DkimCanonicalizationType::Simple).into_owned(),
+            b"\r\n"
+        );
+    }
+
+    #[test]
+    fn body_canonicalization_does_not_append_a_missing_final_crlf() {
+        // DOCUMENTS A BUG. Both RFC 6376 3.4.3 and
+        // 3.4.4 step b say "If the body is non-empty but does not end with a
+        // CRLF, a CRLF is added." Neither branch does that.
+        //
+        // `dkim_sign` is insulated because `Message::body_raw` appends a CRLF
+        // unconditionally; a direct caller of the canonicalizer is not.
+        assert_eq!(
+            dkim_canonicalize_body(b"abc", DkimCanonicalizationType::Simple).into_owned(),
+            b"abc"
+        );
+        assert_eq!(
+            dkim_canonicalize_body(b"abc", DkimCanonicalizationType::Relaxed).into_owned(),
+            b"abc"
+        );
+    }
+
+    #[test]
+    fn relaxed_body_canonicalization_reduces_whitespace_per_rfc_6376_3_4_4() {
+        // Step a: trailing WSP before a CRLF is dropped, and any run of WSP
+        // inside a line collapses to one SP.
+        assert_eq!(
+            dkim_canonicalize_body(b"a \t \r\nb\t\r\n", DkimCanonicalizationType::Relaxed)
+                .into_owned(),
+            b"a\r\nb\r\n"
+        );
+        assert_eq!(
+            dkim_canonicalize_body(b"x \t \t y\r\n", DkimCanonicalizationType::Relaxed)
+                .into_owned(),
+            b"x y\r\n"
+        );
+        // Leading whitespace on a line is whitespace *inside* the line and
+        // collapses rather than disappearing.
+        assert_eq!(
+            dkim_canonicalize_body(b"  a\r\n", DkimCanonicalizationType::Relaxed).into_owned(),
+            b" a\r\n"
+        );
+    }
+
+    #[test]
+    fn simple_body_canonicalization_preserves_everything_but_trailing_blank_lines() {
+        assert_eq!(
+            dkim_canonicalize_body(b"  a \t b  \r\n\r\n\r\n", DkimCanonicalizationType::Simple)
+                .into_owned(),
+            b"  a \t b  \r\n"
         );
     }
 

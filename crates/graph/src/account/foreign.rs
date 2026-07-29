@@ -323,6 +323,82 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_folder_scope_mints_an_unqualified_message_id() {
+        // `CursorScope::Folder` is the public-folder shape, and its
+        // `FolderId` is never foreign-encoded, so `encode_message_id`
+        // returns the native id bare. Public-folder projections must
+        // therefore use `encode_public_item_id`, NOT this function - the
+        // folder qualification is what routes the read onto EWS at all.
+        let scope = CursorScope::Folder(FolderId("AAMkPF=".to_string()));
+        let id = encode_message_id(&scope, "AAMkItem=");
+        assert_eq!(id.0, "AAMkItem=");
+        assert_eq!(parse_message_id(&id).public_folder(), None);
+    }
+
+    #[test]
+    fn a_non_folder_scope_mints_an_unqualified_message_id() {
+        let id = encode_message_id(&CursorScope::Account, "AAMkmessage");
+        assert_eq!(id.0, "AAMkmessage");
+        assert_eq!(parse_message_id(&id).owner(), None);
+    }
+
+    #[test]
+    fn the_public_separator_is_checked_before_the_foreign_one() {
+        // The two namespaces must stay mutually unambiguous even when a
+        // single id carries both bytes: the RS-separated public form wins,
+        // because that is the only shape either mint site produces.
+        let id = ObjectId(format!("AAMkPF={PUBLIC_SEP}mailbox{FOREIGN_SEP}item"));
+        match parse_message_id(&id) {
+            ParsedMessageId::Public { folder, item } => {
+                assert_eq!(folder, "AAMkPF=");
+                assert_eq!(item, format!("mailbox{FOREIGN_SEP}item"));
+            }
+            other => panic!("expected Public, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_mailbox_prefix_still_parses_as_foreign() {
+        // Degenerate but constructible from a misconfigured
+        // `with_shared_mailbox("")`: the id parses foreign with an empty
+        // owner, which `client_for_owner` will not find in
+        // `shared_clients`, so the request falls back to `/me` and the
+        // server reports the real miss. Pinned so the fallback is not
+        // mistaken for a primary-mailbox id.
+        let parsed = parse_message_id(&ObjectId(format!("{FOREIGN_SEP}AAMkmsg")));
+        assert_eq!(parsed.owner(), Some(""));
+        assert_eq!(parsed.native_id(), "AAMkmsg");
+    }
+
+    #[test]
+    fn a_trailing_separator_yields_an_empty_native_id() {
+        let parsed = parse_folder(&FolderId(format!("shared@contoso.com{FOREIGN_SEP}")));
+        assert_eq!(parsed.native_id(), "");
+        assert_eq!(
+            parsed.foreign().map(|f| f.mailbox.as_str()),
+            Some("shared@contoso.com")
+        );
+    }
+
+    #[test]
+    fn encode_foreign_and_encode_message_id_agree_on_the_separator() {
+        // Discovery mints the SCOPE with `encode_foreign(mailbox, folder)`
+        // and projections mint the ITEM with `encode_message_id`; both must
+        // use the same delimiter or `parse_message_id` would read a folder
+        // id as an owner (or vice versa).
+        let scope = CursorScope::FolderType {
+            folder: encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let item = encode_message_id(&scope, "AAMkmsg");
+        let folder = encode_foreign("shared@contoso.com", "AAMkfolder");
+        assert_eq!(
+            item.0.split_once(FOREIGN_SEP).map(|(m, _)| m),
+            folder.0.split_once(FOREIGN_SEP).map(|(m, _)| m)
+        );
+    }
+
+    #[test]
     fn bare_message_id_parses_as_primary() {
         let parsed = parse_message_id(&ObjectId("AAMkmessage".to_string()));
         assert_eq!(parsed, ParsedMessageId::Primary("AAMkmessage".to_string()));

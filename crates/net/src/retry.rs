@@ -77,3 +77,69 @@ impl RetryPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_matches_the_documented_shape() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(policy.initial_backoff, Duration::from_secs(1));
+        assert_eq!(policy.max_backoff, Duration::from_secs(60));
+        assert_eq!(policy.honor_retry_after_cap, Duration::from_secs(60));
+        assert!(policy.network_errors);
+        assert!(
+            policy.statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+            "429 is the one 4xx the default retries"
+        );
+        assert_eq!(
+            RetryPolicy::new().max_attempts,
+            RetryPolicy::default().max_attempts
+        );
+    }
+
+    /// `statuses` is documented as the *additive* set on top of an
+    /// unconditional `is_server_error()`. Pin that the only non-5xx
+    /// member is 429, so a reader cannot mistake the list for the
+    /// complete retry set.
+    #[test]
+    fn the_only_non_server_error_in_the_default_set_is_429() {
+        let policy = RetryPolicy::default();
+        let non_5xx: Vec<StatusCode> = policy
+            .statuses
+            .iter()
+            .filter(|status| !status.is_server_error())
+            .copied()
+            .collect();
+        assert_eq!(non_5xx, vec![StatusCode::TOO_MANY_REQUESTS]);
+    }
+
+    /// `disabled()` sets `max_attempts = 1` rather than emptying
+    /// `statuses`: the retry loop's exhausted-budget branch is what
+    /// surfaces the failure, so a 503 still becomes
+    /// `RetryBudgetExhausted` (with its final-response evidence) on the
+    /// very first attempt instead of a bare `Status`.
+    #[test]
+    fn disabled_caps_attempts_but_keeps_the_status_set() {
+        let policy = RetryPolicy::disabled();
+        assert_eq!(policy.max_attempts, 1);
+        assert_eq!(policy.statuses, RetryPolicy::default().statuses);
+        assert!(policy.network_errors);
+    }
+
+    #[test]
+    fn honor_retry_after_cap_is_the_single_capping_knob() {
+        let policy = RetryPolicy {
+            honor_retry_after_cap: Duration::from_secs(3600),
+            ..RetryPolicy::default()
+        };
+        let hint = Duration::from_secs(1800);
+        assert_eq!(
+            hint.min(policy.honor_retry_after_cap),
+            hint,
+            "raising the cap must actually let a long server hint through"
+        );
+    }
+}

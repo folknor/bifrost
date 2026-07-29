@@ -285,3 +285,74 @@ pub enum Error {
         hops: u8,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bodies_at_or_under_the_cap_pass_through_unchanged() {
+        let short = Bytes::from_static(b"{\"error\":\"nope\"}");
+        assert_eq!(cap_status_body(short.clone()), short);
+
+        let exact = Bytes::from(vec![b'x'; STATUS_BODY_CAP]);
+        let capped = cap_status_body(exact.clone());
+        assert_eq!(capped.len(), STATUS_BODY_CAP);
+        assert_eq!(capped, exact, "exactly at the cap is not truncation");
+    }
+
+    #[test]
+    fn oversize_bodies_are_truncated_with_a_visible_marker() {
+        let huge = Bytes::from(vec![b'x'; STATUS_BODY_CAP * 4]);
+        let capped = cap_status_body(huge);
+        assert_eq!(
+            capped.len(),
+            STATUS_BODY_CAP + STATUS_BODY_TRUNCATED_MARKER.len()
+        );
+        assert!(capped.ends_with(STATUS_BODY_TRUNCATED_MARKER));
+        assert_eq!(&capped[..STATUS_BODY_CAP], vec![b'x'; STATUS_BODY_CAP]);
+    }
+
+    /// One byte past the cap still truncates, so the marker is the
+    /// unambiguous signal rather than a length comparison.
+    #[test]
+    fn one_byte_over_the_cap_truncates() {
+        let over = Bytes::from(vec![b'y'; STATUS_BODY_CAP + 1]);
+        let capped = cap_status_body(over);
+        assert!(capped.ends_with(STATUS_BODY_TRUNCATED_MARKER));
+    }
+
+    /// The cap slices on a byte boundary, not a character boundary, so
+    /// a multi-byte glyph straddling the cap is split. Pin it: callers
+    /// must treat the body as bytes, and `String::from_utf8` on it can
+    /// fail even when the original body was valid UTF-8.
+    #[test]
+    fn truncation_can_split_a_multibyte_character() {
+        let mut raw = vec![b'a'; STATUS_BODY_CAP - 1];
+        raw.extend_from_slice("é".as_bytes());
+        raw.extend_from_slice(&[b'b'; 16]);
+        let capped = cap_status_body(Bytes::from(raw));
+        assert!(std::str::from_utf8(&capped[..STATUS_BODY_CAP]).is_err());
+    }
+
+    #[test]
+    fn empty_body_is_preserved() {
+        assert_eq!(cap_status_body(Bytes::new()), Bytes::new());
+    }
+
+    /// `Error` renders without leaking the response body into the
+    /// Display text; consumers read `body` explicitly when they want it.
+    #[test]
+    fn status_display_names_only_the_code() {
+        let err = Error::Status {
+            code: StatusCode::IM_A_TEAPOT,
+            body: Bytes::from_static(b"secret-token-in-body"),
+            headers: HeaderMap::new(),
+        };
+        let rendered = err.to_string();
+        // `StatusCode` renders its canonical reason too, so pin the prefix
+        // rather than coupling this to the `http` crate's reason phrases.
+        assert!(rendered.starts_with("HTTP 418"), "got {rendered:?}");
+        assert!(!rendered.contains("secret-token-in-body"));
+    }
+}

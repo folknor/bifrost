@@ -510,3 +510,7 @@ fn try_parse_literal_marker(buf: &[u8], crlf_pos: usize) -> Option<usize> {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
 }
+
+#[cfg(test)]
+#[path = "wire_tests.rs"]
+mod tests;

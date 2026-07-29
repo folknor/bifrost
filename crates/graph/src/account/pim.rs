@@ -3130,4 +3130,211 @@ mod tests {
             json!({ "importance": "normal" })
         );
     }
+
+    /// The `bifrost-types` convenience layer routes `set_starred` through
+    /// `set_category` with the reserved `"$flagged"` sentinel (Graph
+    /// advertises `StarredFlagShape::Category`). Pin the sentinel Graph
+    /// honors, plus the historical aliases, so a rename on either side is a
+    /// test failure rather than a silently-created literal category named
+    /// `$flagged` on every starred message.
+    #[test]
+    fn the_reserved_starred_sentinel_and_its_aliases_are_recognized() {
+        assert_eq!(STARRED_CATEGORY, "$flagged");
+        for token in [
+            "$flagged",
+            "$FLAGGED",
+            "\\flagged",
+            "\\Flagged",
+            "flagged",
+            "Flagged",
+            "starred",
+            "STARRED",
+        ] {
+            assert!(is_starred_category(token), "{token} must map to the flag");
+        }
+    }
+
+    #[test]
+    fn ordinary_category_names_are_not_mistaken_for_the_starred_sentinel() {
+        for token in ["Work", "flag", "$flagged-ish", "un-flagged", "$starred", ""] {
+            assert!(
+                !is_starred_category(token),
+                "{token} must stay an ordinary category"
+            );
+        }
+    }
+
+    #[test]
+    fn setting_an_ordinary_category_is_a_read_modify_write_over_the_existing_array() {
+        // `set_category` reads `categories`, edits, sorts, and writes the
+        // whole array back; a naive `["new"]` write would drop the others.
+        let existing = json!({ "categories": ["Zeta", "Alpha"] });
+        let mut categories = categories_from_value(&existing);
+        assert_eq!(categories, vec!["Zeta".to_string(), "Alpha".to_string()]);
+        categories.push("Mid".to_string());
+        categories.sort();
+        assert_eq!(categories, vec!["Alpha", "Mid", "Zeta"]);
+
+        // Absent / non-array `categories` reads as empty rather than
+        // panicking, so a sparse `$select` cannot poison the write.
+        assert!(categories_from_value(&json!({})).is_empty());
+        assert!(categories_from_value(&json!({ "categories": "Work" })).is_empty());
+        // Non-string members are skipped.
+        assert_eq!(
+            categories_from_value(&json!({ "categories": ["Work", 7, null] })),
+            vec!["Work".to_string()]
+        );
+    }
+
+    #[test]
+    fn last_verb_executed_aliases_map_onto_the_graph_proptag() {
+        // `replied_via_extended_property` / `forwarded_via_extended_property`
+        // are advertised true, and the convenience layer passes the MAPI
+        // alias; Graph only accepts the proptag form.
+        for alias in [
+            "PR_LAST_VERB_EXECUTED",
+            "pr_last_verb_executed",
+            "PidTagLastVerbExecuted",
+            "pidtaglastverbexecuted",
+        ] {
+            assert_eq!(
+                graph_extended_property_id(alias),
+                PR_LAST_VERB_EXECUTED_GRAPH_ID
+            );
+        }
+        // Anything else passes through verbatim - the caller owns the id.
+        assert_eq!(
+            graph_extended_property_id("SystemTime 0x3FEF"),
+            "SystemTime 0x3FEF"
+        );
+    }
+
+    #[test]
+    fn the_deferred_send_property_is_the_pidtag_deferred_send_time_proptag() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let body = deferred_send_time_body(at);
+        let props = body
+            .get("singleValueExtendedProperties")
+            .and_then(Value::as_array)
+            .expect("array");
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0]["id"], json!(DEFERRED_SEND_TIME_PROPERTY_ID));
+        // ISO-8601 UTC with a `Z`, second precision, no fraction.
+        let value = props[0]["value"].as_str().expect("string value");
+        assert!(value.ends_with('Z'), "{value}");
+        assert!(!value.contains('.'), "{value}");
+        assert_eq!(value, graph_iso8601_utc(at));
+    }
+
+    #[test]
+    fn send_as_on_behalf_of_keeps_an_explicit_author_but_stamps_the_sender() {
+        let mut message =
+            json!({ "from": { "emailAddress": { "address": "author@contoso.com" } } });
+        apply_send_as(
+            &mut message,
+            &SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string())),
+            Some("me@contoso.com"),
+        );
+        assert_eq!(
+            message["from"]["emailAddress"]["address"],
+            json!("author@contoso.com")
+        );
+        assert_eq!(
+            message["sender"]["emailAddress"]["address"],
+            json!("me@contoso.com")
+        );
+    }
+
+    #[test]
+    fn send_as_on_behalf_of_fills_a_missing_author_with_the_mailbox() {
+        let mut message = json!({});
+        apply_send_as(
+            &mut message,
+            &SendAs::OnBehalfOf(MailboxId("shared@contoso.com".to_string())),
+            None,
+        );
+        assert_eq!(
+            message["from"]["emailAddress"]["address"],
+            json!("shared@contoso.com")
+        );
+        // Without a known user email `sender` is omitted so Graph fills it
+        // from the authenticated context rather than being told wrongly.
+        assert!(message.get("sender").is_none());
+    }
+
+    #[test]
+    fn send_as_overrides_any_consumer_supplied_author() {
+        // `As` means author == sender == mailbox; a consumer-set `from`
+        // must not survive, or the message would claim an identity the
+        // send-as grant does not cover.
+        let mut message =
+            json!({ "from": { "emailAddress": { "address": "author@contoso.com" } } });
+        apply_send_as(
+            &mut message,
+            &SendAs::As(MailboxId("shared@contoso.com".to_string())),
+            Some("me@contoso.com"),
+        );
+        assert_eq!(
+            message["from"]["emailAddress"]["address"],
+            json!("shared@contoso.com")
+        );
+        assert_eq!(
+            message["sender"]["emailAddress"]["address"],
+            json!("shared@contoso.com")
+        );
+    }
+
+    /// `DraftPatch` is `#[non_exhaustive]`, so functional-update syntax is
+    /// unavailable outside `bifrost-types`; build through a closure so the
+    /// tests below read as one expression each.
+    fn draft_patch(fill: impl FnOnce(&mut DraftPatch)) -> DraftPatch {
+        let mut patch = DraftPatch::default();
+        fill(&mut patch);
+        patch
+    }
+
+    #[test]
+    fn a_draft_patch_of_one_field_touches_only_that_field() {
+        // The partial-update seam: `draft_update` passes
+        // `include_empty = false`, so a subject-only rename must not emit
+        // `null` / `[]` for the untouched recipient and body buckets (Graph
+        // reads those as clears).
+        let patch = draft_patch(|patch| {
+            patch.subject = Some(Some("Renamed".to_string()));
+        });
+        let message = message_from_draft_patch(&patch, false).expect("patch builds");
+        let object = message.as_object().expect("object");
+        assert_eq!(object.get("subject"), Some(&json!("Renamed")));
+        for untouched in [
+            "toRecipients",
+            "ccRecipients",
+            "bccRecipients",
+            "replyTo",
+            "from",
+            "body",
+            "attachments",
+        ] {
+            assert!(
+                !object.contains_key(untouched),
+                "{untouched} must not appear in a sparse draft patch: {message}"
+            );
+        }
+        assert_eq!(object.len(), 1);
+    }
+
+    #[test]
+    fn an_explicitly_cleared_draft_field_still_emits_its_clear() {
+        // The flip side: `Some(None)` is a deliberate clear and MUST reach
+        // the wire, so the sparse rule cannot just drop every empty value.
+        let patch = draft_patch(|patch| {
+            patch.subject = Some(None);
+            patch.from = Some(None);
+            patch.cc = Some(Vec::new());
+        });
+        let message = message_from_draft_patch(&patch, false).expect("patch builds");
+        assert_eq!(message.get("subject"), Some(&json!("")));
+        assert_eq!(message.get("from"), Some(&Value::Null));
+        assert_eq!(message.get("cc"), None);
+        assert_eq!(message.get("ccRecipients"), Some(&json!([])));
+    }
 }

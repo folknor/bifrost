@@ -586,4 +586,235 @@ mod tests {
         assert_eq!(subscriptions[0].subscription_id, "sub-1");
         assert_eq!(subscriptions[0].watermark.as_deref(), Some("wm-1"));
     }
+
+    fn email_scope(folder: &str) -> CursorScope {
+        CursorScope::FolderType {
+            folder: bifrost_types::FolderId(folder.to_string()),
+            ty: bifrost_types::ObjectType::Email,
+        }
+    }
+
+    #[test]
+    fn subscribe_request_lists_every_folder_and_the_six_event_types() {
+        let body = build_subscribe_request(&[email_scope("f1"), email_scope("f2")], None);
+        assert!(body.contains(r#"<t:FolderId Id="f1"/>"#), "{body}");
+        assert!(body.contains(r#"<t:FolderId Id="f2"/>"#), "{body}");
+        for event in [
+            "NewMailEvent",
+            "CreatedEvent",
+            "DeletedEvent",
+            "ModifiedEvent",
+            "MovedEvent",
+            "CopiedEvent",
+        ] {
+            assert!(body.contains(event), "{event} missing from {body}");
+        }
+        assert!(!body.contains("<t:Watermark>"));
+    }
+
+    #[test]
+    fn subscribe_request_carries_a_resume_watermark_when_one_is_known() {
+        let body = build_subscribe_request(&[email_scope("f1")], Some("wm-1"));
+        assert!(body.contains("<t:Watermark>wm-1</t:Watermark>"), "{body}");
+    }
+
+    #[test]
+    fn subscribe_request_escapes_xml_metacharacters() {
+        let body = build_subscribe_request(&[email_scope(r#"a&b<c>"d'"#)], Some("wm&1"));
+        assert!(
+            body.contains(r#"<t:FolderId Id="a&amp;b&lt;c&gt;&quot;d&apos;"/>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains("<t:Watermark>wm&amp;1</t:Watermark>"),
+            "{body}"
+        );
+    }
+
+    /// Documents a defect, NOT the intended contract.
+    /// Every other request builder decodes a
+    /// foreign `FolderId` before putting it on the wire
+    /// (`push::resource_for_scope`, `inventory::initial_delta_url`); the EWS
+    /// Subscribe body does not. A shared-mailbox scope therefore emits the
+    /// raw `mailbox\u{1f}folder` string inside an XML attribute - U+001F is
+    /// not a legal XML 1.0 character and `xml_escape` covers only the five
+    /// metacharacters - and even if it parsed, it names a folder id the
+    /// primary mailbox does not own (no routing header is sent either).
+    #[test]
+    fn subscribe_request_leaks_the_foreign_separator_into_the_folder_id() {
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMk"),
+            ty: bifrost_types::ObjectType::Email,
+        };
+        let body = build_subscribe_request(&[scope], None);
+        assert!(body.contains('\u{1f}'), "{body:?}");
+        assert!(body.contains("shared@contoso.com"), "{body}");
+        // The native-id form the other builders would have produced.
+        assert!(!body.contains(r#"<t:FolderId Id="AAMk"/>"#), "{body}");
+    }
+
+    /// Documents a defect, NOT the intended contract.
+    /// A scope that is not `FolderType` is
+    /// silently skipped, so a request built from only such scopes ships an
+    /// empty `<t:FolderIds>`, which EWS rejects with
+    /// `ErrorInvalidSubscriptionRequest` - and that response code is not in
+    /// `SoapFaultCode::parse`, so it lands on the terminal Unknown path and
+    /// kills the worker.
+    #[test]
+    fn subscribe_request_silently_drops_non_folder_scopes() {
+        let body = build_subscribe_request(&[CursorScope::Account], None);
+        assert!(body.contains("<t:FolderIds></t:FolderIds>"), "{body}");
+    }
+
+    #[test]
+    fn get_streaming_events_clamps_the_connection_timeout_to_the_ews_maximum() {
+        assert!(
+            build_get_streaming_events_request("sub-1", 120)
+                .contains("<m:ConnectionTimeout>30</m:ConnectionTimeout>")
+        );
+        assert!(
+            build_get_streaming_events_request("sub-1", 5)
+                .contains("<m:ConnectionTimeout>5</m:ConnectionTimeout>")
+        );
+        assert!(
+            build_get_streaming_events_request("a&b", 30)
+                .contains("<t:SubscriptionId>a&amp;b</t:SubscriptionId>")
+        );
+    }
+
+    #[test]
+    fn the_envelope_subscription_id_is_stamped_on_every_event_in_the_notification() {
+        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Success">
+          <m:Notifications>
+            <t:Notification>
+              <t:SubscriptionId>sub-1</t:SubscriptionId>
+              <t:PreviousWatermark>wm-0</t:PreviousWatermark>
+              <t:MoreEvents>false</t:MoreEvents>
+              <t:CreatedEvent>
+                <t:Watermark>wm-1</t:Watermark>
+                <t:ItemId Id="item-1"/>
+                <t:ParentFolderId Id="folder-1"/>
+              </t:CreatedEvent>
+              <t:DeletedEvent>
+                <t:Watermark>wm-2</t:Watermark>
+                <t:ItemId Id="item-2"/>
+                <t:ParentFolderId Id="folder-1"/>
+              </t:DeletedEvent>
+            </t:Notification>
+          </m:Notifications>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        let notifications = parse_streaming_notifications(xml).expect("parse should succeed");
+        assert_eq!(notifications.len(), 2);
+        for notification in &notifications {
+            assert_eq!(notification.subscription_id.as_deref(), Some("sub-1"));
+        }
+        assert_eq!(notifications[0].event_type, EwsStreamingEventType::Created);
+        assert_eq!(notifications[1].event_type, EwsStreamingEventType::Deleted);
+        // `PreviousWatermark` / `MoreEvents` must not be mistaken for the
+        // per-event watermark.
+        assert_eq!(notifications[0].watermark.as_deref(), Some("wm-1"));
+        assert_eq!(notifications[1].watermark.as_deref(), Some("wm-2"));
+    }
+
+    #[test]
+    fn a_status_frame_without_a_parent_folder_parses_without_fabricating_one() {
+        // The worker maps a missing parent folder onto an account-wide
+        // `Unknown` hint; the parser must report the absence honestly
+        // rather than defaulting to an empty FolderId.
+        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Success">
+          <m:Notifications>
+            <t:Notification>
+              <t:SubscriptionId>sub-1</t:SubscriptionId>
+              <t:NewMailEvent>
+                <t:Watermark>wm-9</t:Watermark>
+              </t:NewMailEvent>
+            </t:Notification>
+          </m:Notifications>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        let notifications = parse_streaming_notifications(xml).expect("parse should succeed");
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].parent_folder_id.is_none());
+        assert!(notifications[0].item_id.is_none());
+        assert_eq!(notifications[0].watermark.as_deref(), Some("wm-9"));
+    }
+
+    #[test]
+    fn unrecognized_event_elements_produce_no_notification() {
+        // Forward compatibility: an EWS event type this build does not
+        // know must be ignored, not turned into an untyped invalidation.
+        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:GetStreamingEventsResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages"
+                                  xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+      <m:ResponseMessages>
+        <m:GetStreamingEventsResponseMessage ResponseClass="Success">
+          <m:Notifications>
+            <t:Notification>
+              <t:SubscriptionId>sub-1</t:SubscriptionId>
+              <t:StatusEvent>
+                <t:Watermark>wm-1</t:Watermark>
+              </t:StatusEvent>
+            </t:Notification>
+          </m:Notifications>
+        </m:GetStreamingEventsResponseMessage>
+      </m:ResponseMessages>
+    </m:GetStreamingEventsResponse>
+  </s:Body>
+</s:Envelope>"#;
+
+        assert!(
+            parse_streaming_notifications(xml)
+                .expect("parse should succeed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn subscribe_response_without_a_subscription_id_yields_no_subscription() {
+        // `subscribe` turns the empty vec into `MalformedXml`; pin that the
+        // parser does not invent an empty id.
+        let xml = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <m:SubscribeResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+      <m:ResponseMessages>
+        <m:SubscribeResponseMessage ResponseClass="Success">
+          <m:SubscriptionId></m:SubscriptionId>
+        </m:SubscribeResponseMessage>
+      </m:ResponseMessages>
+    </m:SubscribeResponse>
+  </s:Body>
+</s:Envelope>"#;
+        assert!(
+            parse_subscribe_response(xml)
+                .expect("parse should succeed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_name_strips_any_namespace_prefix() {
+        assert_eq!(local_name(b"t:ItemId"), "ItemId");
+        assert_eq!(local_name(b"ItemId"), "ItemId");
+        assert_eq!(local_name(b""), "");
+    }
 }

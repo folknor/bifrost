@@ -426,4 +426,230 @@ mod tests {
             vec![LABEL_DRAFT.to_string(), LABEL_IMPORTANT.to_string()]
         );
     }
+
+    fn work_label() -> Vec<GmailLabel> {
+        vec![GmailLabel {
+            id: "Label_1".to_string(),
+            name: "Work".to_string(),
+            label_type: Some("user".to_string()),
+            color: None,
+        }]
+    }
+
+    /// A user-label flag whose spelling matches `<id>:<name>` in the
+    /// known vocabulary translates to the bare Gmail label id.
+    #[test]
+    fn user_label_flags_translate_to_their_gmail_label_id() {
+        let patch = translate_flag_op(
+            &FlagOp::Add(set(&["$gmail-label:Label_1:Work"])),
+            &work_label(),
+        );
+        assert_eq!(patch.add_label_ids, vec!["Label_1".to_string()]);
+        assert!(patch.unsupported_flags.is_empty());
+
+        let patch = translate_flag_op(
+            &FlagOp::Remove(set(&["$gmail-label:Label_1:Work"])),
+            &work_label(),
+        );
+        assert_eq!(patch.remove_label_ids, vec!["Label_1".to_string()]);
+    }
+
+    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. The user-label lookup keys
+    /// on the WHOLE `<id>:<name>` spelling, so a label renamed on the
+    /// server between the read that minted the flag and the write that
+    /// replays it no longer resolves. The flag lands in
+    /// `unsupported_flags`, and `apply_label_patch` turns a non-empty
+    /// `unsupported_flags` into `MutationSuccess::Skipped` for every id
+    /// in the batch - a success lane. A stale name therefore silently
+    /// drops the whole flag operation for up to 1000 messages instead
+    /// of resolving by id or reporting a failure.
+    #[test]
+    fn a_user_label_flag_with_a_stale_name_becomes_unsupported() {
+        let patch = translate_flag_op(
+            &FlagOp::Add(set(&["$gmail-label:Label_1:OldName"])),
+            &work_label(),
+        );
+        assert!(patch.add_label_ids.is_empty());
+        assert_eq!(
+            patch.unsupported_flags,
+            vec!["$gmail-label:Label_1:OldName".to_string()],
+            "the id is right there in the flag, but the lookup requires the name to match too"
+        );
+    }
+
+    /// Same shape, reached the other way: an empty label vocabulary
+    /// (the state a freshly opened account's scope cache is in) cannot
+    /// resolve any user label at all.
+    #[test]
+    fn an_empty_label_vocabulary_makes_every_user_label_unsupported() {
+        let patch = translate_flag_op(&FlagOp::Add(set(&["$gmail-label:Label_1:Work"])), &[]);
+        assert!(patch.add_label_ids.is_empty());
+        assert_eq!(patch.unsupported_flags.len(), 1);
+    }
+
+    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `FlagOp::Set` means "the
+    /// flag set is exactly this". `patch_for_set` re-derives add/remove
+    /// over the four canonical flags but never walks the known user
+    /// label vocabulary, so a user label the message currently carries
+    /// and the `Set` omits is left attached. `reference/google.md`
+    /// describes `Set` as re-deriving "over the canonical four flags
+    /// plus the user label vocabulary", which the code does not do.
+    #[test]
+    fn set_does_not_remove_user_labels_the_new_set_omits() {
+        let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN])), &work_label());
+        assert!(
+            !patch.remove_label_ids.contains(&"Label_1".to_string()),
+            "an exact-set operation leaves known user labels attached",
+        );
+        assert_eq!(
+            patch.remove_label_ids,
+            vec![
+                LABEL_DRAFT.to_string(),
+                LABEL_IMPORTANT.to_string(),
+                LABEL_STARRED.to_string(),
+                LABEL_UNREAD.to_string()
+            ]
+        );
+    }
+
+    /// An unknown flag inside a `Set` is added verbatim and then fails
+    /// to translate, so the whole patch is poisoned into the
+    /// unsupported lane rather than applying the parts it understood.
+    #[test]
+    fn an_unknown_flag_inside_a_set_poisons_the_whole_patch() {
+        let patch = translate_flag_op(&FlagOp::Set(set(&[FLAG_SEEN, "$Junk"])), &[]);
+        assert_eq!(patch.unsupported_flags, vec!["$Junk".to_string()]);
+        assert!(
+            !patch.remove_label_ids.is_empty(),
+            "the canonical half still translates; the driver skips on unsupported_flags",
+        );
+    }
+
+    /// Flag comparison is ASCII-case-insensitive, matching IMAP
+    /// keyword semantics, so `\seen` and `\Seen` are the same flag.
+    #[test]
+    fn canonical_flag_matching_is_case_insensitive() {
+        let patch = translate_flag_op(&FlagOp::Add(set(&["\\sEeN", "$important"])), &[]);
+        assert_eq!(patch.remove_label_ids, vec![LABEL_UNREAD.to_string()]);
+        assert_eq!(patch.add_label_ids, vec![LABEL_IMPORTANT.to_string()]);
+        assert!(patch.unsupported_flags.is_empty());
+    }
+
+    /// Adding and removing the same flag in one `Patch` is a caller
+    /// contradiction; the label lands in both lists and Gmail resolves
+    /// it (removal wins). Pinned so the behaviour is a decision rather
+    /// than an accident.
+    #[test]
+    fn a_contradictory_patch_lands_the_label_in_both_lists() {
+        let patch = translate_flag_op(
+            &FlagOp::Patch {
+                add: set(&[FLAG_FLAGGED]),
+                remove: set(&[FLAG_FLAGGED]),
+            },
+            &[],
+        );
+        assert_eq!(patch.add_label_ids, vec![LABEL_STARRED.to_string()]);
+        assert_eq!(patch.remove_label_ids, vec![LABEL_STARRED.to_string()]);
+    }
+
+    #[test]
+    fn empty_flag_ops_produce_an_empty_patch() {
+        let patch = translate_flag_op(&FlagOp::Add(HashSet::new()), &[]);
+        assert_eq!(patch, LabelPatch::default());
+        let patch = translate_flag_op(&FlagOp::Remove(HashSet::new()), &[]);
+        assert_eq!(patch, LabelPatch::default());
+    }
+
+    /// The canonical projection is order-independent: Gmail returns
+    /// `labelIds` in no guaranteed order, so the hash must not depend
+    /// on it.
+    #[test]
+    fn canonical_flags_are_order_independent_and_deduplicated() {
+        let forward = canonical_flags(
+            &[
+                LABEL_STARRED.to_string(),
+                LABEL_IMPORTANT.to_string(),
+                "Label_1".to_string(),
+            ],
+            &work_label(),
+        );
+        let reversed = canonical_flags(
+            &[
+                "Label_1".to_string(),
+                LABEL_IMPORTANT.to_string(),
+                LABEL_STARRED.to_string(),
+            ],
+            &work_label(),
+        );
+        assert_eq!(forward.flags, reversed.flags);
+        assert_eq!(forward.hash, reversed.hash);
+
+        let duplicated =
+            canonical_flags(&[LABEL_STARRED.to_string(), LABEL_STARRED.to_string()], &[]);
+        assert_eq!(
+            duplicated.flags,
+            vec![FLAG_FLAGGED.to_string(), FLAG_SEEN.to_string()]
+        );
+    }
+
+    /// Folder-like Gmail labels are containers, not flags, and must not
+    /// leak into the canonical flag set.
+    #[test]
+    fn folder_shaped_labels_drop_out_of_the_flag_projection() {
+        let canonical = canonical_flags(
+            &[
+                LABEL_INBOX.to_string(),
+                "SENT".to_string(),
+                LABEL_TRASH.to_string(),
+                LABEL_SPAM.to_string(),
+                "CHAT".to_string(),
+            ],
+            &[],
+        );
+        assert_eq!(
+            canonical.flags,
+            vec![FLAG_SEEN.to_string()],
+            "only the derived \\Seen survives a folder-only label set"
+        );
+    }
+
+    /// DOCUMENTS CURRENT BEHAVIOUR. An unknown label id renders with
+    /// the id in the name position, so the flag spelling silently
+    /// changes once the label list catches up. That is the same
+    /// mechanism that makes `flags_hash` cache-order dependent.
+    #[test]
+    fn an_unknown_label_id_renders_its_id_in_the_name_slot() {
+        let canonical = canonical_flags(&["Label_9".to_string()], &[]);
+        assert!(
+            canonical
+                .flags
+                .contains(&"$gmail-label:Label_9:Label_9".to_string())
+        );
+    }
+
+    /// The `UNREAD` check that derives `\Seen` is an exact match, while
+    /// the exclusive-container check in `move_placement_patch` is
+    /// case-insensitive. Gmail only ever emits uppercase system ids, so
+    /// this is latent, but the two halves of the crate disagree.
+    #[test]
+    fn the_unread_projection_is_case_sensitive_unlike_the_move_rule() {
+        let upper = canonical_flags(&[LABEL_UNREAD.to_string()], &[]);
+        assert!(!upper.flags.contains(&FLAG_SEEN.to_string()));
+
+        let lower = canonical_flags(&["unread".to_string()], &[]);
+        assert!(
+            lower.flags.contains(&FLAG_SEEN.to_string()),
+            "a lowercased UNREAD is not recognised and the message reads as seen",
+        );
+    }
+
+    /// One label spelled `ab` and two labels spelled `a` and `b` must
+    /// not collide. The `0xff` terminator the hash mixes after every
+    /// flag is what separates them.
+    #[test]
+    fn one_long_label_does_not_hash_like_two_short_ones() {
+        let joined = canonical_flags(&["Label_ab".to_string()], &[]);
+        let split = canonical_flags(&["Label_a".to_string(), "Label_b".to_string()], &[]);
+        assert_ne!(joined.hash, split.hash);
+    }
 }

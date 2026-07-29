@@ -604,4 +604,136 @@ mod tests {
         assert_eq!(decoded.uidvalidity, 10);
         assert_eq!(decoded.uids, vec![1, 3]);
     }
+
+    fn is_schema_incompatible(err: &AccountError) -> bool {
+        matches!(
+            err.kind(),
+            AccountErrorKind::SyncState(bifrost_types::SyncStateErrorKind::SchemaIncompatible)
+        )
+    }
+
+    fn is_malformed(err: &AccountError) -> bool {
+        matches!(
+            err.kind(),
+            AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        )
+    }
+
+    // A cursor minted by another protocol must never be decoded as IMAP
+    // bytes: the protocol tag is checked before the payload is touched.
+    #[test]
+    fn cursor_envelope_rejects_a_foreign_protocol_tag() {
+        let mut change = encode_cursor(
+            CursorScope::Account,
+            &FolderCursor::Basic {
+                uidvalidity: 1,
+                uidnext: 2,
+                known_uids: CompactUidSet::default(),
+            },
+        );
+        change.server_state.protocol = ProtocolKind::Jmap;
+        let err = decode_cursor(&change).expect_err("foreign protocol must be rejected");
+        assert!(is_schema_incompatible(&err), "kind: {:?}", err.kind());
+    }
+
+    #[test]
+    fn cursor_payload_rejects_bad_magic_and_unknown_tag() {
+        let mut wrong_magic = b"NOTMAGIC".to_vec();
+        wrong_magic.push(1);
+        let err = decode_folder_cursor(&wrong_magic).expect_err("magic mismatch");
+        assert!(is_schema_incompatible(&err));
+
+        let mut unknown_tag = MAGIC.to_vec();
+        unknown_tag.push(9);
+        let err = decode_folder_cursor(&unknown_tag).expect_err("unknown tag");
+        assert!(is_schema_incompatible(&err));
+
+        // Magic present but nothing after it: the tag read itself is short.
+        let err = decode_folder_cursor(&MAGIC[..]).expect_err("missing tag");
+        assert!(is_schema_incompatible(&err));
+    }
+
+    #[test]
+    fn cursor_payload_rejects_truncated_fields() {
+        // Condstore declares a u64 modseq that is not there.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(2);
+        push_u32(&mut bytes, 7);
+        bytes.extend_from_slice(&[0u8; 3]);
+        let err = decode_folder_cursor(&bytes).expect_err("truncated modseq");
+        assert!(is_schema_incompatible(&err));
+
+        // Basic declares two UID ranges but supplies bytes for one.
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(3);
+        push_u32(&mut bytes, 7);
+        push_u32(&mut bytes, 20);
+        push_u32(&mut bytes, 2);
+        push_u32(&mut bytes, 1);
+        push_u32(&mut bytes, 5);
+        let err = decode_folder_cursor(&bytes).expect_err("truncated uid set");
+        assert!(is_schema_incompatible(&err));
+    }
+
+    #[test]
+    fn object_id_decode_rejects_malformed_shapes() {
+        for bad in [
+            "not-an-imap-id",
+            "imap1",
+            "imap1:INBOX:1:2",
+            "imap1:x:INBOX:1:2",
+            "imap1:99:INBOX:1:2",
+            "imap1:5:INBOXX1:2",
+            "imap1:5:INBOX:1:2:3",
+            "imap1:5:INBOX:notanumber:2",
+            "imap1:5:INBOX:1",
+        ] {
+            let err = decode_object_id(&ObjectId(bad.to_owned()))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} must not decode"));
+            assert!(is_malformed(&err), "{bad}: kind {:?}", err.kind());
+        }
+    }
+
+    #[test]
+    fn object_id_roundtrips_a_multibyte_folder_name() {
+        // The length prefix is a BYTE count, so a folder whose name is not
+        // pure ASCII must still slice back out on a char boundary.
+        let folder = MailboxName::new("Ünread/Läst").expect("valid folder");
+        let id = encode_object_id(&folder, 3, 9);
+        let decoded = decode_object_id(&id).expect("multibyte folder decodes");
+        assert_eq!(decoded.folder, folder);
+        assert_eq!(decoded.uidvalidity, 3);
+        assert_eq!(decoded.uid, 9);
+    }
+
+    #[test]
+    fn thread_id_decode_rejects_empty_and_non_numeric_uid_sets() {
+        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:10:".to_owned()))
+            .expect_err("empty uid set");
+        assert!(is_malformed(&err));
+
+        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX:10:1,x".to_owned()))
+            .expect_err("non-numeric uid");
+        assert!(is_malformed(&err));
+
+        let err = decode_thread_id(&ThreadId("imapthread1:5:INBOX".to_owned()))
+            .expect_err("missing uid field");
+        assert!(is_malformed(&err));
+    }
+
+    #[test]
+    fn blob_id_section_survives_colons_and_empty_means_none() {
+        let folder = MailboxName::new("INBOX").expect("valid folder");
+        // A section spec can itself contain colons (HEADER.FIELDS lists),
+        // so only the first two separators after the folder are structural.
+        let id = encode_blob_id(&folder, 4, 8, Some("HEADER.FIELDS (TO:CC)"));
+        let decoded = decode_blob_id(&id).expect("blob id decodes");
+        assert_eq!(decoded.section.as_deref(), Some("HEADER.FIELDS (TO:CC)"));
+        assert_eq!(decoded.uidvalidity, 4);
+        assert_eq!(decoded.uid, 8);
+
+        let whole = encode_blob_id(&folder, 4, 8, None);
+        assert_eq!(decode_blob_id(&whole).expect("whole message").section, None);
+    }
 }

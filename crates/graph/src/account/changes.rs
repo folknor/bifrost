@@ -165,3 +165,178 @@ pub(crate) fn changes_stream(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use bifrost_types::{
+        AccountErrorKind, CursorScope, FolderId, ObjectType, OpaqueChangeState, ProtocolKind,
+        SyncStateErrorKind,
+    };
+    use futures::StreamExt;
+
+    use super::super::PushMode;
+    use super::super::cursor::{
+        CHANGE_CURSOR_ENVELOPE_VERSION, GRAPH_CURSOR_ENVELOPE_VERSION, GraphCursorPayload,
+        encode_cursor, kind_for_scope,
+    };
+    use super::*;
+    use crate::client::GraphClient;
+
+    fn account() -> GraphAccount {
+        GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions)
+    }
+
+    fn email_scope(folder: &str) -> CursorScope {
+        CursorScope::FolderType {
+            folder: FolderId(folder.to_string()),
+            ty: ObjectType::Email,
+        }
+    }
+
+    /// Drain a `changes_stream` that is expected to reject its cursor
+    /// before touching the wire, returning the terminal error.
+    async fn terminal_kind(cursor: ChangeCursor) -> bifrost_types::AccountError {
+        let mut stream = changes_stream(account(), cursor);
+        let error = match stream.next().await.expect("an event") {
+            SyncEvent::Terminated(error) => error,
+            _ => panic!("expected SyncEvent::Terminated"),
+        };
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(stream.next().await.is_none());
+        error
+    }
+
+    #[tokio::test]
+    async fn a_cursor_minted_by_another_protocol_terminates_schema_incompatible() {
+        // The engine persists cursors opaquely; handing a Gmail-tagged
+        // cursor to Graph must be rejected at the door, not walked.
+        let cursor = ChangeCursor {
+            scope: email_scope("inbox"),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Gmail,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                bytes: Vec::new(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_future_envelope_version_terminates_schema_incompatible() {
+        let cursor = ChangeCursor {
+            scope: email_scope("inbox"),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION + 1,
+                bytes: b"{}".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_garbage_payload_terminates_as_a_contract_violation() {
+        let cursor = ChangeCursor {
+            scope: email_scope("inbox"),
+            server_state: OpaqueChangeState {
+                protocol: ProtocolKind::Graph,
+                envelope_version: GRAPH_CURSOR_ENVELOPE_VERSION,
+                bytes: b"{not-json".to_vec(),
+            },
+            advanced_through: None,
+            envelope_version: CHANGE_CURSOR_ENVELOPE_VERSION,
+        };
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::Protocol(bifrost_types::ProtocolErrorKind::ContractViolation)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_payload_naming_another_collection_terminates_before_any_fetch() {
+        // The hostile / stale case that matters: a cursor whose scope says
+        // "inbox messages" but whose delta link belongs to the contacts
+        // collection. Walking it would file contact rows as messages, so
+        // `scope_matches_payload` must terminate the stream.
+        let contact_scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Contact,
+        };
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&contact_scope).expect("contact scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        // `encode_cursor` does not cross-check, so the mismatch is
+        // constructible exactly as a corrupted persisted cursor would be.
+        let cursor = encode_cursor(email_scope("inbox"), payload).expect("encode");
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_payload_for_a_different_folder_terminates() {
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&email_scope("archive")).expect("email scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(email_scope("inbox"), payload).expect("encode");
+        let error = terminal_kind(cursor).await;
+        assert!(matches!(
+            error.kind(),
+            AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_event_calendar_event_alias_is_accepted_at_the_changes_door() {
+        // A cursor minted from a `CalendarEvent` scope must not be rejected
+        // when the engine hands it back tagged `Event` (the Events cursor
+        // structurally cannot record which of the two it was). The stream
+        // gets past the guard and fails on the wire instead - an unattached
+        // client - which is the observable proof the guard let it through.
+        let payload = GraphCursorPayload::new(
+            kind_for_scope(&CursorScope::FolderType {
+                folder: FolderId("calendar".to_string()),
+                ty: ObjectType::CalendarEvent,
+            })
+            .expect("calendar event scope maps"),
+            "https://graph.example/delta".to_string(),
+            None,
+        );
+        let cursor = encode_cursor(
+            CursorScope::FolderType {
+                folder: FolderId("calendar".to_string()),
+                ty: ObjectType::Event,
+            },
+            payload,
+        )
+        .expect("encode");
+        let error = terminal_kind(cursor).await;
+        assert!(
+            !matches!(
+                error.kind(),
+                AccountErrorKind::SyncState(SyncStateErrorKind::SchemaIncompatible)
+            ),
+            "alias must not be rejected as a schema mismatch: {:?}",
+            error.kind()
+        );
+    }
+}

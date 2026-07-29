@@ -201,3 +201,156 @@ fn translate(error: BlobError, blob_id: &BlobId) -> AccountError {
 fn terminate_blob(error: AccountError) -> SyncEvent<Bytes> {
     SyncEvent::Terminated(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(value: serde_json::Value) -> GmailMessage {
+        serde_json::from_value(value).expect("message fixture deserializes")
+    }
+
+    #[test]
+    fn a_message_without_a_payload_has_no_blobs() {
+        let msg = message(json!({ "id": "m1", "threadId": "t1" }));
+        assert!(blob_handles_for_message(&msg).is_empty());
+    }
+
+    /// Only parts carrying an `attachmentId` become blob handles.
+    /// Inline bodies (Gmail returns their bytes in `body.data`) are
+    /// deliberately not surfaced as blobs.
+    #[test]
+    fn inline_bodies_without_an_attachment_id_are_not_blobs() {
+        let msg = message(json!({
+            "id": "m2",
+            "threadId": "t2",
+            "payload": {
+                "mimeType": "text/plain",
+                "body": { "size": 12, "data": "aGVsbG8" },
+            },
+        }));
+        assert!(blob_handles_for_message(&msg).is_empty());
+    }
+
+    #[test]
+    fn attachment_parts_become_handles_with_gmail_blob_capabilities() {
+        let msg = message(json!({
+            "id": "m3",
+            "threadId": "t3",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {
+                        "mimeType": "text/plain",
+                        "body": { "size": 4, "data": "aGk" },
+                    },
+                    {
+                        "mimeType": "application/pdf",
+                        "filename": "report.pdf",
+                        "body": { "attachmentId": "att-1", "size": 2048 },
+                    },
+                ],
+            },
+        }));
+
+        let handles = blob_handles_for_message(&msg);
+        assert_eq!(handles.len(), 1);
+        let handle = &handles[0];
+        assert_eq!(handle.size, Some(2048));
+        assert_eq!(handle.content_type.as_deref(), Some("application/pdf"));
+        assert!(
+            handle.digest.is_none(),
+            "Gmail exposes no pre-download digest for attachments"
+        );
+        assert!(
+            !handle.capabilities.supports_range,
+            "the range gate in open_blob_range depends on this staying false"
+        );
+        assert!(!handle.capabilities.supports_parallel);
+        assert!(!handle.capabilities.digest_available_pre_download);
+        assert!(matches!(
+            handle.capabilities.encoding,
+            BlobEncoding::Base64Url
+        ));
+    }
+
+    /// The MIME tree is walked depth-first, so an attachment nested
+    /// inside a `multipart/related` under a `multipart/mixed` is still
+    /// found. A shallow walk would silently drop inline-image parts.
+    #[test]
+    fn nested_multipart_trees_are_walked_recursively() {
+        let msg = message(json!({
+            "id": "m4",
+            "threadId": "t4",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [{
+                    "mimeType": "multipart/related",
+                    "parts": [{
+                        "mimeType": "image/png",
+                        "body": { "attachmentId": "deep-att", "size": 99 },
+                    }],
+                }],
+            },
+        }));
+        let handles = blob_handles_for_message(&msg);
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].size, Some(99));
+    }
+
+    /// A negative `size` (Gmail should never send one, but the DTO is
+    /// `i64`) yields `None` rather than a wrapped huge `u64`.
+    #[test]
+    fn a_negative_part_size_becomes_an_unknown_size() {
+        let msg = message(json!({
+            "id": "m5",
+            "threadId": "t5",
+            "payload": {
+                "mimeType": "application/octet-stream",
+                "body": { "attachmentId": "att-neg", "size": -1 },
+            },
+        }));
+        assert_eq!(blob_handles_for_message(&msg)[0].size, None);
+    }
+
+    /// The blob id is an opaque JSON envelope pairing the message with
+    /// the attachment; `open_blob` decodes it back. Both halves must
+    /// survive, because Gmail's attachment endpoint is message-scoped.
+    #[test]
+    fn blob_ids_round_trip_the_message_and_attachment_pair() {
+        let encoded = encode_blob_id("msg-1", "att-1");
+        let decoded = match decode_blob_id(&encoded) {
+            Ok(key) => key,
+            Err(_) => panic!("a freshly encoded blob id must decode"),
+        };
+        assert_eq!(decoded.message_id, "msg-1");
+        assert_eq!(decoded.attachment_id, "att-1");
+    }
+
+    #[test]
+    fn a_malformed_blob_id_is_rejected_rather_than_guessed_at() {
+        for raw in ["", "not json", "{}", r#"{"message_id":"m"}"#] {
+            assert!(
+                matches!(
+                    decode_blob_id(&BlobId(raw.to_owned())),
+                    Err(BlobError::InvalidId(_))
+                ),
+                "{raw:?} must not decode as a blob id"
+            );
+        }
+    }
+
+    /// Ids containing JSON metacharacters survive the envelope, so an
+    /// exotic attachment id cannot corrupt the handle.
+    #[test]
+    fn blob_ids_survive_json_metacharacters() {
+        let encoded = encode_blob_id(r#"m"1"#, "a\\b");
+        let decoded = match decode_blob_id(&encoded) {
+            Ok(key) => key,
+            Err(_) => panic!("escaped ids must round-trip"),
+        };
+        assert_eq!(decoded.message_id, r#"m"1"#);
+        assert_eq!(decoded.attachment_id, "a\\b");
+    }
+}

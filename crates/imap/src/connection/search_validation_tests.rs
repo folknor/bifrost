@@ -1,0 +1,257 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use crate::connection::test_support::detached;
+use crate::connection::{ImapConnection, SessionState};
+use crate::error::Error;
+use crate::types::Capability;
+
+fn has(criteria: &str, atom: &str) -> bool {
+    ImapConnection::search_criteria_contains_atom(criteria, atom)
+}
+
+fn conn(caps: Vec<Capability>) -> ImapConnection {
+    detached(SessionState::Selected, caps, &[])
+}
+
+// ---------------------------------------------------------------------------
+// search_criteria_contains_atom - positive detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn atom_found_as_a_bare_key() {
+    assert!(has("MODSEQ 123", "MODSEQ"));
+    assert!(has("SEEN MODSEQ 123", "MODSEQ"));
+    assert!(has("modseq 123", "MODSEQ"), "keys are case-insensitive");
+}
+
+#[test]
+fn atom_found_inside_a_parenthesized_group() {
+    assert!(has("(SEEN (MODSEQ 5))", "MODSEQ"));
+    assert!(has("OR (SEEN) (OLDER 60)", "OLDER"));
+}
+
+#[test]
+fn atom_found_through_not_and_or_operands() {
+    assert!(has("NOT YOUNGER 60", "YOUNGER"));
+    assert!(has("NOT NOT SAVEDSINCE 1-Jan-2026", "SAVEDSINCE"));
+    assert!(has("OR SEEN EMAILID M1", "EMAILID"));
+    assert!(has("OR EMAILID M1 SEEN", "EMAILID"));
+}
+
+#[test]
+fn atom_found_after_a_charset_prefix() {
+    // RFC 3501 Section 6.4.4: optional `CHARSET <astring>` prefix.
+    assert!(has("CHARSET UTF-8 MODSEQ 7", "MODSEQ"));
+    assert!(has("CHARSET \"UTF-8\" MODSEQ 7", "MODSEQ"));
+}
+
+#[test]
+fn atom_found_after_multi_operand_keys() {
+    assert!(has("HEADER Subject hi MODSEQ 3", "MODSEQ"));
+    assert!(has("BEFORE 1-Jan-2026 THREADID T1", "THREADID"));
+    assert!(has("LARGER 1000 SAVEDON 1-Jan-2026", "SAVEDON"));
+}
+
+#[test]
+fn saved_search_marker_is_detected_as_a_bare_key() {
+    // RFC 5182 Section 2.1: `$` as a sequence-set search key.
+    assert!(has("$", "$"));
+    assert!(has("SEEN $", "$"));
+}
+
+// ---------------------------------------------------------------------------
+// search_criteria_contains_atom - operand skipping (the whole point)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn atom_not_matched_inside_a_quoted_operand() {
+    assert!(!has("HEADER Subject \"MODSEQ\"", "MODSEQ"));
+    assert!(!has("SUBJECT \"OLDER than dirt\"", "OLDER"));
+    assert!(!has("FROM \"a\\\"MODSEQ\"", "MODSEQ"), "escaped quote");
+}
+
+#[test]
+fn atom_not_matched_inside_a_literal_operand() {
+    assert!(!has("BODY {6}\r\nMODSEQ", "MODSEQ"));
+    assert!(!has("BODY {7+}\r\nMODSEQ!", "MODSEQ"));
+}
+
+#[test]
+fn atom_not_matched_as_a_bare_operand() {
+    assert!(!has("BODY MODSEQ", "MODSEQ"));
+    assert!(!has("SUBJECT OLDER", "OLDER"));
+    assert!(!has("KEYWORD EMAILID", "EMAILID"));
+    assert!(
+        !has("HEADER MODSEQ MODSEQ", "MODSEQ"),
+        "both HEADER operands"
+    );
+}
+
+#[test]
+fn modseq_variable_operands_are_skipped() {
+    // RFC 7162 Section 3.1.5: MODSEQ takes either a bare valzer, or
+    // entry-name + entry-type-req + valzer. The three-operand form's
+    // `entry-type-req` must be consumed as an operand, not inspected as
+    // a key.
+    assert!(
+        !has("MODSEQ \"/flags/\\\\Draft\" all 5", "ALL"),
+        "entry-type-req is an operand, not a search key"
+    );
+    // Both forms leave the scanner at the next real key.
+    assert!(has("MODSEQ 5 OLDER 60", "OLDER"));
+    assert!(has("MODSEQ \"/flags/\\\\Draft\" all 5 OLDER 60", "OLDER"));
+}
+
+#[test]
+fn unknown_keys_are_treated_as_zero_operand() {
+    // A sequence set or an unrecognized extension key must not swallow
+    // the next token.
+    assert!(has("1:100 MODSEQ 5", "MODSEQ"));
+    assert!(has("UNKNOWNKEY MODSEQ 5", "MODSEQ"));
+}
+
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
+///
+/// `UID` is on the one-operand key list, so it consumes the `$` that
+/// follows it. `UID $` (RFC 5182 Section 2.1 - a saved-result reference
+/// used as the UID set) therefore does not trip the SEARCHRES gate, and
+/// the command goes out to a server that may not support `$`.
+///
+///
+#[test]
+fn saved_search_marker_missed_after_uid_key() {
+    assert!(
+        !has("UID $", "$"),
+        "current behavior: the SEARCHRES gate does not see `$` here"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Termination on odd input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scanner_terminates_on_empty_and_whitespace() {
+    assert!(!has("", "MODSEQ"));
+    assert!(!has("   ", "MODSEQ"));
+    assert!(!has("\r\n", "MODSEQ"));
+}
+
+#[test]
+fn scanner_terminates_on_unterminated_quote_and_literal() {
+    assert!(!has("SUBJECT \"unterminated", "MODSEQ"));
+    assert!(!has("BODY {99}\r\nshort", "MODSEQ"));
+    assert!(!has("BODY {", "MODSEQ"));
+    assert!(!has("BODY {12", "MODSEQ"));
+}
+
+#[test]
+fn scanner_terminates_on_unclosed_group() {
+    assert!(!has("(SEEN", "MODSEQ"));
+    assert!(has("(SEEN MODSEQ 5", "MODSEQ"));
+}
+
+#[test]
+fn scanner_handles_non_ascii_operands() {
+    // Byte-index slicing must land on char boundaries.
+    assert!(!has("SUBJECT MODSEQ\u{e5}", "MODSEQ"));
+    assert!(has("SUBJECT \u{e5}\u{e6}\u{f8} MODSEQ 5", "MODSEQ"));
+}
+
+// ---------------------------------------------------------------------------
+// validate_search_criteria_capabilities - the gates the scanner feeds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn modseq_criterion_requires_condstore() {
+    assert!(matches!(
+        conn(vec![]).validate_search_criteria_capabilities("MODSEQ 5"),
+        Err(Error::MissingCapability(_))
+    ));
+    assert!(
+        conn(vec![Capability::Condstore])
+            .validate_search_criteria_capabilities("MODSEQ 5")
+            .is_ok()
+    );
+}
+
+#[test]
+fn within_criteria_require_the_within_capability() {
+    // RFC 5032: OLDER / YOUNGER are WITHIN, and rev2 does not fold them in.
+    for criteria in ["OLDER 60", "YOUNGER 60"] {
+        assert!(matches!(
+            conn(vec![Capability::Imap4Rev2]).validate_search_criteria_capabilities(criteria),
+            Err(Error::MissingCapability(_))
+        ));
+        assert!(
+            conn(vec![Capability::Within])
+                .validate_search_criteria_capabilities(criteria)
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn savedate_criteria_are_implied_by_rev2() {
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev1])
+            .validate_search_criteria_capabilities("SAVEDSINCE 1-Jan-2026"),
+        Err(Error::MissingCapability(_))
+    ));
+    assert!(
+        conn(vec![Capability::Imap4Rev2])
+            .validate_search_criteria_capabilities("SAVEDBEFORE 1-Jan-2026")
+            .is_ok()
+    );
+    assert!(
+        conn(vec![Capability::SaveDate])
+            .validate_search_criteria_capabilities("SAVEDATESUPPORTED")
+            .is_ok()
+    );
+}
+
+#[test]
+fn objectid_criteria_are_implied_by_rev2() {
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("EMAILID M1"),
+        Err(Error::MissingCapability(_))
+    ));
+    assert!(
+        conn(vec![Capability::Imap4Rev2])
+            .validate_search_criteria_capabilities("THREADID T1")
+            .is_ok()
+    );
+}
+
+#[test]
+fn saved_result_marker_requires_searchres() {
+    assert!(matches!(
+        conn(vec![Capability::Imap4Rev1]).validate_search_criteria_capabilities("$"),
+        Err(Error::MissingCapability(_))
+    ));
+    assert!(
+        conn(vec![Capability::SearchRes])
+            .validate_search_criteria_capabilities("$")
+            .is_ok()
+    );
+}
+
+#[test]
+fn plain_criteria_need_no_capability() {
+    assert!(
+        conn(vec![])
+            .validate_search_criteria_capabilities("ALL")
+            .is_ok()
+    );
+    assert!(
+        conn(vec![])
+            .validate_search_criteria_capabilities("UNSEEN SINCE 1-Jan-2026")
+            .is_ok()
+    );
+    // Payloads that merely look like gated keys stay ungated.
+    assert!(
+        conn(vec![])
+            .validate_search_criteria_capabilities("HEADER Subject \"MODSEQ\"")
+            .is_ok()
+    );
+}

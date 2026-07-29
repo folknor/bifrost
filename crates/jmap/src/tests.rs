@@ -1204,3 +1204,2210 @@ mod principals_owner_capability {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Method name / capability table (RFC 8620 s3.2 "using")
+// ---------------------------------------------------------------------------
+//
+// `Request::call` derives the `using` entry from `M::Cap::URI` and the
+// wire method name from `M::NAME`. Neither is exercised by any other
+// test, and a typo in either is a runtime `unknownMethod` /
+// `unknownCapability` against a real server, never a compile error.
+
+mod method_name_and_capability_table {
+    use crate::core::capability::Capability;
+    use crate::core::method::JmapMethod;
+
+    const CORE: &str = "urn:ietf:params:jmap:core";
+    #[cfg(feature = "mail")]
+    const MAIL: &str = "urn:ietf:params:jmap:mail";
+    #[cfg(feature = "mail")]
+    const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+    #[cfg(feature = "mail")]
+    const VACATION: &str = "urn:ietf:params:jmap:vacationresponse";
+    #[cfg(feature = "mail")]
+    const SIEVE: &str = "urn:ietf:params:jmap:sieve";
+    const PRINCIPALS: &str = "urn:ietf:params:jmap:principals";
+    #[cfg(feature = "blob")]
+    const BLOB: &str = "urn:ietf:params:jmap:blob";
+    #[cfg(feature = "quota")]
+    const QUOTA: &str = "urn:ietf:params:jmap:quota";
+    #[cfg(feature = "calendars")]
+    const CALENDARS: &str = "urn:ietf:params:jmap:calendars";
+    #[cfg(feature = "contacts")]
+    const CONTACTS: &str = "urn:ietf:params:jmap:contacts";
+
+    fn check<M: JmapMethod>(name: &str, uri: &str) {
+        assert_eq!(M::NAME, name, "wire method name");
+        assert_eq!(
+            <M::Cap as Capability>::URI,
+            uri,
+            "capability URI advertised in `using` for {name}"
+        );
+    }
+
+    #[test]
+    fn core_methods() {
+        check::<crate::push_subscription::PushSubscriptionGet>("PushSubscription/get", CORE);
+        check::<crate::push_subscription::PushSubscriptionSet>("PushSubscription/set", CORE);
+        // RFC 8620 s6.3: Blob/copy is a core method, not a blob-extension
+        // one.
+        check::<crate::blob::copy::CopyBlobRequest>("Blob/copy", CORE);
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_methods() {
+        check::<crate::email::EmailGet>("Email/get", MAIL);
+        check::<crate::email::EmailSet>("Email/set", MAIL);
+        check::<crate::email::EmailChanges>("Email/changes", MAIL);
+        check::<crate::email::EmailQuery>("Email/query", MAIL);
+        check::<crate::email::EmailQueryChanges>("Email/queryChanges", MAIL);
+        check::<crate::email::EmailCopy>("Email/copy", MAIL);
+        check::<crate::email::import::EmailImportRequest>("Email/import", MAIL);
+        check::<crate::email::parse::EmailParseRequest>("Email/parse", MAIL);
+        check::<crate::email::search_snippet::SearchSnippetGetRequest>("SearchSnippet/get", MAIL);
+        check::<crate::mailbox::MailboxGet>("Mailbox/get", MAIL);
+        check::<crate::mailbox::MailboxSet>("Mailbox/set", MAIL);
+        check::<crate::mailbox::MailboxChanges>("Mailbox/changes", MAIL);
+        check::<crate::mailbox::MailboxQuery>("Mailbox/query", MAIL);
+        check::<crate::mailbox::MailboxQueryChanges>("Mailbox/queryChanges", MAIL);
+        check::<crate::thread::ThreadGet>("Thread/get", MAIL);
+        check::<crate::thread::ThreadChanges>("Thread/changes", MAIL);
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn submission_methods() {
+        // RFC 8621 s6: Identity lives in the submission capability, not
+        // in mail.
+        check::<crate::identity::IdentityGet>("Identity/get", SUBMISSION);
+        check::<crate::identity::IdentitySet>("Identity/set", SUBMISSION);
+        check::<crate::identity::IdentityChanges>("Identity/changes", SUBMISSION);
+        check::<crate::email_submission::EmailSubmissionGet>("EmailSubmission/get", SUBMISSION);
+        check::<crate::email_submission::EmailSubmissionSet>("EmailSubmission/set", SUBMISSION);
+        check::<crate::email_submission::EmailSubmissionChanges>(
+            "EmailSubmission/changes",
+            SUBMISSION,
+        );
+        check::<crate::email_submission::EmailSubmissionQuery>("EmailSubmission/query", SUBMISSION);
+        check::<crate::email_submission::EmailSubmissionQueryChanges>(
+            "EmailSubmission/queryChanges",
+            SUBMISSION,
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn vacation_and_sieve_methods() {
+        check::<crate::vacation_response::VacationResponseGet>("VacationResponse/get", VACATION);
+        check::<crate::vacation_response::VacationResponseSet>("VacationResponse/set", VACATION);
+        check::<crate::sieve::SieveScriptGet>("SieveScript/get", SIEVE);
+        check::<crate::sieve::SieveScriptSet>("SieveScript/set", SIEVE);
+        check::<crate::sieve::SieveScriptQuery>("SieveScript/query", SIEVE);
+        check::<crate::sieve::validate::SieveScriptValidateRequest>("SieveScript/validate", SIEVE);
+    }
+
+    #[test]
+    fn principal_and_sharing_methods() {
+        check::<crate::principal::PrincipalGet>("Principal/get", PRINCIPALS);
+        check::<crate::principal::PrincipalSet>("Principal/set", PRINCIPALS);
+        check::<crate::principal::PrincipalChanges>("Principal/changes", PRINCIPALS);
+        check::<crate::principal::PrincipalQuery>("Principal/query", PRINCIPALS);
+        check::<crate::principal::PrincipalQueryChanges>("Principal/queryChanges", PRINCIPALS);
+        // RFC 9670 s3: ShareNotification is defined by the principals
+        // capability.
+        check::<crate::share_notification::ShareNotificationGet>(
+            "ShareNotification/get",
+            PRINCIPALS,
+        );
+        check::<crate::share_notification::ShareNotificationSet>(
+            "ShareNotification/set",
+            PRINCIPALS,
+        );
+        check::<crate::share_notification::ShareNotificationChanges>(
+            "ShareNotification/changes",
+            PRINCIPALS,
+        );
+        check::<crate::share_notification::ShareNotificationQuery>(
+            "ShareNotification/query",
+            PRINCIPALS,
+        );
+        check::<crate::share_notification::ShareNotificationQueryChanges>(
+            "ShareNotification/queryChanges",
+            PRINCIPALS,
+        );
+    }
+
+    #[cfg(feature = "blob")]
+    #[test]
+    fn blob_methods() {
+        check::<crate::blob::manage::BlobUploadRequest>("Blob/upload", BLOB);
+        check::<crate::blob::manage::BlobGetRequest>("Blob/get", BLOB);
+        check::<crate::blob::manage::BlobLookupRequest>("Blob/lookup", BLOB);
+    }
+
+    #[cfg(feature = "quota")]
+    #[test]
+    fn quota_methods() {
+        check::<crate::quota::QuotaGet>("Quota/get", QUOTA);
+        check::<crate::quota::QuotaChanges>("Quota/changes", QUOTA);
+        check::<crate::quota::QuotaQuery>("Quota/query", QUOTA);
+        check::<crate::quota::QuotaQueryChanges>("Quota/queryChanges", QUOTA);
+    }
+
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn calendar_methods() {
+        check::<crate::calendar::CalendarGet>("Calendar/get", CALENDARS);
+        check::<crate::calendar::CalendarSet>("Calendar/set", CALENDARS);
+        check::<crate::calendar::CalendarChanges>("Calendar/changes", CALENDARS);
+        check::<crate::calendar_event::CalendarEventGet>("CalendarEvent/get", CALENDARS);
+        check::<crate::calendar_event::CalendarEventSet>("CalendarEvent/set", CALENDARS);
+        check::<crate::calendar_event::CalendarEventChanges>("CalendarEvent/changes", CALENDARS);
+        check::<crate::calendar_event::CalendarEventQuery>("CalendarEvent/query", CALENDARS);
+        check::<crate::calendar_event::CalendarEventQueryChanges>(
+            "CalendarEvent/queryChanges",
+            CALENDARS,
+        );
+        check::<crate::calendar_event::CalendarEventCopy>("CalendarEvent/copy", CALENDARS);
+        check::<crate::calendar_event_notification::CalendarEventNotificationGet>(
+            "CalendarEventNotification/get",
+            CALENDARS,
+        );
+        check::<crate::calendar_event_notification::CalendarEventNotificationSet>(
+            "CalendarEventNotification/set",
+            CALENDARS,
+        );
+        check::<crate::participant_identity::ParticipantIdentityGet>(
+            "ParticipantIdentity/get",
+            CALENDARS,
+        );
+        // The `parse` sub-capability is separate from `calendars`.
+        check::<crate::calendar_event::parse::CalendarEventParseRequest>(
+            "CalendarEvent/parse",
+            "urn:ietf:params:jmap:calendars:parse",
+        );
+    }
+
+    #[cfg(feature = "contacts")]
+    #[test]
+    fn contact_methods() {
+        check::<crate::address_book::AddressBookGet>("AddressBook/get", CONTACTS);
+        check::<crate::address_book::AddressBookSet>("AddressBook/set", CONTACTS);
+        check::<crate::address_book::AddressBookChanges>("AddressBook/changes", CONTACTS);
+        check::<crate::contact_card::ContactCardGet>("ContactCard/get", CONTACTS);
+        check::<crate::contact_card::ContactCardSet>("ContactCard/set", CONTACTS);
+        check::<crate::contact_card::ContactCardChanges>("ContactCard/changes", CONTACTS);
+        check::<crate::contact_card::ContactCardQuery>("ContactCard/query", CONTACTS);
+        check::<crate::contact_card::ContactCardQueryChanges>("ContactCard/queryChanges", CONTACTS);
+        check::<crate::contact_card::ContactCardCopy>("ContactCard/copy", CONTACTS);
+        check::<crate::contact_card::parse::ContactCardParseRequest>(
+            "ContactCard/parse",
+            "urn:ietf:params:jmap:contacts:parse",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email header-property grammar (RFC 8621 s4.1.2)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod email_header_property_grammar {
+    use super::*;
+    use crate::email::{Header, HeaderForm, Property};
+
+    #[test]
+    fn every_header_form_round_trips_through_display() {
+        for (wire, form, all) in [
+            ("header:Subject", HeaderForm::Raw, false),
+            ("header:Subject:all", HeaderForm::Raw, true),
+            ("header:Subject:asText", HeaderForm::Text, false),
+            ("header:Subject:asText:all", HeaderForm::Text, true),
+            ("header:To:asAddresses", HeaderForm::Addresses, false),
+            (
+                "header:To:asGroupedAddresses",
+                HeaderForm::GroupedAddresses,
+                false,
+            ),
+            (
+                "header:References:asMessageIds",
+                HeaderForm::MessageIds,
+                false,
+            ),
+            ("header:Date:asDate", HeaderForm::Date, false),
+            ("header:List-Post:asURLs", HeaderForm::URLs, false),
+        ] {
+            let header = Header::parse(wire).unwrap_or_else(|| panic!("{wire} must parse"));
+            assert_eq!(header.form, form, "form for {wire}");
+            assert_eq!(header.all, all, "`:all` suffix for {wire}");
+            assert_eq!(header.to_string(), wire, "{wire} must render back verbatim");
+        }
+    }
+
+    #[test]
+    fn header_parse_rejects_malformed_names() {
+        // Not prefixed with the `header:` literal.
+        assert!(Header::parse("subject").is_none());
+        assert!(Header::parse("Subject:asText").is_none());
+        // Unknown form.
+        assert!(Header::parse("header:X-Spam:asFloat").is_none());
+        // Too many segments.
+        assert!(Header::parse("header:X-Spam:asText:all:extra").is_none());
+    }
+
+    #[test]
+    fn header_constructors_agree_with_the_parser() {
+        assert_eq!(
+            Header::as_message_ids("References", false),
+            Header::parse("header:References:asMessageIds").unwrap()
+        );
+        assert_eq!(
+            Header::as_raw("X-Vendor", true),
+            Header::parse("header:X-Vendor:all").unwrap()
+        );
+    }
+
+    #[test]
+    fn property_serde_covers_named_and_header_and_vendor_forms() {
+        for (prop, wire) in [
+            (Property::Id, "id"),
+            (Property::BlobId, "blobId"),
+            (Property::ThreadId, "threadId"),
+            (Property::MailboxIds, "mailboxIds"),
+            (Property::Keywords, "keywords"),
+            (Property::Size, "size"),
+            (Property::ReceivedAt, "receivedAt"),
+            (Property::MessageId, "messageId"),
+            (Property::InReplyTo, "inReplyTo"),
+            (Property::References, "references"),
+            (Property::Sender, "sender"),
+            (Property::From, "from"),
+            (Property::To, "to"),
+            (Property::Cc, "cc"),
+            (Property::Bcc, "bcc"),
+            (Property::ReplyTo, "replyTo"),
+            (Property::Subject, "subject"),
+            (Property::SentAt, "sentAt"),
+            (Property::BodyStructure, "bodyStructure"),
+            (Property::BodyValues, "bodyValues"),
+            (Property::TextBody, "textBody"),
+            (Property::HtmlBody, "htmlBody"),
+            (Property::Attachments, "attachments"),
+            (Property::HasAttachment, "hasAttachment"),
+            (Property::Preview, "preview"),
+        ] {
+            assert_eq!(serde_json::to_value(&prop).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<Property>(json!(wire)).unwrap(),
+                prop
+            );
+        }
+
+        let header = Property::Header(Header::as_text("Subject", false));
+        assert_eq!(
+            serde_json::to_value(&header).unwrap(),
+            json!("header:Subject:asText")
+        );
+        assert_eq!(
+            serde_json::from_value::<Property>(json!("header:Subject:asText")).unwrap(),
+            header
+        );
+
+        // Anything else is preserved verbatim rather than rejected.
+        assert_eq!(
+            serde_json::from_value::<Property>(json!("example.com:custom")).unwrap(),
+            Property::Other("example.com:custom".to_string())
+        );
+    }
+
+    #[test]
+    fn property_rejects_an_unparseable_header_form() {
+        // A `header:`-prefixed name with a bad form is the one input
+        // `Property` refuses outright; everything else falls through to
+        // `Other`.
+        assert!(serde_json::from_value::<Property>(json!("header:X:asFloat")).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email object decode
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod email_object_decode {
+    use super::*;
+    use crate::email::{Email, Header, HeaderValue};
+
+    #[test]
+    fn known_properties_decode() {
+        let email: Email = serde_json::from_value(json!({
+            "id": "e1",
+            "blobId": "b1",
+            "threadId": "t1",
+            "mailboxIds": {"mb1": true, "mb2": false},
+            "keywords": {"$seen": true, "$flagged": false},
+            "size": 1234,
+            "receivedAt": "2026-01-02T03:04:05Z",
+            "messageId": ["<a@b>"],
+            "from": [{"name": "Alice", "email": "alice@example.com"}],
+            "subject": "Hi",
+            "hasAttachment": true
+        }))
+        .expect("email decodes");
+
+        assert_eq!(email.id().map(crate::core::id::Id::as_str), Some("e1"));
+        assert_eq!(email.size(), 1234);
+        assert!(email.has_attachment());
+        // `mailboxIds` / `keywords` getters filter on the boolean value,
+        // so an explicit `false` membership is not reported.
+        let mb1 = crate::mailbox::MailboxId::new("mb1");
+        assert_eq!(email.mailbox_ids(), vec![&mb1]);
+        assert_eq!(email.keywords(), vec!["$seen"]);
+        assert_eq!(email.received_at(), Some(1_767_323_045));
+    }
+
+    // The header-form aliases on `Email` are gated behind
+    // `cfg_attr(not(feature = "debug"), ...)`, so enabling `debug` removes
+    // them and this decode stops working. That divergence is itself a bug
+    // the gate here keeps the suite honest
+    // under `--all-features` rather than endorsing it.
+    #[cfg(not(feature = "debug"))]
+    #[test]
+    fn header_form_aliases_populate_the_typed_fields() {
+        // The Account layer asks for `messageId` / `references`, but a
+        // server may answer with the RFC 8621 header-form spellings.
+        let email: Email = serde_json::from_value(json!({
+            "id": "e1",
+            "header:Message-ID:asMessageIds": ["<a@b>"],
+            "header:References:asMessageIds": ["<c@d>"],
+            "header:Subject:asText": "Hello"
+        }))
+        .expect("alias spellings decode");
+
+        let message_id = ["<a@b>".to_string()];
+        let references = ["<c@d>".to_string()];
+        assert_eq!(email.message_id(), Some(&message_id[..]));
+        assert_eq!(email.references(), Some(&references[..]));
+        assert_eq!(email.subject(), Some("Hello"));
+    }
+
+    #[test]
+    fn arbitrary_header_properties_land_in_the_flattened_map() {
+        let email: Email = serde_json::from_value(json!({
+            "id": "e1",
+            "header:X-Spam-Score:asText": "0.1"
+        }))
+        .expect("header property decodes");
+
+        let key = Header::as_text("X-Spam-Score", false);
+        assert!(email.has_header(&key));
+        match email.header(&key) {
+            Some(HeaderValue::AsText(v)) => assert_eq!(v, "0.1"),
+            other => panic!("expected AsText, got {other:?}"),
+        }
+    }
+
+    // BUG, documented rather than endorsed. `Email` routes every
+    // unrecognised top-level key into `#[serde(flatten)] headers:
+    // HashMap<Header, _>`, and `Header`'s deserializer hard-errors on
+    // anything that is not `header:<name>[:<form>][:all]`. One vendor
+    // extension property in an `Email/get` response therefore fails the
+    // decode of the WHOLE response, not just that property. Fix: make
+    // the flattened key type fall back to a non-header variant (or
+    // deserialize the map with a `deserialize_with` that drops keys
+    // `Header::parse` rejects) instead of erroring.
+    #[test]
+    fn one_unknown_property_fails_the_entire_email_decode() {
+        let ok = serde_json::from_value::<Email>(json!({"id": "e1", "subject": "Hi"}));
+        assert!(ok.is_ok(), "control: the same object without the extension");
+
+        let result = serde_json::from_value::<Email>(json!({
+            "id": "e1",
+            "subject": "Hi",
+            "example.com:snoozedUntil": "2026-02-01T00:00:00Z"
+        }));
+        assert!(
+            result.is_err(),
+            "a single vendor extension property must not be able to fail \
+             the whole decode, but today it does; if this assertion ever \
+             starts failing the bug has been fixed and the test should be \
+             inverted"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email/query filter + comparator wire shapes (RFC 8621 s4.4)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod email_query_wire {
+    use super::*;
+    use crate::email::query::{Comparator, Filter};
+
+    fn wire(filter: Filter) -> serde_json::Value {
+        serde_json::to_value(&filter).unwrap()
+    }
+
+    #[test]
+    fn filter_condition_property_names() {
+        assert_eq!(wire(Filter::in_mailbox("mb1")), json!({"inMailbox": "mb1"}));
+        assert_eq!(
+            wire(Filter::in_mailbox_other_than(["a", "b"])),
+            json!({"inMailboxOtherThan": ["a", "b"]})
+        );
+        assert_eq!(
+            wire(Filter::has_keyword("$seen")),
+            json!({"hasKeyword": "$seen"})
+        );
+        assert_eq!(
+            wire(Filter::not_keyword("$seen")),
+            json!({"notKeyword": "$seen"})
+        );
+        assert_eq!(
+            wire(Filter::all_in_thread_have_keyword("$seen")),
+            json!({"allInThreadHaveKeyword": "$seen"})
+        );
+        assert_eq!(
+            wire(Filter::some_in_thread_have_keyword("$seen")),
+            json!({"someInThreadHaveKeyword": "$seen"})
+        );
+        assert_eq!(
+            wire(Filter::none_in_thread_have_keyword("$seen")),
+            json!({"noneInThreadHaveKeyword": "$seen"})
+        );
+        assert_eq!(
+            wire(Filter::has_attachment(true)),
+            json!({"hasAttachment": true})
+        );
+        assert_eq!(wire(Filter::min_size(10)), json!({"minSize": 10}));
+        assert_eq!(wire(Filter::max_size(20)), json!({"maxSize": 20}));
+        assert_eq!(wire(Filter::text("q")), json!({"text": "q"}));
+        assert_eq!(
+            wire(Filter::from("a@example.com")),
+            json!({"from": "a@example.com"})
+        );
+        assert_eq!(
+            wire(Filter::to("a@example.com")),
+            json!({"to": "a@example.com"})
+        );
+        assert_eq!(
+            wire(Filter::cc("a@example.com")),
+            json!({"cc": "a@example.com"})
+        );
+        assert_eq!(
+            wire(Filter::bcc("a@example.com")),
+            json!({"bcc": "a@example.com"})
+        );
+        assert_eq!(wire(Filter::subject("s")), json!({"subject": "s"}));
+        assert_eq!(wire(Filter::body("b")), json!({"body": "b"}));
+    }
+
+    #[test]
+    fn header_filter_is_a_one_or_two_element_array() {
+        assert_eq!(
+            wire(Filter::header("X-Vendor", None::<String>)),
+            json!({"header": ["X-Vendor"]})
+        );
+        assert_eq!(
+            wire(Filter::header("X-Vendor", Some("v"))),
+            json!({"header": ["X-Vendor", "v"]})
+        );
+    }
+
+    #[test]
+    fn date_filters_serialise_as_jmap_utcdate() {
+        // RFC 8620 s1.4 UTCDate: "YYYY-MM-DDTHH:MM:SSZ", no offset, no
+        // fractional seconds for a whole-second instant.
+        assert_eq!(
+            wire(Filter::before(0)),
+            json!({"before": "1970-01-01T00:00:00Z"})
+        );
+        assert_eq!(
+            wire(Filter::after(1_767_323_045)),
+            json!({"after": "2026-01-02T03:04:05Z"})
+        );
+    }
+
+    #[test]
+    fn comparators_flatten_the_property_tag() {
+        assert_eq!(
+            serde_json::to_value(Comparator::received_at().descending()).unwrap(),
+            json!({"isAscending": false, "property": "receivedAt"})
+        );
+        assert_eq!(
+            serde_json::to_value(Comparator::has_keyword("$flagged")).unwrap(),
+            json!({"isAscending": true, "property": "hasKeyword", "keyword": "$flagged"})
+        );
+        assert_eq!(
+            serde_json::to_value(Comparator::size().collation("i;ascii-casemap".to_string()))
+                .unwrap(),
+            json!({"isAscending": true, "collation": "i;ascii-casemap", "property": "size"})
+        );
+    }
+
+    #[test]
+    fn query_request_carries_collapse_threads_and_paging() {
+        let query = crate::email::EmailQuery::new()
+            .filter(Filter::in_mailbox("mb1"))
+            .sort([Comparator::received_at().descending()])
+            .position(20)
+            .limit(10)
+            .calculate_total(true)
+            .collapse_threads(true);
+        let value = serde_json::to_value(&query).unwrap();
+
+        assert_eq!(value.get("filter"), Some(&json!({"inMailbox": "mb1"})));
+        assert_eq!(value.get("position"), Some(&json!(20)));
+        assert_eq!(value.get("limit"), Some(&json!(10)));
+        assert_eq!(value.get("calculateTotal"), Some(&json!(true)));
+        assert_eq!(value.get("collapseThreads"), Some(&json!(true)));
+        // Unset paging arguments must not appear at all.
+        assert!(value.get("anchor").is_none());
+        assert!(value.get("anchorOffset").is_none());
+    }
+
+    #[test]
+    fn filter_operators_nest() {
+        use crate::core::query::{Filter as CoreFilter, Operator};
+        let in_mailbox: CoreFilter<Filter> = CoreFilter::FilterCondition(Filter::in_mailbox("mb1"));
+        let has_keyword: CoreFilter<Filter> =
+            CoreFilter::FilterCondition(Filter::has_keyword("$seen"));
+        let negated: CoreFilter<Filter> = CoreFilter::not([has_keyword]);
+        let combined: CoreFilter<Filter> = CoreFilter::and([in_mailbox, negated]);
+        let value = serde_json::to_value(&combined).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "operator": "AND",
+                "conditions": [
+                    {"inMailbox": "mb1"},
+                    {"operator": "NOT", "conditions": [{"hasKeyword": "$seen"}]}
+                ]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Operator::Or).unwrap(),
+            json!("OR"),
+            "operator names are upper-case in RFC 8620 s5.5"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email/set patch shapes (RFC 8620 s5.3 PatchObject)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod email_set_patch_shapes {
+    use super::*;
+    use crate::email::EmailPatch;
+    use crate::mailbox::MailboxId;
+
+    #[test]
+    fn dotted_paths_use_null_to_remove_and_true_to_add() {
+        let mut patch = EmailPatch::default();
+        patch.keyword("$seen", true);
+        patch.keyword("$flagged", false);
+        patch.mailbox_id(&MailboxId::new("mb1"), true);
+        patch.mailbox_id(&MailboxId::new("mb2"), false);
+        let value = serde_json::to_value(&patch).unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "keywords/$seen": true,
+                "keywords/$flagged": null,
+                "mailboxIds/mb1": true,
+                "mailboxIds/mb2": null
+            })
+        );
+    }
+
+    #[test]
+    fn a_path_setter_clears_the_wholesale_property() {
+        // RFC 8620 s5.3 forbids sending both `keywords` and
+        // `keywords/x` in one PatchObject.
+        let mut patch = EmailPatch::default();
+        patch.keywords(["$seen"]);
+        patch.keyword("$flagged", true);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert!(value.get("keywords").is_none());
+        assert_eq!(value.get("keywords/$flagged"), Some(&json!(true)));
+    }
+
+    // BUG, documented rather than endorsed. The reverse order is not
+    // symmetric: `keywords()` / `mailbox_ids()` do NOT clear the dotted
+    // paths a previous `keyword()` / `mailbox_id()` installed, so the
+    // patch carries both the wholesale property and a path into it -
+    // exactly what RFC 8620 s5.3 forbids ("the value for the key MUST
+    // NOT also be given ... as part of a larger object"). Fix: have the
+    // wholesale setters clear the matching prefix out of `self.patch`,
+    // mirroring what the path setters already do.
+    #[test]
+    fn a_wholesale_setter_does_not_clear_previously_set_paths() {
+        let mut patch = EmailPatch::default();
+        patch.keyword("$flagged", true);
+        patch.keywords(["$seen"]);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value.get("keywords"), Some(&json!({"$seen": true})));
+        assert_eq!(
+            value.get("keywords/$flagged"),
+            Some(&json!(true)),
+            "both forms are emitted; RFC 8620 s5.3 says a server may reject this"
+        );
+    }
+
+    #[test]
+    fn raw_and_null_property_escape_hatches() {
+        let mut patch = EmailPatch::default();
+        patch
+            .raw_property("keywords/$vendor", &true)
+            .expect("serializable");
+        patch.null_property("preview");
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value.get("keywords/$vendor"), Some(&json!(true)));
+        assert_eq!(value.get("preview"), Some(&serde_json::Value::Null));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mailbox wire shapes (RFC 8621 s2)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod mailbox_wire {
+    use super::*;
+    use crate::core::SetCreate;
+    use crate::mailbox::{MailboxCreate, MailboxId, MailboxPatch, MailboxSet, Role};
+    use crate::principal::ACL;
+
+    #[test]
+    fn role_wire_names() {
+        for (role, wire) in [
+            (Role::Inbox, "inbox"),
+            (Role::Sent, "sent"),
+            (Role::Trash, "trash"),
+            (Role::Drafts, "drafts"),
+            (Role::Junk, "junk"),
+            (Role::Archive, "archive"),
+            (Role::Important, "important"),
+        ] {
+            assert_eq!(serde_json::to_value(&role).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_str::<Role>(&format!("\"{wire}\"")).unwrap(),
+                role
+            );
+        }
+        // Role matching is case-insensitive on the way in.
+        assert_eq!(
+            serde_json::from_str::<Role>("\"INBOX\"").unwrap(),
+            Role::Inbox
+        );
+    }
+
+    #[test]
+    fn unknown_roles_survive_as_other_but_are_lower_cased() {
+        // Note the case fold: an `x-` role does NOT round-trip byte for
+        // byte, which matters if the value is ever echoed back in a set.
+        assert_eq!(
+            serde_json::from_str::<Role>("\"x-MyRole\"").unwrap(),
+            Role::Other("x-myrole".to_string())
+        );
+        assert_eq!(
+            serde_json::to_value(Role::Other("x-myrole".to_string())).unwrap(),
+            json!("x-myrole")
+        );
+    }
+
+    // BUG, documented rather than endorsed. `Role`'s hand-written
+    // deserializer calls `<&str>::deserialize`, which only succeeds when
+    // the deserializer can lend a borrowed `&'de str`. `Response::get`
+    // happens to use `serde_json::from_str` over a `RawValue`, so the
+    // common path works - but any escaped character in the JSON string
+    // (serde_json then has to unescape into a scratch buffer) or any
+    // `from_value` call fails the whole `Mailbox` decode with
+    // "invalid type: string ..., expected a borrowed string". Fix:
+    // deserialize through `String` or a `Visitor` implementing
+    // `visit_str`, as every other hand-written deserializer in this
+    // crate already does.
+    #[test]
+    fn role_cannot_be_decoded_when_the_string_is_not_borrowable() {
+        // An owned `serde_json::Value` cannot lend a `&'de str`.
+        assert!(serde_json::from_value::<Role>(json!("inbox")).is_err());
+        // Neither can `from_str` once serde_json has to unescape into a
+        // scratch buffer. 92 is the backslash byte, so the JSON below
+        // spells `inbox` with a `u0069` escape for the leading `i` - it
+        // unescapes to exactly "inbox", but the borrow is gone.
+        let escaped = String::from_utf8(vec![
+            b'"', 92, b'u', b'0', b'0', b'6', b'9', b'n', b'b', b'o', b'x', b'"',
+        ])
+        .expect("ascii");
+        assert!(serde_json::from_str::<Role>(&escaped).is_err());
+        // The borrowed path is the only one that works.
+        assert_eq!(
+            serde_json::from_str::<Role>(r#""inbox""#).unwrap(),
+            Role::Inbox
+        );
+    }
+
+    #[test]
+    fn a_fresh_create_serialises_to_an_empty_object() {
+        // The sentinel defaults (`parentId: ""`, `role: None`, empty
+        // `shareWith`) all have to be skipped, or a plain
+        // `Mailbox/set create` would carry three properties the caller
+        // never asked for.
+        let create = MailboxCreate::new(Some(0));
+        assert_eq!(serde_json::to_value(&create).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn create_with_an_explicit_none_parent_sends_null() {
+        let mut create = MailboxCreate::new(Some(0));
+        create.name("Top level");
+        create.parent_id(None::<MailboxId>);
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value.get("name"), Some(&json!("Top level")));
+        assert_eq!(value.get("parentId"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn create_id_references_are_hash_prefixed() {
+        let mut create = MailboxCreate::new(Some(0));
+        create.parent_id_ref("c0");
+        assert_eq!(
+            serde_json::to_value(&create).unwrap().get("parentId"),
+            Some(&json!("#c0"))
+        );
+    }
+
+    // BUG, documented rather than endorsed. A default-constructed
+    // `MailboxPatch` - which is exactly what `SetRequest::update` hands
+    // every caller, via `or_default()` - does NOT serialise to `{}`. Two
+    // of its fields use skip predicates that return `false` for `None`:
+    //
+    //   role       skip_if = role_not_set   -> matches!(Some(Role::None))
+    //   shareWith  skip_if = skip_if_empty_map -> matches!(Some(empty))
+    //
+    // so `None` reaches the wire as an explicit `null`. On a JMAP
+    // PatchObject `null` means REMOVE, so every `Mailbox/set update`
+    // this crate sends also clears the mailbox's `role` and its whole
+    // `shareWith` ACL map. `sync/pim.rs::container_rename` is the live
+    // path: renaming the Inbox de-roles it and drops every share.
+    //
+    // `MailboxCreate` avoids this only because its `SetCreate::new`
+    // hand-initialises the sentinels (`Some(Role::None)`, an empty
+    // `shareWith`); `MailboxPatch` uses `#[derive(Default)]`, which
+    // cannot.
+    //
+    // Fix: make the Patch fields `Field<T>` (defaulting to `Omitted`),
+    // or give `MailboxPatch` a hand-written `Default` that installs the
+    // same sentinels `MailboxCreate::new` does.
+    #[test]
+    fn an_empty_mailbox_patch_still_clears_role_and_share_with() {
+        assert_eq!(
+            serde_json::to_value(MailboxPatch::default()).unwrap(),
+            json!({"role": null, "shareWith": null}),
+            "an untouched patch must be `{{}}`; today it removes two properties"
+        );
+
+        // The live rename path, verbatim.
+        let mut set = MailboxSet::new();
+        set.update(MailboxId::new("mb1")).name("Renamed");
+        assert_eq!(
+            serde_json::to_value(&set).unwrap().get("update"),
+            Some(&json!({
+                "mb1": {"name": "Renamed", "role": null, "shareWith": null}
+            }))
+        );
+    }
+
+    // BUG, documented rather than endorsed. `MailboxPatch::parent_id`
+    // takes an `Option`, so `None` is the only way a caller can say
+    // "move this mailbox to the top level" - but that field IS
+    // `skip_serializing_if = "Option::is_none"`, so the intent is
+    // dropped entirely. This is live:
+    // `sync/pim.rs::container_move(container, None)` takes exactly this
+    // path and then reports success. Fix: `Field<MailboxId>`, as
+    // `Calendar`/`AddressBook` already use for their nullable
+    // properties; `MailboxCreate` already gets it right via
+    // `skip_if_empty_id`.
+    #[test]
+    fn patching_parent_id_to_none_emits_no_parent_id_at_all() {
+        let mut patch = MailboxPatch::default();
+        patch.parent_id(None::<MailboxId>);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert!(
+            value.get("parentId").is_none(),
+            "the `move to root` intent is lost on the wire"
+        );
+    }
+
+    #[test]
+    fn patching_parent_id_to_some_moves_the_mailbox() {
+        let mut patch = MailboxPatch::default();
+        patch.parent_id(Some(MailboxId::new("mb-parent")));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap().get("parentId"),
+            Some(&json!("mb-parent"))
+        );
+    }
+
+    #[test]
+    fn role_none_is_the_only_way_to_omit_role_from_a_patch() {
+        // `role(Role::None)` sets the field to `None`, which is NOT the
+        // sentinel `role_not_set` looks for, so it still emits null.
+        // Only an explicit `Some(Role::None)` is skipped, and no public
+        // setter produces one.
+        let mut patch = MailboxPatch::default();
+        patch.name("Renamed");
+        patch.role(Role::None);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap().get("role"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let sentinel = MailboxPatch {
+            role: Some(Role::None),
+            ..MailboxPatch::default()
+        };
+        assert!(
+            serde_json::to_value(&sentinel)
+                .unwrap()
+                .get("role")
+                .is_none(),
+            "the sentinel is the skip condition; the setter cannot reach it"
+        );
+    }
+
+    #[test]
+    fn share_with_replacement_uses_the_rfc_property_names() {
+        let mut patch = MailboxPatch::default();
+        patch.acls([("u1", [ACL::ReadItems, ACL::AddItems])]);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            value.get("shareWith").and_then(|v| v.get("u1")),
+            Some(&json!({"mayReadItems": true, "mayAddItems": true}))
+        );
+    }
+
+    // BUG, documented rather than endorsed. `ACL` serialises with the
+    // RFC 8621 `shareWith` property names (`mayReadItems`, `mayShare`,
+    // ...) but its `Display` impl renders a different vocabulary
+    // (`readItems`, `administer`, ...). `MailboxPatch::acl_set` builds
+    // its dotted patch path with `Display`, so it names a property no
+    // JMAP server has; `MailboxPatch::acl` (the whole-map form on the
+    // same struct) uses the serde name. The two disagree. Fix: build the
+    // path from the serde name (e.g. via
+    // `serde_json::to_value(acl)`/`as_str()`), or delete the divergent
+    // `Display` impl.
+    #[test]
+    fn acl_set_builds_a_patch_path_the_server_will_not_recognise() {
+        let mut patch = MailboxPatch::default();
+        patch.acl_set("u1", ACL::ReadItems, true);
+        patch.acl_set("u1", ACL::Administer, false);
+        let value = serde_json::to_value(&patch).unwrap();
+
+        assert_eq!(value.get("shareWith/u1/readItems"), Some(&json!(true)));
+        assert_eq!(value.get("shareWith/u1/administer"), Some(&json!(false)));
+        assert!(
+            value.get("shareWith/u1/mayReadItems").is_none(),
+            "the RFC 8621 property name is `mayReadItems`"
+        );
+        assert!(
+            value.get("shareWith/u1/mayShare").is_none(),
+            "the RFC 8621 property name for Administer is `mayShare`"
+        );
+    }
+
+    #[test]
+    fn on_destroy_remove_emails_flattens_into_the_set_request() {
+        let set = MailboxSet::new()
+            .destroy([MailboxId::new("mb1")])
+            .on_destroy_remove_emails(false);
+        let value = serde_json::to_value(&set).unwrap();
+        assert_eq!(value.get("destroy"), Some(&json!(["mb1"])));
+        assert_eq!(value.get("onDestroyRemoveEmails"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn mailbox_decodes_counts_and_rights() {
+        let mailbox: crate::mailbox::Mailbox = serde_json::from_str(
+            r#"{"id":"mb1","name":"Inbox","parentId":null,"role":"inbox","sortOrder":0,
+                "totalEmails":10,"unreadEmails":3,"totalThreads":8,"unreadThreads":2,
+                "isSubscribed":true,
+                "myRights":{"mayReadItems":true,"mayAddItems":false}}"#,
+        )
+        .expect("mailbox decodes");
+
+        assert_eq!(mailbox.name(), Some("Inbox"));
+        assert_eq!(mailbox.role(), Some(&Role::Inbox));
+        assert_eq!(mailbox.parent_id(), None, "a null parentId reads as absent");
+        assert_eq!(mailbox.total_emails(), Some(10));
+        assert_eq!(mailbox.unread_threads(), Some(2));
+        assert_eq!(mailbox.is_subscribed(), Some(true));
+
+        let rights = mailbox.my_rights().expect("myRights present");
+        assert!(rights.may_read_items());
+        // Rights the server omitted default to false rather than
+        // failing the decode.
+        assert!(!rights.may_submit());
+        assert_eq!(rights.acl_list(), vec![ACL::ReadItems]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmailSubmission wire shapes (RFC 8621 s7)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod email_submission_wire {
+    use super::*;
+    use crate::email_submission::{Address, EmailSubmissionSet, UndoStatus};
+
+    #[test]
+    fn envelope_address_parameters() {
+        // RFC 4865 FUTURERELEASE rides as a `mailFrom` parameter.
+        let held = Address::new("me@example.com")
+            .with_parameter("holduntil", Some("2026-01-02T03:04:05Z"));
+        assert_eq!(
+            serde_json::to_value(&held).unwrap(),
+            json!({
+                "email": "me@example.com",
+                "parameters": {"holduntil": "2026-01-02T03:04:05Z"}
+            })
+        );
+
+        // A valueless ESMTP parameter is a null value, not an empty
+        // string.
+        let flagged = Address::new("me@example.com").with_parameter("body", None::<String>);
+        assert_eq!(
+            serde_json::to_value(&flagged).unwrap(),
+            json!({"email": "me@example.com", "parameters": {"body": null}})
+        );
+
+        // With no parameters at all the key is still emitted as null
+        // (`parameters` has no `skip_serializing_if`). RFC 8621 s7.1
+        // types it `String[String|null]|null`, so this is legal, just
+        // noisier than it needs to be.
+        assert_eq!(
+            serde_json::to_value(Address::new("me@example.com")).unwrap(),
+            json!({"email": "me@example.com", "parameters": null})
+        );
+    }
+
+    #[test]
+    fn create_and_on_success_arguments() {
+        let mut set = EmailSubmissionSet::new();
+        {
+            let create = set.create();
+            create.identity_id("identity-1");
+            create.email_id("e1");
+            create.envelope("me@example.com", ["you@example.com"]);
+            create.undo_status(UndoStatus::Pending);
+        }
+        set.on_success_update_email("c0")
+            .keyword(crate::email::DRAFT_KEYWORD, false);
+        let set = set.on_success_destroy_email("c0");
+
+        let value = serde_json::to_value(&set).unwrap();
+
+        let created = value
+            .get("create")
+            .and_then(|c| c.get("c0"))
+            .expect("create entry c0");
+        assert_eq!(created.get("identityId"), Some(&json!("identity-1")));
+        assert_eq!(created.get("emailId"), Some(&json!("e1")));
+        assert_eq!(created.get("undoStatus"), Some(&json!("pending")));
+        assert_eq!(
+            created.get("envelope"),
+            Some(&json!({
+                "mailFrom": {"email": "me@example.com", "parameters": null},
+                "rcptTo": [{"email": "you@example.com", "parameters": null}]
+            }))
+        );
+
+        // Both onSuccess arguments key off the create-id with a `#`
+        // prefix (RFC 8621 s7.5).
+        assert_eq!(
+            value.get("onSuccessUpdateEmail"),
+            Some(&json!({"#c0": {"keywords/$draft": null}}))
+        );
+        assert_eq!(value.get("onSuccessDestroyEmail"), Some(&json!(["#c0"])));
+    }
+
+    #[test]
+    fn a_submission_id_reference_is_not_hash_prefixed() {
+        let mut set = EmailSubmissionSet::new();
+        set.on_success_update_email_id(crate::email_submission::EmailSubmissionId::new("sub-1"))
+            .subject("ignored");
+        let value = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            value.get("onSuccessUpdateEmail"),
+            Some(&json!({"sub-1": {"subject": "ignored"}}))
+        );
+    }
+
+    #[test]
+    fn undo_status_patch() {
+        let mut set = EmailSubmissionSet::new();
+        set.update(crate::email_submission::EmailSubmissionId::new("sub-1"))
+            .undo_status(UndoStatus::Canceled);
+        assert_eq!(
+            serde_json::to_value(&set).unwrap().get("update"),
+            Some(&json!({"sub-1": {"undoStatus": "canceled"}}))
+        );
+    }
+
+    #[test]
+    fn submission_decodes_delivery_status() {
+        let submission: crate::email_submission::EmailSubmission = serde_json::from_str(
+            r#"{"id":"sub-1","identityId":"i1","emailId":"e1","threadId":"t1",
+                "sendAt":"2026-01-02T03:04:05Z","undoStatus":"final",
+                "deliveryStatus":{"you@example.com":{"smtpReply":"250 ok",
+                    "delivered":"yes","displayed":"unknown"}}}"#,
+        )
+        .expect("submission decodes");
+
+        assert_eq!(submission.send_at(), Some(1_767_323_045));
+        assert_eq!(submission.undo_status(), Some(&UndoStatus::Final));
+        let status = submission
+            .delivery_status_email("you@example.com")
+            .expect("delivery status");
+        assert_eq!(status.smtp_reply(), "250 ok");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity / VacationResponse / SieveScript wire shapes
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod settings_object_wire {
+    use super::*;
+    use crate::identity::IdentityPatch;
+    use crate::sieve::SieveScriptSet;
+    use crate::vacation_response::{
+        VacationResponseId, VacationResponsePatch, VacationResponseSet,
+    };
+
+    // BUG, documented rather than endorsed. Same root cause as
+    // `mailbox_wire::an_empty_mailbox_patch_still_clears_role_and_share_with`:
+    // `replyTo` and `bcc` use `skip_if_empty_list`, which returns
+    // `false` for `None`, so a default-constructed `IdentityPatch`
+    // serialises to `{"replyTo": null, "bcc": null}`. On a JMAP
+    // PatchObject that is a removal, so
+    // `sync/pim.rs::identity_update` - which only ever touches the
+    // fields the caller named - silently wipes the identity's reply-to
+    // and Bcc lists every time someone renames an identity or edits a
+    // signature. Fix: `Field<Vec<EmailAddress>>`, or a hand-written
+    // `Default` that installs the `Some(empty)` sentinels the way
+    // `IdentityCreate::new` does.
+    #[test]
+    fn an_empty_identity_patch_still_clears_reply_to_and_bcc() {
+        assert_eq!(
+            serde_json::to_value(IdentityPatch::default()).unwrap(),
+            json!({"replyTo": null, "bcc": null})
+        );
+
+        let mut patch = IdentityPatch::default();
+        patch.name("Alice");
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"name": "Alice", "replyTo": null, "bcc": null}),
+            "renaming an identity must not touch replyTo/bcc"
+        );
+    }
+
+    #[test]
+    fn identity_patch_clears_a_list_deliberately_with_none() {
+        // The same `None`-means-null behaviour is what a caller who
+        // *wants* to clear `replyTo` relies on (RFC 8621 s6 types it
+        // `EmailAddress[]|null`), which is why the fix has to be a
+        // three-state field rather than flipping the predicate.
+        let mut patch = IdentityPatch::default();
+        patch.reply_to(None::<std::iter::Empty<crate::email::EmailAddress>>);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap().get("replyTo"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn identity_patch_sets_a_reply_to_list() {
+        let mut patch = IdentityPatch::default();
+        patch.reply_to(Some(
+            [crate::email::EmailAddress::new("r@example.com".to_string())].into_iter(),
+        ));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap().get("replyTo"),
+            Some(&json!([{"name": null, "email": "r@example.com"}]))
+        );
+    }
+
+    // BUG, documented rather than endorsed. Every `VacationResponsePatch`
+    // setter takes an `Option`, but the fields are
+    // `skip_serializing_if = "Option::is_none"`, so passing `None`
+    // (the caller's "clear this") silently emits nothing. The Create
+    // shape does the opposite - it uses `skip_if_empty_str` /
+    // `skip_if_zero_date`, which let `None` through as `null`.
+    // `sync/pim.rs::vacation_set` already works around this by calling
+    // `null_property(...)` by hand for all five nullable properties,
+    // which is the tell. Fix: make the Patch fields `Field<T>` (or reuse
+    // the Create shape's skip predicates) so the setters mean what their
+    // signatures say.
+    #[test]
+    fn vacation_patch_setters_cannot_clear_a_property() {
+        let mut patch = VacationResponsePatch::default();
+        patch.is_enabled(false);
+        patch.subject(None::<String>);
+        patch.to_date(None);
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"isEnabled": false}),
+            "`subject(None)` and `to_date(None)` vanish instead of clearing"
+        );
+    }
+
+    #[test]
+    fn vacation_patch_null_property_is_the_working_escape_hatch() {
+        let mut set = VacationResponseSet::new();
+        let patch = set.update(VacationResponseId::new("singleton"));
+        patch.is_enabled(true);
+        patch.subject(Some("Away"));
+        patch.null_property("toDate");
+        assert_eq!(
+            serde_json::to_value(&set).unwrap().get("update"),
+            Some(&json!({
+                "singleton": {"isEnabled": true, "subject": "Away", "toDate": null}
+            }))
+        );
+    }
+
+    #[test]
+    fn vacation_response_decodes_dates() {
+        let vacation: crate::vacation_response::VacationResponse = serde_json::from_str(
+            r#"{"id":"singleton","isEnabled":true,"fromDate":"2026-01-02T03:04:05Z",
+                "toDate":null,"subject":"Away","textBody":"back soon"}"#,
+        )
+        .expect("vacation decodes");
+        assert!(vacation.is_enabled());
+        assert_eq!(vacation.from_date(), Some(1_767_323_045));
+        assert_eq!(vacation.to_date(), None);
+        assert_eq!(vacation.subject(), Some("Away"));
+    }
+
+    #[test]
+    fn sieve_activation_arguments() {
+        // Activating a script created in the same request references the
+        // create-id with a `#`; activating an existing one does not.
+        let by_create_id = SieveScriptSet::new().on_success_activate_script("c0");
+        assert_eq!(
+            serde_json::to_value(&by_create_id)
+                .unwrap()
+                .get("onSuccessActivateScript"),
+            Some(&json!("#c0"))
+        );
+
+        let by_id = SieveScriptSet::new()
+            .on_success_activate_script_id(crate::sieve::SieveScriptId::new("s1"));
+        assert_eq!(
+            serde_json::to_value(&by_id)
+                .unwrap()
+                .get("onSuccessActivateScript"),
+            Some(&json!("s1"))
+        );
+
+        let deactivate = SieveScriptSet::new().on_success_deactivate_script(true);
+        assert_eq!(
+            serde_json::to_value(&deactivate)
+                .unwrap()
+                .get("onSuccessDeactivateScript"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn sieve_validate_response_carries_a_set_error() {
+        let response: crate::sieve::validate::SieveScriptValidateResponse = serde_json::from_str(
+            r#"{"error":{"type":"invalidScript","description":"line 3: syntax error"}}"#,
+        )
+        .expect("validate response decodes");
+        let error = response.into_error().expect("an error");
+        assert_eq!(
+            error.error_type(),
+            &crate::core::set::SetErrorType::InvalidScript
+        );
+        assert_eq!(error.description(), Some("line 3: syntax error"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default-constructed PatchObjects must be empty
+// ---------------------------------------------------------------------------
+//
+// `SetRequest::update` hands out `O::Patch::default()`. RFC 8620 s5.3
+// makes a `null` value in a PatchObject a REMOVAL, so any property a
+// default patch happens to serialise is a property every update in this
+// crate silently deletes.
+//
+// The rule the crate follows elsewhere is: a nullable property uses a
+// skip predicate that lets `None` through as `null` (`skip_if_empty_str`
+// / `_list` / `_map` / `skip_if_zero_date` / `skip_if_empty_id` all
+// return `false` for `None`), and the Create type's hand-written
+// `SetCreate::new` installs `Some(empty)` sentinels so the default is
+// still skipped. The Patch types use `#[derive(Default)]`, which cannot
+// install a sentinel - so wherever a Patch field uses one of those
+// predicates, the default leaks a `null`.
+
+mod patch_defaults {
+    use super::*;
+
+    fn empty<T: serde::Serialize + Default>(label: &str) {
+        assert_eq!(
+            serde_json::to_value(T::default()).unwrap(),
+            json!({}),
+            "a default {label} must not remove any property"
+        );
+    }
+
+    #[test]
+    fn patches_that_are_correctly_empty() {
+        #[cfg(feature = "mail")]
+        {
+            empty::<crate::email::EmailPatch>("EmailPatch");
+            empty::<crate::email_submission::EmailSubmissionPatch>("EmailSubmissionPatch");
+            empty::<crate::vacation_response::VacationResponsePatch>("VacationResponsePatch");
+            empty::<crate::sieve::SieveScriptPatch>("SieveScriptPatch");
+        }
+        empty::<crate::principal::PrincipalPatch>("PrincipalPatch");
+        #[cfg(feature = "calendars")]
+        {
+            empty::<crate::calendar::CalendarPatch>("CalendarPatch");
+            empty::<crate::calendar_event::CalendarEventPatch>("CalendarEventPatch");
+        }
+        #[cfg(feature = "contacts")]
+        {
+            empty::<crate::address_book::AddressBookPatch>("AddressBookPatch");
+            empty::<crate::contact_card::ContactCardPatch>("ContactCardPatch");
+        }
+    }
+
+    // BUG, documented rather than endorsed. These four default patches
+    // are not empty; each `null` below is a property removal the caller
+    // never asked for. Two of them are on live paths
+    // (`container_rename` / `container_move` for Mailbox,
+    // `identity_update` for Identity).
+    #[test]
+    fn patches_that_leak_property_removals() {
+        #[cfg(feature = "mail")]
+        assert_eq!(
+            serde_json::to_value(crate::mailbox::MailboxPatch::default()).unwrap(),
+            json!({"role": null, "shareWith": null}),
+            "every Mailbox/set update de-roles the mailbox and drops its shares"
+        );
+        #[cfg(feature = "mail")]
+        assert_eq!(
+            serde_json::to_value(crate::identity::IdentityPatch::default()).unwrap(),
+            json!({"replyTo": null, "bcc": null}),
+            "every Identity/set update clears reply-to and Bcc"
+        );
+        assert_eq!(
+            serde_json::to_value(crate::push_subscription::PushSubscriptionPatch::default())
+                .unwrap(),
+            json!({"types": null}),
+            "RFC 8620 s7.2: a null `types` means `every type`, so a \
+             verification-code update also widens the subscription"
+        );
+        #[cfg(feature = "calendars")]
+        assert_eq!(
+            serde_json::to_value(crate::participant_identity::ParticipantIdentityPatch::default())
+                .unwrap(),
+            json!({"sendTo": null})
+        );
+    }
+
+    // The same predicate family bites two Create shapes whose
+    // `SetCreate::new` forgot to install the sentinel. Less severe (a
+    // create always sets the property in practice) but the same defect.
+    #[test]
+    fn creates_whose_sentinels_are_missing() {
+        use crate::core::SetCreate;
+        #[cfg(feature = "contacts")]
+        assert_eq!(
+            serde_json::to_value(crate::address_book::AddressBookCreate::new(Some(0))).unwrap(),
+            json!({"name": null}),
+            "AddressBook `name` is a non-nullable String in RFC 9610"
+        );
+        #[cfg(feature = "calendars")]
+        assert_eq!(
+            serde_json::to_value(crate::participant_identity::ParticipantIdentityCreate::new(
+                Some(0)
+            ))
+            .unwrap(),
+            json!({"sendTo": null})
+        );
+        // The ones that do install sentinels.
+        #[cfg(feature = "mail")]
+        {
+            assert_eq!(
+                serde_json::to_value(crate::mailbox::MailboxCreate::new(Some(0))).unwrap(),
+                json!({})
+            );
+            assert_eq!(
+                serde_json::to_value(crate::identity::IdentityCreate::new(Some(0))).unwrap(),
+                json!({})
+            );
+            assert_eq!(
+                serde_json::to_value(crate::vacation_response::VacationResponseCreate::new(Some(
+                    0
+                )))
+                .unwrap(),
+                json!({})
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(crate::principal::PrincipalCreate::new(Some(0))).unwrap(),
+            json!({})
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetError vocabulary (RFC 8620 s5.3 / RFC 8621 / sieve draft)
+// ---------------------------------------------------------------------------
+
+mod set_error_vocabulary {
+    use crate::core::set::{SetError, SetErrorType};
+
+    fn decode(code: &str) -> SetErrorType {
+        let error: SetError<String> =
+            serde_json::from_str(&format!(r#"{{"type":"{code}"}}"#)).expect("set error decodes");
+        error.error_type().clone()
+    }
+
+    #[test]
+    fn known_codes_map_to_typed_variants_and_render_back() {
+        for (code, variant) in [
+            ("forbidden", SetErrorType::Forbidden),
+            ("overQuota", SetErrorType::OverQuota),
+            ("tooLarge", SetErrorType::TooLarge),
+            ("rateLimit", SetErrorType::RateLimit),
+            ("notFound", SetErrorType::NotFound),
+            ("invalidPatch", SetErrorType::InvalidPatch),
+            ("willDestroy", SetErrorType::WillDestroy),
+            ("invalidProperties", SetErrorType::InvalidProperties),
+            ("singleton", SetErrorType::Singleton),
+            ("mailboxHasChild", SetErrorType::MailboxHasChild),
+            ("mailboxHasEmail", SetErrorType::MailboxHasEmail),
+            ("blobNotFound", SetErrorType::BlobNotFound),
+            ("tooManyKeywords", SetErrorType::TooManyKeywords),
+            ("tooManyMailboxes", SetErrorType::TooManyMailboxes),
+            ("forbiddenFrom", SetErrorType::ForbiddenFrom),
+            ("invalidEmail", SetErrorType::InvalidEmail),
+            ("tooManyRecipients", SetErrorType::TooManyRecipients),
+            ("noRecipients", SetErrorType::NoRecipients),
+            ("invalidRecipients", SetErrorType::InvalidRecipients),
+            ("forbiddenMailFrom", SetErrorType::ForbiddenMailFrom),
+            ("forbiddenToSend", SetErrorType::ForbiddenToSend),
+            ("cannotUnsend", SetErrorType::CannotUnsend),
+            ("alreadyExists", SetErrorType::AlreadyExists),
+            ("invalidScript", SetErrorType::InvalidScript),
+            ("scriptIsActive", SetErrorType::ScriptIsActive),
+        ] {
+            assert_eq!(decode(code), variant, "decoding {code}");
+            assert_eq!(variant.to_string(), code, "rendering {code}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_code_keeps_the_literal_the_server_sent() {
+        // The gate-5 invariant: never synthesise an "other" literal; the
+        // real wire code has to reach `WireCause::Jmap(Unknown { code })`.
+        let decoded = decode("vendorSpecificFailure");
+        assert_eq!(
+            decoded,
+            SetErrorType::Other("vendorSpecificFailure".to_string())
+        );
+        assert_eq!(decoded.to_string(), "vendorSpecificFailure");
+    }
+
+    #[test]
+    fn set_error_display_includes_description_and_properties() {
+        let error: SetError<String> = serde_json::from_str(
+            r#"{"type":"invalidProperties","description":"bad","properties":["a","b"]}"#,
+        )
+        .expect("decodes");
+        assert_eq!(
+            error.to_string(),
+            "invalidProperties: bad (properties: a, b)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `#[non_exhaustive]` wire enums with no catch-all
+// ---------------------------------------------------------------------------
+//
+// These enums are marked `#[non_exhaustive]` (the crate reserves the
+// right to grow them) but their deserializers have no `#[serde(other)]`
+// arm, so an unrecognised wire value fails the decode of the ENTIRE
+// containing response rather than degrading. `DataType`, `Role`,
+// `AlertTrigger` and `SetErrorType` all do have a catch-all; the ones
+// below do not. Pinned as-is.
+
+mod wire_enums_without_a_catch_all {
+    #[cfg(feature = "mail")]
+    #[test]
+    fn undo_status_rejects_an_unknown_value() {
+        assert!(
+            serde_json::from_str::<crate::email_submission::UndoStatus>(r#""queued""#).is_err()
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn delivery_state_rejects_an_unknown_value() {
+        assert!(
+            serde_json::from_str::<crate::email_submission::Delivered>(r#""bounced""#).is_err()
+        );
+        assert!(serde_json::from_str::<crate::email_submission::Displayed>(r#""no""#).is_err());
+    }
+
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn alert_action_rejects_an_unknown_value() {
+        assert!(
+            serde_json::from_str::<crate::calendar_event::AlertAction>(r#""audio""#).is_err(),
+            "RFC 8984 only defines display/email today, but the enum is #[non_exhaustive]"
+        );
+    }
+
+    #[cfg(feature = "calendars")]
+    #[test]
+    fn include_in_availability_rejects_an_unknown_value() {
+        assert!(
+            serde_json::from_str::<crate::calendar::IncludeInAvailability>(r#""maybe""#).is_err()
+        );
+    }
+
+    #[test]
+    fn principal_type_rejects_an_unknown_value() {
+        // Note `Type::Other` exists but is spelled "other" on the wire -
+        // it is a real RFC value, not a catch-all.
+        assert!(serde_json::from_str::<crate::principal::Type>(r#""room""#).is_err());
+        assert!(serde_json::from_str::<crate::principal::Type>(r#""other""#).is_ok());
+    }
+
+    #[test]
+    fn data_type_does_have_a_catch_all() {
+        assert_eq!(
+            serde_json::from_str::<crate::DataType>(r#""SomeFutureType""#).unwrap(),
+            crate::DataType::Other
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DataType wire names (RFC 8620 s7 push / RFC 8887 dataTypes)
+// ---------------------------------------------------------------------------
+
+mod data_type_wire {
+    use super::*;
+    use crate::DataType;
+
+    #[test]
+    fn display_matches_the_serde_representation() {
+        #[allow(unused_mut)]
+        let mut types = vec![
+            DataType::Core,
+            DataType::PushSubscription,
+            DataType::Principal,
+            DataType::ShareNotification,
+            DataType::FileNode,
+        ];
+        #[cfg(feature = "mail")]
+        types.extend([
+            DataType::Email,
+            DataType::EmailDelivery,
+            DataType::EmailSubmission,
+            DataType::Mailbox,
+            DataType::Thread,
+            DataType::Identity,
+            DataType::SearchSnippet,
+            DataType::VacationResponse,
+            DataType::Mdn,
+            DataType::SieveScript,
+        ]);
+        #[cfg(feature = "calendars")]
+        types.extend([
+            DataType::Calendar,
+            DataType::CalendarEvent,
+            DataType::CalendarEventNotification,
+            DataType::ParticipantIdentity,
+            DataType::CalendarAlert,
+        ]);
+        #[cfg(feature = "contacts")]
+        types.extend([DataType::AddressBook, DataType::ContactCard]);
+        #[cfg(feature = "quota")]
+        types.push(DataType::Quota);
+
+        for data_type in types {
+            let wire = serde_json::to_value(&data_type).unwrap();
+            assert_eq!(
+                wire,
+                json!(data_type.to_string()),
+                "Display and Serialize must agree for {data_type:?}"
+            );
+            assert_eq!(serde_json::from_value::<DataType>(wire).unwrap(), data_type);
+        }
+    }
+
+    #[test]
+    fn mdn_is_spelled_in_caps_on_the_wire() {
+        #[cfg(feature = "mail")]
+        assert_eq!(serde_json::to_value(DataType::Mdn).unwrap(), json!("MDN"));
+    }
+
+    // Documented, not endorsed: `DataType::Other` is a
+    // deserialize-only catch-all, but it still SERIALISES, as the
+    // literal `"Other"`. Anything that decodes a server's type name and
+    // echoes it back (the `WebSocketPushEnable.dataTypes` union, a
+    // `PushSubscription.types` round-trip) will therefore ask the server
+    // to subscribe to a type called `Other`.
+    #[test]
+    fn other_serialises_as_a_literal_that_is_not_a_jmap_type() {
+        assert_eq!(
+            serde_json::to_value(DataType::Other).unwrap(),
+            json!("Other")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session capability decoding fallbacks
+// ---------------------------------------------------------------------------
+
+mod session_capability_fallbacks {
+    use super::*;
+    use crate::core::session::{Capabilities, Session};
+
+    fn session_with(capabilities: serde_json::Value) -> Session {
+        serde_json::from_value(json!({
+            "capabilities": capabilities,
+            "accounts": {},
+            "primaryAccounts": {},
+            "username": "u@example.org",
+            "apiUrl": "https://example.org/jmap/",
+            "downloadUrl": "https://example.org/dl/{accountId}/{blobId}/{name}?accept={type}",
+            "uploadUrl": "https://example.org/ul/{accountId}/",
+            "eventSourceUrl": "https://example.org/es/?types={types}&closeafter={closeafter}&ping={ping}",
+            "state": "s0"
+        }))
+        .expect("session decodes")
+    }
+
+    #[test]
+    fn websocket_capability_decodes() {
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:websocket": {
+                "url": "wss://example.org/jmap/ws",
+                "supportsPush": true
+            }
+        }));
+        let ws = session.websocket_capabilities().expect("websocket cap");
+        assert_eq!(ws.url(), "wss://example.org/jmap/ws");
+        assert!(ws.supports_push());
+    }
+
+    // Documented, not endorsed. `deserialize_capabilities_map` falls
+    // back to `Capabilities::Other` whenever the typed struct fails to
+    // parse. `WebSocketCapabilities` has no `#[serde(default)]` and both
+    // of its fields are required, so a server that omits `supportsPush`
+    // does not produce a decode error the operator can see - it produces
+    // a session where `websocket_capabilities()` is `None` and push is
+    // silently switched off for the whole account. Fix: either default
+    // the field (`supportsPush` absent == false is the RFC 8887 reading)
+    // or surface the fallback so it is diagnosable.
+    #[test]
+    fn a_malformed_capability_silently_degrades_to_other() {
+        let session = session_with(json!({
+            "urn:ietf:params:jmap:websocket": {"url": "wss://example.org/jmap/ws"}
+        }));
+        assert!(
+            session.websocket_capabilities().is_none(),
+            "push is silently disabled rather than reported"
+        );
+        assert!(matches!(
+            session.capability("urn:ietf:params:jmap:websocket"),
+            Some(Capabilities::Other(_))
+        ));
+    }
+
+    #[test]
+    fn core_capabilities_default_missing_limits_to_zero() {
+        // `CoreCapabilities` is `#[serde(default)]`, so an empty object
+        // decodes rather than falling through to `Other` - the zero
+        // limits are what the sync layer's validation has to reject.
+        let session = session_with(json!({"urn:ietf:params:jmap:core": {}}));
+        let core = session.core_capabilities().expect("core cap");
+        assert_eq!(core.max_objects_in_get(), 0);
+        assert_eq!(core.max_objects_in_set(), 0);
+        assert!(core.collation_algorithms().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_capability_uri_is_preserved_verbatim() {
+        let session = session_with(json!({"urn:vendor:thing": {"a": 1}}));
+        match session.capability("urn:vendor:thing") {
+            Some(Capabilities::Other(v)) => assert_eq!(v, &json!({"a": 1})),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// URL template parsing (RFC 8620 s2 download/upload/eventSource URLs)
+// ---------------------------------------------------------------------------
+
+mod url_template_parsing {
+    use crate::core::session::{URLParser, URLPart};
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum P {
+        A,
+        B,
+    }
+
+    impl URLParser for P {
+        fn parse(value: &str) -> Option<Self> {
+            match value {
+                "a" => Some(P::A),
+                "b" => Some(P::B),
+                _ => None,
+            }
+        }
+    }
+
+    fn parts(url: &str) -> Vec<String> {
+        URLPart::<P>::parse(url)
+            .expect("parses")
+            .into_iter()
+            .map(|part| match part {
+                URLPart::Value(v) => format!("value:{v}"),
+                URLPart::Parameter(p) => format!("param:{p:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn literals_and_parameters_alternate() {
+        assert_eq!(
+            parts("https://x/{a}/y/{b}"),
+            vec![
+                "value:https://x/".to_string(),
+                "param:A".to_string(),
+                "value:/y/".to_string(),
+                "param:B".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn adjacent_parameters_produce_no_empty_literal() {
+        assert_eq!(
+            parts("{a}{b}"),
+            vec!["param:A".to_string(), "param:B".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_templates_are_rejected() {
+        // Unterminated parameter.
+        assert!(URLPart::<P>::parse("https://x/{a").is_err());
+        // Empty parameter.
+        assert!(URLPart::<P>::parse("https://x/{}").is_err());
+        // Closing brace with no opening one.
+        assert!(URLPart::<P>::parse("https://x/a}").is_err());
+        // Unknown parameter name.
+        assert!(URLPart::<P>::parse("https://x/{zzz}").is_err());
+    }
+
+    #[test]
+    fn blob_url_parameters_cover_the_rfc_set() {
+        use crate::blob::URLParameter;
+        assert!(matches!(
+            URLParameter::parse("accountId"),
+            Some(URLParameter::AccountId)
+        ));
+        assert!(matches!(
+            URLParameter::parse("blobId"),
+            Some(URLParameter::BlobId)
+        ));
+        assert!(matches!(
+            URLParameter::parse("name"),
+            Some(URLParameter::Name)
+        ));
+        assert!(matches!(
+            URLParameter::parse("type"),
+            Some(URLParameter::Type)
+        ));
+        assert!(URLParameter::parse("size").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blob management wire shapes (RFC 9404)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "blob")]
+mod blob_management_wire {
+    use super::*;
+    use crate::blob::manage::{
+        BlobGetResponse, BlobLookupRequest, BlobLookupResponse, BlobUploadRequest, DataSource,
+        DataSourceBlob,
+    };
+
+    #[test]
+    fn upload_request_keys_creates_and_concatenates_sources() {
+        let mut request = BlobUploadRequest::new();
+        let first = request.create_from_text("hello", Some("text/plain"));
+        let second = request.create_with_sources(
+            vec![
+                DataSource::Blob(DataSourceBlob {
+                    blob_id: "b1".into(),
+                    offset: Some(0),
+                    length: Some(4),
+                }),
+                DataSource::Text(crate::blob::manage::DataSourceText {
+                    value: "!".to_string(),
+                }),
+            ],
+            None::<String>,
+        );
+        assert_eq!(first, "b0");
+        assert_eq!(second, "b1");
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value.get("create").and_then(|c| c.get("b0")),
+            Some(&json!({"data": [{"data:asText": "hello"}], "type": "text/plain"}))
+        );
+        assert_eq!(
+            value.get("create").and_then(|c| c.get("b1")),
+            Some(&json!({
+                "data": [
+                    {"blobId": "b1", "offset": 0, "length": 4},
+                    {"data:asText": "!"}
+                ]
+            })),
+            "an omitted content type must not appear as null"
+        );
+    }
+
+    #[test]
+    fn get_response_splits_named_fields_from_dynamic_ones() {
+        let response: BlobGetResponse = serde_json::from_str(
+            r#"{"accountId":"a1","list":[{"id":"b1","size":5,"isTruncated":false,
+                "data:asText":"hello","digest:sha-256":"deadbeef"}],"notFound":["b2"]}"#,
+        )
+        .expect("blob get decodes");
+
+        let entry = &response.list()[0];
+        assert_eq!(entry.size, Some(5));
+        assert_eq!(entry.is_truncated, Some(false));
+        assert_eq!(entry.data_as_text(), Some("hello"));
+        assert_eq!(entry.digest("sha-256"), Some("deadbeef"));
+        // The named fields must not be duplicated into the flatten map.
+        assert!(!entry.properties.contains_key("size"));
+        assert!(!entry.properties.contains_key("id"));
+        assert_eq!(
+            response.not_found().map(<[crate::core::id::BlobId]>::len),
+            Some(1),
+            "notFound is optional but present here"
+        );
+    }
+
+    #[test]
+    fn lookup_round_trip() {
+        let request = BlobLookupRequest::new()
+            .type_names(["Email", "CalendarEvent"])
+            .ids(["b1"]);
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value.get("typeNames"),
+            Some(&json!(["Email", "CalendarEvent"]))
+        );
+        assert_eq!(value.get("ids"), Some(&json!(["b1"])));
+
+        let response: BlobLookupResponse = serde_json::from_str(
+            r#"{"accountId":"a1","list":[{"id":"b1","matchedIds":{"Email":["e1","e2"]}}]}"#,
+        )
+        .expect("lookup decodes");
+        assert_eq!(
+            response.list()[0].matched_ids.get("Email"),
+            Some(&vec!["e1".to_string(), "e2".to_string()])
+        );
+        assert!(response.not_found().is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Three-state `Field<T>` on the typed-struct objects
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "quota")]
+mod quota_field_three_state {
+    use crate::core::field::Field;
+    use crate::quota::Quota;
+
+    #[test]
+    fn omitted_null_and_present_are_distinguishable() {
+        let omitted: Quota = serde_json::from_str(r#"{"id":"q1"}"#).unwrap();
+        assert!(omitted.warn_limit_field().is_omitted());
+
+        let null: Quota = serde_json::from_str(r#"{"id":"q1","warnLimit":null}"#).unwrap();
+        assert!(null.warn_limit_field().is_null());
+
+        let present: Quota = serde_json::from_str(r#"{"id":"q1","warnLimit":42}"#).unwrap();
+        assert_eq!(present.warn_limit_field(), &Field::Value(42));
+        assert_eq!(present.warn_limit(), Some(42));
+    }
+
+    #[test]
+    fn a_null_field_reads_the_same_as_an_omitted_one_through_the_option_getter() {
+        // The ergonomic getter collapses the two; the `_field()` sibling
+        // is the only way to tell them apart when generating a patch.
+        let null: Quota = serde_json::from_str(r#"{"id":"q1","description":null}"#).unwrap();
+        let omitted: Quota = serde_json::from_str(r#"{"id":"q1"}"#).unwrap();
+        assert_eq!(null.description(), omitted.description());
+        assert_ne!(
+            null.description_field().is_null(),
+            omitted.description_field().is_null()
+        );
+    }
+
+    #[test]
+    fn quota_decodes_the_rfc_9425_shape() {
+        let quota: Quota = serde_json::from_str(
+            r#"{"id":"q1","resourceType":"octets","used":100,"hardLimit":1000,
+                "scope":"account","name":"Storage","types":["Mail"],"softLimit":900}"#,
+        )
+        .expect("quota decodes");
+        assert_eq!(quota.resource_type(), Some("octets"));
+        assert_eq!(quota.used(), Some(100));
+        assert_eq!(quota.hard_limit(), Some(1000));
+        assert_eq!(quota.scope(), Some("account"));
+        assert_eq!(quota.soft_limit(), Some(900));
+    }
+}
+
+#[cfg(feature = "contacts")]
+mod address_book_wire {
+    use super::*;
+    use crate::address_book::{AddressBook, AddressBookPatch};
+
+    #[test]
+    fn patching_a_nullable_field_to_null_reaches_the_wire() {
+        // Contrast with `MailboxPatch::parent_id` / the
+        // `VacationResponsePatch` setters: `Field<T>` gets this right.
+        let mut patch = AddressBookPatch::default();
+        patch.name("Work");
+        patch.description(None::<String>);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(value.get("name"), Some(&json!("Work")));
+        assert_eq!(value.get("description"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn an_untouched_field_is_omitted_from_the_patch() {
+        let mut patch = AddressBookPatch::default();
+        patch.name("Work");
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"name": "Work"})
+        );
+    }
+
+    #[test]
+    fn address_book_decodes_rights() {
+        let book: AddressBook = serde_json::from_str(
+            r#"{"id":"ab1","name":"Personal","description":null,"sortOrder":0,
+                "isDefault":true,"isSubscribed":true,
+                "myRights":{"mayRead":true,"mayWrite":false}}"#,
+        )
+        .expect("address book decodes");
+        assert_eq!(book.name(), Some("Personal"));
+        assert!(book.description_field().is_null());
+        assert_eq!(book.is_default(), Some(true));
+        let rights = book.my_rights().expect("rights");
+        assert_eq!(rights.may_read, Some(true));
+        assert_eq!(rights.may_write, Some(false));
+        assert_eq!(rights.may_share, None, "omitted rights stay unknown");
+    }
+}
+
+#[cfg(feature = "calendars")]
+mod calendar_wire {
+    use super::*;
+    use crate::calendar::{Calendar, CalendarPatch, IncludeInAvailability};
+
+    #[test]
+    fn calendar_decodes_the_full_draft_shape() {
+        let calendar: Calendar = serde_json::from_str(
+            r##"{"id":"cal1","name":"Work","description":null,"color":"#112233",
+                "sortOrder":1,"isSubscribed":true,"isVisible":true,"isDefault":false,
+                "includeInAvailability":"attending","timeZone":"Europe/Oslo",
+                "myRights":{"mayReadItems":true,"mayWriteAll":false,"mayRSVP":true}}"##,
+        )
+        .expect("calendar decodes");
+
+        assert_eq!(calendar.name(), Some("Work"));
+        assert!(calendar.description_field().is_null());
+        assert_eq!(calendar.color(), Some("#112233"));
+        assert_eq!(calendar.time_zone(), Some("Europe/Oslo"));
+        assert_eq!(
+            calendar.include_in_availability(),
+            Some(&IncludeInAvailability::Attending)
+        );
+        let rights = calendar.my_rights().expect("rights");
+        assert_eq!(
+            rights.may_rsvp,
+            Some(true),
+            "`mayRSVP` keeps the RFC casing"
+        );
+        assert_eq!(rights.may_read_items, Some(true));
+    }
+
+    #[test]
+    fn calendar_patch_clears_and_sets_alerts() {
+        let mut patch = CalendarPatch::default();
+        patch.default_alerts_with_time(None);
+        patch.is_visible(false);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            value.get("defaultAlertsWithTime"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(value.get("isVisible"), Some(&json!(false)));
+        assert!(value.get("defaultAlertsWithoutTime").is_none());
+    }
+
+    #[test]
+    fn calendar_set_arguments_flatten() {
+        let set = crate::calendar::CalendarSet::new()
+            .destroy([crate::calendar::CalendarId::new("cal1")])
+            .on_destroy_remove_events(true)
+            .on_success_set_is_default("cal2");
+        let value = serde_json::to_value(&set).unwrap();
+        assert_eq!(value.get("onDestroyRemoveEvents"), Some(&json!(true)));
+        assert_eq!(value.get("onSuccessSetIsDefault"), Some(&json!("cal2")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CalendarEvent / ContactCard patch-vs-create nesting
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "calendars")]
+mod calendar_event_patch_nesting {
+    use super::*;
+    use crate::calendar_event::{CalendarEventPatch, CalendarEventSet};
+
+    // Documented, not endorsed. `calendar_id(id, false)` writes a NESTED
+    // object (`{"calendarIds": {"cal-1": null}}`). On a create that is
+    // fine-ish; inside a `/set update` it is a wholesale REPLACEMENT of
+    // `calendarIds` with a map containing a null value, not the
+    // `"calendarIds/cal-1": null` dotted path RFC 8620 s5.3 calls for.
+    // `EmailPatch::mailbox_id` gets this right; the JSON-map objects do
+    // not have the same distinction between their Create and Patch
+    // setters (`ce_setters!` is applied to both types verbatim).
+    #[test]
+    fn patch_calendar_id_nests_instead_of_using_a_dotted_path() {
+        let mut patch = CalendarEventPatch::default();
+        patch.calendar_id("cal-1", false);
+        patch.calendar_id("cal-2", true);
+        let value = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            value,
+            json!({"calendarIds": {"cal-1": null, "cal-2": true}})
+        );
+        assert!(value.get("calendarIds/cal-1").is_none());
+    }
+
+    #[test]
+    fn dotted_paths_are_available_through_set_property() {
+        let mut patch = CalendarEventPatch::default();
+        patch.set_property("participants/p1/participationStatus", json!("accepted"));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!({"participants/p1/participationStatus": "accepted"})
+        );
+    }
+
+    #[test]
+    fn set_arguments_flatten_into_the_request() {
+        let set = CalendarEventSet::new().send_scheduling_messages(false);
+        assert_eq!(
+            serde_json::to_value(&set)
+                .unwrap()
+                .get("sendSchedulingMessages"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn get_arguments_flatten_into_the_request() {
+        let get = crate::calendar_event::CalendarEventGet::new()
+            .ids(["ev1"])
+            .recurrence_overrides_after("2026-01-01T00:00:00")
+            .reduce_participants(true)
+            .time_zone("Europe/Oslo");
+        let value = serde_json::to_value(&get).unwrap();
+        assert_eq!(
+            value.get("recurrenceOverridesAfter"),
+            Some(&json!("2026-01-01T00:00:00"))
+        );
+        assert_eq!(value.get("reduceParticipants"), Some(&json!(true)));
+        assert_eq!(value.get("timeZone"), Some(&json!("Europe/Oslo")));
+        assert!(value.get("recurrenceOverridesBefore").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thread / SearchSnippet / PushSubscription decode
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "mail")]
+mod misc_mail_object_decode {
+    use super::*;
+
+    #[test]
+    fn thread_requires_both_properties() {
+        let thread: crate::thread::Thread =
+            serde_json::from_str(r#"{"id":"t1","emailIds":["e1","e2"]}"#).expect("thread decodes");
+        assert_eq!(thread.email_ids().len(), 2);
+
+        // Neither field is optional, so a partial `Thread/get`
+        // projection fails the decode outright.
+        assert!(serde_json::from_str::<crate::thread::Thread>(r#"{"emailIds":["e1"]}"#).is_err());
+    }
+
+    #[test]
+    fn search_snippet_request_shape() {
+        let request = crate::email::search_snippet::SearchSnippetGetRequest::new()
+            .filter(crate::email::query::Filter::text("needle"))
+            .email_ids(["e1", "e2"]);
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value.get("filter"), Some(&json!({"text": "needle"})));
+        assert_eq!(value.get("emailIds"), Some(&json!(["e1", "e2"])));
+        assert!(value.get("#emailIds").is_none());
+    }
+
+    #[test]
+    fn email_import_entries_are_keyed_i0_i1() {
+        let mut request = crate::email::import::EmailImportRequest::new().if_in_state("s1");
+        {
+            let entry = request.email("blob-1");
+            entry.mailbox_ids([crate::mailbox::MailboxId::new("mb1")]);
+            entry.keywords(["$seen"]);
+            assert_eq!(entry.create_id(), "i0");
+        }
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value.get("ifInState"), Some(&json!("s1")));
+        assert_eq!(
+            value.get("emails").and_then(|e| e.get("i0")),
+            Some(&json!({
+                "blobId": "blob-1",
+                "mailboxIds": {"mb1": true},
+                "keywords": {"$seen": true}
+            }))
+        );
+    }
+}
+
+mod push_subscription_wire {
+    use super::*;
+    use crate::core::SetCreate;
+    use crate::push_subscription::{PushSubscriptionCreate, PushSubscriptionGet};
+
+    #[test]
+    fn push_subscription_get_has_no_account_id() {
+        // RFC 8620 s7.2: PushSubscription is not account-scoped, so the
+        // request must not carry an `accountId` even though
+        // `Request::call` injects one into every other method.
+        use crate::core::method::JmapMethod;
+        let mut request = PushSubscriptionGet::new();
+        request.set_account_id(&crate::core::id::AccountId::new("a1"));
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(
+            value.get("accountId").is_none(),
+            "accountId must stay absent for a non-account-scoped type"
+        );
+    }
+
+    #[test]
+    fn a_fresh_create_omits_the_empty_types_list() {
+        let create = PushSubscriptionCreate::new(Some(0));
+        assert_eq!(serde_json::to_value(&create).unwrap(), json!({}));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Principal ACL vocabulary (RFC 8621 s2 shareWith)
+// ---------------------------------------------------------------------------
+
+mod principal_acl_vocabulary {
+    use super::*;
+    use crate::principal::ACL;
+
+    #[test]
+    fn acl_serialises_with_the_share_with_property_names() {
+        for (acl, wire) in [
+            (ACL::Rename, "mayRename"),
+            (ACL::Delete, "mayDelete"),
+            (ACL::ReadItems, "mayReadItems"),
+            (ACL::AddItems, "mayAddItems"),
+            (ACL::SetKeywords, "maySetKeywords"),
+            (ACL::RemoveItems, "mayRemoveItems"),
+            (ACL::CreateChild, "mayCreateChild"),
+            (ACL::Administer, "mayShare"),
+            (ACL::Submit, "maySubmit"),
+            (ACL::SetSeen, "maySetSeen"),
+        ] {
+            assert_eq!(serde_json::to_value(acl).unwrap(), json!(wire));
+            assert_eq!(serde_json::from_value::<ACL>(json!(wire)).unwrap(), acl);
+        }
+    }
+
+    // Documented, not endorsed: see
+    // `mailbox_wire::acl_set_builds_a_patch_path_the_server_will_not_recognise`.
+    // `Display` renders a second, incompatible vocabulary.
+    #[test]
+    fn acl_display_does_not_match_the_wire_names() {
+        assert_eq!(ACL::ReadItems.to_string(), "readItems");
+        assert_eq!(ACL::Administer.to_string(), "administer");
+        for acl in [
+            ACL::Rename,
+            ACL::Delete,
+            ACL::ReadItems,
+            ACL::AddItems,
+            ACL::SetKeywords,
+            ACL::RemoveItems,
+            ACL::CreateChild,
+            ACL::Administer,
+            ACL::Submit,
+            ACL::SetSeen,
+        ] {
+            let wire = serde_json::to_value(acl).unwrap();
+            assert_ne!(
+                json!(acl.to_string()),
+                wire,
+                "Display and Serialize disagree for every ACL variant; \
+                 anything that builds a wire key from Display is wrong"
+            );
+        }
+    }
+}

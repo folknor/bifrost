@@ -649,6 +649,37 @@ END:VCARD</C:address-data>
         assert!(cards.is_empty());
     }
 
+    #[test]
+    fn multiget_complete_failure_is_indistinguishable_from_empty() {
+        // GAP (documented, not endorsed): unlike CalDAV's multiget parser,
+        // which returns per-resource failures and classifies an all-failed
+        // 207 as a CompleteFailure (RFC 4918 s13), the CardDAV multiget
+        // returns only the successes. An all-401 body parses to an empty
+        // Vec that the caller cannot tell apart from a legitimately empty
+        // result, so it surfaces as an empty page a consumer records as a
+        // completed walk. Pinned so a future fix flips this loudly.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>/contacts/one.vcf</D:href>
+    <D:propstat>
+      <D:prop><C:address-data/></D:prop>
+      <D:status>HTTP/1.1 401 Unauthorized</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/contacts/two.vcf</D:href>
+    <D:propstat>
+      <D:prop><C:address-data/></D:prop>
+      <D:status>HTTP/1.1 401 Unauthorized</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let cards = parse_multiget_report(xml).expect("valid 207");
+        assert!(cards.is_empty());
+    }
+
     // The depth-0 getctag PROPFIND backing the brick-8 ctag
     // short-circuit. The short-circuit decision (current == previous)
     // is exercised end-to-end downstream against a real server, per the

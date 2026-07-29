@@ -349,6 +349,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scram_sha256_client_final_matches_rfc_7677_vector() {
+        use base64::Engine;
+
+        // RFC 7677 Section 3: the published SCRAM-SHA-256 exchange for
+        // user "user", password "pencil".
+        let client_nonce = "rOprNGfwEbeRWgbNEkqO";
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let (client_final, server_signature) = scram_client_final(
+            ScramHash::Sha256,
+            "pencil",
+            client_nonce,
+            client_first_bare,
+            server_first,
+            &ScramChannelBinding::None,
+        )
+        .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(client_final.as_str())
+            .unwrap();
+        let decoded = String::from_utf8(decoded).unwrap();
+        assert_eq!(
+            decoded,
+            "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+        );
+        // The RFC's server-final message verifies against the signature we
+        // computed, closing the loop on both directions of the exchange.
+        verify_server_final(
+            "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=",
+            &server_signature,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn escape_username_escapes_equals_before_comma() {
+        assert_eq!(escape_username("a,b=c"), "a=2Cb=3Dc");
+        // Order matters: '=' must be escaped before ','. The reverse order
+        // would rewrite the '=' introduced by the ',' escape into '=3D',
+        // yielding '=3D2C' for a lone comma.
+        assert_eq!(escape_username("=,"), "=3D=2C");
+        assert_eq!(escape_username("plain"), "plain");
+    }
+
+    #[test]
+    fn scram_rejects_malformed_server_first_messages() {
+        let nonce = "abc";
+        let bare = "n=user,r=abc";
+        for server_first in [
+            // missing salt
+            "r=abcdef,i=4096",
+            // missing iteration count
+            "r=abcdef,s=QSXCR+Q6sek8bf92",
+            // missing server nonce
+            "s=QSXCR+Q6sek8bf92,i=4096",
+            // RFC 5802 mandatory extension is unsupported
+            "m=ext,r=abcdef,s=QSXCR+Q6sek8bf92,i=4096",
+            // zero iterations
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=0",
+            // salt is not base64
+            "r=abcdef,s=!!!,i=4096",
+            // iteration count is not numeric
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=nope",
+            // negative iteration count does not parse as u32
+            "r=abcdef,s=QSXCR+Q6sek8bf92,i=-1",
+        ] {
+            let err = scram_client_final(
+                ScramHash::Sha256,
+                "pencil",
+                nonce,
+                bare,
+                server_first,
+                &ScramChannelBinding::None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SaslError::Protocol(_)),
+                "{server_first}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scram_rejects_server_nonce_with_different_prefix() {
+        // A server nonce that does not extend the client nonce is a
+        // reflection/tamper signal, not merely short entropy.
+        let err = scram_client_final(
+            ScramHash::Sha256,
+            "pencil",
+            "abc",
+            "n=user,r=abc",
+            "r=xyzdef,s=QSXCR+Q6sek8bf92,i=4096",
+            &ScramChannelBinding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_continuation_decodes_text_and_rejects_garbage() {
+        assert_eq!(decode_continuation("aGVsbG8=").unwrap(), "hello");
+        // Surrounding whitespace (trailing CRLF from the wire) is tolerated.
+        assert_eq!(decode_continuation(" aGVsbG8=\r\n").unwrap(), "hello");
+        let err = decode_continuation("!!!").unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+        // Valid base64 of invalid UTF-8 (a lone 0xFF byte).
+        let err = decode_continuation("/w==").unwrap_err();
+        assert!(matches!(err, SaslError::Protocol(_)), "got {err:?}");
+    }
+
     /// Decode the base64 client-final and return its `c=` field.
     fn client_final_c_field(client_final: &Secret) -> String {
         use base64::Engine;

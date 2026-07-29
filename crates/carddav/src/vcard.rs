@@ -1121,6 +1121,71 @@ mod tests {
     }
 
     #[test]
+    fn bare_params_collect_multiple_types() {
+        // vCard 3.0 shorthand allows several bare TYPE tokens on one line;
+        // each becomes a TYPE value and all of them survive.
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            None,
+            None,
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ada\r\nEMAIL;INTERNET;HOME:ada@example.test\r\nEND:VCARD\r\n",
+        );
+
+        assert_eq!(contact.emails[0].kind.as_deref(), Some("internet,home"));
+        assert!(!contact.emails[0].is_primary);
+    }
+
+    #[test]
+    fn detect_version_reads_version_line_and_defaults_to_v4() {
+        assert_eq!(
+            detect_version("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:A\r\nEND:VCARD\r\n"),
+            VCardVersion::V3
+        );
+        assert_eq!(
+            detect_version("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:A\r\nEND:VCARD\r\n"),
+            VCardVersion::V4
+        );
+        // No VERSION line: default to 4.0, matching the create path.
+        assert_eq!(
+            detect_version("BEGIN:VCARD\r\nFN:A\r\nEND:VCARD\r\n"),
+            VCardVersion::V4
+        );
+    }
+
+    #[test]
+    fn photo_value_uri_accepts_non_http_uri() {
+        // A VALUE=URI PHOTO with a non-http scheme is still a URL
+        // reference, not inline data.
+        let contact = parse_contact(
+            "/ab/1.vcf".to_string(),
+            None,
+            None,
+            "BEGIN:VCARD\r\nFN:Ada\r\nPHOTO;VALUE=URI:content://photos/1\r\nEND:VCARD\r\n",
+        );
+
+        assert_eq!(contact.photo_url.as_deref(), Some("content://photos/1"));
+        assert!(contact.photo.is_none());
+    }
+
+    #[test]
+    fn unescape_text_handles_adjacent_backslashes_in_a_single_pass() {
+        // Raw `\\n` is an escaped backslash followed by a literal n, not a
+        // newline; an ordering-dependent replace-chain corrupts it.
+        assert_eq!(unescape_text("a\\\\nb"), "a\\nb");
+        assert_eq!(unescape_text("line\\nbreak"), "line\nbreak");
+        assert_eq!(unescape_text("semi\\;comma\\,"), "semi;comma,");
+        // Unknown escapes and a trailing backslash pass through verbatim.
+        assert_eq!(unescape_text("odd\\x"), "odd\\x");
+        assert_eq!(unescape_text("tail\\"), "tail\\");
+    }
+
+    #[test]
+    fn escape_then_unescape_round_trips_text() {
+        let original = "a,b;c\\d\nnewline";
+        assert_eq!(unescape_text(&escape_text(original)), original);
+    }
+
+    #[test]
     fn adr_po_box_and_extended_round_trip() {
         // A real PO-box / extended-address must not be dropped on parse; the
         // model carries them as leading street entries.

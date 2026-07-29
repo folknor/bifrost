@@ -155,3 +155,7 @@ impl ImapConnection {
         Ok(conn)
     }
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

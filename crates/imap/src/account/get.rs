@@ -321,4 +321,177 @@ mod tests {
                 .all(|attr| !matches!(attr, FetchAttr::ModSeq))
         );
     }
+
+    fn folder() -> MailboxName {
+        MailboxName::new("INBOX").expect("valid mailbox")
+    }
+
+    // Every projection must ask for UID: without it `fetch_to_hydrated`
+    // cannot mint an ObjectId and silently drops the item.
+    #[test]
+    fn every_projection_requests_the_uid() {
+        for projection in [
+            Projection::FlagsOnly,
+            Projection::Metadata,
+            Projection::Headers,
+            Projection::Preview(512),
+            Projection::TextOnly,
+            Projection::Full,
+            Projection::FullWithBlobs,
+        ] {
+            let attrs = attrs_for_projection(projection, false);
+            assert!(
+                attrs.iter().any(|attr| matches!(attr, FetchAttr::Uid)),
+                "{projection:?} must request UID",
+            );
+        }
+    }
+
+    #[test]
+    fn body_bearing_projections_peek_rather_than_setting_seen() {
+        // A hydration read must never flip `\Seen` as a side effect, so
+        // every BODY section the read paths request is a PEEK.
+        for projection in [
+            Projection::Preview(64),
+            Projection::TextOnly,
+            Projection::Full,
+            Projection::FullWithBlobs,
+        ] {
+            let attrs = attrs_for_projection(projection, false);
+            let peeks: Vec<bool> = attrs
+                .iter()
+                .filter_map(|attr| match attr {
+                    FetchAttr::BodySection { peek, .. } => Some(*peek),
+                    _ => None,
+                })
+                .collect();
+            assert!(!peeks.is_empty(), "{projection:?} must fetch a body");
+            assert!(peeks.iter().all(|peek| *peek), "{projection:?} must PEEK");
+        }
+    }
+
+    #[test]
+    fn flags_only_and_metadata_never_fetch_a_body_section() {
+        for projection in [Projection::FlagsOnly, Projection::Metadata] {
+            assert!(
+                attrs_for_projection(projection, true)
+                    .iter()
+                    .all(|attr| !matches!(attr, FetchAttr::BodySection { .. })),
+                "{projection:?} must stay a metadata-only fetch",
+            );
+        }
+    }
+
+    #[test]
+    fn hydrated_object_requires_a_uid() {
+        let no_uid = FetchResponse {
+            flags: Some(vec![crate::types::Flag::Seen]),
+            ..Default::default()
+        };
+        assert!(
+            fetch_to_hydrated(&folder(), 9, no_uid, Projection::FlagsOnly, None).is_none(),
+            "a FETCH without UID cannot be addressed and must be dropped",
+        );
+    }
+
+    #[test]
+    fn flags_only_hydration_lowercases_the_flag_set() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            flags: Some(vec![
+                crate::types::Flag::Seen,
+                crate::types::Flag::Custom("$Important".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::FlagsOnly, None)
+            .expect("uid present");
+        assert_eq!(object.id, super::super::encode_object_id(&folder(), 9, 3));
+        assert!(object.blobs.is_empty());
+        match object.kind {
+            HydratedObjectKind::FlagsOnly(flags) => {
+                assert!(flags.contains("\\seen"));
+                assert!(flags.contains("$important"));
+            }
+            other => panic!("expected FlagsOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_hydration_reuses_the_inventory_projection_and_owner_tag() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            rfc822_size: Some(77),
+            ..Default::default()
+        };
+        let owner = bifrost_types::MailboxId("alice".to_owned());
+        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Metadata, Some(&owner))
+            .expect("uid present");
+        match object.kind {
+            HydratedObjectKind::Metadata(entry) => {
+                assert_eq!(entry.size, Some(77));
+                assert!(
+                    entry
+                        .memberships
+                        .contains(&bifrost_types::MembershipScope::Mailbox(owner)),
+                    "the shared-mailbox membership must survive hydration",
+                );
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    // A raw-MIME projection with no returned section yields empty bytes
+    // rather than dropping the item: the id still reaches the consumer.
+    #[test]
+    fn raw_mime_hydration_tolerates_a_missing_section() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            ..Default::default()
+        };
+        let object =
+            fetch_to_hydrated(&folder(), 9, fetch, Projection::Full, None).expect("uid present");
+        match object.kind {
+            HydratedObjectKind::RawMime(bytes) => assert!(bytes.is_empty()),
+            other => panic!("expected RawMime, got {other:?}"),
+        }
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG. A
+    // `Preview` fetch asks for both RFC822.HEADER and a partial
+    // BODY.PEEK[TEXT], but `fetch_to_hydrated` keeps only the FIRST
+    // section that carried data, so the preview text is discarded and the
+    // consumer receives headers labelled as raw MIME. See
+    //
+    #[test]
+    fn preview_hydration_keeps_only_the_first_returned_section() {
+        let fetch = FetchResponse {
+            uid: Some(3),
+            body_sections: vec![
+                crate::types::fetch::BodySection {
+                    section: "HEADER".to_owned(),
+                    origin: None,
+                    data: Some(b"Subject: hi\r\n\r\n".to_vec()),
+                },
+                crate::types::fetch::BodySection {
+                    section: "TEXT".to_owned(),
+                    origin: Some(0),
+                    data: Some(b"preview body".to_vec()),
+                },
+            ],
+            ..Default::default()
+        };
+        let object = fetch_to_hydrated(&folder(), 9, fetch, Projection::Preview(16), None)
+            .expect("uid present");
+        match object.kind {
+            HydratedObjectKind::RawMime(bytes) => {
+                assert_eq!(bytes.as_ref(), &b"Subject: hi\r\n\r\n"[..]);
+                assert!(
+                    !bytes.as_ref().ends_with(&b"preview body"[..]),
+                    "documents the dropped preview text; not an endorsement",
+                );
+            }
+            other => panic!("expected RawMime, got {other:?}"),
+        }
+    }
 }

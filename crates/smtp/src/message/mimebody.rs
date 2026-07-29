@@ -931,6 +931,52 @@ mod test {
     }
 
     #[test]
+    #[should_panic]
+    fn multipart_with_a_boundary_less_content_type_panics_when_formatted() {
+        // DOCUMENTS A BUG: `MultiPartBuilder::build`
+        // only injects a default Content-Type - and therefore a boundary -
+        // when none is set. Setting a multipart Content-Type by hand that
+        // carries no `boundary` parameter leaves `MultiPart::boundary()`
+        // unwrapping `None`, so formatting the message panics instead of
+        // returning an error or generating a boundary.
+        let part = MultiPart::builder()
+            .header(ContentType::parse("multipart/mixed").unwrap())
+            .singlepart(SinglePart::plain("hello".to_owned()));
+
+        let _ = part.formatted();
+    }
+
+    #[test]
+    fn a_body_containing_the_boundary_forges_a_part_delimiter() {
+        // The boundary is chosen without ever looking at the part bodies.
+        // `make_boundary` picks 40 random alphanumerics, which makes an
+        // accidental collision negligible, but `MultiPartBuilder::boundary`
+        // lets a caller pin a short, guessable one and performs no check that
+        // it is absent from the content. The delimiter then appears twice.
+        let part = MultiPart::mixed()
+            .boundary("BOUNDARY")
+            .singlepart(SinglePart::plain(
+                "before\r\n--BOUNDARY\r\nafter".to_owned(),
+            ));
+
+        let formatted = String::from_utf8(part.formatted()).unwrap();
+
+        assert_eq!(formatted.matches("\r\n--BOUNDARY\r\n").count(), 2);
+    }
+
+    #[test]
+    fn report_type_token_validation_is_shared_by_both_constructors() {
+        // `MultiPart::report` panics where `try_report` returns an error; both
+        // go through `is_mime_token`.
+        assert!(is_mime_token("delivery-status"));
+        assert!(!is_mime_token(""));
+        assert!(!is_mime_token("delivery status"));
+        assert!(!is_mime_token("delivery\r\nstatus"));
+        assert!(!is_mime_token("delivery/status"));
+        assert!(!is_mime_token("delivery\u{80}status"));
+    }
+
+    #[test]
     fn test_make_boundary() {
         let mut boundaries = std::collections::HashSet::with_capacity(10);
         for _ in 0..1000 {

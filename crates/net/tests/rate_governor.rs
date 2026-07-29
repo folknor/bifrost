@@ -97,3 +97,170 @@ async fn cost_default_for_returns_registered_default() {
     assert_eq!(governor.cost_default_for("default.test"), Some(7));
     assert_eq!(governor.cost_default_for("unknown.test"), None);
 }
+
+fn limit(host: &str, quota_per_second: f64, burst: u32) -> RateLimit {
+    RateLimit {
+        host: host.to_owned(),
+        quota_per_second,
+        cost_default: 1,
+        burst,
+    }
+}
+
+/// A host nobody registered is unmetered: `acquire` returns
+/// immediately whatever the cost, and `refund` is a no-op rather than a
+/// panic. JMAP relies on this - it registers no rate limits at all.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unregistered_hosts_are_unmetered() {
+    let governor = RateLimitGovernor::new();
+    governor
+        .acquire("nobody.test", 10_000)
+        .await
+        .expect("an unregistered host never blocks");
+    governor.refund("nobody.test", 5);
+    assert_eq!(governor.cost_default_for("nobody.test"), None);
+}
+
+/// `cost > burst` errors, but `cost == burst` is legal - a request that
+/// exactly drains a full bucket must not be misread as a configuration
+/// bug.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cost_exactly_equal_to_burst_is_admitted() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("edge.test", 10.0, 4));
+    governor
+        .acquire("edge.test", 4)
+        .await
+        .expect("draining the whole bucket in one debit is legal");
+    let err = governor
+        .acquire("edge.test", 5)
+        .await
+        .expect_err("one unit past burst is a configuration bug");
+    assert!(matches!(err, Error::CostExceedsBurst { cost: 5, burst: 4 }));
+}
+
+/// A zero-cost request bypasses the bucket entirely: `tokens >= 0.0`
+/// holds even on a drained bucket. Callers that want a request metered
+/// must not pass `.cost(0)`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn zero_cost_requests_bypass_the_bucket() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("zero.test", 1.0, 1));
+    governor.acquire("zero.test", 1).await.expect("drain");
+    tokio::time::timeout(Duration::from_millis(50), governor.acquire("zero.test", 0))
+        .await
+        .expect("a zero-cost acquire must not park on an empty bucket")
+        .expect("zero cost is never over burst");
+}
+
+/// `refund` clamps at `burst`, so an over-refund (or a refund racing a
+/// natural refill) cannot inflate the bucket beyond its configured
+/// ceiling.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn refund_clamps_at_burst() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("clamp.test", 1.0, 1));
+    governor.acquire("clamp.test", 1).await.expect("drain");
+
+    governor.refund("clamp.test", 1_000);
+    governor
+        .acquire("clamp.test", 1)
+        .await
+        .expect("the refund restored the single token");
+
+    let blocked =
+        tokio::time::timeout(Duration::from_millis(50), governor.acquire("clamp.test", 1)).await;
+    assert!(
+        blocked.is_err(),
+        "a 1000-unit refund into a burst-1 bucket must leave exactly one token",
+    );
+}
+
+/// Per-host attach counts are what let five Gmail accounts share one
+/// host bucket. The bucket survives every `unregister` but the last.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn attach_counts_keep_a_shared_bucket_alive() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("shared.test", 5.0, 5));
+    governor.register(limit("shared.test", 5.0, 5));
+    governor.register(limit("shared.test", 5.0, 5));
+
+    governor.unregister("shared.test");
+    governor.unregister("shared.test");
+    assert_eq!(
+        governor.cost_default_for("shared.test"),
+        Some(1),
+        "two of three accounts detached; the bucket must survive"
+    );
+
+    governor.unregister("shared.test");
+    assert_eq!(
+        governor.cost_default_for("shared.test"),
+        None,
+        "the last detach reclaims the bucket"
+    );
+
+    // Over-unregistering an already-dropped host is a no-op, not a
+    // panic or an underflow.
+    governor.unregister("shared.test");
+    assert_eq!(governor.cost_default_for("shared.test"), None);
+}
+
+/// First registration wins. A second registration disagreeing on quota
+/// warns and is ignored, so one misconfigured consumer cannot poison a
+/// host bucket other accounts share.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn duplicate_registration_keeps_the_first_configuration() {
+    let governor = RateLimitGovernor::new();
+    governor.register(RateLimit {
+        host: "dup.test".to_owned(),
+        quota_per_second: 250.0,
+        cost_default: 5,
+        burst: 250,
+    });
+    governor.register(RateLimit {
+        host: "dup.test".to_owned(),
+        quota_per_second: 1.0,
+        cost_default: 99,
+        burst: 1,
+    });
+
+    assert_eq!(governor.cost_default_for("dup.test"), Some(5));
+    governor
+        .acquire("dup.test", 250)
+        .await
+        .expect("the first registration's burst of 250 is still in force");
+}
+
+/// DOCUMENTS A HAZARD, NOT AN ENDORSEMENT. `quota_per_second: 0.0` is
+/// accepted at registration, and the bucket then never refills: once
+/// the initial burst is spent every further `acquire` parks forever
+/// (polling every 250 ms) with no error and no deadline. Only an
+/// explicit `refund` can ever release it. `cost > burst` is caught as a
+/// configuration bug; a zero refill rate is not.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn zero_quota_never_refills_and_parks_forever() {
+    let governor = RateLimitGovernor::new();
+    governor.register(limit("stalled.test", 0.0, 1));
+    governor
+        .acquire("stalled.test", 1)
+        .await
+        .expect("the initial burst is spendable");
+
+    let blocked =
+        tokio::time::timeout(Duration::from_secs(60), governor.acquire("stalled.test", 1)).await;
+    assert!(
+        blocked.is_err(),
+        "a zero refill rate parks the caller indefinitely instead of erroring",
+    );
+}
+
+// There is deliberately no test here for a negative or NaN
+// `quota_per_second`. `RateLimit` validates neither, and a governor
+// registered with one wedges on the very first `acquire`: the wait
+// computation clamps to a zero-length sleep, so under a paused runtime
+// the executor never goes idle, virtual time never advances, and even a
+// `tokio::time::timeout` around the call cannot fire. Any test that
+// exercises it hangs the suite instead of failing it. Validating the
+// rate at registration is the fix; until then this stays untested on
+// purpose.

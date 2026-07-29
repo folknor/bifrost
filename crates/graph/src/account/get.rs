@@ -689,4 +689,160 @@ mod tests {
             hydrated_from_value(ObjectId("missing".to_string()), &no_id, Projection::Headers);
         assert!(matches!(hydrated.kind, HydratedObjectKind::FlagsOnly(_)));
     }
+
+    /// Documents a defect, NOT the intended contract.
+    /// `metadata_or_flags` rebuilds a
+    /// `CursorScope` from the bare `parentFolderId` alone, discarding the
+    /// owning mailbox the caller's `ObjectId` carries. So hydrating a
+    /// shared-mailbox message at a metadata projection produces an OUTER
+    /// id that is foreign-encoded and an INNER `InventoryEntry` whose id is
+    /// bare and whose membership is a primary-looking folder - the exact
+    /// cross-mailbox conflation `inventory.rs` documents as forbidden, and
+    /// a second wire form for one logical message.
+    #[test]
+    fn metadata_projection_strips_the_shared_mailbox_owner_from_the_inner_entry() {
+        let foreign_scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkfolder"),
+            ty: ObjectType::Email,
+        };
+        let outer = super::super::foreign::encode_message_id(&foreign_scope, "AAMkmsg");
+        let value = json!({
+            "id": "AAMkmsg",
+            "parentFolderId": "inbox",
+            "changeKey": "CK1"
+        });
+
+        let hydrated = hydrated_from_value(outer.clone(), &value, Projection::Metadata);
+        assert_eq!(hydrated.id, outer);
+        match hydrated.kind {
+            HydratedObjectKind::Metadata(entry) => {
+                // Correct behavior would be `outer` and the foreign-encoded
+                // folder plus a `Mailbox(shared@contoso.com)` membership.
+                assert_eq!(entry.id.0, "AAMkmsg");
+                assert_eq!(
+                    entry.memberships,
+                    vec![MembershipScope::Folder(FolderId("inbox".to_string()))]
+                );
+                assert_ne!(entry.id, outer);
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flags_only_maps_graph_state_onto_the_canonical_vocabulary() {
+        let value = json!({
+            "isRead": true,
+            "flag": { "flagStatus": "flagged" },
+            "categories": ["Work", "Urgent"]
+        });
+        let flags = flags_from_value(&value);
+        assert!(flags.contains("\\seen"));
+        assert!(flags.contains("\\flagged"));
+        assert!(flags.contains("category:Work"));
+        assert!(flags.contains("category:Urgent"));
+        assert_eq!(flags.len(), 4);
+    }
+
+    #[test]
+    fn only_the_flagged_status_becomes_the_starred_flag() {
+        // Graph's `flagStatus` is a three-value enum; `complete` means the
+        // follow-up was finished, not that the message is starred.
+        for status in ["notFlagged", "complete"] {
+            let value = json!({ "flag": { "flagStatus": status } });
+            assert!(
+                !flags_from_value(&value).contains("\\flagged"),
+                "flagStatus {status} must not map to \\flagged"
+            );
+        }
+        // The read side is case-insensitive on the token.
+        let value = json!({ "flag": { "flagStatus": "Flagged" } });
+        assert!(flags_from_value(&value).contains("\\flagged"));
+    }
+
+    #[test]
+    fn absent_fields_produce_no_flags() {
+        assert!(flags_from_value(&json!({ "id": "m1" })).is_empty());
+        assert!(flags_from_value(&json!({ "isRead": false })).is_empty());
+    }
+
+    #[test]
+    fn every_projection_selects_the_parent_folder() {
+        // `metadata_or_flags` rebuilds the membership scope from
+        // `parentFolderId`; a projection that omitted it would file every
+        // hydrated message under `FolderId("")`.
+        for projection in [
+            Projection::FlagsOnly,
+            Projection::Metadata,
+            Projection::Headers,
+            Projection::Full,
+            Projection::FullWithBlobs,
+            Projection::TextOnly,
+        ] {
+            assert!(
+                select_for_projection(projection).contains("parentFolderId"),
+                "{projection:?} select lacks parentFolderId"
+            );
+        }
+    }
+
+    #[test]
+    fn the_metadata_select_relies_on_the_odata_etag_annotation() {
+        // `MESSAGE_SELECT` does NOT list `changeKey`, unlike the other
+        // projections' selects. That is only safe because `graph_etag`
+        // falls back to the `@odata.etag` annotation Graph returns on
+        // entities regardless of `$select` - the whole `If-Match` chain for
+        // metadata-hydrated messages hangs on that fallback, so pin the
+        // dependency explicitly rather than leaving it implicit.
+        assert!(!MESSAGE_SELECT.contains("changeKey"));
+        assert!(select_for_projection(Projection::FlagsOnly).contains("changeKey"));
+        assert!(select_for_projection(Projection::Full).contains("changeKey"));
+
+        assert_eq!(
+            graph_etag(&json!({ "@odata.etag": "W/\"CK1\"" })).as_deref(),
+            Some("W/\"CK1\"")
+        );
+    }
+
+    #[test]
+    fn folder_destination_accepts_only_folder_memberships() {
+        assert_eq!(
+            folder_destination(MembershipScope::Folder(FolderId("inbox".to_string()))),
+            Some(FolderId("inbox".to_string()))
+        );
+        assert_eq!(
+            folder_destination(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                "shared@contoso.com".to_string()
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn hydration_url_percent_encodes_the_native_id_and_keeps_the_select() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let url = hydrate_url_for_id(&account, &ObjectId("AAMk/GI2=".to_string()), "id,changeKey");
+        assert!(!url.contains("AAMk/GI2="), "unencoded id in {url}");
+        assert!(url.ends_with("?$select=id,changeKey"), "{url}");
+    }
+
+    /// A public-folder id whose folder is NOT in the routing map falls back
+    /// to the REST arm (pinned by `public_folder_ids_partition_onto_the_ews_arm`).
+    /// This pins what that fallback then asks for: `/me/messages/{itemId}`
+    /// with the RS separator percent-encoded, which Graph answers with
+    /// `ErrorItemNotFound`. That is the deliberate "report the real miss"
+    /// behavior, not a silent drop.
+    #[test]
+    fn an_unrouted_public_folder_id_hydrates_through_the_rest_arm_url() {
+        let account =
+            GraphAccount::new_for_tests(GraphClient::new("token"), PushMode::GraphSubscriptions);
+        let id = super::super::foreign::encode_public_item_id(
+            &FolderId("AAMkPF=".to_string()),
+            "AAMkItem=",
+        );
+        let url = hydrate_url_for_id(&account, &id, "id");
+        assert!(url.starts_with("/me/messages/"), "{url}");
+        assert!(!url.contains('\u{1e}'), "{url}");
+    }
 }

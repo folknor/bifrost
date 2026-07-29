@@ -70,11 +70,14 @@ CalDAV composes into IMAP-shaped accounts when configured.
 
 ### Testing rules
 
-- Bifrost tests are small and technical. Parser tests, encoder tests, type-level checks, validation rules, error classification, serde round-trips. That is the entire scope.
-- Do not add end-to-end, integration, or live-server tests in this repo. Do not spawn mock servers from bifrost tests. Do not add Docker-driven, fixed-port, or external-account harnesses.
-- Public APIs are exercised end-to-end downstream, not here. Bifrost does not prove its own protocol round-trips at the integration level.
-- When in doubt, write the smallest deterministic unit test that pins the behavior. If the test needs a real server, the test belongs elsewhere.
-- Do not propose growing the suite to "match coverage of similar crates." The size of the suite is a deliberate choice, not an oversight.
+The line is hermeticity, not size. A test belongs here if it is deterministic and runs entirely in-process.
+
+- In scope: parser and encoder tests, type-level and object-safety checks, validation rules, error classification and recovery mapping, serde round-trips, state-machine sequencing driven through in-crate test doubles, and byte-level protocol transcripts fed through an in-memory duplex.
+- Test doubles are fine and encouraged: `StubAccount`-style fakes implementing the crate's own traits (see `crates/imap/src/account/test_support.rs`), stub transports, canned server transcripts. These are not "integration tests" - no socket, no port, no daemon.
+- Out of scope, still: real sockets or listeners, fixed ports, Docker, live credentials, external accounts, wall-clock sleeps, anything that can fail because a network did.
+- Public APIs are exercised against real servers downstream, not here. Bifrost does not prove its protocol round-trips against live endpoints.
+- Prefer the smallest test that pins the behavior. Breadth is welcome where it is hermetic; ceremony is not.
+- Coverage is not a target in itself. Do not propose growing the suite to "match coverage of similar crates" - but do not treat the current size as a ceiling either.
 
 ## Commands
 

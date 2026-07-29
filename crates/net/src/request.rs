@@ -901,3 +901,292 @@ pub fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
     let now = std::time::SystemTime::now();
     when.duration_since(now).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rate::{RateLimit, RateLimitGovernor};
+
+    fn hv(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).expect("test header value")
+    }
+
+    // ---- backoff_for -------------------------------------------------
+
+    /// The documented shape is `half-of-capped` plus proportional
+    /// jitter in `0..capped`. Pin both ends of the interval across
+    /// enough draws that a broken jitter source shows up.
+    #[test]
+    fn backoff_first_attempt_stays_inside_the_proportional_window() {
+        let policy = RetryPolicy::default();
+        for _ in 0..64 {
+            let wait = backoff_for(&policy, 1);
+            assert!(
+                wait >= Duration::from_millis(500),
+                "backoff must never dip below half the base, got {wait:?}"
+            );
+            assert!(
+                wait < Duration::from_millis(1500),
+                "backoff must stay under half-base plus one full base, got {wait:?}"
+            );
+        }
+    }
+
+    /// The base doubles per attempt until `max_backoff` clamps it.
+    /// Attempt 7 with a 1 s base scales to 64 s, which the default
+    /// 60 s ceiling caps, so the window becomes `[30 s, 60 s]`.
+    #[test]
+    fn backoff_growth_is_clamped_by_max_backoff() {
+        let policy = RetryPolicy::default();
+        for _ in 0..32 {
+            let wait = backoff_for(&policy, 7);
+            assert!(wait >= Duration::from_secs(30), "got {wait:?}");
+            assert!(wait <= policy.max_backoff, "got {wait:?}");
+        }
+    }
+
+    /// `exp` is clamped at 16 and the result is `min`-ed against
+    /// `max_backoff`, so an absurd attempt count cannot produce an
+    /// unbounded (or overflowing) sleep.
+    #[test]
+    fn backoff_saturates_rather_than_overflowing_on_huge_attempt_counts() {
+        let policy = RetryPolicy::default();
+        for attempt in [17u32, 64, 1_000, u32::MAX] {
+            let wait = backoff_for(&policy, attempt);
+            assert!(
+                wait <= policy.max_backoff,
+                "attempt {attempt} produced {wait:?}, above max_backoff"
+            );
+        }
+    }
+
+    /// A degenerate all-zero policy must return `Duration::ZERO`
+    /// rather than panic inside the modulus (the `.max(1)` guard on
+    /// `capped_ns` is what makes this safe).
+    #[test]
+    fn backoff_with_zero_durations_is_zero_and_does_not_panic() {
+        let policy = RetryPolicy {
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(backoff_for(&policy, 1), Duration::ZERO);
+        assert_eq!(backoff_for(&policy, 9), Duration::ZERO);
+    }
+
+    /// `Duration::MAX` inputs exercise the `u64::try_from(as_nanos)`
+    /// fallback and the `saturating_add`. The value is nonsense as a
+    /// policy but must not panic; it saturates at `max_backoff`.
+    #[test]
+    fn backoff_with_saturated_durations_does_not_panic() {
+        let policy = RetryPolicy {
+            initial_backoff: Duration::MAX,
+            max_backoff: Duration::MAX,
+            ..RetryPolicy::default()
+        };
+        let wait = backoff_for(&policy, 3);
+        assert!(
+            wait >= Duration::from_secs(1),
+            "a saturated policy still yields a positive wait, got {wait:?}"
+        );
+    }
+
+    /// A `max_backoff` shorter than `initial_backoff` clamps on the
+    /// very first attempt; the window is then `[max/2, max]`.
+    #[test]
+    fn backoff_honors_a_max_below_the_initial_base() {
+        let policy = RetryPolicy {
+            initial_backoff: Duration::from_secs(30),
+            max_backoff: Duration::from_millis(200),
+            ..RetryPolicy::default()
+        };
+        for _ in 0..32 {
+            let wait = backoff_for(&policy, 1);
+            assert!(wait >= Duration::from_millis(100), "got {wait:?}");
+            assert!(wait <= Duration::from_millis(200), "got {wait:?}");
+        }
+    }
+
+    // ---- parse_retry_after -------------------------------------------
+
+    #[test]
+    fn retry_after_absent_header_is_none() {
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds() {
+        assert_eq!(
+            parse_retry_after(Some(&hv("30"))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&hv("0"))),
+            Some(Duration::ZERO),
+            "a zero hint is a real instruction, not an absent one"
+        );
+    }
+
+    #[test]
+    fn retry_after_trims_surrounding_whitespace() {
+        assert_eq!(
+            parse_retry_after(Some(&hv("  45  "))),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn retry_after_rejects_negative_and_garbage() {
+        assert_eq!(parse_retry_after(Some(&hv("-5"))), None);
+        assert_eq!(parse_retry_after(Some(&hv("soon"))), None);
+        assert_eq!(parse_retry_after(Some(&hv(""))), None);
+        assert_eq!(parse_retry_after(Some(&hv("1.5"))), None);
+    }
+
+    /// An HTTP-date already in the past yields `None` (the header
+    /// carries no useful wait), and a future date yields the remaining
+    /// delta.
+    #[test]
+    fn retry_after_parses_http_dates_relative_to_now() {
+        assert_eq!(
+            parse_retry_after(Some(&hv("Wed, 21 Oct 2015 07:28:00 GMT"))),
+            None,
+            "a date in the past is not a wait"
+        );
+        let future =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3600));
+        let parsed = parse_retry_after(Some(&hv(&future))).expect("future date parses");
+        assert!(parsed <= Duration::from_secs(3600));
+        assert!(parsed > Duration::from_secs(3000));
+    }
+
+    /// The parser deliberately does NOT cap: an absurd server hint is
+    /// returned verbatim and the retry loop applies
+    /// `policy.honor_retry_after_cap` as the single capping site. This
+    /// pins that the cap lives with the caller, not here.
+    #[test]
+    fn retry_after_does_not_cap_absurd_server_hints() {
+        assert_eq!(
+            parse_retry_after(Some(&hv("31536000"))),
+            Some(Duration::from_secs(31_536_000)),
+            "a one-year hint survives the parser; capping is the policy's job"
+        );
+        let capped = parse_retry_after(Some(&hv("31536000")))
+            .map(|d| d.min(RetryPolicy::default().honor_retry_after_cap));
+        assert_eq!(capped, Some(Duration::from_secs(60)));
+    }
+
+    // ---- cost resolution ---------------------------------------------
+
+    #[test]
+    fn cost_precedence_is_override_then_host_default_then_one() {
+        let governor = RateLimitGovernor::new();
+        governor.register(RateLimit {
+            host: "cost.test".to_owned(),
+            quota_per_second: 10.0,
+            cost_default: 5,
+            burst: 50,
+        });
+
+        assert_eq!(
+            recompute_cost_units(&governor, Some("cost.test"), Some(9)),
+            9,
+            "an explicit .cost(n) wins over the host default"
+        );
+        assert_eq!(
+            recompute_cost_units(&governor, Some("cost.test"), None),
+            5,
+            "without an override the host's registered default applies"
+        );
+        assert_eq!(
+            recompute_cost_units(&governor, Some("unknown.test"), None),
+            1,
+            "an unregistered host falls back to one unit"
+        );
+        assert_eq!(
+            recompute_cost_units(&governor, None, None),
+            1,
+            "an unparseable URL has no host bucket and costs one unit"
+        );
+    }
+
+    // ---- URL / header helpers ----------------------------------------
+
+    #[test]
+    fn host_extraction_handles_ports_userinfo_and_junk() {
+        assert_eq!(
+            host_from_url("https://a.example/path?q=1"),
+            Some("a.example".to_owned())
+        );
+        assert_eq!(
+            host_from_url("https://user:pw@b.example:8443/p"),
+            Some("b.example".to_owned()),
+            "the bucket key is the host alone, without userinfo or port"
+        );
+        assert_eq!(host_from_url("not a url"), None);
+        assert_eq!(
+            host_from_url("https://A.EXAMPLE/"),
+            Some("a.example".to_owned()),
+            "reqwest lowercases the host, so bucket keys are case-normalised"
+        );
+    }
+
+    #[test]
+    fn body_headers_are_stripped_but_others_survive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            HeaderValue::from_static("42"),
+        );
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-keep"),
+            HeaderValue::from_static("yes"),
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer t"));
+
+        strip_body_headers(&mut headers);
+
+        assert!(!headers.contains_key(reqwest::header::CONTENT_TYPE));
+        assert!(!headers.contains_key(reqwest::header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(reqwest::header::CONTENT_ENCODING));
+        assert!(
+            headers.contains_key(HeaderName::from_static("x-keep")),
+            "only body-describing headers are dropped on a method rewrite"
+        );
+        assert!(
+            headers.contains_key(AUTHORIZATION),
+            "Authorization is the redirect loop's business, not the body strip's"
+        );
+    }
+
+    // ---- deferred builder errors -------------------------------------
+
+    /// `RequestBuilder::header` defers a rejected header name or value
+    /// to send time rather than returning `Result` from the setter.
+    /// Pin the underlying reqwest rejections the deferred-error arms
+    /// key off, so a future header crate that starts accepting these
+    /// silently does not turn the deferral into dead code.
+    #[test]
+    fn header_rejections_the_deferred_error_arms_rely_on() {
+        assert!(
+            HeaderName::from_bytes(b"bad header").is_err(),
+            "a space in a header name must be rejected"
+        );
+        assert!(
+            HeaderValue::from_str("bad\nvalue").is_err(),
+            "a newline in a header value must be rejected"
+        );
+        assert!(
+            HeaderValue::from_str("fine").is_ok(),
+            "an ordinary value must still be accepted"
+        );
+    }
+}

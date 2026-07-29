@@ -214,3 +214,7 @@ pub(super) fn patch_small_literals_to_plus_with_binary(
     }
     result
 }
+
+#[cfg(test)]
+#[path = "literals_tests.rs"]
+mod tests;

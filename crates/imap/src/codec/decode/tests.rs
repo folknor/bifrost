@@ -13921,3 +13921,182 @@ fn list_with_oldname_for_notify_rename() {
         panic!("expected Untagged, got: {resp:?}");
     }
 }
+
+// ========================================================================
+// Adversarial input: pathological headers, silent degradation, dropped
+// extension data.
+// ========================================================================
+
+/// RFC 2047 Section 2: an encoded word is `=?charset?encoding?text?=`, and
+/// none of `charset`, `encoding`, or `encoded-text` may contain SPACE.
+/// `parse_encoded_word_inner` nevertheless searches for the closing `?=`
+/// across the *entire* remaining header value, so a value built from
+/// repeated `=?` shift prefixes separated by spaces costs a full scan per
+/// candidate.
+///
+/// This pins the output  -  no candidate is a valid encoded word, so the whole
+/// value is passed through verbatim per RFC 2047 Section 6.3  -  and names the
+/// quadratic cost, which is
+/// The repetition count here is deliberately small so the test stays fast;
+/// the defect only bites on attacker-sized Subject headers.
+#[test]
+fn rfc2047_repeated_shift_prefix_is_passed_through_verbatim() {
+    let input = "=? ".repeat(2000);
+    assert_eq!(
+        decode_rfc2047(input.as_bytes()),
+        input,
+        "an unparseable `=?` run must be emitted verbatim (RFC 2047 Section 6.3)"
+    );
+}
+
+/// RFC 2047 Section 6.3: adjacent `=?` prefixes that never close are text.
+/// Companion to the test above with no whitespace separators, which takes a
+/// different branch (`candidate_has_valid_prefix` is false from the second
+/// candidate onward, so `parse_encoded_word` is never re-entered).
+#[test]
+fn rfc2047_adjacent_shift_prefixes_are_passed_through_verbatim() {
+    let input = "=?x".repeat(2000);
+    assert_eq!(decode_rfc2047(input.as_bytes()), input);
+}
+
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
+///
+/// `parse_untagged`'s final alternative is the unconditional
+/// `parse_untagged_unknown` catch-all, so *any* parse failure inside a
+/// recognized response type is laundered into `UntaggedResponse::Unknown`
+/// with no diagnostic at all  -  not even a `tracing` event.
+///
+/// `classify` maps `Unknown` to `OnlyUnsolicited` (`codec/classification.rs`),
+/// so a STATUS response the parser could not handle is routed away from the
+/// STATUS command's consumer and the command completes with no status data
+/// and no error.
+///
+/// Input below violates RFC 3501 Section 7.2.4 (`status-att SP number`): the
+/// MESSAGES item carries no value.
+#[test]
+fn malformed_status_silently_degrades_to_unknown_response() {
+    let input = b"* STATUS \"INBOX\" (MESSAGES)\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    match resp {
+        Response::Untagged(u) => match *u {
+            UntaggedResponse::Unknown(raw) => {
+                assert_eq!(
+                    raw, "STATUS \"INBOX\" (MESSAGES)",
+                    "the whole malformed response is captured as opaque text"
+                );
+            }
+            other => panic!("expected Unknown, got: {other:?}"),
+        },
+        other => panic!("expected Untagged, got: {other:?}"),
+    }
+}
+
+/// Same degradation on a recognized-but-malformed FETCH: an ENVELOPE with
+/// too few fields (RFC 3501 Section 7.4.2 requires ten) surfaces as
+/// `Unknown`, silently dropping the UID and FLAGS that parsed fine.
+///
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
+#[test]
+fn malformed_fetch_envelope_silently_degrades_to_unknown_response() {
+    let input = b"* 1 FETCH (UID 9 ENVELOPE (NIL NIL) FLAGS (\\Seen))\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    match resp {
+        Response::Untagged(u) => assert!(
+            matches!(*u, UntaggedResponse::Unknown(_)),
+            "a malformed ENVELOPE loses the entire FETCH, including the \
+             UID and FLAGS that parsed; got: {u:?}"
+        ),
+        other => panic!("expected Untagged, got: {other:?}"),
+    }
+}
+
+/// Gmail's `X-GM-LABELS` FETCH data item has no field on `FetchResponse`, so
+/// the unknown-attribute skipper discards it. `X-GM-MSGID` and `X-GM-THRID`
+/// *are* modelled, which makes labels a conspicuous omission rather than a
+/// deliberate exclusion -.
+///
+/// Pinned here so the drop is visible: the surrounding attributes survive.
+#[test]
+fn fetch_x_gm_labels_is_skipped_without_losing_other_attributes() {
+    let input = b"* 1 FETCH (UID 9 X-GM-LABELS (\"\\\\Inbox\" \"Work\") FLAGS (\\Seen))\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    if let Response::Untagged(u) = resp {
+        if let UntaggedResponse::Fetch(fr) = *u {
+            assert_eq!(fr.uid, Some(9), "UID before the unknown item survives");
+            assert_eq!(
+                fr.flags,
+                Some(vec![Flag::Seen]),
+                "FLAGS after the unknown item survives"
+            );
+        } else {
+            panic!("expected Fetch, got: {u:?}");
+        }
+    } else {
+        panic!("expected Untagged, got: {resp:?}");
+    }
+}
+
+/// A `[UIDNEXT n]` response code whose value overflows `u32` is not merely
+/// dropped: `opt(response_code)` backtracks the whole bracket group, so the
+/// entire `[...]` ends up in the human-readable text field instead.
+///
+/// The STATUS parser uses `number_tolerant` in the same position and keeps
+/// the surrounding items, so the two paths disagree about what "tolerate an
+/// oversized number" means.
+#[test]
+fn response_code_uidnext_overflow_falls_into_text_not_code() {
+    let input = b"* OK [UIDNEXT 4294967296] Predicted next UID\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    if let Response::Untagged(u) = resp {
+        if let UntaggedResponse::Status { code, text, .. } = *u {
+            assert!(
+                code.is_none(),
+                "the oversized UIDNEXT loses its structure entirely; got: {code:?}"
+            );
+            assert_eq!(text, "[UIDNEXT 4294967296] Predicted next UID");
+        } else {
+            panic!("expected Status, got: {u:?}");
+        }
+    } else {
+        panic!("expected Untagged, got: {resp:?}");
+    }
+}
+
+/// `decode_mailbox_from_wire` builds a `MailboxName` via
+/// `MailboxName::from_decoded`, which performs no validation, so a
+/// modified-Base64 shift segment lets a server hand the client a mailbox
+/// name containing CR, LF, or NUL  -  octets `MailboxName::new` rejects.
+///
+/// `&AAoALQ-` is UTF-16BE `U+000A U+002D` ("\n-"). See
+///: the encode path happens to contain this
+/// (MUTF-7 re-encodes the LF, and UTF8=ACCEPT mode falls back to a literal),
+/// so this is an invariant leak rather than an injection.
+#[test]
+fn list_mailbox_name_can_carry_control_characters_from_the_wire() {
+    let input = b"* LIST () \"/\" \"&AAoALQ-\"\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    if let Response::Untagged(u) = resp {
+        if let UntaggedResponse::List(info) = *u {
+            assert_eq!(
+                info.name.as_str(),
+                "\n-",
+                "the decoded name carries a raw LF that `MailboxName::new` \
+                 would have rejected"
+            );
+            assert!(
+                MailboxName::new(info.name.as_str()).is_err(),
+                "the same string is not constructible through the validating \
+                 constructor"
+            );
+        } else {
+            panic!("expected List, got: {u:?}");
+        }
+    } else {
+        panic!("expected Untagged, got: {resp:?}");
+    }
+}

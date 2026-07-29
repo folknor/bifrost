@@ -104,3 +104,78 @@ impl NetConfig {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_safe_for_production() {
+        let config = NetConfig::default();
+        assert!(
+            !config.dangerous_accept_invalid_certs,
+            "the invalid-cert escape hatch must never default on"
+        );
+        assert!(config.root_certs.is_empty());
+        assert_eq!(config.token_max_age, DEFAULT_TOKEN_MAX_AGE);
+        assert!(
+            config.user_agent.starts_with("bifrost-net/"),
+            "every outbound request identifies the crate, got {}",
+            config.user_agent
+        );
+        assert!(config.connect_timeout > Duration::ZERO);
+        assert!(
+            config.http2_keep_alive_timeout < config.http2_keep_alive_interval,
+            "the PING ack deadline must be shorter than the PING interval"
+        );
+    }
+
+    /// The default is redirect-following ON with an empty allowlist and
+    /// ten hops - the same cap reqwest classically used.
+    #[test]
+    fn default_redirect_policy_is_enabled_with_ten_hops() {
+        let config = NetConfig::new();
+        match config.follow_redirects {
+            FollowRedirects::Enabled(policy) => {
+                assert_eq!(policy.max_hops, 10);
+                assert!(
+                    policy.trusted_hosts.is_empty(),
+                    "an empty allowlist means every host is acceptable"
+                );
+            }
+            FollowRedirects::Disabled => panic!("default must follow redirects"),
+        }
+    }
+
+    #[test]
+    fn builder_helpers_replace_the_redirect_policy() {
+        let disabled = NetConfig::new().follow_redirects(FollowRedirects::Disabled);
+        assert!(matches!(
+            disabled.follow_redirects,
+            FollowRedirects::Disabled
+        ));
+
+        let scoped = NetConfig::new()
+            .with_redirect_policy(RedirectPolicy::with_hops(3).trust_host("Allowed.Example"));
+        match scoped.follow_redirects {
+            FollowRedirects::Enabled(policy) => {
+                assert_eq!(policy.max_hops, 3);
+                assert!(
+                    policy.allows_host("allowed.example"),
+                    "trust_host lowercases so the allowlist is case-insensitive"
+                );
+                assert!(!policy.allows_host("other.example"));
+            }
+            FollowRedirects::Disabled => panic!("with_redirect_policy must enable following"),
+        }
+    }
+
+    #[test]
+    fn token_max_age_leaves_a_margin_under_a_typical_one_hour_ttl() {
+        assert!(
+            DEFAULT_TOKEN_MAX_AGE < Duration::from_secs(60 * 60),
+            "the opaque-token max age must expire before a typical issuer TTL"
+        );
+        assert!(DEFAULT_TOKEN_MAX_AGE >= Duration::from_secs(30 * 60));
+    }
+}

@@ -915,6 +915,153 @@ mod tests {
         assert!(!stream_terminating(&transient));
     }
 
+    fn folder() -> MailboxName {
+        MailboxName::new("INBOX").expect("valid mailbox")
+    }
+
+    fn ids(uids: &[u32]) -> Vec<DecodedObjectId> {
+        uids.iter()
+            .map(|uid| DecodedObjectId {
+                folder: folder(),
+                uidvalidity: 7,
+                uid: *uid,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_modified_response_code_yields_conflicting_uids() {
+        assert_eq!(modified_uids(None), None);
+        assert_eq!(modified_uids(Some(&ResponseCode::Alert)), None);
+        assert_eq!(
+            modified_uids(Some(&ResponseCode::Modified(vec![
+                UidRange::single(2),
+                UidRange::range(5, 7),
+            ]))),
+            Some(vec![2, 5, 6, 7])
+        );
+        // An empty MODIFIED list is still a MODIFIED response: the STORE
+        // outcome must not silently degrade to "no conflict reported".
+        assert_eq!(
+            modified_uids(Some(&ResponseCode::Modified(Vec::new()))),
+            Some(Vec::new())
+        );
+    }
+
+    // A tagged-OK STORE carrying `[MODIFIED ...]` partially applied: the
+    // named UIDs conflicted, everything else in the same command landed.
+    #[test]
+    fn modified_outcome_splits_conflicts_from_successes_per_uid() {
+        let outcomes = mutation_results(
+            ids(&[1, 2, 3]),
+            &[1, 2, 3],
+            StoreWireOutcome::Modified(vec![2]),
+            AccountOperation::UpdateFlags,
+            &folder(),
+        );
+        assert_eq!(outcomes.len(), 3);
+        let failed: Vec<&BatchFailure> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                ItemOutcome::Failed(failure) => Some(failure),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failed.len(), 1, "only the MODIFIED uid conflicts");
+        assert!(
+            failed[0].item.0.ends_with(":7:2"),
+            "item: {}",
+            failed[0].item.0
+        );
+        assert!(matches!(
+            failed[0].error.kind(),
+            AccountErrorKind::ConcurrencyConflict
+        ));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+                .count(),
+            2,
+        );
+    }
+
+    #[test]
+    fn applied_outcome_succeeds_every_target() {
+        let outcomes = mutation_results(
+            ids(&[4, 5]),
+            &[4, 5],
+            StoreWireOutcome::Applied,
+            AccountOperation::BulkMove,
+            &folder(),
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, ItemOutcome::Succeeded(_)))
+        );
+    }
+
+    // A tagged-NO STORE with no `[MODIFIED ...]` names no conflicting
+    // UIDs, so every target fails - none may be reported Succeeded.
+    #[test]
+    fn failed_outcome_fails_every_target() {
+        let outcomes = mutation_results(
+            ids(&[4, 5]),
+            &[4, 5],
+            StoreWireOutcome::Failed,
+            AccountOperation::BulkDestroy,
+            &folder(),
+        );
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            match outcome {
+                ItemOutcome::Failed(failure) => assert_eq!(
+                    failure.error.operation(),
+                    Some(AccountOperation::BulkDestroy)
+                ),
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn split_ids_by_uid_partitions_on_membership() {
+        let (matching, remaining) = split_ids_by_uid(ids(&[1, 2, 3]), &[2]);
+        assert_eq!(
+            matching.iter().map(|id| id.uid).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            remaining.iter().map(|id| id.uid).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        // An empty expunge set leaves everything on the remaining side.
+        let (matching, remaining) = split_ids_by_uid(ids(&[1, 2]), &[]);
+        assert!(matching.is_empty());
+        assert_eq!(remaining.len(), 2);
+    }
+
+    // Every target handed to `failed_all` must come back as its own
+    // `Failed` item carrying the encoded object id: a stale-UIDVALIDITY
+    // batch must not collapse into one aggregate failure.
+    #[test]
+    fn failed_all_emits_one_outcome_per_target() {
+        let error = uidvalidity_changed_error(AccountOperation::BulkMove, &folder());
+        let outcomes = failed_all(ids(&[1, 2, 3]), error);
+        assert_eq!(outcomes.len(), 3);
+        let items: Vec<String> = outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                ItemOutcome::Failed(failure) => failure.item.0.clone(),
+                other => panic!("expected Failed, got {other:?}"),
+            })
+            .collect();
+        assert!(items[0].ends_with(":7:1"), "item: {}", items[0]);
+        assert!(items[2].ends_with(":7:3"), "item: {}", items[2]);
+    }
+
     #[test]
     fn stale_uidvalidity_targets_are_kept_for_failed_results() {
         let folder = MailboxName::new("INBOX").expect("valid mailbox");

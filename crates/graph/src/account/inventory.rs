@@ -672,6 +672,202 @@ mod tests {
     }
 
     #[test]
+    fn membership_falls_back_to_the_scope_folder_when_parent_is_absent() {
+        // A delta `@removed` tombstone carries only `{id, @removed}`, so the
+        // fallback is the only membership source for a deletion.
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        for value in [
+            json!({ "id": "m1" }),
+            json!({ "id": "m1", "parentFolderId": "" }),
+            json!({ "id": "m1", "@removed": { "reason": "deleted" } }),
+        ] {
+            assert_eq!(
+                membership_from_value(&scope, &value),
+                MembershipScope::Folder(FolderId("inbox".to_string()))
+            );
+        }
+    }
+
+    /// Documents a defect, NOT the intended contract.
+    /// When a foreign (shared-mailbox) scope's
+    /// item carries no `parentFolderId` - which is every delta `@removed`
+    /// tombstone - `membership_from_value` falls back to the scope's
+    /// ALREADY-ENCODED folder id and then encodes it a second time, so the
+    /// membership names `mailbox\u{1f}mailbox\u{1f}folder`. Discovery never
+    /// emits that folder, so a shared-mailbox deletion is filed against a
+    /// scope the engine does not have. The correct fallback is the scope's
+    /// native folder id.
+    #[test]
+    fn foreign_scope_membership_double_encodes_when_parent_is_absent() {
+        let scope = CursorScope::FolderType {
+            folder: super::super::foreign::encode_foreign("shared@contoso.com", "AAMkRoot"),
+            ty: ObjectType::Email,
+        };
+        let tombstone = json!({ "id": "m1", "@removed": { "reason": "deleted" } });
+
+        let got = membership_from_value(&scope, &tombstone);
+        assert_eq!(
+            got,
+            MembershipScope::Folder(FolderId(
+                "shared@contoso.com\u{1f}shared@contoso.com\u{1f}AAMkRoot".to_string()
+            ))
+        );
+        // What discovery emitted for that same folder, for contrast:
+        assert_ne!(
+            got,
+            MembershipScope::Folder(super::super::foreign::encode_foreign(
+                "shared@contoso.com",
+                "AAMkRoot"
+            ))
+        );
+    }
+
+    #[test]
+    fn graph_etag_prefers_change_key_over_the_odata_etag() {
+        assert_eq!(
+            graph_etag(&json!({ "changeKey": "CK1", "@odata.etag": "W/\"E1\"" })).as_deref(),
+            Some("CK1")
+        );
+        assert_eq!(
+            graph_etag(&json!({ "@odata.etag": "W/\"E1\"" })).as_deref(),
+            Some("W/\"E1\"")
+        );
+        assert_eq!(graph_etag(&json!({ "id": "m1" })), None);
+    }
+
+    #[test]
+    fn removed_tombstones_are_detected_and_keep_their_id() {
+        let removed = json!({ "id": "m1", "@removed": { "reason": "deleted" } });
+        assert!(is_removed(&removed));
+        assert_eq!(removed_id(&removed), Some(ObjectId("m1".to_string())));
+        assert!(!is_removed(&json!({ "id": "m1" })));
+        assert_eq!(removed_id(&json!({ "@removed": {} })), None);
+    }
+
+    #[test]
+    fn internet_message_id_falls_back_to_the_odata_property() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let value = json!({
+            "id": "m1",
+            "internetMessageId": "<fallback@example.test>"
+        });
+        let entry = inventory_entry_from_value(&scope, &value).expect("entry");
+        assert_eq!(entry.message_id.as_deref(), Some("<fallback@example.test>"));
+
+        // The header wins when both are present.
+        let both = json!({
+            "id": "m1",
+            "internetMessageId": "<fallback@example.test>",
+            "internetMessageHeaders": [
+                { "name": "message-id", "value": "<header@example.test>" }
+            ]
+        });
+        let entry = inventory_entry_from_value(&scope, &both).expect("entry");
+        assert_eq!(entry.message_id.as_deref(), Some("<header@example.test>"));
+    }
+
+    #[test]
+    fn missing_change_key_projects_server_version_unavailable() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let entry =
+            inventory_entry_from_value(&scope, &json!({ "id": "m1" })).expect("entry expected");
+        assert!(matches!(
+            entry.fingerprint.server_version,
+            ServerVersion::Unavailable
+        ));
+    }
+
+    #[test]
+    fn an_entry_without_an_id_is_dropped() {
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        assert!(inventory_entry_from_value(&scope, &json!({ "changeKey": "CK1" })).is_none());
+    }
+
+    #[test]
+    fn flags_hash_is_stable_under_category_order_and_case() {
+        let a = json!({ "isRead": true, "categories": ["Blue", "Red"] });
+        let b = json!({ "isRead": true, "categories": ["red", "BLUE"] });
+        assert_eq!(flags_hash(&a), flags_hash(&b));
+    }
+
+    #[test]
+    fn flags_hash_moves_when_any_tracked_flag_moves() {
+        let base = json!({ "isRead": true, "flag": { "flagStatus": "notFlagged" } });
+        let read_cleared = json!({ "isRead": false, "flag": { "flagStatus": "notFlagged" } });
+        let flagged = json!({ "isRead": true, "flag": { "flagStatus": "flagged" } });
+        let categorized = json!({ "isRead": true, "flag": { "flagStatus": "notFlagged" }, "categories": ["Work"] });
+
+        let base_hash = flags_hash(&base);
+        assert_ne!(base_hash, flags_hash(&read_cleared));
+        assert_ne!(base_hash, flags_hash(&flagged));
+        assert_ne!(base_hash, flags_hash(&categorized));
+    }
+
+    #[test]
+    fn flags_hash_ignores_untracked_fields() {
+        // Subject / body churn must not look like a flag change, or every
+        // edit would re-hydrate the message.
+        let a = json!({ "isRead": true, "subject": "one" });
+        let b = json!({ "isRead": true, "subject": "two" });
+        assert_eq!(flags_hash(&a), flags_hash(&b));
+    }
+
+    #[test]
+    fn the_message_select_carries_every_field_the_projection_reads() {
+        let account = test_account();
+        let scope = CursorScope::FolderType {
+            folder: FolderId("inbox".to_string()),
+            ty: ObjectType::Email,
+        };
+        let url = initial_delta_url(&account, &scope).expect("email scope is supported");
+        // `parentFolderId` drives membership, `isRead`/`categories`/`flag`
+        // drive the flags hash, `conversationId` the thread id, and
+        // `internetMessageHeaders` the threading headers. Losing any of
+        // them degrades sync silently rather than failing.
+        for field in [
+            "parentFolderId",
+            "isRead",
+            "categories",
+            "flag",
+            "conversationId",
+            "internetMessageHeaders",
+            "internetMessageId",
+        ] {
+            assert!(url.contains(field), "{field} missing from {url}");
+        }
+        assert!(url.contains("$top=50"));
+        // Note: `changeKey` is deliberately absent - the etag comes from
+        // the `@odata.etag` annotation via `graph_etag`'s fallback.
+        assert!(!url.contains("changeKey"), "{url}");
+    }
+
+    #[test]
+    fn initial_delta_url_percent_encodes_opaque_folder_ids() {
+        let account = test_account();
+        // Graph mail-folder ids are URL-safe base64 but can carry `=`
+        // padding, which must not leak into the path unencoded.
+        let scope = CursorScope::FolderType {
+            folder: FolderId("AAMkAGI2/x=".to_string()),
+            ty: ObjectType::Email,
+        };
+        let url = initial_delta_url(&account, &scope).expect("email scope is supported");
+        assert!(!url.contains("AAMkAGI2/x="), "unencoded id in {url}");
+        assert!(url.starts_with("/me/mailFolders/"));
+    }
+
+    #[test]
     fn inventory_entry_omits_graph_message_size() {
         let scope = CursorScope::FolderType {
             folder: FolderId("inbox".to_string()),

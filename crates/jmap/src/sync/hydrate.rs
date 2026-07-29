@@ -238,4 +238,36 @@ mod tests {
         let gone = ObjectId(super::super::foreign::encode_object("acct-gone", "M1"));
         assert_eq!(route_for_id(&gone, is_registered), HydrationRoute::Primary);
     }
+
+    #[test]
+    fn each_projection_requests_the_properties_it_actually_reads() {
+        // `FlagsOnly` builds its outcome from `keywords`, so dropping that
+        // property would silently hydrate every message with an empty flag
+        // set instead of failing. `Metadata` must ask for exactly the
+        // inventory property set, or a hydrated entry and the inventory
+        // entry it replaces would carry different fingerprints.
+        let flags_only = properties_for_projection(Projection::FlagsOnly);
+        assert!(flags_only.contains(&Property::Keywords));
+        assert!(flags_only.contains(&Property::Id));
+
+        assert_eq!(
+            properties_for_projection(Projection::Metadata),
+            inventory_properties()
+        );
+    }
+
+    #[test]
+    fn a_foreign_route_and_a_primary_route_never_share_a_batch_buffer() {
+        // `stream` keys its per-request buffers on `HydrationRoute`, so the
+        // routes must not compare equal - one `Email/get` is scoped to one
+        // accountId and cannot carry ids from two accounts.
+        assert_ne!(
+            HydrationRoute::Primary,
+            HydrationRoute::Foreign("acct-9".to_string())
+        );
+        assert_ne!(
+            HydrationRoute::Foreign("acct-9".to_string()),
+            HydrationRoute::Foreign("acct-7".to_string())
+        );
+    }
 }

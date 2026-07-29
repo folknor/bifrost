@@ -723,3 +723,7 @@ impl ImapConnection {
         .map_err(|_| Error::timeout_inflight())?
     }
 }
+
+#[cfg(test)]
+#[path = "helpers_tests.rs"]
+mod tests;

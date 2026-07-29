@@ -396,3 +396,87 @@ fn checkpoint_for(scope: CursorScope, state_string: String) -> ChangeCursor {
 fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value.max(1)).expect("value.max(1) is non-zero")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::email::EmailId;
+
+    fn object_ids(changes: &[Change]) -> Vec<String> {
+        changes
+            .iter()
+            .map(|change| match change {
+                Change::ObjectChange(object) => object.id.0.clone(),
+                other => panic!("expected an ObjectChange, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn primary_change_ids_stay_bare() {
+        let ids = vec![EmailId::new("M1"), EmailId::new("M2")];
+        let changes = object_changes::<Email>(&ids, ObjectChangeKind::Created, None);
+
+        assert_eq!(object_ids(&changes), vec!["M1", "M2"]);
+        for change in &changes {
+            match change {
+                Change::ObjectChange(object) => {
+                    assert_eq!(object.kind, ObjectChangeKind::Created);
+                }
+                other => panic!("expected an ObjectChange, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_change_ids_carry_their_owning_account() {
+        // A foreign scope's change ids must land in the SAME namespace the
+        // foreign inventory mints, or hydrating a changed shared-account
+        // message routes through the primary account's `Email/get`.
+        let ids = vec![EmailId::new("M1")];
+        let changes = object_changes::<Email>(&ids, ObjectChangeKind::Destroyed, Some("acct-9"));
+
+        assert_eq!(
+            object_ids(&changes),
+            vec![super::super::foreign::encode_object("acct-9", "M1")]
+        );
+        // And the encoding is reversible back to the wire id.
+        assert_eq!(
+            super::super::foreign::native_object(&object_ids(&changes)[0]),
+            "M1"
+        );
+    }
+
+    #[test]
+    fn an_empty_change_list_yields_no_changes() {
+        let ids: Vec<EmailId> = Vec::new();
+        assert!(object_changes::<Email>(&ids, ObjectChangeKind::Updated, None).is_empty());
+        assert!(
+            object_changes::<Email>(&ids, ObjectChangeKind::Updated, Some("acct-9")).is_empty()
+        );
+    }
+
+    #[test]
+    fn every_supported_scope_can_build_its_checkpoint_cursor() {
+        // `checkpoint_for` unwraps, so any scope reachable from a change
+        // loop must encode. The foreign `Folder` shape is the one that
+        // round-trips through a codec rather than a fixed tag.
+        for scope in [
+            CursorScope::Type(bifrost_types::ObjectType::Email),
+            CursorScope::Type(bifrost_types::ObjectType::Mailbox),
+            CursorScope::Type(bifrost_types::ObjectType::Thread),
+            CursorScope::Query(bifrost_types::QueryId("q-1".to_string())),
+            CursorScope::Folder(super::super::foreign::encode_foreign("acct-9", "mbx-1")),
+        ] {
+            let cursor = checkpoint_for(scope.clone(), "state-1".to_string());
+            assert_eq!(cursor.scope, scope);
+            assert_eq!(
+                cursor.envelope_version,
+                state::CHANGE_CURSOR_ENVELOPE_VERSION
+            );
+            let (_, state_string) =
+                state::decode_cursor(&cursor).expect("a checkpoint must decode again");
+            assert_eq!(state_string, "state-1");
+        }
+    }
+}

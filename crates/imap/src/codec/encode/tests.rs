@@ -7469,3 +7469,178 @@ fn encode_notify_set_rejects_extension_event_on_selected() {
         );
     }
 }
+
+// ========================================================================
+// Adversarial / hostile-payload encoding
+//
+// These pin how the encoder behaves when a *command payload* happens to
+// contain bytes that look like IMAP framing. Three of them document
+// defects rather than endorse behavior.
+// ========================================================================
+
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
+///
+/// `EncodedCommand::from_flat_buffer` only skips the payload of markers that
+/// `find_sync_literal_boundary` actually matched. Non-synchronizing markers
+/// (`{N+}\r\n`, RFC 7888 Section 4) are *not* matched, so their payload is
+/// rescanned, and any `{digits}\r\n` inside a LITERAL+ body is mistaken for a
+/// synchronizing literal marker.
+///
+/// The result is a bogus segment split. `send_encoded_segments` then waits for
+/// a `+` continuation which the server has no reason to send: under LITERAL+
+/// it is counting down N octets of a non-synchronizing literal.
+///
+/// Correct behavior: under `LiteralMode::LiteralPlus` every literal is
+/// non-synchronizing (RFC 7888 Section 4), so the command must always be a
+/// single segment regardless of payload content. The pre-existing
+/// `prop_roundtrip::literal_plus_single_segment` property states exactly
+/// that, but its generator never produces a command carrying a literal, so
+/// the property is vacuous today.
+#[test]
+fn literal_plus_body_containing_sync_marker_is_wrongly_split() {
+    let cmd = Command::SetMetadata {
+        mailbox: MailboxName::new("INBOX").unwrap(),
+        // 11 opaque octets. `{5}\r\n` is ordinary data here, not framing.
+        entries: vec![("/private/x".into(), Some(b"a{5}\r\nbbbbb".to_vec()))],
+    };
+    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralPlus, false)).unwrap();
+    let segments = encoded.segments();
+
+    assert_eq!(
+        segments.len(),
+        2,
+        "current (defective) behavior: the `{{5}}\\r\\n` inside the LITERAL+ \
+         body is mistaken for a synchronizing literal marker. The correct \
+         result is 1 segment (RFC 7888 Section 4). Got: {:?}",
+        segments
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        segments[0].ends_with(b"a{5}\r\n"),
+        "the bogus split lands just past the literal-looking bytes in the \
+         payload; got: {:?}",
+        String::from_utf8_lossy(&segments[0])
+    );
+    assert_eq!(
+        &segments[1][..],
+        b"bbbbb)\r\n",
+        "the remainder of the payload becomes a second segment that is only \
+         sent after a `+` that never arrives"
+    );
+}
+
+/// A *synchronizing* literal payload is skipped correctly, so the same
+/// hostile bytes are harmless under `LiteralMode::Synchronizing`. This is the
+/// control case for the test above: it isolates the defect to the
+/// non-synchronizing marker form rather than to literal payloads generally.
+#[test]
+fn sync_literal_body_containing_sync_marker_is_skipped() {
+    let cmd = Command::SetMetadata {
+        mailbox: MailboxName::new("INBOX").unwrap(),
+        entries: vec![("/private/x".into(), Some(b"a{5}\r\nbbbbb".to_vec()))],
+    };
+    let encoded = encode_command("A001", &cmd, &default_opts()).unwrap();
+    let segments = encoded.segments();
+
+    assert_eq!(
+        segments.len(),
+        2,
+        "exactly one split, at the real `{{11}}\\r\\n` marker (RFC 3501 \
+         Section 4.3); got: {:?}",
+        segments
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        segments[0].ends_with(b"{11}\r\n"),
+        "the split must be at the real marker; got: {:?}",
+        String::from_utf8_lossy(&segments[0])
+    );
+    assert_eq!(
+        &segments[1][..],
+        b"a{5}\r\nbbbbb)\r\n",
+        "the whole payload plus the command tail is one segment because \
+         `from_flat_buffer` advanced past the declared 11 octets"
+    );
+}
+
+/// `find_sync_literal_boundary` requires `}` to abut the CRLF, so a
+/// `{digits}` group that is *not* at end-of-line is not mistaken for a
+/// literal marker. The response-side framing scanner in `connection/wire.rs`
+/// lacks this check; this pins that
+/// the encoder does not share that defect.
+#[test]
+fn brace_digits_not_abutting_crlf_is_not_a_literal_marker() {
+    let cmd = Command::SetMetadata {
+        mailbox: MailboxName::new("INBOX").unwrap(),
+        // `{5}` appears, but is followed by `x`, not CRLF.
+        entries: vec![("/private/x".into(), Some(b"a{5}x\r\nbb".to_vec()))],
+    };
+    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralPlus, false)).unwrap();
+    assert_eq!(
+        encoded.segments().len(),
+        1,
+        "`{{5}}x` is not a literal marker: `}}` does not abut the CRLF \
+         (RFC 3501 Section 4.3)"
+    );
+}
+
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
+///
+/// `commands/list.rs::list_status_return_option_items` slices the item list
+/// as `&suffix[1..suffix.len() - 1]` after `strip_prefix(" (")` has already
+/// removed the opening paren, so the first octet of the item list is eaten.
+/// For a one-character item list the result degenerates to `""` and the
+/// command is rejected with "must contain at least one status data item"
+/// instead of being accepted.
+///
+/// This is the codec-side twin of; the two
+/// copies of this helper have the identical off-by-one.
+#[test]
+fn list_status_return_option_rejects_one_character_item_list() {
+    let mut buf = BytesMut::new();
+    let cmd = Command::ListExtended {
+        selection_options: Vec::new(),
+        reference: String::new(),
+        patterns: vec!["*".into()],
+        return_options: vec!["STATUS (X)".into()],
+    };
+
+    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
+    assert!(
+        matches!(result, Err(EncodeError::Validation(ref msg))
+            if msg.contains("at least one status data item")),
+        "current (defective) behavior: the single item `X` is truncated to \
+         the empty string before validation, so a non-empty item list is \
+         reported as empty: {result:?}"
+    );
+}
+
+/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
+///
+/// The same off-by-one hides a leading `(` from the nested-parenthesis check
+/// in `normalize_status_items_body`, so an unbalanced `STATUS ((MESSAGES)`
+/// return option passes validation and is written to the wire verbatim,
+/// producing a syntactically invalid LIST command (RFC 5819 Section 4 /
+/// RFC 9051 Section 7).
+#[test]
+fn list_status_return_option_accepts_unbalanced_leading_paren() {
+    let mut buf = BytesMut::new();
+    let cmd = Command::ListExtended {
+        selection_options: Vec::new(),
+        reference: String::new(),
+        patterns: vec!["*".into()],
+        return_options: vec!["STATUS ((MESSAGES)".into()],
+    };
+
+    encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
+    assert_eq!(
+        &buf[..],
+        b"A001 LIST \"\" \"*\" RETURN (STATUS ((MESSAGES))\r\n",
+        "current (defective) behavior: the unbalanced item list is accepted \
+         and emitted verbatim, so the server sees a malformed RETURN list"
+    );
+}

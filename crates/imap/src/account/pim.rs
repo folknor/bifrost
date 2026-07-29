@@ -1358,6 +1358,7 @@ fn search_plan(request: &SearchRequest) -> Result<SearchPlan, AccountError> {
     })
 }
 
+#[derive(Debug)]
 struct CriteriaPart {
     criteria: String,
     folder: Option<MailboxName>,
@@ -2353,6 +2354,429 @@ body text\r\n";
             part.folder.as_ref().map(MailboxName::as_str),
             Some("Archive")
         );
+    }
+
+    #[test]
+    fn folder_role_prefers_special_use_over_the_folder_name() {
+        // A localized mailbox is only recognizable by its SPECIAL-USE
+        // attribute, and a mislabelled name must not beat the attribute.
+        assert_eq!(
+            folder_role(&[MailboxAttribute::Sent], "Gesendete Objekte"),
+            Some(FolderRole::Sent)
+        );
+        assert_eq!(
+            folder_role(&[MailboxAttribute::Junk], "Archive"),
+            Some(FolderRole::Spam),
+            "the attribute wins over the name",
+        );
+        assert_eq!(
+            folder_role(
+                &[MailboxAttribute::Custom("\\INBOX".to_owned())],
+                "Posteingang"
+            ),
+            Some(FolderRole::Inbox),
+            "the \\Inbox custom attribute is matched case-insensitively",
+        );
+    }
+
+    #[test]
+    fn folder_role_falls_back_to_the_slash_delimited_leaf_name() {
+        assert_eq!(folder_role(&[], "INBOX"), Some(FolderRole::Inbox));
+        assert_eq!(folder_role(&[], "inbox"), Some(FolderRole::Inbox));
+        assert_eq!(
+            folder_role(&[], "[Gmail]/Sent Mail"),
+            Some(FolderRole::Sent)
+        );
+        assert_eq!(
+            folder_role(&[], "Deleted Messages"),
+            Some(FolderRole::Trash)
+        );
+        assert_eq!(folder_role(&[], "Projects/Q3"), None);
+        assert_eq!(
+            folder_role(&[MailboxAttribute::HasChildren], "Whatever"),
+            None,
+            "a non-special-use attribute contributes no role",
+        );
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG. The
+    // leaf-name fallback splits on `/` only, but the hierarchy delimiter
+    // is per-server (Courier and several Dovecot layouts use `.`), and
+    // the real delimiter is already known - it rides on `FolderEntry`.
+    // On such a server no role resolves, so `role_folder(Sent)` is None
+    // and the Sent-copy APPEND, `draft_create` and `delete_thread`
+    // silently lose their targets.
+    #[test]
+    fn folder_role_misses_the_leaf_when_the_delimiter_is_not_a_slash() {
+        assert_eq!(folder_role(&[], "INBOX.Sent"), None);
+        assert_eq!(folder_role(&[], "INBOX.Trash"), None);
+        // The same layout with `/` resolves, which is the asymmetry.
+        assert_eq!(folder_role(&[], "INBOX/Sent"), Some(FolderRole::Sent));
+    }
+
+    #[test]
+    fn parent_id_needs_the_servers_delimiter() {
+        assert_eq!(
+            parent_id(Some('/'), "Projects/Q3"),
+            Some(ContainerId("Projects".to_owned()))
+        );
+        assert_eq!(
+            parent_id(Some('.'), "INBOX.Projects.Q3"),
+            Some(ContainerId("INBOX.Projects".to_owned())),
+            "the delimiter is taken from LIST, not assumed",
+        );
+        assert_eq!(parent_id(Some('/'), "INBOX"), None, "a root has no parent");
+        assert_eq!(
+            parent_id(None, "Projects/Q3"),
+            None,
+            "a flat server has no hierarchy at all",
+        );
+    }
+
+    #[test]
+    fn convenience_keywords_map_onto_system_flags() {
+        assert_eq!(imap_flag_for_keyword("$flagged"), Flag::Flagged);
+        assert_eq!(imap_flag_for_keyword("$FLAGGED"), Flag::Flagged);
+        assert_eq!(imap_flag_for_keyword("\\Flagged"), Flag::Flagged);
+        assert_eq!(imap_flag_for_keyword("$answered"), Flag::Answered);
+        assert_eq!(imap_flag_for_keyword("$seen"), Flag::Seen);
+        // Everything else stays a keyword, verbatim: `$forwarded` and
+        // `$MDNSent` have no system-flag equivalent.
+        assert_eq!(
+            imap_flag_for_keyword("$MDNSent"),
+            Flag::Custom("$MDNSent".to_owned())
+        );
+        assert_eq!(
+            imap_flag_for_keyword("$important"),
+            Flag::Custom("$important".to_owned())
+        );
+    }
+
+    fn search_request(limit: Option<u32>, cursor: Option<&str>) -> SearchRequest {
+        let mut request = SearchRequest::default();
+        request.limit = limit;
+        request.page_cursor = cursor.map(|c| c.as_bytes().to_vec());
+        request
+    }
+
+    #[test]
+    fn page_from_items_walks_an_offset_cursor_to_exhaustion() {
+        let items: Vec<u32> = (0..5).collect();
+
+        let first = page_from_items(items.clone(), &search_request(Some(2), None)).expect("page");
+        assert_eq!(first.items, vec![0, 1]);
+        assert_eq!(first.next_cursor.as_deref(), Some(b"2".as_slice()));
+        assert_eq!(first.estimated_total, Some(5));
+
+        let last =
+            page_from_items(items.clone(), &search_request(Some(2), Some("4"))).expect("page");
+        assert_eq!(last.items, vec![4]);
+        assert_eq!(last.next_cursor, None, "the final page ends the walk");
+
+        // A cursor at or past the end yields an empty final page rather
+        // than an error or a panic on the slice.
+        let past = page_from_items(items, &search_request(Some(2), Some("99"))).expect("page");
+        assert!(past.items.is_empty());
+        assert_eq!(past.next_cursor, None);
+    }
+
+    #[test]
+    fn page_from_items_rejects_a_cursor_it_did_not_mint() {
+        let err = page_from_items(vec![1u32], &search_request(None, Some("not-a-number")))
+            .expect_err("garbage cursor");
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+    }
+
+    #[test]
+    fn imap_date_uses_the_rfc3501_date_text_production() {
+        // date-text = date-day "-" date-month "-" date-year, and
+        // date-day is 1*2DIGIT, so a single-digit day is not zero-padded.
+        assert_eq!(imap_date(SystemTime::UNIX_EPOCH), "1-Jan-1970");
+        assert_eq!(
+            imap_date(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(60 * 60 * 24 * 364)),
+            "31-Dec-1970"
+        );
+    }
+
+    #[test]
+    fn search_plan_defaults_to_all_and_carries_the_folder_restriction() {
+        let plan = search_plan(&SearchRequest::default()).expect("plan");
+        assert_eq!(plan.criteria, "ALL");
+        assert!(plan.folder.is_none());
+
+        let plan = search_plan(&SearchRequest::filter(SearchFilter::In(ContainerId(
+            "Archive".to_owned(),
+        ))))
+        .expect("plan");
+        assert_eq!(plan.criteria, "ALL", "In contributes no criteria");
+        assert_eq!(
+            plan.folder.as_ref().map(MailboxName::as_str),
+            Some("Archive")
+        );
+    }
+
+    #[test]
+    fn search_plan_quotes_filter_operands() {
+        let plan = search_plan(&SearchRequest::filter(SearchFilter::Subject(
+            "quarterly \"report\"".to_owned(),
+        )))
+        .expect("plan");
+        assert_eq!(plan.criteria, "SUBJECT \"quarterly \\\"report\\\"\"");
+    }
+
+    #[test]
+    fn search_plan_substitutes_or_conjoins_the_provider_query() {
+        // With no structured filter the raw query replaces the ALL.
+        let plan = search_plan(&SearchRequest::provider("  UNSEEN  ")).expect("plan");
+        assert_eq!(plan.criteria, "UNSEEN", "the raw query is trimmed");
+
+        // With a structured filter the two are juxtaposed, which is
+        // IMAP's implicit AND (RFC 3501 Section 6.4.4).
+        let mut request = SearchRequest::filter(SearchFilter::From("a@b.test".to_owned()));
+        request.provider_query = Some("UNSEEN".to_owned());
+        let plan = search_plan(&request).expect("plan");
+        assert_eq!(plan.criteria, "FROM \"a@b.test\" UNSEEN");
+
+        // A whitespace-only raw query is ignored entirely.
+        let plan = search_plan(&SearchRequest::provider("   ")).expect("plan");
+        assert_eq!(plan.criteria, "ALL");
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG.
+    // `provider_query` is spliced into the criteria string with no
+    // syntactic validation whatsoever, so an unbalanced `)` reaches the
+    // connection layer's SEARCH-criteria scanner - where it currently
+    // spins forever.
+    #[test]
+    fn search_plan_passes_an_unbalanced_provider_query_straight_through() {
+        let plan = search_plan(&SearchRequest::provider(")")).expect("plan");
+        assert_eq!(plan.criteria, ")", "no parenthesis balancing is applied");
+
+        let plan = search_plan(&SearchRequest::provider("FROM")).expect("plan");
+        assert_eq!(plan.criteria, "FROM", "no operand-arity check is applied");
+    }
+
+    #[test]
+    fn and_and_or_combinators_produce_the_expected_criteria_shapes() {
+        let and = combine_and(&[
+            SearchFilter::From("a@b.test".to_owned()),
+            SearchFilter::Subject("hi".to_owned()),
+        ])
+        .expect("and");
+        assert_eq!(and.criteria, "FROM \"a@b.test\" SUBJECT \"hi\"");
+
+        // An `In`-only conjunction degenerates to ALL plus the folder.
+        let folder_only =
+            combine_and(&[SearchFilter::In(ContainerId("Archive".to_owned()))]).expect("and");
+        assert_eq!(folder_only.criteria, "ALL");
+        assert_eq!(
+            folder_only.folder.as_ref().map(MailboxName::as_str),
+            Some("Archive")
+        );
+
+        // RFC 3501 OR takes exactly two search-keys, so a three-way OR
+        // has to nest.
+        let or = combine_or(&[
+            SearchFilter::From("a@b.test".to_owned()),
+            SearchFilter::From("c@d.test".to_owned()),
+            SearchFilter::From("e@f.test".to_owned()),
+        ])
+        .expect("or");
+        assert_eq!(
+            or.criteria,
+            "OR (OR (FROM \"a@b.test\") (FROM \"c@d.test\")) (FROM \"e@f.test\")"
+        );
+
+        assert_eq!(combine_or(&[]).expect("empty or").criteria, "ALL");
+    }
+
+    #[test]
+    fn and_across_two_folders_is_rejected_rather_than_silently_narrowed() {
+        // IMAP SEARCH runs against one selected mailbox, so a filter
+        // naming two folders has no faithful single-command encoding.
+        let err = combine_and(&[
+            SearchFilter::In(ContainerId("Archive".to_owned())),
+            SearchFilter::In(ContainerId("Sent".to_owned())),
+        ])
+        .expect_err("two folders");
+        assert_eq!(
+            *err.kind(),
+            AccountErrorKind::Request(RequestErrorKind::Malformed)
+        );
+        // The same folder twice is not a conflict.
+        assert!(
+            combine_and(&[
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+                SearchFilter::In(ContainerId("Archive".to_owned())),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn not_wraps_its_inner_criteria_and_keeps_the_folder() {
+        let part = criteria_from_filter(&SearchFilter::Not(Box::new(SearchFilter::And(vec![
+            SearchFilter::In(ContainerId("Archive".to_owned())),
+            SearchFilter::From("a@b.test".to_owned()),
+        ]))))
+        .expect("not");
+        assert_eq!(part.criteria, "NOT (FROM \"a@b.test\")");
+        assert_eq!(
+            part.folder.as_ref().map(MailboxName::as_str),
+            Some("Archive")
+        );
+    }
+
+    #[test]
+    fn header_name_matching_is_trimmed_and_case_insensitive() {
+        assert!(header_name_is_bcc(b"Bcc: x@y"));
+        assert!(header_name_is_bcc(b"BCC:x@y"));
+        assert!(header_name_is_bcc(b" bcc : x@y"));
+        assert!(!header_name_is_bcc(b"Bcc-Original: x@y"));
+        assert!(!header_name_is_bcc(b"X-Original-Bcc: x@y"));
+        assert!(!header_name_is_bcc(b"Bcc x@y"), "no colon, no header");
+    }
+
+    #[test]
+    fn strip_bcc_drops_the_folded_continuation_lines_too() {
+        // A folded `Bcc:` whose continuation lines were kept would leak
+        // the blind recipients as a dangling header fragment.
+        let header = b"To: a@b.test\r\nBcc: x@y.test,\r\n\tz@w.test\r\nSubject: hi\r\n";
+        let out = strip_bcc_header(header, b"body");
+        let text = String::from_utf8(out).expect("ascii");
+        assert!(!text.to_ascii_lowercase().contains("bcc"));
+        assert!(
+            !text.contains("z@w.test"),
+            "the fold must go with its header"
+        );
+        assert!(text.contains("To: a@b.test"));
+        assert!(text.contains("Subject: hi"));
+        assert!(text.ends_with("\r\n\r\nbody"));
+    }
+
+    #[test]
+    fn unfold_headers_joins_folds_and_keeps_repeats_in_order() {
+        let headers = unfold_headers("To: a@b.test,\r\n  c@d.test\r\nTo: e@f.test\r\nX: 1\r\n");
+        assert_eq!(
+            headers,
+            vec![
+                ("to".to_owned(), "a@b.test, c@d.test".to_owned()),
+                ("to".to_owned(), "e@f.test".to_owned()),
+                ("x".to_owned(), "1".to_owned()),
+            ]
+        );
+        // Both `To:` headers contribute recipients.
+        let addrs: Vec<String> = addresses_for(&headers, "to")
+            .into_iter()
+            .map(|a| a.address)
+            .collect();
+        assert_eq!(addrs, ["a@b.test", "c@d.test", "e@f.test"]);
+    }
+
+    #[test]
+    fn address_list_splitting_ignores_commas_inside_angle_brackets() {
+        let items = split_address_list("<a@b, c>, d@e");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trim(), "<a@b, c>");
+        assert_eq!(items[1].trim(), "d@e");
+    }
+
+    #[test]
+    fn hydration_attrs_track_the_projection() {
+        for projection in [
+            HydrationProjection::Headers,
+            HydrationProjection::Preview(64),
+            HydrationProjection::Full,
+            HydrationProjection::FullWithBlobs,
+        ] {
+            let attrs = attrs_for_hydration(projection);
+            assert!(attrs.iter().any(|attr| matches!(attr, FetchAttr::Envelope)));
+            assert!(attrs.iter().any(|attr| matches!(attr, FetchAttr::Uid)));
+        }
+
+        assert!(
+            attrs_for_hydration(HydrationProjection::Headers)
+                .iter()
+                .all(|attr| !matches!(attr, FetchAttr::BodySection { .. })),
+            "a headers-only hydration must not pull a body",
+        );
+
+        let preview = attrs_for_hydration(HydrationProjection::Preview(64));
+        assert!(preview.iter().any(|attr| matches!(
+            attr,
+            FetchAttr::BodySection {
+                peek: true,
+                section: Some(s),
+                partial: Some((0, 64)),
+            } if s == "TEXT"
+        )));
+
+        let full = attrs_for_hydration(HydrationProjection::Full);
+        assert!(full.iter().any(|attr| matches!(
+            attr,
+            FetchAttr::BodySection {
+                peek: true,
+                section: None,
+                partial: None,
+            }
+        )));
+    }
+
+    #[test]
+    fn hydrated_message_maps_importance_from_the_important_keyword() {
+        let with = crate::types::FetchResponse {
+            uid: Some(2),
+            flags: Some(vec![Flag::Custom("$Important".to_owned())]),
+            ..Default::default()
+        };
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let message =
+            fetch_to_message(&folder, 9, with, HydrationProjection::Headers).expect("uid present");
+        assert_eq!(message.importance, Importance::High);
+        assert_eq!(message.containers, vec![ContainerId("INBOX".to_owned())]);
+        assert!(
+            message.body_text.is_none(),
+            "a headers projection carries no body"
+        );
+
+        let without = crate::types::FetchResponse {
+            uid: Some(2),
+            ..Default::default()
+        };
+        let message = fetch_to_message(&folder, 9, without, HydrationProjection::Headers)
+            .expect("uid present");
+        assert_eq!(message.importance, Importance::Normal);
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG. A `Full`
+    // hydration fetches `BODY.PEEK[]` - the ENTIRE RFC 5322 message - and
+    // assigns the lossy-UTF-8 string of it to `Message::body_text`, so the
+    // consumer receives headers and MIME boundaries in a field documented
+    // as the text body.
+    #[test]
+    fn full_hydration_puts_the_whole_raw_message_in_body_text() {
+        let fetch = crate::types::FetchResponse {
+            uid: Some(2),
+            body_sections: vec![crate::types::fetch::BodySection {
+                section: String::new(),
+                origin: None,
+                data: Some(b"Subject: hi\r\n\r\nthe body".to_vec()),
+            }],
+            ..Default::default()
+        };
+        let folder = MailboxName::new("INBOX").expect("valid mailbox");
+        let message =
+            fetch_to_message(&folder, 9, fetch, HydrationProjection::Full).expect("uid present");
+        let body = message.body_text.expect("full projection carries a body");
+        assert!(
+            body.starts_with("Subject: hi"),
+            "documents the un-parsed raw message; not an endorsement",
+        );
+        assert!(message.body_html.is_none());
+        assert!(message.attachments.is_empty());
     }
 
     #[test]

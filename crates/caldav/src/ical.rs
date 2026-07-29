@@ -2123,6 +2123,65 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "byte index")]
+    fn non_ascii_datetime_value_panics_in_projection() {
+        // BUG (documented, not endorsed): `format_ical_time` slices the raw
+        // DTSTART value at fixed BYTE offsets, so any multi-byte UTF-8 value
+        // whose byte length is >= 15 panics on a char boundary instead of
+        // degrading to a per-resource error like every other malformed body.
+        // A garbage-emitting or hostile server can take down the whole pull
+        // with one resource. Five EURO SIGN characters are 15 bytes.
+        // Replace this test with a non-panicking assertion when the slicing
+        // is made boundary-safe.
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            "\u{20ac}".repeat(5)
+        );
+        let _ = event_from_ical(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            &body,
+        );
+    }
+
+    #[test]
+    fn duration_based_end_is_not_modeled() {
+        // GAP (documented, not endorsed): a VEVENT carrying DTSTART plus
+        // DURATION instead of DTEND (legal per RFC 5545, emitted by several
+        // real producers) projects with an EMPTY end value - DURATION is
+        // never read. Pinned so a future fix flips this loudly.
+        let event = parse_event(
+            "/cal/one.ics".to_string(),
+            CalendarId("/cal/".to_string()),
+            None,
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u1\r\nDTSTART:20260602T120000Z\r\nDURATION:PT1H\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+
+        assert_eq!(event.start.value, "2026-06-02T12:00:00Z");
+        assert_eq!(event.end.value, "");
+    }
+
+    #[test]
+    fn unescape_text_handles_adjacent_backslashes_in_a_single_pass() {
+        // Raw `\\n` is an escaped backslash followed by a literal n, not a
+        // newline; an ordering-dependent replace-chain corrupts it.
+        assert_eq!(unescape_text("a\\\\nb"), "a\\nb");
+        assert_eq!(unescape_text("line\\nbreak"), "line\nbreak");
+        assert_eq!(unescape_text("big\\Nbreak"), "big\nbreak");
+        assert_eq!(unescape_text("semi\\;comma\\,"), "semi;comma,");
+        // Unknown escapes and a trailing backslash pass through verbatim.
+        assert_eq!(unescape_text("odd\\x"), "odd\\x");
+        assert_eq!(unescape_text("tail\\"), "tail\\");
+    }
+
+    #[test]
+    fn escape_then_unescape_round_trips_text() {
+        let original = "a,b;c\\d\nnewline";
+        assert_eq!(unescape_text(&escape_text(original)), original);
+    }
+
+    #[test]
     fn ignores_non_mailto_attendees() {
         let event = parse_event(
             "/cal/one.ics".to_string(),

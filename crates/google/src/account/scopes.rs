@@ -235,3 +235,191 @@ fn diff_snapshots(old: &ScopeSnapshot, new: &ScopeSnapshot) -> Vec<ScopeLifecycl
     }
     events
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label(id: &str, name: &str, label_type: &str) -> GmailLabel {
+        GmailLabel {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            label_type: Some(label_type.to_owned()),
+            color: None,
+        }
+    }
+
+    fn snapshot_of(labels: Vec<GmailLabel>) -> ScopeSnapshot {
+        ScopeSnapshot {
+            labels,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    fn label_id(scope: &MembershipScope) -> &str {
+        match scope {
+            MembershipScope::Label(LabelId(id)) => id.as_str(),
+            _ => panic!("gmail lifecycle events are always label-scoped"),
+        }
+    }
+
+    #[test]
+    fn identical_snapshots_produce_no_events() {
+        let snap = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        let again = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        assert!(diff_snapshots(&snap, &again).is_empty());
+    }
+
+    #[test]
+    fn a_new_label_is_created_and_a_vanished_one_is_deleted() {
+        let old = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        let new = snapshot_of(vec![label("Label_2", "Home", "user")]);
+        let events = diff_snapshots(&old, &new);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ScopeLifecycle::Created(scope) => assert_eq!(label_id(scope), "Label_2"),
+            other => panic!("expected Created first, got {other:?}"),
+        }
+        match &events[1] {
+            ScopeLifecycle::Deleted(scope) => assert_eq!(label_id(scope), "Label_1"),
+            other => panic!("expected Deleted second, got {other:?}"),
+        }
+    }
+
+    /// Gmail keeps the label id across a rename, so a name change on a
+    /// user label surfaces as `Renamed`.
+    #[test]
+    fn a_user_label_name_change_is_a_rename() {
+        let old = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        let new = snapshot_of(vec![label("Label_1", "Work Stuff", "user")]);
+        let events = diff_snapshots(&old, &new);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ScopeLifecycle::Renamed { .. }));
+    }
+
+    /// DOCUMENTS CURRENT BEHAVIOUR, NOT AN ENDORSEMENT. Gmail's label id
+    /// is stable across a rename, so the `Renamed` event carries the
+    /// same scope on both sides. A consumer cannot learn the old or the
+    /// new display name from the event and must re-read
+    /// `containers_list` to find out what actually changed.
+    #[test]
+    fn rename_events_carry_the_same_scope_on_both_sides() {
+        let old = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        let new = snapshot_of(vec![label("Label_1", "Renamed", "user")]);
+        match &diff_snapshots(&old, &new)[0] {
+            ScopeLifecycle::Renamed { old, new } => {
+                assert_eq!(label_id(old), label_id(new));
+                assert_eq!(label_id(old), "Label_1");
+            }
+            other => panic!("expected Renamed, got {other:?}"),
+        }
+    }
+
+    /// System labels are localised by Gmail (the `INBOX` label's `name`
+    /// follows the account language), so a locale flip must not be
+    /// reported as a user-visible rename.
+    #[test]
+    fn system_label_name_changes_are_not_renames() {
+        let old = snapshot_of(vec![label("INBOX", "INBOX", "system")]);
+        let new = snapshot_of(vec![label("INBOX", "Innboks", "system")]);
+        assert!(diff_snapshots(&old, &new).is_empty());
+    }
+
+    /// A label whose `type` Gmail omitted is treated as user-shaped, so
+    /// its rename still surfaces. The alternative (swallowing it) would
+    /// silently drop renames on any future label shape.
+    #[test]
+    fn a_label_with_no_type_is_treated_as_renameable() {
+        let old = snapshot_of(vec![GmailLabel {
+            id: "Label_3".to_owned(),
+            name: "Old".to_owned(),
+            label_type: None,
+            color: None,
+        }]);
+        let new = snapshot_of(vec![GmailLabel {
+            id: "Label_3".to_owned(),
+            name: "New".to_owned(),
+            label_type: None,
+            color: None,
+        }]);
+        assert_eq!(diff_snapshots(&old, &new).len(), 1);
+    }
+
+    /// A color-only edit is not a lifecycle event; only presence and
+    /// name participate in the diff.
+    #[test]
+    fn a_color_only_change_is_not_a_lifecycle_event() {
+        let old = snapshot_of(vec![label("Label_1", "Work", "user")]);
+        let mut recolored = label("Label_1", "Work", "user");
+        recolored.color = Some(crate::types::GmailLabelColor {
+            background_color: Some("#000000".to_owned()),
+            text_color: Some("#ffffff".to_owned()),
+        });
+        assert!(diff_snapshots(&old, &snapshot_of(vec![recolored])).is_empty());
+    }
+
+    #[test]
+    fn diffing_against_an_empty_old_snapshot_creates_everything() {
+        let new = snapshot_of(vec![
+            label("Label_1", "Work", "user"),
+            label("INBOX", "INBOX", "system"),
+        ]);
+        let events = diff_snapshots(&ScopeSnapshot::empty(), &new);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, ScopeLifecycle::Created(_))),
+        );
+    }
+
+    /// DOCUMENTS A BUG, NOT AN ENDORSEMENT. `ScopeSnapshot::empty()`
+    /// stamps `fetched_at` with `Instant::now()`, so a never-populated
+    /// cache reports itself FRESH for the first five minutes after
+    /// `open()`. `labels_for_flags` short-circuits on `!is_stale()` and
+    /// therefore hands `translate_flag_op` an empty label vocabulary,
+    /// which turns any `$gmail-label:<id>:<name>` flag into an
+    /// `unsupported_flags` entry - and the bulk driver reports that as
+    /// `MutationSuccess::Skipped`, a success lane. The same empty list
+    /// reaches `canonical_flags` from `inventory_stream` and
+    /// `get_stream`, where the missing name falls back to the id and
+    /// changes the `flags_hash` in every `Fingerprint`.
+    #[test]
+    fn a_never_populated_scope_cache_reports_itself_fresh() {
+        let empty = ScopeSnapshot::empty();
+        assert!(empty.labels.is_empty());
+        assert!(
+            !empty.is_stale(),
+            "an empty cache claims freshness, so no refresh is triggered for {SCOPE_CACHE_STALE_AFTER:?}",
+        );
+    }
+
+    #[test]
+    fn a_snapshot_older_than_the_stale_window_is_stale() {
+        // `Instant` is monotonic-since-boot, so back-dating can fail on
+        // a machine that just booted. Skip rather than panic there.
+        if let Some(back_dated) =
+            Instant::now().checked_sub(SCOPE_CACHE_STALE_AFTER + Duration::from_secs(1))
+        {
+            let stale = ScopeSnapshot {
+                labels: vec![label("Label_1", "Work", "user")],
+                fetched_at: back_dated,
+            };
+            assert!(stale.is_stale());
+        }
+
+        let fresh = ScopeSnapshot {
+            labels: vec![label("Label_1", "Work", "user")],
+            fetched_at: Instant::now(),
+        };
+        assert!(!fresh.is_stale());
+    }
+
+    #[test]
+    fn snapshot_reads_the_cache_under_the_lock() {
+        let cache: ScopeCache = Arc::new(RwLock::new(snapshot_of(vec![label(
+            "Label_1", "Work", "user",
+        )])));
+        assert_eq!(snapshot(&cache).labels.len(), 1);
+    }
+}

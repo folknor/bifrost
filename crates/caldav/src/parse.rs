@@ -1212,6 +1212,61 @@ END:VCALENDAR</C:calendar-data></D:prop>
     }
 
     #[test]
+    fn multiget_response_level_status_reports_failed_resource() {
+        // Some servers report a vanished resource with a response-level
+        // status and no propstat at all (the sync-collection shape). The
+        // status still classifies the failure as a benign missing
+        // resource.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/cal/gone.ics</D:href>
+    <D:status>HTTP/1.1 404 Not Found</D:status>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.events.is_empty());
+        assert_eq!(report.failed_hrefs(), vec!["/cal/gone.ics".to_string()]);
+        assert_eq!(report.failed[0].status, Some(404));
+        assert_eq!(report.classify(), MultigetOutcome::Usable);
+    }
+
+    #[test]
+    fn classify_carries_none_status_for_a_statusless_systemic_failure() {
+        // A 2xx propstat with no calendar-data yields a failed resource
+        // with no status code at all. Combined with a benign 404 the body
+        // still classifies as a complete failure (nothing usable came
+        // back, and not every failure was a vanished resource), and the
+        // carried status is None because the systemic failure had none.
+        let xml = r#"
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/cal/gone.ics</D:href>
+    <D:propstat>
+      <D:prop><C:calendar-data/></D:prop>
+      <D:status>HTTP/1.1 404 Not Found</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>/cal/empty.ics</D:href>
+    <D:propstat>
+      <D:prop><D:getetag>"e"</D:getetag></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let report = parse_multiget_report(xml).expect("valid 207");
+        assert!(report.events.is_empty());
+        assert_eq!(report.failed.len(), 2);
+        assert_eq!(
+            report.classify(),
+            MultigetOutcome::CompleteFailure { status: None }
+        );
+    }
+
+    #[test]
     fn an_empty_body_is_usable_not_a_failure() {
         // A query that matched nothing is a legitimate empty result.
         let xml = r#"<D:multistatus xmlns:D="DAV:"></D:multistatus>"#;

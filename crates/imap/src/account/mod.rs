@@ -1155,4 +1155,60 @@ mod router_tests {
             &AccountErrorKind::Unsupported(AccountOperation::SyncInventory)
         );
     }
+
+    // A non-folder, non-composable scope must not silently resolve to a
+    // folder named after it; it is honestly Unsupported.
+    #[test]
+    fn account_scope_is_unsupported_for_imap() {
+        let err = super::folder_from_scope(&CursorScope::Account, AccountOperation::SyncChanges)
+            .expect_err("an account-wide scope has no IMAP mailbox");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Unsupported(AccountOperation::SyncChanges)
+        );
+    }
+
+    // The folder scope string and the membership scope string are the
+    // same native mailbox path; the container projection joins on it.
+    #[test]
+    fn folder_and_membership_scopes_agree_on_the_native_path() {
+        let folder = crate::types::MailboxName::new("Shared/alice/Reports").expect("valid mailbox");
+        assert_eq!(
+            super::folder_scope(&folder),
+            CursorScope::Folder(FolderId("Shared/alice/Reports".to_string()))
+        );
+        assert_eq!(
+            super::membership_scope(&folder),
+            bifrost_types::MembershipScope::Folder(FolderId("Shared/alice/Reports".to_string()))
+        );
+    }
+
+    // A mailbox name with a NUL or CRLF cannot be sent on the wire, so a
+    // scope carrying one is a malformed request, not a folder handler.
+    #[test]
+    fn a_scope_with_an_unsendable_mailbox_name_is_malformed() {
+        let scope = CursorScope::Folder(FolderId("IN\r\nBOX".to_string()));
+        let err = super::folder_from_scope(&scope, AccountOperation::SyncChanges)
+            .expect_err("CRLF in a mailbox name must be rejected");
+        assert_eq!(
+            err.kind(),
+            &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+    }
+
+    // `UidSet` operands must never go out empty, and UID 0 is not a UID
+    // (RFC 3501 Section 9), so a batch of only-zero targets yields None
+    // rather than an empty or `0`-bearing sequence set.
+    #[test]
+    fn uid_set_from_u32_drops_zeros_and_refuses_to_build_an_empty_operand() {
+        assert!(super::uid_set_from_u32(&[]).is_none());
+        assert!(super::uid_set_from_u32(&[0, 0]).is_none());
+
+        let set = super::uid_set_from_u32(&[3, 1, 2, 0, 2]).expect("non-empty");
+        assert_eq!(
+            set.as_sequence_set().as_str(),
+            "1:3",
+            "adjacent UIDs coalesce into a range and the 0 is dropped",
+        );
+    }
 }

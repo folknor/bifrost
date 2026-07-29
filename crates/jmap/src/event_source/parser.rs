@@ -255,4 +255,86 @@ mod tests {
             ]
         );
     }
+
+    // The SSE spec (WHATWG, "Interpreting an event stream") says the
+    // `id` field SETS the last-event-id buffer: a second `id:` line
+    // replaces the first. This parser appends. Documented, not
+    // endorsed - `Last-Event-ID` resumption sends a fabricated id.
+    #[test]
+    fn repeated_id_fields_concatenate_instead_of_replacing() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("id: 1\nid: 2\ndata: x\n\n"));
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(event.id).unwrap(), "12");
+        assert_eq!(String::from_utf8(event.data).unwrap(), "x");
+    }
+
+    // `push_bytes` overwrites the buffer without resetting `pos`, and
+    // nothing enforces the `needs_bytes()` precondition. A caller that
+    // stops draining the iterator early - which `event_source::stream`
+    // does on every yielded error, because its `break` only leaves the
+    // inner `for` loop - resumes at a stale offset inside the NEW
+    // buffer. Documented, not endorsed: the fix is for `push_bytes` to
+    // append to (or refuse to clobber) an unconsumed buffer.
+    #[test]
+    fn push_bytes_over_a_partially_consumed_buffer_resumes_at_a_stale_offset() {
+        let mut parser = super::EventParser::default();
+        parser.push_bytes(Vec::from("data: one\n\ndata: two\n\n"));
+
+        let first = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(String::from_utf8(first.data).unwrap(), "one");
+        assert!(
+            !parser.needs_bytes(),
+            "the buffer still holds the second event"
+        );
+
+        // 11 bytes have been consumed. Pushing a 13-byte frame resumes
+        // at index 11 of it, i.e. at the two trailing newlines, so the
+        // `three` payload is never seen and a bogus empty event is
+        // emitted instead.
+        parser.push_bytes(Vec::from("data: three\n\n"));
+        let next = parser.next().expect("an event").expect("no parse error");
+        assert_eq!(
+            String::from_utf8(next.data).unwrap(),
+            "",
+            "`two` was dropped and `three` was skipped"
+        );
+    }
+
+    // The size guard returns an error without clearing the overflowing
+    // field or resynchronising, so the same buffer keeps producing the
+    // same error. Documented, not endorsed.
+    #[test]
+    fn an_oversized_field_errors_repeatedly_without_resyncing() {
+        let mut parser = super::EventParser::default();
+        let mut frame = vec![b'x'; super::MAX_EVENT_SIZE + 4];
+        frame.extend_from_slice(b": v\n\n");
+        parser.push_bytes(frame);
+
+        assert!(parser.next().expect("an item").is_err());
+        assert!(
+            parser.next().expect("another item").is_err(),
+            "the parser never drops the oversized field, so it cannot recover"
+        );
+    }
+
+    // Only `data` accumulation is unbounded: MAX_EVENT_SIZE caps a
+    // single field/value pair, but `result.data` grows across every
+    // `data:` line of one event with no cap at all.
+    #[test]
+    fn multi_line_data_accumulates_past_the_single_line_cap() {
+        let mut parser = super::EventParser::default();
+        let line = format!("data: {}\n", "y".repeat(1024));
+        let mut frame = String::new();
+        for _ in 0..64 {
+            frame.push_str(&line);
+        }
+        frame.push('\n');
+        parser.push_bytes(frame.into_bytes());
+
+        let event = parser.next().expect("an event").expect("no parse error");
+        // 64 lines of 1024 bytes plus 63 joining newlines.
+        assert_eq!(event.data.len(), 64 * 1024 + 63);
+    }
 }

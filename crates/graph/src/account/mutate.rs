@@ -672,4 +672,273 @@ mod tests {
         assert!(body.get("flag").is_none());
         assert!(body.get("categories").is_none());
     }
+
+    #[test]
+    fn remove_clears_the_named_fields() {
+        let body = patch_for_flags(&FlagOp::Remove(flag_set(&["\\Seen", "starred"])));
+        assert_eq!(body.get("isRead"), Some(&json!(false)));
+        assert_eq!(
+            body.get("flag"),
+            Some(&json!({ "flagStatus": "notFlagged" }))
+        );
+    }
+
+    #[test]
+    fn patch_applies_removes_after_adds_so_remove_wins_on_a_contested_flag() {
+        // `Patch` is one wire operation, so a flag present in both halves
+        // has to resolve deterministically. `apply_flag_removes` runs last.
+        let body = patch_for_flags(&FlagOp::Patch {
+            add: flag_set(&["\\Seen", "\\Flagged"]),
+            remove: flag_set(&["\\Seen"]),
+        });
+        assert_eq!(body.get("isRead"), Some(&json!(false)));
+        assert_eq!(body.get("flag"), Some(&json!({ "flagStatus": "flagged" })));
+    }
+
+    #[test]
+    fn set_sorts_categories_for_a_deterministic_body() {
+        let body = patch_for_flags(&FlagOp::Set(flag_set(&[
+            "category:Zeta",
+            "category:alpha",
+            "category:Mid",
+        ])));
+        // Byte order, not locale order - the point is only that the same
+        // input set always produces the same JSON.
+        assert_eq!(
+            body.get("categories"),
+            Some(&json!(["Mid", "Zeta", "alpha"]))
+        );
+    }
+
+    #[test]
+    fn flag_names_are_matched_case_insensitively() {
+        for token in ["\\seen", "\\SEEN", "Read", "read"] {
+            let body = patch_for_flags(&FlagOp::Add(flag_set(&[token])));
+            assert_eq!(
+                body.get("isRead"),
+                Some(&json!(true)),
+                "token {token} did not set isRead"
+            );
+        }
+        for token in ["\\flagged", "\\FLAGGED", "Flagged", "Starred"] {
+            let body = patch_for_flags(&FlagOp::Add(flag_set(&[token])));
+            assert_eq!(
+                body.get("flag"),
+                Some(&json!({ "flagStatus": "flagged" })),
+                "token {token} did not set the flag"
+            );
+        }
+    }
+
+    /// Documents a defect, NOT the intended contract.
+    /// `FlagOp::Add` / `Remove` / `Patch`
+    /// ignore `category:` flags entirely - only `Set` writes `categories`.
+    /// A `bulk_set_flags(Add{category:Work})` therefore PATCHes an EMPTY
+    /// object, Graph answers 200, and `mutation_item_outcome` reports
+    /// `Succeeded(Applied)` for a mutation that changed nothing. The
+    /// consumer's read-back guard is the only thing that would notice.
+    #[test]
+    fn add_and_remove_silently_drop_category_flags_into_an_empty_patch() {
+        assert_eq!(
+            patch_for_flags(&FlagOp::Add(flag_set(&["category:Work"]))),
+            json!({})
+        );
+        assert_eq!(
+            patch_for_flags(&FlagOp::Remove(flag_set(&["category:Work"]))),
+            json!({})
+        );
+        assert_eq!(
+            patch_for_flags(&FlagOp::Patch {
+                add: flag_set(&["category:Work"]),
+                remove: flag_set(&["category:Old"]),
+            }),
+            json!({})
+        );
+        // An unrecognized flag is dropped the same way.
+        assert_eq!(
+            patch_for_flags(&FlagOp::Add(flag_set(&["\\Draft"]))),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn set_flags_without_an_etag_refuses_to_build_a_request() {
+        // `If-Match` is mandatory for SetFlags/Move; without a cached or
+        // refreshed etag the item must fail rather than write unconditioned.
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        assert!(
+            request_for_mutation(
+                &account,
+                &id,
+                &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+                &HashMap::new(),
+            )
+            .expect("builds")
+            .is_none()
+        );
+        assert!(
+            request_for_mutation(
+                &account,
+                &id,
+                &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
+                &HashMap::new(),
+            )
+            .expect("builds")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn destroy_attaches_if_match_opportunistically() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+
+        let unconditioned =
+            request_for_mutation(&account, &id, &MutationKind::Destroy, &HashMap::new())
+                .expect("builds")
+                .expect("destroy needs no etag");
+        assert!(unconditioned.headers.is_none());
+
+        let conditioned =
+            request_for_mutation(&account, &id, &MutationKind::Destroy, &etag_map(&id))
+                .expect("builds")
+                .expect("some request");
+        assert_eq!(
+            conditioned
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("If-Match"))
+                .map(String::as_str),
+            Some("W/\"CK1\"")
+        );
+        assert!(conditioned.body.is_none());
+    }
+
+    #[test]
+    fn move_to_a_non_folder_destination_is_rejected() {
+        // Only `MembershipScope::Folder` names a Graph move target; a
+        // mailbox-scoped destination is a caller error, surfaced by the
+        // caller as `Request(Malformed)`.
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        let etags = etag_map(&id);
+        assert!(
+            request_for_mutation(
+                &account,
+                &id,
+                &MutationKind::Move(MembershipScope::Mailbox(bifrost_types::MailboxId(
+                    "shared@contoso.com".to_string()
+                ))),
+                &etags,
+            )
+            .expect("builds")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn primary_move_uses_the_bare_destination_folder_id() {
+        let account = shared_account();
+        let id = ObjectId("AAMkmsg".to_string());
+        let etags = etag_map(&id);
+        let request = request_for_mutation(
+            &account,
+            &id,
+            &MutationKind::Move(MembershipScope::Folder(FolderId("archive".to_string()))),
+            &etags,
+        )
+        .expect("builds")
+        .expect("some request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "/me/messages/AAMkmsg/move");
+        assert_eq!(request.body, Some(json!({ "destinationId": "archive" })));
+    }
+
+    #[test]
+    fn set_flags_conditions_on_the_cached_etag_keyed_by_the_encoded_id() {
+        // The etag cache is keyed by the CALLER-facing (foreign-encoded) id
+        // even though the URL carries the native one; a lookup by native id
+        // would miss and drop the mutation.
+        let account = shared_account();
+        let id = foreign_message_id("shared@contoso.com", "AAMkfolder", "AAMkmsg");
+        let mut native_keyed = HashMap::new();
+        native_keyed.insert("AAMkmsg".to_string(), "W/\"CK1\"".to_string());
+        assert!(
+            request_for_mutation(
+                &account,
+                &id,
+                &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+                &native_keyed,
+            )
+            .expect("builds")
+            .is_none(),
+            "a native-keyed etag must not satisfy an encoded-id lookup"
+        );
+
+        let request = request_for_mutation(
+            &account,
+            &id,
+            &MutationKind::SetFlags(FlagOp::Add(HashSet::from(["\\seen".to_string()]))),
+            &etag_map(&id),
+        )
+        .expect("builds")
+        .expect("some request");
+        assert_eq!(
+            request
+                .headers
+                .as_ref()
+                .and_then(|h| h.get("If-Match"))
+                .map(String::as_str),
+            Some("W/\"CK1\"")
+        );
+    }
+
+    #[test]
+    fn operation_labels_match_the_mutation_kind() {
+        assert_eq!(
+            operation_for_kind(&MutationKind::SetFlags(FlagOp::Add(HashSet::new()))),
+            AccountOperation::UpdateFlags
+        );
+        assert_eq!(
+            operation_for_kind(&MutationKind::Move(MembershipScope::Folder(FolderId(
+                "archive".to_string()
+            )))),
+            AccountOperation::BulkMove
+        );
+        assert_eq!(
+            operation_for_kind(&MutationKind::Destroy),
+            AccountOperation::BulkDestroy
+        );
+    }
+
+    #[test]
+    fn only_flag_bearing_kinds_require_an_etag() {
+        assert!(requires_etag(&MutationKind::SetFlags(FlagOp::Add(
+            HashSet::new()
+        ))));
+        assert!(requires_etag(&MutationKind::Move(MembershipScope::Folder(
+            FolderId("archive".to_string())
+        ))));
+        assert!(!requires_etag(&MutationKind::Destroy));
+    }
+
+    fn idempotency_key() -> IdempotencyKey {
+        IdempotencyKey {
+            run_id: bifrost_types::RunId("run-1".to_string()),
+            sequence: 0,
+            protocol_salt: bifrost_types::ProtocolSalt::Graph("salt".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_target_stream_yields_only_done() {
+        // No ids means no `$batch`; the stream must not emit an empty
+        // `Batch` (which the engine would read as "0 of N applied").
+        let account = shared_account();
+        let targets: AccountStream<ObjectId> = Box::pin(futures::stream::empty());
+        let mut stream = bulk_destroy_stream(account, targets, idempotency_key());
+        assert!(matches!(stream.next().await, Some(SyncEvent::Done(None))));
+        assert!(stream.next().await.is_none());
+    }
 }

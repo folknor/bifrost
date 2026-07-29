@@ -319,3 +319,7 @@ enum SearchCriteriaItem<'a> {
     Quoted,
     Literal,
 }
+
+#[cfg(test)]
+#[path = "search_validation_tests.rs"]
+mod tests;

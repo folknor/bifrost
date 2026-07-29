@@ -372,3 +372,223 @@ impl std::fmt::Debug for MeterSinkHandle {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sliding window is anchored on `Instant`, which no test clock
+    /// controls. Every assertion below drives `RateWindow` with
+    /// synthetic instants instead, so the roll / zero / divisor maths is
+    /// pinned deterministically rather than raced against wall time
+    /// (which is what forced `tests/bandwidth_window.rs` to settle for
+    /// qualitative assertions).
+    fn base() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn samples_inside_one_second_land_in_the_same_bucket() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, 100);
+        window.add_out(t0 + Duration::from_millis(400), 50);
+        window.add_in(t0 + Duration::from_millis(999), 25);
+
+        assert_eq!(window.head, 0, "sub-second samples must not roll the head");
+        assert_eq!(window.samples[0].bytes_in, 125);
+        assert_eq!(window.samples[0].bytes_out, 50);
+    }
+
+    #[test]
+    fn crossing_a_second_boundary_opens_a_fresh_bucket() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, 100);
+        window.add_in(t0 + Duration::from_secs(1), 40);
+
+        assert_eq!(window.head, 1);
+        assert_eq!(window.samples[0].bytes_in, 100, "the prior second is kept");
+        assert_eq!(window.samples[1].bytes_in, 40);
+    }
+
+    /// `head_started` advances by whole seconds only, so the sub-second
+    /// remainder carries forward. Without that, a stream of samples at
+    /// 1.5 s intervals would roll on every single call.
+    #[test]
+    fn sub_second_remainder_carries_forward_across_rolls() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0 + Duration::from_millis(1500), 10);
+        assert_eq!(window.head, 1);
+        window.add_in(t0 + Duration::from_millis(1900), 10);
+        assert_eq!(
+            window.head, 1,
+            "1.9 s is still inside the bucket opened at 1.0 s"
+        );
+        assert_eq!(window.samples[1].bytes_in, 20);
+        window.add_in(t0 + Duration::from_millis(2100), 10);
+        assert_eq!(window.head, 2);
+    }
+
+    #[test]
+    fn a_ten_second_gap_empties_the_entire_window() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, 1_000);
+        assert_eq!(window.bps(t0), 1_000);
+        assert_eq!(
+            window.bps(t0 + Duration::from_secs(10)),
+            0,
+            "ten idle seconds roll every bucket out of the window"
+        );
+    }
+
+    /// The roll loop is bounded at ten steps, so an hour-long idle gap
+    /// costs ten iterations and leaves an empty window rather than
+    /// walking 3600 buckets.
+    #[test]
+    fn a_very_long_gap_is_bounded_and_still_empties_the_window() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, 5_000);
+        assert_eq!(window.bps(t0 + Duration::from_secs(3600)), 0);
+        window.add_in(t0 + Duration::from_secs(3601), 700);
+        assert_eq!(
+            window.bps(t0 + Duration::from_secs(3601)),
+            70,
+            "after an hour idle the divisor is the full ten-second window"
+        );
+    }
+
+    /// During warm-up the divisor is the elapsed window rather than a
+    /// flat ten seconds, so a fresh meter does not under-report by 10x.
+    /// The divisor saturates at one second so a sub-second first sample
+    /// does not become a division-by-zero spike.
+    #[test]
+    fn warmup_divisor_is_elapsed_time_saturated_to_one_second() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, 300);
+        assert_eq!(
+            window.bps(t0 + Duration::from_millis(500)),
+            300,
+            "under a second the divisor is 1, not 0"
+        );
+
+        let mut window = RateWindow::new(t0);
+        for second in 0..4u64 {
+            window.add_in(t0 + Duration::from_secs(second), 100);
+        }
+        assert_eq!(
+            window.bps(t0 + Duration::from_secs(3)),
+            133,
+            "400 bytes over a 3 s warm-up window, integer-divided"
+        );
+    }
+
+    #[test]
+    fn divisor_is_capped_at_ten_seconds_once_warm() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        for second in 0..10u64 {
+            window.add_in(t0 + Duration::from_secs(second), 90);
+        }
+        assert_eq!(
+            window.bps(t0 + Duration::from_secs(9)),
+            100,
+            "900 bytes across a nine-second elapsed window"
+        );
+        let mut window = RateWindow::new(t0);
+        for second in 0..30u64 {
+            window.add_in(t0 + Duration::from_secs(second), 100);
+        }
+        assert_eq!(
+            window.bps(t0 + Duration::from_secs(29)),
+            100,
+            "a long-running stream still divides by ten, not by thirty"
+        );
+    }
+
+    #[test]
+    fn per_bucket_byte_counts_saturate_instead_of_overflowing() {
+        let t0 = base();
+        let mut window = RateWindow::new(t0);
+        window.add_in(t0, u64::MAX);
+        window.add_in(t0, 1);
+        window.add_out(t0, u64::MAX);
+        assert_eq!(window.samples[0].bytes_in, u64::MAX);
+        // `bps` sums in + out with `saturating_add` too, so the total
+        // is clamped rather than wrapping to a small number.
+        assert_eq!(window.bps(t0), u64::MAX);
+    }
+
+    // ---- meter registration ------------------------------------------
+
+    /// `AccountMeter` for an unregistered account is inert: every
+    /// reading is zero and every record is dropped. This is the
+    /// asymmetry the HTTP path inherits, because `AccountNet::meter()`
+    /// snapshots via `BandwidthMeter::account` (lookup only) while the
+    /// `MeterSink` impl auto-registers.
+    #[test]
+    fn unregistered_account_meter_is_inert_but_meter_sink_auto_registers() {
+        let meter = BandwidthMeter::new();
+        let account = AccountId("never-registered".to_owned());
+
+        let handle = meter.account(account.clone());
+        handle.record_bytes_in(4_096);
+        assert_eq!(
+            handle.bytes_in(),
+            0,
+            "a handle minted before registration silently drops bytes"
+        );
+
+        // The MeterSink path takes the other branch and registers.
+        MeterSink::record_bytes_in(&meter, &account, 4_096);
+        assert_eq!(meter.account(account).bytes_in(), 4_096);
+    }
+
+    #[test]
+    fn register_account_is_idempotent_and_forget_clears_counters() {
+        let meter = BandwidthMeter::new();
+        let account = AccountId("acct".to_owned());
+        meter.register_account(account.clone());
+        MeterSink::record_bytes_in(&meter, &account, 10);
+        meter.register_account(account.clone());
+        assert_eq!(
+            meter.account(account.clone()).bytes_in(),
+            10,
+            "re-registering must not reset live counters"
+        );
+
+        meter.forget_account(&account);
+        assert_eq!(meter.account(account).bytes_in(), 0);
+    }
+
+    #[test]
+    fn meter_sink_handle_routes_to_the_account_it_owns() {
+        let meter = Arc::new(BandwidthMeter::new());
+        let account = AccountId("imap-acct".to_owned());
+        meter.register_account(account.clone());
+
+        let handle = MeterSinkHandle::from_meter(Arc::clone(&meter), account.clone());
+        assert_eq!(handle.account(), &account);
+        handle.record_bytes_out(512);
+        handle.record_bytes_in(1_024);
+
+        let view = meter.account(account);
+        assert_eq!(view.bytes_out(), 512);
+        assert_eq!(view.bytes_in(), 1_024);
+    }
+
+    /// The account id must not leak through `Debug` alongside secrets;
+    /// pin that the handle prints its account and nothing else.
+    #[test]
+    fn meter_sink_handle_debug_is_non_exhaustive() {
+        let meter = Arc::new(BandwidthMeter::new());
+        let handle = MeterSinkHandle::from_meter(meter, AccountId("a".to_owned()));
+        let rendered = format!("{handle:?}");
+        assert!(rendered.starts_with("MeterSinkHandle"));
+        assert!(rendered.contains(".."));
+    }
+}

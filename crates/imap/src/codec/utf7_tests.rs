@@ -527,3 +527,88 @@ fn imap_b64_alphabet_is_valid() {
     base64::alphabet::Alphabet::new(IMAP_B64_ALPHABET_STR)
         .expect("alphabet must be accepted by the base64 crate");
 }
+
+/// RFC 3501 Section 5.1.3 replaces raw control octets with U+FFFD, but a
+/// control character carried *inside* a modified-Base64 shift segment is
+/// decoded literally: `&AAoACQ-` is UTF-16BE `U+000A U+0009`.
+///
+/// The two paths therefore disagree about whether a mailbox name may contain
+/// control characters.
+/// means downstream  -  `MailboxName::from_decoded` performs no validation.
+#[test]
+fn base64_encoded_control_characters_are_decoded_literally() {
+    assert_eq!(
+        decode_utf7(b"&AAoACQ-"),
+        "\n\t",
+        "control characters inside a Base64 shift segment survive decoding, \
+         unlike raw control octets which become U+FFFD"
+    );
+    // Contrast: the same octets sent raw are replaced.
+    assert_eq!(decode_utf7(b"\n\t"), "\u{FFFD}\u{FFFD}");
+}
+
+mod prop_decode_invariants {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Arbitrary Rust strings, *including* control characters. The existing
+    /// `i15_roundtrip_encode_decode_utf7` property deliberately excludes NUL,
+    /// CR, and LF because they are invalid in a user-supplied mailbox name;
+    /// this generator covers the names `decode_utf7` can itself produce.
+    fn arb_any_string() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<char>(), 0..40)
+            .prop_map(|chars| chars.into_iter().collect::<String>())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// `decode_utf7` must not panic on arbitrary wire bytes. Mailbox
+        /// names are fully server-controlled and are decoded before any
+        /// validation runs (RFC 3501 Section 5.1.3).
+        #[test]
+        fn decode_utf7_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
+            let _ = decode_utf7(&bytes);
+        }
+
+        /// RFC 3501 Section 5.1.3: encode/decode is an identity for *every*
+        /// Rust string, not only for names free of NUL/CR/LF. This matters
+        /// operationally because `decode_utf7` can emit control characters
+        /// (see `base64_encoded_control_characters_are_decoded_literally`),
+        /// and the resulting `MailboxName` is handed straight back to
+        /// `encode_mailbox_str` on the next command.
+        #[test]
+        fn roundtrip_identity_including_control_characters(name in arb_any_string()) {
+            let encoded = encode_utf7(&name);
+            prop_assert_eq!(decode_utf7(encoded.as_bytes()), name);
+        }
+
+        /// Whatever `decode_utf7` produced from hostile wire bytes must
+        /// survive the round trip the account layer actually performs:
+        /// decode on parse, re-encode on the next command. A non-identity
+        /// here would make the client address a different mailbox than the
+        /// server named (RFC 3501 Section 5.1.3).
+        #[test]
+        fn decode_is_stable_under_reencode(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
+            let once = decode_utf7(&bytes);
+            let twice = decode_utf7(encode_utf7(&once).as_bytes());
+            prop_assert_eq!(twice, once);
+        }
+
+        /// Encoding never emits an octet outside printable US-ASCII
+        /// (RFC 3501 Section 5.1.3: everything else goes through the
+        /// modified-Base64 shift). This is what lets `encode_mailbox_str`
+        /// hand the result to the quoted-string encoder without escaping.
+        #[test]
+        fn encode_emits_only_printable_ascii(name in arb_any_string()) {
+            let encoded = encode_utf7(&name);
+            for b in encoded.bytes() {
+                prop_assert!(
+                    (0x20..=0x7E).contains(&b),
+                    "encode_utf7 emitted non-printable octet {:#04x} for {:?}",
+                    b, name
+                );
+            }
+        }
+    }
+}

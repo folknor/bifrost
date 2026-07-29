@@ -886,6 +886,112 @@ mod tests {
     }
 
     #[test]
+    fn compact_uid_set_drops_zero_sorts_and_dedupes() {
+        // UIDs are nz-number: a 0 is not a UID and must never reach a
+        // range. Input order and duplicates must not survive either.
+        let set = CompactUidSet::from_uids([9, 0, 2, 2, 1, 0, 3]);
+        assert_eq!(set.to_uids(), vec![1, 2, 3, 9]);
+        assert_eq!(set.ranges(), &[UidRange::range(1, 3), UidRange::single(9)]);
+        assert_eq!(set.len(), 4);
+
+        assert!(CompactUidSet::from_uids([0, 0]).ranges().is_empty());
+        assert_eq!(CompactUidSet::default().len(), 0);
+    }
+
+    #[test]
+    fn compact_uid_set_from_ranges_normalizes_overlap_and_order() {
+        // `from_ranges` is the cursor-decode entry point, so it must cope
+        // with a set that was written out of order or with overlaps and
+        // still produce one canonical merged range list.
+        let set = CompactUidSet::from_ranges(vec![
+            UidRange::range(5, 8),
+            UidRange::single(1),
+            UidRange::range(2, 6),
+        ]);
+        assert_eq!(set.ranges(), &[UidRange::range(1, 8)]);
+        assert_eq!(set.len(), 8);
+    }
+
+    #[test]
+    fn compact_uid_set_diff_reports_both_directions() {
+        let old = CompactUidSet::from_uids([1, 2, 3]);
+        let new = CompactUidSet::from_uids([2, 3, 4]);
+        let forward = old.diff(&new);
+        assert_eq!(forward.added, vec![4]);
+        assert_eq!(forward.removed, vec![1]);
+        let backward = new.diff(&old);
+        assert_eq!(backward.added, vec![1]);
+        assert_eq!(backward.removed, vec![4]);
+        // A set diffed against itself reports nothing.
+        assert_eq!(old.diff(&old), UidSetDiff::default());
+    }
+
+    #[test]
+    fn expand_range_covers_single_and_inclusive_range() {
+        assert_eq!(expand_range(UidRange::single(4)), vec![4]);
+        assert_eq!(expand_range(UidRange::range(4, 7)), vec![4, 5, 6, 7]);
+        assert_eq!(expand_range(UidRange::range(4, 4)), vec![4]);
+    }
+
+    #[test]
+    fn clear_modseqs_is_a_no_op_for_another_uidvalidity_epoch() {
+        let info = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            ..Default::default()
+        };
+        let entry = FolderEntry::from_mailbox(info);
+        entry.record_modseq(11, 7, 99).expect("valid modseq");
+
+        // An expunge reported against a different epoch must not evict the
+        // current epoch's cached MODSEQ (that would silently downgrade the
+        // next STORE from UNCHANGEDSINCE-protected to unprotected).
+        entry.clear_modseqs(12, &[7]);
+        assert_eq!(entry.modseq(11, 7), Some(99));
+
+        entry.clear_modseqs(11, &[7]);
+        assert_eq!(entry.modseq(11, 7), None);
+    }
+
+    #[test]
+    fn mark_seen_records_a_last_seen_instant() {
+        let info = MailboxInfo {
+            name: MailboxName::new("INBOX").expect("valid mailbox"),
+            ..Default::default()
+        };
+        let entry = FolderEntry::from_mailbox(info);
+        assert!(entry.last_seen().is_none());
+        entry.mark_seen();
+        assert!(entry.last_seen().is_some());
+    }
+
+    // A LIST/IDLE event for a folder we already know, with no OLDNAME and
+    // no `\NonExistent`, is a re-announcement, not a new epoch: the entry
+    // (and its MODSEQ cache and cursor) is left alone. Only a delete
+    // followed by a create, or an explicit rename, installs a fresh entry.
+    #[test]
+    fn duplicate_create_event_leaves_a_known_folder_untouched() {
+        let folder = MailboxName::new("Projects").expect("valid mailbox");
+        let registry = FolderRegistry::from_list(vec![MailboxInfo {
+            name: folder.clone(),
+            ..Default::default()
+        }]);
+        let entry = registry.get(&folder).expect("folder entry");
+        entry.record_modseq(11, 7, 99).expect("valid modseq");
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: folder.clone(),
+            ..Default::default()
+        });
+
+        let after = registry.get(&folder).expect("folder still registered");
+        assert_eq!(
+            after.modseq(11, 7),
+            Some(99),
+            "a re-announcement must not reset the MODSEQ cache"
+        );
+    }
+
+    #[test]
     fn recreate_preserves_shared_owner_tag() {
         let folder = MailboxName::new("Shared/alice/Proj").expect("valid mailbox");
         let registry = FolderRegistry::from_lists(Vec::new(), vec![shared_entry(&folder, None)]);

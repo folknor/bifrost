@@ -70,3 +70,56 @@ impl UidRange {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::UidRange;
+
+    #[test]
+    fn single_and_range_carry_the_expected_shape() {
+        let single = UidRange::single(7);
+        assert_eq!(single.start, 7);
+        assert_eq!(single.end, None, "a single UID is not a range");
+
+        let range = UidRange::range(3, 9);
+        assert_eq!(range.start, 3);
+        assert_eq!(range.end, Some(9));
+
+        // A one-element range is representable both ways, and the two
+        // spellings are NOT equal: `end` distinguishes them.
+        assert_ne!(UidRange::range(3, 3), UidRange::single(3));
+    }
+
+    // RFC 3501 Section 9: uniqueid = nz-number. The checked constructors
+    // are the ones decode paths must use, because the unchecked pair only
+    // asserts in debug builds - a release build would silently mint a
+    // zero-UID range from corrupt input.
+    #[test]
+    fn checked_constructors_reject_zero_uids() {
+        assert_eq!(UidRange::try_single(0), None);
+        assert_eq!(UidRange::try_range(0, 5), None);
+        assert_eq!(UidRange::try_range(5, 0), None);
+        assert_eq!(UidRange::try_range(0, 0), None);
+
+        assert_eq!(UidRange::try_single(1), Some(UidRange::single(1)));
+        assert_eq!(UidRange::try_range(1, 2), Some(UidRange::range(1, 2)));
+    }
+
+    #[test]
+    fn checked_range_does_not_police_direction() {
+        // `try_range` only enforces nz-number, not ordering: a backwards
+        // range is the caller's problem (cursor decode rejects it
+        // explicitly in `account::envelope`).
+        assert_eq!(UidRange::try_range(9, 3), Some(UidRange::range(9, 3)));
+    }
+
+    #[test]
+    fn default_is_the_degenerate_zero_single() {
+        // `Default` exists for struct-update syntax; it is deliberately
+        // NOT a valid UID, so nothing may treat it as one.
+        let default = UidRange::default();
+        assert_eq!(default.start, 0);
+        assert_eq!(default.end, None);
+        assert_eq!(UidRange::try_single(default.start), None);
+    }
+}

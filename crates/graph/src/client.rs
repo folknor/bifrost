@@ -695,6 +695,96 @@ mod tests {
         assert!(scoped.is_shared_mailbox());
     }
 
+    /// Documents a latent trap, NOT a guarantee. Unlike
+    /// `derive_outlook_base`, which follows any non-production Graph host,
+    /// `derive_beta_base` only rewrites a base that ends in `/v1.0` and
+    /// otherwise falls back to the PRODUCTION `graph.microsoft.com/beta`.
+    /// A harness or sovereign-cloud base shaped any other way would send
+    /// beta traffic to the real service. Nothing reads `api_beta_base`
+    /// today, so this is latent rather than live - pinned so it is not
+    /// wired up without noticing.
+    #[test]
+    fn beta_base_falls_back_to_production_for_a_base_without_the_v1_suffix() {
+        let client = GraphClient::with_api_base("http://127.0.0.1:8181/graph", "token");
+        assert_eq!(client.api_base(), "http://127.0.0.1:8181/graph");
+        assert_eq!(client.api_beta_base(), GRAPH_API_BETA);
+        // The Outlook origin, by contrast, correctly follows the redirect.
+        assert_eq!(client.outlook_base(), "http://127.0.0.1:8181");
+
+        assert_eq!(
+            derive_beta_base("https://example.test/v1.0").as_deref(),
+            Some("https://example.test/beta")
+        );
+        assert_eq!(derive_beta_base("https://example.test/graph"), None);
+    }
+
+    #[test]
+    fn build_url_joins_relative_paths_and_passes_absolute_urls_through() {
+        // The `@odata.nextLink` / `@odata.deltaLink` walk feeds absolute
+        // URLs back in; rewriting them onto the api-base would break
+        // pagination.
+        assert_eq!(
+            build_url("https://x/v1.0", "/me/messages"),
+            "https://x/v1.0/me/messages"
+        );
+        assert_eq!(
+            build_url("https://x/v1.0", "me/messages"),
+            "https://x/v1.0/me/messages"
+        );
+        assert_eq!(
+            build_url("https://x/v1.0", "https://graph.example/next?$skiptoken=a"),
+            "https://graph.example/next?$skiptoken=a"
+        );
+        assert_eq!(
+            build_url("https://x/v1.0", "http://graph.example/next"),
+            "http://graph.example/next"
+        );
+    }
+
+    #[test]
+    fn rate_limit_host_tracks_the_api_base_host() {
+        // The per-host token bucket must follow a redirected base, or a
+        // harness run would meter against `graph.microsoft.com`.
+        assert_eq!(
+            host_from_api_base("https://graph.microsoft.com/v1.0"),
+            GRAPH_HOST
+        );
+        assert_eq!(
+            host_from_api_base("http://127.0.0.1:8181/v1.0"),
+            "127.0.0.1"
+        );
+        // An unparseable base falls back to production rather than panicking.
+        assert_eq!(host_from_api_base("not a url"), GRAPH_HOST);
+    }
+
+    #[test]
+    fn outlook_base_keeps_the_scheme_and_port_of_a_redirected_api_base() {
+        assert_eq!(
+            derive_outlook_base("https://graph.contoso-cloud.test/v1.0"),
+            "https://graph.contoso-cloud.test"
+        );
+        assert_eq!(
+            derive_outlook_base("http://127.0.0.1:8181/v1.0"),
+            "http://127.0.0.1:8181"
+        );
+        assert_eq!(derive_outlook_base("nonsense"), OUTLOOK_BASE);
+    }
+
+    #[test]
+    fn shared_mailbox_prefix_percent_encodes_the_routing_key() {
+        // The routing key is an SMTP address; `@` and any `+` tag must not
+        // leak into the path unencoded.
+        let client = GraphClient::new("token").for_shared_mailbox("a+tag@contoso.com");
+        let prefix = client.api_path_prefix();
+        assert!(!prefix.contains('@'), "{prefix}");
+        assert!(!prefix.contains('+'), "{prefix}");
+        assert!(prefix.starts_with("/users/"), "{prefix}");
+        // The stored key stays verbatim - it is the map key every routing
+        // site (`client_for_owner`, `encode_foreign`) looks up.
+        assert_eq!(client.mailbox_id(), Some("a+tag@contoso.com"));
+        assert!(!client.uses_default_mailbox());
+    }
+
     #[test]
     fn attach_account_uses_engine_account_id() {
         let client = GraphClient::new("token");

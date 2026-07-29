@@ -1614,6 +1614,24 @@ mod tests {
     }
 
     #[test]
+    fn rrule_until_parses_date_form_and_case_insensitive_key() {
+        // UNTIL comes in both date and date-time forms, and RRULE part
+        // names are case-insensitive per RFC 5545.
+        let until = rrule_until("FREQ=WEEKLY;until=20260525").expect("date-form UNTIL");
+        assert_eq!(until.to_rfc3339(), "2026-05-25T00:00:00+00:00");
+
+        let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000").expect("datetime UNTIL");
+        assert_eq!(until.to_rfc3339(), "2026-05-25T12:00:00+00:00");
+
+        let until = rrule_until("FREQ=DAILY;UNTIL=20260525T120000Z").expect("UTC UNTIL");
+        assert_eq!(until.to_rfc3339(), "2026-05-25T12:00:00+00:00");
+
+        assert!(rrule_until("FREQ=DAILY").is_none());
+        assert!(rrule_until("FREQ=DAILY;UNTIL=garbage").is_none());
+        assert!(rrule_until("").is_none());
+    }
+
+    #[test]
     fn caldav_query_time_formats_rfc3339_as_utc_basic() {
         assert_eq!(
             caldav_query_time(&time("2026-06-02T02:30:00+02:00")).as_deref(),

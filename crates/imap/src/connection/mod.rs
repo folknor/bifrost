@@ -59,6 +59,9 @@ use literals::{
 use stream::{CompressedStream, ImapStream, InnerStream};
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
 

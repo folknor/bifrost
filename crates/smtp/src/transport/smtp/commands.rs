@@ -482,6 +482,89 @@ mod test {
     }
 
     #[test]
+    fn ehlo_and_lhlo_do_not_validate_the_client_id() {
+        // DOCUMENTS A BUG: `ClientId::Domain` is
+        // written into the greeting verbatim. VRFY and EXPN run their argument
+        // through `validate_single_line_argument`; EHLO and LHLO do not, so a
+        // caller-supplied `hello_name` carrying CRLF emits a second command
+        // line before any reply is read.
+        let id = ClientId::Domain("host\r\nRSET".to_owned());
+
+        assert_eq!(
+            format!("{}", Ehlo::new(id.clone())),
+            "EHLO host\r\nRSET\r\n"
+        );
+        assert_eq!(format!("{}", Lhlo::new(id)), "LHLO host\r\nRSET\r\n");
+    }
+
+    #[test]
+    fn vrfy_and_expn_reject_every_control_character() {
+        assert!(Vrfy::new("ok\r\nRSET".to_owned()).is_err());
+        assert!(Vrfy::new("ok\nRSET".to_owned()).is_err());
+        assert!(Vrfy::new("ok\0".to_owned()).is_err());
+        assert!(Expn::new("list\u{7f}".to_owned()).is_err());
+        assert!(Expn::new("list\u{9f}".to_owned()).is_err());
+        // A plain argument with an embedded space is still fine: the command
+        // is a single line, spaces are not a framing character.
+        assert!(Vrfy::new("Smith John".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn bdat_renders_a_zero_length_final_chunk() {
+        assert_eq!(format!("{}", Bdat::last(0)), "BDAT 0 LAST\r\n");
+    }
+
+    #[test]
+    fn mail_from_renders_parameters_in_insertion_order() {
+        let email = Address::from_str("test@example.com").unwrap();
+        let mail = Mail::new(
+            Some(email),
+            vec![
+                MailParameter::Size(10),
+                MailParameter::RequireTls,
+                MailParameter::SmtpUtfEight,
+            ],
+        );
+
+        assert_eq!(
+            format!("{mail}"),
+            "MAIL FROM:<test@example.com> SIZE=10 REQUIRETLS SMTPUTF8\r\n"
+        );
+    }
+
+    #[test]
+    fn auth_continuation_requires_a_334_challenge() {
+        let credentials = Credentials::password("user".to_owned(), "password".to_owned());
+        let not_a_challenge = Response::new(
+            crate::transport::smtp::response::Code {
+                severity: crate::transport::smtp::response::Severity::PositiveCompletion,
+                category: crate::transport::smtp::response::Category::MailSystem,
+                detail: crate::transport::smtp::response::Detail::Zero,
+            },
+            vec![crate::base64::encode("x")],
+        );
+
+        assert!(
+            Auth::new_from_response(Mechanism::Plain, credentials, &not_a_challenge, None).is_err()
+        );
+    }
+
+    #[test]
+    fn auth_continuation_rejects_a_non_base64_challenge() {
+        let credentials = Credentials::password("user".to_owned(), "password".to_owned());
+        let challenge = Response::new(
+            crate::transport::smtp::response::Code {
+                severity: crate::transport::smtp::response::Severity::PositiveIntermediate,
+                category: crate::transport::smtp::response::Category::Unspecified3,
+                detail: crate::transport::smtp::response::Detail::Four,
+            },
+            vec!["!!!!".to_owned()],
+        );
+
+        assert!(Auth::new_from_response(Mechanism::Plain, credentials, &challenge, None).is_err());
+    }
+
+    #[test]
     fn scram_initial_command_is_bare_auth() {
         // SCRAM has no initial response and is driven by the SCRAM exchange,
         // so `Auth::new(.., None)` must not invoke `Mechanism::response` (which

@@ -295,3 +295,116 @@ fn blob_attr(section: Option<&str>, range: Option<ByteRange>, size: Option<u64>)
         partial,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(attr: &FetchAttr) -> (bool, Option<&str>, Option<(u64, u64)>) {
+        match attr {
+            FetchAttr::BodySection {
+                peek,
+                section,
+                partial,
+            } => (*peek, section.as_deref(), *partial),
+            other => panic!("expected a body section, got {other:?}"),
+        }
+    }
+
+    // A blob read must never flip `\Seen`, and a whole-blob read must
+    // carry no `<origin.count>` so the server streams the entire section.
+    #[test]
+    fn blob_attr_without_a_range_peeks_the_whole_section() {
+        let attr = blob_attr(Some("2.1"), None, Some(4096));
+        let (peek, section, partial) = parts(&attr);
+        assert!(peek, "blob reads must use BODY.PEEK");
+        assert_eq!(section, Some("2.1"));
+        assert_eq!(partial, None);
+
+        let attr = blob_attr(None, None, None);
+        let (_, section, partial) = parts(&attr);
+        assert_eq!(section, None, "no section means the whole message");
+        assert_eq!(partial, None);
+    }
+
+    #[test]
+    fn blob_attr_uses_the_explicit_range_length_when_given() {
+        let attr = blob_attr(
+            None,
+            Some(ByteRange {
+                start: 100,
+                length: Some(50),
+            }),
+            Some(4096),
+        );
+        let (peek, _, partial) = parts(&attr);
+        assert!(peek);
+        assert_eq!(partial, Some((100, 50)));
+    }
+
+    // An open-ended range ("from here to the end") has to be turned into
+    // an explicit count, because IMAP `<origin.count>` has no
+    // "rest of section" form.
+    #[test]
+    fn blob_attr_derives_the_remaining_length_from_the_known_total() {
+        let attr = blob_attr(
+            None,
+            Some(ByteRange {
+                start: 100,
+                length: None,
+            }),
+            Some(4096),
+        );
+        let (_, _, partial) = parts(&attr);
+        assert_eq!(partial, Some((100, 3996)));
+
+        // Start at the very end: saturating, never a wrapped huge count.
+        let attr = blob_attr(
+            None,
+            Some(ByteRange {
+                start: 4096,
+                length: None,
+            }),
+            Some(4096),
+        );
+        let (_, _, partial) = parts(&attr);
+        assert_eq!(partial, Some((4096, 0)));
+    }
+
+    #[test]
+    fn blob_attr_falls_back_to_a_bounded_count_when_the_size_is_unknown() {
+        let attr = blob_attr(
+            None,
+            Some(ByteRange {
+                start: 0,
+                length: None,
+            }),
+            None,
+        );
+        let (_, _, partial) = parts(&attr);
+        assert_eq!(
+            partial,
+            Some((0, u64::from(u32::MAX))),
+            "an unknown total falls back to the u32 partial-count ceiling",
+        );
+    }
+
+    // NOTE: this pins CURRENT behavior, which is believed WRONG. RFC 3501
+    // Section 9 defines the partial count as `nz-number`, so `<start.0>`
+    // is not a legal FETCH partial; a zero-length `ByteRange` should be
+    // answered locally with an empty body rather than encoded onto the
+    // wire.
+    #[test]
+    fn blob_attr_encodes_a_zero_length_range_verbatim() {
+        let attr = blob_attr(
+            None,
+            Some(ByteRange {
+                start: 10,
+                length: Some(0),
+            }),
+            Some(4096),
+        );
+        let (_, _, partial) = parts(&attr);
+        assert_eq!(partial, Some((10, 0)));
+    }
+}
