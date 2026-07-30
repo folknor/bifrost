@@ -143,6 +143,26 @@ impl JmapAccount {
         self.mail_for_scope(scope).id_str().to_string()
     }
 
+    /// Resolve a single object mutation to its owning account. As with
+    /// hydration, a qualified id for an account no longer in this session
+    /// stays on the primary route so the server, not a guessed local route,
+    /// reports the miss.
+    fn mail_for_object_id(&self, id: &ObjectId) -> MailAccount {
+        foreign_account_id_for_object(id, |account_id| self.foreign_mail.contains_key(account_id))
+            .as_deref()
+            .and_then(|account_id| self.foreign_mail.get(account_id))
+            .cloned()
+            .unwrap_or_else(|| self.mail.clone())
+    }
+
+    fn mail_for_mutation_target(&self, target: &MutationTarget) -> MailAccount {
+        match target {
+            MutationTarget::Message(id) => self.mail_for_object_id(id),
+            MutationTarget::Thread(_) => self.mail.clone(),
+            _ => self.mail.clone(),
+        }
+    }
+
     /// The owning shared-account identity for a foreign `Folder` scope,
     /// or `None` for a primary scope. Drives the revocation-isolation
     /// decision (quarantine the foreign scope vs escalate account-wide).
@@ -203,6 +223,15 @@ impl JmapAccount {
         let next = self.subscription_seq.fetch_add(1, Ordering::AcqRel);
         SubscriptionHandle(format!("jmap-ws-{next}"))
     }
+}
+
+fn foreign_account_id_for_object<F>(id: &ObjectId, is_registered: F) -> Option<String>
+where
+    F: Fn(&str) -> bool,
+{
+    super::foreign::parse_object(&id.0)
+        .filter(|(account_id, _)| is_registered(account_id))
+        .map(|(account_id, _)| account_id.to_string())
 }
 
 /// Pure descriptor logic behind `Account::describe_cursor`, split out
@@ -452,9 +481,9 @@ impl Account for JmapAccount {
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::set_flags(
             self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
             self.core_limits,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
             targets,
             op,
             key,
@@ -469,9 +498,9 @@ impl Account for JmapAccount {
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::move_to(
             self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
             self.core_limits,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
             targets,
             destination,
             key,
@@ -485,9 +514,9 @@ impl Account for JmapAccount {
     ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
         mutation::destroy(
             self.mail.clone(),
+            Arc::clone(&self.foreign_mail),
             self.core_limits,
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
             targets,
             key,
         )
@@ -498,10 +527,11 @@ impl Account for JmapAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_mutation_target(&target);
         pim::add_to_container(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             target,
             container,
         )
@@ -512,10 +542,11 @@ impl Account for JmapAccount {
         target: MutationTarget,
         container: ContainerId,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_mutation_target(&target);
         pim::remove_from_container(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             target,
             container,
         )
@@ -527,10 +558,11 @@ impl Account for JmapAccount {
         keyword: String,
         value: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_mutation_target(&target);
         pim::set_keyword(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             target,
             keyword,
             value,
@@ -584,10 +616,11 @@ impl Account for JmapAccount {
         target: MutationTarget,
         is_read: bool,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_mutation_target(&target);
         pim::set_is_read(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             target,
             is_read,
         )
@@ -598,10 +631,11 @@ impl Account for JmapAccount {
         target: MutationTarget,
         level: Importance,
     ) -> AccountFuture<Result<(), AccountError>> {
+        let mail = self.mail_for_mutation_target(&target);
         pim::set_importance(
-            self.mail.clone(),
+            mail.clone(),
             Arc::clone(&self.email_states),
-            self.mail.id_str().to_string(),
+            mail.id_str().to_string(),
             target,
             level,
         )
@@ -1264,14 +1298,15 @@ mod tests {
     use std::collections::HashSet;
 
     use bifrost_types::{
-        AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope, ObjectType,
-        QueryId, SendAs,
+        AccountErrorKind, AccountOperation, CursorScope, MailboxId, MembershipScope, ObjectId,
+        ObjectType, QueryId, SendAs,
     };
 
     use super::super::{foreign, state};
     use super::{
-        describe_cursor_support, foreign_owner_memberships_from_scopes, is_unregistered_foreign,
-        resolve_foreign_account_id, route_send_as,
+        describe_cursor_support, foreign_account_id_for_object,
+        foreign_owner_memberships_from_scopes, is_unregistered_foreign, resolve_foreign_account_id,
+        route_send_as,
     };
     use bifrost_types::{ChangeCursor, CostClass, SyncStrategy};
 
@@ -1410,6 +1445,32 @@ mod tests {
                 &CursorScope::Query(QueryId("q1".to_string())),
                 is_registered
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn message_mutations_select_only_registered_foreign_accounts() {
+        let registered: HashSet<String> = ["acct-9".to_string()].into_iter().collect();
+        let is_registered = |id: &str| registered.contains(id);
+
+        assert_eq!(
+            foreign_account_id_for_object(
+                &ObjectId(foreign::encode_object("acct-9", "M1")),
+                is_registered,
+            ),
+            Some("acct-9".to_string())
+        );
+        assert_eq!(
+            foreign_account_id_for_object(
+                &ObjectId(foreign::encode_object("acct-gone", "M1")),
+                is_registered,
+            ),
+            None,
+            "an unreachable account stays on the primary route for a real server miss"
+        );
+        assert_eq!(
+            foreign_account_id_for_object(&ObjectId("M1".to_string()), is_registered),
             None
         );
     }

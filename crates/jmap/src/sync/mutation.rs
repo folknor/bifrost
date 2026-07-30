@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bifrost_types::{
@@ -18,9 +20,9 @@ type MailAccount<T> = crate::account::Account<T>;
 
 pub(crate) fn set_flags<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
-    account_id: String,
     targets: AccountStream<ObjectId>,
     op: FlagOp,
     _key: IdempotencyKey,
@@ -35,9 +37,9 @@ pub(crate) fn set_flags<T: HttpTransport>(
         FlagOp::Add(_) | FlagOp::Remove(_) | FlagOp::Set(_) | FlagOp::Patch { .. } => {
             mutation_stream(
                 mail,
+                foreign_mail,
                 limits,
                 email_states,
-                account_id,
                 targets,
                 MutationKind::Flags(op),
             )
@@ -92,9 +94,9 @@ fn skipped_flag_stream(
 
 pub(crate) fn move_to<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
-    account_id: String,
     targets: AccountStream<ObjectId>,
     destination: MembershipScope,
     _key: IdempotencyKey,
@@ -111,22 +113,22 @@ pub(crate) fn move_to<T: HttpTransport>(
             });
         }
     };
-    mutation_stream(mail, limits, email_states, account_id, targets, kind)
+    mutation_stream(mail, foreign_mail, limits, email_states, targets, kind)
 }
 
 pub(crate) fn destroy<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
-    account_id: String,
     targets: AccountStream<ObjectId>,
     _key: IdempotencyKey,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     mutation_stream(
         mail,
+        foreign_mail,
         limits,
         email_states,
-        account_id,
         targets,
         MutationKind::Destroy,
     )
@@ -146,23 +148,185 @@ fn operation_for_kind(kind: &MutationKind) -> AccountOperation {
     }
 }
 
+/// One owner account's pending work, held between flushes.
+///
+/// `last_touch` is the input position at which this route last received a
+/// target. It is what bounds a partial batch's wait: without it a route that
+/// fell one target short of `batch_size` would sit in the map until the whole
+/// input stream ended, so an owner that trickles could be starved
+/// indefinitely by an owner that streams.
+#[derive(Default)]
+struct PendingRoute {
+    /// Targets bound for this account's `Email/set`, in arrival order.
+    items: Vec<ObjectId>,
+    /// Outcomes already decided locally (a destination this account cannot
+    /// express). They ride out in the same batch as the wire results so the
+    /// caller still sees exactly one outcome per input target.
+    rejected: Vec<ItemOutcome<MutationSuccess>>,
+    /// Input position of the most recent target routed here.
+    last_touch: usize,
+}
+
+impl PendingRoute {
+    fn pending(&self) -> usize {
+        self.items.len() + self.rejected.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending() == 0
+    }
+}
+
+/// Per-owner batching for one bulk mutation stream.
+///
+/// Two properties the flat `HashMap` + `Vec<String>` it replaced did not
+/// have, both of which only bite on multi-account (shared-mailbox) input:
+///
+/// * `order` holds each owner exactly ONCE. Draining empties a route in
+///   place instead of removing it, so a re-fed owner does not append a
+///   second entry. Removing the entry made `order` grow by one `String` per
+///   input target whenever `batch_size` was 1, i.e. unbounded in the input.
+/// * A partial batch is flushed once `batch_size` further targets have gone
+///   to other owners. Waiting for end-of-input instead let one owner's
+///   stream hold another owner's short batch for the entire run.
+struct RouteBuffers {
+    batch_size: usize,
+    /// Count of targets accepted so far; the clock `last_touch` is read on.
+    seen: usize,
+    /// Distinct owners in first-arrival order.
+    order: Vec<String>,
+    pending: HashMap<String, PendingRoute>,
+}
+
+impl RouteBuffers {
+    fn new(batch_size: usize) -> Self {
+        Self {
+            batch_size,
+            seen: 0,
+            order: Vec::new(),
+            pending: HashMap::new(),
+        }
+    }
+
+    /// Record one routed target and report the owners due for flush now:
+    /// this owner if its batch just filled, plus any owner sitting on a
+    /// partial batch that has gone `batch_size` inputs without being fed.
+    fn push(
+        &mut self,
+        account_id: String,
+        target: ObjectId,
+        rejection: Option<ItemOutcome<MutationSuccess>>,
+    ) -> Vec<String> {
+        self.seen += 1;
+        let seen = self.seen;
+        let batch_size = self.batch_size;
+        let order = &mut self.order;
+        let route = self.pending.entry(account_id.clone()).or_insert_with(|| {
+            order.push(account_id.clone());
+            PendingRoute::default()
+        });
+        route.last_touch = seen;
+        match rejection {
+            Some(outcome) => route.rejected.push(outcome),
+            None => route.items.push(target),
+        }
+        let full = route.pending() >= batch_size;
+
+        let mut due: Vec<String> = self
+            .order
+            .iter()
+            .filter(|owner| {
+                self.pending.get(*owner).is_some_and(|route| {
+                    !route.is_empty() && seen.saturating_sub(route.last_touch) >= batch_size
+                })
+            })
+            .cloned()
+            .collect();
+        if full {
+            due.push(account_id);
+        }
+        due
+    }
+
+    /// Every owner still holding work, in first-arrival order. Used for the
+    /// end-of-input drain.
+    fn remaining(&self) -> Vec<String> {
+        self.order.clone()
+    }
+
+    /// Take one owner's pending work, leaving its route in place so the
+    /// owner is never re-registered in `order`.
+    fn drain(
+        &mut self,
+        account_id: &str,
+    ) -> Option<(Vec<ObjectId>, Vec<ItemOutcome<MutationSuccess>>)> {
+        let route = self.pending.get_mut(account_id)?;
+        if route.is_empty() {
+            return None;
+        }
+        Some((
+            std::mem::take(&mut route.items),
+            std::mem::take(&mut route.rejected),
+        ))
+    }
+}
+
 fn mutation_stream<T: HttpTransport>(
     mail: MailAccount<T>,
+    foreign_mail: Arc<HashMap<String, MailAccount<T>>>,
     limits: CoreLimits,
     email_states: StateMap,
-    account_id: String,
     mut targets: AccountStream<ObjectId>,
     kind: MutationKind,
 ) -> AccountStream<SyncEvent<ItemOutcome<MutationSuccess>>> {
     Box::pin(async_stream::stream! {
         let batch_size = limits.max_objects_in_set.clamp(1, 500);
-        let mut batch = Vec::with_capacity(batch_size);
-        while let Some(target) = targets.next().await {
-            batch.push(target);
-            if batch.len() >= batch_size {
-                match apply_batch(&mail, &email_states, &account_id, &kind, &mut batch).await {
-                    Ok(Some(out)) => yield SyncEvent::Batch(out),
-                    Ok(None) => {}
+        let primary_account_id = mail.id_str().to_string();
+        let mut buffers = RouteBuffers::new(batch_size);
+
+        loop {
+            let (due, at_end) = match targets.next().await {
+                Some(target) => {
+                    let account_id =
+                        account_id_for_target(&target, &primary_account_id, &foreign_mail);
+                    let rejection = destination_rejection(&kind, &target);
+                    (buffers.push(account_id, target, rejection), false)
+                }
+                None => (buffers.remaining(), true),
+            };
+
+            for account_id in due {
+                let Some((mut batch, rejected)) = buffers.drain(&account_id) else {
+                    continue;
+                };
+                let routed_mail = mail_for_account(&mail, &foreign_mail, &account_id);
+                let foreign_account = account_id != primary_account_id;
+                let started = Instant::now();
+                match apply_batch(
+                    routed_mail,
+                    &email_states,
+                    &account_id,
+                    foreign_account,
+                    &kind,
+                    &mut batch,
+                )
+                .await
+                {
+                    Ok(Some(mut out)) => {
+                        out.items.extend(rejected);
+                        yield SyncEvent::Batch(out);
+                    }
+                    Ok(None) => {
+                        if !rejected.is_empty() {
+                            yield SyncEvent::Batch(Batch {
+                                items: rejected,
+                                page_boundary: PageBoundary::Page,
+                                server_latency: started.elapsed(),
+                                bytes_in: 0,
+                                checkpoint: None,
+                            });
+                        }
+                    }
                     Err(err) => {
                         yield super::error::terminated_from_jmap(
                             err,
@@ -172,19 +336,9 @@ fn mutation_stream<T: HttpTransport>(
                     }
                 }
             }
-        }
 
-        if !batch.is_empty() {
-            match apply_batch(&mail, &email_states, &account_id, &kind, &mut batch).await {
-                Ok(Some(out)) => yield SyncEvent::Batch(out),
-                Ok(None) => {}
-                Err(err) => {
-                    yield super::error::terminated_from_jmap(
-                        err,
-                        super::error::JmapErrorContext::new(operation_for_kind(&kind)),
-                    );
-                    return;
-                }
+            if at_end {
+                break;
             }
         }
 
@@ -192,21 +346,83 @@ fn mutation_stream<T: HttpTransport>(
     })
 }
 
+/// Reject a target whose owner disagrees with the move destination's owner
+/// before it can reach the wire.
+///
+/// The destination is one `MembershipScope` for the whole call while targets
+/// are routed per owner, so the two can disagree per target. `Email/set`
+/// resolves both operands inside the routed `accountId`, which makes the
+/// disagreement silent rather than loud: a bare primary mailbox id sent
+/// against a foreign account resolves to whatever mailbox that account has
+/// under that id. Fail the individual target, not the stream - the caller's
+/// other targets may be perfectly expressible.
+fn destination_rejection(
+    kind: &MutationKind,
+    target: &ObjectId,
+) -> Option<ItemOutcome<MutationSuccess>> {
+    let MutationKind::Move(destination) = kind else {
+        return None;
+    };
+    let target_owner = super::foreign::owner_of(&target.0);
+    let destination_owner = super::foreign::owner_of(destination.as_str());
+    if target_owner == destination_owner {
+        return None;
+    }
+    Some(ItemOutcome::Failed(BatchFailure::new(
+        BatchItemId(target.0.clone()),
+        super::error::cross_account_destination(
+            AccountOperation::BulkMove,
+            &target.0,
+            target_owner,
+            destination.as_str(),
+            destination_owner,
+        ),
+    )))
+}
+
+/// Select the account that owns a bulk target. An object qualified for an
+/// account no longer available in this session deliberately keeps the primary
+/// route, so the server returns its normal not-found result rather than the
+/// client fabricating a local routing error.
+fn account_id_for_target<T: HttpTransport>(
+    target: &ObjectId,
+    primary_account_id: &str,
+    foreign_mail: &HashMap<String, MailAccount<T>>,
+) -> String {
+    super::foreign::parse_object(&target.0)
+        .filter(|(account_id, _)| foreign_mail.contains_key(*account_id))
+        .map_or_else(
+            || primary_account_id.to_string(),
+            |(account_id, _)| account_id.to_string(),
+        )
+}
+
+fn mail_for_account<'a, T: HttpTransport>(
+    primary: &'a MailAccount<T>,
+    foreign_mail: &'a HashMap<String, MailAccount<T>>,
+    account_id: &str,
+) -> &'a MailAccount<T> {
+    foreign_mail.get(account_id).unwrap_or(primary)
+}
+
 async fn apply_batch<T: HttpTransport>(
     mail: &MailAccount<T>,
     email_states: &StateMap,
     account_id: &str,
+    foreign_account: bool,
     kind: &MutationKind,
     batch: &mut Vec<ObjectId>,
 ) -> crate::Result<Option<Batch<ItemOutcome<MutationSuccess>>>> {
     let started = Instant::now();
-    let mut state = current_or_probe_state(mail, email_states, account_id).await?;
     let ids = std::mem::take(batch);
     if ids.is_empty() {
+        // A route can hold only locally-rejected targets. Probing Email
+        // state for it would spend a round trip to send nothing.
         return Ok(None);
     }
+    let mut state = current_or_probe_state(mail, email_states, account_id).await?;
 
-    let mut response = match send_set(mail, &state, &ids, kind).await {
+    let mut response = match send_set(mail, &state, &ids, kind, foreign_account).await {
         Ok(response) => response,
         Err(err) => {
             if !super::error::is_state_mismatch(&err) {
@@ -215,7 +431,7 @@ async fn apply_batch<T: HttpTransport>(
             let fresh = probe_email_state(mail).await?;
             state_cache::set(email_states, account_id, fresh.clone()).await;
             state = fresh;
-            match send_set(mail, &state, &ids, kind).await {
+            match send_set(mail, &state, &ids, kind, foreign_account).await {
                 Ok(response) => response,
                 Err(err) if super::error::is_state_mismatch(&err) => {
                     // A second method-level `stateMismatch` after a
@@ -243,7 +459,7 @@ async fn apply_batch<T: HttpTransport>(
     let operation = operation_for_kind(kind);
     let mut results = Vec::with_capacity(ids.len());
     for id in ids {
-        let email_id = EmailId::new(id.0.clone());
+        let email_id = wire_email_id(&id, account_id, foreign_account);
         let raw = match kind {
             MutationKind::Destroy => response.destroyed(&email_id),
             MutationKind::Flags(_) | MutationKind::Move(_) => {
@@ -354,27 +570,55 @@ async fn send_set<T: HttpTransport>(
     state: &str,
     ids: &[ObjectId],
     kind: &MutationKind,
+    foreign_account: bool,
 ) -> crate::Result<crate::core::set::SetResponse<crate::email::Email>> {
     let mut set = EmailSet::new().if_in_state(state.to_string());
 
     match kind {
         MutationKind::Destroy => {
-            set = set.destroy(ids.iter().map(|id| EmailId::new(id.0.clone())));
+            set = set.destroy(
+                ids.iter()
+                    .map(|id| wire_email_id(id, mail.id_str(), foreign_account)),
+            );
         }
         MutationKind::Flags(op) => {
             for id in ids {
-                apply_flags(set.update(EmailId::new(id.0.clone())), op);
+                apply_flags(
+                    set.update(wire_email_id(id, mail.id_str(), foreign_account)),
+                    op,
+                );
             }
         }
         MutationKind::Move(mailbox_id) => {
             for id in ids {
-                set.update(EmailId::new(id.0.clone()))
-                    .mailbox_ids([mailbox_id.clone()]);
+                set.update(wire_email_id(id, mail.id_str(), foreign_account))
+                    .mailbox_ids([wire_mailbox_id(mailbox_id, mail.id_str(), foreign_account)]);
             }
         }
     }
 
     mail.call(set).await
+}
+
+/// Convert a routed foreign object back to the native id JMAP accepts on the
+/// selected account. Keep an id for an unregistered foreign account intact on
+/// the primary route, preserving the real server-side not-found behavior.
+fn wire_email_id(id: &ObjectId, account_id: &str, foreign_account: bool) -> EmailId {
+    match super::foreign::parse_object(&id.0) {
+        Some((owner, native)) if foreign_account && owner == account_id => EmailId::new(native),
+        _ => EmailId::new(id.0.clone()),
+    }
+}
+
+/// The native form of the move destination for the routed account.
+/// `destination_rejection` has already established that the destination and
+/// every target in this batch name the same owner, so the only work left is
+/// stripping the qualification the foreign account does not use.
+fn wire_mailbox_id(id: &MailboxId, account_id: &str, foreign_account: bool) -> MailboxId {
+    match super::foreign::parse_object(id.as_str()) {
+        Some((owner, native)) if foreign_account && owner == account_id => MailboxId::new(native),
+        _ => id.clone(),
+    }
 }
 
 fn apply_flags(patch: &mut EmailPatch, op: &FlagOp) {
@@ -628,6 +872,137 @@ mod tests {
                 other => panic!("expected Failed, got {other:?}"),
             }
         }
+    }
+
+    /// Route membership is per OWNER, not per input target. Draining used
+    /// to remove the map entry, so the next target for the same owner
+    /// re-registered it and appended another `String`; at
+    /// `maxObjectsInSet = 1` that is one allocation retained per input item
+    /// for the whole run.
+    #[test]
+    fn a_repeatedly_drained_route_is_registered_exactly_once() {
+        let mut buffers = RouteBuffers::new(1);
+        for n in 0..64 {
+            let due = buffers.push("acct-9".to_string(), ObjectId(format!("m{n}")), None);
+            assert_eq!(due, vec!["acct-9".to_string()]);
+            assert!(buffers.drain("acct-9").is_some());
+        }
+        assert_eq!(buffers.remaining(), vec!["acct-9".to_string()]);
+    }
+
+    /// A short batch cannot be held hostage by another owner's traffic. The
+    /// quiet owner is flushed once `batch_size` further targets have gone
+    /// elsewhere - the same wait a full batch already accepts - instead of
+    /// waiting for the input stream to end.
+    #[test]
+    fn a_partial_batch_flushes_once_a_full_batch_of_input_has_passed_it() {
+        let mut buffers = RouteBuffers::new(4);
+        assert!(
+            buffers
+                .push("quiet".to_string(), ObjectId("q1".to_string()), None)
+                .is_empty()
+        );
+        for n in 0..3 {
+            assert!(
+                buffers
+                    .push("busy".to_string(), ObjectId(format!("b{n}")), None)
+                    .is_empty(),
+                "nothing is due while both routes are short and freshly fed"
+            );
+        }
+
+        // The fourth `busy` target both fills that route and ages `quiet`
+        // by a full batch worth of input.
+        let due = buffers.push("busy".to_string(), ObjectId("b3".to_string()), None);
+        assert_eq!(due, vec!["quiet".to_string(), "busy".to_string()]);
+        assert_eq!(
+            buffers.drain("quiet").expect("quiet route").0,
+            vec![ObjectId("q1".to_string())]
+        );
+    }
+
+    /// An emptied route is never re-flushed by the idle sweep, and the
+    /// end-of-input drain skips it too.
+    #[test]
+    fn an_emptied_route_is_not_flushed_again() {
+        let mut buffers = RouteBuffers::new(1);
+        buffers.push("acct-9".to_string(), ObjectId("m1".to_string()), None);
+        assert!(buffers.drain("acct-9").is_some());
+        let due = buffers.push("primary".to_string(), ObjectId("m2".to_string()), None);
+        assert_eq!(due, vec!["primary".to_string()]);
+        assert!(buffers.drain("acct-9").is_none());
+    }
+
+    /// A locally-rejected target still occupies a slot in its owner's
+    /// batch, so a stream of nothing but rejections cannot accumulate
+    /// without bound waiting for a wire flush that never comes.
+    #[test]
+    fn a_rejected_target_counts_toward_its_owners_batch() {
+        let rejected = ItemOutcome::Failed(BatchFailure::new(
+            BatchItemId("m1".to_string()),
+            super::super::error::cross_account_destination(
+                AccountOperation::BulkMove,
+                "m1",
+                None,
+                "acct-9\u{1f}mbx",
+                Some("acct-9"),
+            ),
+        ));
+        let mut buffers = RouteBuffers::new(1);
+        let due = buffers.push(
+            "primary".to_string(),
+            ObjectId("m1".to_string()),
+            Some(rejected),
+        );
+        assert_eq!(due, vec!["primary".to_string()]);
+        let (wire, rejected) = buffers.drain("primary").expect("primary route");
+        assert!(wire.is_empty(), "a rejected target never reaches the wire");
+        assert_eq!(rejected.len(), 1);
+    }
+
+    /// The owner comparison behind the wire-level rejection, enumerated.
+    /// Both operands bare, or both qualified with the same account, is the
+    /// only expressible pairing.
+    #[test]
+    fn a_move_destination_must_name_the_targets_own_account() {
+        let foreign_target = ObjectId(super::super::foreign::encode_object("acct-9", "M1"));
+        let primary_target = ObjectId("m1".to_string());
+        let foreign_box = |account: &str| {
+            MutationKind::Move(MailboxId::new(
+                super::super::foreign::encode_foreign(account, "mbx").0,
+            ))
+        };
+        let primary_box = MutationKind::Move(MailboxId::new("inbox"));
+
+        assert!(destination_rejection(&primary_box, &primary_target).is_none());
+        assert!(destination_rejection(&foreign_box("acct-9"), &foreign_target).is_none());
+
+        // The silent one: a bare primary mailbox id would otherwise be
+        // resolved inside acct-9's namespace.
+        let rejected = destination_rejection(&primary_box, &foreign_target)
+            .expect("a primary destination cannot receive a foreign message");
+        let ItemOutcome::Failed(failure) = rejected else {
+            panic!("a cross-account move must land on the item Failed lane");
+        };
+        assert_eq!(failure.item.0, foreign_target.0);
+        assert_eq!(
+            failure.error.kind(),
+            &AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert!(matches!(failure.error.recovery(), RecoveryClass::ClientBug));
+
+        assert!(destination_rejection(&foreign_box("acct-9"), &primary_target).is_some());
+        assert!(destination_rejection(&foreign_box("acct-7"), &foreign_target).is_some());
+
+        // Kinds with no destination never reject.
+        assert!(destination_rejection(&MutationKind::Destroy, &foreign_target).is_none());
+        assert!(
+            destination_rejection(
+                &MutationKind::Flags(FlagOp::Add(flags(&["$seen"]))),
+                &foreign_target,
+            )
+            .is_none()
+        );
     }
 
     #[test]

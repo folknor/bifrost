@@ -77,7 +77,10 @@ retryable under `RetryPolicy::default()` (429 plus the 5xx family, read off the
 policy rather than restated) come back as `RateLimited` / `RetryBudgetExhausted`
 with their final response preserved, and only a genuinely non-retryable 4xx is
 `Error::Status`. An exhausted script reports the request ordinal rather than
-falling through to a network.
+falling through to a network. Despite the test module's location,
+`AccountFactory::open` itself is not hermetically reachable: its `connect()`
+call hardwires `ReqwestTransport`. The seam covers the generic sync request
+helpers beneath that boundary, not factory connection establishment.
 
 ## Module pattern
 
@@ -271,11 +274,49 @@ Every await in the reader's lifecycle is cancellation-covered, so `close()` is p
 
 `bulk_set_flags`, `bulk_move`, and `bulk_destroy` share a `mutation_stream` engine. Targets batch at `max_objects_in_set` clamped to `[1, 500]`; each batch is one `Email/set` gated by `ifInState(current_state)`. On `stateMismatch` the pipeline probes current state via `Email/get` (empty ids), updates the cache, and retries the batch once. Other errors abort with `SyncEvent::Terminated(AccountError)`.
 
+Each bulk target is routed independently: a registered foreign-qualified
+object id selects that account's `Mail` handle and its own Email-state cache,
+then carries only its native id in the account-scoped `Email/set`. A batch
+never mixes accounts. The returned outcome still uses the original qualified
+id. An id for an account no longer registered deliberately remains literal on
+the primary route so the server supplies the normal not-found result.
+
+`bulk_move` additionally validates the destination against each target's
+owner and fails the mismatched target on the item lane as
+`Request(Malformed)` (`RecoveryClass::ClientBug`) before anything is sent,
+the same call bifrost-graph makes for a cross-mailbox move. The destination
+is a single `MembershipScope` for the whole call, so with mixed-owner targets
+it can be right for some and wrong for others; owners are compared as
+`Option<accountId>` (a bare id is the primary account, and no bare id is ever
+minted for a share), independent of whether the named account is still
+registered. This is not a politeness check: `Email/set` resolves the message
+and the mailbox inside ONE `accountId`, so a bare primary mailbox id sent to
+a shared account is not rejected by the server - it names whatever mailbox
+that account holds under the same id, and the move reports `Applied` after
+filing the message somewhere the caller never asked for.
+
+Per-owner batching is bounded on both axes (`RouteBuffers`). Draining empties
+a route in place rather than removing it, so the owner list holds one entry
+per account rather than one per input target. A partial batch is flushed once
+`batch_size` further targets have gone to other owners, so a quiet share's
+short batch cannot be held to end-of-input by a busy one; the wait is capped
+at the same input volume a full batch already accepts. A route holding only
+locally-rejected targets emits them without probing Email state.
+
 `IdempotencyKey` is a wire no-op, so replay safety stays `None` (read-back guard protects against double-apply). Per-id outcomes flow from `SetResponse::updated`/`destroyed`; an id the server names in neither the success nor error collection becomes `Protocol(PartialResponse)` with `Attempt(Acknowledged)`, so idempotent flag work retries and possibly-applied moves/destroys reconcile rather than being fabricated as `NotFound`. A `stateMismatch` surviving retry emits `Failed(ConcurrencyConflict)`; real per-id set errors map through `classify_set_item`. Empty additive/subtractive flag operations short-circuit locally with per-target `Skipped` outcomes rather than transmitting empty patches. `bulk_move` accepts only `MembershipScope::Mailbox`.
 
 ### PIM primitives and conveniences
 
 `pim.rs` is the Stage 1 unified mail surface. Message/thread mutation resolves `MutationTarget::Thread` via `Thread/get`, then `Email/set` patches against `mailboxIds`/`keywords`/`$seen`, guarded by the cached `Email` state with one `stateMismatch` retry. Gmail labels, Graph categories/extended properties return `Unsupported`.
+
+`patch_mailbox_membership` (`add_to_container` / `remove_from_container`, and
+the two legs of `move_thread` / `delete_thread`) applies the same owner check
+`bulk_move` does, for the same reason: the account layer routes by the
+TARGET's owner but takes the container id as given, so a bare container id on
+a foreign route resolves in the share's namespace. Owners disagreeing is
+`Request(Malformed)` raised before `resolve_target` runs. A thread's owner is
+the primary account (threads are never foreign-routed - see nc-7); other
+target shapes are left to `resolve_target`'s `Unsupported`.
 
 `attachment_upload` stores bytes through the upload URL, returns an opaque blob handle. `draft_create`/`update`/`discard` use `Email/set` against Drafts. `send_message` creates the draft `Email` + `EmailSubmission` in one result-referenced request, then `onSuccessUpdateEmail` to Sent (or `onSuccessDestroyEmail` when `save_to_sent == Some(false)`). `draft_send` submits an existing draft and moves it to Sent, resolving Sent and Drafts from a single `Mailbox/get` via `role_mailboxes`. A `SendRequest::send_as` routes both sets to a successfully seeded foreign account that advertises Submission, resolves a concrete foreign `Identity/get` identity, and forces its `identityId`; `As` forces From to that identity and `OnBehalfOf` adds the authenticated user's Sender when known. Scheduled foreign sends are rejected because their bare submission handles cannot be safely routed through cancel/reschedule.
 
@@ -417,8 +458,11 @@ interchangeable and the projection must not confuse them.
 
 `thread_hydrate` is NOT routed, deliberately: foreign inventory never
 qualifies `InventoryEntry::thread_id`, so there is no foreign-encoded thread
-id in circulation to route. See the `nc-7` TODO - qualifying thread ids is a
-contract change, not a wiring fix.
+id in circulation to route. That is a statement about routability, not about
+safety - a bare foreign thread id is indistinguishable from a primary one, so
+every thread-taking read AND mutation runs against the primary account and
+can resolve an unrelated thread on an id collision. See the `nc-7` TODO;
+qualifying thread ids is a contract change, not a wiring fix.
 
 `containers_list` appends each foreign account's mailboxes with
 `namespace = Shared`, `owner = MailboxId(accountId)`,
@@ -432,11 +476,19 @@ remaining containers: one unreachable share neither blanks the sidebar nor
 vanishes from it silently. A primary enumeration failure still fails the
 call.
 
-Out of A5a's read/sync slice (named follow-ups): foreign-account *mutations* (the `ifInState` cache is shaped for it via the per-accountId maps, but unwired - a mutation primitive handed a foreign-qualified id today would pass the whole encoded string to the primary account) and foreign *mailbox lifecycle* (the `scope_lifecycle` worker polls only the primary; a foreign mailbox added after `open` appears at the next reopen).
+Foreign object mutations route through the same registered-account decision as
+hydration: bulk operations partition by owner, and single-message PIM
+operations select the owning `Mail` handle before stripping the qualified id
+for `Email/set`. Their state-cache key is that selected accountId. Foreign
+mailbox lifecycle remains out of scope: `scope_lifecycle` polls only the
+primary, so a foreign mailbox added after `open` appears at the next reopen.
 
 ### Known limitations
 
-- Foreign bulk mutations and live foreign-mailbox lifecycle are not wired. `get_stream` / `open_blob` / `open_raw_rfc822` DO route to the foreign account (via the qualified object-id codec); the mutation primitives do not. Foreign submission is supported, but scheduled foreign submission is not.
+- Live foreign-mailbox lifecycle is not wired. `get_stream`, `open_blob`,
+  `open_raw_rfc822`, bulk mutation, and single-message PIM mutation route to
+  the foreign account via the qualified object-id codec. Foreign submission is
+  supported, but scheduled foreign submission is not.
 - Raw-MIME projections unsupported; only `FlagsOnly` and `Metadata` work. Push is WebSocket-subprotocol only (no HTTP/EventSource fallback).
 - `BlobRangeSupport::No`; `open_blob_range` fatals `Error::Unsupported` even when the handle advertises range support (no transport `Range` hook).
 - `MutationReplaySafety::None`; `IdempotencyKey` is a wire no-op (read-back guard is the only lost-update protection).

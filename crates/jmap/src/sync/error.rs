@@ -294,6 +294,50 @@ pub(crate) fn send_as_unknown_account(mailbox: &bifrost_types::MailboxId) -> Acc
     .expect("valid account error classification")
 }
 
+/// A mutation whose message and whose destination mailbox belong to
+/// different JMAP accounts.
+///
+/// `Email/set` addresses exactly one `accountId` and JMAP ids are
+/// account-scoped, so no single request can express "move this shared-account
+/// message into my primary Inbox". Sending it anyway is worse than an error:
+/// the destination id is interpreted in the ROUTED account's namespace, so if
+/// that account holds a mailbox with the same id the move succeeds against
+/// the wrong container and the caller is never told. Reject before the wire.
+///
+/// Classified `Request(Malformed)` (a caller-side request-shape fault routing
+/// to `ClientBug`) rather than `Unsupported`, which would wrongly imply the
+/// protocol has no move at all. Mirrors bifrost-graph's cross-mailbox
+/// `bulk_move` rejection.
+#[must_use]
+pub(crate) fn cross_account_destination(
+    operation: AccountOperation,
+    target_id: &str,
+    target_owner: Option<&str>,
+    destination_id: &str,
+    destination_owner: Option<&str>,
+) -> AccountError {
+    let target_owner = super::foreign::owner_label(target_owner);
+    let destination_owner = super::foreign::owner_label(destination_owner);
+    AccountErrorBuilder::new(
+        AccountErrorKind::Request(RequestErrorKind::Malformed),
+        Cause::Request(RequestCause::InvalidArgument {
+            field: Some("destination"),
+            message: Some(DiagnosticText::support_only(format!(
+                "mailbox {destination_id} belongs to account {destination_owner}, \
+                 but object {target_id} belongs to account {target_owner}; \
+                 one Email/set cannot span two accounts"
+            ))),
+        }),
+    )
+    .protocol(Protocol::Jmap)
+    .operation(operation)
+    .scope(ErrorScope::Message {
+        id: target_id.to_string(),
+    })
+    .try_build()
+    .expect("valid account error classification")
+}
+
 /// Convenience for stream call sites that need to emit a
 /// `SyncEvent::Terminated(Unsupported(op))`. Callers pass the
 /// operation the stream is performing; the helper previously

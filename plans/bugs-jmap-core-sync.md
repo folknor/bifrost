@@ -10,6 +10,13 @@ finding already closed there.
 
 Ordering inside each section is by blast radius, not by discovery order.
 
+This file is NOT the whole open-gap picture for bifrost-jmap: it holds only
+what this sweep found and has not yet closed. Standing jmap gaps that predate
+or outlive it live in `TODO.md` as `nc-*` (currently nc-6 hydration flush
+ordering, nc-7 unqualified foreign thread ids, nc-8 unreported foreign
+container rights). nc-7 in particular is a live correctness hazard on the
+mutation paths this sweep just wired.
+
 ---
 
 ## 1. Bugs
@@ -61,22 +68,3 @@ the fanout as-is. This is an argument for (a), not a new bug.
     `mailboxIds` for each changed id and emit `ScopeChange`s, so the engine
     can attribute the change.
 This is a design call, not a mechanical fix.
-
-## 2. Gaps and smells
-
-### G3 - Bulk mutations hand a foreign-qualified id to the primary account verbatim
-
-Known and documented (`reference/jmap.md` "Known limitations"), but the exact
-failure mode is worth naming because it is not a clean error: `mutation.rs`
-does `EmailId::new(id.0.clone())` on whatever `ObjectId` it is given
-(191, 294, 298, 303). A foreign-qualified id is
-`"acct-9\u{1f}M123"`, so the literal control character goes on the wire inside
-the `Email/set` `update` key. The server answers `notFound` for a nonsense id,
-and `apply_batch` reports `Failed(NotFound)` naming the encoded string. The
-read path (`hydrate::route_for_id`, `blob::foreign_split`) already has the
-decode; `mutation.rs` needs the same three-line selection plus the
-per-accountId state key (which `state_cache` is already shaped for).
-
-Same for `pim.rs::add_to_container` / `remove_from_container` / `set_keyword` /
-`set_is_read` / `set_importance`, all of which take `self.mail` and
-`self.mail.id_str()` from `account.rs` (477-589).

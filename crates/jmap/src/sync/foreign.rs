@@ -88,6 +88,33 @@ pub(crate) fn native_object(id: &str) -> &str {
     parse_object(id).map_or(id, |(_, native)| native)
 }
 
+/// The JMAP `accountId` a consumer-supplied id belongs to, or `None` when the
+/// id is bare and therefore names an object in the primary account. Ids are
+/// only ever encoded for foreign accounts, so `None` and `Some(_)` are
+/// exactly "primary" and "that share".
+///
+/// This is the routing question every mutation has to answer for BOTH of its
+/// operands. JMAP ids are account-scoped and `Email/set` names exactly one
+/// `accountId`, so a message and the mailbox it is being filed into must
+/// agree on their owner or the request is not expressible - and, worse than
+/// inexpressible, a bare primary mailbox id sent against a foreign account
+/// can *resolve* there if that account happens to hold a mailbox under the
+/// same id, silently filing the message into the wrong container.
+///
+/// Deliberately independent of whether the named account is still registered
+/// in this session: an id for a departed share still declares its owner, and
+/// a caller who names two different owners has asked for something no single
+/// `Email/set` can do regardless of reachability.
+pub(crate) fn owner_of(id: &str) -> Option<&str> {
+    parse_object(id).map(|(owner, _)| owner)
+}
+
+/// Render an owner for diagnostics. The primary account has no qualifier in
+/// the id namespace, so it needs a name of its own in error text.
+pub(crate) fn owner_label(owner: Option<&str>) -> &str {
+    owner.unwrap_or("<primary>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -384,23 +384,27 @@ container projection itself.
   mailbox, so shared-mailbox containers fall back to display-name matching and
   their Inbox / Sent carry no `FolderRole`. A correct fix costs about six extra
   round-trips per shared mailbox; decide whether the roles are worth it.
-- **nc-5 (jmap/graph)** The mutation primitives were never taught the
-  foreign-qualified id form. Hydration and blob access now route to the owning
-  account, but a consumer handing a foreign-encoded id to `set_keyword` /
-  `bulk_move` / the other mutation entry points still misroutes to the primary
-  account. Required before a consumer can mutate shared-mailbox mail.
 - **nc-6 (jmap)** Hydration flushes its trailing per-target buffers in
   `HashMap` iteration order, so batch ordering across routing targets is
   nondeterministic. Per-item outcomes are unaffected; only the grouping order
   varies.
 - **nc-7 (jmap)** Foreign inventory does not qualify `InventoryEntry::thread_id`,
-  so a foreign account's thread ids reach the consumer bare. Two consequences:
+  and neither does `message_hydrate`'s `qualify_foreign_message_ids` (it
+  qualifies `id`, containers, and attachment blob ids, not `thread_id`), so a
+  foreign account's thread ids reach the consumer bare. Consequences:
   a foreign thread id collides in the consumer's index with a primary thread
-  that happens to share the id, and `thread_hydrate` (which is therefore left
+  that happens to share the id; `thread_hydrate` (which is therefore left
   unrouted on purpose - there is no encoded form to route) runs `Thread/get`
-  against the primary account for a foreign thread. Qualifying thread ids is a
-  contract change on an id the consumer groups by, not a wiring fix, so it
-  wants a decision rather than a patch. `id` and `blob_id` ARE qualified.
+  against the primary account for a foreign thread; and, now that the
+  mutation primitives route, every thread-taking MUTATION
+  (`set_keyword`/`set_is_read`/`set_importance` on `MutationTarget::Thread`,
+  `move_thread`, `delete_thread`) does the same. That last one is the sharp
+  edge: a bare foreign thread id is indistinguishable from a primary one, so
+  on a collision the primary `Thread/get` resolves an UNRELATED thread and
+  the mutation is applied to its messages - `delete_thread` destroys them.
+  Owner validation cannot catch it, because a bare id asserts primary
+  ownership. Qualifying thread ids is a contract change on an id the consumer
+  groups by, not a wiring fix, so it wants a decision rather than a patch.
 - **nc-8 (jmap)** `pim::containers_list` reports `Container::rights` for the
   primary account from `Mailbox/myRights`, but a foreign account's mailboxes go
   through the same `container_from_mailbox`, so a share whose `Mailbox/get`

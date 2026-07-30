@@ -601,11 +601,16 @@ impl JmapCredentials {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use bifrost_types::{
+        ContainerId, FlagOp, IdempotencyKey, MembershipScope, MutationTarget, ObjectId,
+        ProtocolSalt, RunId,
+    };
     use bytes::Bytes;
+    use futures::StreamExt;
     use serde_json::{Value, json};
 
     use crate::core::session::Session;
@@ -871,6 +876,56 @@ mod tests {
         ])])
     }
 
+    fn email_set_reply(
+        account_id: &str,
+        old_state: &str,
+        new_state: &str,
+        id: &str,
+    ) -> ScriptedReply {
+        email_set_reply_ids(account_id, old_state, new_state, &[id])
+    }
+
+    /// An `Email/set` answer acknowledging every submitted id.
+    fn email_set_reply_ids(
+        account_id: &str,
+        old_state: &str,
+        new_state: &str,
+        ids: &[&str],
+    ) -> ScriptedReply {
+        let updated: serde_json::Map<String, Value> = ids
+            .iter()
+            .map(|id| ((*id).to_string(), Value::Null))
+            .collect();
+        method_reply(vec![json!([
+            "Email/set",
+            {
+                "accountId": account_id,
+                "oldState": old_state,
+                "newState": new_state,
+                "updated": updated,
+                "notUpdated": {}
+            },
+            "s0"
+        ])])
+    }
+
+    fn state_map(entries: &[(&str, &str)]) -> crate::sync::state_cache::StateMap {
+        Arc::new(tokio::sync::Mutex::new(
+            entries
+                .iter()
+                .map(|(account, state)| ((*account).to_string(), Some((*state).to_string())))
+                .collect(),
+        ))
+    }
+
+    fn idempotency_key() -> IdempotencyKey {
+        IdempotencyKey {
+            run_id: RunId("test-run".to_string()),
+            sequence: 1,
+            protocol_salt: ProtocolSalt::Jmap("test".to_string()),
+        }
+    }
+
     /// One reply answering both batched open probes.
     fn open_reply(account_id: &str, suffix: &str) -> ScriptedReply {
         method_reply(vec![
@@ -974,6 +1029,341 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_open_batch(&requests[0], "primary");
         assert_open_batch(&requests[1], "shared");
+    }
+
+    /// The production factory still calls `connect()` and therefore
+    /// hardwires `ReqwestTransport`; this test deliberately exercises the
+    /// generic sync request helper below that boundary. The scripted seam
+    /// records the full Email/set request and returns the same response shape
+    /// bifrost-net gives the JMAP decoder.
+    #[tokio::test]
+    async fn foreign_bulk_flags_use_the_foreign_account_native_id_and_state() {
+        let client = scripted_client([email_set_reply(
+            "shared",
+            "shared-state",
+            "shared-next",
+            "M9",
+        )]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
+        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            "shared".to_string(),
+            Some("shared-state".to_string()),
+        )])));
+        let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
+        let mut stream = crate::sync::mutation::set_flags(
+            primary,
+            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 1,
+                max_objects_in_set: 1,
+            },
+            states,
+            targets,
+            FlagOp::Add(HashSet::from(["$seen".to_string()])),
+            idempotency_key(),
+        );
+
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(batch)) => match &batch.items[..] {
+                [bifrost_types::ItemOutcome::Succeeded(success)] => {
+                    assert_eq!(success.item.0, foreign_id.0);
+                }
+                other => panic!("expected a successful foreign mutation, got {other:?}"),
+            },
+            other => panic!("expected the foreign mutation batch, got {other:?}"),
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Done(None))
+        ));
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 1);
+        let call = &requests[0]["methodCalls"][0];
+        assert_eq!(call[0], "Email/set");
+        assert_eq!(call[1]["accountId"], "shared");
+        assert_eq!(call[1]["ifInState"], "shared-state");
+        assert_eq!(call[1]["update"]["M9"]["keywords/$seen"], true);
+        assert!(call[1]["update"].get(&foreign_id.0).is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_single_message_keyword_uses_native_id_on_its_selected_account() {
+        let client = scripted_client([email_set_reply(
+            "shared",
+            "shared-state",
+            "shared-next",
+            "M9",
+        )]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
+        let states = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            "shared".to_string(),
+            Some("shared-state".to_string()),
+        )])));
+
+        crate::sync::pim::set_keyword(
+            shared,
+            states,
+            "shared".to_string(),
+            MutationTarget::Message(foreign_id.clone()),
+            "$seen".to_string(),
+            true,
+        )
+        .await
+        .expect("foreign keyword mutation succeeds");
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 1);
+        let call = &requests[0]["methodCalls"][0];
+        assert_eq!(call[0], "Email/set");
+        assert_eq!(call[1]["accountId"], "shared");
+        assert_eq!(call[1]["ifInState"], "shared-state");
+        assert_eq!(call[1]["update"]["M9"]["keywords/$seen"], true);
+        assert!(call[1]["update"].get(&foreign_id.0).is_none());
+    }
+
+    /// The outcome this pins is the one that SUCCEEDS.
+    ///
+    /// JMAP ids are account-scoped, so a bare primary mailbox id addressed to
+    /// a shared account does not 404 - it resolves to whatever mailbox that
+    /// account happens to hold under the same id. The second armed reply is
+    /// exactly that server: a shared account with its own "inbox",
+    /// acknowledging the update of M9. So if the foreign target's move is
+    /// allowed on the wire, the caller is told the move APPLIED while the
+    /// message was filed into a container it never named. The primary
+    /// sibling is here to pin the other half: one inexpressible target must
+    /// not take an expressible one down with it.
+    #[tokio::test]
+    async fn a_foreign_move_into_a_primary_mailbox_id_never_reaches_the_shared_account() {
+        let client = scripted_client([
+            email_set_reply("primary", "primary-state", "primary-next", "m1"),
+            // Only reachable if the defect is present, and then it is the
+            // wrong-container success the fix exists to prevent.
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
+        let states = state_map(&[("primary", "primary-state"), ("shared", "shared-state")]);
+        let targets = Box::pin(futures::stream::iter([
+            ObjectId("m1".to_string()),
+            foreign_id.clone(),
+        ]));
+
+        let mut stream = crate::sync::mutation::move_to(
+            primary,
+            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 1,
+                max_objects_in_set: 1,
+            },
+            states,
+            targets,
+            MembershipScope::Mailbox(bifrost_types::MailboxId("inbox".to_string())),
+            idempotency_key(),
+        );
+
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(batch)) => match &batch.items[..] {
+                [bifrost_types::ItemOutcome::Succeeded(success)] => {
+                    assert_eq!(success.item.0, "m1");
+                }
+                other => panic!("expected the primary move to apply, got {other:?}"),
+            },
+            other => panic!("expected the primary move batch, got {other:?}"),
+        }
+        // The cross-account target fails locally, on the item lane, so its
+        // expressible sibling is not taken down with it.
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(batch)) => match &batch.items[..] {
+                [bifrost_types::ItemOutcome::Failed(failure)] => {
+                    assert_eq!(failure.item.0, foreign_id.0);
+                    assert_eq!(
+                        failure.error.kind(),
+                        &bifrost_types::AccountErrorKind::Request(
+                            bifrost_types::RequestErrorKind::Malformed
+                        )
+                    );
+                }
+                other => panic!("expected the cross-account move to fail, got {other:?}"),
+            },
+            other => panic!("expected the rejection batch, got {other:?}"),
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(bifrost_types::SyncEvent::Done(None))
+        ));
+
+        let requests = client.transport().requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the primary target is expressible; nothing may be sent for the foreign one"
+        );
+        let call = &requests[0]["methodCalls"][0];
+        assert_eq!(call[1]["accountId"], "primary");
+        assert_eq!(
+            call[1]["update"]["m1"]["mailboxIds"],
+            json!({"inbox": true})
+        );
+        for request in &requests {
+            assert_ne!(
+                request["methodCalls"][0][1]["accountId"], "shared",
+                "a primary mailbox id must never be resolved in a shared account's namespace"
+            );
+        }
+    }
+
+    /// The same-owner move is still expressible and still strips both
+    /// qualifications, so the rejection above is a routing check and not a
+    /// blanket refusal of foreign moves.
+    #[tokio::test]
+    async fn a_foreign_move_into_that_accounts_own_mailbox_uses_native_ids() {
+        let client = scripted_client([email_set_reply(
+            "shared",
+            "shared-state",
+            "shared-next",
+            "M9",
+        )]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
+        let destination = foreign::encode_foreign("shared", "mbx-2");
+        let states = state_map(&[("shared", "shared-state")]);
+        let targets = Box::pin(futures::stream::iter([foreign_id.clone()]));
+
+        let mut stream = crate::sync::mutation::move_to(
+            primary,
+            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 1,
+                max_objects_in_set: 1,
+            },
+            states,
+            targets,
+            MembershipScope::Mailbox(bifrost_types::MailboxId(destination.0)),
+            idempotency_key(),
+        );
+
+        match stream.next().await {
+            Some(bifrost_types::SyncEvent::Batch(batch)) => match &batch.items[..] {
+                [bifrost_types::ItemOutcome::Succeeded(success)] => {
+                    assert_eq!(success.item.0, foreign_id.0);
+                }
+                other => panic!("expected the foreign move to apply, got {other:?}"),
+            },
+            other => panic!("expected the foreign move batch, got {other:?}"),
+        }
+
+        let requests = client.transport().requests();
+        assert_eq!(requests.len(), 1);
+        let call = &requests[0]["methodCalls"][0];
+        assert_eq!(call[1]["accountId"], "shared");
+        assert_eq!(call[1]["ifInState"], "shared-state");
+        assert_eq!(
+            call[1]["update"]["M9"]["mailboxIds"],
+            json!({"mbx-2": true})
+        );
+    }
+
+    /// Single-item container membership has the same silent-wrong-container
+    /// exposure as the bulk lane: the target selects the account, the
+    /// container id is taken as given, and both resolve inside that one
+    /// account. The armed reply is what a shared server holding its own
+    /// "inbox" would answer, so under the defect this call returns `Ok`.
+    #[tokio::test]
+    async fn a_foreign_message_cannot_be_filed_into_a_primary_container_id() {
+        let client = scripted_client([email_set_reply(
+            "shared",
+            "shared-state",
+            "shared-next",
+            "M9",
+        )]);
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let foreign_id = ObjectId(foreign::encode_object("shared", "M9"));
+        let states = state_map(&[("shared", "shared-state")]);
+
+        let error = crate::sync::pim::add_to_container(
+            shared,
+            states,
+            "shared".to_string(),
+            MutationTarget::Message(foreign_id),
+            ContainerId("inbox".to_string()),
+        )
+        .await
+        .expect_err("a primary container id is not addressable in a shared account");
+
+        assert_eq!(
+            error.kind(),
+            &bifrost_types::AccountErrorKind::Request(bifrost_types::RequestErrorKind::Malformed)
+        );
+        assert!(
+            client.transport().requests().is_empty(),
+            "the rejection has to happen before the Email/set is sent"
+        );
+    }
+
+    /// A short batch for a quiet owner must not wait for the whole input to
+    /// end. `shared` contributes one target and then goes silent; the fix
+    /// flushes it once a full batch worth of other input has gone by, so its
+    /// request precedes the busy owner's rather than trailing everything.
+    #[tokio::test]
+    async fn a_partial_batch_for_one_owner_flushes_before_the_input_ends() {
+        let client = scripted_client([
+            email_set_reply("shared", "shared-state", "shared-next", "M9"),
+            email_set_reply_ids("primary", "primary-state", "primary-b", &["m1", "m2"]),
+            email_set_reply_ids("primary", "primary-b", "primary-c", &["m3"]),
+        ]);
+        let primary = client
+            .primary_account::<capability::Mail>()
+            .expect("primary mail account");
+        let shared = JmapMailAccount::new(client.clone(), JmapAccountId::new("shared"));
+        let states = state_map(&[("primary", "primary-state"), ("shared", "shared-state")]);
+        let targets = Box::pin(futures::stream::iter([
+            ObjectId(foreign::encode_object("shared", "M9")),
+            ObjectId("m1".to_string()),
+            ObjectId("m2".to_string()),
+            ObjectId("m3".to_string()),
+        ]));
+
+        let mut stream = crate::sync::mutation::set_flags(
+            primary,
+            Arc::new(HashMap::from([("shared".to_string(), shared)])),
+            super::capabilities::CoreLimits {
+                max_objects_in_get: 1,
+                max_objects_in_set: 2,
+            },
+            states,
+            targets,
+            FlagOp::Add(HashSet::from(["$seen".to_string()])),
+            idempotency_key(),
+        );
+        while let Some(event) = stream.next().await {
+            assert!(
+                !matches!(event, bifrost_types::SyncEvent::Terminated(_)),
+                "the mutation stream must not terminate: {event:?}"
+            );
+        }
+
+        let requests = client.transport().requests();
+        let accounts: Vec<Value> = requests
+            .iter()
+            .map(|request| request["methodCalls"][0][1]["accountId"].clone())
+            .collect();
+        assert_eq!(
+            accounts,
+            vec![json!("shared"), json!("primary"), json!("primary")],
+            "the quiet owner's short batch must not be held until end of input"
+        );
     }
 
     #[tokio::test]

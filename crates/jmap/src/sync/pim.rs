@@ -1388,8 +1388,12 @@ async fn patch_mailbox_membership<T: HttpTransport>(
     value: bool,
     op: AccountOperation,
 ) -> Result<(), AccountError> {
+    cross_account_container(&target, &container, op)?;
     let ids = resolve_target(mail, target, op).await?;
-    let mailbox = MailboxId::new(container.0);
+    // The owner check above has established that the container names the
+    // same account as the target, so the only work left is stripping the
+    // qualification the selected account does not use.
+    let mailbox = MailboxId::new(wire_id_for_mail(&container.0, mail.id_str()));
     let ids_for_set = ids.clone();
     let mut response =
         send_email_set_with_retry(mail, email_states, account_id, op, move |state| {
@@ -1412,7 +1416,9 @@ async fn resolve_target<T: HttpTransport>(
     op: AccountOperation,
 ) -> Result<Vec<EmailId>, AccountError> {
     match target {
-        MutationTarget::Message(id) => Ok(vec![EmailId::new(id.0)]),
+        MutationTarget::Message(id) => {
+            Ok(vec![EmailId::new(wire_id_for_mail(&id.0, mail.id_str()))])
+        }
         MutationTarget::Thread(thread) => {
             let mut response = mail
                 .call(
@@ -1438,6 +1444,55 @@ async fn resolve_target<T: HttpTransport>(
             None,
             "JMAP does not support this mutation target",
         )),
+    }
+}
+
+/// Refuse a container membership patch whose object and whose container
+/// belong to different JMAP accounts.
+///
+/// The account layer routes the `Email/set` by the TARGET's owner but takes
+/// the container id as given, and the server resolves both operands inside
+/// that one `accountId`. So a bare (primary) container id addressed to a
+/// foreign account does not fail: it names whatever mailbox that account
+/// holds under the same id, and the message is filed somewhere the caller
+/// never asked for with no error reported. Compare owners before anything is
+/// sent. Threads never route foreign, so their owner is the primary account
+/// (`None`); other target shapes keep `resolve_target`'s `Unsupported`
+/// classification and are left alone here.
+///
+/// `Request(Malformed)` matches bifrost-graph's cross-mailbox `bulk_move`
+/// rejection: the caller asked for something one endpoint cannot express.
+fn cross_account_container(
+    target: &MutationTarget,
+    container: &ContainerId,
+    op: AccountOperation,
+) -> Result<(), AccountError> {
+    let (target_id, target_owner) = match target {
+        MutationTarget::Message(id) => (id.0.as_str(), super::foreign::owner_of(&id.0)),
+        MutationTarget::Thread(thread) => (thread.0.as_str(), None),
+        _ => return Ok(()),
+    };
+    let container_owner = super::foreign::owner_of(&container.0);
+    if target_owner == container_owner {
+        return Ok(());
+    }
+    Err(super::error::cross_account_destination(
+        op,
+        target_id,
+        target_owner,
+        &container.0,
+        container_owner,
+    ))
+}
+
+/// The account layer has already selected `mail` from a registered foreign
+/// object id. Strip that routing prefix only when it names this exact account;
+/// an unreachable foreign id remains literal on the primary route so the
+/// server produces the normal not-found response.
+fn wire_id_for_mail(id: &str, account_id: &str) -> String {
+    match super::foreign::parse_object(id) {
+        Some((owner, native)) if owner == account_id => native.to_string(),
+        _ => id.to_string(),
     }
 }
 
