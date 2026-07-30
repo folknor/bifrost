@@ -181,6 +181,15 @@ pub(crate) struct PooledConn {
 }
 
 impl PooledConn {
+    /// The live connection of this checkout.
+    ///
+    /// Panics if the member has been taken: after `discard()`, or after a
+    /// `deselect_target` fallback whose redial failed (the old member is
+    /// already logged out by then, so there is nothing valid to return).
+    /// Both are terminal for the checkout - every caller propagates the
+    /// error and drops the `PooledConn` - so the panic marks a caller
+    /// reusing a checkout it was told is dead, which is a bug worth being
+    /// loud about rather than surfacing as a quiet dead-connection error.
     pub(crate) fn connection(&self) -> &ImapConnection {
         &self
             .member

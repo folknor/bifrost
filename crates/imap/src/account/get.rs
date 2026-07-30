@@ -59,13 +59,18 @@ pub(crate) fn get_stream(
         let mut groups: Vec<(MailboxName, Vec<DecodedObjectId>)> = grouped.into_values().collect();
         groups.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (folder, ids) in groups {
-            match run_folder_get(&account, &folder, ids.clone(), projection, &tx).await {
+            let mut pending = ids;
+            match run_folder_get(&account, &folder, &mut pending, projection, &tx).await {
                 Ok(()) => {}
                 Err(GetError::ChannelDropped) => return,
                 Err(other) => {
                     // Per-folder failure does not collapse the stream:
-                    // remaining items in this folder surface as
-                    // `Uncertain`, the next folder still runs. A
+                    // still-unresolved items in this folder surface as
+                    // `Uncertain`, the next folder still runs. Only ids
+                    // without a published outcome fall into that lane:
+                    // stale-UIDVALIDITY ids were already emitted as
+                    // `Failed` before the fallible FETCH, and re-emitting
+                    // them here would put one id in two lanes. A
                     // shared-folder SELECT denial is pre-classified to
                     // `ScopeRevoked` so it quarantines that scope rather
                     // than masquerading as a generic hydration failure.
@@ -80,7 +85,7 @@ pub(crate) fn get_stream(
                         ),
                         GetError::ChannelDropped => unreachable!("handled above"),
                     };
-                    let uncertain: Vec<ItemOutcome<HydratedObject>> = ids
+                    let uncertain: Vec<ItemOutcome<HydratedObject>> = pending
                         .into_iter()
                         .map(|id| {
                             let item = BatchItemId(
@@ -178,10 +183,16 @@ async fn emit_stale_failures(
         .map_err(|_| GetError::ChannelDropped)
 }
 
+/// Hydrate one folder's ids. `pending` is the caller's unresolved set: ids
+/// whose outcome this function has already published are removed from it,
+/// so a folder-level error afterwards downgrades only the ids that still
+/// lack a lane. Without that pruning, a FETCH failure after the stale
+/// publication would re-emit the stale ids as `Uncertain` on top of their
+/// `Failed`, breaking the one-outcome-per-id contract the engine holds.
 async fn run_folder_get(
     account: &ImapAccount,
     folder: &MailboxName,
-    ids: Vec<DecodedObjectId>,
+    pending: &mut Vec<DecodedObjectId>,
     projection: Projection,
     tx: &tokio::sync::mpsc::Sender<SyncEvent<ItemOutcome<HydratedObject>>>,
 ) -> Result<(), GetError> {
@@ -216,8 +227,10 @@ async fn run_folder_get(
         .mailbox
         .uid_validity
         .ok_or_else(|| crate::Error::Protocol("SELECT missing UIDVALIDITY".into()))?;
-    let (valid, stale): (Vec<_>, Vec<_>) = ids
-        .into_iter()
+    // `pending` is drained only now: a checkout or SELECT failure above
+    // must leave every id in the caller's unresolved set.
+    let (valid, stale): (Vec<_>, Vec<_>) = pending
+        .drain(..)
         .partition(|id| id.uidvalidity == uidvalidity);
     let requested: Vec<u32> = valid.iter().map(|id| id.uid).collect();
     let requested_uids: HashSet<u32> = requested.iter().copied().collect();
@@ -226,6 +239,9 @@ async fn run_folder_get(
     // per-item truth if that FETCH fails and the folder falls back to the
     // uncertain lane.
     emit_stale_failures(tx, stale, folder).await?;
+    // The stale failures are on the channel: from here on only the valid
+    // ids remain unresolved should the FETCH (or MODSEQ recording) fail.
+    *pending = valid.clone();
     let mut out: Vec<ItemOutcome<HydratedObject>> = Vec::with_capacity(BATCH_ITEMS);
     let Some(uid_set) = uid_set_from_u32(&requested) else {
         return Ok(());

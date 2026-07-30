@@ -114,6 +114,94 @@ async fn container_create_completes_under_a_single_permit_pool() {
     let _server = script.await.unwrap();
 }
 
+/// A hydration FETCH failure after the stale-UIDVALIDITY batch was
+/// published must downgrade only the still-unresolved ids. Re-emitting the
+/// stale ids as `Uncertain` would put one id in two lanes: the engine
+/// would terminally fail it and simultaneously queue it for read-back.
+#[tokio::test]
+async fn folder_get_failure_does_not_relabel_published_stale_ids() {
+    use bifrost_types::{ItemOutcome, Projection, SyncEvent};
+
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("INBOX").unwrap();
+    let stale_id = super::encode_object_id(&folder, 4, 7);
+    let valid_id = super::encode_object_id(&folder, 5, 3);
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(
+            select.contains("EXAMINE") || select.contains("SELECT"),
+            "expected a select, got {select}"
+        );
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 1 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 5] ok\r\n\
+                 * OK [UIDNEXT 9] ok\r\n\
+                 {} OK [READ-ONLY] done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let fetch = read_line(&mut server).await;
+        assert!(fetch.contains("FETCH"), "expected UID FETCH, got {fetch}");
+        respond(
+            &mut server,
+            &format!("{} NO [UNAVAILABLE] busy\r\n", tag_of(&fetch)),
+        )
+        .await;
+        server
+    });
+
+    let ids: bifrost_types::AccountStream<bifrost_types::ObjectId> =
+        Box::pin(futures::stream::iter(vec![
+            stale_id.clone(),
+            valid_id.clone(),
+        ]));
+    let mut stream = super::get::get_stream(account, ids, Projection::Metadata);
+
+    let mut failed = Vec::new();
+    let mut uncertain = Vec::new();
+    let mut succeeded = Vec::new();
+    use futures::StreamExt;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream must make progress")
+    {
+        match event {
+            SyncEvent::Batch(batch) => {
+                for outcome in batch.items {
+                    match outcome {
+                        ItemOutcome::Failed(item) => failed.push(item.item.0.clone()),
+                        ItemOutcome::Uncertain(item) => uncertain.push(item.item.0.clone()),
+                        ItemOutcome::Succeeded(item) => succeeded.push(item.item.0.clone()),
+                    }
+                }
+            }
+            SyncEvent::Done(_) => break,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        failed,
+        vec![stale_id.0.clone()],
+        "the stale id fails exactly once, before the FETCH"
+    );
+    assert_eq!(
+        uncertain,
+        vec![valid_id.0.clone()],
+        "only the unresolved id may fall to the uncertain lane"
+    );
+    assert!(succeeded.is_empty());
+    let _server = script.await.unwrap();
+}
+
 fn created_name() -> crate::types::MailboxName {
     crate::types::MailboxName::new("Archive".to_owned()).unwrap()
 }

@@ -284,7 +284,7 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 `get_stream` groups requested ids by folder and answers every requested id exactly once.
 
-- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails.
+- Ids whose UIDVALIDITY no longer matches the selected mailbox are `Failed(Request(Malformed))` and are published *before* the hydration FETCH is issued. They are known truth already; buffering them behind a fallible command would relabel them uncertain whenever that command fails. The per-folder error path in turn only downgrades ids that still lack a published outcome (`run_folder_get` prunes the caller's unresolved set as it publishes), so a FETCH failure after the stale batch cannot put one id in two lanes.
 - A requested UID the server never returns is `Failed(NotFound(Message))` rather than being silently dropped.
 - FETCH responses are merged per UID before conversion. A server may follow the solicited response with unsolicited FLAGS-only FETCHes for the same UID; the merge adopts later `FLAGS` / `MODSEQ` and fills gaps, but never blanks a data item or body section the earlier response carried, so a trailing partial response cannot turn a complete hydration into an empty one.
 - `Projection::Preview` asks for headers plus a partial `BODY.PEEK[TEXT]`; the raw-MIME bytes concatenate the HEADER section and the TEXT section rather than keeping whichever arrived first.
