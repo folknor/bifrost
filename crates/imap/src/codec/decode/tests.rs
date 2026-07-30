@@ -3069,53 +3069,28 @@ fn untagged_fetch_missing_closing_paren() {
 fn quoted_string_incomplete_does_not_block_alt_fallthrough() {
     // A FETCH response whose ENVELOPE has an unterminated quoted string.
     // The quoted_string parser must return Error (not Incomplete) so that
-    // alt() falls through to the Unknown catch-all.
+    // the unknown-response fallback can preserve wire framing.
     let input = b"* 1 FETCH (ENVELOPE (\"unterminated subject))\r\n";
     let result = parse_response(input);
-    match result {
-        Ok((_, Response::Untagged(boxed))) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "Truncated quoted string in FETCH should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        Ok((_, other)) => panic!("Expected Untagged(Unknown), got {other:?}"),
-        // Incomplete error means the bug is present  -  alt() didn't fall through.
-        Err(nom::Err::Incomplete(_)) => {
-            panic!(
-                "BUG: quoted_string returned Incomplete in complete mode, blocking alt() fallthrough"
-            );
-        }
-        Err(_) => {
-            panic!("BUG: parse failed instead of falling through to Unknown");
-        }
-    }
+    assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
+    assert!(matches!(
+        result,
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
 fn scan_section_spec_incomplete_does_not_block_alt_fallthrough() {
     // A FETCH response with an unterminated BODY section (missing `]`).
-    // scan_section_spec must return Error (not Incomplete) so that
-    // alt() falls through to the Unknown catch-all.
+    // scan_section_spec must return Error (not Incomplete) so that the
+    // unknown-response fallback can preserve wire framing.
     let input = b"* 1 FETCH (BODY[HEADER no-close\r\n";
     let result = parse_response(input);
-    match result {
-        Ok((_, Response::Untagged(boxed))) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "Unterminated BODY section should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        Ok((_, other)) => panic!("Expected Untagged(Unknown), got {other:?}"),
-        Err(nom::Err::Incomplete(_)) => {
-            panic!(
-                "BUG: scan_section_spec returned Incomplete in complete mode, blocking alt() fallthrough"
-            );
-        }
-        Err(_) => {
-            panic!("BUG: parse failed instead of falling through to Unknown");
-        }
-    }
+    assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
+    assert!(matches!(
+        result,
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
@@ -3161,27 +3136,15 @@ fn untagged_status_bare_bye_no_text() {
 #[test]
 fn skip_paren_group_incomplete_does_not_block_alt_fallthrough() {
     // A FETCH BODYSTRUCTURE with unclosed parentheses in extension data.
-    // skip_paren_group must return Error (not Incomplete) so that
-    // alt() falls through to the Unknown catch-all.
+    // skip_paren_group must return Error (not Incomplete) so that the
+    // unknown-response fallback can preserve wire framing.
     let input = b"* 1 FETCH (BODYSTRUCTURE (\"text\" \"plain\" NIL NIL NIL \"7bit\" 42 3 NIL NIL NIL NIL (unclosed-ext\r\n";
     let result = parse_response(input);
-    match result {
-        Ok((_, Response::Untagged(boxed))) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "Unclosed paren in BODYSTRUCTURE should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        Ok((_, other)) => panic!("Expected Untagged(Unknown), got {other:?}"),
-        Err(nom::Err::Incomplete(_)) => {
-            panic!(
-                "BUG: skip_paren_group returned Incomplete in complete mode, blocking alt() fallthrough"
-            );
-        }
-        Err(_) => {
-            panic!("BUG: parse failed instead of falling through to Unknown");
-        }
-    }
+    assert!(!matches!(result, Err(nom::Err::Incomplete(_))));
+    assert!(matches!(
+        result,
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
@@ -6824,19 +6787,7 @@ fn vanished_overlapping_ranges() {
 fn vanished_sequence_set_with_star() {
     // `*` must be rejected in VANISHED known-uids per RFC 7162 Section 6.
     let input = b"* VANISHED 1:5,*\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    // The VANISHED parser must fail on `*`; the input falls through to
-    // the catch-all `Unknown` branch instead.
-    match resp {
-        Response::Untagged(boxed) => match *boxed {
-            UntaggedResponse::Vanished { .. } => {
-                panic!("VANISHED must reject `*` in known-uids (RFC 7162 Section 6)");
-            }
-            UntaggedResponse::Unknown(_) => {} // expected
-            other => panic!("unexpected variant: {other:?}"),
-        },
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 /// VANISHED known-uids must reject `*` per RFC 7162 Section 6.
@@ -6854,45 +6805,15 @@ fn vanished_sequence_set_with_star() {
 fn vanished_rejects_star_in_known_uids() {
     // Bare `*` must be rejected.
     let input = b"* VANISHED *\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => match *boxed {
-            UntaggedResponse::Vanished { .. } => {
-                panic!("VANISHED must reject bare `*` in known-uids (RFC 7162 Section 6)");
-            }
-            UntaggedResponse::Unknown(_) => {} // expected
-            other => panic!("unexpected variant: {other:?}"),
-        },
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 
     // `*` in a range (`1:*`) must also be rejected.
     let input = b"* VANISHED 1:*\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => match *boxed {
-            UntaggedResponse::Vanished { .. } => {
-                panic!("VANISHED must reject `*` in range in known-uids (RFC 7162 Section 6)");
-            }
-            UntaggedResponse::Unknown(_) => {} // expected
-            other => panic!("unexpected variant: {other:?}"),
-        },
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 
     // `*` with EARLIER must also be rejected.
     let input = b"* VANISHED (EARLIER) 1:5,*\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => match *boxed {
-            UntaggedResponse::Vanished { .. } => {
-                panic!("VANISHED EARLIER must reject `*` in known-uids (RFC 7162 Section 6)");
-            }
-            UntaggedResponse::Unknown(_) => {} // expected
-            other => panic!("unexpected variant: {other:?}"),
-        },
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 /// Non-ASCII bytes in quoted strings are handled gracefully.
@@ -7247,37 +7168,15 @@ fn address_list_accepts_nil() {
 #[test]
 fn esearch_min_rejects_zero() {
     // "* ESEARCH (TAG \"A1\") MIN 0\r\n"  -  MIN 0 is invalid per RFC 4731.
-    // The ESEARCH parser fails, so it falls through to Unknown
-    // (RFC 9051 Section 2.2.2).
     let input = b"* ESEARCH (TAG \"A1\") MIN 0\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "ESEARCH MIN 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 #[test]
 fn esearch_max_rejects_zero() {
     // "* ESEARCH (TAG \"A1\") MAX 0\r\n"  -  MAX 0 is invalid per RFC 4731.
-    // The ESEARCH parser fails, so it falls through to Unknown
-    // (RFC 9051 Section 2.2.2).
     let input = b"* ESEARCH (TAG \"A1\") MAX 0\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "ESEARCH MAX 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 #[test]
@@ -7765,19 +7664,11 @@ fn search_empty_results_still_works() {
 #[test]
 fn fetch_uid_zero_rejected() {
     // uniqueid = nz-number per RFC 3501 Section 9.
-    // The FETCH parser fails, so it falls through to Unknown
-    // (RFC 9051 Section 2.2.2).
     let input = b"* 1 FETCH (UID 0)\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "FETCH UID 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    assert!(matches!(
+        parse_response(input),
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
@@ -7962,37 +7853,30 @@ fn response_code_copyuid_zero_uidvalidity_accepted() {
 #[test]
 fn expunge_zero_rejected() {
     // message-data uses nz-number for EXPUNGE (RFC 3501 Section 7.4.1).
-    // The numbered parser fails, so it falls through to Unknown
-    // (RFC 9051 Section 2.2.2).
-    let input = b"* 0 EXPUNGE\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "EXPUNGE 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    // `number SP EXPUNGE` is a form this codec fully implements, so a
+    // violation is a server contract violation, not an unknown extension: it
+    // must surface as a parse failure the account boundary maps to
+    // Protocol(ParseFailed).
+    assert!(parse_response(b"* 0 EXPUNGE\r\n").is_err());
+    // The same holds for EXISTS and RECENT, and through a tolerated run of
+    // spaces after the number.
+    assert!(parse_response(b"* 0 EXISTS trailing\r\n").is_err());
+    assert!(parse_response(b"* 1  RECENT junk\r\n").is_err());
+    // A numbered response we do not model stays an extension.
+    assert!(matches!(
+        parse_response(b"* 1 XSOMETHING (a b)\r\n"),
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
 fn fetch_seq_zero_rejected() {
     // message-data uses nz-number for FETCH (RFC 3501 Section 7.4.2).
-    // The numbered parser fails, so it falls through to Unknown
-    // (RFC 9051 Section 2.2.2).
     let input = b"* 0 FETCH (UID 1 FLAGS (\\Seen))\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "FETCH seq 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    assert!(matches!(
+        parse_response(input),
+        Ok((_, Response::Untagged(response))) if matches!(*response, UntaggedResponse::Unknown(_))
+    ));
 }
 
 #[test]
@@ -9226,19 +9110,9 @@ fn audit_m3_skip_paren_group_handles_literal() {
 /// RFC 5256 Section 5.
 #[test]
 fn audit_m4_thread_rejects_zero_uid() {
-    // THREAD must reject UID 0 per RFC 5256. The THREAD parser fails,
-    // so it falls through to Unknown (RFC 9051 Section 2.2.2).
+    // THREAD must reject UID 0 per RFC 5256.
     let input = b"* THREAD (5 0 3)\r\n";
-    let (_, resp) = parse_response(input).unwrap();
-    match resp {
-        Response::Untagged(boxed) => {
-            assert!(
-                matches!(*boxed, UntaggedResponse::Unknown(_)),
-                "THREAD with UID 0 should fall through to Unknown, got {boxed:?}"
-            );
-        }
-        other => panic!("Expected Untagged(Unknown), got {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 /// M5: BINARY section parts must use `nz-number`.
@@ -13927,20 +13801,45 @@ fn list_with_oldname_for_notify_rename() {
 // extension data.
 // ========================================================================
 
-/// RFC 2047 Section 2: an encoded word is `=?charset?encoding?text?=`, and
-/// none of `charset`, `encoding`, or `encoded-text` may contain SPACE.
-/// `parse_encoded_word_inner` nevertheless searches for the closing `?=`
-/// across the *entire* remaining header value, so a value built from
-/// repeated `=?` shift prefixes separated by spaces costs a full scan per
-/// candidate.
-///
-/// This pins the output  -  no candidate is a valid encoded word, so the whole
-/// value is passed through verbatim per RFC 2047 Section 6.3  -  and names the
-/// quadratic cost, which is
-/// The repetition count here is deliberately small so the test stays fast;
-/// the defect only bites on attacker-sized Subject headers.
+/// An RFC 2047 encoded word cannot span whitespace. Keeping delimiter scans
+/// inside this candidate window avoids rescanning the rest of a hostile header
+/// for every invalid `=?` prefix.
 #[test]
-fn rfc2047_repeated_shift_prefix_is_passed_through_verbatim() {
+fn rfc2047_candidate_window_stops_at_whitespace() {
+    assert_eq!(
+        super::encoded_words::encoded_word_window("UTF-8?Q?x?= rest"),
+        "UTF-8?Q?x?="
+    );
+    assert_eq!(
+        super::encoded_words::encoded_word_window("UTF-8?Q?x?=é"),
+        "UTF-8?Q?x?="
+    );
+}
+
+/// Whitespace alone is not enough of a bound: a hostile header can be one
+/// unbroken printable run, so the candidate window is also capped by a
+/// constant. Without the cap each of the N failing `=?` candidates rescans
+/// O(N) bytes and RFC 2047 decoding is quadratic in the header length.
+#[test]
+fn rfc2047_candidate_window_is_capped_for_unbroken_printable_runs() {
+    let hostile = "=?".repeat(50_000);
+    let window = super::encoded_words::encoded_word_window(&hostile);
+    assert!(
+        window.len() <= 998,
+        "candidate scan must be bounded by a constant, scanned {} bytes",
+        window.len()
+    );
+    // The bound must not truncate an overlong-but-real encoded word, which
+    // this decoder still accepts (regression IMAP-001).
+    let long_word = format!("UTF-8?B?{}?=", "QQ==".repeat(20));
+    assert_eq!(
+        super::encoded_words::encoded_word_window(&long_word),
+        long_word
+    );
+}
+
+#[test]
+fn rfc2047_repeated_shift_prefixes_are_passed_through_verbatim() {
     let input = "=? ".repeat(2000);
     assert_eq!(
         decode_rfc2047(input.as_bytes()),
@@ -13959,57 +13858,13 @@ fn rfc2047_adjacent_shift_prefixes_are_passed_through_verbatim() {
     assert_eq!(decode_rfc2047(input.as_bytes()), input);
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
-///
-/// `parse_untagged`'s final alternative is the unconditional
-/// `parse_untagged_unknown` catch-all, so *any* parse failure inside a
-/// recognized response type is laundered into `UntaggedResponse::Unknown`
-/// with no diagnostic at all  -  not even a `tracing` event.
-///
-/// `classify` maps `Unknown` to `OnlyUnsolicited` (`codec/classification.rs`),
-/// so a STATUS response the parser could not handle is routed away from the
-/// STATUS command's consumer and the command completes with no status data
-/// and no error.
-///
-/// Input below violates RFC 3501 Section 7.2.4 (`status-att SP number`): the
-/// MESSAGES item carries no value.
+/// A malformed form of a known response is a parse failure, not an extension
+/// response. The driver closes the connection and the account boundary maps
+/// it to `Protocol(ParseFailed)`.
 #[test]
-fn malformed_status_silently_degrades_to_unknown_response() {
+fn malformed_status_is_a_parse_failure() {
     let input = b"* STATUS \"INBOX\" (MESSAGES)\r\n";
-    let (rest, resp) = parse_response(input).unwrap();
-    assert!(rest.is_empty());
-    match resp {
-        Response::Untagged(u) => match *u {
-            UntaggedResponse::Unknown(raw) => {
-                assert_eq!(
-                    raw, "STATUS \"INBOX\" (MESSAGES)",
-                    "the whole malformed response is captured as opaque text"
-                );
-            }
-            other => panic!("expected Unknown, got: {other:?}"),
-        },
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
-}
-
-/// Same degradation on a recognized-but-malformed FETCH: an ENVELOPE with
-/// too few fields (RFC 3501 Section 7.4.2 requires ten) surfaces as
-/// `Unknown`, silently dropping the UID and FLAGS that parsed fine.
-///
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
-#[test]
-fn malformed_fetch_envelope_silently_degrades_to_unknown_response() {
-    let input = b"* 1 FETCH (UID 9 ENVELOPE (NIL NIL) FLAGS (\\Seen))\r\n";
-    let (rest, resp) = parse_response(input).unwrap();
-    assert!(rest.is_empty());
-    match resp {
-        Response::Untagged(u) => assert!(
-            matches!(*u, UntaggedResponse::Unknown(_)),
-            "a malformed ENVELOPE loses the entire FETCH, including the \
-             UID and FLAGS that parsed; got: {u:?}"
-        ),
-        other => panic!("expected Untagged, got: {other:?}"),
-    }
+    assert!(parse_response(input).is_err());
 }
 
 /// Gmail's `X-GM-LABELS` FETCH data item has no field on `FetchResponse`, so
@@ -14039,25 +13894,49 @@ fn fetch_x_gm_labels_is_skipped_without_losing_other_attributes() {
     }
 }
 
-/// A `[UIDNEXT n]` response code whose value overflows `u32` is not merely
-/// dropped: `opt(response_code)` backtracks the whole bracket group, so the
-/// entire `[...]` ends up in the human-readable text field instead.
-///
-/// The STATUS parser uses `number_tolerant` in the same position and keeps
-/// the surrounding items, so the two paths disagree about what "tolerate an
-/// oversized number" means.
+/// The overflow recovery above must look only at the code's own value. A
+/// number in the surrounding status text (or in a response coalesced into the
+/// same buffer) is not evidence that the code overflowed, so a genuinely
+/// malformed code stays a parse error and keeps falling back to display text.
 #[test]
-fn response_code_uidnext_overflow_falls_into_text_not_code() {
+fn response_code_overflow_recovery_stops_at_the_closing_bracket() {
+    // APPENDUID with no uid-set is malformed, not overflowing; the 4294967296
+    // lives in the text after `]`.
+    let input = b"* OK [APPENDUID 1234 ] saved as 4294967296\r\n";
+    let (rest, resp) = parse_response(input).unwrap();
+    assert!(rest.is_empty());
+    if let Response::Untagged(u) = resp {
+        if let UntaggedResponse::Status { code, text, .. } = *u {
+            assert_eq!(
+                code, None,
+                "a malformed APPENDUID must not be laundered into an opaque code"
+            );
+            assert_eq!(text, "[APPENDUID 1234 ] saved as 4294967296");
+        } else {
+            panic!("expected Status, got: {u:?}");
+        }
+    } else {
+        panic!("expected Untagged");
+    }
+}
+
+/// An overflowing numeric response code remains structured as an opaque code
+/// rather than being demoted into the human-readable status text.
+#[test]
+fn response_code_uidnext_overflow_preserves_the_code() {
     let input = b"* OK [UIDNEXT 4294967296] Predicted next UID\r\n";
     let (rest, resp) = parse_response(input).unwrap();
     assert!(rest.is_empty());
     if let Response::Untagged(u) = resp {
         if let UntaggedResponse::Status { code, text, .. } = *u {
-            assert!(
-                code.is_none(),
-                "the oversized UIDNEXT loses its structure entirely; got: {code:?}"
+            assert_eq!(
+                code,
+                Some(ResponseCode::Other {
+                    name: "UIDNEXT".into(),
+                    value: Some("4294967296".into()),
+                })
             );
-            assert_eq!(text, "[UIDNEXT 4294967296] Predicted next UID");
+            assert_eq!(text, "Predicted next UID");
         } else {
             panic!("expected Status, got: {u:?}");
         }
@@ -14066,17 +13945,13 @@ fn response_code_uidnext_overflow_falls_into_text_not_code() {
     }
 }
 
-/// `decode_mailbox_from_wire` builds a `MailboxName` via
-/// `MailboxName::from_decoded`, which performs no validation, so a
-/// modified-Base64 shift segment lets a server hand the client a mailbox
-/// name containing CR, LF, or NUL  -  octets `MailboxName::new` rejects.
-///
-/// `&AAoALQ-` is UTF-16BE `U+000A U+002D` ("\n-"). See
-///: the encode path happens to contain this
-/// (MUTF-7 re-encodes the LF, and UTF8=ACCEPT mode falls back to a literal),
-/// so this is an invariant leak rather than an injection.
+/// A wire-decoded mailbox name is the server's own identifier, so it is kept
+/// byte-for-byte even when it contains octets `MailboxName::new` rejects
+/// (RFC 3501 Section 5.1: MUTF-7 can represent any code point). Rewriting it
+/// would make the client address a mailbox the server never advertised; CRLF
+/// safety is enforced when the name is re-encoded, not here.
 #[test]
-fn list_mailbox_name_can_carry_control_characters_from_the_wire() {
+fn list_mailbox_name_preserves_control_characters_from_the_wire() {
     let input = b"* LIST () \"/\" \"&AAoALQ-\"\r\n";
     let (rest, resp) = parse_response(input).unwrap();
     assert!(rest.is_empty());
@@ -14085,13 +13960,12 @@ fn list_mailbox_name_can_carry_control_characters_from_the_wire() {
             assert_eq!(
                 info.name.as_str(),
                 "\n-",
-                "the decoded name carries a raw LF that `MailboxName::new` \
-                 would have rejected"
+                "the server's name is preserved verbatim, LF and all"
             );
             assert!(
                 MailboxName::new(info.name.as_str()).is_err(),
-                "the same string is not constructible through the validating \
-                 constructor"
+                "the validating constructor is stricter than the wire path on \
+                 purpose; consumers must not assume its invariant for parsed names"
             );
         } else {
             panic!("expected List, got: {u:?}");

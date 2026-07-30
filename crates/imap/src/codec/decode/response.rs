@@ -59,7 +59,7 @@ pub(super) fn parse_continuation(input: &[u8]) -> IResult<&[u8], ContinuationReq
 /// per Postel's law (RFC 1122 Section 1.2.2).
 pub(super) fn parse_tagged(input: &[u8]) -> IResult<&[u8], TaggedResponse> {
     let (input, tag_bytes) = tag_str(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, status) = alt((
         value(StatusKind::Ok, tag_no_case(&b"OK"[..])),
         value(StatusKind::No, tag_no_case(&b"NO"[..])),
@@ -173,7 +173,7 @@ pub(super) fn parse_untagged_numbered(
 ) -> IResult<&[u8], UntaggedResponse> {
     let num_start = input; // Save position for leading-zero check
     let (input, n) = number(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
 
     // Peek at the keyword to decide which response type we have.
     if input.len() >= 6 && input[..6].eq_ignore_ascii_case(b"EXISTS") {
@@ -222,7 +222,7 @@ pub(super) fn parse_untagged_numbered(
 
     // message-data: nz-number SP msg-att (RFC 3501 Section 7.4.2)
     let (input, _) = tag_no_case(&b"FETCH"[..]).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, mut fr) = fetch_response_inner(input, utf8_mode)?;
     let (input, _) = crlf(input)?;
     fr.seq = n;
@@ -232,7 +232,7 @@ pub(super) fn parse_untagged_numbered(
 /// Parse `* CAPABILITY ...` (RFC 3501 Section 7.2.1 / RFC 9051 Section 7.2.1).
 pub(super) fn parse_untagged_capability(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"CAPABILITY"[..]).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // RFC 3501 Section 7.2.1: capability-data = "CAPABILITY" *(SP capability)
     let (input, caps) = capability_list(input)?;
     // Tolerate trailing whitespace before CRLF (Postel's law).
@@ -244,7 +244,7 @@ pub(super) fn parse_untagged_capability(input: &[u8]) -> IResult<&[u8], Untagged
 /// Parse `* FLAGS (...)` (RFC 3501 Section 7.2.6 / RFC 9051 Section 7.2.6).
 pub(super) fn parse_untagged_flags(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"FLAGS"[..]).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // RFC 3501 Section 7.2.6: "FLAGS" SP flag-list
     let (input, flags) = flag_list(input)?;
     // Tolerate trailing whitespace before CRLF (Postel's law).
@@ -348,7 +348,7 @@ where
     F: FnOnce(MailboxInfo) -> UntaggedResponse,
 {
     let (input, _) = tag_no_case(keyword).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // Attributes
     let (input, attrs) = delimited(
         char('('),
@@ -369,10 +369,10 @@ where
         char(')'),
     )
     .parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // Delimiter: NIL or single QUOTED-CHAR  -  RFC 3501 Section 9.
     let (input, delimiter) = mailbox_delimiter(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // Mailbox name  -  decode from wire form (MUTF-7 or UTF-8) at parse time
     // per RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1.
     let (input, name_bytes) = astring(input)?;
@@ -469,12 +469,12 @@ pub(super) fn parse_untagged_status_mailbox(
     utf8_mode: bool,
 ) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"STATUS"[..]).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     // Decode wire-form mailbox name (MUTF-7 or UTF-8) at parse time
     // per RFC 3501 Section 5.1.3 / RFC 9051 Section 5.1.
     let (input, mailbox_bytes) = astring(input)?;
     let mailbox = decode_mailbox_from_wire(&mailbox_bytes, utf8_mode);
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, items) = delimited(char('('), status_items, char(')')).parse(input)?;
     let (input, _) = crlf(input)?;
     Ok((input, UntaggedResponse::MailboxStatus { mailbox, items }))
@@ -504,7 +504,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
 
         match upper.as_str() {
             "MESSAGES" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -513,7 +513,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 input_loop = rest;
             }
             "RECENT" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -522,7 +522,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 input_loop = rest;
             }
             "UNSEEN" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -535,7 +535,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
             // non-conformant servers (e.g. some Dovecot configurations) send 0
             // for empty mailboxes.
             "UIDNEXT" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -544,7 +544,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 input_loop = rest;
             }
             "UIDVALIDITY" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -554,7 +554,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
             }
             // RFC 9051 Section 6.3.11: DELETED is a standard rev2 STATUS item.
             "DELETED" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number_tolerant(rest)?;
                 if let Some(val) = val {
@@ -563,7 +563,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 input_loop = rest;
             }
             "HIGHESTMODSEQ" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number64_tolerant(rest)?;
                 if let Some(val) = val {
@@ -572,7 +572,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 input_loop = rest;
             }
             "SIZE" => {
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
                 let (rest, val) = number64_tolerant(rest)?;
                 if let Some(val) = val {
@@ -583,7 +583,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
             "MAILBOXID" => {
                 // RFC 8474 Section 5.1: MAILBOXID (objectid-val)
                 // objectid = 1*255(ALPHA / DIGIT / "_" / "-") per RFC 8474 Section 7.
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 let (rest, _) = char('(').parse(rest)?;
                 let (rest, val) =
                     map(objectid, |a| String::from_utf8_lossy(a).into_owned()).parse(rest)?;
@@ -594,7 +594,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
             "APPENDLIMIT" => {
                 // RFC 7889: APPENDLIMIT in STATUS can be NIL (no limit) or a number.
                 // Overflow is silently skipped per Postel's law (RFC 1122 Section 1.2.2).
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 let (rest, val) = alt((
                     map(nil_token, |_| Some(None::<u64>)),
                     map(number64_tolerant, |opt| opt.map(Some)),
@@ -608,7 +608,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
             "DELETED-STORAGE" => {
                 // RFC 9208 Section 3: disk space consumed by deleted messages.
                 // Tolerant: overflow skipped per Postel's law (RFC 1122 Section 1.2.2).
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 let (rest, val) = number64_tolerant(rest)?;
                 if let Some(val) = val {
                     items.push(StatusItem::DeletedStorage(val));
@@ -620,7 +620,7 @@ pub(super) fn status_items(input: &[u8]) -> IResult<&[u8], Vec<StatusItem>> {
                 // includes parenthesized forms, quoted strings, and literals.
                 // tagged-ext-val = tagged-ext-simple /
                 //   "(" [tagged-ext-comp] ")"
-                let (rest, _) = sp(rest)?;
+                let (rest, _) = take_while1(|b: u8| b == b' ').parse(rest)?;
                 if rest.first() == Some(&b'(') {
                     // Parenthesized value  -  skip balanced group.
                     let (rest, ()) = skip_parenthesized_block(rest)?;
@@ -645,7 +645,7 @@ pub(super) fn parse_untagged_enabled(input: &[u8]) -> IResult<&[u8], UntaggedRes
     let (input, _) = tag_no_case(&b"ENABLED"[..]).parse(input)?;
     // RFC 5161 Section 3.2: "ENABLED" *(SP capability)
     let (input, caps) = many0(preceded(
-        sp,
+        take_while1(|b: u8| b == b' '),
         map(atom, |a| String::from_utf8_lossy(a).into_owned()),
     ))
     .parse(input)?;
@@ -663,17 +663,18 @@ pub(super) fn parse_untagged_enabled(input: &[u8]) -> IResult<&[u8], UntaggedRes
 /// where `known-uids = sequence-set` (RFC 3501 Section 9).
 pub(super) fn parse_untagged_vanished(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
     let (input, _) = tag_no_case(&b"VANISHED"[..]).parse(input)?;
-    let (input, _) = sp(input)?;
+    let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
     let (input, earlier) = opt(delimited(
         char('('),
         tag_no_case(&b"EARLIER"[..]),
         char(')'),
     ))
     .parse(input)?;
-    let (input, _) = if earlier.is_some() {
-        sp(input)?
+    let input = if earlier.is_some() {
+        let (input, _) = take_while1(|b: u8| b == b' ').parse(input)?;
+        input
     } else {
-        (input, b' ')
+        input
     };
     // RFC 7162 Section 6 ABNF: known-uids = sequence-set
     //   ;; Sequence of UIDs; "*" is not allowed.

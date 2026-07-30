@@ -332,12 +332,92 @@ pub(super) fn parse_untagged_thread(input: &[u8]) -> IResult<&[u8], UntaggedResp
 /// Only the final CRLF (not embedded in a literal or quoted string) terminates
 /// the response.
 pub(super) fn parse_untagged_unknown(input: &[u8]) -> IResult<&[u8], UntaggedResponse> {
+    // An extension response is allowed here, but a malformed form of a
+    // response we claim to understand is a server protocol violation. Let it
+    // reach WireReader as Error::Parse rather than silently routing it as an
+    // unsolicited unknown response.
+    if starts_known_untagged_response(input) {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
     let (input, raw) = scan_unknown_response(input)?;
     let (input, _) = crlf(input)?;
     Ok((
         input,
         UntaggedResponse::Unknown(String::from_utf8_lossy(raw).into_owned()),
     ))
+}
+
+/// Whether `input` (the body of an untagged response, after `* `) opens with a
+/// response keyword this codec claims to parse.
+///
+/// The direct table lists keywords whose whole grammar we implement, so a
+/// parse failure on one of them is a server contract violation rather than an
+/// extension we do not know.
+///
+/// The numbered table is deliberately smaller than the set of numbered
+/// responses we parse: `EXISTS`, `RECENT`, and `EXPUNGE` are `number SP
+/// keyword` and nothing else, so any failure really is malformed input.
+/// `FETCH` is excluded on purpose - its `msg-att` body is open-ended, this
+/// parser has known tolerance gaps inside it (two-space separators in
+/// `body-ext-*`, unmodelled data items), and hard-failing there would turn a
+/// shortfall of ours into a dropped connection against a conformant server.
+/// Malformed numbered `FETCH` therefore still degrades to `Unknown`.
+fn starts_known_untagged_response(input: &[u8]) -> bool {
+    const DIRECT_KEYWORDS: &[&[u8]] = &[
+        b"OK",
+        b"NO",
+        b"BAD",
+        b"BYE",
+        b"STATUS",
+        b"CAPABILITY",
+        b"FLAGS",
+        b"LIST",
+        b"LSUB",
+        b"ESEARCH",
+        b"SEARCH",
+        b"SORT",
+        b"ENABLED",
+        b"VANISHED",
+        b"ID",
+        b"NAMESPACE",
+        b"QUOTA",
+        b"QUOTAROOT",
+        b"ACL",
+        b"MYRIGHTS",
+        b"LISTRIGHTS",
+        b"METADATA",
+        b"THREAD",
+    ];
+
+    const NUMBERED_KEYWORDS: &[&[u8]] = &[b"EXISTS", b"RECENT", b"EXPUNGE"];
+
+    fn starts_keyword(value: &[u8], keywords: &[&[u8]]) -> bool {
+        keywords.iter().any(|keyword| {
+            value
+                .get(..keyword.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+                && value
+                    .get(keyword.len())
+                    .is_none_or(|next| matches!(*next, b' ' | b'\r' | b'\n'))
+        })
+    }
+
+    if starts_keyword(input, DIRECT_KEYWORDS) {
+        return true;
+    }
+
+    let digits = input.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    // The numbered parsers tolerate runs of spaces after the number
+    // (Postel's law), so the guard must too or it stops recognizing exactly
+    // the malformed-but-recognizable forms it exists for.
+    let spaces = input[digits..].iter().take_while(|b| **b == b' ').count();
+    spaces > 0 && starts_keyword(&input[digits + spaces..], NUMBERED_KEYWORDS)
 }
 
 /// Scans through an unknown response body, consuming all bytes including any

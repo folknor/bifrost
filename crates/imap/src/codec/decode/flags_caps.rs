@@ -180,10 +180,75 @@ pub(super) fn response_code(input: &[u8]) -> IResult<&[u8], ResponseCode> {
     let code_str = String::from_utf8_lossy(code_atom);
     let upper = code_str.to_ascii_uppercase();
 
-    let (input, code) = response_code_inner(input, &code_str, &upper)?;
+    match response_code_inner(input, &code_str, &upper) {
+        Ok((input, code)) => {
+            let (input, _) = char(']').parse(input)?;
+            Ok((input, code))
+        }
+        Err(nom::Err::Incomplete(needed)) => Err(nom::Err::Incomplete(needed)),
+        Err(_err @ (nom::Err::Error(_) | nom::Err::Failure(_)))
+            if response_code_has_overflow(input, &upper) =>
+        {
+            // A malformed value for a recognized code, most commonly an
+            // overflowed number, must not make `opt(response_code)` demote
+            // the entire bracket group into display text. Preserve its name
+            // and opaque value without inventing a typed numeric value.
+            let (input, value) = response_code_optional_tail(input)?;
+            let (input, _) = char(']').parse(input)?;
+            Ok((
+                input,
+                ResponseCode::Other {
+                    name: code_str.into_owned(),
+                    value,
+                },
+            ))
+        }
+        Err(err) => Err(err),
+    }
+}
 
-    let (input, _) = char(']').parse(input)?;
-    Ok((input, code))
+/// Whether a recognized numeric response-code value exceeds the width its
+/// typed variant can represent. This is deliberately narrower than generic
+/// malformed-code recovery: a missing APPENDUID set, for example, remains a
+/// parse error rather than being treated as an opaque extension.
+fn response_code_has_overflow(input: &[u8], upper: &str) -> bool {
+    let max = match upper {
+        "UIDNEXT" | "UIDVALIDITY" | "UNSEEN" | "APPENDUID" | "COPYUID" | "MODIFIED" => {
+            u64::from(u32::MAX)
+        }
+        "HIGHESTMODSEQ" | "METADATA" => i64::MAX as u64,
+        _ => return false,
+    };
+
+    // Only the code's own value can overflow. Scanning past the closing
+    // bracket would let unrelated status text, or a coalesced later response
+    // in the same buffer, be mistaken for an oversized value and turn a real
+    // parse error into an opaque code.
+    let end = input
+        .iter()
+        .position(|b| matches!(*b, b']' | b'\r' | b'\n'))
+        .unwrap_or(input.len());
+    let input = &input[..end];
+
+    let mut pos = 0;
+    while pos < input.len() {
+        if input[pos].is_ascii_digit() {
+            let start = pos;
+            while pos < input.len() && input[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            let overflowed = std::str::from_utf8(&input[start..pos])
+                .ok()
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .is_none_or(|number| number > max);
+            if overflowed {
+                return true;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    false
 }
 
 /// Parse the optional text that follows a response-code atom before the closing

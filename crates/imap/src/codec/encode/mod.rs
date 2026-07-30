@@ -32,6 +32,7 @@ pub(crate) use string_helpers::{encode_quoted_or_literal, encode_quoted_or_liter
 
 // Make sub-module items available within this module for dispatch.
 pub(crate) use commands::encode_mailbox_str;
+pub(crate) use commands::list_status_return_option_items;
 #[cfg(test)]
 use commands::{encode_getmetadata, encode_login, encode_select_or_examine, encode_simple};
 pub(crate) use core::{EncodeError, EncodeOptions, EncodedCommand, LITERAL_MINUS_MAX, LiteralMode};

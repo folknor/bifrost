@@ -292,42 +292,12 @@ impl ImapConnection {
     /// RFC 5819 Section 2 adds the reserved `STATUS (<items>)` return option
     /// to RFC 5258's `option-extension` grammar, so tokens that merely start
     /// with `STATUS` remain generic extension names rather than STATUS itself.
+    ///
+    /// This pre-encode capability check and the encoder must agree on which
+    /// return options are LIST-STATUS, so both go through the encoder's
+    /// implementation rather than keeping a second copy here.
     pub(super) fn list_status_return_option_items(option: &str) -> Option<Result<&str, Error>> {
-        let trimmed = option.trim();
-        if !trimmed
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("STATUS"))
-        {
-            return None;
-        }
-
-        // Only the exact STATUS keyword, followed by the reserved `SP "("`
-        // sequence from RFC 5819 Section 2, is LIST-STATUS. A longer atom
-        // such as STATUSX is still an RFC 5258 option-extension.
-        match trimmed.as_bytes().get(6).copied() {
-            Some(next) if next != b' ' && !next.is_ascii_whitespace() && next != b'(' => {
-                return None;
-            }
-            _ => {}
-        }
-
-        Some(if let Some(suffix) = trimmed[6..].strip_prefix(" (") {
-            if suffix.ends_with(')') && suffix.len() >= 2 {
-                Ok(&suffix[1..suffix.len() - 1])
-            } else {
-                Err(Error::Protocol(
-                    "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
-                 per RFC 5819 Section 2 / RFC 9051 Section 6.3.9"
-                        .into(),
-                ))
-            }
-        } else {
-            Err(Error::Protocol(
-                "LIST-EXTENDED STATUS return option must be STATUS (<items>) \
-                 per RFC 5819 Section 2 / RFC 9051 Section 6.3.9"
-                    .into(),
-            ))
-        })
+        crate::codec::encode::list_status_return_option_items(option.trim())
     }
 
     /// Validate requested STATUS data items against the negotiated protocol

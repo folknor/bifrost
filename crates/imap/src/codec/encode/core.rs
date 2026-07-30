@@ -186,9 +186,8 @@ impl EncodedCommand {
         buf
     }
 
-    /// Build an `EncodedCommand` from a flat buffer by scanning for
-    /// synchronizing literal markers (`{N}\r\n`) and splitting at each
-    /// boundary.
+    /// Build an `EncodedCommand` from a flat buffer by scanning literal
+    /// markers and splitting at synchronizing boundaries.
     ///
     /// A synchronizing literal marker is `{digits}\r\n` where digits parse as
     /// a valid `usize` and there is no `+` before `}`. The buffer is split so
@@ -207,22 +206,33 @@ impl EncodedCommand {
         let mut scan_pos = 0;
 
         while scan_pos < buf.len() {
-            if let Some((marker_end_rel, literal_size)) =
-                find_sync_literal_boundary(&buf[scan_pos..])
-            {
-                // Absolute offset of the byte just past `{N}\r\n`.
-                let abs_marker_end = scan_pos + marker_end_rel;
+            let Some((marker_end_rel, literal_size, synchronizing)) =
+                find_literal_marker(&buf[scan_pos..])
+            else {
+                break;
+            };
+            // Absolute offset of the byte just past `{N}\r\n` or
+            // `{N+}\r\n`.
+            let abs_marker_end = scan_pos + marker_end_rel;
+            // A malformed marker cannot delimit a literal body. In particular,
+            // do not allow an attacker-controlled size to wrap scan_pos or make
+            // us rescan bytes that a valid preceding literal owns.
+            let Some(payload_end) = abs_marker_end
+                .checked_add(literal_size)
+                .filter(|&end| end <= buf.len())
+            else {
+                break;
+            };
+            if synchronizing {
                 // Current segment: from seg_start through the marker (inclusive
                 // of `{N}\r\n`).
                 segments.push(BytesMut::from(&buf[seg_start..abs_marker_end]));
                 // Next segment begins at the literal body.
                 seg_start = abs_marker_end;
-                // Skip past the literal body so we don't rescan it for markers.
-                scan_pos = abs_marker_end + literal_size;
-            } else {
-                // No more synchronizing literals in the remainder.
-                break;
             }
+            // Skip every literal body, including LITERAL+ / small LITERAL-
+            // bodies. Their contents are opaque and may look like framing.
+            scan_pos = payload_end;
         }
 
         // Remaining bytes (literal body + any trailing command text) form the
@@ -237,19 +247,18 @@ impl EncodedCommand {
     }
 }
 
-/// Find the first synchronizing literal marker (`{digits}\r\n`) in `buf`.
+/// Find the first literal marker in `buf`.
 ///
-/// Returns `(marker_end, literal_size)` where `marker_end` is the offset
+/// Returns `(marker_end, literal_size, synchronizing)` where `marker_end` is the offset
 /// past the `\r\n` of the marker, and `literal_size` is the parsed digit
 /// count (the number of octets in the literal body).
 ///
-/// Skips non-synchronizing markers (`{digits+}\r\n`).
-///
-/// Matches both regular synchronizing literals (`{N}\r\n`) and literal8
+/// Matches synchronizing literals (`{N}\r\n`), non-synchronizing literals
+/// (`{N+}\r\n`), and literal8
 /// markers (`~{N}\r\n`). RFC 9051 Section 9 defines
 /// `literal8 = "~{" number64 "}" CRLF *OCTET` with no `["+"]` modifier,
 /// so literal8 is unconditionally synchronizing (RFC 3516 Section 4).
-fn find_sync_literal_boundary(buf: &[u8]) -> Option<(usize, usize)> {
+fn find_literal_marker(buf: &[u8]) -> Option<(usize, usize, bool)> {
     let mut i = 0;
     while i < buf.len() {
         if buf[i] == b'{' {
@@ -258,17 +267,15 @@ fn find_sync_literal_boundary(buf: &[u8]) -> Option<(usize, usize)> {
             while j < buf.len() && buf[j].is_ascii_digit() {
                 j += 1;
             }
-            // Must have at least one digit, then `}\r\n`
+            let non_synchronizing = j > start && buf.get(j) == Some(&b'+');
+            let close = j + usize::from(non_synchronizing);
+            // Must have at least one digit, then optional `+` and `}\r\n`.
             if j > start
-                && j + 2 < buf.len()
-                && buf[j] == b'}'
-                && buf[j + 1] == b'\r'
-                && buf[j + 2] == b'\n'
+                && close + 2 < buf.len()
+                && buf[close] == b'}'
+                && buf[close + 1] == b'\r'
+                && buf[close + 2] == b'\n'
             {
-                // Verify this is synchronizing (no `+` before `}`)
-                //  -  since we checked buf[j] == b'}' and digits end at j,
-                // there is no `+`. Non-synchronizing would have `+` at buf[j]
-                // which would fail the buf[j] == b'}' check.
                 let Ok(size_str) = std::str::from_utf8(&buf[start..j]) else {
                     i += 1;
                     continue;
@@ -277,7 +284,7 @@ fn find_sync_literal_boundary(buf: &[u8]) -> Option<(usize, usize)> {
                     i += 1;
                     continue;
                 };
-                return Some((j + 3, size));
+                return Some((close + 3, size, !non_synchronizing));
             }
         }
         i += 1;

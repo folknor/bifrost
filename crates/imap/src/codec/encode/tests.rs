@@ -7474,30 +7474,13 @@ fn encode_notify_set_rejects_extension_event_on_selected() {
 // Adversarial / hostile-payload encoding
 //
 // These pin how the encoder behaves when a *command payload* happens to
-// contain bytes that look like IMAP framing. Three of them document
-// defects rather than endorse behavior.
+// contain bytes that look like IMAP framing.
 // ========================================================================
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
-///
-/// `EncodedCommand::from_flat_buffer` only skips the payload of markers that
-/// `find_sync_literal_boundary` actually matched. Non-synchronizing markers
-/// (`{N+}\r\n`, RFC 7888 Section 4) are *not* matched, so their payload is
-/// rescanned, and any `{digits}\r\n` inside a LITERAL+ body is mistaken for a
-/// synchronizing literal marker.
-///
-/// The result is a bogus segment split. `send_encoded_segments` then waits for
-/// a `+` continuation which the server has no reason to send: under LITERAL+
-/// it is counting down N octets of a non-synchronizing literal.
-///
-/// Correct behavior: under `LiteralMode::LiteralPlus` every literal is
-/// non-synchronizing (RFC 7888 Section 4), so the command must always be a
-/// single segment regardless of payload content. The pre-existing
-/// `prop_roundtrip::literal_plus_single_segment` property states exactly
-/// that, but its generator never produces a command carrying a literal, so
-/// the property is vacuous today.
+/// A LITERAL+ payload is opaque framing data. A sequence that resembles a
+/// synchronizing marker inside the payload must not create another segment.
 #[test]
-fn literal_plus_body_containing_sync_marker_is_wrongly_split() {
+fn literal_plus_body_containing_sync_marker_stays_in_one_segment() {
     let cmd = Command::SetMetadata {
         mailbox: MailboxName::new("INBOX").unwrap(),
         // 11 opaque octets. `{5}\r\n` is ordinary data here, not framing.
@@ -7508,27 +7491,34 @@ fn literal_plus_body_containing_sync_marker_is_wrongly_split() {
 
     assert_eq!(
         segments.len(),
-        2,
-        "current (defective) behavior: the `{{5}}\\r\\n` inside the LITERAL+ \
-         body is mistaken for a synchronizing literal marker. The correct \
-         result is 1 segment (RFC 7888 Section 4). Got: {:?}",
+        1,
+        "the `{{5}}\\r\\n` inside the LITERAL+ body is data, not a literal \
+         marker (RFC 7888 Section 4). Got: {:?}",
         segments
             .iter()
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect::<Vec<_>>()
     );
-    assert!(
-        segments[0].ends_with(b"a{5}\r\n"),
-        "the bogus split lands just past the literal-looking bytes in the \
-         payload; got: {:?}",
-        String::from_utf8_lossy(&segments[0])
-    );
     assert_eq!(
-        &segments[1][..],
-        b"bbbbb)\r\n",
-        "the remainder of the payload becomes a second segment that is only \
-         sent after a `+` that never arrives"
+        &segments[0][..],
+        b"A001 SETMETADATA \"INBOX\" (\"/private/x\" {11+}\r\na{5}\r\nbbbbb)\r\n"
     );
+}
+
+/// A literal-looking payload with an unrepresentable octet count is still
+/// opaque LITERAL+ data. It must not be scanned, overflowed, or split.
+#[test]
+fn literal_plus_body_containing_overflow_marker_stays_in_one_segment() {
+    let cmd = Command::SetMetadata {
+        mailbox: MailboxName::new("INBOX").unwrap(),
+        entries: vec![(
+            "/private/x".into(),
+            Some(b"{18446744073709551592}\r\n".to_vec()),
+        )],
+    };
+    let encoded = encode_command("A001", &cmd, &opts(LiteralMode::LiteralPlus, false)).unwrap();
+
+    assert_eq!(encoded.segments().len(), 1);
 }
 
 /// A *synchronizing* literal payload is skipped correctly, so the same
@@ -7588,19 +7578,9 @@ fn brace_digits_not_abutting_crlf_is_not_a_literal_marker() {
     );
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
-///
-/// `commands/list.rs::list_status_return_option_items` slices the item list
-/// as `&suffix[1..suffix.len() - 1]` after `strip_prefix(" (")` has already
-/// removed the opening paren, so the first octet of the item list is eaten.
-/// For a one-character item list the result degenerates to `""` and the
-/// command is rejected with "must contain at least one status data item"
-/// instead of being accepted.
-///
-/// This is the codec-side twin of; the two
-/// copies of this helper have the identical off-by-one.
+/// A one-character STATUS item list is valid in a LIST-EXTENDED return option.
 #[test]
-fn list_status_return_option_rejects_one_character_item_list() {
+fn list_status_return_option_accepts_one_character_item_list() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: Vec::new(),
@@ -7609,25 +7589,16 @@ fn list_status_return_option_rejects_one_character_item_list() {
         return_options: vec!["STATUS (X)".into()],
     };
 
-    let result = encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts());
     assert!(
-        matches!(result, Err(EncodeError::Validation(ref msg))
-            if msg.contains("at least one status data item")),
-        "current (defective) behavior: the single item `X` is truncated to \
-         the empty string before validation, so a non-empty item list is \
-         reported as empty: {result:?}"
+        encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).is_ok(),
+        "the single item `X` must not be truncated before validation"
     );
+    assert_eq!(&buf[..], b"A001 LIST \"\" \"*\" RETURN (STATUS (X))\r\n");
 }
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT -.
-///
-/// The same off-by-one hides a leading `(` from the nested-parenthesis check
-/// in `normalize_status_items_body`, so an unbalanced `STATUS ((MESSAGES)`
-/// return option passes validation and is written to the wire verbatim,
-/// producing a syntactically invalid LIST command (RFC 5819 Section 4 /
-/// RFC 9051 Section 7).
+/// Nested parentheses are not valid in a LIST-EXTENDED STATUS item list.
 #[test]
-fn list_status_return_option_accepts_unbalanced_leading_paren() {
+fn list_status_return_option_rejects_unbalanced_leading_paren() {
     let mut buf = BytesMut::new();
     let cmd = Command::ListExtended {
         selection_options: Vec::new(),
@@ -7636,11 +7607,11 @@ fn list_status_return_option_accepts_unbalanced_leading_paren() {
         return_options: vec!["STATUS ((MESSAGES)".into()],
     };
 
-    encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()).unwrap();
-    assert_eq!(
-        &buf[..],
-        b"A001 LIST \"\" \"*\" RETURN (STATUS ((MESSAGES))\r\n",
-        "current (defective) behavior: the unbalanced item list is accepted \
-         and emitted verbatim, so the server sees a malformed RETURN list"
+    assert!(
+        matches!(
+            encode_command_to_buf(&mut buf, "A001", &cmd, &default_opts()),
+            Err(EncodeError::Validation(_))
+        ),
+        "an unbalanced STATUS list must not be emitted"
     );
 }

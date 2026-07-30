@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::types::validated::MailboxName;
 
 /// RFC 3501 Section 5.1.3 example: plain ASCII mailbox.
 #[test]
@@ -532,9 +533,11 @@ fn imap_b64_alphabet_is_valid() {
 /// control character carried *inside* a modified-Base64 shift segment is
 /// decoded literally: `&AAoACQ-` is UTF-16BE `U+000A U+0009`.
 ///
-/// The two paths therefore disagree about whether a mailbox name may contain
-/// control characters.
-/// means downstream  -  `MailboxName::from_decoded` performs no validation.
+/// The two paths therefore disagree, and deliberately: a raw control octet is
+/// a framing error in the wire form and is replaced, while a Base64 shift
+/// segment is an unambiguous encoding of a code point the server chose for its
+/// mailbox, so it is decoded and carried through `MailboxName::from_decoded`
+/// unchanged.
 #[test]
 fn base64_encoded_control_characters_are_decoded_literally() {
     assert_eq!(
@@ -545,6 +548,13 @@ fn base64_encoded_control_characters_are_decoded_literally() {
     );
     // Contrast: the same octets sent raw are replaced.
     assert_eq!(decode_utf7(b"\n\t"), "\u{FFFD}\u{FFFD}");
+    assert_eq!(
+        MailboxName::from_decoded(decode_utf7(b"&AAoACQ-")).as_str(),
+        "\n\t"
+    );
+    // Re-encoding is what contains the control characters: MUTF-7 folds them
+    // back into a shift segment, so nothing reaches the wire unescaped.
+    assert_eq!(encode_utf7("\n\t"), "&AAoACQ-");
 }
 
 mod prop_decode_invariants {

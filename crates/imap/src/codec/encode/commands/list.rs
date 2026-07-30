@@ -187,7 +187,15 @@ fn validate_list_extended_option_syntax(
 /// RFC 5819 Section 4 / RFC 9051 Section 7: only the reserved
 /// `STATUS SP "(" status-att *(SP status-att) ")"` form is LIST-STATUS.
 /// Longer atoms such as `STATUSX` remain generic RFC 5258 option extensions.
-fn list_status_return_option_items(option: &str) -> Option<Result<&str, crate::Error>> {
+///
+/// Returns `None` when the option is not LIST-STATUS at all, `Some(Ok(items))`
+/// with the inner `status-att-list` for the reserved form, and `Some(Err(_))`
+/// when the option claims to be STATUS but is not well formed.
+///
+/// `option` must already be trimmed. This is the single implementation: the
+/// connection layer's pre-encode capability check calls it too, so the two
+/// paths cannot disagree about what counts as LIST-STATUS.
+pub(crate) fn list_status_return_option_items(option: &str) -> Option<Result<&str, crate::Error>> {
     if !option
         .get(..6)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("STATUS"))
@@ -201,8 +209,8 @@ fn list_status_return_option_items(option: &str) -> Option<Result<&str, crate::E
     }
 
     Some(if let Some(suffix) = option[6..].strip_prefix(" (") {
-        if suffix.ends_with(')') && suffix.len() >= 2 {
-            Ok(&suffix[1..suffix.len() - 1])
+        if let Some(items) = suffix.strip_suffix(')') {
+            Ok(items)
         } else {
             Err(crate::Error::Protocol(
                 "LIST-EXTENDED STATUS return option must be STATUS (<items>) \

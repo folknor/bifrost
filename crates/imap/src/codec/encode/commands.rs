@@ -27,6 +27,7 @@ mod thread_sort;
 pub(crate) use self::append::encode_multi_append_header;
 pub(crate) use self::append::encode_multi_append_header_with_literal8;
 pub(super) use self::id::encode_id;
+pub(crate) use self::list::list_status_return_option_items;
 pub(super) use self::list::{encode_create_special_use, encode_list_extended, encode_list_status};
 pub(super) use self::metadata::{encode_getmetadata, encode_setmetadata};
 pub(super) use self::notify::encode_notify_set;

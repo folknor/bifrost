@@ -86,26 +86,27 @@ fn parse_encoded_word(remaining: &mut &str) -> Option<String> {
 /// Inner implementation of encoded-word parsing (RFC 2047 Section 2).
 /// Separated so that `parse_encoded_word` can restore position on failure.
 fn parse_encoded_word_inner(remaining: &mut &str) -> Option<String> {
-    // Find charset
-    let q1 = remaining.find('?')?;
-    let charset_raw = &remaining[..q1];
+    let input = *remaining;
+    let window = encoded_word_window(input);
+
+    // Find charset.
+    let q1 = window.find('?')?;
+    let charset_raw = &window[..q1];
     // RFC 2231 Section 5: charset may include "*language" suffix (e.g., "UTF-8*EN").
     // Strip the language tag if present.
     let charset = match charset_raw.find('*') {
         Some(pos) => &charset_raw[..pos],
         None => charset_raw,
     };
-    *remaining = &remaining[q1 + 1..];
+    // Find encoding.
+    let after_charset = &window[q1 + 1..];
+    let q2 = after_charset.find('?')?;
+    let encoding = &after_charset[..q2];
 
-    // Find encoding
-    let q2 = remaining.find('?')?;
-    let encoding = &remaining[..q2];
-    *remaining = &remaining[q2 + 1..];
-
-    // Find encoded text (ends with ?=)
-    let end = remaining.find("?=")?;
-    let encoded_text = &remaining[..end];
-    *remaining = &remaining[end + 2..];
+    // Find encoded text (ends with ?=).
+    let after_encoding = &after_charset[q2 + 1..];
+    let end = after_encoding.find("?=")?;
+    let encoded_text = &after_encoding[..end];
 
     // RFC 2047 Section 2: charset and encoding are required components.
     // The 75-character limit and non-empty encoded-text requirement are
@@ -123,7 +124,11 @@ fn parse_encoded_word_inner(remaining: &mut &str) -> Option<String> {
         return None;
     }
 
-    // Decode the payload
+    // Advance only after every delimiter and payload check has succeeded.
+    let consumed = q1 + 1 + q2 + 1 + end + 2;
+    *remaining = &input[consumed..];
+
+    // Decode the payload.
     let raw_bytes = match encoding.to_ascii_uppercase().as_str() {
         "B" => {
             use base64::Engine;
@@ -150,6 +155,31 @@ fn parse_encoded_word_inner(remaining: &mut &str) -> Option<String> {
         let (cow, _) = encoding.decode_without_bom_handling(&raw_bytes);
         Some(cow.into_owned())
     }
+}
+
+/// Hard cap on the bytes a single encoded-word candidate may scan.
+///
+/// RFC 2047 Section 2 caps an encoded word at 75 characters, but this decoder
+/// deliberately accepts overlong words (many real servers emit them), so the
+/// spec limit is not usable as the scan bound. RFC 5322 Section 2.1.1 caps a
+/// header line at 998 octets, which is the largest window a conformant word
+/// can occupy, and a constant bound is what keeps the outer loop linear: a
+/// header made only of unterminated `=?` candidates would otherwise cost a
+/// full-remainder scan per candidate.
+const ENCODED_WORD_SCAN_LIMIT: usize = 998;
+
+/// Return the prefix in which an RFC 2047 encoded word may occur: printable
+/// non-space ASCII, capped at [`ENCODED_WORD_SCAN_LIMIT`]. RFC 2047 tokens
+/// cannot cross whitespace, controls, DEL, or UTF-8, and bytes outside
+/// `33..=126` are never inside a multi-byte `char`, so both bounds land on a
+/// `char` boundary.
+pub(super) fn encoded_word_window(input: &str) -> &str {
+    let len = input
+        .bytes()
+        .take(ENCODED_WORD_SCAN_LIMIT)
+        .position(|b| !(33..=126).contains(&b))
+        .unwrap_or_else(|| input.len().min(ENCODED_WORD_SCAN_LIMIT));
+    &input[..len]
 }
 
 /// Decode Q-encoding per RFC 2047 Section 4.2.

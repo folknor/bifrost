@@ -314,15 +314,21 @@ pub(crate) fn validate_atom_bytes(bytes: &[u8], context: &str) -> Result<(), Val
 /// METADATA queries (RFC 5464 Section 4.2) and LIST reference names
 /// (RFC 3501 Section 6.3.8).
 ///
-/// Validation:
+/// Validation, on the [`MailboxName::new`] path only:
 /// - No NUL, CR, or LF bytes
 ///
 /// # Parse-don't-validate discipline
 ///
 /// `MailboxName` has exactly two construction paths: [`MailboxName::new`]
-/// (public, validating) and `from_decoded` (codec-private). There is no
-/// `From<String>` or `From<&str>`  -  smuggling unvalidated data through
-/// the type is a compile error:
+/// (public, validating) and `from_decoded` (codec-private, **not**
+/// validating - it preserves the server's own mailbox identifier verbatim,
+/// see that constructor for why). A `MailboxName` that came off the wire is
+/// therefore guaranteed only to be valid UTF-8; do not assume the NUL / CR /
+/// LF exclusion for names you did not construct yourself. Injection safety on
+/// the wire comes from the encoder, not from this type.
+///
+/// There is no `From<String>` or `From<&str>`  -  constructing the type
+/// outside those two paths is a compile error:
 ///
 /// ```compile_fail
 /// use bifrost_imap::MailboxName;
@@ -364,13 +370,25 @@ impl MailboxName {
         &self.0
     }
 
-    /// Construct from already-decoded bytes produced by the codec's
-    /// decoder. This constructor skips validation  -  callers must
-    /// guarantee the input has already been MUTF-7 decoded (or passed
-    /// through in UTF-8 mode per RFC 6855).
+    /// Construct from already-decoded bytes produced by the codec's decoder.
+    /// Callers must guarantee the input has already been MUTF-7 decoded (or
+    /// passed through in UTF-8 mode per RFC 6855).
     ///
-    /// This is the only non-validating constructor. Every other
-    /// constructor path validates via `new`.
+    /// This constructor does **not** apply [`MailboxName::new`]'s NUL / CR / LF
+    /// rejection, and deliberately so: RFC 3501 Section 5.1 and RFC 9051
+    /// Section 5.1 make the mailbox name the server's own identifier, and
+    /// modified UTF-7 can represent control characters, so rewriting or
+    /// rejecting one would leave us naming a mailbox the server never
+    /// advertised. Wire-originated names are preserved byte-for-byte and the
+    /// injection concern is handled at the encode boundary instead: MUTF-7
+    /// encoding folds every non-printable character back into a Base64 shift
+    /// segment, and in UTF8=ACCEPT mode a name containing CR or LF fails the
+    /// `quotable` check and is sent as a literal, where those octets are legal.
+    ///
+    /// Consequence for consumers: a `MailboxName` obtained from a parsed
+    /// response satisfies "valid UTF-8, non-empty" but not "free of NUL, CR,
+    /// and LF". Anything that embeds a mailbox name in a line-oriented sink
+    /// (logs, on-disk indexes, UI) must escape it itself.
     ///
     /// # Visibility
     ///

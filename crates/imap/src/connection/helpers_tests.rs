@@ -75,33 +75,31 @@ fn status_tokens_reject_nested_parentheses() {
 // list_status_return_option_items (RFC 5819 Section 2)
 // ---------------------------------------------------------------------------
 
-/// DOCUMENTS A BUG, NOT AN ENDORSEMENT.
-///
-/// `strip_prefix(" (")` already removes the opening paren, and then the
-/// body is sliced `[1..len-1]` as if it had not been. The first octet of
-/// the first STATUS item is therefore eaten: `STATUS (MESSAGES UNSEEN)`
-/// yields `"ESSAGES UNSEEN"`. The truncated first token no longer matches
-/// any gated item name, so `validate_requested_status_items` silently
-/// stops validating it (`STATUS (RECENT)` passes on an IMAP4rev2
-/// connection, `STATUS (HIGHESTMODSEQ)` passes without CONDSTORE).
-///
-///
+/// RFC 5819 Section 2: the reserved return option is `STATUS SP "("
+/// status-att-list ")"`, so the extracted body is exactly the item list. The
+/// items must survive intact or the capability gate downstream
+/// (`validate_requested_status_items`) stops recognizing the names it gates:
+/// a truncated `RECENT` would pass on an IMAP4rev2 connection and a truncated
+/// `HIGHESTMODSEQ` would pass without CONDSTORE.
 #[test]
-fn list_status_option_drops_the_first_item_octet() {
+fn list_status_option_extracts_the_whole_item_list() {
     let items = ImapConnection::list_status_return_option_items("STATUS (MESSAGES UNSEEN)")
         .expect("recognized as STATUS")
         .unwrap();
-    assert_eq!(items, "ESSAGES UNSEEN", "current behavior, not the intent");
+    assert_eq!(items, "MESSAGES UNSEEN");
+
+    let single = ImapConnection::list_status_return_option_items("STATUS (RECENT)")
+        .expect("recognized as STATUS")
+        .unwrap();
+    assert_eq!(single, "RECENT");
 }
 
 #[test]
 fn list_status_option_keyword_is_case_insensitive() {
-    // Same first-octet loss as above; the point here is that a lowercase
-    // `status` keyword is still recognized as LIST-STATUS.
     let items = ImapConnection::list_status_return_option_items("status (MESSAGES)")
         .expect("recognized as STATUS")
         .unwrap();
-    assert_eq!(items, "ESSAGES");
+    assert_eq!(items, "MESSAGES");
 }
 
 #[test]
