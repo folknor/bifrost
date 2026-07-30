@@ -82,17 +82,20 @@ pub(crate) fn push_unsubscribe(
     handle: SubscriptionHandle,
 ) -> AccountFuture<Result<(), AccountError>> {
     Box::pin(async move {
-        let empty = {
+        let removed = {
             let mut scopes = account
                 .push
                 .scopes
                 .lock()
                 .expect("push scopes lock poisoned");
-            scopes.remove(&handle.0);
-            scopes.is_empty()
+            scopes.remove(&handle.0).is_some()
         };
-        if empty {
-            account.push.stop();
+        if removed {
+            // The task is account-owned, not subscription-owned. It stays
+            // alive while this account is open and waits when there are no
+            // scopes, so an unsubscribe followed by a subscribe cannot race
+            // a cancelling task into two IDLE loops (or no loop at all).
+            account.push.resubscribe.notify_one();
         }
         Ok(())
     })
@@ -165,7 +168,14 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
         }
         let folder = choose_idle_folder(&account);
         let Some(folder) = folder else {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // Do not tear down the task merely because the last subscription
+            // left. `ensure_idle_task` has one account-lifetime owner; a
+            // subsequent subscription wakes this parked loop directly.
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = account.shutdown.cancelled() => break,
+                () = resubscribe.notified() => {}
+            }
             continue;
         };
         let conn = match account.pool.dial_idle().await {
@@ -219,8 +229,20 @@ async fn idle_loop(account: ImapAccount, cancel: CancellationToken) {
             let interrupted_by_resubscribe = round_cancel.is_cancelled() && !cancel.is_cancelled();
             nudge.abort();
             match idle_result {
-                Ok(_) if interrupted_by_resubscribe => {
-                    // A new scope arrived: redial and re-choose the folder.
+                Ok(event) if interrupted_by_resubscribe => {
+                    // The scope set changed and this IDLE was cancelled to
+                    // re-choose a folder. Cancellation has strict priority
+                    // over queued server events inside `idle()`, and the
+                    // DONE drain that follows discards whatever was still
+                    // in flight, so an EXISTS/EXPUNGE/VANISHED that landed
+                    // in that window is simply gone - and the remaining
+                    // subscriptions would never hear about it. Absorb what
+                    // did come back, then degrade to a coarse invalidation
+                    // rather than losing the window silently.
+                    if !matches!(event, IdleEvent::Cancelled) {
+                        let _ = absorb_idle_event(&account, &folder, uidvalidity, &event);
+                    }
+                    signal_idle_interrupt_loss(&account.push);
                     break;
                 }
                 Ok(event) => {
@@ -256,23 +278,53 @@ fn choose_idle_folder(account: &ImapAccount) -> Option<crate::types::MailboxName
         .push
         .scopes
         .lock()
-        .expect("push scopes lock poisoned")
-        .values()
-        .flat_map(|set| set.iter().cloned())
-        .collect::<Vec<_>>();
-    for scope in scopes {
-        if let CursorScope::Folder(folder) = scope
-            && let Ok(mailbox) = crate::types::MailboxName::new(folder.0)
-        {
-            return Some(mailbox);
-        }
+        .expect("push scopes lock poisoned");
+    if scopes.is_empty() {
+        return None;
     }
+    if let Some(folder) = subscribed_idle_folder(&scopes) {
+        return Some(folder);
+    }
+    drop(scopes);
+
     account
         .folders
         .entries()
         .into_iter()
         .find(|entry| entry.name.as_str().eq_ignore_ascii_case("INBOX"))
         .map(|entry| entry.name.clone())
+}
+
+/// Select a subscribed folder deterministically. A HashMap/HashSet backs
+/// subscriptions, so iteration order must not decide which mailbox IDLE
+/// monitors after a resubscription.
+fn subscribed_idle_folder(
+    scopes: &HashMap<String, HashSet<CursorScope>>,
+) -> Option<crate::types::MailboxName> {
+    let mut folders = scopes
+        .values()
+        .flat_map(|scopes| scopes.iter())
+        .filter_map(|scope| match scope {
+            CursorScope::Folder(folder) => crate::types::MailboxName::new(folder.0.clone()).ok(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    folders.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    folders.into_iter().next()
+}
+
+/// Cover the events a resubscribe-cancelled IDLE round may have swallowed.
+///
+/// `ImapConnection::idle` gives cancellation strict priority over queued
+/// server events, and the DONE handshake that follows drains and discards
+/// whatever else was in flight. Reconfiguring the subscription set must not
+/// therefore turn into silent push loss for the scopes that are staying:
+/// `reference/sync.md` requires a missed push to degrade to a coarser
+/// invalidation, never to nothing. `Unknown` is the honest hint - the folder
+/// this round was watching is known, but the content of the lost window is
+/// not, and unsolicited events can name other mailboxes.
+fn signal_idle_interrupt_loss(push: &PushState) {
+    let _ = push.tx.send(invalidated(HintPayload::Unknown));
 }
 
 fn absorb_idle_event(
@@ -363,5 +415,52 @@ mod tests {
         assert!(event_closes_connection(&IdleEvent::ServerTerminated));
         assert!(!event_closes_connection(&IdleEvent::Exists(3)));
         assert!(!event_closes_connection(&IdleEvent::Timeout));
+    }
+
+    /// An unsubscribe (or subscribe) cancels the in-flight IDLE round, and
+    /// cancellation outranks any server event still queued on that
+    /// connection. The retained subscriptions must still learn that
+    /// something may have happened.
+    #[tokio::test]
+    async fn a_resubscribe_interrupted_idle_round_still_invalidates() {
+        let push = PushState::new();
+        let mut rx = push.tx.subscribe();
+
+        signal_idle_interrupt_loss(&push);
+
+        let event = rx.try_recv().expect("an invalidation must be emitted");
+        assert!(matches!(
+            event,
+            WatchEvent::Invalidated {
+                hint: InvalidationHint {
+                    payload: HintPayload::Unknown,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn subscribed_folder_choice_is_deterministic() {
+        let mut scopes = HashMap::new();
+        scopes.insert(
+            "later".to_owned(),
+            HashSet::from([CursorScope::Folder(bifrost_types::FolderId(
+                "Zebra".to_owned(),
+            ))]),
+        );
+        scopes.insert(
+            "first".to_owned(),
+            HashSet::from([CursorScope::Folder(bifrost_types::FolderId(
+                "Archive".to_owned(),
+            ))]),
+        );
+
+        assert_eq!(
+            subscribed_idle_folder(&scopes)
+                .expect("a subscribed folder")
+                .as_str(),
+            "Archive"
+        );
     }
 }

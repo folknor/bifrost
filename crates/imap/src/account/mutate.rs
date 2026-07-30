@@ -335,11 +335,7 @@ async fn run_destroy_mutation_groups(
             let (expunging_ids, remaining_ids) = split_ids_by_uid(ids, &expunge_uids);
             results.extend(failed_all(
                 expunging_ids,
-                super::account_error_with(
-                    err,
-                    super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
-                        .with_folder_scope(folder),
-                ),
+                expunge_failed_after_delete_mark(folder, err),
             ));
             results.extend(mutation_results(
                 remaining_ids,
@@ -884,6 +880,32 @@ fn store_failed_error(operation: AccountOperation, folder: &MailboxName) -> Acco
     .expect("valid account error classification")
 }
 
+/// The STORE half of IMAP deletion is already acknowledged before this
+/// helper runs, so a failed UID EXPUNGE leaves a confirmed server-side
+/// partial effect: those messages are still flagged `\Deleted`.
+///
+/// The failure keeps its own classification. Collapsing every EXPUNGE
+/// error into `Protocol(PartialResponse)` would erase exactly the
+/// distinctions `reference/error-model.md` asks the producer to preserve -
+/// an auth loss, an ACL denial, a quota or rate-limit throttle, and a
+/// capability loss each derive a different `RecoveryClass`, and none of
+/// them is served by a generic reconcile. What this helper adds is the
+/// side-effect evidence, as support-only diagnostic text riding on the
+/// real error, so the engine can see both "why it failed" and "what
+/// already landed".
+fn expunge_failed_after_delete_mark(folder: &MailboxName, error: crate::Error) -> AccountError {
+    super::account_error_with(
+        error,
+        super::error::ImapErrorContext::operation(AccountOperation::BulkDestroy)
+            .with_folder_scope(folder)
+            .with_extra_text(DiagnosticText::support_only(format!(
+                "UID EXPUNGE failed for {} after UID STORE +FLAGS.SILENT \\Deleted was \
+                 acknowledged; those messages remain flagged \\Deleted server-side",
+                folder.as_str(),
+            ))),
+    )
+}
+
 fn split_by_uidvalidity(
     ids: Vec<DecodedObjectId>,
     uidvalidity: u32,
@@ -1055,6 +1077,58 @@ mod tests {
             err.scope(),
             Some(bifrost_types::ErrorScope::Mailbox { .. })
         ));
+    }
+
+    /// The partial-effect note must ride on the real error, not replace it.
+    /// An ACL denial and a quota exhaustion derive different recovery, and
+    /// an engine that saw only `Protocol(PartialResponse)` would reconcile
+    /// (or retry) both identically.
+    #[test]
+    fn expunge_failure_keeps_its_classification_and_adds_the_side_effect_note() {
+        let denied = expunge_failed_after_delete_mark(
+            &folder(),
+            crate::Error::No {
+                text: "permission denied".to_owned(),
+                code: Some(crate::types::ResponseCode::NoPerm),
+                attempt: None,
+            },
+        );
+        assert!(
+            matches!(
+                denied.kind(),
+                AccountErrorKind::Authorization(bifrost_types::AccessErrorKind::PermissionDenied)
+            ),
+            "ACL denial must not be laundered into a generic partial response: {:?}",
+            denied.kind()
+        );
+
+        let over_quota = expunge_failed_after_delete_mark(
+            &folder(),
+            crate::Error::No {
+                text: "over quota".to_owned(),
+                code: Some(crate::types::ResponseCode::OverQuota),
+                attempt: None,
+            },
+        );
+        assert!(matches!(
+            over_quota.kind(),
+            AccountErrorKind::Server(bifrost_types::ServerErrorKind::QuotaExhausted)
+        ));
+        assert_ne!(
+            denied.recovery(),
+            over_quota.recovery(),
+            "distinct failures must keep deriving distinct recovery classes"
+        );
+
+        for err in [&denied, &over_quota] {
+            assert!(
+                err.support_consented().support_text.iter().any(|text| {
+                    text.contains("UID EXPUNGE failed")
+                        && text.contains("remain flagged \\Deleted server-side")
+                }),
+                "the confirmed partial side effect must be attached"
+            );
+        }
     }
 
     #[test]

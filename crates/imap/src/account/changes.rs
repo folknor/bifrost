@@ -454,7 +454,7 @@ async fn run_qresync(
     }
 
     let live_set = CompactUidSet::from_uids(live_uids);
-    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.len()).await?;
+    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let next = account.cursor_from_select(&selected.mailbox, Some(live_set))?;
     account.folders.set_cursor(&folder, next.clone());
     let checkpoint = Some(Checkpoint::Change(encode_cursor(
@@ -556,7 +556,7 @@ async fn run_condstore_with_baseline(
         search_all(&account, conn.connection()).await?
     };
     let live_set = CompactUidSet::from_uids(live);
-    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.len()).await?;
+    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     for uid in diff.added {
         changes.push(added_change(&folder, uidvalidity, uid));
@@ -589,7 +589,7 @@ async fn run_basic(
     validate_uidvalidity(&folder, cursor.uidvalidity(), uidvalidity)?;
     let live = search_all(&account, conn.connection()).await?;
     let live_set = CompactUidSet::from_uids(live);
-    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.len()).await?;
+    warn_if_uid_count_mismatch(&tx, &folder, selected.mailbox.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     let mut changes = Vec::new();
     for fetch in &selected.mailbox.changed_messages {
@@ -628,7 +628,7 @@ async fn run_basic_from_selected(
     let uidvalidity = selected_uidvalidity(&selected)?;
     let live = search_all(&account, conn.connection()).await?;
     let live_set = CompactUidSet::from_uids(live);
-    warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.len()).await?;
+    warn_if_uid_count_mismatch(&tx, &folder, selected.exists, live_set.uid_count()).await?;
     let diff = known_uids.diff(&live_set);
     let mut changes = Vec::new();
     for uid in diff.added {

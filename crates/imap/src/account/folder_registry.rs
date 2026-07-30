@@ -58,7 +58,8 @@ impl CompactUidSet {
         self.ranges.iter().copied().flat_map(expand_range).collect()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Number of individual UIDs represented by the compact ranges.
+    pub(crate) fn uid_count(&self) -> usize {
         self.ranges
             .iter()
             .map(|range| {
@@ -69,6 +70,10 @@ impl CompactUidSet {
             })
             .map(|count| usize::try_from(count).unwrap_or(usize::MAX))
             .sum()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
     }
 
     pub(crate) fn diff(&self, newer: &Self) -> UidSetDiff {
@@ -96,9 +101,13 @@ pub(crate) fn expand_range(range: UidRange) -> Vec<u32> {
 
 pub(crate) struct FolderEntry {
     pub(crate) name: MailboxName,
-    pub(crate) selectable: bool,
-    pub(crate) delimiter: Option<char>,
-    pub(crate) attributes: Vec<MailboxAttribute>,
+    /// The LIST-derived facts that a mid-session LIST/IDLE announcement can
+    /// change for an unchanged mailbox epoch. Held behind a lock rather than
+    /// as plain fields so a refresh mutates the entry every holder already
+    /// shares. Swapping in a replacement `Arc<FolderEntry>` instead would
+    /// lose any cursor or MODSEQ write a task performed through an `Arc` it
+    /// had cloned before the swap.
+    listing: RwLock<FolderListing>,
     /// `Some(owner)` for a shared/other-user folder discovered under a
     /// non-personal namespace; `None` for the account's own personal
     /// folders. Drives `MembershipScope::Mailbox` tagging and
@@ -116,10 +125,35 @@ pub(crate) struct FolderEntry {
     last_seen: Mutex<Option<Instant>>,
 }
 
-#[derive(Debug, Default)]
+/// The mutable, LIST-sourced projection of one folder.
+#[derive(Debug, Clone)]
+pub(crate) struct FolderListing {
+    pub(crate) selectable: bool,
+    pub(crate) delimiter: Option<char>,
+    pub(crate) attributes: Vec<MailboxAttribute>,
+}
+
+#[derive(Debug, Default, Clone)]
 struct ModSeqCache {
     uidvalidity: Option<u32>,
     by_uid: HashMap<u32, u64>,
+}
+
+fn listing_from_info(
+    info: &MailboxInfo,
+    rights: Option<&crate::types::MailboxRights>,
+) -> FolderListing {
+    let listed_selectable = !info.attributes.iter().any(|attr| {
+        matches!(
+            attr,
+            MailboxAttribute::NoSelect | MailboxAttribute::NonExistent
+        )
+    });
+    FolderListing {
+        selectable: shared_folder_is_selectable(listed_selectable, rights),
+        delimiter: info.delimiter,
+        attributes: info.attributes.clone(),
+    }
 }
 
 impl FolderEntry {
@@ -139,24 +173,50 @@ impl FolderEntry {
         shared_owner: Option<bifrost_types::MailboxId>,
         rights: Option<crate::types::MailboxRights>,
     ) -> Self {
-        let listed_selectable = !info.attributes.iter().any(|attr| {
-            matches!(
-                attr,
-                MailboxAttribute::NoSelect | MailboxAttribute::NonExistent
-            )
-        });
-        let selectable = shared_folder_is_selectable(listed_selectable, rights.as_ref());
+        let listing = listing_from_info(&info, rights.as_ref());
         Self {
             name: info.name,
-            selectable,
-            delimiter: info.delimiter,
-            attributes: info.attributes,
+            listing: RwLock::new(listing),
             shared_owner,
             rights,
             cursor: RwLock::new(None),
             modseq_by_uid: RwLock::new(ModSeqCache::default()),
             last_seen: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn selectable(&self) -> bool {
+        self.listing
+            .read()
+            .expect("folder listing lock poisoned")
+            .selectable
+    }
+
+    pub(crate) fn delimiter(&self) -> Option<char> {
+        self.listing
+            .read()
+            .expect("folder listing lock poisoned")
+            .delimiter
+    }
+
+    pub(crate) fn attributes(&self) -> Vec<MailboxAttribute> {
+        self.listing
+            .read()
+            .expect("folder listing lock poisoned")
+            .attributes
+            .clone()
+    }
+
+    /// Apply a same-name LIST/IDLE re-announcement to this entry in place.
+    ///
+    /// The announcement is the same UIDVALIDITY epoch, so cursor, MODSEQ
+    /// cache, and last-seen stay untouched; only the LIST projection moves.
+    /// Mutating through the shared `Arc` is the point: another task may be
+    /// holding this same entry across an await and recording a cursor or a
+    /// MODSEQ, and those writes must not be discarded by the refresh.
+    pub(crate) fn refresh_listing(&self, info: &MailboxInfo) {
+        *self.listing.write().expect("folder listing lock poisoned") =
+            listing_from_info(info, self.rights.as_ref());
     }
 
     pub(crate) fn cursor(&self) -> Option<FolderCursor> {
@@ -465,6 +525,15 @@ impl FolderRegistry {
                 inherited_rights,
             ));
             map.insert(name, entry);
+        } else if let Some(existing) = map.get(&name) {
+            // A same-name LIST/IDLE announcement is not a new UIDVALIDITY
+            // epoch, but its attributes are live folder-lifecycle state.
+            // In particular `\NoSelect` / `\NonExistent` and SPECIAL-USE
+            // changes alter whether this folder is usable and how it is
+            // exposed. Refresh in place: the entry keeps its identity, so
+            // its cursor and MODSEQ cache survive, and so does any write a
+            // task performs through an `Arc` it cloned before this event.
+            existing.refresh_listing(&info);
         }
     }
 
@@ -565,7 +634,7 @@ mod tests {
         let diff = set.diff(&newer);
         assert_eq!(diff.added, vec![4]);
         assert_eq!(diff.removed, vec![1, 7, 10]);
-        assert_eq!(set.len(), 6);
+        assert_eq!(set.uid_count(), 6);
     }
 
     #[test]
@@ -578,7 +647,7 @@ mod tests {
             child_info: Vec::new(),
         };
         let entry = FolderEntry::from_mailbox(info);
-        assert!(!entry.selectable);
+        assert!(!entry.selectable());
     }
 
     #[test]
@@ -756,8 +825,8 @@ mod tests {
         );
         // Both are readable, so both stay selectable: rights are the ONLY
         // difference between the two entries.
-        assert!(w.selectable);
-        assert!(r.selectable);
+        assert!(w.selectable());
+        assert!(r.selectable());
     }
 
     // A share the grantee cannot read keeps its shared identity (so it can
@@ -781,7 +850,7 @@ mod tests {
         );
         assert_eq!(entry.rights, Some(crate::types::MailboxRights::parse("l")));
         assert!(
-            !entry.selectable,
+            !entry.selectable(),
             "an unreadable share must not become a cursor scope"
         );
     }
@@ -943,10 +1012,11 @@ mod tests {
         let set = CompactUidSet::from_uids([9, 0, 2, 2, 1, 0, 3]);
         assert_eq!(set.to_uids(), vec![1, 2, 3, 9]);
         assert_eq!(set.ranges(), &[UidRange::range(1, 3), UidRange::single(9)]);
-        assert_eq!(set.len(), 4);
+        assert_eq!(set.uid_count(), 4);
 
-        assert!(CompactUidSet::from_uids([0, 0]).ranges().is_empty());
-        assert_eq!(CompactUidSet::default().len(), 0);
+        assert!(CompactUidSet::from_uids([0, 0]).is_empty());
+        assert!(CompactUidSet::default().is_empty());
+        assert_eq!(CompactUidSet::default().uid_count(), 0);
     }
 
     #[test]
@@ -960,7 +1030,7 @@ mod tests {
             UidRange::range(2, 6),
         ]);
         assert_eq!(set.ranges(), &[UidRange::range(1, 8)]);
-        assert_eq!(set.len(), 8);
+        assert_eq!(set.uid_count(), 8);
     }
 
     #[test]
@@ -1016,11 +1086,11 @@ mod tests {
     }
 
     // A LIST/IDLE event for a folder we already know, with no OLDNAME and
-    // no `\NonExistent`, is a re-announcement, not a new epoch: the entry
-    // (and its MODSEQ cache and cursor) is left alone. Only a delete
+    // no `\NonExistent`, is a re-announcement, not a new epoch: it retains
+    // cursor/MODSEQ state but refreshes live attributes. Only a delete
     // followed by a create, or an explicit rename, installs a fresh entry.
     #[test]
-    fn duplicate_create_event_leaves_a_known_folder_untouched() {
+    fn duplicate_create_event_refreshes_attributes_without_resetting_state() {
         let folder = MailboxName::new("Projects").expect("valid mailbox");
         let registry = FolderRegistry::from_list(vec![MailboxInfo {
             name: folder.clone(),
@@ -1031,6 +1101,7 @@ mod tests {
 
         registry.apply_mailbox_event(MailboxInfo {
             name: folder.clone(),
+            attributes: vec![MailboxAttribute::NoSelect, MailboxAttribute::Sent],
             ..Default::default()
         });
 
@@ -1039,6 +1110,66 @@ mod tests {
             after.modseq(11, 7),
             Some(99),
             "a re-announcement must not reset the MODSEQ cache"
+        );
+        assert!(!after.selectable(), "NoSelect must take effect immediately");
+        assert_eq!(
+            after.attributes(),
+            vec![MailboxAttribute::NoSelect, MailboxAttribute::Sent],
+            "SPECIAL-USE changes must refresh with the same announcement"
+        );
+    }
+
+    /// The attribute refresh must mutate the entry every holder shares.
+    ///
+    /// Tasks clone `Arc<FolderEntry>` out of the registry and hold them
+    /// across awaits (a sync run records MODSEQs and sets the folder cursor
+    /// on the handle it took at the start). If a refresh copied that state
+    /// into a replacement `Arc` and swapped the map entry, every write the
+    /// holder made after the copy would land on an orphan and vanish - a
+    /// just-recorded cursor lost, stale MODSEQ guards restored.
+    ///
+    /// No timing here: the handle is taken before the event and written
+    /// after it, which is exactly the interleaving the swap loses.
+    #[test]
+    fn attribute_refresh_does_not_drop_writes_from_a_handle_taken_before_it() {
+        let folder = MailboxName::new("Projects").expect("valid mailbox");
+        let registry = FolderRegistry::from_list(vec![MailboxInfo {
+            name: folder.clone(),
+            ..Default::default()
+        }]);
+        // A task checks the folder out and is now mid-run.
+        let held = registry.get(&folder).expect("folder entry");
+
+        registry.apply_mailbox_event(MailboxInfo {
+            name: folder.clone(),
+            attributes: vec![MailboxAttribute::Sent],
+            ..Default::default()
+        });
+
+        // The run finishes and commits its state through the handle it has.
+        held.record_modseq(11, 7, 99).expect("valid modseq");
+        held.set_cursor(FolderCursor::Basic {
+            uidvalidity: 11,
+            uidnext: 8,
+            known_uids: CompactUidSet::from_uids([7]),
+        });
+        held.mark_seen();
+
+        let after = registry.get(&folder).expect("folder still registered");
+        assert_eq!(
+            after.modseq(11, 7),
+            Some(99),
+            "a MODSEQ recorded through a pre-refresh handle must not be lost"
+        );
+        assert!(
+            after.cursor().is_some(),
+            "a cursor set through a pre-refresh handle must not be lost"
+        );
+        assert!(after.last_seen().is_some());
+        assert_eq!(
+            after.attributes(),
+            vec![MailboxAttribute::Sent],
+            "the refresh still has to land"
         );
     }
 

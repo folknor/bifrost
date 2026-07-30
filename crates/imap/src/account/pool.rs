@@ -195,6 +195,72 @@ impl PooledConn {
         }
     }
 
+    /// Make a mailbox-management command safe for a target that this pooled
+    /// member happens to have selected. RFC 3501 permits servers to reject
+    /// DELETE and RENAME for the selected mailbox. Prefer UNSELECT because
+    /// it keeps the checkout on its existing connection; old servers without
+    /// UNSELECT replace the selected member with a freshly dialed connection.
+    pub(crate) async fn deselect_target(
+        &mut self,
+        target: &MailboxName,
+        timeout: std::time::Duration,
+    ) -> Result<(), Error> {
+        let selected_target = self
+            .member
+            .as_ref()
+            .is_some_and(|member| member.selected.as_ref() == Some(target));
+        if !selected_target {
+            return Ok(());
+        }
+
+        match self.connection().unselect(timeout).await {
+            Ok(()) => {
+                self.member
+                    .as_mut()
+                    .expect("pooled connection present")
+                    .selected = None;
+                Ok(())
+            }
+            Err(Error::MissingCapability(_)) => self.replace_selected_member().await,
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Replace this checkout's connection with a freshly dialed one.
+    ///
+    /// The old member is logged out and released BEFORE the replacement is
+    /// dialed. Dialing first would hold cap+1 physical connections for the
+    /// duration of the handshake, and a server that enforces its per-user
+    /// connection limit rejects exactly the fallback that a pre-UNSELECT
+    /// server needs. It also keeps the old session SELECTed on the target
+    /// while the DELETE that follows is issued, which RFC 2683 2.2.2 warns
+    /// against. Ordering the teardown first costs one round trip and makes
+    /// the fallback work on the servers that require it.
+    async fn replace_selected_member(&mut self) -> Result<(), Error> {
+        if let Some(old) = self.member.take() {
+            let _ = old.conn.logout().await;
+        }
+        if self.pool.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::closed());
+        }
+        let (conn, _auth) = self
+            .pool
+            .config
+            .imap
+            .connect_authenticated_metered(
+                &self.pool.config.credentials,
+                &self.pool.config.auth_policy,
+                self.pool.meter.clone(),
+                Some(Arc::clone(&self.pool.bandwidth_cap)),
+            )
+            .await?;
+        self.member = Some(PoolMember {
+            conn,
+            selected: None,
+        });
+        Ok(())
+    }
+
     pub(crate) fn discard(&mut self) {
         self.member.take();
     }

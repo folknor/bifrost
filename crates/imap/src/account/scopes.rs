@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bifrost_types::{Account, CursorScope, MembershipScope, SyncEvent, Warning};
@@ -11,7 +12,7 @@ pub(crate) fn discover_cursor_scopes(
         .folders
         .entries()
         .into_iter()
-        .filter(|entry| entry.selectable)
+        .filter(|entry| entry.selectable())
         .map(|entry| folder_scope(&entry.name))
         .collect();
     // The two composable sub-accounts contribute their own typed cursor
@@ -31,11 +32,12 @@ pub(crate) fn discover_cursor_scopes(
 pub(crate) fn discover_memberships(
     account: ImapAccount,
 ) -> bifrost_types::AccountStream<SyncEvent<MembershipScope>> {
+    let mut shared_owners = HashSet::new();
     let folder_memberships: Vec<MembershipScope> = account
         .folders
         .entries()
         .into_iter()
-        .flat_map(|entry| memberships_for_entry(&entry))
+        .flat_map(|entry| memberships_for_entry(&entry, &mut shared_owners))
         .collect();
     let subs: Vec<Arc<dyn Account>> = [account.contacts.clone(), account.calendars.clone()]
         .into_iter()
@@ -72,9 +74,14 @@ where
 /// engine's `scope_covers_membership` covering rule (the FolderId and
 /// MailboxId strings differ for a shared folder), so it must be emitted
 /// explicitly here.
-fn memberships_for_entry(entry: &super::folder_registry::FolderEntry) -> Vec<MembershipScope> {
+fn memberships_for_entry(
+    entry: &super::folder_registry::FolderEntry,
+    shared_owners: &mut HashSet<bifrost_types::MailboxId>,
+) -> Vec<MembershipScope> {
     let mut out = vec![membership_scope(&entry.name)];
-    if let Some(owner) = &entry.shared_owner {
+    if let Some(owner) = &entry.shared_owner
+        && shared_owners.insert(owner.clone())
+    {
         out.push(MembershipScope::Mailbox(owner.clone()));
     }
     out
@@ -150,9 +157,9 @@ mod tests {
         let mut shared = None;
         for entry in registry.entries() {
             if entry.name.as_str() == "INBOX" {
-                personal = Some(memberships_for_entry(&entry));
+                personal = Some(memberships_for_entry(&entry, &mut Default::default()));
             } else {
-                shared = Some(memberships_for_entry(&entry));
+                shared = Some(memberships_for_entry(&entry, &mut Default::default()));
             }
         }
 
@@ -168,6 +175,42 @@ mod tests {
         ))));
         assert!(shared.contains(&MembershipScope::Mailbox(MailboxId("alice".to_string()))));
         assert_eq!(shared.len(), 2);
+    }
+
+    #[test]
+    fn discover_memberships_emits_one_mailbox_scope_per_shared_owner() {
+        let owner = MailboxId("alice".to_string());
+        let registry = FolderRegistry::from_lists(
+            Vec::new(),
+            vec![
+                SharedFolderEntry {
+                    info: mailbox_info("Shared/alice/INBOX"),
+                    owner: owner.clone(),
+                    rights: None,
+                    namespace_prefix: "Shared/".to_string(),
+                },
+                SharedFolderEntry {
+                    info: mailbox_info("Shared/alice/Archive"),
+                    owner: owner.clone(),
+                    rights: None,
+                    namespace_prefix: "Shared/".to_string(),
+                },
+            ],
+        );
+        let mut owners = Default::default();
+        let memberships: Vec<_> = registry
+            .entries()
+            .into_iter()
+            .flat_map(|entry| memberships_for_entry(&entry, &mut owners))
+            .collect();
+
+        assert_eq!(
+            memberships
+                .iter()
+                .filter(|membership| **membership == MembershipScope::Mailbox(owner.clone()))
+                .count(),
+            1
+        );
     }
 
     // A shared selectable folder surfaces as an ordinary
@@ -187,7 +230,7 @@ mod tests {
         let folder_scopes: Vec<CursorScope> = registry
             .entries()
             .into_iter()
-            .filter(|entry| entry.selectable)
+            .filter(|entry| entry.selectable())
             .map(|entry| folder_scope(&entry.name))
             .collect();
 

@@ -899,7 +899,10 @@ pub(crate) fn container_rename(
         let folder = folder_from_container(&container)?;
         let new_name = renamed_sibling(&account, &folder, &name)?;
         let err = op_err(AccountOperation::ContainerRename);
-        let conn = account.pool.checkout_any().await.map_err(err)?;
+        let mut conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.deselect_target(&folder, account.command_timeout())
+            .await
+            .map_err(err)?;
         conn.connection()
             .rename(
                 folder.as_str(),
@@ -927,7 +930,10 @@ pub(crate) fn container_move(
         let leaf = leaf_name(&account, &folder);
         let new_name = child_name(&account, new_parent.as_ref(), &leaf)?;
         let err = op_err(AccountOperation::ContainerMove);
-        let conn = account.pool.checkout_any().await.map_err(err)?;
+        let mut conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.deselect_target(&folder, account.command_timeout())
+            .await
+            .map_err(err)?;
         conn.connection()
             .rename(
                 folder.as_str(),
@@ -947,7 +953,10 @@ pub(crate) fn container_delete(
     Box::pin(async move {
         let folder = folder_from_container(&container)?;
         let err = op_err(AccountOperation::ContainerDelete);
-        let conn = account.pool.checkout_any().await.map_err(err)?;
+        let mut conn = account.pool.checkout_any().await.map_err(err)?;
+        conn.deselect_target(&folder, account.command_timeout())
+            .await
+            .map_err(err)?;
         let status = conn
             .connection()
             .status(folder.as_str(), "MESSAGES", account.command_timeout())
@@ -1100,13 +1109,16 @@ pub(crate) fn delete_thread(
         if let Some(current) = current {
             let folder = folder_from_container(&current)?;
             let entry = account.folders.get(&folder);
+            let attributes = entry
+                .as_deref()
+                .map(super::folder_registry::FolderEntry::attributes)
+                .unwrap_or_default();
             if folder_role(
+                &attributes,
+                folder.as_str(),
                 entry
                     .as_deref()
-                    .map(|entry| entry.attributes.as_slice())
-                    .unwrap_or(&[]),
-                folder.as_str(),
-                entry.as_deref().and_then(|entry| entry.delimiter),
+                    .and_then(super::folder_registry::FolderEntry::delimiter),
             ) == Some(FolderRole::Trash)
             {
                 return remove_from_container(account, MutationTarget::Thread(thread), current)
@@ -1655,7 +1667,7 @@ fn search_folders(account: &ImapAccount, restriction: Option<&MailboxName>) -> V
         .folders
         .entries()
         .into_iter()
-        .filter(|entry| entry.selectable)
+        .filter(|entry| entry.selectable())
         .map(|entry| entry.name.clone())
         .collect();
     folders.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -1731,14 +1743,14 @@ fn container_from_folder_entry(
     Container::new(
         ContainerId(native.clone()),
         ContainerKind::Folder,
-        folder_role(&entry.attributes, &native, entry.delimiter),
+        folder_role(&entry.attributes(), &native, entry.delimiter()),
         Provenance {
             provider: ProtocolKind::Imap,
             kind: ContainerKind::Folder,
             native: native.clone(),
         },
         display_name,
-        parent_id(entry.delimiter, &native),
+        parent_id(entry.delimiter(), &native),
     )
     // IMAP mailboxes carry no container color, and IMAP is folder-shaped
     // (special-use maps into `role`), so `style` and `system` keep their
@@ -1843,11 +1855,12 @@ fn role_folder_from_entries(
     entries
         .into_iter()
         .filter(|entry| {
-            folder_role(&entry.attributes, entry.name.as_str(), entry.delimiter) == Some(role)
+            folder_role(&entry.attributes(), entry.name.as_str(), entry.delimiter()) == Some(role)
         })
         .min_by(|left, right| {
-            let left_rank = u8::from(folder_role_from_attributes(&left.attributes) != Some(role));
-            let right_rank = u8::from(folder_role_from_attributes(&right.attributes) != Some(role));
+            let left_rank = u8::from(folder_role_from_attributes(&left.attributes()) != Some(role));
+            let right_rank =
+                u8::from(folder_role_from_attributes(&right.attributes()) != Some(role));
             left_rank
                 .cmp(&right_rank)
                 .then_with(|| left.name.as_str().cmp(right.name.as_str()))
@@ -1865,7 +1878,7 @@ fn first_selectable_folder(
 ) -> Option<MailboxName> {
     entries
         .into_iter()
-        .filter(|entry| entry.selectable)
+        .filter(|entry| entry.selectable())
         .min_by(|left, right| left.name.as_str().cmp(right.name.as_str()))
         .map(|entry| entry.name.clone())
 }
@@ -1882,7 +1895,7 @@ fn child_name(
     let delimiter = account
         .folders
         .get(&parent_folder)
-        .and_then(|entry| entry.delimiter)
+        .and_then(|entry| entry.delimiter())
         .ok_or_else(|| super::error::unsupported(AccountOperation::ContainerCreate))?;
     MailboxName::new(format!("{}{delimiter}{leaf}", parent_folder.as_str()))
         .map_err(|e| pim_malformed(e.to_string()))
@@ -1896,7 +1909,7 @@ fn renamed_sibling(
     let delimiter = account
         .folders
         .get(folder)
-        .and_then(|entry| entry.delimiter);
+        .and_then(|entry| entry.delimiter());
     let Some(delimiter) = delimiter else {
         return MailboxName::new(new_leaf.to_owned()).map_err(|e| pim_malformed(e.to_string()));
     };
@@ -1912,7 +1925,7 @@ fn leaf_name(account: &ImapAccount, folder: &MailboxName) -> String {
     let delimiter = account
         .folders
         .get(folder)
-        .and_then(|entry| entry.delimiter);
+        .and_then(|entry| entry.delimiter());
     delimiter
         .and_then(|delimiter| folder.as_str().rsplit_once(delimiter).map(|(_, leaf)| leaf))
         .unwrap_or_else(|| folder.as_str())

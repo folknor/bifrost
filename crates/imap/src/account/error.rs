@@ -39,6 +39,12 @@ pub(crate) struct ImapErrorContext {
     pub(crate) provider: Option<Provider>,
     pub(crate) idempotency_override: Option<bool>,
     pub(crate) transmission_state: Option<TransmissionState>,
+    /// Extra support-only diagnostics the call site knows and the wire
+    /// error does not - notably a confirmed partial side effect that
+    /// already landed before this failure. Appended to whatever text the
+    /// classification produces; it never replaces the classification, so
+    /// the `RecoveryClass` derivation still sees the real failure.
+    pub(crate) extra_text: Vec<DiagnosticText>,
 }
 
 impl ImapErrorContext {
@@ -49,7 +55,14 @@ impl ImapErrorContext {
             provider: None,
             idempotency_override: None,
             transmission_state: None,
+            extra_text: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_extra_text(mut self, text: DiagnosticText) -> Self {
+        self.extra_text.push(text);
+        self
     }
 
     #[must_use]
@@ -150,6 +163,9 @@ pub(crate) fn into_account_error(error: Error, ctx: ImapErrorContext) -> Account
         builder = builder.native_code(code);
     }
     if let Some(text) = diagnostic_text {
+        builder = builder.text(text);
+    }
+    for text in ctx.extra_text {
         builder = builder.text(text);
     }
 

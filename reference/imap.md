@@ -302,9 +302,32 @@ Containers use native mailbox paths as primitive/provenance ids. `containers_lis
 
 `FolderRegistry::apply_mailbox_event` handles delete, rename, and delete-then-recreate: delete/rename drop the in-memory entry; a recreate (fresh UIDVALIDITY at the same name) installs a fresh `FolderEntry` with empty modseq cache and cursor, so a recreated mailbox cannot reuse the prior epoch's state.
 
+A same-name LIST/IDLE re-announcement is the existing mailbox epoch, but its
+attributes are live lifecycle state. The registry refreshes them (`\Noselect`,
+`\NonExistent`, SPECIAL-USE) so a folder whose access or role changed does not
+keep syncing under a stale projection until reopen. The refresh happens IN
+PLACE: attributes, delimiter, and the derived `selectable` flag live behind
+`FolderEntry::listing` (a `RwLock<FolderListing>`, read through
+`selectable()` / `delimiter()` / `attributes()`), and the map keeps the same
+`Arc<FolderEntry>`. Copying the state into a replacement entry and swapping
+the map would drop every write a task made through an `Arc` it cloned before
+the swap - a sync run holds its entry across awaits and commits a cursor and
+MODSEQs at the end, so the lost-update window is real, not theoretical.
+
+Mailbox management on a mailbox this account has SELECTed goes through
+`PooledConn::deselect_target`: an affinity-free `checkout_any` can hand back a
+connection still selected on the RENAME/DELETE target, and RFC 3501 lets a
+server reject either for the selected mailbox (RFC 2683 2.2.2 asks the client
+to close first). UNSELECT is preferred - it keeps the checkout on its
+connection. A pre-UNSELECT server falls back to replacing the member, and the
+old connection is LOGOUT'd BEFORE the replacement is dialed: dialing first
+would hold `pool_cap + 1` physical connections across the handshake, which a
+server enforcing a per-user connection limit rejects - precisely on the old
+servers that need the fallback.
+
 ### Shared / other-user folders (A5c)
 
-`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `MailboxId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Mailbox(owner)` per shared entry - explicitly, because `scope_covers_membership` does not link them (FolderId and MailboxId strings differ).
+`factory::open` issues NAMESPACE after the personal LIST and enumerates each non-personal `other`/`shared` prefix via `LIST "" "<prefix>*"` (`discover_shared_folders`, prefix in the PATTERN - RFC 3501 6.3.8 leaves reference/pattern concatenation implementation-defined and a server that ignores the reference answers the reference form with the personal namespace), tagging each with its owning `MailboxId`. An other-user root (`#user/`) carries one descriptor for all users, so the principal is read per folder (`mailbox_owner_from_other_user_path`: the segment after the root, e.g. `#user/alice/INBOX` -> `alice`); a shared root collapses to itself (`mailbox_owner_for`). Under ACL, candidates are probed with MYRIGHTS and the parsed set rides out on the entry; a MYRIGHTS failure is non-fatal and defers to SELECT. Discovery no longer DROPS an unreadable candidate: the personal `LIST "" "*"` may echo the same path (RFC 2342), so dropping it left that echo behind as a bare personal entry and a read-only share presented downstream as a writable personal folder. The read decision moves one layer down to `shared_folder_is_selectable` (pure, `folder_registry.rs`): `\Noselect`/`\NonExistent` or a reported rights set without `l`+`r` clears `FolderEntry::selectable()`, which is exactly the flag `discover_cursor_scopes` filters on, so an unreadable share keeps its owner / `Shared` namespace / rights in `containers_list` and still never becomes a cursor scope. The owner rides on `FolderEntry.shared_owner` (via `FolderRegistry::from_lists`). Shared folders are ordinary `CursorScope::Folder` scopes (no new variant, no `route_typed_scope` change); discovery and inventory also emit `MembershipScope::Mailbox(owner)` per shared entry - explicitly, because `scope_covers_membership` does not link them (FolderId and MailboxId strings differ).
 
 Two registry rules keep the shared tagging (and therefore the owner and the rights) attached to the entry:
 
@@ -322,6 +345,14 @@ Revocation quarantines, not escalates. A shared-folder SELECT permission denial 
 `Error::response_code()` returns the structured `ResponseCode` from `[CODE ...]` brackets (first only); recovery consumes those via the typed `ImapResponseCode` wire variants.
 
 `Error::No` and `Error::Bad` carry `attempt: Option<ImapAttempt>`; `no_with_code`/`bad_with_code` default it to `Some(Acknowledged)` because a tagged `NO`/`BAD` is a server-acknowledged terminal response. Without this, recovery rows keyed on `Acknowledged` (e.g. `Server(Error { status: None }) + Acknowledged -> ProviderRefused`) collapse to the `Unsent` arm and misclassify provider refusals as retryable drops.
+
+`ImapErrorContext::with_extra_text` appends support-only diagnostics the call site knows and the wire does not, WITHOUT touching the classification. The destroy path uses it: a UID EXPUNGE that fails after its `UID STORE +FLAGS.SILENT \Deleted` was acknowledged leaves a confirmed partial effect (those messages stay flagged `\Deleted`), but the failure itself keeps its own kind and cause chain. Collapsing it into `Protocol(PartialResponse)` would flatten an auth loss, an ACL denial, a quota throttle and a capability loss into one generic reconcile - the exact classification `reference/error-model.md` requires the producer to preserve.
+
+### Push lifecycle
+
+The IDLE task is account-owned, not subscription-owned: `ensure_idle_task` spawns one for the account's lifetime, and `push_unsubscribe` never cancels it. With no subscribed scopes the loop parks on the `resubscribe` `Notify` (plus the cancel/shutdown tokens) instead of sleeping or exiting, so a subscribe/unsubscribe pair cannot race a cancelling task into two IDLE loops or none. `choose_idle_folder` sorts subscribed folder scopes by name before picking, so a `HashMap`/`HashSet` iteration order never decides which mailbox is watched, then falls back to INBOX.
+
+A scope-set change cancels the in-flight IDLE round through a child token so the folder choice can be re-evaluated. `ImapConnection::idle` gives cancellation strict priority over queued server events and the DONE handshake discards the rest, so any event that landed in that window is unrecoverable - the loop therefore absorbs whatever `idle()` did return and then emits a coarse `HintPayload::Unknown` invalidation (`signal_idle_interrupt_loss`). Reconfiguring subscriptions degrades to a broader reconcile, never to silent push loss for the scopes that stayed.
 
 ### Concurrency conflicts and UNCHANGEDSINCE
 

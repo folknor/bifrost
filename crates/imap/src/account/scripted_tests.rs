@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use bifrost_types::ContainerKind;
+use bifrost_types::{ContainerId, ContainerKind};
 
 use crate::connection::test_support::{driver_pair, preauth_greeting, read_line, respond, tag_of};
 use crate::types::{AuthPolicy, Credentials};
@@ -116,4 +116,149 @@ async fn container_create_completes_under_a_single_permit_pool() {
 
 fn created_name() -> crate::types::MailboxName {
     crate::types::MailboxName::new("Archive".to_owned()).unwrap()
+}
+
+/// DELETE must not be sent on a pooled connection that still has its target
+/// selected. IMAP4rev2 provides UNSELECT, so this transcript proves the
+/// affinity-free checkout explicitly deselects before STATUS/DELETE rather
+/// than relying on a server accepting the selected-mailbox operation.
+#[tokio::test]
+async fn container_delete_deselects_a_target_left_selected_in_the_pool() {
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev2")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("Archive").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT"), "expected SELECT, got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
+                 * 0 EXISTS\r\n\
+                 * LIST () \"/\" Archive\r\n\
+                 * OK [UIDVALIDITY 1] selected\r\n\
+                 {} OK [READ-WRITE] SELECT done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let unselect = read_line(&mut server).await;
+        assert!(
+            unselect.contains("UNSELECT"),
+            "expected UNSELECT before DELETE, got {unselect}"
+        );
+        respond(
+            &mut server,
+            &format!("{} OK UNSELECT done\r\n", tag_of(&unselect)),
+        )
+        .await;
+
+        let status = read_line(&mut server).await;
+        assert!(status.contains("STATUS"), "expected STATUS, got {status}");
+        respond(
+            &mut server,
+            &format!(
+                "* STATUS Archive (MESSAGES 0)\r\n{} OK STATUS done\r\n",
+                tag_of(&status)
+            ),
+        )
+        .await;
+
+        let delete = read_line(&mut server).await;
+        assert!(delete.contains("DELETE"), "expected DELETE, got {delete}");
+        respond(
+            &mut server,
+            &format!("{} OK DELETE done\r\n", tag_of(&delete)),
+        )
+        .await;
+
+        let list = read_line(&mut server).await;
+        assert!(list.contains("LIST"), "expected LIST, got {list}");
+        respond(&mut server, &format!("{} OK LIST done\r\n", tag_of(&list))).await;
+        server
+    });
+
+    let mut pooled = account.pool.checkout_any().await.unwrap();
+    account
+        .select_folder(&mut pooled, &folder, None, false)
+        .await
+        .unwrap();
+    drop(pooled);
+
+    super::pim::container_delete(account.clone(), ContainerId("Archive".to_owned()))
+        .await
+        .expect("selected target must be deselected before delete");
+    let _server = script.await.unwrap();
+}
+
+/// On a pre-UNSELECT server the deselect fallback replaces the checked-out
+/// connection. It must release the old one BEFORE dialing the replacement:
+/// dialing first holds `pool_cap + 1` physical connections across the whole
+/// handshake, and a server enforcing its per-user connection limit rejects
+/// exactly the fallback these old servers need. It also leaves the target
+/// mailbox SELECTed on a live session while DELETE goes out (RFC 2683 2.2.2).
+///
+/// The pool is closed before the fallback runs, so the redial is refused
+/// locally and cannot reach for a socket. What the transcript then proves is
+/// the ordering: LOGOUT for the old member is on the wire even though the
+/// replacement never happened.
+#[tokio::test]
+async fn deselect_fallback_releases_the_old_connection_before_redialing() {
+    // IMAP4rev1 with no UNSELECT capability: `unselect` fails the gate
+    // without touching the wire, so the fallback is what runs.
+    let (conn, mut server) = driver_pair(&preauth_greeting("IMAP4rev1")).await;
+    let account = scripted_account(conn, 1);
+    let folder = crate::types::MailboxName::new("Archive").unwrap();
+
+    let script = tokio::spawn(async move {
+        let select = read_line(&mut server).await;
+        assert!(select.contains("SELECT"), "expected SELECT, got {select}");
+        respond(
+            &mut server,
+            &format!(
+                "* FLAGS (\\Deleted \\Seen)\r\n\
+                 * 0 EXISTS\r\n\
+                 * 0 RECENT\r\n\
+                 * OK [UIDVALIDITY 1] selected\r\n\
+                 {} OK [READ-WRITE] SELECT done\r\n",
+                tag_of(&select)
+            ),
+        )
+        .await;
+
+        let logout = read_line(&mut server).await;
+        assert!(
+            logout.contains("LOGOUT"),
+            "the superseded selected connection must be closed first, got {logout}"
+        );
+        respond(
+            &mut server,
+            &format!("* BYE closing\r\n{} OK LOGOUT done\r\n", tag_of(&logout)),
+        )
+        .await;
+        server
+    });
+
+    let mut pooled = account.pool.checkout_any().await.unwrap();
+    account
+        .select_folder(&mut pooled, &folder, None, false)
+        .await
+        .unwrap();
+
+    // Refuse the redial locally rather than letting it look for a socket.
+    account.pool.close().await;
+
+    let result = pooled
+        .deselect_target(&folder, Duration::from_secs(5))
+        .await;
+    assert!(
+        result.is_err(),
+        "a refused redial must surface, not silently leave the target selected"
+    );
+    let _server = tokio::time::timeout(Duration::from_secs(5), script)
+        .await
+        .expect("LOGOUT must precede the replacement dial")
+        .unwrap();
 }
